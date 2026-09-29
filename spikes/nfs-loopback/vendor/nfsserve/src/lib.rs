@@ -14,6 +14,7 @@ mod portmap_handlers;
 
 pub mod nfs;
 mod nfs_handlers;
+pub use nfs_handlers::take_stats;
 
 #[cfg(not(target_os = "windows"))]
 pub mod fs_util;

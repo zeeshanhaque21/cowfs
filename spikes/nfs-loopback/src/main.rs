@@ -170,8 +170,8 @@ impl NFSFileSystem for Mirror {
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        self.tr(format!("SETATTR id={id} mode={} size={}", matches!(setattr.mode, set_mode3::mode(_)), match setattr.size { set_size3::size(n) => n as i64, _ => -1 }));
         let p = self.path(id)?;
+        self.tr(format!("SETATTR {} mode={} size={} atime={} mtime={}", p.display(), matches!(setattr.mode, set_mode3::mode(_)), match setattr.size { set_size3::size(n) => n as i64, _ => -1 }, !matches!(setattr.atime, set_atime::DONT_CHANGE), !matches!(setattr.mtime, set_mtime::DONT_CHANGE)));
         self.apply(&p, &setattr)?;
         self.attr_by_id(id)
     }
@@ -239,6 +239,11 @@ impl NFSFileSystem for Mirror {
         let from = self.child(from_dirid, from_filename)?;
         let to = self.child(to_dirid, to_filename)?;
         fs::rename(&from, &to).map_err(err)?;
+        let md = fs::symlink_metadata(&to).map_err(err)?;
+        if !md.is_dir() {
+            self.remember(md.ino(), to);
+            return Ok(());
+        }
         let mut m = self.paths.lock().unwrap();
         for v in m.values_mut() {
             if let Ok(rest) = v.strip_prefix(&from) {
@@ -257,27 +262,15 @@ impl NFSFileSystem for Mirror {
             .map(|e| (e.file_name().as_bytes().to_vec(), e.path()))
             .collect();
         ents.sort();
-        let mut ids = Vec::with_capacity(ents.len());
-        for (_, p) in &ents {
-            ids.push(fs::symlink_metadata(p).map(|m| m.ino()).unwrap_or(0));
-        }
-        let start = if start_after == 0 {
-            0
-        } else {
-            ids.iter().position(|i| *i == start_after).map(|i| i + 1).unwrap_or(0)
-        };
         let mut out = ReadDirResult::default();
-        for i in start..ents.len() {
+        for i in (start_after as usize).min(ents.len())..ents.len() {
             if out.entries.len() >= max_entries {
                 return Ok(out);
             }
             let (name, p) = &ents[i];
-            if ids[i] == 0 {
-                continue;
-            }
-            self.remember(ids[i], p.clone());
             if let Ok(attr) = self.attr_of(None, p) {
-                out.entries.push(DirEntry { fileid: ids[i], name: name.clone().into(), attr });
+                self.remember(attr.fileid, p.clone());
+                out.entries.push(DirEntry { fileid: attr.fileid, name: name.clone().into(), attr, cookie: i as u64 + 1 });
             }
         }
         out.end = true;
@@ -328,5 +321,11 @@ async fn main() -> io::Result<()> {
     let fs = Mirror { root, hide_appledouble: hide, trace, paths: Mutex::new(paths) };
     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{port}"), fs).await?;
     eprintln!("listening on 127.0.0.1:{}", listener.get_listen_port());
+    tokio::spawn(async {
+        let mut s = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()).unwrap();
+        while s.recv().await.is_some() {
+            eprint!("STATS\n{}", nfsserve::take_stats());
+        }
+    });
     listener.handle_forever().await
 }

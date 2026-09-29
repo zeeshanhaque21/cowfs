@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 pub struct TransactionTracker {
     retention_period: Duration,
     transactions: Mutex<HashMap<(u32, String), TransactionState>>,
+    last_housekeeping: Mutex<SystemTime>,
 }
 
 impl TransactionTracker {
@@ -13,6 +14,7 @@ impl TransactionTracker {
         Self {
             retention_period,
             transactions: Mutex::new(HashMap::new()),
+            last_housekeeping: Mutex::new(SystemTime::now()),
         }
     }
 
@@ -23,7 +25,14 @@ impl TransactionTracker {
     pub fn is_retransmission(&self, xid: u32, client_addr: &str) -> bool {
         let key = (xid, client_addr.to_string());
         let mut transactions = self.transactions.lock().expect("unable to unlock transactions mutex");
-        housekeeping(&mut transactions, self.retention_period);
+        // full-map scan per request was O(n) under a global lock; amortize to once a second
+        let now = SystemTime::now();
+        let mut last = self.last_housekeeping.lock().expect("unable to unlock housekeeping mutex");
+        if now.duration_since(*last).unwrap_or_default() >= Duration::from_secs(1) {
+            *last = now;
+            housekeeping(&mut transactions, self.retention_period);
+        }
+        drop(last);
         if let hash_map::Entry::Vacant(e) = transactions.entry(key) {
             e.insert(TransactionState::InProgress);
             false

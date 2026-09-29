@@ -128,7 +128,49 @@ pub async fn handle_nfs(
         return Ok(());
     }
     let prog = NFSProgram::from_u32(call.proc).unwrap_or(NFSProgram::INVALID);
+    let slot = (call.proc as usize).min(STAT_N - 1);
+    let depth = INFLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+    INFLIGHT_SUM.fetch_add(depth, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    let r = handle_nfs_inner(xid, prog, input, output, context).await;
+    INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+    STAT_COUNT[slot].fetch_add(1, Ordering::Relaxed);
+    STAT_NS[slot].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    r
+}
 
+use std::sync::atomic::{AtomicU64, Ordering};
+const STAT_N: usize = 23;
+static STAT_COUNT: [AtomicU64; STAT_N] = [const { AtomicU64::new(0) }; STAT_N];
+static STAT_NS: [AtomicU64; STAT_N] = [const { AtomicU64::new(0) }; STAT_N];
+static INFLIGHT: AtomicU64 = AtomicU64::new(0);
+static INFLIGHT_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// Per-procedure op count and cumulative server-side latency, then resets.
+pub fn take_stats() -> String {
+    let mut s = String::from("proc count total_ms avg_us\n");
+    let mut total = 0;
+    for i in 0..STAT_N {
+        let c = STAT_COUNT[i].swap(0, Ordering::Relaxed);
+        let ns = STAT_NS[i].swap(0, Ordering::Relaxed);
+        total += c;
+        if c > 0 {
+            let name = NFSProgram::from_usize(i).map(|p| format!("{:?}", p)).unwrap_or(i.to_string());
+            s += &format!("{} {} {:.1} {:.1}\n", name, c, ns as f64 / 1e6, ns as f64 / 1e3 / c as f64);
+        }
+    }
+    let sum = INFLIGHT_SUM.swap(0, Ordering::Relaxed);
+    s += &format!("TOTAL {} mean_inflight_at_arrival {:.2}\n", total, if total > 0 { sum as f64 / total as f64 } else { 0.0 });
+    s
+}
+
+async fn handle_nfs_inner(
+    xid: u32,
+    prog: NFSProgram,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    context: &RPCContext,
+) -> Result<(), anyhow::Error> {
     match prog {
         NFSProgram::NFSPROC3_NULL => nfsproc3_null(xid, input, output)?,
         NFSProgram::NFSPROC3_GETATTR => nfsproc3_getattr(xid, input, output, context).await?,
@@ -893,7 +935,7 @@ pub async fn nfsproc3_readdirplus(
                 let entry = entryplus3 {
                     fileid: entry.fileid,
                     name: entry.name,
-                    cookie: entry.fileid,
+                    cookie: entry.cookie,
                     name_attributes: nfs::post_op_attr::attributes(obj_attr),
                     name_handle: handle,
                 };
@@ -1014,7 +1056,7 @@ pub async fn nfsproc3_readdir(
                 let entry = entry3 {
                     fileid: entry.fileid,
                     name: entry.name,
-                    cookie: entry.fileid,
+                    cookie: entry.cookie,
                 };
                 // write the entry into a buffer first
                 let mut write_buf: Vec<u8> = Vec::new();
