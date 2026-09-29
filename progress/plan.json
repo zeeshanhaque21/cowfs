@@ -7,7 +7,8 @@
       "items": [
         {"id": "1", "title": "#1 dedup ratio on the real worktree corpus", "state": "running", "owner": "lead", "live": "spike1", "issue": 1,
          "detail": "Full run on 45 slots, 843,889 files, 273.43 GiB raw, 0 errors. Raw 1.00x, per-file zstd 3.60x, whole-file dedup 3.12x, CDC only 5.08x, CDC + zstd 14.04x. A median extra lumen slot costs 0.47 GiB compressed (4.9% of raw). Caveat: 97.5% of raw is cargo target/ and 91.7% is one repo, so 14x is a Rust build-output result. Write-up: docs/spikes/1-dedup-corpus.md. Gate met."},
-        {"id": "2", "title": "#2 mmap and file locking over the macOS NFS loopback", "state": "pending", "issue": 2},
+        {"id": "2", "title": "#2 mmap and file locking over the macOS NFS loopback", "state": "building", "owner": "subagent", "issue": 2,
+         "detail": "Passthrough NFSv3 server on nfsserve 0.11 mounts WITHOUT sudo. With -o locallocks: mmap (shared, private, grow), flock, fcntl, git init/add/commit/status/gc/fsck, and a ~60-crate cargo build (native 8.4-9.2s, NFS 23-31s, n=2) all work. 23/24 checks pass; hardlinks fail because nfsserve lacks NFSv3 LINK. A subagent is patching a vendored copy. Bugs found on the way: rename path fix-up produced a trailing slash (mine, fixed), and macOS writes ._ AppleDouble sidecars for xattrs (unresolved)."},
         {"id": "3", "title": "#3 build and git status overhead versus native", "state": "pending", "issue": 3},
         {"id": "4", "title": "#4 .git inside the filesystem", "state": "pending", "issue": 4},
         {"id": "5", "title": "#5 treehouse process detection on the mount", "state": "pending", "issue": 5},
