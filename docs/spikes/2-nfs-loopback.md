@@ -8,7 +8,8 @@ Run date: 2026-09-29, macOS 26 on an Apple M3 Max, APFS backing store.
 
 The macOS NFS loopback is viable as the mount mechanism, with three conditions.
 The unprivileged mount, `mmap`, locking, git, and cargo debug and release builds all work.
-Performance is far outside the 1.5x criterion and is not resolved by this spike.
+Clean builds are within 1.5x after fixing the server.
+Incremental rebuilds are 2.6x to 3.8x and probably structural.
 
 Server: a passthrough NFSv3 server built on `nfsserve` 0.11 that mirrors a backing directory.
 Mount: `mount_nfs -o locallocks,vers=3,tcp,rsize=131072,actimeo=120,port=11111,mountport=11111 localhost:/ <dir>`, run as the normal user.
@@ -26,6 +27,10 @@ Mount: `mount_nfs -o locallocks,vers=3,tcp,rsize=131072,actimeo=120,port=11111,m
   Per-file `lstat` on the mount agrees with the backing store for all 644.
 
 ## Conditions
+
+0. **The `nfsserve` library needed four fixes.**
+   LINK support, a lock-contention fix in `TransactionTracker`, a readdir cookie fix, and a path-map fix (see Performance and Bugs).
+   The vendored copy carries them all.
 
 1. **`locallocks` is required.**
    With `nolocks`, every flock and fcntl call fails with `EOPNOTSUPP`, and rustc's incremental compilation aborts because it cannot take its session lock.
@@ -45,24 +50,74 @@ Mount: `mount_nfs -o locallocks,vers=3,tcp,rsize=131072,actimeo=120,port=11111,m
    The spike server hides `._*` entries in readdir, which is a hack.
    A real store needs a deliberate policy: store them as ordinary files, or map them to xattrs.
 
-## Performance is not within the bar
+## Performance
 
-Same crate (about 60 dependencies), clean build, this Mac, n=2 per row:
+### First measurement: 2.5x to 4.3x on clean builds, 9x to 26x on incremental
 
-| Build | Native APFS | NFS loopback | Ratio |
-|---|---|---|---|
-| release, clean | 8.4s, 9.2s | 23.3s, 31.0s | 2.5x to 3.7x |
-| debug, clean | 7.5s, 8.0s | 27.8s, 34.3s | 3.7x to 4.3x |
-| debug, incremental rebuild after a one-line edit | 0.3s, 0.3s | 7.7s, 2.8s | 9x to 26x |
+Same crate (about 60 dependencies), this Mac, n=2 per row, naive passthrough server.
+This first result showed the criterion was missed and did not say why.
 
-The success criterion is within 1.5x.
-This spike does not meet it, and does not show where the time goes.
-The server is a naive passthrough: a global path-map mutex, synchronous `std::fs` calls on the async runtime, no readdir batching, and a full re-sort of every directory on each readdir page.
-So the numbers are an upper bound on loopback overhead for this server, not a floor for NFS in general.
-Spike #3 needs to profile before any conclusion about NFS versus FUSE-T.
-The n=2 spread in the incremental row (7.7s vs 2.8s) is large, and variance was not characterised.
+### Where the time went (Opus profiling pass, original server)
+
+- One clean debug build: about 39,000 NFS operations, 28.5s of summed server latency inside 23.4s of wall time.
+  The client keeps only 1.5 to 2 requests in flight.
+- A 10s `sample` of the server showed about 94% of samples waiting on one lock inside `nfsserve`'s `TransactionTracker`.
+  On every request it scanned its whole retransmission map (60s of entries) while holding a global mutex, so cost grew with the square of the operation count.
+- The second contention point was our path map.
+  Renaming any file rescanned the whole map, which never shrinks.
+- Server CPU during the build was 21.5s, against 16.3s user and 5.4s sys for cargo.
+
+### After fixing the server
+
+Ratio is NFS time divided by native time, median and range, paired per run and interleaved.
+The machine was not idle: load average was 17 to 100 (CI runners and other rustc builds), and native debug clean itself moved between 5.5s and 11s.
+Treat spreads as wide.
+
+| Variant | n | Debug clean | Release clean | One-line-edit rebuild |
+|---|---|---|---|---|
+| Original server | 3 | 5.41 [1.89-7.62] | 3.44 [3.03-5.23] | 19.5 [13.2-29.4] |
+| Tracker fix | 3 | 1.05 [0.93-1.37] | 1.18 [1.08-1.36] | 3.09 [2.27-3.10] |
+| Final tree, one server for 4 runs | 4 | 1.07 [0.95-1.31] | 0.98 [0.92-1.09] | 3.79 [2.56-7.34] |
+| Final tree without the rename fast path, 4 runs | 4 | 1.58 [1.26-1.81] | 1.44 [1.35-1.66] | 2.80 [2.16-3.19] |
+
+- Clean builds are now about native speed, so most of the first gap was a library bug and not the NFS protocol.
+- The last row shows the path map growing: NFS times rose run over run (release 12.8s to 15.0s) without the rename fast path.
+- Mount options `rsize/wsize=1 MiB` and `actimeo=3600` did not beat the baseline mount beyond noise (n=3).
+- `nordirplus` was not tested because plain READDIR in `nfsserve` ignored the page cookie.
+
+### Incremental rebuild is still 2.6x to 3.8x, and probably structural
+
+A one-line-edit rebuild is 13,000 to 26,000 operations, mostly LOOKUP.
+A lookup of a missing file cost 45 to 69 microseconds over the loopback against about 3 microseconds native (n=3 by 3,000).
+The server's share is about 10 to 20 microseconds.
+The rest is the macOS NFS client, TCP loopback and RPC.
+About 20,000 operations at 50 microseconds with 1.8 in flight gives about 0.55s, which matches the observed gap of about 0.6s.
+This is the agent's inference from one microbenchmark.
+It is not a proven root cause, and I have not verified it independently.
+If it holds, the incremental case cannot reach 1.5x by server tuning alone, and this is the workload agents hit most.
+The seeded-build measurement (spike #3 scope) tests exactly this case.
+
+### Still open
+
+- readdir re-reads and re-sorts the whole directory per page: 23 to 71 ms per page on a 10,000 to 15,000 entry `deps/`.
+- The path map never shrinks, and directory rename still scans all of it.
+- A real cowfs backend adds hashing, zstd and a redb lookup per operation.
+  That is reasoning only, not measured.
+  It mostly lands on read, write and create, but any per-lookup redb transaction adds directly to the incremental cost.
 
 ## Bugs found on the way
+
+- **`nfsserve` readdir cookie bug (correctness).**
+  The library used the inode number as the page cookie, and the server resumed a listing at the first entry with that inode.
+  Hardlinks to one file in the same directory share an inode, so a page boundary on such an entry restarted the listing from the wrong place.
+  rustc incremental builds create exactly this pattern in `deps/`.
+  Effect: duplicates and errors on listing, `rm -rf target` failing, and later builds failing with "can't find crate".
+  The Opus agent reported 6 of 6 reproductions.
+  I confirmed it independently with `test_hardlink_readdir.py` (4,000 adjacent hardlink pairs).
+  Old server: run 1 listed 8062 of 8000 entries with 8000 unique and `rmtree` failed, and runs 2 to 4 hung on the corrupted leftover directory.
+  Fixed server: 3 of 3 pass with 8000 of 8000 unique and clean removal.
+  My first, smaller version of the test (600 files, 200 links, non-adjacent) also passed against the old server, so it proved nothing.
+  I strengthened it before recording this result.
 
 - Rename fix-up in the path map appended a trailing slash when the renamed entry was the path itself.
   This made `write` fail with `ENOTDIR` and left zero-length files.
@@ -77,7 +132,8 @@ The n=2 spread in the incremental row (7.7s vs 2.8s) is large, and variance was 
 ## Not tested
 
 - `pjdfstest`, `fsx`, `xfstests`: not run.
-- Server-side LINK tracing: not enabled, so there is no log of the LINK calls themselves.
+- All timing was taken on a heavily loaded machine (load 17 to 100), n=3 to 4.
+- The tracker fix was not A/B tested alone under matched load.
 - Unlink of the original name followed by access through an already-open or cached filehandle to a remaining link.
   The server keeps the id-to-path entry for the first name, so a stale handle may fail.
 - Whether the macOS client rejects `link()` on a directory before it reaches the server (the result was `EPERM`).
