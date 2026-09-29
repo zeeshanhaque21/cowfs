@@ -9,7 +9,8 @@ Run date: 2026-09-29, macOS 26 on an Apple M3 Max, APFS backing store.
 The macOS NFS loopback is viable as the mount mechanism, with three conditions.
 The unprivileged mount, `mmap`, locking, git, and cargo debug and release builds all work.
 Clean builds are within 1.5x after fixing the server.
-Incremental rebuilds are 2.6x to 3.8x and probably structural.
+Warm and incremental builds are 2.5x to 3.5x and probably structural.
+`git status` and clean builds are within 1.5x on the tuned server.
 
 Server: a passthrough NFSv3 server built on `nfsserve` 0.11 that mirrors a backing directory.
 Mount: `mount_nfs -o locallocks,vers=3,tcp,rsize=131072,actimeo=120,port=11111,mountport=11111 localhost:/ <dir>`, run as the normal user.
@@ -97,6 +98,49 @@ It is not a proven root cause, and I have not verified it independently.
 If it holds, the incremental case cannot reach 1.5x by server tuning alone, and this is the workload agents hit most.
 The seeded-build measurement (spike #3 scope) tests exactly this case.
 
+### Seeded builds (warm base), tuned server, default cargo profile
+
+Seeded means the tree already holds a fully built `target/`, as in the design's mode (b).
+Tuned-server ratios are NFS divided by native, from two replicates that agreed within about 5%.
+Machine load was 6 to 13, 0 contaminated runs of 164 and 134.
+Baseline ratios come from the old server on a different cargo profile (`split-debuginfo=off`), because the default profile could not run there.
+They are an approximate comparison only.
+
+| Workload | Old server | Tuned server | Native s | NFS s (tuned) |
+|---|---|---|---|---|
+| Copy to a new path, no-op build | 3.7x | 2.6x | 0.045 | 0.118 |
+| Copy to a new path, one-line edit | 9.0x | 2.6x to 3.2x | 0.305 | 0.8 to 0.96 |
+| Test-compile after an edit (n=3) | 5.6x | 2.9x to 3.4x | 0.156 | 0.47 to 0.53 |
+| Test-compile warm (n=3) | 8.5x | 2.9x to 3.0x | 0.043 | 0.126 |
+| Build in place after a clean build: no-op | 39x | 3.4x | 0.044 | 0.152 |
+| Build in place after a clean build: one-line edit | 55x | 3.1x to 3.2x | 0.306 | 0.94 |
+| Clean build in place (n=3) | 4.2x | 0.91x to 0.93x | 5.3 | 4.8 |
+| `git status`, small tree, warm | 2.8x | 1.3x to 1.4x | 0.010 | 0.014 |
+| `git status`, 24k-file Node tree, warm | 1.85x | 1.31x | 0.013 | 0.017 |
+| `git status --ignored`, same tree | 2.7x | 1.7x to 1.8x | 0.093 | 0.167 |
+| Seeding by `rsync -aH` of the small crate (n=3) | 41x | 4.2x | 0.455 | 1.93 |
+
+Findings:
+
+- **Clean builds and warm `git status` are within 1.5x** on the tuned server.
+  `git status` on a large tree at 1.31x meets the second half of success criterion 2 for this tree, but that tree has only 599 tracked files and ignores `node_modules`, so plain status walks little.
+  The `--ignored` variant walks about 23,000 files and misses at 1.7x to 1.8x.
+- **Every warm or incremental build cell misses the bar at 2.5x to 3.5x.**
+  These are small absolute costs on this small crate: 70 to 650 ms per operation, which is consistent with the per-operation latency floor described above.
+  It has not been tested on a large workspace, where the number of operations scales with the code base.
+- **Copying a warm base to a different absolute path stayed Fresh.**
+  A build after copying `target/` to a new path compiled 0 crates and reported 34 Fresh, on both native and NFS, in 3 of 3 first builds per side (default profile) plus one `-v` check.
+  Mtimes were preserved and cargo rewrote `target/debug/dedup-corpus.d` to the new path.
+  This is one 60-dependency crate with no path dependencies outside the crate.
+  It does not show that byte-identical artifacts survive at different paths, which is spike #6.
+  `--remap-path-prefix` was not needed and was not tested.
+- **Server slowdown over time is gone.** No-op build on NFS, n=5 each, one server: 0.140s fresh, 0.138s after 3 clean builds, 0.151s after 6.
+  The old server went from 0.245s to 0.622s after two clean builds, and reached 2.4s at 57 minutes old.
+  Server resident memory still grows: 25 MB, 76 MB, then 134 MB across those phases.
+  The cause is not diagnosed and no soak longer than about a minute was run.
+- **Hardlinked `target/` copies survive.**
+  `rsync -aH` of a 4,317-entry `deps/` directory (4,186 hardlinked) exited 0, listed all 4,317 entries after a server restart, and the 6-edit default-profile probe passed with 1,127 hardlinked files in the backing store.
+
 ### Still open
 
 - readdir re-reads and re-sorts the whole directory per page: 23 to 71 ms per page on a 10,000 to 15,000 entry `deps/`.
@@ -128,6 +172,14 @@ The seeded-build measurement (spike #3 scope) tests exactly this case.
   Attributes returned inside readdir replies carry a stale `nlink`.
   Tools that read `nlink` through readdir attributes will undercount until the file is stat-ed.
   I did not check whether `actimeo` or readdirplus settings change this.
+
+- **`nfsserve` follows symlinks on SETATTR.**
+  `src/main.rs` calls `fs::metadata` (line 134) and `filetime::set_file_times` (line 137), both of which follow symlinks.
+  Setting times on a dangling symlink fails with ENOENT, which is why `rsync` of a Node tree onto the mount exited 23 on `node_modules/.bin`.
+  On a valid symlink the target's mtime is changed and the link's own mtime is not, which can silently disturb cargo's mtime-based fingerprints.
+  Proposed fix (not applied): `fs::symlink_metadata` and `filetime::set_symlink_file_times`.
+  The `chmod` path (`fs::set_permissions`) also follows symlinks and was not tested.
+  This was verified in code and by the agent's test on the mount, and not re-run by me.
 
 ## Not tested
 
