@@ -1,0 +1,45 @@
+{
+  "loop": "gauntlet: a builder and a separate critic with fresh context per piece. The critic runs ours next to native, names the biggest gap, and the piece loops until the critic picks ours.",
+  "bar": "native APFS (this Mac) and ext4 (moonscape): cargo build and git status within 1.5x, pjdfstest + fsx + xfstests-generic no worse than native, zero data loss in crash-injection.",
+  "phases": [
+    {
+      "name": "Spikes (gate v1)",
+      "items": [
+        {"id": "1", "title": "#1 dedup ratio on the real worktree corpus", "state": "running", "owner": "lead", "live": "spike1", "issue": 1,
+         "detail": "Tool built and validated against an independent Python check (files, raw bytes, whole-file dedup all match). 3-slot lumen sample: 7.95x with CDC + zstd. Hardlinks are within-slot only, all in target/, so each inode is counted once. Full run in progress."},
+        {"id": "2", "title": "#2 mmap and file locking over the macOS NFS loopback", "state": "pending", "issue": 2},
+        {"id": "3", "title": "#3 build and git status overhead versus native", "state": "pending", "issue": 3},
+        {"id": "4", "title": "#4 .git inside the filesystem", "state": "pending", "issue": 4},
+        {"id": "5", "title": "#5 treehouse process detection on the mount", "state": "pending", "issue": 5},
+        {"id": "6", "title": "#6 artifact byte-identity across slots at different paths", "state": "pending", "issue": 6}
+      ]
+    },
+    {
+      "name": "v1 build",
+      "items": [
+        {"id": "7", "title": "#7 chunking, hashing and block store", "state": "blocked", "issue": 7},
+        {"id": "8", "title": "#8 Merkle tree and O(1) writable snapshots", "state": "blocked", "issue": 8},
+        {"id": "9", "title": "#9 redb metadata store with crash consistency", "state": "blocked", "issue": 9},
+        {"id": "10", "title": "#10 garbage collection", "state": "blocked", "issue": 10},
+        {"id": "11", "title": "#11 Linux FUSE mount", "state": "blocked", "issue": 11},
+        {"id": "12", "title": "#12 macOS NFS loopback mount", "state": "blocked", "issue": 12},
+        {"id": "13", "title": "#13 CLI and Unix-socket control API", "state": "blocked", "issue": 13},
+        {"id": "14", "title": "#14 cowfs import (non-destructive migration)", "state": "blocked", "issue": 14},
+        {"id": "15", "title": "#15 treehouse mode (a) transparent", "state": "blocked", "issue": 15},
+        {"id": "16", "title": "#16 treehouse mode (b) snapshot-native slots and warm base", "state": "blocked", "issue": 16},
+        {"id": "17", "title": "#17 Linux mount namespaces for canonical paths", "state": "blocked", "issue": 17}
+      ]
+    },
+    {
+      "name": "Gauntlet gates vs native",
+      "items": [
+        {"id": "g1", "title": "cargo build within 1.5x of native (APFS and ext4)", "state": "pending"},
+        {"id": "g2", "title": "git status on a large tree within 1.5x of native", "state": "pending"},
+        {"id": "g3", "title": "pjdfstest no worse than native", "state": "pending"},
+        {"id": "g4", "title": "fsx no worse than native", "state": "pending"},
+        {"id": "g5", "title": "xfstests-generic no worse than native", "state": "pending"},
+        {"id": "g6", "title": "crash-injection: zero data loss, no torn tree", "state": "pending"}
+      ]
+    }
+  ]
+}

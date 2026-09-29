@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cowfs build train</title>
+<style>
+  body { font: 15px/1.4 -apple-system, system-ui, sans-serif; margin: 0; padding: 12px; background: #111; color: #eee; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .meta { color: #999; font-size: 12px; margin-bottom: 12px; }
+  .bar { background: #1c1c1c; padding: 8px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }
+  h2 { font-size: 16px; margin: 18px 0 6px; display: inline; }
+  .item { background: #1c1c1c; border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+  .item > summary { display: flex; gap: 8px; align-items: center; cursor: pointer; list-style: none; }
+  .item > summary::-webkit-details-marker { display: none; }
+  .item > summary::before { content: "▸"; color: #888; flex: none; width: 10px; }
+  .item[open] > summary::before { content: "▾"; }
+  .body { margin: 4px 0 0 46px; }
+  input[type=checkbox] { width: 20px; height: 20px; margin: 0; flex: none; }
+  .title { font-weight: 600; }
+  .state { font-size: 12px; padding: 1px 6px; border-radius: 8px; margin-left: 4px; white-space: nowrap; }
+  .reviewing, .running, .building { background: #2a4a7a; } .repairing, .fixing { background: #5a4a1a; }
+  .waiting, .merging { background: #2a5a5a; } .ready, .pending { background: #444; }
+  .done { background: #2a6a3a; } .failed, .blocked { background: #5a2a2a; }
+  .owner { font-size: 11px; color: #aaa; border: 1px solid #444; border-radius: 8px; padding: 0 6px; white-space: nowrap; }
+  .ci { font-size: 12px; color: #9ab; margin-left: auto; white-space: nowrap; }
+  .ctl { font-size: 12px; margin-bottom: 8px; } .ctl button { background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 8px; margin-right: 6px; }
+  .detail { font-size: 13px; color: #ccc; margin-top: 4px; white-space: pre-wrap; }
+  .detail a, .item a { color: #8bf; }
+  .track { height: 8px; background: #2a2a2a; border-radius: 4px; margin-top: 8px; overflow: hidden; }
+  .fill { height: 100%; background: #3b82f6; transition: width .6s; }
+  .fill.done { background: #2a9a4a; }
+  .count { color: #999; font-weight: normal; font-size: 13px; }
+  details.phase { margin-top: 12px; }
+  details.phase > summary { cursor: pointer; list-style: none; }
+  details.phase > summary::-webkit-details-marker { display: none; }
+</style>
+</head>
+<body>
+<h1>cowfs build train</h1>
+<div class="meta" id="meta">loading…</div>
+<div class="bar" id="loop"></div>
+<div class="ctl"><button onclick="setAll(true)">Expand all</button><button onclick="setAll(false)">Collapse all</button></div>
+<div id="phases"></div>
+<script>
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+const opened = new Set(JSON.parse(localStorage.getItem("cowfsOpen") || "[]"));
+const shut = new Set(JSON.parse(localStorage.getItem("cowfsShut") || "[]"));
+function save() {
+  localStorage.setItem("cowfsOpen", JSON.stringify([...opened]));
+  localStorage.setItem("cowfsShut", JSON.stringify([...shut]));
+}
+function toggled(el) {
+  const id = el.dataset.id;
+  if (el.open) { opened.add(id); shut.delete(id); } else { opened.delete(id); shut.add(id); }
+  save();
+}
+function setAll(open) { document.querySelectorAll("details.item").forEach(d => { d.open = open; toggled(d); }); }
+async function load() {
+  try {
+    const r = await fetch("status.json?t=" + Date.now(), { cache: "no-store" });
+    const s = await r.json();
+    document.getElementById("meta").textContent =
+      `${s.totals.closed}/${s.totals.slices} items closed · plan ${s.updated} · refreshed ${new Date().toLocaleTimeString()}`;
+    document.getElementById("loop").innerHTML = `<b>Loop:</b> ${esc(s.loop)}<br><b>Bar:</b> ${esc(s.bar)}`;
+    document.getElementById("phases").innerHTML = s.phases.map(p => {
+      const d = p.items.filter(i => i.done).length;
+      const pid = "phase:" + p.name;
+      const tiles = p.items.map(i => {
+        const id = String(i.id ?? i.title);
+        const slug = String(i.state ?? "").trim().toLowerCase().replace(/\s+/g, "-");
+        const isOpen = opened.has(id) || (slug === "running" && !shut.has(id));
+        const links = [i.issue_url ? `<a href="${esc(i.issue_url)}">issue</a>` : "",
+                       i.pr_url ? `<a href="${esc(i.pr_url)}">PR ${esc(i.pr)}</a>` : ""].filter(Boolean).join(" · ");
+        const bar = typeof i.progress === "number"
+          ? `<div class="track"><div class="fill ${i.done ? "done" : ""}" style="width:${Math.round(i.progress * 100)}%"></div></div>` : "";
+        return `
+        <details class="item" data-id="${esc(id)}" ${isOpen ? "open" : ""} ontoggle="toggled(this)">
+          <summary><input type="checkbox" disabled ${i.done ? "checked" : ""}>
+          <span class="title">${esc(i.title)}</span><span class="state ${esc(slug)}">${esc(i.state)}</span>
+          ${i.owner ? `<span class="owner">${esc(i.owner)}</span>` : ""}
+          ${i.ci ? `<span class="ci">${esc(i.ci)}</span>` : ""}</summary>
+          <div class="body">
+          ${links ? `<div class="detail">${links}</div>` : ""}
+          ${i.detail ? `<div class="detail">${esc(i.detail)}</div>` : ""}
+          ${i.numbers ? `<div class="detail"><b>numbers:</b> ${esc(i.numbers)}</div>` : ""}
+          ${i.verdict ? `<div class="detail"><b>critic:</b> ${esc(i.verdict)}</div>` : ""}
+          ${bar}
+          </div></details>`;
+      }).join("");
+      return `<details class="phase" data-id="${esc(pid)}" open>
+              <summary><h2>${esc(p.name)} <span class="count">${d}/${p.items.length}</span></h2></summary>${tiles}</details>`;
+    }).join("");
+  } catch (e) {
+    document.getElementById("meta").textContent = "status.json unreadable: " + e;
+  }
+}
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>
