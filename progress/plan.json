@@ -41,10 +41,10 @@
         {
           "id": "5",
           "title": "#5 treehouse process detection on the mount",
-          "state": "running",
+          "state": "done",
           "issue": 5,
-          "owner": "subagent",
-          "detail": "Reads treehouse return's detection mechanism, then tests it on a sandbox pool on the mount. Never touches ~/.treehouse (checksummed before and after). Running."
+          "owner": "lead",
+          "detail": "cwd-only detection works on the mount for every detectable case. Gap: a process holding an open fd or flock after chdir out is not detected, and on the mount the reset leaves a .nfs silly-rename file and a dirty slot while return exits 0 (#20). lsof and cwd lookup fine. Real pools untouched. docs/spikes/5-treehouse-process-detection.md"
         },
         {
           "id": "6",
@@ -68,6 +68,13 @@
           "state": "ready",
           "issue": 19,
           "detail": "LINK, tracker lock, readdir cookie (fixed in vendored copy); open: symlink SETATTR, AppleDouble policy, stale nlink in readdir, memory growth, readdir sort, path map."
+        },
+        {
+          "id": "20",
+          "title": "#20 v1: open-fd holders not detected, .nfs dirt on the mount",
+          "state": "ready",
+          "issue": 20,
+          "detail": "Propose upstream fd detection to treehouse, add a cowfs control-API process list, decide how .nfs entries are handled."
         }
       ]
     },

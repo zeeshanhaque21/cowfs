@@ -3,7 +3,7 @@
 import os, subprocess, sys, time
 
 S = os.path.abspath(os.path.join(os.path.dirname(__file__), "../out/seeded"))
-BIN, BACK, MNT, PIDF = f"{S}/nfs-loopback-bin", f"{S}/backing", f"{S}/mnt", f"{S}/server.pid"
+BIN, BACK, MNT, PIDF = os.environ.get("SRV_BIN", f"{S}/nfs-loopback-bin"), f"{S}/backing", f"{S}/mnt", f"{S}/server.pid"
 
 
 def mounted():
@@ -31,7 +31,7 @@ def stop():
     assert not mounted(), "still mounted"
     pid = open(PIDF).read().strip()
     cmd = subprocess.run(["ps", "-p", pid, "-o", "command="], capture_output=True, text=True).stdout
-    if f"{S}/nfs-loopback-bin" in cmd:
+    if BIN in cmd:
         os.kill(int(pid), 15)
         print("killed", pid)
     else:

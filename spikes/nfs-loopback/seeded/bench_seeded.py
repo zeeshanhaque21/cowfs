@@ -14,7 +14,7 @@ BACK = f"{S}/backing"
 SEED = f"{S}/native-seed"
 CTX_SRC = "/Users/zeeshanhaque/Projects/context-mode/"
 NAMES = {"cargo", "rustc", "cc", "clang", "ld"}
-RUNS = f"{S}/runs.jsonl"
+RUNS = os.environ.get("RUNS_FILE", f"{S}/runs.jsonl")
 ME = os.getpid()
 CONTAM = {"n": 0}
 if os.environ.get("BENCH_SDI_OFF"):
@@ -303,6 +303,23 @@ def stage_age():
         rmtree(f"{tree('nfs')}/target")
         subprocess.run(["cargo", "build", "--frozen"], cwd=tree("nfs"), capture_output=True)
     w1("AfterTwoCleanBuildsChurn")
+
+
+def stage_aging():
+    tree = lambda side: f"{ROOT[side]}/ageT"
+    for side in ROOT:
+        rmtree(tree(side))
+        subprocess.run(rsync_seed(tree(side)), check=True)
+    def w1(pfx):
+        def f(side, i):
+            run(f"{pfx}_W1_noop_build", side, ["cargo", "build", "--frozen"], tree(side), i)
+        interleave(5, f)
+    w1("Aging0")
+    for phase in ("After3Clean", "After6Clean"):
+        for k in range(3):
+            rmtree(f"{tree('nfs')}/target")
+            subprocess.run(["cargo", "build", "--frozen"], cwd=tree("nfs"), capture_output=True)
+        w1(f"Aging{phase}")
 
 
 def stage_git():
