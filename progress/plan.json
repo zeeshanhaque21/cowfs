@@ -5,41 +5,178 @@
     {
       "name": "Spikes (gate v1)",
       "items": [
-        {"id": "1", "title": "#1 dedup ratio on the real worktree corpus", "state": "running", "owner": "lead", "live": "spike1", "issue": 1,
-         "detail": "Full run on 45 slots, 843,889 files, 273.43 GiB raw, 0 errors. Raw 1.00x, per-file zstd 3.60x, whole-file dedup 3.12x, CDC only 5.08x, CDC + zstd 14.04x. A median extra lumen slot costs 0.47 GiB compressed (4.9% of raw). Caveat: 97.5% of raw is cargo target/ and 91.7% is one repo, so 14x is a Rust build-output result. Write-up: docs/spikes/1-dedup-corpus.md. Gate met."},
-        {"id": "2", "title": "#2 mmap and file locking over the macOS NFS loopback", "state": "building", "owner": "subagent", "issue": 2,
-         "detail": "Passthrough NFSv3 server on nfsserve 0.11 mounts WITHOUT sudo. With -o locallocks: mmap (shared, private, grow), flock, fcntl, git init/add/commit/status/gc/fsck, and a ~60-crate cargo build (native 8.4-9.2s, NFS 23-31s, n=2) all work. 23/24 checks pass; hardlinks fail because nfsserve lacks NFSv3 LINK. A subagent is patching a vendored copy. Bugs found on the way: rename path fix-up produced a trailing slash (mine, fixed), and macOS writes ._ AppleDouble sidecars for xattrs (unresolved)."},
-        {"id": "3", "title": "#3 build and git status overhead versus native", "state": "pending", "issue": 3},
-        {"id": "4", "title": "#4 .git inside the filesystem", "state": "pending", "issue": 4},
-        {"id": "5", "title": "#5 treehouse process detection on the mount", "state": "pending", "issue": 5},
-        {"id": "6", "title": "#6 artifact byte-identity across slots at different paths", "state": "pending", "issue": 6}
+        {
+          "id": "1",
+          "title": "#1 dedup ratio on the real worktree corpus",
+          "state": "done",
+          "owner": "lead",
+          "live": "spike1",
+          "issue": 1,
+          "detail": "Full run on 45 slots, 843,889 files, 273.43 GiB raw, 0 errors. Raw 1.00x, per-file zstd 3.60x, whole-file dedup 3.12x, CDC only 5.08x, CDC + zstd 14.04x. A median extra lumen slot costs 0.47 GiB compressed (4.9% of raw). Caveat: 97.5% of raw is cargo target/ and 91.7% is one repo, so 14x is a Rust build-output result. Write-up: docs/spikes/1-dedup-corpus.md. Gate met."
+        },
+        {
+          "id": "2",
+          "title": "#2 mmap and file locking over the macOS NFS loopback",
+          "state": "done",
+          "owner": "lead",
+          "issue": 2,
+          "detail": "Viable without sudo (-o locallocks). 24/24 checks. Tuned server: clean builds 0.9x-1.2x native, git status 1.3x-1.4x, warm and incremental builds 2.5x-3.5x (misses 1.5x, see #18). Old server was 3-5x clean and 9-55x warm because of nfsserve bugs (LINK, tracker lock, readdir cookie), fixed in the vendored copy (#19). One 60-dep crate, passthrough server, n=3-5. Write-up: docs/spikes/2-nfs-loopback.md."
+        },
+        {
+          "id": "3",
+          "title": "#3 build and git status overhead versus native",
+          "state": "running",
+          "issue": 3,
+          "owner": "subagent",
+          "detail": "macOS NFS half done (see #2). Linux FUSE on moonscape vs native ext4 running now."
+        },
+        {
+          "id": "4",
+          "title": "#4 .git inside the filesystem",
+          "state": "running",
+          "issue": 4,
+          "owner": "subagent",
+          "detail": "Git workloads with .git on the mount vs native vs a native .git overlay, plus the worktree pattern. Running."
+        },
+        {
+          "id": "5",
+          "title": "#5 treehouse process detection on the mount",
+          "state": "running",
+          "issue": 5,
+          "owner": "subagent",
+          "detail": "Reads treehouse return's detection mechanism, then tests it on a sandbox pool on the mount. Never touches ~/.treehouse (checksummed before and after). Running."
+        },
+        {
+          "id": "6",
+          "title": "#6 artifact byte-identity across slots at different paths",
+          "state": "running",
+          "issue": 6,
+          "owner": "subagent",
+          "detail": "Native builds at different absolute paths, with and without path remapping, dedup measured with the spike 1 tool. Partial prior evidence: a copied warm base at a new path was Fresh (#2). Running."
+        },
+        {
+          "id": "18",
+          "title": "#18 decision: warm and incremental builds 2.5x-3.5x over NFS loopback",
+          "state": "waiting",
+          "issue": 18,
+          "owner": "zee",
+          "detail": "Needs a decision: cut client round trips, evaluate FUSE-T, or reframe criterion 2 for warm builds. FUSE-T is not installed and needs admin to install."
+        },
+        {
+          "id": "19",
+          "title": "#19 v1 server requirements and nfsserve fixes",
+          "state": "ready",
+          "issue": 19,
+          "detail": "LINK, tracker lock, readdir cookie (fixed in vendored copy); open: symlink SETATTR, AppleDouble policy, stale nlink in readdir, memory growth, readdir sort, path map."
+        }
       ]
     },
     {
       "name": "v1 build",
       "items": [
-        {"id": "7", "title": "#7 chunking, hashing and block store", "state": "blocked", "issue": 7},
-        {"id": "8", "title": "#8 Merkle tree and O(1) writable snapshots", "state": "blocked", "issue": 8},
-        {"id": "9", "title": "#9 redb metadata store with crash consistency", "state": "blocked", "issue": 9},
-        {"id": "10", "title": "#10 garbage collection", "state": "blocked", "issue": 10},
-        {"id": "11", "title": "#11 Linux FUSE mount", "state": "blocked", "issue": 11},
-        {"id": "12", "title": "#12 macOS NFS loopback mount", "state": "blocked", "issue": 12},
-        {"id": "13", "title": "#13 CLI and Unix-socket control API", "state": "blocked", "issue": 13},
-        {"id": "14", "title": "#14 cowfs import (non-destructive migration)", "state": "blocked", "issue": 14},
-        {"id": "15", "title": "#15 treehouse mode (a) transparent", "state": "blocked", "issue": 15},
-        {"id": "16", "title": "#16 treehouse mode (b) snapshot-native slots and warm base", "state": "blocked", "issue": 16},
-        {"id": "17", "title": "#17 Linux mount namespaces for canonical paths", "state": "blocked", "issue": 17}
+        {
+          "id": "7",
+          "title": "#7 chunking, hashing and block store",
+          "state": "blocked",
+          "issue": 7
+        },
+        {
+          "id": "8",
+          "title": "#8 Merkle tree and O(1) writable snapshots",
+          "state": "blocked",
+          "issue": 8
+        },
+        {
+          "id": "9",
+          "title": "#9 redb metadata store with crash consistency",
+          "state": "blocked",
+          "issue": 9
+        },
+        {
+          "id": "10",
+          "title": "#10 garbage collection",
+          "state": "blocked",
+          "issue": 10
+        },
+        {
+          "id": "11",
+          "title": "#11 Linux FUSE mount",
+          "state": "blocked",
+          "issue": 11
+        },
+        {
+          "id": "12",
+          "title": "#12 macOS NFS loopback mount",
+          "state": "blocked",
+          "issue": 12
+        },
+        {
+          "id": "13",
+          "title": "#13 CLI and Unix-socket control API",
+          "state": "blocked",
+          "issue": 13
+        },
+        {
+          "id": "14",
+          "title": "#14 cowfs import (non-destructive migration)",
+          "state": "blocked",
+          "issue": 14
+        },
+        {
+          "id": "15",
+          "title": "#15 treehouse mode (a) transparent",
+          "state": "blocked",
+          "issue": 15
+        },
+        {
+          "id": "16",
+          "title": "#16 treehouse mode (b) snapshot-native slots and warm base",
+          "state": "blocked",
+          "issue": 16
+        },
+        {
+          "id": "17",
+          "title": "#17 Linux mount namespaces for canonical paths",
+          "state": "blocked",
+          "issue": 17
+        }
       ]
     },
     {
       "name": "Gauntlet gates vs native",
       "items": [
-        {"id": "g1", "title": "cargo build within 1.5x of native (APFS and ext4)", "state": "pending"},
-        {"id": "g2", "title": "git status on a large tree within 1.5x of native", "state": "pending"},
-        {"id": "g3", "title": "pjdfstest no worse than native", "state": "pending"},
-        {"id": "g4", "title": "fsx no worse than native", "state": "pending"},
-        {"id": "g5", "title": "xfstests-generic no worse than native", "state": "pending"},
-        {"id": "g6", "title": "crash-injection: zero data loss, no torn tree", "state": "pending"}
+        {
+          "id": "g1",
+          "title": "cargo build within 1.5x of native (APFS and ext4)",
+          "state": "waiting",
+          "detail": "Clean builds within 1.5x on macOS NFS (0.9x-1.2x). Warm and incremental 2.5x-3.5x, see #18. Linux and real backend not measured."
+        },
+        {
+          "id": "g2",
+          "title": "git status on a large tree within 1.5x of native",
+          "state": "waiting",
+          "detail": "Plain git status 1.3x-1.4x on macOS NFS. git status --ignored 1.7x-1.8x. Large tracked tree not measured yet."
+        },
+        {
+          "id": "g3",
+          "title": "pjdfstest no worse than native",
+          "state": "pending"
+        },
+        {
+          "id": "g4",
+          "title": "fsx no worse than native",
+          "state": "pending"
+        },
+        {
+          "id": "g5",
+          "title": "xfstests-generic no worse than native",
+          "state": "pending"
+        },
+        {
+          "id": "g6",
+          "title": "crash-injection: zero data loss, no torn tree",
+          "state": "pending"
+        }
       ]
     }
   ]
