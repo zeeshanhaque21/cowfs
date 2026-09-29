@@ -6,7 +6,7 @@
       "name": "Spikes (gate v1)",
       "items": [
         {"id": "1", "title": "#1 dedup ratio on the real worktree corpus", "state": "running", "owner": "lead", "live": "spike1", "issue": 1,
-         "detail": "Tool built and validated against an independent Python check (files, raw bytes, whole-file dedup all match). 3-slot lumen sample: 7.95x with CDC + zstd. Hardlinks are within-slot only, all in target/, so each inode is counted once. Full run in progress."},
+         "detail": "Full run on 45 slots, 843,889 files, 273.43 GiB raw, 0 errors. Raw 1.00x, per-file zstd 3.60x, whole-file dedup 3.12x, CDC only 5.08x, CDC + zstd 14.04x. A median extra lumen slot costs 0.47 GiB compressed (4.9% of raw). Caveat: 97.5% of raw is cargo target/ and 91.7% is one repo, so 14x is a Rust build-output result. Write-up: docs/spikes/1-dedup-corpus.md. Gate met."},
         {"id": "2", "title": "#2 mmap and file locking over the macOS NFS loopback", "state": "pending", "issue": 2},
         {"id": "3", "title": "#3 build and git status overhead versus native", "state": "pending", "issue": 3},
         {"id": "4", "title": "#4 .git inside the filesystem", "state": "pending", "issue": 4},
