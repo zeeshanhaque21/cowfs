@@ -846,3 +846,64 @@ fn rpcs_per_operation_by_appledouble_mode() {
         m.finish();
     }
 }
+
+/// Mixed metadata workload for `COWFS_SOAK_SECS` seconds (default 600), printing the resident
+/// memory of this process (server, file system and test) every minute:
+/// `COWFS_SOAK_SECS=600 cargo test -p cowfs-nfs --release --test mount -- --ignored --nocapture rss_soak`
+#[test]
+#[ignore = "10 minute soak; run by hand"]
+fn rss_soak() {
+    let secs: u64 = std::env::var("COWFS_SOAK_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let vfs = common::counting::CountingVfs::new();
+    let Some(m) = mounted_vfs(vfs.clone(), MountOptions::default()) else {
+        return;
+    };
+    let root = m.path().to_path_buf();
+    let start = Instant::now();
+    let mut next_sample = Duration::ZERO;
+    let mut i: u64 = 0;
+    let mut samples = Vec::new();
+    while start.elapsed() < Duration::from_secs(secs) {
+        if start.elapsed() >= next_sample {
+            let rss = common::rss_bytes() >> 20;
+            println!(
+                "SOAK t={:>4}s iterations={i:>8} rss={rss} MiB live_inodes={}",
+                start.elapsed().as_secs(),
+                vfs.live()
+            );
+            samples.push(rss);
+            next_sample += Duration::from_secs(60);
+        }
+        fs::write(root.join("tmp"), format!("v{i}")).unwrap();
+        fs::rename(root.join("tmp"), root.join("target")).unwrap();
+        let p = root.join("scratch");
+        fs::write(&p, "x").unwrap();
+        fs::hard_link(&p, root.join("scratch2")).unwrap();
+        fs::remove_file(&p).unwrap();
+        fs::remove_file(root.join("scratch2")).unwrap();
+        fs::create_dir_all(root.join("d/e")).unwrap();
+        fs::write(root.join("d/e/f"), "y").unwrap();
+        fs::rename(root.join("d"), root.join("d2")).unwrap();
+        fs::remove_dir_all(root.join("d2")).unwrap();
+        if i.is_multiple_of(200) {
+            let (ok, out) = sh(&root, "xattr -w user.n 1 target && xattr -d user.n target");
+            assert!(ok, "{out}");
+        }
+        i += 1;
+    }
+    fs::remove_file(root.join("target")).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    println!("SOAK done: {i} iterations, samples (MiB) {samples:?}");
+    assert_eq!(vfs.live(), 0, "inodes left after the soak");
+    assert_eq!(vfs.outstanding(), 0);
+    let first = samples.get(1).copied().unwrap_or(0);
+    let last = samples.last().copied().unwrap_or(0);
+    assert!(
+        last <= first + first / 2 + 20,
+        "RSS kept growing: {samples:?}"
+    );
+    m.finish();
+}
