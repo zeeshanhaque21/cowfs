@@ -4,3 +4,4 @@ target/
 /progress/*.pid
 __pycache__/
 *.pyc
+/progress/serve.log
