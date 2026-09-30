@@ -57,9 +57,8 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use cowfs_vfs::{
-    validate_name, Attr, DirEntry, DirEntryPlus, Error, FileHandle, FileKind, Ino, ReadDir,
-    ReadDirPlus, RenameFlags, Result, SetAttr, SetTime, StatFs, Vfs, XattrFlags, MODE_MASK,
-    NAME_MAX, ROOT_INO,
+    validate_name, Attr, DirEntryPlus, Error, FileHandle, FileKind, Ino, ReadDir, ReadDirPlus,
+    RenameFlags, Result, SetAttr, SetTime, StatFs, Vfs, XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
 };
 
 mod cookies;
@@ -68,7 +67,7 @@ mod sys;
 mod table;
 
 use sys::{TimeSpec, XTarget};
-use table::{io_err, kind_of, open_from, Loc, State};
+use table::{io_err, open_from, Loc, State};
 
 const READ_MAX: u32 = 64 << 20;
 
@@ -113,63 +112,6 @@ impl PathVfs {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// One page with attributes: the listing carries the `fstatat` results, so a page costs one
-    /// `fstatat` per entry and no extra `getattr`.
-    fn readdir_page(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDirPlus> {
-        if max == 0 {
-            return Err(Error::InvalidArgument);
-        }
-        let mut s = self.lock();
-        let open = s.dir_fd(dir)?;
-        let dstamp = sys::fstat(open.file.as_fd()).map_err(io_err)?;
-        let stamp = (
-            dstamp.mtime.0,
-            dstamp.mtime.1,
-            dstamp.ctime.0,
-            dstamp.ctime.1,
-            dstamp.size,
-            dstamp.nlink,
-        );
-        let listing = match s.listing_for(dir, stamp, cookie == 0) {
-            Some(l) => l,
-            None => {
-                let names = sys::list_dir(open.file.as_fd()).map_err(io_err)?;
-                s.node_mut(dir)?.cookies.sync(names)
-            }
-        };
-        let rest = listing[listing.partition_point(|(c, _)| *c <= cookie)..].to_vec();
-        let mut entries = Vec::new();
-        let mut consumed = 0;
-        for (c, name) in &rest {
-            if entries.len() >= max {
-                break;
-            }
-            consumed += 1;
-            let st = match sys::fstatat(open.file.as_fd(), name) {
-                Ok(st) => st,
-                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
-                Err(e) => return Err(io_err(e)),
-            };
-            let Ok(kind) = kind_of(&st) else {
-                continue;
-            };
-            let ino = s.register(dir, &open.file, name, &st)?;
-            let attr = s.attr_of(ino, &st)?;
-            entries.push(DirEntryPlus {
-                entry: DirEntry {
-                    ino,
-                    kind,
-                    name: name.clone(),
-                    cookie: *c,
-                },
-                attr,
-            });
-        }
-        let eof = consumed == rest.len();
-        s.set_listing(dir, listing, stamp);
-        Ok(ReadDirPlus { entries, eof })
     }
 
     fn with_xattr<R>(&self, ino: Ino, f: impl FnOnce(&XTarget<'_>) -> io::Result<R>) -> Result<R> {
@@ -543,15 +485,28 @@ impl Vfs for PathVfs {
     }
 
     fn readdir(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDir> {
-        let page = self.readdir_page(dir, cookie, max)?;
+        if max == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let (entries, eof) = self.lock().readdir_page(dir, cookie, max)?;
         Ok(ReadDir {
-            entries: page.entries.into_iter().map(|e| e.entry).collect(),
-            eof: page.eof,
+            entries: entries.into_iter().map(|(e, _)| e).collect(),
+            eof,
         })
     }
 
     fn readdir_attrs(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDirPlus> {
-        self.readdir_page(dir, cookie, max)
+        if max == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let (entries, eof) = self.lock().readdir_page(dir, cookie, max)?;
+        Ok(ReadDirPlus {
+            entries: entries
+                .into_iter()
+                .map(|(entry, attr)| DirEntryPlus { entry, attr })
+                .collect(),
+            eof,
+        })
     }
 
     fn statfs(&self) -> Result<StatFs> {

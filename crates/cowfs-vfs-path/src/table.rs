@@ -4,7 +4,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 
-use cowfs_vfs::{Attr, Error, FileKind, Ino, Result, Timestamp, MODE_MASK, ROOT_INO};
+use cowfs_vfs::{Attr, DirEntry, Error, FileKind, Ino, Result, Timestamp, MODE_MASK, ROOT_INO};
 
 use crate::cookies::Cookies;
 use crate::sys::{self, Stat};
@@ -159,33 +159,72 @@ impl State {
         }
     }
 
-    /// The cached listing of `dir`, or `None` when it must be read again: either nobody has read
-    /// it, or the directory itself changed since, which is the only signal that a name appeared
-    /// or vanished without `PathVfs` doing it.
-    pub(crate) fn listing_for(
+    /// One page of a directory listing, with attributes.
+    ///
+    /// The directory is read again when the call starts from the beginning or when the directory
+    /// itself changed since the last read, which is the only signal that a name appeared or
+    /// vanished without `PathVfs` doing it. Between the pages of one listing the cached names are
+    /// used as they are, so paging a large directory stays linear.
+    pub(crate) fn readdir_page(
         &mut self,
         dir: Ino,
-        stamp: (i64, u32, i64, u32, u64, u64),
-        restart: bool,
-    ) -> Option<Vec<(u64, Vec<u8>)>> {
-        let n = self.nodes.get(&dir)?;
-        if restart || n.listing.is_none() || n.listing_stamp != Some(stamp) {
-            return None;
+        cookie: u64,
+        max: usize,
+    ) -> Result<(Vec<(DirEntry, Attr)>, bool)> {
+        let open = self.dir_fd(dir)?;
+        let dstamp = sys::fstat(open.file.as_fd()).map_err(io_err)?;
+        let stamp = (
+            dstamp.mtime.0,
+            dstamp.mtime.1,
+            dstamp.ctime.0,
+            dstamp.ctime.1,
+            dstamp.size,
+            dstamp.nlink,
+        );
+        let restart = cookie == 0
+            || self
+                .nodes
+                .get(&dir)
+                .is_none_or(|n| n.listing.is_none() || n.listing_stamp != Some(stamp));
+        let listing = if restart {
+            let names = sys::list_dir(open.file.as_fd()).map_err(io_err)?;
+            self.node_mut(dir)?.cookies.sync(names)
+        } else {
+            self.node_mut(dir)?.listing.take().ok_or(Error::Stale)?
+        };
+        let start = listing.partition_point(|(c, _)| *c <= cookie);
+        let mut entries = Vec::new();
+        let mut consumed = 0;
+        for (c, name) in &listing[start..] {
+            if entries.len() >= max {
+                break;
+            }
+            consumed += 1;
+            let st = match sys::fstatat(open.file.as_fd(), name) {
+                Ok(st) => st,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(e) => return Err(io_err(e)),
+            };
+            let Ok(kind) = kind_of(&st) else {
+                continue;
+            };
+            let ino = self.register(dir, &open.file, name, &st)?;
+            let attr = self.attr_of(ino, &st)?;
+            entries.push((
+                DirEntry {
+                    ino,
+                    kind,
+                    name: name.clone(),
+                    cookie: *c,
+                },
+                attr,
+            ));
         }
-        n.listing.clone()
-    }
-
-    /// Keeps a listing that a resumed call just used.
-    pub(crate) fn set_listing(
-        &mut self,
-        dir: Ino,
-        listing: Vec<(u64, Vec<u8>)>,
-        stamp: (i64, u32, i64, u32, u64, u64),
-    ) {
-        if let Some(n) = self.nodes.get_mut(&dir) {
-            n.listing = Some(listing);
-            n.listing_stamp = Some(stamp);
-        }
+        let eof = consumed == listing.len() - start;
+        let n = self.node_mut(dir)?;
+        n.listing = Some(listing);
+        n.listing_stamp = Some(stamp);
+        Ok((entries, eof))
     }
 
     /// The inode for a backing identity, when the node behind it is still live.

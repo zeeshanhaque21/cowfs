@@ -52,7 +52,15 @@ pub fn run_suite(base: &Path) {
         Arc::new(fs)
     };
     println!("suite base directory: {}", base.display());
-    let report = run_all(&factory, &Options::from_env());
+    let mut opts = Options::from_env();
+    if opts.timeout.is_none() {
+        // One Posix check creates 8,000 hardlink pairs in one directory and lists them six times
+        // at page sizes from 1 up. On this machine a single `linkat` costs about 0.9 ms, so the
+        // check needs minutes, and the suite's 60 s default would report a hang that says
+        // nothing about the filesystem.
+        opts.timeout = std::time::Duration::from_secs(300).into();
+    }
+    let report = run_all(&factory, &opts);
     println!("{}", report.table());
     wait_for_cleanup();
     if std::env::var("COWFS_PATHVFS_STRICT").is_ok_and(|v| v == "1") {
