@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod backend;
+
 use cowfs_meta::{BlockId, ChunkRef, FileType, Ino, Meta, SetAttr, ROOT_INO};
 
 pub struct Rng(pub u64);

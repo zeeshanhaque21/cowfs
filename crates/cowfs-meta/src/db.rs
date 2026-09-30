@@ -1,22 +1,31 @@
-//! Database handle, snapshots, and the transaction plumbing.
+//! Database handle, snapshots, and the commit pipeline.
+//!
+//! Every mutation is applied in memory first (`Session`), where it is visible to every reader at
+//! once. The only way state reaches redb is a durable commit, and every durable commit is
+//! preceded by the `before_sync` hook, which runs after all closures that contributed to the
+//! commit have returned. See `docs/v1-meta.md`.
 
 use crate::error::guard;
-use crate::node::NodeId;
-use crate::ptree::{Cached, MemTree, NodeCache, NodeWriter};
-use crate::read::{self, RoView};
-use crate::tx::Tx;
+use crate::node::{Node, NodeId};
+use crate::ptree::{Lazy, MemTree, NodeCache, NodeWriter};
+use crate::read::{self, View};
+use crate::tx::{InoAlloc, Tx};
 use crate::types::*;
 use crate::walk::{LiveBlocks, Marker};
 use crate::{Error, Result};
 use cowfs_store::ChunkRef;
 use redb::{
-    Builder, Database, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition,
-    WriteTransaction,
+    Builder, Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    StorageBackend, TableDefinition,
 };
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub(crate) const NODES: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("nodes");
@@ -24,27 +33,53 @@ pub(crate) const REFS: TableDefinition<[u8; 32], u64> = TableDefinition::new("re
 pub(crate) const SNAPSHOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("snapshots");
 pub(crate) const SNAP_NAMES: TableDefinition<&str, u64> = TableDefinition::new("snap_names");
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+pub(crate) const REAP: TableDefinition<u64, [u8; 32]> = TableDefinition::new("reap");
 
-pub(crate) const FORMAT_VERSION: u64 = 1;
+/// "COWFSMET": identifies a cowfs-meta database among redb files.
+pub(crate) const MAGIC: u64 = 0x434f_5746_534d_4554;
+pub(crate) const FORMAT_VERSION: u64 = 2;
+const REAP_BUDGET: usize = 256;
 
 /// Hook run before every durable commit; the mount layer sets it to the block store's `sync`.
 pub type SyncHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
+/// When a mutating call returns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Ack {
+    /// After the change is applied and visible to every reader. It becomes durable by the sync
+    /// policy, `sync()` or `close()`.
+    #[default]
+    Applied,
+    /// After the change is durable. Concurrent callers share one commit and one `before_sync`.
+    Durable,
+}
 
 /// Tuning knobs for [`Meta::open`].
 #[derive(Clone)]
 pub struct Options {
     /// Target encoded size of a tree node in bytes. Fixed when the database is created.
     pub node_size: usize,
-    /// A durable commit happens at the latest after this many mutating transactions.
+    /// A durable commit happens after this many applied mutating calls (a batch counts as one).
     pub sync_every_ops: u32,
-    /// A durable commit happens at the latest when a mutation arrives this long after the last one.
+    /// A durable commit happens at the latest this long after the oldest unsynced mutation.
+    /// Enforced by a background thread unless `background` is false.
     pub sync_interval: Duration,
-    /// Called before every durable commit. If it fails the commit does not happen.
+    /// Called before every durable commit, after every closure that contributed to it has
+    /// returned, and by every `sync()` even when nothing is pending. If it fails, the commit does
+    /// not happen. It must not call back into this crate (that returns `Error::Reentrant`).
     pub before_sync: Option<SyncHook>,
     /// redb page cache size in bytes.
     pub cache_size: usize,
     /// Verified tree nodes kept in memory (about `node_size` bytes each).
     pub node_cache: usize,
+    /// When mutating calls return.
+    pub ack: Ack,
+    /// Run the timer/reaper thread. When false, the caller drives `sync()` and `reap_step()`.
+    pub background: bool,
+    /// A durable commit happens when this many bytes of changes are pending.
+    pub max_pending_bytes: usize,
+    /// Inode numbers are reserved durably in blocks of this size.
+    pub ino_block: u64,
 }
 
 impl Default for Options {
@@ -55,7 +90,11 @@ impl Default for Options {
             sync_interval: Duration::from_secs(1),
             before_sync: None,
             cache_size: 64 << 20,
-            node_cache: 16384,
+            node_cache: 32768,
+            ack: Ack::Applied,
+            background: true,
+            max_pending_bytes: 32 << 20,
+            ino_block: 1024,
         }
     }
 }
@@ -69,14 +108,39 @@ impl std::fmt::Debug for Options {
             .field("before_sync", &self.before_sync.is_some())
             .field("cache_size", &self.cache_size)
             .field("node_cache", &self.node_cache)
+            .field("ack", &self.ack)
+            .field("background", &self.background)
+            .field("max_pending_bytes", &self.max_pending_bytes)
+            .field("ino_block", &self.ino_block)
             .finish()
     }
 }
 
-#[derive(Debug)]
-struct SyncState {
-    pending: u32,
-    last_sync: Instant,
+thread_local! {
+    static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+struct HookScope;
+
+impl HookScope {
+    fn enter() -> Self {
+        IN_HOOK.with(|c| c.set(true));
+        HookScope
+    }
+}
+
+impl Drop for HookScope {
+    fn drop(&mut self) {
+        IN_HOOK.with(|c| c.set(false));
+    }
+}
+
+fn reentered() -> bool {
+    IN_HOOK.with(Cell::get)
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Owns the redb handle so a panic in redb's close-time commit on a damaged file cannot escape `drop`.
@@ -101,12 +165,49 @@ impl Drop for Db {
     }
 }
 
+pub(crate) struct SnapEntry {
+    pub(crate) info: SnapshotInfo,
+    pub(crate) tree: MemTree,
+}
+
+pub(crate) struct Session {
+    pub(crate) snaps: BTreeMap<SnapshotId, SnapEntry>,
+    pub(crate) names: HashMap<String, SnapshotId>,
+    pub(crate) ino: InoAlloc,
+    pub(crate) next_snapshot: u64,
+    pub(crate) next_reap: u64,
+    pub(crate) reap_len: u64,
+    applied: u64,
+    durable: u64,
+    pending_ops: u32,
+    pending_bytes: usize,
+    pending_since: Option<Instant>,
+    flush_err: Option<String>,
+    closed: bool,
+}
+
+struct BgState {
+    stop: bool,
+    deadline: Option<Instant>,
+    reap: bool,
+}
+
+struct Bg {
+    m: Mutex<BgState>,
+    cv: Condvar,
+}
+
 pub(crate) struct Inner {
     pub(crate) db: Db,
-    opts: Options,
-    node_max: usize,
+    pub(crate) opts: Options,
+    pub(crate) node_max: usize,
     pub(crate) cache: Arc<NodeCache>,
-    state: Mutex<SyncState>,
+    pub(crate) session: RwLock<Session>,
+    durable_seq: AtomicU64,
+    gc: Mutex<bool>,
+    gc_cv: Condvar,
+    bg: Bg,
+    poisoned: AtomicBool,
 }
 
 impl std::fmt::Debug for Inner {
@@ -115,77 +216,15 @@ impl std::fmt::Debug for Inner {
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
+type Committed = (Vec<(SnapshotId, NodeId)>, Option<(SnapshotInfo, NodeId)>);
 
-impl Inner {
-    fn run_hook(&self) -> Result<()> {
-        match &self.opts.before_sync {
-            Some(h) => h().map_err(Error::Hook),
-            None => Ok(()),
-        }
-    }
-
-    fn begin(&self, durable: bool) -> Result<WriteTransaction> {
-        let mut wtx = self.db.begin_write()?;
-        if durable {
-            wtx.set_two_phase_commit(true);
-        } else {
-            wtx.set_durability(redb::Durability::None)?;
-        }
-        Ok(wtx)
-    }
-
-    /// Runs one mutating transaction. `f` returns whether anything changed; if not, nothing commits.
-    pub(crate) fn write<T>(
-        &self,
-        force_durable: bool,
-        f: impl FnOnce(&WriteTransaction) -> Result<(T, bool)>,
-    ) -> Result<T> {
-        let mut st = lock(&self.state);
-        let durable = force_durable
-            || st.pending + 1 >= self.opts.sync_every_ops
-            || st.last_sync.elapsed() >= self.opts.sync_interval;
-        if durable {
-            self.run_hook()?;
-        }
-        guard(|| {
-            let wtx = self.begin(durable)?;
-            let (out, changed) = f(&wtx)?;
-            if !changed {
-                return Ok(out);
-            }
-            wtx.commit()?;
-            if durable {
-                st.pending = 0;
-                st.last_sync = Instant::now();
-            } else {
-                st.pending += 1;
-            }
-            Ok(out)
-        })
-    }
-
-    pub(crate) fn sync(&self) -> Result<()> {
-        let mut st = lock(&self.state);
-        if st.pending == 0 {
-            return Ok(());
-        }
-        self.run_hook()?;
-        guard(|| {
-            self.begin(true)?.commit()?;
-            st.pending = 0;
-            st.last_sync = Instant::now();
-            Ok(())
-        })
-    }
-}
-
-impl Drop for Inner {
-    fn drop(&mut self) {
-        let _ = self.sync();
-    }
+enum Extra<'a> {
+    None,
+    Add {
+        name: &'a str,
+        from: Option<SnapshotId>,
+    },
+    Remove(SnapshotId),
 }
 
 fn corrupt(what: &str) -> Error {
@@ -229,31 +268,640 @@ pub(crate) fn decode_snap(id: u64, b: &[u8]) -> Result<SnapshotInfo> {
     })
 }
 
-pub(crate) fn read_snap<T: ReadableTable<u64, &'static [u8]>>(
-    t: &T,
-    id: SnapshotId,
-) -> Result<SnapshotInfo> {
-    let g = t.get(id.0)?.ok_or(Error::NoSuchSnapshot)?;
-    decode_snap(id.0, g.value())
-}
-
 pub(crate) fn meta_get<T: ReadableTable<&'static str, u64>>(t: &T, k: &str) -> Result<u64> {
     t.get(k)?
         .map(|g| g.value())
         .ok_or_else(|| Error::Corrupt(format!("missing meta key {k}")))
 }
 
+impl Inner {
+    fn rlock(&self) -> Result<RwLockReadGuard<'_, Session>> {
+        if reentered() {
+            return Err(Error::Reentrant);
+        }
+        Ok(self.session.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn wlock(&self) -> Result<RwLockWriteGuard<'_, Session>> {
+        if reentered() {
+            return Err(Error::Reentrant);
+        }
+        Ok(self.session.write().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn note(&self, e: &Error) {
+        if matches!(e, Error::Corrupt(_)) {
+            self.poisoned.store(true, SeqCst);
+        }
+    }
+
+    fn check_writable(&self, s: &Session) -> Result<()> {
+        if s.closed {
+            return Err(Error::Closed);
+        }
+        if self.poisoned.load(SeqCst) {
+            return Err(corrupt(
+                "handle refuses writes after detecting corruption; reopen and run check()",
+            ));
+        }
+        Ok(())
+    }
+
+    fn run_hook(&self) -> Result<()> {
+        match &self.opts.before_sync {
+            Some(h) => {
+                let _scope = HookScope::enter();
+                h().map_err(Error::Hook)
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn arm_timer(&self, deadline: Instant) {
+        if !self.opts.background {
+            return;
+        }
+        let mut st = lock(&self.bg.m);
+        if st.deadline.is_none() {
+            st.deadline = Some(deadline);
+            self.bg.cv.notify_all();
+        }
+    }
+
+    fn disarm_timer(&self) {
+        lock(&self.bg.m).deadline = None;
+    }
+
+    /// One durable commit of every pending change, plus `extra`, preceded by the hook.
+    ///
+    /// Nothing changes in memory unless the commit succeeds.
+    fn commit(
+        &self,
+        s: &mut Session,
+        extra: Extra<'_>,
+        closing: bool,
+        force_hook: bool,
+    ) -> Result<Option<SnapshotId>> {
+        self.check_writable(s)?;
+        let removed = match &extra {
+            Extra::Remove(id) => Some(*id),
+            _ => None,
+        };
+        let dirty = s
+            .snaps
+            .iter()
+            .any(|(id, e)| Some(*id) != removed && e.tree.is_dirty());
+        let close_work = closing && s.ino.next < s.ino.reserved;
+        let has_work = dirty || close_work || !matches!(extra, Extra::None);
+        if !has_work && !force_hook {
+            return Ok(None);
+        }
+        match &extra {
+            Extra::Add { name, from } => {
+                if s.names.contains_key(*name) {
+                    return Err(Error::SnapshotExists);
+                }
+                if let Some(f) = from {
+                    if !s.snaps.contains_key(f) {
+                        return Err(Error::NoSuchSnapshot);
+                    }
+                }
+                if s.next_snapshot >= SNAPSHOT_LIMIT {
+                    return Err(Error::LimitExceeded("snapshot ids exhausted"));
+                }
+            }
+            Extra::Remove(id) => {
+                if !s.snaps.contains_key(id) {
+                    return Err(Error::NoSuchSnapshot);
+                }
+            }
+            Extra::None => {}
+        }
+        self.run_hook()?;
+        if !has_work {
+            return Ok(None);
+        }
+        let node_max = self.node_max;
+        let r = guard(|| -> Result<Committed> {
+            let mut wtx = self.db.begin_write()?;
+            wtx.set_two_phase_commit(true);
+            let mut new_roots = Vec::new();
+            let mut added = None;
+            {
+                let mut snaps = wtx.open_table(SNAPSHOTS)?;
+                let mut names = wtx.open_table(SNAP_NAMES)?;
+                let mut meta = wtx.open_table(META)?;
+                let mut reap = wtx.open_table(REAP)?;
+                let mut w = NodeWriter::new(
+                    wtx.open_table(NODES)?,
+                    wtx.open_table(REFS)?,
+                    self.cache.clone(),
+                );
+                for (id, e) in &s.snaps {
+                    if Some(*id) == removed || !e.tree.is_dirty() {
+                        continue;
+                    }
+                    let root = e.tree.write(&mut w)?;
+                    if root != e.info.root {
+                        w.add_ref(root);
+                        w.drop_ref(e.info.root);
+                        let info = SnapshotInfo {
+                            root,
+                            ..e.info.clone()
+                        };
+                        snaps.insert(id.0, encode_snap(&info).as_slice())?;
+                    }
+                    new_roots.push((*id, root));
+                }
+                match &extra {
+                    Extra::None => {}
+                    Extra::Add { name, from } => {
+                        let root = match from {
+                            Some(src) => new_roots
+                                .iter()
+                                .find(|(i, _)| i == src)
+                                .map(|(_, r)| *r)
+                                .or_else(|| s.snaps.get(src).map(|e| e.info.root))
+                                .ok_or(Error::NoSuchSnapshot)?,
+                            None => {
+                                let mut tree = MemTree::empty(node_max);
+                                let now = Timestamp::now();
+                                let rec = InodeRec {
+                                    kind: FileType::Dir,
+                                    mode: 0o755,
+                                    nlink: 2,
+                                    size: 0,
+                                    atime: now,
+                                    mtime: now,
+                                    ctime: now,
+                                    parent: ROOT_INO.0,
+                                    next_cookie: 1,
+                                    covered: 0,
+                                    cversion: 0,
+                                };
+                                let empty = Lazy::new(&self.db, &self.cache);
+                                tree.insert(&empty, &key(ROOT_INO, K_INODE, &[]), rec.encode())?;
+                                tree.write(&mut w)?
+                            }
+                        };
+                        w.add_ref(root);
+                        let id = s.next_snapshot;
+                        let info = SnapshotInfo {
+                            id: SnapshotId(id),
+                            name: (*name).to_string(),
+                            root,
+                            created: Timestamp::now(),
+                            parent: *from,
+                        };
+                        snaps.insert(id, encode_snap(&info).as_slice())?;
+                        names.insert(*name, id)?;
+                        meta.insert("next_snapshot", id + 1)?;
+                        added = Some((info, root));
+                    }
+                    Extra::Remove(id) => {
+                        let e = s.snaps.get(id).ok_or(Error::NoSuchSnapshot)?;
+                        snaps.remove(id.0)?;
+                        names.remove(e.info.name.as_str())?;
+                        reap.insert(s.next_reap, *e.info.root.as_bytes())?;
+                        meta.insert("next_reap", s.next_reap + 1)?;
+                    }
+                }
+                w.settle()?;
+                let reserved = if closing {
+                    s.ino.next.min(s.ino.reserved)
+                } else {
+                    s.ino.reserved
+                };
+                meta.insert("ino_reserved", reserved)?;
+            }
+            wtx.commit()?;
+            Ok((new_roots, added))
+        });
+        let (new_roots, added) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                self.note(&e);
+                return Err(e);
+            }
+        };
+        for (id, root) in new_roots {
+            if let Some(e) = s.snaps.get_mut(&id) {
+                e.info.root = root;
+                e.tree.reset(root);
+            }
+        }
+        let mut out = None;
+        match extra {
+            Extra::Add { name, .. } => {
+                if let Some((info, root)) = added {
+                    let id = info.id;
+                    s.snaps.insert(
+                        id,
+                        SnapEntry {
+                            info,
+                            tree: MemTree::new(root, node_max),
+                        },
+                    );
+                    s.names.insert(name.to_string(), id);
+                    s.next_snapshot += 1;
+                    out = Some(id);
+                }
+            }
+            Extra::Remove(id) => {
+                if let Some(e) = s.snaps.remove(&id) {
+                    s.names.remove(&e.info.name);
+                }
+                s.next_reap += 1;
+                s.reap_len += 1;
+                self.wake_reaper();
+            }
+            Extra::None => {}
+        }
+        if closing {
+            s.ino.reserved = s.ino.next.min(s.ino.reserved);
+        }
+        s.durable = s.applied;
+        s.pending_ops = 0;
+        s.pending_bytes = 0;
+        s.pending_since = None;
+        s.flush_err = None;
+        self.disarm_timer();
+        self.durable_seq.store(s.durable, SeqCst);
+        let _g = lock(&self.gc);
+        self.gc_cv.notify_all();
+        Ok(out)
+    }
+
+    fn wake_reaper(&self) {
+        if self.opts.background {
+            lock(&self.bg.m).reap = true;
+            self.bg.cv.notify_all();
+        }
+    }
+
+    /// Durably reserves inode numbers below `new`. Carries no chunk references, so no hook.
+    fn reserve_durable(&self, new: u64) -> Result<()> {
+        guard(|| {
+            let mut wtx = self.db.begin_write()?;
+            wtx.set_two_phase_commit(true);
+            wtx.open_table(META)?.insert("ino_reserved", new)?;
+            wtx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn mutate<T>(
+        &self,
+        id: SnapshotId,
+        f: impl FnOnce(&mut Tx<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let (out, wait_for) = {
+            let mut guard_ = self.wlock()?;
+            let s = &mut *guard_;
+            self.check_writable(s)?;
+            if s.pending_ops > self.opts.sync_every_ops.saturating_mul(8) && s.flush_err.is_some() {
+                let msg = s.flush_err.clone().unwrap_or_default();
+                return Err(Error::Storage(format!(
+                    "durable commits keep failing, refusing more changes: {msg}"
+                )));
+            }
+            let e = s.snaps.get_mut(&id).ok_or(Error::NoSuchSnapshot)?;
+            let saved = e.tree.clone();
+            let lazy = Lazy::new(&self.db, &self.cache);
+            let reserve = |n: u64| self.reserve_durable(n);
+            let res = {
+                let mut tx = Tx {
+                    tree: &mut e.tree,
+                    src: &lazy,
+                    ino: &mut s.ino,
+                    reserve: &reserve,
+                    now: Timestamp::now(),
+                };
+                catch_unwind(AssertUnwindSafe(|| f(&mut tx)))
+            };
+            let out = match res {
+                Err(p) => {
+                    e.tree = saved;
+                    resume_unwind(p);
+                }
+                Ok(Err(er)) => {
+                    e.tree = saved;
+                    self.note(&er);
+                    return Err(er);
+                }
+                Ok(Ok(v)) => v,
+            };
+            let changed = e.tree.edits() != saved.edits();
+            if changed {
+                s.applied += 1;
+                s.pending_ops += 1;
+                s.pending_bytes += e.tree.dirty_bytes().saturating_sub(saved.dirty_bytes());
+                if s.pending_since.is_none() {
+                    let now = Instant::now();
+                    s.pending_since = Some(now);
+                    if let Some(d) = now.checked_add(self.opts.sync_interval) {
+                        self.arm_timer(d);
+                    }
+                }
+                if self.opts.ack == Ack::Applied {
+                    let due = s.pending_ops >= self.opts.sync_every_ops
+                        || s.pending_bytes >= self.opts.max_pending_bytes
+                        || s.pending_since
+                            .is_some_and(|t| t.elapsed() >= self.opts.sync_interval);
+                    if due {
+                        if let Err(er) = self.commit(s, Extra::None, false, true) {
+                            s.flush_err = Some(er.to_string());
+                        }
+                    }
+                }
+            }
+            (
+                out,
+                (changed && self.opts.ack == Ack::Durable).then_some(s.applied),
+            )
+        };
+        if let Some(seq) = wait_for {
+            self.wait_durable(seq)?;
+        }
+        Ok(out)
+    }
+
+    /// Returns once every change applied up to `seq` is durable. Callers that arrive while a
+    /// commit is running share the next one (leader and followers).
+    fn wait_durable(&self, seq: u64) -> Result<()> {
+        loop {
+            let mut led = lock(&self.gc);
+            if self.durable_seq.load(SeqCst) >= seq {
+                return Ok(());
+            }
+            if *led {
+                let _ = self.gc_cv.wait_timeout(led, Duration::from_millis(50));
+                continue;
+            }
+            *led = true;
+            drop(led);
+            let r = match self.wlock() {
+                Ok(mut s) => self.commit(&mut s, Extra::None, false, true).map(|_| ()),
+                Err(e) => Err(e),
+            };
+            *lock(&self.gc) = false;
+            self.gc_cv.notify_all();
+            r?;
+        }
+    }
+
+    pub(crate) fn sync(&self) -> Result<()> {
+        let mut s = self.wlock()?;
+        self.commit(&mut s, Extra::None, false, true).map(|_| ())
+    }
+
+    pub(crate) fn close(&self) -> Result<()> {
+        let mut s = self.wlock()?;
+        if s.closed {
+            return Ok(());
+        }
+        let r = self.commit(&mut s, Extra::None, true, true).map(|_| ());
+        s.closed = true;
+        r
+    }
+
+    /// Drop path: make everything durable if the hook allows it, otherwise discard it.
+    fn finish_on_drop(&self) {
+        let Ok(mut s) = self.wlock() else { return };
+        if s.closed {
+            return;
+        }
+        let _ = self.commit(&mut s, Extra::None, true, true);
+        s.closed = true;
+        s.snaps.clear();
+    }
+
+    fn add_snapshot(&self, name: &str, from: Option<SnapshotId>) -> Result<SnapshotId> {
+        if name.is_empty() || name.len() > usize::from(u16::MAX) {
+            return Err(Error::Invalid("bad snapshot name"));
+        }
+        let mut s = self.wlock()?;
+        self.commit(&mut s, Extra::Add { name, from }, false, true)?
+            .ok_or_else(|| corrupt("snapshot was not created"))
+    }
+
+    fn remove_snapshot(&self, id: SnapshotId) -> Result<()> {
+        let mut s = self.wlock()?;
+        self.commit(&mut s, Extra::Remove(id), false, true)
+            .map(|_| ())
+    }
+
+    /// Frees a bounded number of nodes of removed snapshots in one small transaction. Returns
+    /// whether more work remains.
+    pub(crate) fn reap_step(&self) -> Result<bool> {
+        let mut s = self.wlock()?;
+        if s.reap_len == 0 {
+            return Ok(false);
+        }
+        self.check_writable(&s)?;
+        let r = guard(|| -> Result<(u64, u64)> {
+            let mut wtx = self.db.begin_write()?;
+            wtx.set_durability(Durability::None)?;
+            let (taken, added);
+            {
+                let mut reap = wtx.open_table(REAP)?;
+                let mut nodes = wtx.open_table(NODES)?;
+                let mut refs = wtx.open_table(REFS)?;
+                let mut meta = wtx.open_table(META)?;
+                let mut rows: Vec<(u64, [u8; 32])> = Vec::new();
+                for r in reap.iter()?.take(REAP_BUDGET) {
+                    let (k, v) = r?;
+                    rows.push((k.value(), v.value()));
+                }
+                taken = rows.len() as u64;
+                for (k, _) in &rows {
+                    reap.remove(*k)?;
+                }
+                let mut work: Vec<[u8; 32]> = rows.into_iter().map(|(_, v)| v).collect();
+                let (mut freed, mut left) = (0usize, Vec::new());
+                while let Some(id) = work.pop() {
+                    if freed >= REAP_BUDGET {
+                        left.push(id);
+                        continue;
+                    }
+                    let cur = refs
+                        .get(id)?
+                        .map(|g| g.value())
+                        .ok_or_else(|| corrupt("reap entry names a node without a count"))?;
+                    if cur > 1 {
+                        refs.insert(id, cur - 1)?;
+                        continue;
+                    }
+                    let bytes = nodes
+                        .remove(id)?
+                        .map(|g| g.value().to_vec())
+                        .ok_or_else(|| corrupt("reap entry names a missing node"))?;
+                    refs.remove(id)?;
+                    freed += 1;
+                    let n = Node::parse(bytes)?;
+                    if !n.is_leaf() {
+                        for i in 0..n.len() {
+                            work.push(*n.child(i).as_bytes());
+                        }
+                    }
+                }
+                let mut next = meta_get(&meta, "next_reap")?;
+                added = left.len() as u64;
+                for id in left {
+                    reap.insert(next, id)?;
+                    next += 1;
+                }
+                meta.insert("next_reap", next)?;
+            }
+            wtx.commit()?;
+            Ok((taken, added))
+        });
+        match r {
+            Ok((taken, added)) => {
+                s.reap_len = s.reap_len.saturating_sub(taken) + added;
+                s.next_reap += added;
+                Ok(s.reap_len > 0)
+            }
+            Err(e) => {
+                self.note(&e);
+                Err(e)
+            }
+        }
+    }
+
+    fn timer_flush(&self) {
+        let Ok(mut s) = self.wlock() else { return };
+        if s.closed || s.pending_ops == 0 {
+            return;
+        }
+        let waited = s
+            .pending_since
+            .map_or(self.opts.sync_interval, |t| t.elapsed());
+        let retry = |wait: Duration| {
+            if let Some(d) = Instant::now().checked_add(wait) {
+                self.arm_timer(d);
+            }
+        };
+        if waited < self.opts.sync_interval {
+            retry(self.opts.sync_interval - waited);
+            return;
+        }
+        if let Err(e) = self.commit(&mut s, Extra::None, false, true) {
+            s.flush_err = Some(e.to_string());
+            retry(self.opts.sync_interval);
+        }
+    }
+
+    fn stop_bg(&self) {
+        lock(&self.bg.m).stop = true;
+        self.bg.cv.notify_all();
+    }
+}
+
+fn bg_main(inner: Arc<Inner>) {
+    enum Job {
+        Flush,
+        Reap,
+    }
+    loop {
+        let job = {
+            let mut st = lock(&inner.bg.m);
+            loop {
+                if st.stop {
+                    return;
+                }
+                if st.reap {
+                    st.reap = false;
+                    break Job::Reap;
+                }
+                match st.deadline {
+                    Some(d) => {
+                        let now = Instant::now();
+                        if d <= now {
+                            st.deadline = None;
+                            break Job::Flush;
+                        }
+                        st = inner
+                            .bg
+                            .cv
+                            .wait_timeout(st, d - now)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0;
+                    }
+                    None => st = inner.bg.cv.wait(st).unwrap_or_else(|e| e.into_inner()),
+                }
+            }
+        };
+        match job {
+            Job::Flush => inner.timer_flush(),
+            Job::Reap => {
+                if matches!(
+                    catch_unwind(AssertUnwindSafe(|| inner.reap_step())),
+                    Ok(Ok(true))
+                ) {
+                    std::thread::sleep(Duration::from_micros(300));
+                    lock(&inner.bg.m).reap = true;
+                }
+            }
+        }
+    }
+}
+
+/// Shared by every `Meta` and `Snapshot` clone. Dropping the last one stops the background
+/// thread, makes pending changes durable if the hook allows it, and closes the file.
+pub(crate) struct Handle {
+    pub(crate) inner: Arc<Inner>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for Handle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handle").finish_non_exhaustive()
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.inner.stop_bg();
+        if let Some(t) = lock(&self.thread).take() {
+            let _ = t.join();
+        }
+        let _ = catch_unwind(AssertUnwindSafe(|| self.inner.finish_on_drop()));
+    }
+}
+
+/// What `Meta::open_recover` did.
+#[derive(Clone, Debug)]
+pub struct Recovery {
+    /// True when the newest commit could not be read and the previous one was used.
+    pub rolled_back: bool,
+    /// Copy of the file as it was before recovery (only when `rolled_back`).
+    pub backup: Option<PathBuf>,
+    /// The snapshots of the recovered state.
+    pub snapshots: Vec<SnapshotInfo>,
+}
+
 /// The metadata store: one redb file holding every snapshot's tree.
 ///
-/// Cloning is cheap and shares the database. All methods take `&self`; redb allows one writer at a
-/// time and any number of readers, so writers are serialized and readers never block.
+/// Cloning is cheap and shares the database. All methods take `&self`. Writers are serialized;
+/// readers see every applied change immediately and never a partial one.
 #[derive(Clone, Debug)]
 pub struct Meta {
-    pub(crate) inner: Arc<Inner>,
+    pub(crate) h: Arc<Handle>,
+}
+
+fn builder(opts: &Options) -> Builder {
+    let mut b = Builder::new();
+    b.set_cache_size(opts.cache_size);
+    b
 }
 
 impl Meta {
     /// Opens the database at `path`, creating it if the file is missing or empty.
+    ///
+    /// Fails closed: a file that is not a cowfs-meta database is refused with [`Error::Format`],
+    /// and a file whose newest commit cannot be verified is refused with a storage error. See
+    /// [`Meta::open_recover`].
     pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Meta> {
         guard(|| Self::init(builder(&opts).create(path)?, opts.clone()))
     }
@@ -263,199 +911,326 @@ impl Meta {
         guard(|| Self::init(builder(&opts).create_with_backend(backend)?, opts.clone()))
     }
 
+    /// Opens a file that [`Meta::open`] refuses because its newest commit is unreadable (for
+    /// example after a disk lied about an fsync), using the previous commit instead.
+    ///
+    /// Never called automatically. The file is copied to `<path>.pre-recover` first, and restored
+    /// from that copy if recovery fails. Everything committed after the previous commit is lost;
+    /// the returned report lists the recovered snapshots so the caller can tell.
+    pub fn open_recover(path: impl AsRef<Path>, opts: Options) -> Result<(Meta, Recovery)> {
+        let path = path.as_ref();
+        match catch_unwind(AssertUnwindSafe(|| builder(&opts).create(path))) {
+            Ok(Ok(db)) => {
+                let m = guard(|| Self::init(db, opts.clone()))?;
+                let snapshots = m.snapshots()?;
+                return Ok((
+                    m,
+                    Recovery {
+                        rolled_back: false,
+                        backup: None,
+                        snapshots,
+                    },
+                ));
+            }
+            Ok(Err(redb::DatabaseError::Storage(redb::StorageError::Corrupted(_)))) | Err(_) => {}
+            Ok(Err(e)) => return Err(e.into()),
+        }
+        let mut head = [0u8; 10];
+        {
+            use std::io::Read;
+            let mut f = std::fs::File::open(path).map_err(|e| Error::Storage(e.to_string()))?;
+            f.read_exact(&mut head)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        if head[..9] != REDB_MAGIC {
+            return Err(Error::Format("not a redb file".into()));
+        }
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(".pre-recover");
+        let backup = PathBuf::from(backup);
+        std::fs::copy(path, &backup)
+            .map_err(|e| Error::Storage(format!("cannot back up before recovery: {e}")))?;
+        let restore = |why: String| -> Error {
+            let _ = std::fs::copy(&backup, path);
+            Error::Storage(format!(
+                "recovery failed ({why}); file restored from {}",
+                backup.display()
+            ))
+        };
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            f.seek(SeekFrom::Start(9))
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            // Clear the two-phase-commit flag and ask for repair: redb then verifies the primary
+            // commit slot and falls back to the other one when it does not verify.
+            f.write_all(&[(head[9] | GOD_RECOVERY) & !GOD_TWO_PHASE])
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            f.sync_all().map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        match Self::open(path, opts) {
+            Ok(m) => {
+                let snapshots = m.snapshots()?;
+                Ok((
+                    m,
+                    Recovery {
+                        rolled_back: true,
+                        backup: Some(backup),
+                        snapshots,
+                    },
+                ))
+            }
+            Err(e) => Err(restore(e.to_string())),
+        }
+    }
+
     fn init(db: Database, opts: Options) -> Result<Meta> {
         if opts.node_size < 256 {
             return Err(Error::Invalid("node_size below 256"));
         }
-        let existing = {
+        let tables: Vec<String> = {
             let rtx = db.begin_read()?;
-            match rtx.open_table(META) {
-                Ok(t) => Some((meta_get(&t, "version")?, meta_get(&t, "node_size")?)),
-                Err(redb::TableError::TableDoesNotExist(_)) => None,
-                Err(e) => return Err(e.into()),
-            }
+            let list: Vec<String> = rtx
+                .list_tables()?
+                .map(|t| redb::TableHandle::name(&t).to_string())
+                .collect();
+            list
         };
-        let node_max = match existing {
-            Some((v, n)) => {
-                if v != FORMAT_VERSION {
-                    return Err(Error::Corrupt(format!("unsupported format version {v}")));
-                }
-                usize::try_from(n)
-                    .ok()
-                    .filter(|&n| n >= 256)
-                    .ok_or_else(|| corrupt("bad node size"))?
+        if tables.is_empty() {
+            let mut wtx = db.begin_write()?;
+            wtx.set_two_phase_commit(true);
+            {
+                wtx.open_table(NODES)?;
+                wtx.open_table(REFS)?;
+                wtx.open_table(SNAPSHOTS)?;
+                wtx.open_table(SNAP_NAMES)?;
+                wtx.open_table(REAP)?;
+                let mut m = wtx.open_table(META)?;
+                m.insert("magic", MAGIC)?;
+                m.insert("version", FORMAT_VERSION)?;
+                m.insert("node_size", opts.node_size as u64)?;
+                m.insert("ino_reserved", 2)?;
+                m.insert("next_snapshot", 1)?;
+                m.insert("next_reap", 1)?;
             }
-            None => {
-                let mut wtx = db.begin_write()?;
-                wtx.set_two_phase_commit(true);
-                {
-                    wtx.open_table(NODES)?;
-                    wtx.open_table(REFS)?;
-                    wtx.open_table(SNAPSHOTS)?;
-                    wtx.open_table(SNAP_NAMES)?;
-                    let mut m = wtx.open_table(META)?;
-                    m.insert("version", FORMAT_VERSION)?;
-                    m.insert("node_size", opts.node_size as u64)?;
-                    m.insert("next_ino", 2)?;
-                    m.insert("next_snapshot", 1)?;
-                }
-                wtx.commit()?;
-                opts.node_size
+            wtx.commit()?;
+        } else if !tables.iter().any(|t| t == "meta") {
+            return Err(Error::Format(
+                "no cowfs-meta header in this redb file".into(),
+            ));
+        }
+        let rtx = db.begin_read()?;
+        let meta = rtx.open_table(META)?;
+        if meta.get("magic")?.map(|g| g.value()) != Some(MAGIC) {
+            return Err(Error::Format(
+                "no cowfs-meta header in this redb file".into(),
+            ));
+        }
+        let version = meta_get(&meta, "version")?;
+        if version != FORMAT_VERSION {
+            return Err(Error::Format(format!(
+                "format version {version}, this build reads {FORMAT_VERSION}"
+            )));
+        }
+        let node_max = usize::try_from(meta_get(&meta, "node_size")?)
+            .ok()
+            .filter(|&n| n >= 256)
+            .ok_or_else(|| corrupt("bad node size"))?;
+        let reserved = meta_get(&meta, "ino_reserved")?;
+        let mut snaps = BTreeMap::new();
+        let mut names = HashMap::new();
+        for r in rtx.open_table(SNAPSHOTS)?.iter()? {
+            let (k, v) = r?;
+            let info = decode_snap(k.value(), v.value())?;
+            names.insert(info.name.clone(), info.id);
+            let tree = MemTree::new(info.root, node_max);
+            snaps.insert(info.id, SnapEntry { info, tree });
+        }
+        let session = Session {
+            snaps,
+            names,
+            ino: InoAlloc {
+                next: reserved,
+                reserved,
+                block: opts.ino_block,
+            },
+            next_snapshot: meta_get(&meta, "next_snapshot")?,
+            next_reap: meta_get(&meta, "next_reap")?,
+            reap_len: rtx.open_table(REAP)?.len()?,
+            applied: 0,
+            durable: 0,
+            pending_ops: 0,
+            pending_bytes: 0,
+            pending_since: None,
+            flush_err: None,
+            closed: false,
+        };
+        drop(meta);
+        drop(rtx);
+        let background = opts.background;
+        let inner = Arc::new(Inner {
+            db: Db(Some(db)),
+            node_max,
+            cache: Arc::new(NodeCache::new(opts.node_cache)),
+            session: RwLock::new(session),
+            durable_seq: AtomicU64::new(0),
+            gc: Mutex::new(false),
+            gc_cv: Condvar::new(),
+            bg: Bg {
+                m: Mutex::new(BgState {
+                    stop: false,
+                    deadline: None,
+                    reap: false,
+                }),
+                cv: Condvar::new(),
+            },
+            poisoned: AtomicBool::new(false),
+            opts,
+        });
+        let thread = if background {
+            let i2 = inner.clone();
+            let t = std::thread::Builder::new()
+                .name("cowfs-meta-bg".into())
+                .spawn(move || bg_main(i2))
+                .map_err(|e| Error::Storage(format!("cannot start the background thread: {e}")))?;
+            if inner.session.read().is_ok_and(|s| s.reap_len > 0) {
+                inner.wake_reaper();
             }
+            Some(t)
+        } else {
+            None
         };
         Ok(Meta {
-            inner: Arc::new(Inner {
-                db: Db(Some(db)),
-                node_max,
-                cache: Arc::new(NodeCache::new(opts.node_cache)),
-                state: Mutex::new(SyncState {
-                    pending: 0,
-                    last_sync: Instant::now(),
-                }),
-                opts,
+            h: Arc::new(Handle {
+                inner,
+                thread: Mutex::new(thread),
             }),
         })
     }
 
-    /// Creates a snapshot holding an empty tree (just the root directory).
-    pub fn new_snapshot(&self, name: &str) -> Result<Snapshot> {
-        self.add_snapshot(name, None)
+    fn snap(&self, id: SnapshotId) -> Snapshot {
+        Snapshot {
+            h: self.h.clone(),
+            id,
+        }
     }
 
-    fn add_snapshot(&self, name: &str, from: Option<SnapshotId>) -> Result<Snapshot> {
-        if name.is_empty() || name.len() > usize::from(u16::MAX) {
-            return Err(Error::Invalid("bad snapshot name"));
-        }
-        let node_max = self.inner.node_max;
-        let id = self.inner.write(true, |wtx| {
-            let mut names = wtx.open_table(SNAP_NAMES)?;
-            let mut snaps = wtx.open_table(SNAPSHOTS)?;
-            let mut meta = wtx.open_table(META)?;
-            let mut w = NodeWriter::new(
-                wtx.open_table(NODES)?,
-                wtx.open_table(REFS)?,
-                self.inner.cache.clone(),
-            );
-            if names.get(name)?.is_some() {
-                return Err(Error::SnapshotExists);
-            }
-            let root = match from {
-                Some(src) => read_snap(&snaps, src)?.root,
-                None => {
-                    let mut tree = MemTree::empty(node_max);
-                    let now = Timestamp::now();
-                    let rec = InodeRec {
-                        kind: FileType::Dir,
-                        mode: 0o755,
-                        nlink: 2,
-                        size: 0,
-                        atime: now,
-                        mtime: now,
-                        ctime: now,
-                        parent: ROOT_INO.0,
-                        next_cookie: 1,
-                    };
-                    tree.insert(&w.nodes, &key(ROOT_INO, K_INODE, &[]), rec.encode())?;
-                    tree.flush(&mut w)?
-                }
-            };
-            w.add_ref(root);
-            w.settle()?;
-            let id = meta_get(&meta, "next_snapshot")?;
-            meta.insert("next_snapshot", id + 1)?;
-            let info = SnapshotInfo {
-                id: SnapshotId(id),
-                name: name.to_string(),
-                root,
-                created: Timestamp::now(),
-                parent: from,
-            };
-            snaps.insert(id, encode_snap(&info).as_slice())?;
-            names.insert(name, id)?;
-            Ok((SnapshotId(id), true))
-        })?;
-        Ok(Snapshot {
-            inner: self.inner.clone(),
-            id,
-        })
+    /// Creates a snapshot holding an empty tree (just the root directory). Durable on return.
+    pub fn new_snapshot(&self, name: &str) -> Result<Snapshot> {
+        Ok(self.snap(self.h.inner.add_snapshot(name, None)?))
     }
 
     /// Opens a snapshot by name.
     pub fn snapshot(&self, name: &str) -> Result<Snapshot> {
-        guard(|| {
-            let rtx = self.inner.db.begin_read()?;
-            let id = rtx
-                .open_table(SNAP_NAMES)?
-                .get(name)?
-                .map(|g| g.value())
-                .ok_or(Error::NoSuchSnapshot)?;
-            Ok(Snapshot {
-                inner: self.inner.clone(),
-                id: SnapshotId(id),
-            })
-        })
+        let s = self.h.inner.rlock()?;
+        s.names
+            .get(name)
+            .map(|id| self.snap(*id))
+            .ok_or(Error::NoSuchSnapshot)
     }
 
     /// Opens a snapshot by id.
     pub fn snapshot_by_id(&self, id: SnapshotId) -> Result<Snapshot> {
-        guard(|| {
-            let rtx = self.inner.db.begin_read()?;
-            read_snap(&rtx.open_table(SNAPSHOTS)?, id)?;
-            Ok(Snapshot {
-                inner: self.inner.clone(),
-                id,
-            })
-        })
+        let s = self.h.inner.rlock()?;
+        if s.snaps.contains_key(&id) {
+            Ok(self.snap(id))
+        } else {
+            Err(Error::NoSuchSnapshot)
+        }
     }
 
-    /// Lists all snapshots in id order.
+    /// Lists all snapshots in id order. Roots include applied changes that are not yet durable.
     pub fn snapshots(&self) -> Result<Vec<SnapshotInfo>> {
+        let s = self.h.inner.rlock()?;
+        Ok(s.snaps.values().map(entry_info).collect())
+    }
+
+    /// Snapshots as of the last durable commit, read from the file. This is what a crash right now
+    /// would leave, so tests and tooling can compare it with a reopened database.
+    pub fn durable_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
         guard(|| {
-            let rtx = self.inner.db.begin_read()?;
-            rtx.open_table(SNAPSHOTS)?
-                .iter()?
-                .map(|r| {
-                    let (k, v) = r?;
-                    decode_snap(k.value(), v.value())
-                })
-                .collect()
+            let rtx = self.h.inner.db.begin_read()?;
+            let t = rtx.open_table(SNAPSHOTS)?;
+            let mut out = Vec::new();
+            for r in t.iter()? {
+                let (k, v) = r?;
+                out.push(decode_snap(k.value(), v.value())?);
+            }
+            Ok(out)
         })
     }
 
-    /// Removes a snapshot and frees every tree node no other snapshot shares.
+    /// Removes a snapshot. Durable on return. Its nodes are freed in small steps afterwards by
+    /// the background thread (or by `reap_step` when `background` is off), so no long lock is
+    /// held; the space returns as the steps run.
     pub fn remove_snapshot(&self, id: SnapshotId) -> Result<()> {
-        self.inner.write(true, |wtx| {
-            let mut names = wtx.open_table(SNAP_NAMES)?;
-            let mut snaps = wtx.open_table(SNAPSHOTS)?;
-            let mut w = NodeWriter::new(
-                wtx.open_table(NODES)?,
-                wtx.open_table(REFS)?,
-                self.inner.cache.clone(),
-            );
-            let info = read_snap(&snaps, id)?;
-            w.drop_ref(info.root);
-            w.settle()?;
-            snaps.remove(id.0)?;
-            names.remove(info.name.as_str())?;
-            Ok(((), true))
-        })
+        self.h.inner.remove_snapshot(id)
     }
 
-    /// Makes every earlier mutation durable (runs `before_sync` first).
+    /// Frees a bounded number of nodes of removed snapshots. Returns true when more remain.
+    pub fn reap_step(&self) -> Result<bool> {
+        self.h.inner.reap_step()
+    }
+
+    /// Runs `reap_step` until nothing is left.
+    pub fn reap_all(&self) -> Result<()> {
+        while self.reap_step()? {}
+        Ok(())
+    }
+
+    /// Number of removed-snapshot roots still waiting to be freed.
+    pub fn pending_reap(&self) -> Result<u64> {
+        Ok(self.h.inner.rlock()?.reap_len)
+    }
+
+    /// Runs `before_sync`, then makes every applied change durable. The hook runs on every call,
+    /// also when nothing is pending, so a caller can use this as "sync the store, then the
+    /// metadata". Returns the hook's or the commit's error.
     pub fn sync(&self) -> Result<()> {
-        self.inner.sync()
+        self.h.inner.sync()
     }
 
-    /// Verifies every structural and semantic invariant. See `docs/v1-meta.md`.
+    /// Final sync: runs the hook, makes everything durable, records the exact inode counter, and
+    /// stops accepting changes. Reports errors, which drop cannot. Dropping the last handle does
+    /// the same, but discards unsynced changes if the hook fails.
+    pub fn close(&self) -> Result<()> {
+        self.h.inner.close()
+    }
+
+    /// Verifies every structural and semantic invariant (after a `sync()`). See `docs/v1-meta.md`.
     pub fn check(&self) -> Result<()> {
-        guard(|| crate::check::check(&self.inner))
+        self.sync()?;
+        guard(|| crate::check::check(&self.h.inner))
+    }
+
+    /// Packs a snapshot id and an inode number into one restart-stable `u64`: the snapshot id in
+    /// the top 24 bits, the inode in the low 40. `None` if either is out of range; the store never
+    /// hands out such values (it returns [`Error::LimitExceeded`] instead), so `None` means the
+    /// arguments did not come from this store.
+    pub fn pack_ino(snapshot: SnapshotId, ino: Ino) -> Option<u64> {
+        (snapshot.0 != 0 && snapshot.0 < SNAPSHOT_LIMIT && ino.0 < INO_LIMIT)
+            .then_some(snapshot.0 << 40 | ino.0)
+    }
+
+    /// Inverse of [`Meta::pack_ino`].
+    pub fn unpack_ino(packed: u64) -> (SnapshotId, Ino) {
+        (SnapshotId(packed >> 40), Ino(packed & (INO_LIMIT - 1)))
     }
 }
 
-fn builder(opts: &Options) -> Builder {
-    let mut b = Builder::new();
-    b.set_cache_size(opts.cache_size);
-    b
+const REDB_MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
+const GOD_RECOVERY: u8 = 2;
+const GOD_TWO_PHASE: u8 = 4;
+
+fn entry_info(e: &SnapEntry) -> SnapshotInfo {
+    let mut info = e.info.clone();
+    if e.tree.is_dirty() {
+        info.root = e.tree.root_id();
+    }
+    info
 }
 
 /// A cheap `Send + Sync` handle to one snapshot. All methods take `&self`.
@@ -464,7 +1239,7 @@ fn builder(opts: &Options) -> Builder {
 /// snapshot, including the one it was forked from.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
-    inner: Arc<Inner>,
+    pub(crate) h: Arc<Handle>,
     id: SnapshotId,
 }
 
@@ -498,6 +1273,8 @@ forward_writes! {
     setattr(ino: Ino, set: SetAttr) -> Attr;
     /// Replaces a file's chunk list and size. See [`Tx::set_content`].
     set_content(ino: Ino, chunks: &[ChunkRef], size: u64) -> Attr;
+    /// Compare-and-swap replacement of a chunk range. See [`Tx::splice_content`].
+    splice_content(ino: Ino, expected_version: u64, start: u64, end: u64, new_chunks: &[ChunkRef], new_size: u64) -> u64;
     /// Sets an extended attribute. See [`Tx::setxattr`].
     setxattr(ino: Ino, name: &[u8], value: &[u8]) -> ();
     /// Removes an extended attribute. See [`Tx::removexattr`].
@@ -510,12 +1287,14 @@ impl Snapshot {
         self.id
     }
 
-    /// Name, root, creation time and parent of this snapshot.
+    /// Name, root, creation time and parent of this snapshot. The root includes applied changes
+    /// that are not yet durable.
     pub fn info(&self) -> Result<SnapshotInfo> {
-        guard(|| {
-            let rtx = self.inner.db.begin_read()?;
-            read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)
-        })
+        let s = self.h.inner.rlock()?;
+        s.snaps
+            .get(&self.id)
+            .map(entry_info)
+            .ok_or(Error::NoSuchSnapshot)
     }
 
     /// The Merkle root of this snapshot's tree.
@@ -523,26 +1302,31 @@ impl Snapshot {
         Ok(self.info()?.root)
     }
 
-    /// Creates a writable clone named `name`. Costs one row and one counter, independent of tree size.
+    /// Creates a writable clone named `name`. Durable on return. Costs one row and one counter
+    /// plus the commit, independent of tree size.
     pub fn fork(&self, name: &str) -> Result<Snapshot> {
-        Meta {
-            inner: self.inner.clone(),
-        }
-        .add_snapshot(name, Some(self.id))
+        let id = self.h.inner.add_snapshot(name, Some(self.id))?;
+        Ok(Snapshot {
+            h: self.h.clone(),
+            id,
+        })
     }
 
-    fn read<T>(&self, f: impl FnOnce(&RoView) -> Result<T>) -> Result<T> {
-        guard(|| {
-            let rtx = self.inner.db.begin_read()?;
-            let root = read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)?.root;
-            f(&RoView {
-                nodes: Cached {
-                    table: rtx.open_table(NODES)?,
-                    cache: self.inner.cache.clone(),
-                },
-                root,
+    fn read<T>(&self, f: impl FnOnce(&View<'_>) -> Result<T>) -> Result<T> {
+        let inner = &self.h.inner;
+        let r = guard(|| {
+            let s = inner.rlock()?;
+            let e = s.snaps.get(&self.id).ok_or(Error::NoSuchSnapshot)?;
+            let lazy = Lazy::new(&inner.db, &inner.cache);
+            f(&View {
+                tree: &e.tree,
+                src: &lazy,
             })
-        })
+        });
+        if let Err(e) = &r {
+            inner.note(e);
+        }
+        r
     }
 
     /// Looks up a name in a directory. `.` and `..` resolve.
@@ -568,9 +1352,19 @@ impl Snapshot {
         self.read(|r| read::readlink(r, ino))
     }
 
-    /// Chunk list of a regular file.
+    /// Whole chunk list of a regular file.
     pub fn chunks(&self, ino: Ino) -> Result<Vec<ChunkRef>> {
         self.read(|r| read::chunks(r, ino))
+    }
+
+    /// The chunks starting in byte range `start..end` with the content version they were read at.
+    pub fn chunk_range(&self, ino: Ino, start: u64, end: u64) -> Result<ChunkRange> {
+        self.read(|r| read::chunk_range(r, ino, start, end))
+    }
+
+    /// The content version of a file: the token `splice_content` compares.
+    pub fn content_version(&self, ino: Ino) -> Result<u64> {
+        self.read(|r| read::content_version(r, ino))
     }
 
     /// Value of an extended attribute.
@@ -585,66 +1379,31 @@ impl Snapshot {
 
     /// Walks the tree yielding every block id referenced by a chunk list.
     ///
+    /// Makes everything durable first (`sync`, including the hook), so the walk sees exactly the
+    /// state a crash would leave and a collector never frees a block the durable tree needs.
     /// Subtrees whose root is already in `marker` are skipped, and each subtree is added to
-    /// `marker` once fully walked. Sharing one `marker` across snapshots therefore costs only the
-    /// nodes that differ. A block may be yielded more than once.
+    /// `marker` once fully walked. A block may be yielded more than once.
     pub fn live_blocks<'m>(&self, marker: &'m mut Marker) -> Result<LiveBlocks<'m>> {
+        let inner = &self.h.inner;
+        inner.sync()?;
         guard(|| {
-            let rtx = self.inner.db.begin_read()?;
-            let root = read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)?.root;
+            let root = inner
+                .rlock()?
+                .snaps
+                .get(&self.id)
+                .ok_or(Error::NoSuchSnapshot)?
+                .info
+                .root;
+            let rtx = inner.db.begin_read()?;
             LiveBlocks::new(rtx.open_table(NODES)?, root, marker)
         })
     }
 
-    /// Runs several operations in one transaction: all commit together or none do.
+    /// Runs several operations as one atomic change: all apply or none do. The closure runs on the
+    /// calling thread while it holds the writer lock, so it may `put` blocks and then reference
+    /// them; the `before_sync` hook of any commit that carries this change runs after the closure.
+    /// Do not call this store from inside the closure other than through the `Tx`.
     pub fn batch<T>(&self, f: impl FnOnce(&mut Tx<'_>) -> Result<T>) -> Result<T> {
-        let id = self.id;
-        let node_max = self.inner.node_max;
-        let mut user_panic = None;
-        let res = self.inner.write(false, |wtx| {
-            let mut snaps = wtx.open_table(SNAPSHOTS)?;
-            let mut meta = wtx.open_table(META)?;
-            let info = read_snap(&snaps, id)?;
-            let next_ino = meta_get(&meta, "next_ino")?;
-            let mut tx = Tx {
-                w: NodeWriter::new(
-                    wtx.open_table(NODES)?,
-                    wtx.open_table(REFS)?,
-                    self.inner.cache.clone(),
-                ),
-                tree: MemTree::new(info.root, node_max),
-                next_ino,
-                now: Timestamp::now(),
-            };
-            let out = match catch_unwind(AssertUnwindSafe(|| f(&mut tx))) {
-                Ok(r) => r?,
-                Err(p) => {
-                    user_panic = Some(p);
-                    return Err(Error::Invalid("batch closure panicked"));
-                }
-            };
-            if tx.tree.unchanged() {
-                return Ok((out, false));
-            }
-            let new_root = tx.tree.flush(&mut tx.w)?;
-            if new_root != info.root {
-                tx.w.add_ref(new_root);
-                tx.w.drop_ref(info.root);
-            }
-            tx.w.settle()?;
-            if new_root != info.root {
-                let updated = SnapshotInfo {
-                    root: new_root,
-                    ..info
-                };
-                snaps.insert(id.0, encode_snap(&updated).as_slice())?;
-            }
-            meta.insert("next_ino", tx.next_ino)?;
-            Ok((out, true))
-        });
-        if let Some(p) = user_panic {
-            resume_unwind(p);
-        }
-        res
+        self.h.inner.mutate(self.id, f)
     }
 }

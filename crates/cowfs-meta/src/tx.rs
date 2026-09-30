@@ -1,19 +1,30 @@
-//! Mutating operations, run inside one redb write transaction.
+//! Mutating operations, applied to a snapshot's in-memory tree.
 
-use crate::ptree::{MemTree, NodeWriter};
-use crate::read::{self, Entry, Reader};
+use crate::ptree::{Entry, MemTree, NodeSource};
+use crate::read::{self, Reader};
 use crate::types::*;
 use crate::{Error, Result};
 use cowfs_store::ChunkRef;
+use std::collections::{HashMap, HashSet};
 
-/// A batch of operations on one snapshot, committed atomically.
+/// Hands out inode numbers below a durable high-water mark.
+#[derive(Debug)]
+pub(crate) struct InoAlloc {
+    pub(crate) next: u64,
+    pub(crate) reserved: u64,
+    pub(crate) block: u64,
+}
+
+/// A batch of operations on one snapshot, applied atomically.
 ///
-/// Obtained from [`Snapshot::batch`](crate::Snapshot::batch). Nothing is visible to other readers
-/// until the closure returns `Ok`; on `Err` every change is discarded.
+/// Obtained from [`Snapshot::batch`](crate::Snapshot::batch). Other readers see nothing until the
+/// closure returns `Ok`; on `Err` every change to the tree is discarded (inode numbers handed out
+/// inside the closure are still consumed and never reused).
 pub struct Tx<'a> {
-    pub(crate) w: NodeWriter<'a>,
-    pub(crate) tree: MemTree,
-    pub(crate) next_ino: u64,
+    pub(crate) tree: &'a mut MemTree,
+    pub(crate) src: &'a dyn NodeSource,
+    pub(crate) ino: &'a mut InoAlloc,
+    pub(crate) reserve: &'a dyn Fn(u64) -> Result<()>,
     pub(crate) now: Timestamp,
 }
 
@@ -25,31 +36,46 @@ impl std::fmt::Debug for Tx<'_> {
 
 impl Reader for Tx<'_> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.tree.get(&self.w, key)
+        self.tree.get(self.src, key)
     }
 
     fn seek_ge(&self, key: &[u8]) -> Result<Option<Entry>> {
-        self.tree.seek_ge(&self.w, key)
+        self.tree.seek_ge(self.src, key)
+    }
+
+    fn scan(&self, from: &[u8], prefix: &[u8], limit: usize) -> Result<Vec<Entry>> {
+        self.tree.scan(self.src, from, prefix, limit)
     }
 }
 
+const PAGE: usize = 512;
+
 impl Tx<'_> {
     fn put(&mut self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
-        self.tree.insert(&self.w, &key, val)
+        self.tree.insert(self.src, &key, val)
     }
 
     fn del(&mut self, key: &[u8]) -> Result<()> {
-        self.tree.remove(&self.w, key).map(|_| ())
+        self.tree.remove(self.src, key).map(|_| ())
     }
 
     fn put_inode(&mut self, ino: Ino, rec: &InodeRec) -> Result<()> {
         self.put(key(ino, K_INODE, &[]), rec.encode())
     }
 
-    fn alloc(&mut self) -> Ino {
-        let ino = Ino(self.next_ino);
-        self.next_ino += 1;
-        ino
+    fn alloc(&mut self) -> Result<Ino> {
+        let a = &mut *self.ino;
+        if a.next >= INO_LIMIT {
+            return Err(Error::LimitExceeded("inode numbers exhausted"));
+        }
+        if a.next >= a.reserved {
+            let new = (a.next + a.block.max(1)).min(INO_LIMIT);
+            (self.reserve)(new)?;
+            self.ino.reserved = new;
+        }
+        let ino = Ino(self.ino.next);
+        self.ino.next += 1;
+        Ok(ino)
     }
 
     fn new_rec(&self, kind: FileType, mode: u32, parent: Ino) -> InodeRec {
@@ -63,6 +89,8 @@ impl Tx<'_> {
             ctime: self.now,
             parent: parent.0,
             next_cookie: 1,
+            covered: 0,
+            cversion: 0,
         }
     }
 
@@ -98,16 +126,25 @@ impl Tx<'_> {
         self.put_inode(dir, &d)
     }
 
+    fn delete_prefix(&mut self, prefix: &[u8]) -> Result<()> {
+        loop {
+            let rows = self.scan(prefix, prefix, PAGE)?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            for (k, _) in rows {
+                self.del(&k)?;
+            }
+        }
+    }
+
     fn drop_inode(&mut self, ino: Ino, rec: &InodeRec) -> Result<Vec<ChunkRef>> {
         let chunks = if rec.kind == FileType::File {
             read::chunks(self, ino)?
         } else {
             Vec::new()
         };
-        let prefix = ino.0.to_be_bytes();
-        for (k, _) in self.scan(&prefix, &prefix, usize::MAX)? {
-            self.del(&k)?;
-        }
+        self.delete_prefix(&ino.0.to_be_bytes())?;
         Ok(chunks)
     }
 
@@ -166,9 +203,9 @@ impl Tx<'_> {
                 return Err(Error::TooBig);
             }
         }
-        let ino = self.alloc();
+        let ino = self.alloc()?;
         let mut rec = self.new_rec(kind, mode, dir);
-        let delta = if kind == FileType::Dir { 1 } else { 0 };
+        let delta = i64::from(kind == FileType::Dir);
         if let Some(t) = target {
             rec.size = t.len() as u64;
             self.put(key(ino, K_LINK, &[]), t.to_vec())?;
@@ -247,6 +284,10 @@ impl Tx<'_> {
     ///
     /// Returns what the replacement removed. Renaming a name onto another name of the same inode
     /// does nothing. A directory cannot move into its own subtree.
+    ///
+    /// Within one directory the entry keeps its cookie, so it keeps its place in listings and a
+    /// listing that renames every entry it sees still terminates. Moving to another directory gives
+    /// the entry a new cookie there (it appears once more at the end of that directory).
     pub fn rename(
         &mut self,
         from_dir: Ino,
@@ -302,8 +343,21 @@ impl Tx<'_> {
                 self.unref(dino)?
             });
         }
-        self.remove_entry(from_dir, from_name, scookie, -is_dir)?;
-        self.add_entry(to_dir, to_name, src, skind, is_dir)?;
+        if from_dir == to_dir {
+            self.del(&key(from_dir, K_NAME, from_name))?;
+            self.put(key(to_dir, K_NAME, to_name), name_val(src, skind, scookie))?;
+            self.put(
+                key(to_dir, K_COOKIE, &scookie.to_be_bytes()),
+                cookie_val(src, skind, to_name),
+            )?;
+            let mut d = read::inode(self, to_dir)?;
+            d.mtime = self.now;
+            d.ctime = self.now;
+            self.put_inode(to_dir, &d)?;
+        } else {
+            self.remove_entry(from_dir, from_name, scookie, -is_dir)?;
+            self.add_entry(to_dir, to_name, src, skind, is_dir)?;
+        }
         let mut rec = read::inode(self, src)?;
         rec.ctime = self.now;
         if skind == FileType::Dir {
@@ -313,7 +367,11 @@ impl Tx<'_> {
         Ok(replaced)
     }
 
-    /// Changes mode, times, or size. Shrinking a file must land on a chunk boundary.
+    /// Changes mode, times, or size.
+    ///
+    /// Growing makes a trailing hole. Shrinking a file below its chunk-covered length must land on
+    /// a chunk boundary, otherwise it fails with [`Error::NeedsRechunk`]: the caller re-chunks the
+    /// tail, `put`s the new tail block and calls `splice_content` (or `set_content`).
     pub fn setattr(&mut self, ino: Ino, set: SetAttr) -> Result<Attr> {
         let mut rec = read::inode(self, ino)?;
         if let Some(size) = set.size {
@@ -323,25 +381,18 @@ impl Tx<'_> {
                 FileType::File => {}
             }
             if size != rec.size {
-                let chunks = read::chunks(self, ino)?;
-                let total: u64 = chunks.iter().map(|c| u64::from(c.len)).sum();
-                if size < total {
-                    let mut acc = 0u64;
-                    let mut keep = (size == 0).then_some(0);
-                    for (i, c) in chunks.iter().enumerate() {
-                        if keep.is_some() || acc >= size {
-                            break;
-                        }
-                        acc += u64::from(c.len);
-                        if acc == size {
-                            keep = Some(i + 1);
-                        }
+                if size < rec.covered {
+                    let at = key(ino, K_CHUNK, &size.to_be_bytes());
+                    match self.seek_ge(&at)? {
+                        Some((k, _)) if k == at => {}
+                        _ => return Err(Error::NeedsRechunk),
                     }
-                    let keep = keep.ok_or(Error::Invalid("size must be a chunk boundary"))?;
-                    self.write_chunks(ino, &chunks[..keep])?;
+                    self.remove_extents_from(ino, size)?;
+                    rec.covered = size;
                 }
                 rec.size = size;
                 rec.mtime = self.now;
+                rec.cversion += 1;
             }
         }
         if let Some(mode) = set.mode {
@@ -358,48 +409,133 @@ impl Tx<'_> {
         Ok(rec.attr(ino))
     }
 
-    fn write_chunks(&mut self, ino: Ino, chunks: &[ChunkRef]) -> Result<()> {
+    fn remove_extents_from(&mut self, ino: Ino, from_off: u64) -> Result<()> {
         let prefix = key(ino, K_CHUNK, &[]);
-        let old = self.scan(&prefix, &prefix, usize::MAX)?;
-        let new: Vec<Entry> = chunks
-            .chunks(CHUNKS_PER_SEGMENT)
-            .enumerate()
-            .map(|(i, seg)| {
-                (
-                    key(ino, K_CHUNK, &(i as u32).to_be_bytes()),
-                    encode_chunks(seg),
-                )
-            })
-            .collect();
-        for (i, e) in new.iter().enumerate() {
-            if old.get(i) != Some(e) {
-                self.put(e.0.clone(), e.1.clone())?;
+        let from = key(ino, K_CHUNK, &from_off.to_be_bytes());
+        loop {
+            let rows = self.scan(&from, &prefix, PAGE)?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            for (k, _) in rows {
+                self.del(&k)?;
             }
         }
-        for (k, _) in old.iter().skip(new.len()) {
-            self.del(k)?;
-        }
-        Ok(())
     }
 
-    /// Replaces a file's chunk list and size. `size` may exceed the chunk total (a trailing hole).
-    pub fn set_content(&mut self, ino: Ino, chunks: &[ChunkRef], size: u64) -> Result<Attr> {
-        let mut rec = read::inode(self, ino)?;
+    fn put_extent(&mut self, ino: Ino, off: u64, c: &ChunkRef) -> Result<()> {
+        self.put(
+            key(ino, K_CHUNK, &off.to_be_bytes()),
+            encode_chunks(std::slice::from_ref(c)),
+        )
+    }
+
+    fn file_rec(&self, ino: Ino) -> Result<InodeRec> {
+        let rec = read::inode(self, ino)?;
         match rec.kind {
-            FileType::Dir => return Err(Error::IsDir),
-            FileType::Symlink => return Err(Error::Invalid("not a regular file")),
-            FileType::File => {}
+            FileType::Dir => Err(Error::IsDir),
+            FileType::Symlink => Err(Error::Invalid("not a regular file")),
+            FileType::File => Ok(rec),
         }
+    }
+
+    /// Replaces a file's whole chunk list and size. `size` may exceed the chunk total (a trailing
+    /// hole). Last writer wins; use [`Tx::splice_content`] for a compare-and-swap.
+    pub fn set_content(&mut self, ino: Ino, chunks: &[ChunkRef], size: u64) -> Result<Attr> {
+        let mut rec = self.file_rec(ino)?;
         let total: u64 = chunks.iter().map(|c| u64::from(c.len)).sum();
         if size < total {
             return Err(Error::Invalid("size smaller than chunk list"));
         }
-        self.write_chunks(ino, chunks)?;
+        let old: HashMap<u64, ChunkRef> =
+            read::extents(self, ino, 0, u64::MAX)?.into_iter().collect();
+        let mut keep = HashSet::new();
+        let mut off = 0u64;
+        for c in chunks {
+            if old.get(&off) != Some(c) {
+                self.put_extent(ino, off, c)?;
+            }
+            keep.insert(off);
+            off += u64::from(c.len);
+        }
+        for o in old.keys().filter(|o| !keep.contains(o)) {
+            self.del(&key(ino, K_CHUNK, &o.to_be_bytes()))?;
+        }
+        rec.covered = total;
         rec.size = size;
         rec.mtime = self.now;
         rec.ctime = self.now;
+        rec.cversion += 1;
         self.put_inode(ino, &rec)?;
         Ok(rec.attr(ino))
+    }
+
+    /// Replaces the chunks covering bytes `start..end` of a file with `new_chunks` and sets the
+    /// file size, if the file's content version is still `expected_version`.
+    ///
+    /// `start` and `end` must be chunk boundaries and `end` at most the chunk-covered length. A
+    /// splice that does not reach the end of the chunk list must keep the byte length; one that
+    /// does (an append or a tail replacement) may change it. Cost is proportional to the chunks
+    /// removed and added plus the tree depth, not to the file. Returns the new content version.
+    ///
+    /// Errors: [`Error::Conflict`] if the version moved on, [`Error::Invalid`] for a bad range.
+    pub fn splice_content(
+        &mut self,
+        ino: Ino,
+        expected_version: u64,
+        start: u64,
+        end: u64,
+        new_chunks: &[ChunkRef],
+        new_size: u64,
+    ) -> Result<u64> {
+        let mut rec = self.file_rec(ino)?;
+        if rec.cversion != expected_version {
+            return Err(Error::Conflict);
+        }
+        if start > end || end > rec.covered {
+            return Err(Error::Invalid("splice range outside the chunk list"));
+        }
+        let old = read::extents(self, ino, start, end)?;
+        let old_len: u64 = old.iter().map(|(_, c)| u64::from(c.len)).sum();
+        let on_boundary = old.first().is_none_or(|(o, _)| *o == start);
+        if !on_boundary || old_len != end - start {
+            return Err(Error::Invalid("splice range is not on chunk boundaries"));
+        }
+        let new_len: u64 = new_chunks.iter().map(|c| u64::from(c.len)).sum();
+        if end < rec.covered && new_len != end - start {
+            return Err(Error::Invalid(
+                "splice before the end must keep the byte length",
+            ));
+        }
+        let covered = rec.covered - (end - start) + new_len;
+        if new_size < covered {
+            return Err(Error::Invalid("size smaller than chunk list"));
+        }
+        let mut off = start;
+        let mut want = HashMap::new();
+        for c in new_chunks {
+            want.insert(off, *c);
+            off += u64::from(c.len);
+        }
+        let old_map: HashMap<u64, ChunkRef> = old.into_iter().collect();
+        for o in old_map.keys().filter(|o| !want.contains_key(*o)) {
+            self.del(&key(ino, K_CHUNK, &o.to_be_bytes()))?;
+        }
+        let mut puts: Vec<_> = want
+            .iter()
+            .filter(|(o, c)| old_map.get(o) != Some(c))
+            .collect();
+        puts.sort_by_key(|(o, _)| **o);
+        for (o, c) in puts {
+            self.put_extent(ino, *o, c)?;
+        }
+        rec.covered = covered;
+        rec.size = new_size;
+        rec.mtime = self.now;
+        rec.ctime = self.now;
+        rec.cversion += 1;
+        self.put_inode(ino, &rec)?;
+        Ok(rec.cversion)
     }
 
     /// Sets an extended attribute.
@@ -443,9 +579,24 @@ impl Tx<'_> {
         read::readdir(self, dir, cookie, max)
     }
 
-    /// A file's chunk list.
+    /// A file's whole chunk list.
     pub fn chunks(&self, ino: Ino) -> Result<Vec<ChunkRef>> {
         read::chunks(self, ino)
+    }
+
+    /// The chunks starting in byte range `start..end`, with the content version they were read at.
+    pub fn chunk_range(&self, ino: Ino, start: u64, end: u64) -> Result<ChunkRange> {
+        read::chunk_range(self, ino, start, end)
+    }
+
+    /// The content version of a file (see [`Tx::splice_content`]).
+    pub fn content_version(&self, ino: Ino) -> Result<u64> {
+        read::content_version(self, ino)
+    }
+
+    /// Target of a symlink.
+    pub fn readlink(&self, ino: Ino) -> Result<Vec<u8>> {
+        read::readlink(self, ino)
     }
 }
 

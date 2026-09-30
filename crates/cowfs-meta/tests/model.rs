@@ -19,6 +19,8 @@ fn kind_name(e: &Error) -> &'static str {
         Error::IsDir => "IsDir",
         Error::NotEmpty => "NotEmpty",
         Error::Invalid(_) => "Invalid",
+        Error::NeedsRechunk => "NeedsRechunk",
+        Error::Conflict => "Conflict",
         Error::NameTooLong => "NameTooLong",
         Error::NoAttr => "NoAttr",
         Error::TooBig => "TooBig",
@@ -38,6 +40,7 @@ struct MI {
     target: Vec<u8>,
     entries: Vec<(Vec<u8>, u64)>,
     parent: u64,
+    version: u64,
 }
 
 impl MI {
@@ -51,6 +54,7 @@ impl MI {
             target: Vec::new(),
             entries: Vec::new(),
             parent,
+            version: 0,
         }
     }
 }
@@ -333,8 +337,14 @@ impl Model {
                 t.unref(d)
             });
         }
-        t.detach(fd, fname);
-        t.attach(td, tname, src);
+        if fd == td {
+            let d = t.inodes.get_mut(&fd).unwrap();
+            let at = d.entries.iter().position(|(n, _)| n == fname).unwrap();
+            d.entries[at].0 = tname.to_vec();
+        } else {
+            t.detach(fd, fname);
+            t.attach(td, tname, src);
+        }
         if skind == FileType::Dir {
             t.inodes.get_mut(&src).unwrap().parent = td;
         }
@@ -355,7 +365,58 @@ impl Model {
         let i = t.inodes.get_mut(&ino).unwrap();
         i.chunks = chunks.to_vec();
         i.size = size;
+        i.version += 1;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn splice(
+        &mut self,
+        s: &str,
+        ino: u64,
+        expected: u64,
+        start: u64,
+        end: u64,
+        new: &[ChunkRef],
+        size: u64,
+    ) -> R<u64> {
+        let t = self.snaps.get_mut(s).unwrap();
+        match t.ino(ino)?.kind {
+            FileType::Dir => return Err("IsDir"),
+            FileType::Symlink => return Err("Invalid"),
+            FileType::File => {}
+        }
+        let i = t.inodes.get_mut(&ino).unwrap();
+        if i.version != expected {
+            return Err("Conflict");
+        }
+        let covered: u64 = i.chunks.iter().map(|c| u64::from(c.len)).sum();
+        if start > end || end > covered {
+            return Err("Invalid");
+        }
+        let mut bounds = vec![0u64];
+        for c in &i.chunks {
+            bounds.push(bounds.last().unwrap() + u64::from(c.len));
+        }
+        if start != end && !(bounds.contains(&start) && bounds.contains(&end)) {
+            return Err("Invalid");
+        }
+        let new_len: u64 = new.iter().map(|c| u64::from(c.len)).sum();
+        if end < covered && new_len != end - start {
+            return Err("Invalid");
+        }
+        let nc = covered - (end - start) + new_len;
+        if size < nc {
+            return Err("Invalid");
+        }
+        if start != end || !new.is_empty() {
+            let from = bounds.iter().position(|b| *b == start).unwrap_or(0);
+            let to = bounds.iter().position(|b| *b == end).unwrap_or(from);
+            i.chunks.splice(from..to, new.iter().copied());
+        }
+        i.size = size;
+        i.version += 1;
+        Ok(i.version)
     }
 
     fn setattr(&mut self, s: &str, ino: u64, set: &SetAttr) -> R<()> {
@@ -382,10 +443,11 @@ impl Model {
                             keep = Some(n + 1);
                         }
                     }
-                    let keep = keep.ok_or("Invalid")?;
+                    let keep = keep.ok_or("NeedsRechunk")?;
                     i.chunks.truncate(keep);
                 }
                 i.size = size;
+                i.version += 1;
             }
         }
         if let Some(m) = set.mode {
@@ -410,6 +472,17 @@ enum Op {
         cnt: usize,
         seed: u8,
         hole: u8,
+    },
+    Splice {
+        s: usize,
+        i: usize,
+        a: usize,
+        b: usize,
+        skew: bool,
+        cnt: usize,
+        seed: u8,
+        hole: u8,
+        stale: bool,
     },
     Rename {
         s: usize,
@@ -468,6 +541,8 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(s, d, n, k, t)| Op::Create { s, d, n, k, t }),
         4 => (u.clone(), u.clone(), 0usize..6, any::<u8>(), 0u8..4)
             .prop_map(|(s, i, cnt, seed, hole)| Op::SetContent { s, i, cnt, seed, hole }),
+        4 => (u.clone(), u.clone(), 0usize..8, 0usize..8, any::<bool>(), 0usize..4, any::<u8>(), 0u8..3, proptest::bool::weighted(0.15))
+            .prop_map(|(s, i, a, b, skew, cnt, seed, hole, stale)| Op::Splice { s, i, a, b, skew, cnt, seed, hole, stale }),
         3 => (u.clone(), u.clone(), u.clone(), u.clone(), u.clone())
             .prop_map(|(s, fd, fnm, td, tn)| Op::Rename { s, fd, fnm, td, tn }),
         3 => (u.clone(), u.clone(), u.clone(), u.clone())
@@ -583,7 +658,10 @@ fn verify(m: &Meta, model: &Model) -> Result<(), TestCaseError> {
                 name
             );
             match mi.kind {
-                FileType::File => prop_assert_eq!(&s.chunks(Ino(ino)).unwrap(), &mi.chunks),
+                FileType::File => {
+                    prop_assert_eq!(&s.chunks(Ino(ino)).unwrap(), &mi.chunks);
+                    prop_assert_eq!(s.content_version(Ino(ino)).unwrap(), mi.version);
+                }
                 FileType::Symlink => prop_assert_eq!(&s.readlink(Ino(ino)).unwrap(), &mi.target),
                 FileType::Dir => {
                     prop_assert_eq!(s.lookup(Ino(ino), b"..").unwrap().ino.0, mi.parent);
@@ -671,6 +749,45 @@ fn run(ops: &[Op], node_size: usize) -> Result<(), TestCaseError> {
                     "set_content",
                     real.map(|_| ()),
                     model.set_content(&sn, ino, &cs, size),
+                )?;
+            }
+            Op::Splice {
+                s,
+                i,
+                a,
+                b,
+                skew,
+                cnt,
+                seed,
+                hole,
+                stale,
+            } => {
+                let sn = sname(*s);
+                let snap = m.snapshot(&sn).unwrap();
+                let ino = pick(&model.snaps[&sn], *i);
+                let (version, bounds) = match model.snaps[&sn].inodes.get(&ino) {
+                    Some(mi) => {
+                        let mut bounds = vec![0u64];
+                        for c in &mi.chunks {
+                            bounds.push(bounds.last().unwrap() + u64::from(c.len));
+                        }
+                        (mi.version, bounds)
+                    }
+                    None => (0, vec![0]),
+                };
+                let (from, to) = (bounds[a % bounds.len()], bounds[b % bounds.len()]);
+                let start = from + u64::from(*skew);
+                let cs = chunks(*cnt, *seed);
+                let new_len: u64 = cs.iter().map(|c| u64::from(c.len)).sum();
+                let covered = *bounds.last().unwrap();
+                let size =
+                    covered.saturating_sub(to.saturating_sub(start)) + new_len + u64::from(*hole);
+                let expected = if *stale { version + 1 } else { version };
+                let real = snap.splice_content(Ino(ino), expected, start, to, &cs, size);
+                same(
+                    "splice",
+                    real,
+                    model.splice(&sn, ino, expected, start, to, &cs, size),
                 )?;
             }
             Op::Rename { s, fd, fnm, td, tn } => {
