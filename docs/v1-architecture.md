@@ -10,11 +10,16 @@ The spike results in `docs/spikes/` are the evidence behind the numbers here.
 |---|---|---|
 | `cowfs-store` | #7, later #10 | Chunking, BLAKE3, zstd, append-only packs, block index, fsck |
 | `cowfs-meta` | #8, #9 | redb-backed inode tables, directories, Merkle root, O(1) snapshots |
+| `cowfs-vfs` | new | The `Vfs` trait, shared types, errors and name validation |
+| `cowfs-vfs-test` | new | `MemVfs` reference implementation and a generic conformance suite that every `Vfs` must pass |
+| `cowfs-core` | new | Implements `Vfs` over `store` and `meta`: file reads and writes, write-back cache, re-chunking, open-handle tracking, snapshot namespace at the mount root |
 | `cowfs-gc` | #10 | Mark and sweep over snapshot roots (not yet created) |
-| `cowfs-fuse`, `cowfs-nfs` | #11, #12 | Mount adapters (not yet created) |
-| `cowfs-cli` | #13, #14 | CLI, control API, `import` (not yet created) |
+| `cowfs-fuse`, `cowfs-nfs` | #11, #12 | Mount adapters, each a thin translation between the kernel protocol and `Vfs` |
+| `cowfs-cli` | #13, #14 | CLI, Unix-socket control API, `import` |
 
-Dependency direction: mounts and CLI depend on `meta` and `store`.
+Dependency direction: mount adapters depend only on `vfs`, so they can be built and tested against `MemVfs` before the core exists.
+`core` implements `vfs` and depends on `meta` and `store`.
+The CLI and control API depend on `core`.
 `meta` depends on `store` for the `BlockId` and `ChunkRef` types only.
 `meta` never writes blocks.
 The caller ingests file data through `store` and hands `meta` the resulting chunk list.
@@ -24,6 +29,37 @@ Shared types live in `cowfs-store`:
 
 - `BlockId`: BLAKE3-256 of the uncompressed bytes of a block.
 - `ChunkRef { id, len }`: one chunk of a file.
+
+## cowfs-vfs contract
+
+- `Vfs` is synchronous, inode-based, `Send + Sync`, with `&self` methods.
+  Mount adapters that are async (the NFS server) call it from blocking tasks.
+- `Ino` is opaque and unique per live file across the whole mount, including across snapshots.
+  Two snapshots that share content must report different inode numbers, or tools such as `find -samefile` and `rsync -H` would treat them as hardlinks.
+- An `Ino` is never reused for a different file within a mount's lifetime.
+  NFS filehandles and kernel dentry caches outlive the file, and a reused number would let a stale handle read another file's bytes (found in the spike 12 critic review).
+  Every `Vfs` implementation must guarantee this, and the conformance suite should check it.
+- The mount root lists the snapshots as directories (`/<snapshot>/`).
+  That synthetic layer belongs to `cowfs-core`, not to the adapters.
+- Snapshot creation, removal, garbage collection and fsck are control-plane operations and are not part of `Vfs`.
+- Reads and writes are by inode.
+  `open` and `release` exist to pin an inode so that an unlinked file stays usable, and NFS, which is stateless, never needs them.
+- `readdir` excludes `.` and `..` and uses cookies that stay valid while entries come and go (the spike 2 bug).
+- Every `Vfs` implementation must pass the conformance suite in `cowfs-vfs-test`, and the suite is where POSIX semantics are pinned down.
+
+### Deliberately not in the `Vfs` trait
+
+These were raised as gaps by the adapter builders and judged correct as they are, so they are not to be re-filed:
+
+- `lookup_parent`: both adapters keep their own parent map, because they need the parent after a rename, which a point-in-time query cannot give.
+- `access` and permission enforcement: adapters check mode bits themselves.
+- `uid` and `gid` in `SetAttr`: adding them invites implementers to honour `chown`. It is accepted and ignored.
+- An async trait: the trait is synchronous, and async adapters call it from blocking tasks.
+- `fallocate`, `copy_file_range`, hole queries (`SEEK_HOLE`), `RENAME_EXCHANGE`, special files, `dev` and `rdev`, and locks: adapters answer `ENOTSUP` or let the kernel handle them.
+- Core's hole flag, virtual inode alias table and snapshot rename belong to `cowfs-store`, `cowfs-core` and the control plane, not to `Vfs`.
+
+`Error` and `FileKind` are `#[non_exhaustive]`, so later variants are not breaking changes.
+`readdir_attrs` has a default implementation and can be overridden when attributes are cheap.
 
 ## cowfs-store contract
 

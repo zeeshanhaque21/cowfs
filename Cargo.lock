@@ -91,6 +91,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cowfs-vfs"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

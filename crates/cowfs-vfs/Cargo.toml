@@ -1,0 +1,15 @@
+[package]
+name = "cowfs-vfs"
+description = "The filesystem interface between cowfs mount adapters and the core: trait, types, errors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"
+thiserror.workspace = true
+
+[lints]
+workspace = true
