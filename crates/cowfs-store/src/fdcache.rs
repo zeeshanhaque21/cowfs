@@ -81,6 +81,14 @@ impl FdCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn has(&self, id: u32) -> bool {
+        self.map
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn cached(&self) -> usize {
         self.map
             .read()
@@ -104,6 +112,7 @@ mod tests {
         for i in 0..10 {
             c.get(i).unwrap();
             assert!(c.cached() <= 3);
+            assert!(c.has(i), "the handle just opened must stay cached");
         }
         assert!(c.get(99).is_err());
     }
