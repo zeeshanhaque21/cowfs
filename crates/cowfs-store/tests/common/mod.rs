@@ -83,3 +83,65 @@ pub fn copy_store(from: &Path, to: &Path) {
         fs::copy(index_path(from), index_path(to)).unwrap();
     }
 }
+
+pub struct Fixture {
+    pub blocks: Vec<(BlockId, Vec<u8>)>,
+    pub packs: Vec<Vec<u8>>,
+    pub index: Vec<u8>,
+}
+
+/// Build a store from `(len, compressible)` specs, synced and checkpointed, and return its files.
+pub fn fixture(specs: &[(usize, bool)], max_pack_size: u64) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let mut blocks = Vec::new();
+    {
+        let s = cowfs_store::Store::open(
+            dir.path(),
+            Options {
+                max_pack_size,
+                checkpoint_on_drop: false,
+            },
+        )
+        .unwrap();
+        for (i, &(len, comp)) in specs.iter().enumerate() {
+            let seed = 1000 + i as u64;
+            let d = if comp {
+                compressible(seed, len)
+            } else {
+                random(seed, len)
+            };
+            blocks.push((s.put(&d).unwrap(), d));
+        }
+        s.sync().unwrap();
+        s.checkpoint().unwrap();
+    }
+    let packs = pack_ids(dir.path())
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| {
+            assert_eq!(i as u32, id);
+            fs::read(pack_path(dir.path(), id)).unwrap()
+        })
+        .collect();
+    let index = fs::read(index_path(dir.path())).unwrap();
+    Fixture {
+        blocks,
+        packs,
+        index,
+    }
+}
+
+/// Replace the contents of the store's `packs/` directory and its index file.
+pub fn install(dir: &Path, packs: &[(u32, &[u8])], index: Option<&[u8]>) {
+    fs::create_dir_all(dir.join("packs")).unwrap();
+    for e in fs::read_dir(dir.join("packs")).unwrap() {
+        fs::remove_file(e.unwrap().path()).unwrap();
+    }
+    for (id, bytes) in packs {
+        fs::write(pack_path(dir, *id), bytes).unwrap();
+    }
+    let _ = fs::remove_file(index_path(dir));
+    if let Some(bytes) = index {
+        fs::write(index_path(dir), bytes).unwrap();
+    }
+}
