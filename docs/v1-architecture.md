@@ -36,6 +36,9 @@ Shared types live in `cowfs-store`:
   Mount adapters that are async (the NFS server) call it from blocking tasks.
 - `Ino` is opaque and unique per live file across the whole mount, including across snapshots.
   Two snapshots that share content must report different inode numbers, or tools such as `find -samefile` and `rsync -H` would treat them as hardlinks.
+- An `Ino` is never reused for a different file within a mount's lifetime.
+  NFS filehandles and kernel dentry caches outlive the file, and a reused number would let a stale handle read another file's bytes (found in the spike 12 critic review).
+  Every `Vfs` implementation must guarantee this, and the conformance suite should check it.
 - The mount root lists the snapshots as directories (`/<snapshot>/`).
   That synthetic layer belongs to `cowfs-core`, not to the adapters.
 - Snapshot creation, removal, garbage collection and fsck are control-plane operations and are not part of `Vfs`.
