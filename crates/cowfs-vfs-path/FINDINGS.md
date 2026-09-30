@@ -1,7 +1,8 @@
 # cowfs-vfs-path findings (#34)
 
 `PathVfs` runs the conformance suite on native filesystems as a control and through the mounted FUSE and NFS adapters.
-Round 2 uses the revised suite (127 checks, levels Posix, Portable, Cowfs) merged from `v1/vfs-test` at 83b9a57.
+Round 3 uses the suite merged from `main` (133 checks: 56 Posix, 24 Portable, 53 Cowfs).
+The native Posix runs and the 18 mutants were repeated after the round 3 fixes.
 Every number below is from a run whose log was read.
 Suite and adapter sources were not touched.
 Single run per environment, except where a repeat count is given.
@@ -23,19 +24,33 @@ No adapter branch was modified.
 
 ## Posix level (56 checks)
 
+Round 3, one run each with the current tree, heavy checks on, per-check timeout 300 s
+(the harness sets it, `COWFS_CONFORMANCE_TIMEOUT_SECS` overrides):
+
 | environment | ran | failed |
 |---|---|---|
 | APFS | 56 | 0 |
-| APFS-cs | 56 | 0 |
 | btrfs | 56 | 0 |
-| ext4 | 56 | 0 |
+| ext4 (loop image, unmounted afterwards) | 56 | 0 |
+
+Round 2, older suite revision, one run each:
+
+| environment | ran | failed |
+|---|---|---|
+| APFS-cs | 56 | 0 |
 | FUSE mount | 56 | 0 |
 | NFS mount | 56 | 10 |
 | NFS raw, default (`AppleDoubleMode::Translate`) | 56 | 1 |
 | NFS raw, `AppleDoubleMode::Store` | 56 | 0 |
 
-No check tagged Posix fails on a native filesystem.
-The level holds on APFS, btrfs and ext4 as far as one run each shows.
+No check tagged Posix fails on a native filesystem, in round 2 or round 3.
+`hardlink_pairs_8000_listed_once_and_removed` is the one that used to flip: it is 39 to 60 s on
+this loaded machine, against a 60 s default timeout, and the control harness now gives every
+check 300 s (`tests/common/mod.rs`).
+Root cause of the cost is the machine, not the crate: `std::fs::hard_link` costs about 900 us per
+call in a 16,000 entry directory here, and `PathVfs` costs 850 us, so the check is at
+filesystem speed. Paging a 16,000 entry directory is 0.16 s at page size 1 and 0.7 s at page
+1000, after the per-page listing rebuild was removed.
 
 NFS mount, the 10 Posix failures, all macOS client behaviour and none an adapter defect on the evidence here:
 - Silly rename (an unlinked file that is still open stays as `.nfs.<id>` until closed, and `rmdir` of its directory is ENOTEMPTY): `mkdir_rmdir_errors`, `readdir_delete_returned_entries_between_pages`, `readdir_delete_upcoming_entries_between_pages`, `readdir_delete_everything_between_pages`, `rename_file_over_file`, `lookup_nlink_is_fresh`, `hardlink_unlink_one_other_survives`, `hardlink_across_directories`, `hardlink_pairs_8000_listed_once_and_removed`.
@@ -207,6 +222,69 @@ Class N.
 - `xattr_shared_by_hardlinks` failed once in a round-1 run with `actimeo=0` (NoAttr through the second name) and passed in every other run, including round 2. Not reproduced, cause unknown.
 - `rename_dir_over_empty_dir` on the NFS mount failed with `nlink 2, want 0` in one run and `Stale` in another, so it depends on attribute caching; not pinned down further.
 
+## Round 3: the review of PR #35 (failing-before evidence from the pre-fix tree)
+
+Every regression test below was run against the pre-fix tree; the messages are what it printed.
+
+| finding | fixed | test | failing before |
+|---|---|---|---|
+| F1 leaked node and descriptor for a file with an untracked hardlink | yes | `a_hardlink_made_outside_the_vfs_does_not_keep_the_node_forever` | `nodes left after forgetting every file: left: 301, right: 1` (critic measured 300 of 300 live and +445 descriptors) |
+| F1 an `Ino` could be reused for a different file | yes | `an_inode_number_the_backing_filesystem_reuses_gets_a_new_ino`, `an_inode_number_is_never_handed_out_twice` | mutant `ino_reused`: KILLED by the first |
+| F8 `Some(EACCES \| EPERM \| EROFS)` is `Some(31)` | yes | `a_pinned_descriptor_lets_a_read_only_file_be_written_after_the_cache_is_cold`, `readonly_file_is_writable_after_the_descriptor_cache_is_cold` | `write cold: PermissionDenied` |
+| F9 cached listing missed changes made outside the Vfs | yes | `readdir_sees_a_name_created_outside_the_vfs_while_a_listing_is_paged` | `left: [[97],[98],[99],[100]], right: [[97],[98],[99],[100],[101]]` (the externally created name never appeared) |
+| F3 reopen after a symlink was swapped into the name | yes | `reopening_a_file_never_follows_a_symlink_swapped_into_its_name` | `read: Io("Too many levels of symbolic links (os error 62)")` |
+| F3 `fchmodat` could follow a swapped symlink | yes | `mode_never_lands_on_a_symlink_target` | mode now goes through an `O_NOFOLLOW` descriptor; `fchmodat` is gone |
+| F4 `hardlink_pairs_8000` marginal against the timeout | yes | (timing, `tests/common/mod.rs` and the per-page rebuild) | 140 s, 242 s and 313 s in three runs before the rebuild; 39 to 60 s after, with a 300 s timeout |
+| F5 one lock over the whole table | partly | (measured) | critic: a `getattr` waited 1.78 s behind one `readdir` of a 50,000 entry directory; now 3.3 ms worst case at page size 1 and 3 us at page 1000 |
+| F7 unbounded `listxattr` retry, `ENOSYS` unmapped, `write` offset guard | yes | (bounded retry, mapping, guard) | - |
+| trait: `#[non_exhaustive]` `Error` and `FileKind`, `readdir_attrs` | yes | - | - |
+
+Two more fixes came out of round 3:
+- `read` above 64 MiB no longer looks like the end of the file: the cap is a per-syscall chunk
+  and the loop fills the caller's buffer (`read_above_the_cap_is_not_mistaken_for_the_end_of_the_file`).
+- xattr names are validated on all four entry points, not just `setxattr`.
+
+## Mutation run: can this control fail?
+
+18 mutants, each a one-line patch in its own copy of the tree, its own `CARGO_TARGET_DIR`,
+its own native directory, unit tests then the Posix level under a hard timeout
+(`spikes/nfs-loopback/out/pathvfs/mut/run_mutations.py`). Killed means the crate's unit tests
+or the Posix-level run failed.
+
+| mutant | killed by |
+|---|---|
+| `hardlink_by_path` | unit: hardlink identity, reclaim |
+| `ino_per_name` | unit |
+| `write_ignores_offset` | unit: two tests |
+| `cookie_unstable` | unit: cookie tests |
+| `setattr_follows_symlink` | Posix: `symlink_dangling_ok`, symlink times |
+| `path_based_open` | SURVIVED |
+| `mode_unmasked` | SURVIVED |
+| `forget_drops_nothing` | unit: three lifecycle tests |
+| `unlink_closes_fd` | unit: three lifecycle tests |
+| `rename_no_table_update` | unit: rename reachability |
+| `create_skips_validate` | unit: name validation on 9 entry points |
+| `no_reclaim` | unit: three lifecycle tests |
+| `xattr_follows` | SURVIVED |
+| `readdir_max_zero_ok` | unit |
+| `external_change_blind` | unit |
+| `ino_reused` | unit |
+| `no_pinned_rw` | unit: read-only write after cold cache |
+| `reopen_without_identity` | unit: inode identity after a name is taken over |
+
+15 of 18 killed. The critic's run of the same 13 mutants killed 5.
+The three survivors, and why:
+- `path_based_open` (drops `O_NOFOLLOW` from every reopen): two independent defences catch it,
+  the identity re-verification on the reopened descriptor and the scan for the file by identity
+  in its parents. Killing it needs a race between the identity check and the open, which is not
+  a deterministic test.
+- `mode_unmasked` (no `MODE_MASK` on setattr): unobservable on any POSIX filesystem, because
+  `chmod` ignores the file-type bits itself. `setattr_masks_the_mode_on_the_backing_filesystem_too`
+  asserts it anyway.
+- `xattr_follows` (the Linux symlink branch of `with_xattr`): on macOS the code is compiled out,
+  and on Linux `lgetxattr`/`lsetxattr` do not follow a final symlink and `fgetxattr` on an
+  `O_PATH` descriptor cannot. Not expressible as a mutation.
+
 ## PathVfs bugs the runs found (all fixed, all with tests where a filesystem is not needed)
 
 - `readdir` rebuilt the sorted snapshot on every page, so `hardlink_pairs_8000` timed out at 300 s on APFS. Now a per-directory listing is cached and dropped on every change to that directory.
@@ -221,6 +299,12 @@ Class N.
 
 - Unlinking the last known name of a file that cannot be reopened (mode 000) while a reference remains makes the inode `Stale` early.
 - `RENAME_EXCL` is not emulated where the filesystem lacks it (NFS client).
+- `setattr` is not atomic: `size`, then times, then mode, each applied in turn.
+- A node whose mode has no owner write bit holds a writable descriptor for as long as it is
+  referenced, because nothing can reopen such a file for writing later; the cost is one
+  descriptor per deliberately read-only file that is still referenced.
+- The inode table is still one lock, so one `readdir` holds it for one `list_dir` plus one
+  `fstatat` per returned entry (3.3 ms for a 50,000 entry directory at page size 1).
 - Symlink xattrs on Linux go through `/proc/self/fd`.
 - One lock guards the inode table.
 - Unit tests: 16, in the crate.
