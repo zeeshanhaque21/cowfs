@@ -47,6 +47,20 @@ Shared types live in `cowfs-store`:
 - `readdir` excludes `.` and `..` and uses cookies that stay valid while entries come and go (the spike 2 bug).
 - Every `Vfs` implementation must pass the conformance suite in `cowfs-vfs-test`, and the suite is where POSIX semantics are pinned down.
 
+### Deliberately not in the `Vfs` trait
+
+These were raised as gaps by the adapter builders and judged correct as they are, so they are not to be re-filed:
+
+- `lookup_parent`: both adapters keep their own parent map, because they need the parent after a rename, which a point-in-time query cannot give.
+- `access` and permission enforcement: adapters check mode bits themselves.
+- `uid` and `gid` in `SetAttr`: adding them invites implementers to honour `chown`. It is accepted and ignored.
+- An async trait: the trait is synchronous, and async adapters call it from blocking tasks.
+- `fallocate`, `copy_file_range`, hole queries (`SEEK_HOLE`), `RENAME_EXCHANGE`, special files, `dev` and `rdev`, and locks: adapters answer `ENOTSUP` or let the kernel handle them.
+- Core's hole flag, virtual inode alias table and snapshot rename belong to `cowfs-store`, `cowfs-core` and the control plane, not to `Vfs`.
+
+`Error` and `FileKind` are `#[non_exhaustive]`, so later variants are not breaking changes.
+`readdir_attrs` has a default implementation and can be overridden when attributes are cheap.
+
 ## cowfs-store contract
 
 ### Chunking
