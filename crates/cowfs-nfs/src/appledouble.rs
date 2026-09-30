@@ -29,6 +29,7 @@ const VERSION: u32 = 0x0002_0000;
 const FILLER: &[u8; 16] = b"Mac OS X        ";
 const ATTR_MAGIC: u32 = 0x4154_5452;
 const AD_RESOURCE: u32 = 2;
+const AD_REALNAME: u32 = 3;
 const AD_FINDERINFO: u32 = 9;
 const ENTRIES_AT: usize = 26;
 const FINFO_AT: usize = 50;
@@ -94,9 +95,11 @@ pub fn is_plausible_prefix(buf: &[u8]) -> bool {
     if be32(buf, 0) != Some(MAGIC) || be32(buf, 4) != Some(VERSION) {
         return false;
     }
+    // The count is not bounded here: the Finder info entry has to sit at FINFO_AT, and that is
+    // only past the end of a header of two entries, so any other count is caught below.
     let count = match be16(buf, 24) {
-        Some(c) if (1..=15).contains(&c) => usize::from(c),
-        _ => return false,
+        Some(c) => usize::from(c),
+        None => return false,
     };
     let header_end = ENTRIES_AT + 12 * count;
     if buf.len() < header_end {
@@ -144,7 +147,12 @@ pub fn is_plausible_prefix(buf: &[u8]) -> bool {
         }
         at += entry_len(namelen);
     }
-    at <= buf.len()
+    // The header has to cover the entry table, and the data may not start inside it.
+    if at > buf.len() {
+        return false;
+    }
+    let wide = |n: u32| usize::try_from(n).is_ok_and(|n| n >= at);
+    wide(be32(buf, ATTR_HDR_AT + 8).unwrap_or(0)) && wide(be32(buf, ATTR_HDR_AT + 12).unwrap_or(0))
 }
 
 fn is_empty_fork(fork: &[u8]) -> bool {
@@ -523,6 +531,32 @@ mod tests {
         for bad in [&b"my real file content"[..], &[0u8; 20], &[0xffu8; 4096]] {
             assert!(!is_plausible_prefix(bad), "{bad:?}");
         }
+        // An entry may not start inside the header it follows. The second entry, which is not the
+        // one the Finder info check looks at, so only the lower bound can catch this.
+        let mut inside = full.clone();
+        put32(&mut inside, ENTRIES_AT + 12 + 4, 20);
+        assert!(!is_plausible_prefix(&inside), "an entry inside the header");
+        for n in [0u16, 3, 16, 0xffff] {
+            let mut count = full.clone();
+            count[24..26].copy_from_slice(&n.to_be_bytes());
+            assert!(!is_plausible_prefix(&count), "{n} entries");
+        }
+        // Neither zero entries nor more than the format holds.
+        for n in [0u16, 16, 0xffff] {
+            let mut count = full.clone();
+            count[24..26].copy_from_slice(&n.to_be_bytes());
+            assert!(!is_plausible_prefix(&count), "{n} entries");
+        }
+        // The attribute header has to be there.
+        let mut no_attr = full.clone();
+        put32(&mut no_attr, ATTR_HDR_AT, 0);
+        assert!(!is_plausible_prefix(&no_attr), "no attribute header");
+        let mut moved = full.clone();
+        put32(&mut moved, ATTR_HDR_AT + 8, 1);
+        assert!(
+            !is_plausible_prefix(&moved),
+            "a total size past what was written"
+        );
         let mut magic = full.clone();
         magic[1] ^= 1;
         assert!(!is_plausible_prefix(&magic));
@@ -551,6 +585,52 @@ mod tests {
                 .insert(format!("user.k{i:03}").into_bytes(), vec![i as u8; 100]);
         }
         s.encode()
+    }
+
+    #[test]
+    fn only_one_to_fifteen_entries_are_a_sidecar() {
+        let good = sample().encode();
+        for n in [0u16, 16, 0xffff] {
+            let mut b = good.clone();
+            b[24..26].copy_from_slice(&n.to_be_bytes());
+            b.truncate(ENTRIES_AT + 12 * usize::from(n.min(15)));
+            assert_eq!(Sidecar::decode(&b), None, "{n} entries");
+        }
+        // Sixteen entries that are each individually valid, past the end of the header and not
+        // overlapping, so nothing but the bound can refuse this: the format holds fifteen.
+        let mut many = vec![0u8; BUF_SIZE];
+        put32(&mut many, 0, MAGIC);
+        put32(&mut many, 4, VERSION);
+        many[8..24].copy_from_slice(FILLER);
+        many[24..26].copy_from_slice(&16u16.to_be_bytes());
+        put32(&mut many, ENTRIES_AT, AD_FINDERINFO);
+        put32(&mut many, ENTRIES_AT + 4, 300);
+        put32(&mut many, ENTRIES_AT + 8, 32);
+        put32(&mut many, ENTRIES_AT + 12, AD_RESOURCE);
+        put32(
+            &mut many,
+            ENTRIES_AT + 16,
+            (BUF_SIZE - EMPTY_FORK_LEN) as u32,
+        );
+        put32(&mut many, ENTRIES_AT + 20, EMPTY_FORK_LEN as u32);
+        for i in 2..16usize {
+            let at = ENTRIES_AT + 12 * i;
+            put32(&mut many, at, AD_REALNAME);
+            put32(&mut many, at + 4, 400 + 10 * (i - 2) as u32);
+            put32(&mut many, at + 8, 4);
+        }
+        // No attribute header here: sixteen entry descriptors cover the bytes where it would be,
+        // and decoding does not read it unless there are exactly two entries.
+        assert_eq!(Sidecar::decode(&many), None, "sixteen entries");
+        for n in 1..=15usize {
+            let mut s = Sidecar::default();
+            for i in 0..n {
+                s.attrs
+                    .insert(format!("user.a{i:02}").into_bytes(), vec![1; 8]);
+            }
+            let b = s.encode();
+            assert_eq!(Sidecar::decode(&b), Some(s), "{n} entries");
+        }
     }
 
     #[test]

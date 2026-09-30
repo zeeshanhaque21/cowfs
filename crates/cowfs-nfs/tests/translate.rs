@@ -247,3 +247,50 @@ fn sidecar_names_are_ordinary_names_except_for_a_sidecar_id() {
     assert_eq!(c.link(&side, &root, "copy").0, acc);
     let _ = vfs;
 }
+
+#[test]
+fn a_sidecar_write_past_the_cap_is_refused() {
+    let vfs = memfs();
+    let (_s, mut c) = serve(vfs.clone(), translated());
+    let root = c.root.clone();
+    c.create_file(&root, "doc");
+    let side = c.create_file(&root, "._doc");
+    let fbig = nfsserve::nfs::nfsstat3::NFS3ERR_FBIG as u32;
+    for (offset, len, why) in [
+        (8u64 << 20, 1_u32, "one byte past the cap"),
+        (1u64 << 40, 1, "far past the cap"),
+        (u64::MAX - 4, 8, "an offset that would overflow"),
+    ] {
+        let st = c.write(&side, offset, &[0u8; 8], 0).0;
+        assert_eq!(st, fbig, "{why} (len {len})");
+    }
+    let doc = vfs.lookup(ROOT_INO, b"doc").unwrap().ino;
+    assert!(
+        vfs.listxattr(doc).unwrap().is_empty(),
+        "and nothing was stored"
+    );
+}
+
+#[test]
+fn the_sidecar_of_a_sidecar_is_a_real_file() {
+    let vfs = memfs();
+    let (_s, mut c) = serve(vfs.clone(), translated());
+    let root = c.root.clone();
+    c.create_file(&root, "._x");
+    let side = c.create_file(&root, "._._x");
+    c.write(&side, 0, b"a real file whose name starts with ._", 2);
+    let stored = vfs
+        .lookup(ROOT_INO, b"._._x")
+        .expect("stored as a real file");
+    assert_eq!(
+        c.read(&side, 0, 100).1,
+        b"a real file whose name starts with ._"
+    );
+    let inner = vfs.lookup(ROOT_INO, b"._x").unwrap().ino;
+    assert!(
+        vfs.listxattr(inner).unwrap().is_empty(),
+        "and no attributes were taken from the file it is named after"
+    );
+    assert_eq!(c.names(&root), vec!["._._x", "._x"]);
+    let _ = stored;
+}

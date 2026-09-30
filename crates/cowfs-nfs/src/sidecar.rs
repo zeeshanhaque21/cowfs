@@ -144,7 +144,10 @@ impl Adapter {
     /// translate, so CREATE stores a real file instead of refusing, which is what an archive
     /// extraction and a checkout of a tree that tracks `._*` need.
     pub(crate) fn side_of(&self, dir: Ino, name: &[u8]) -> bool {
-        self.translating(dir, name) && self.main_of(dir, name).is_ok()
+        // The sidecar of a sidecar is a real file, not a view of another view.
+        self.translating(dir, name)
+            && !is_appledouble(&name[2..])
+            && self.main_of(dir, name).is_ok()
     }
 
     /// The main file a sidecar name belongs to.
