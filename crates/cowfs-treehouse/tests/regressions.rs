@@ -595,3 +595,58 @@ fn f5_a_slot_whose_pool_id_disagrees_is_refused() {
         "the refusal must name the mismatch: {err}"
     );
 }
+
+/// The shim is the guard the whole suite relies on, so its refusals are tested rather than assumed.
+#[test]
+fn the_sandbox_shim_refuses_a_call_that_would_leave() {
+    let _w = Watchdog::start(120);
+    crate::require_treehouse!();
+    let s = Sandbox::new();
+    let shim = s.shim();
+    let call = |args: &[&str]| -> std::process::Output {
+        Command::new(&shim)
+            .args(args)
+            .current_dir(s.repo())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the shim runs")
+    };
+    let sh_out = call(&[
+        "status",
+        "--json",
+        "--root",
+        &s.pool().display().to_string(),
+    ]);
+    assert!(sh_out.status.success(), "an in-sandbox call works");
+
+    // No --root at all: without this the call would fall back to the real store.
+    let out = call(&["status", "--json"]);
+    assert_eq!(out.status.code(), Some(91), "no --root is refused");
+
+    // A --root outside the sandbox.
+    let out = call(&[
+        "status",
+        "--json",
+        "--root",
+        "/Users/zeeshanhaque/.treehouse",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(92),
+        "an out-of-sandbox --root is refused"
+    );
+
+    // An absolute path argument outside the sandbox, even with a good --root.
+    let out = call(&[
+        "return",
+        "/Users/zeeshanhaque/.treehouse/cowfs-7c1bf8/1/cowfs",
+        "--root",
+        &s.pool().display().to_string(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(93),
+        "an out-of-sandbox path argument is refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
