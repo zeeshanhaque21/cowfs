@@ -198,7 +198,10 @@ impl Gc {
             .get(id)
     }
 
-    /// Ask a running cycle to stop at its next check. The store is left consistent.
+    /// Ask a running cycle to stop at its next check, and make the next cycle stop too.
+    ///
+    /// The flag stays set until [`Gc::resume`], so a client that cancels once and then polls
+    /// `collect` does not get a second full cycle by accident.
     pub fn cancel(&self) {
         self.cancelled.store(true, Relaxed);
     }
@@ -208,7 +211,7 @@ impl Gc {
         self.cancelled.store(false, Relaxed);
     }
 
-    /// True once a cancel has been seen by a running cycle.
+    /// True once a cancel has been asked for.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Relaxed)
     }
@@ -220,7 +223,6 @@ impl Gc {
 
     /// One cycle: freeze, mark, choose candidates, copy, then verify and unlink under a barrier.
     pub fn collect(&self, roots: Option<&dyn ExtraRoots>) -> Result<GcReport> {
-        self.cancelled.store(false, Relaxed);
         let mut r = GcReport {
             dry_run: self.opts.dry_run,
             ..GcReport::default()

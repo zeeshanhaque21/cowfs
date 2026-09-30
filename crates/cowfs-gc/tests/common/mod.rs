@@ -21,11 +21,18 @@ pub fn small_store_opts(pack: u64) -> StoreOptions {
 }
 
 /// Everything a test needs: a store, a database and a collector over both.
+///
+/// `keep` holds the `TempDir` so a test that reopens gets the same paths back; it is `None` on a
+/// reopened fixture, whose directory is already on disk.
 pub struct Fixture {
-    pub dir: tempfile::TempDir,
+    pub dir: PathBuf,
     pub store: Arc<Store>,
     pub meta: Arc<Meta>,
     pub gc: Gc,
+    /// The `TempDir` that owns `dir`. Shared, so a reopened fixture can hand it on.
+    keep: Arc<Mutex<Option<tempfile::TempDir>>>,
+    sopts: StoreOptions,
+    gopts: Options,
 }
 
 /// Options tuned so a small corpus reaches the sweep threshold.
@@ -66,10 +73,13 @@ impl Fixture {
         )
         .expect("gc");
         Self {
-            dir,
+            dir: dir.path().to_path_buf(),
+            keep: Arc::new(Mutex::new(Some(dir))),
             store,
             meta,
             gc,
+            sopts,
+            gopts,
         }
     }
 
@@ -79,7 +89,55 @@ impl Fixture {
     }
 
     pub fn path(&self) -> &Path {
-        self.dir.path()
+        &self.dir
+    }
+
+    /// Drop the store and the database and open both again on the same directories, which is what
+    /// a clean restart does. Takes `self`, so the old handles are gone before the reopen.
+    pub fn reopen(self) -> Fixture {
+        let Self {
+            dir,
+            store,
+            meta,
+            gc,
+            keep,
+            sopts,
+            gopts,
+        } = self;
+        let store_dir = dir.join("store");
+        let meta_path = dir.join("meta");
+        let gc_dir = dir.join("gcstate");
+        drop(gc);
+        drop(store);
+        drop(meta);
+        let store = Arc::new(Store::open(&store_dir, sopts).expect("reopen store"));
+        let meta = Arc::new(
+            Meta::open(
+                &meta_path,
+                cowfs_meta::Options {
+                    background: false,
+                    ..cowfs_meta::Options::default()
+                },
+            )
+            .expect("reopen meta"),
+        );
+        let gc =
+            Gc::open(&gc_dir, Arc::clone(&store), Arc::clone(&meta), gopts).expect("reopen gc");
+        Fixture {
+            dir,
+            store,
+            meta,
+            gc,
+            keep,
+            sopts,
+            gopts,
+        }
+    }
+
+    /// Delete the store directory, which is what a crash that lost an unfsynced create leaves for
+    /// a test that wants to build the next image from scratch.
+    pub fn wipe_store(&self) {
+        let _ = std::fs::remove_dir_all(self.store_dir());
     }
 
     /// Store a file's content and set it on a snapshot, the way a mount would.
