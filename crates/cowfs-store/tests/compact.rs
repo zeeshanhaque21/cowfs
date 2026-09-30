@@ -60,7 +60,9 @@ fn plan_counts_live_and_dead_without_writing() {
     assert_eq!(info.len(), 1, "one pack so far");
     assert!(info[0].active);
 
-    let plan = s.plan_pack(info[0].id, &|b| live.contains(&b)).unwrap();
+    let plan = s
+        .plan_pack(info[0].id, &|b| live.contains(&b), &mut Vec::new())
+        .unwrap();
     assert_eq!(plan.records, 8);
     assert!(plan.dead_bytes > 0);
     assert!(plan.dead_ratio() > 0.0 && plan.dead_ratio() < 1.0);
@@ -70,7 +72,7 @@ fn plan_counts_live_and_dead_without_writing() {
     assert_eq!(dir_bytes(d.path()), before, "plan wrote nothing");
 
     // The active pack is never offered: it is the one `put` appends to.
-    let plan_all_live = s.plan_pack(info[0].id, &|_| true).unwrap();
+    let plan_all_live = s.plan_pack(info[0].id, &|_| true, &mut Vec::new()).unwrap();
     assert_eq!(plan_all_live.dead_bytes, 0);
     assert_eq!(plan_all_live.live_bytes, plan.record_bytes());
 }
@@ -88,7 +90,9 @@ fn rewriting_copies_only_live_records_and_frees_the_rest() {
     let old = s.packs().unwrap()[0].id;
     let old_len = s.pack_len(old);
 
-    let plan = s.plan_pack(old, &|b| live.contains(&b)).unwrap();
+    let plan = s
+        .plan_pack(old, &|b| live.contains(&b), &mut Vec::new())
+        .unwrap();
     let mut c = s.begin_compaction(&plan, &|b| live.contains(&b)).unwrap();
     assert!(!c.is_complete());
     while !s.copy_batch(&mut c, 0).unwrap() {}
@@ -146,7 +150,9 @@ fn copy_batch_is_resumable_and_never_splits_a_record() {
     }
     s.sync().unwrap();
     let old = s.packs().unwrap()[0].id;
-    let plan = s.plan_pack(old, &|b| live.contains(&b)).unwrap();
+    let plan = s
+        .plan_pack(old, &|b| live.contains(&b), &mut Vec::new())
+        .unwrap();
     let mut c = s.begin_compaction(&plan, &|b| live.contains(&b)).unwrap();
 
     let total = c.outstanding_bytes();
@@ -179,7 +185,9 @@ fn dropping_a_compaction_mid_copy_leaves_the_store_readable() {
     let dead: Vec<BlockId> = (20..25u8).map(|i| s.put(&data(2048, i)).unwrap()).collect();
     s.sync().unwrap();
     let old = s.packs().unwrap()[0].id;
-    let plan = s.plan_pack(old, &|b| live.contains(&b)).unwrap();
+    let plan = s
+        .plan_pack(old, &|b| live.contains(&b), &mut Vec::new())
+        .unwrap();
     let mut c = s.begin_compaction(&plan, &|b| live.contains(&b)).unwrap();
     s.copy_batch(&mut c, 0).unwrap();
     drop(c);
@@ -218,7 +226,7 @@ fn a_pack_with_durable_corruption_is_never_rewritten() {
         "damage below the watermark is corruption"
     );
     let old = pack_ids(d.path())[0];
-    let plan = s.plan_pack(old, &|_| true).unwrap();
+    let plan = s.plan_pack(old, &|_| true, &mut Vec::new()).unwrap();
     assert!(plan.corrupt, "plan reports the pack as corrupt");
     let e = s.begin_compaction(&plan, &|_| true).unwrap_err();
     assert!(e.to_string().contains("damage"), "{e}");
@@ -243,7 +251,7 @@ fn gap_bytes_are_counted_and_reported() {
 
     let s = store(d.path());
     let old = pack_ids(d.path())[0];
-    let plan = s.plan_pack(old, &|_| true).unwrap();
+    let plan = s.plan_pack(old, &|_| true, &mut Vec::new()).unwrap();
     assert!(plan.gap_bytes > 0, "gap counted");
     assert!(
         plan.records >= 2,
@@ -274,7 +282,9 @@ fn two_compaction_cycles_reclaim_a_two_pack_store() {
             if info.active {
                 continue;
             }
-            let plan = s.plan_pack(info.id, &|b| live.contains(&b)).unwrap();
+            let plan = s
+                .plan_pack(info.id, &|b| live.contains(&b), &mut Vec::new())
+                .unwrap();
             if plan.dead_ratio() < 0.5 {
                 continue;
             }

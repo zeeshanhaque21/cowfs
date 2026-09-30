@@ -112,6 +112,24 @@ fn create_pack(io: &Io, store: &Path, id: u32) -> io::Result<File> {
     Ok(file)
 }
 
+/// The id the next pack must use, stepping over packs this store created.
+///
+/// Compaction creates packs above the active one and records them in `sealed`, so `active + 1`
+/// can already be a pack of ours and must be stepped over rather than refused. A file at that id
+/// that this store does not know is foreign, and the caller keeps the old contract for it: an
+/// empty one is reused, one that holds data makes the roll fail.
+fn next_pack_id(w: &Writer, after: u32) -> Result<u32> {
+    let mut id = after
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("pack ids exhausted"))?;
+    while w.sealed.contains_key(&id) {
+        id = id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("pack ids exhausted"))?;
+    }
+    Ok(id)
+}
+
 /// Read the record `loc` names and check that it decodes to data hashing to `id`.
 fn verify_at(dir: &Path, id: BlockId, loc: Loc) -> bool {
     if !locate_ok(&loc) {
@@ -639,9 +657,7 @@ impl Store {
     fn roll(&self, w: &mut Writer) -> Result<()> {
         self.io
             .sync_file(&w.file, &pack::pack_path(&self.dir, w.id))?;
-        let id =
-            w.id.checked_add(1)
-                .ok_or_else(|| io::Error::other("pack ids exhausted"))?;
+        let id = next_pack_id(w, w.id)?;
         let file = Arc::new(create_pack(&self.io, &self.dir, id)?);
         w.sealed.insert(w.id, w.len);
         w.id = id;
@@ -1089,18 +1105,11 @@ impl Store {
 
     /// Create a pack that `put` will not append to, for compaction to write into.
     ///
-    /// The id is above every pack that exists, and is remembered as sealed, so the writer's next
-    /// rollover never hands it out twice.
+    /// The id is above every pack the store knows, and is recorded in `sealed`, so the writer's
+    /// next rollover steps over it rather than refusing to create it.
     pub fn new_pack(&self) -> Result<(u32, Arc<File>)> {
         let mut w = self.writer();
-        let id = w
-            .pack_lens()
-            .keys()
-            .next_back()
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("pack ids exhausted"))?;
+        let id = next_pack_id(&w, w.pack_lens().keys().next_back().copied().unwrap_or(0))?;
         let file = Arc::new(create_pack(&self.io, &self.dir, id)?);
         w.sealed.insert(id, PACK_HEADER_LEN);
         self.counters.packs.fetch_add(1, Relaxed);

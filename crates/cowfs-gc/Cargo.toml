@@ -1,0 +1,20 @@
+[package]
+name = "cowfs-gc"
+description = "Garbage collection for cowfs: mark-and-sweep from snapshot roots with pack compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cowfs-store = { path = "../cowfs-store" }
+cowfs-meta = { path = "../cowfs-meta" }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

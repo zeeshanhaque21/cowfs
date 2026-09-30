@@ -232,7 +232,15 @@ impl Store {
     ///
     /// `live` decides per record on the id the record's own header claims, so the count does not
     /// depend on the index.
-    pub fn plan_pack(&self, id: u32, live: &dyn Fn(BlockId) -> bool) -> Result<PackPlan> {
+    /// `live_ids` is appended with the id of every live record, for a caller that orders its work
+    /// by something the plan does not carry, such as last-access times. Ids may repeat when a
+    /// pack holds duplicate records of one block.
+    pub fn plan_pack(
+        &self,
+        id: u32,
+        live: &dyn Fn(BlockId) -> bool,
+        live_ids: &mut Vec<BlockId>,
+    ) -> Result<PackPlan> {
         let g = self.guts();
         let path = pack::pack_path(g.dir, id);
         let file = File::open(&path)?;
@@ -250,6 +258,7 @@ impl Store {
                     let n = header.total_len();
                     if live(header.id) {
                         plan.live_bytes += n;
+                        live_ids.push(header.id);
                     } else {
                         plan.dead_bytes += n;
                     }

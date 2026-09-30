@@ -1,0 +1,318 @@
+//! Shared fixtures: a store, a metadata database, a collector, and roots that behave like
+//! `cowfs-core`'s.
+
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
+
+use cowfs_gc::{Barrier, ExtraRoots, Gc, Options};
+use cowfs_meta::{ChunkRef, Meta, Snapshot};
+use cowfs_store::{BlockId, Options as StoreOptions, Store};
+
+/// A store with a small pack, so a test makes several packs without writing gigabytes.
+pub fn small_store_opts(pack: u64) -> StoreOptions {
+    StoreOptions {
+        max_pack_size: pack,
+        ..StoreOptions::default()
+    }
+}
+
+/// Everything a test needs: a store, a database and a collector over both.
+pub struct Fixture {
+    pub dir: tempfile::TempDir,
+    pub store: Arc<Store>,
+    pub meta: Arc<Meta>,
+    pub gc: Gc,
+}
+
+/// Options tuned so a small corpus reaches the sweep threshold.
+pub fn eager() -> Options {
+    Options {
+        dead_ratio: 0.0,
+        min_dead_bytes: 1,
+        io_budget_bytes: 0,
+        batch_bytes: 4096,
+        ..Options::default()
+    }
+}
+
+impl Fixture {
+    /// Open a fixture. `pack` is the maximum pack size in bytes.
+    pub fn with_pack(pack: u64) -> Self {
+        Self::new(small_store_opts(pack), Options::default())
+    }
+
+    pub fn new(sopts: StoreOptions, gopts: Options) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::open(dir.path().join("store"), sopts).expect("store"));
+        let meta = Arc::new(
+            Meta::open(
+                dir.path().join("meta"),
+                cowfs_meta::Options {
+                    background: false,
+                    ..cowfs_meta::Options::default()
+                },
+            )
+            .expect("meta"),
+        );
+        let gc = Gc::open(
+            dir.path().join("gcstate"),
+            Arc::clone(&store),
+            Arc::clone(&meta),
+            gopts,
+        )
+        .expect("gc");
+        Self {
+            dir,
+            store,
+            meta,
+            gc,
+        }
+    }
+
+    /// A fixture whose collector frees eagerly, so a test with a small corpus sweeps.
+    pub fn eager(pack: u64) -> Self {
+        Self::new(small_store_opts(pack), eager())
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Store a file's content and set it on a snapshot, the way a mount would.
+    ///
+    /// `name` is created under the root, or reused when it already exists, so a rewrite of the
+    /// same file deduplicates exactly as a real write does.
+    pub fn write(&self, snap: &Snapshot, name: &[u8], data: &[u8]) -> Vec<ChunkRef> {
+        let chunks = self.store.ingest_bytes(data).expect("ingest");
+        let ino = match snap.lookup(cowfs_meta::ROOT_INO, name) {
+            Ok(a) => a.ino,
+            Err(_) => {
+                snap.batch(|tx| tx.create(cowfs_meta::ROOT_INO, name, 0o644))
+                    .expect("create")
+                    .ino
+            }
+        };
+        snap.batch(|tx| tx.set_content(ino, &chunks, data.len() as u64))
+            .expect("set content");
+        chunks
+    }
+
+    /// Every block any live snapshot references right now.
+    ///
+    /// A hole is not a block, so it is dropped: the raw walk yields it, and a caller that wants to
+    /// know what the store must hold does not want it.
+    pub fn live_blocks(&self) -> std::collections::HashSet<BlockId> {
+        let mut marker = cowfs_meta::Marker::new();
+        let mut out = std::collections::HashSet::new();
+        for info in self.meta.durable_snapshots().expect("snaps") {
+            let snap = self.meta.snapshot_by_id(info.id).expect("snap");
+            for b in snap.live_blocks(&mut marker).expect("walk") {
+                let b = b.expect("block");
+                if b != cowfs_gc::HOLE {
+                    out.insert(b);
+                }
+            }
+        }
+        out
+    }
+
+    /// A copy of every file in the store directory, name and contents.
+    pub fn store_files(&self) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.store_dir()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Ok(b) = std::fs::read(&p) {
+                    out.push((
+                        p.strip_prefix(self.store_dir())
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .into_owned(),
+                        b,
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    pub fn store_dir(&self) -> PathBuf {
+        self.path().join("store")
+    }
+
+    /// Store a file's content under `dir`, creating the name if it is not there.
+    pub fn write_at(&self, snap: &Snapshot, dir: cowfs_meta::Ino, name: &[u8], data: &[u8]) {
+        let chunks = self.store.ingest_bytes(data).expect("ingest");
+        let ino = match snap.lookup(dir, name) {
+            Ok(a) => a.ino,
+            Err(_) => {
+                snap.batch(|tx| tx.create(dir, name, 0o644))
+                    .expect("create")
+                    .ino
+            }
+        };
+        snap.batch(|tx| tx.set_content(ino, &chunks, data.len() as u64))
+            .expect("set content");
+    }
+
+    /// The root of a snapshot, so a test can prove a walk did not change it.
+    pub fn fork_is_isolated(&self, snap: &Snapshot) -> bool {
+        let before = snap.root().expect("root");
+        let _ = self.gc.collect(None);
+        snap.root().expect("root") == before
+    }
+
+    pub fn gc_dir(&self) -> PathBuf {
+        self.path().join("gcstate")
+    }
+}
+
+/// Roots that behave like `cowfs-core`'s: a pinned set, and a barrier that holds a writer lock
+/// for exactly as long as it is alive.
+///
+/// A writer calls [`Roots::write`] to make a commit visible, which takes the same lock. So while a
+/// barrier is alive no commit can start, and one that started before it finishes first. That is
+/// the ordering `cowfs-core` would give with its flusher lock.
+pub struct Roots {
+    inner: Arc<Inner>,
+    pinned: Mutex<Vec<BlockId>>,
+    offers: bool,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    gate: Mutex<GateState>,
+    cv: Condvar,
+    taken: AtomicUsize,
+    held_us: AtomicU64,
+    /// How long writers waited for a barrier, summed. A test can show the stall is bounded.
+    waited_us: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    /// True while a barrier is alive, so no new commit may start.
+    held: bool,
+    /// Commits inside their critical section.
+    writers: usize,
+}
+
+impl Roots {
+    pub fn new() -> Arc<Self> {
+        Self::build(true)
+    }
+
+    /// A `Roots` that offers no barrier, so a cycle must report and not free.
+    pub fn no_barrier() -> Arc<Self> {
+        Self::build(false)
+    }
+
+    fn build(offers: bool) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(Inner::default()),
+            pinned: Mutex::new(Vec::new()),
+            offers,
+        })
+    }
+
+    pub fn pin(&self, b: BlockId) {
+        self.pinned.lock().unwrap().push(b);
+    }
+
+    pub fn unpin_all(&self) {
+        self.pinned.lock().unwrap().clear();
+    }
+
+    /// Run a commit, ordered against any barrier.
+    ///
+    /// Waits while a barrier is held, then holds the gate for the commit itself, so a barrier that
+    /// arrives during it waits for the commit rather than cutting it in half.
+    pub fn write<T>(&self, f: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let mut g = self.inner.gate.lock().unwrap();
+        while g.held {
+            g = self.inner.cv.wait(g).unwrap();
+        }
+        g.writers += 1;
+        drop(g);
+        let out = f();
+        let mut g = self.inner.gate.lock().unwrap();
+        g.writers -= 1;
+        self.inner.cv.notify_all();
+        self.inner
+            .waited_us
+            .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
+        out
+    }
+
+    /// Microseconds a barrier was held, summed over every cycle.
+    pub fn held_us(&self) -> u64 {
+        self.inner.held_us.load(Relaxed)
+    }
+
+    /// Microseconds writers spent waiting for a barrier, summed over every write.
+    pub fn waited_us(&self) -> u64 {
+        self.inner.waited_us.load(Relaxed)
+    }
+
+    /// How many barriers were taken.
+    pub fn barrier_taken(&self) -> usize {
+        self.inner.taken.load(Relaxed)
+    }
+}
+
+impl ExtraRoots for Roots {
+    fn pinned_blocks(&self) -> Vec<BlockId> {
+        self.pinned.lock().unwrap().clone()
+    }
+
+    fn reference_barrier(&self) -> Option<Box<dyn Barrier>> {
+        if !self.offers {
+            return None;
+        }
+        let start = Instant::now();
+        let mut g = self.inner.gate.lock().unwrap();
+        g.held = true;
+        while g.writers > 0 {
+            g = self.inner.cv.wait(g).unwrap();
+        }
+        drop(g);
+        self.inner.taken.fetch_add(1, Relaxed);
+        Some(Box::new(Guard {
+            inner: Arc::clone(&self.inner),
+            start,
+        }))
+    }
+}
+
+/// Holds the gate, and releases it on drop.
+struct Guard {
+    inner: Arc<Inner>,
+    start: Instant,
+}
+
+impl Barrier for Guard {
+    fn hold(&self) {}
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let mut g = self.inner.gate.lock().unwrap();
+        g.held = false;
+        self.inner.cv.notify_all();
+        self.inner
+            .held_us
+            .fetch_add(self.start.elapsed().as_micros() as u64, Relaxed);
+    }
+}
