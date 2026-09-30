@@ -14,6 +14,7 @@ mod io;
 mod node;
 mod ns;
 mod queue;
+mod snapname;
 mod swap;
 mod util;
 mod vfs_impl;
@@ -40,7 +41,9 @@ use crate::queue::SnapCtx;
 use crate::util::{MutexExt, RwExt, ShardMap};
 
 pub use crate::inner::{Options, Stats};
+pub use crate::snapname::{name_key, validate_snapshot_name, validate_snapshot_name_bytes};
 pub use crate::view::SnapshotView;
+pub use cowfs_vfs::NAME_MAX;
 
 /// Errors from the control plane.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -77,29 +80,6 @@ pub struct SnapshotEntry {
     pub created: Timestamp,
     /// Snapshot this one was cloned from.
     pub parent: Option<u64>,
-}
-
-/// Checks a snapshot name: 1 to 255 bytes, no `/` or NUL, not `.` or `..`, and not starting
-/// with `._` (AppleDouble) or `.nfs` (NFS silly rename).
-pub fn validate_snapshot_name(name: &str) -> Result<(), ControlError> {
-    if name.is_empty() {
-        return Err(ControlError::InvalidName("empty"));
-    }
-    if name.len() > cowfs_vfs::NAME_MAX {
-        return Err(ControlError::InvalidName("longer than 255 bytes"));
-    }
-    if name == "." || name == ".." {
-        return Err(ControlError::InvalidName("dot names are reserved"));
-    }
-    if name.contains('/') || name.contains('\0') {
-        return Err(ControlError::InvalidName("contains / or NUL"));
-    }
-    if name.starts_with("._") || name.starts_with(".nfs") {
-        return Err(ControlError::InvalidName(
-            "names starting with ._ or .nfs are reserved for the OS",
-        ));
-    }
-    Ok(())
 }
 
 /// The sync hook that orders a store sync before every durable meta commit.
@@ -173,6 +153,7 @@ impl Core {
         let md = std::fs::metadata(dir).map_err(|e| from_io(&e))?;
         let total = fs2::total_space(dir).unwrap_or(1 << 40);
         let avail = fs2::available_space(dir).unwrap_or(total);
+        let mark = ino::read_virt_mark(dir).map_err(Error::Corrupt)?;
         let base_pack_bytes = store.stats().pack_bytes;
         let inner = Arc::new(Inner {
             meta,
@@ -183,7 +164,9 @@ impl Core {
             aliases: RwLock::new(Aliases::default()),
             handles: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
-            next_virt: AtomicU64::new(0),
+            next_virt: AtomicU64::new(mark),
+            virt_reserved: AtomicU64::new(mark),
+            virt_lock: Mutex::new(()),
             dirty_bytes: AtomicUsize::new(0),
             uid: md.uid(),
             gid: md.gid(),
@@ -405,8 +388,18 @@ impl Inner {
         s.by_id.get(id).cloned().ok_or(ControlError::NotFound)
     }
 
+    /// A name must be free, and must not alias an existing name on a case-insensitive or
+    /// normalising mount (see `snapname::name_key`).
     fn check_new_name(&self, name: &str) -> Result<(), ControlError> {
-        if self.snaps.rd().by_name.contains_key(name) {
+        let key = crate::snapname::name_key(name);
+        let s = self.snaps.rd();
+        if s.by_name.contains_key(name) {
+            return Err(ControlError::Exists);
+        }
+        if s.by_name
+            .keys()
+            .any(|n| crate::snapname::name_key(n) == key)
+        {
             return Err(ControlError::Exists);
         }
         Ok(())

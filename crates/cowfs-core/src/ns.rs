@@ -12,7 +12,7 @@ use crate::dcache::Target;
 use crate::error::{from_meta, stale};
 use crate::file::FileData;
 use crate::inner::{kind_of, mino, Inner};
-use crate::ino::{pack, snap_of, virt};
+use crate::ino::{pack, snap_of};
 use crate::node::{Node, NodeState, DIR_SIZE};
 use crate::queue::{Create, Op, SnapCtx};
 use crate::util::{MutexExt, RwExt};
@@ -172,7 +172,7 @@ impl Inner {
             return Err(Error::Exists);
         }
         let now = Timestamp::now();
-        let ino = virt(sc.id, self.next_virt.fetch_add(1, Ordering::Relaxed) + 1)?;
+        let ino = self.alloc_virt(sc.id)?;
         let (kind, nlink, size, target, mode) = match &what {
             Create::File => (FileKind::Regular, 1, 0, None, mode & MODE_MASK),
             Create::Dir => (FileKind::Directory, 2, 0, None, mode & MODE_MASK),

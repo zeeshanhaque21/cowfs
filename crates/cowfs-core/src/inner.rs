@@ -128,6 +128,10 @@ pub(crate) struct Inner {
     pub(crate) handles: Mutex<HashMap<u64, Ino>>,
     pub(crate) next_handle: AtomicU64,
     pub(crate) next_virt: AtomicU64,
+    /// Virtual numbers up to here are recorded in `<root>/virt.ino`, so a restart never hands out
+    /// a number an earlier session used.
+    pub(crate) virt_reserved: AtomicU64,
+    pub(crate) virt_lock: Mutex<()>,
     pub(crate) dirty_bytes: AtomicUsize,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
@@ -191,6 +195,29 @@ impl Inner {
     }
 
     /// The meta inode number behind `ino`, if meta has one yet.
+    /// The next virtual number, extending the durable reservation when it runs out.
+    pub(crate) fn alloc_virt(&self, snap: u64) -> Result<Ino> {
+        let n = self.next_virt.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= self.virt_reserved.load(Ordering::Acquire) {
+            self.reserve_virt()?;
+        }
+        crate::ino::virt(snap, n)
+    }
+
+    /// Records a block of virtual numbers durably before any of them is handed out, so a crash
+    /// can only waste numbers, never reuse them.
+    fn reserve_virt(&self) -> Result<()> {
+        let _g = self.virt_lock.lk();
+        let next = self.next_virt.load(Ordering::Acquire);
+        if next < self.virt_reserved.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let new = next.saturating_add(crate::ino::VIRT_BLOCK);
+        crate::ino::write_virt_mark(&self.root, new).map_err(|e| crate::error::from_io(&e))?;
+        self.virt_reserved.store(new, Ordering::Release);
+        Ok(())
+    }
+
     pub(crate) fn meta_of(&self, ino: Ino) -> Option<u64> {
         match classify(ino) {
             Id::Meta { m, .. } => Some(m),

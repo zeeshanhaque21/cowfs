@@ -1,12 +1,16 @@
 //! Inode number shapes and the alias table. See `docs/v1-core.md`, "Inode numbers".
 
 use std::collections::HashMap;
+use std::io::Write as _;
 
 use cowfs_meta::SnapshotId;
 use cowfs_vfs::{Error, Ino, Result, ROOT_INO};
 
 /// Set on inode numbers handed out before meta assigned a real one.
 pub(crate) const VIRT: u64 = 1 << 63;
+/// How many virtual numbers one durable reservation covers.
+pub(crate) const VIRT_BLOCK: u64 = 1 << 20;
+const VIRT_FILE: &str = "virt.ino";
 const SHIFT: u32 = 40;
 const LOW: u64 = (1 << SHIFT) - 1;
 /// Snapshot ids must stay below this to fit in an `Ino`.
@@ -99,6 +103,41 @@ impl Aliases {
     }
 }
 
+/// Reads the durable virtual-number high-water mark, 0 when there is none.
+pub(crate) fn read_virt_mark(root: &std::path::Path) -> std::result::Result<u64, String> {
+    let p = root.join(VIRT_FILE);
+    let b = match std::fs::read(&p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("{}: {e}", p.display())),
+    };
+    let v: [u8; 8] = b
+        .get(..8)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| format!("{} is short", p.display()))?;
+    let w: [u8; 8] = b
+        .get(8..16)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| format!("{} is short", p.display()))?;
+    let n = u64::from_le_bytes(v);
+    if u64::from_le_bytes(w) != n {
+        return Err(format!("{} is torn", p.display()));
+    }
+    Ok(n)
+}
+
+/// Records `n` durably (value twice, so a torn write is detected rather than believed).
+pub(crate) fn write_virt_mark(root: &std::path::Path, n: u64) -> std::io::Result<()> {
+    let p = root.join(VIRT_FILE);
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&n.to_le_bytes());
+    b[8..].copy_from_slice(&n.to_le_bytes());
+    let mut f = std::fs::File::create(&p)?;
+    f.write_all(&b)?;
+    f.sync_all()?;
+    std::fs::File::open(root)?.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +160,19 @@ mod tests {
         assert!(pack(MAX_SNAP, 1).is_err());
         assert!(pack(1, LOW + 1).is_err());
         assert!(virt(0, 1).is_err());
+    }
+
+    #[test]
+    fn the_virtual_mark_round_trips_and_a_torn_one_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(read_virt_mark(d.path()), Ok(0));
+        write_virt_mark(d.path(), 12345).unwrap();
+        assert_eq!(read_virt_mark(d.path()), Ok(12345));
+        let p = d.path().join("virt.ino");
+        let mut b = std::fs::read(&p).unwrap();
+        b[9] ^= 0xff;
+        std::fs::write(&p, &b).unwrap();
+        assert!(read_virt_mark(d.path()).is_err());
     }
 
     #[test]
