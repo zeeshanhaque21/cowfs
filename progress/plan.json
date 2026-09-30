@@ -156,12 +156,13 @@
         {
           "id": "13",
           "title": "#13 CLI and Unix-socket control API",
-          "state": "building",
+          "state": "reviewing",
           "issue": 13,
-          "owner": "subagent",
+          "owner": "critic (subagent)",
           "pr": "#33",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/33",
-          "detail": "docs/v1-control-api.md first, then cowfs-ctl (protocol, client, server) and the cowfs CLI against a stub backend with a Backend seam for the real core. Worktree slot 7, branch v1/13-cli."
+          "detail": "Builder done: 61 tests (I re-ran: pass), CI green on Linux and macOS. JSON-lines protocol over a Unix socket, peer uid check, stub backend, Backend seam for the real core. Design points for #15/#16: slot reset is snapshot_rm then snapshot_create (not atomic), ps returns cwd/fd/lock holds for #20. Independent critic attacking sockets, protocol robustness, cancellation and treehouse fit. docs/v1-control-api.md",
+          "ci": "CI: pass (linux, macos)"
         },
         {
           "id": "14",
