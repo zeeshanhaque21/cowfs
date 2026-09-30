@@ -327,6 +327,49 @@ fn crash_every_event_snapshot_rm_workload() {
     assert!(f.is_empty(), "{}", f[..f.len().min(6)].join("\n"));
 }
 
+/// F13: crash at every event while a removed snapshot is freed in several small steps.
+#[test]
+fn crash_every_event_reap_steps() {
+    let o = Options {
+        background: false,
+        ..opts()
+    };
+    let (log, marks) = record(o, |m, mk| {
+        let a = m.new_snapshot("A").unwrap();
+        mk(m);
+        let b = m.new_snapshot("B").unwrap();
+        b.create(ROOT_INO, b"keep", 0o644).unwrap();
+        mk(m);
+        a.batch(|tx| {
+            for i in 0..400u32 {
+                let f = tx.create(ROOT_INO, format!("f{i}").as_bytes(), 0o644)?;
+                let c = ChunkRef {
+                    id: BlockId::of(&i.to_le_bytes()),
+                    len: 3,
+                };
+                tx.set_content(f.ino, &[c], 3)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        m.sync().unwrap();
+        mk(m);
+        m.remove_snapshot(a.id()).unwrap();
+        mk(m);
+        let mut steps = 0;
+        while m.reap_step().unwrap() {
+            steps += 1;
+            mk(m);
+        }
+        assert!(steps >= 1, "the workload must need several reap steps");
+        b.create(ROOT_INO, b"after", 0o644).unwrap();
+        m.sync().unwrap();
+        mk(m);
+    });
+    let f = crash_all("reap", &log, &marks, stride(), 3);
+    assert!(f.is_empty(), "{}", f[..f.len().min(6)].join("\n"));
+}
+
 struct Fs {
     put: Mutex<Vec<BlockId>>,
     dur: Arc<AtomicUsize>,
