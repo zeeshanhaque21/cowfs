@@ -135,6 +135,10 @@ pub(crate) struct Inner {
     pub(crate) last_error: Mutex<Option<String>>,
     pub(crate) capacity_blocks: u64,
     pub(crate) base_pack_bytes: u64,
+    /// The mount root directory, which holds the intent files of an interrupted snapshot swap.
+    pub(crate) root: std::path::PathBuf,
+    /// Test seam for the swap, see `Core::set_swap_fault`.
+    pub(crate) swap_fault: std::sync::atomic::AtomicU8,
 }
 
 impl std::fmt::Debug for Inner {

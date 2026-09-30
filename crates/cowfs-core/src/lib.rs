@@ -14,6 +14,7 @@ mod io;
 mod node;
 mod ns;
 mod queue;
+mod swap;
 mod util;
 mod vfs_impl;
 mod view;
@@ -21,7 +22,7 @@ mod view;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -194,6 +195,8 @@ impl Core {
             last_error: Mutex::new(None),
             capacity_blocks: (avail / 4096).max(1 << 20).min(total / 4096 + 1),
             base_pack_bytes,
+            root: dir.to_path_buf(),
+            swap_fault: AtomicU8::new(0),
             opts,
         });
         for info in inner.meta.snapshots().map_err(from_meta)? {
@@ -230,13 +233,15 @@ impl Core {
         } else {
             None
         };
-        Ok(Core {
+        let core = Core {
             _guard: Arc::new(Guard {
                 inner: inner.clone(),
                 thread: Mutex::new(thread),
             }),
             inner,
-        })
+        };
+        swap::recover(&core);
+        Ok(core)
     }
 
     /// A `Vfs` whose root is the root directory of snapshot `name`.
@@ -272,27 +277,21 @@ impl Core {
         self.inner.unregister(&sc)
     }
 
-    /// Renames a snapshot by forking it under the new name and removing the old one, so its
-    /// snapshot id and every inode number in it change (see `docs/v1-core.md`, request 1).
+    /// Renames a snapshot. Crash-safe and error-safe (see `src/swap.rs`): a failure before the
+    /// old name is removed leaves it untouched, and a crash in between is finished on the next
+    /// open. Its snapshot id and every inode number in it change.
     pub fn rename_snapshot(&self, old: &str, new: &str) -> Result<SnapshotEntry, ControlError> {
-        let e = self.fork_snapshot(old, new)?;
-        self.remove_snapshot(old)?;
-        Ok(e)
+        self.inner.snap_by_name(old)?;
+        self.swap_snapshot(old, Some(old), new, false)
     }
 
-    /// Makes `base` a clone of `src`, replacing an existing `base`. Not atomic across a crash.
+    /// Makes `base` a clone of `src`, replacing an existing `base`.
+    ///
+    /// Crash-safe and error-safe like [`Core::rename_snapshot`]: if anything fails, the old `base`
+    /// is still there.
     pub fn promote_base(&self, src: &str, base: &str) -> Result<SnapshotEntry, ControlError> {
-        if src == base {
-            return Err(ControlError::InvalidName(
-                "source and base are the same snapshot",
-            ));
-        }
-        validate_snapshot_name(base)?;
         self.inner.snap_by_name(src)?;
-        if self.inner.snap_by_name(base).is_ok() {
-            self.remove_snapshot(base)?;
-        }
-        self.fork_snapshot(src, base)
+        self.swap_snapshot(src, None, base, true)
     }
 
     /// All snapshots in id order.
