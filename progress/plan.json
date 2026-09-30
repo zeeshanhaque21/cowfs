@@ -149,12 +149,12 @@
         {
           "id": "12",
           "title": "#12 macOS NFS loopback mount",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 12,
-          "owner": "critic (subagent)",
+          "owner": "builder (subagent)",
           "pr": "#32",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/32",
-          "detail": "Builder done: 18 unit, 22 protocol, 11 nfsserve and 8 mount tests (25/25 battery) pass on my re-run, CI green. Latency floor over MemVfs looks bad (write 3.4 ms, create 4.1 ms, missing lookup 167 us) but was measured at load 50-75 and is unexplained. AppleDouble hidden by default (flag for review). Critic will profile the latency, and check the unauthenticated localhost port, stale handles and mount cleanup.",
+          "detail": "Critic verdict: NOT mergeable. Leak: rename over a file never reaps the replaced sidecar inode (200 write-tmp-rename cycles left 202 inodes; 65k-op workload RSS 4 to 899 MB). Biggest gap: AppleDouble sidecars are ~47% of all RPCs and double the inodes (fix: translate sidecars to Vfs xattrs). Latency is RPC count not server speed (server ~99% idle, 8-55 us/RPC; the builder's 3.4/4.1 ms were load noise, minimums 1.0/1.46 ms). Security: any local uid can MNT and use the port (fix: one-shot MNT plus keyed-MAC handles). DoS: 200 half-sent 8 MiB frames took 1.6 GB. Retransmits dropped not replayed; stale handle read another file's bytes after inode reuse; kill -TERM leaves a hung mount. Builder is fixing.",
           "ci": "CI: pass (linux, macos)"
         },
         {
