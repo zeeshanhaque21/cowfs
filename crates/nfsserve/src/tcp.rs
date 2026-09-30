@@ -236,8 +236,10 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
             let Ok(local) = socket.local_addr() else {
                 continue;
             };
+            let conn = self.reply_cache.open_conn();
             let context = RPCContext {
                 local_port: self.port,
+                conn,
                 client_addr: peer.to_string(),
                 client_ip: peer.ip(),
                 peer,
@@ -252,9 +254,11 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
             };
             let limits = self.limits.clone();
             info!("Accepting connection from {}", context.client_addr);
+            let cache = self.reply_cache.clone();
             tokio::spawn(async move {
                 let (rd, wr) = socket.into_split();
                 serve_connection(rd, wr, context, limits).await;
+                cache.close_conn(conn);
                 drop(permit);
             });
         }

@@ -11,6 +11,8 @@ use crate::vfs::NFSFileSystem;
 #[derive(Clone)]
 pub struct RPCContext {
     pub local_port: u16,
+    /// Identity of the connection this request arrived on, see `ReplyCache`.
+    pub conn: u64,
     pub client_addr: String,
     pub client_ip: IpAddr,
     pub peer: SocketAddr,

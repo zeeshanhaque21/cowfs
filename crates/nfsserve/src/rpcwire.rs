@@ -57,6 +57,7 @@ async fn handle_rpc(
         && NON_IDEMPOTENT.contains(&call.proc))
     .then_some(CacheKey {
         client: context.client_ip,
+        conn: context.conn,
         xid,
         fingerprint,
     });

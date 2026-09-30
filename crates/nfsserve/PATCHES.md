@@ -34,7 +34,23 @@ Everything below is ours.
   - `Limits`: connection cap, idle timeout, per-frame slowloris deadline, in-flight requests per connection, frame size cap.
   - Records are read incrementally, so a declared but unsent frame costs nothing.
   - READDIR, READDIRPLUS and READ replies are capped whatever count the client asks for.
-  - Reply cache keyed by client address, xid and a hash of the whole call: a retransmitted SETATTR, CREATE, MKDIR, SYMLINK, REMOVE, RMDIR, RENAME or LINK gets the original reply. Bounded in entries, bytes and age, and it shrinks.
+  - Reply cache (`reply_cache.rs`) for SETATTR, CREATE, MKDIR, SYMLINK, REMOVE, RMDIR, RENAME and
+    LINK: a retransmitted call gets the original reply. Bounded in entries, bytes and age, and it
+    shrinks.
+    The key is (connection, client address, xid, hash of the whole call). The connection is part
+    of it because one client keeps several connections open and each counts xids from its own
+    start, so an identical call with the same xid on another live connection is a new call and is
+    executed. Keying on (address, xid, hash) alone made the server answer such a call with the
+    first connection's reply without ever running it, and the client was then told a file existed
+    that did not.
+    A call may still be replayed across connections, but only when the connection that ran it has
+    gone away: over TCP a retransmission goes out on the connection it was sent on, so a
+    connection that is gone is the only shape a genuine post-reconnect resend can take. The price
+    is that a mutation is executed twice if a client sends the same (xid, call) on a second
+    connection it is still holding, while the first connection never got its reply. No client
+    does that, and preferring a duplicate effect over a silently wrong success is the safer of
+    the two. The set of closed connections is bounded and the cross-connection index never
+    outlives the entries it points at.
 - Removed: `fs_util` (Windows and path helpers), `write_counter`, `transaction_tracker`, the `demo` feature, the auto IP binding, `filetime`, `intaglio`.
 - Lints: the workspace lint bar (fmt, clippy `-D warnings`).
   Allows that remain: `lib.rs` has `#![allow(non_camel_case_types, clippy::upper_case_acronyms)]` because the RFC type and procedure names are kept as written; `mount.rs` and `portmap.rs` have `#![allow(dead_code)]` because they transcribe RFC constants this server does not all use.

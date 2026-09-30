@@ -1,18 +1,30 @@
 //! Duplicate request cache. A client that retransmits a non-idempotent call (REMOVE, RENAME,
 //! CREATE, ...) must get the original reply, not the error a second execution would produce.
-//! Entries are keyed by client address, xid and a hash of the whole call, and are bounded in
-//! count, bytes and age.
-use std::collections::{HashMap, VecDeque};
+//!
+//! A call is identified by the connection it arrived on, the client address, the xid and a hash
+//! of the whole call. The connection matters: one client keeps several connections open and each
+//! counts xids from its own start, so the same (xid, call) on another connection is a different
+//! call, not a retransmission, and must be executed. See `PATCHES.md`.
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// What identifies one call: retransmissions repeat all three.
+/// What identifies one call on one connection: retransmissions repeat all four.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub client: IpAddr,
+    pub conn: u64,
     pub xid: u32,
     pub fingerprint: u64,
+}
+
+impl CacheKey {
+    /// The same call on any connection.
+    fn call(&self) -> (IpAddr, u32, u64) {
+        (self.client, self.xid, self.fingerprint)
+    }
 }
 
 /// What `ReplyCache::begin` decided.
@@ -42,6 +54,11 @@ struct Entry {
 struct Inner {
     map: HashMap<CacheKey, Entry>,
     order: VecDeque<CacheKey>,
+    /// The call each remembered one answers to when it arrives on another connection.
+    cross: HashMap<(IpAddr, u32, u64), CacheKey>,
+    /// Connections that have gone away, oldest first.
+    closed: VecDeque<u64>,
+    closed_set: HashSet<u64>,
     bytes: usize,
 }
 
@@ -52,6 +69,7 @@ pub struct ReplyCache {
     max_bytes: usize,
     max_age: Duration,
     inner: Mutex<Inner>,
+    next_conn: AtomicU64,
 }
 
 impl ReplyCache {
@@ -61,6 +79,29 @@ impl ReplyCache {
             max_bytes,
             max_age,
             inner: Mutex::new(Inner::default()),
+            next_conn: AtomicU64::new(1),
+        }
+    }
+
+    /// A connection identity, unique for the life of the server.
+    pub fn open_conn(&self) -> u64 {
+        self.next_conn.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Notes that a connection is gone. A call it ran may then be replayed for another
+    /// connection, which is what a client that lost its connection and reconnected does.
+    pub fn close_conn(&self, conn: u64) {
+        let mut g = self.lock();
+        if g.closed_set.insert(conn) {
+            g.closed.push_back(conn);
+        }
+        while g.closed.len() > self.max_entries.saturating_mul(2).max(64) {
+            match g.closed.pop_front() {
+                Some(old) => {
+                    g.closed_set.remove(&old);
+                }
+                None => break,
+            }
         }
     }
 
@@ -83,6 +124,18 @@ impl ReplyCache {
                 State::Done(r) => Begin::Replay(r.clone()),
             };
         }
+        // A call that arrived on a connection which is gone may be a retransmission of one the
+        // client sent before it reconnected, and then must not run again. A call from a
+        // connection that is still open is a new call: the client runs several at once and each
+        // counts xids from its own start.
+        if let Some(&orig) = g.cross.get(&key.call()) {
+            if orig.conn != key.conn && g.closed_set.contains(&orig.conn) {
+                return match &g.map.get(&orig).map(|e| &e.state) {
+                    Some(State::InProgress) | None => Begin::InProgress,
+                    Some(State::Done(r)) => Begin::Replay(r.clone()),
+                };
+            }
+        }
         g.map.insert(
             key,
             Entry {
@@ -91,12 +144,16 @@ impl ReplyCache {
             },
         );
         g.order.push_back(key);
+        g.cross.insert(key.call(), key);
         Begin::New
     }
 
     /// Records the reply of a finished call, or forgets the call if it produced none.
     pub fn finish(&self, key: CacheKey, reply: Option<Vec<u8>>) {
         let mut g = self.lock();
+        if reply.is_none() {
+            g.cross.remove(&key.call());
+        }
         match reply {
             Some(r) => {
                 let len = r.len();
@@ -127,6 +184,9 @@ impl ReplyCache {
                 break;
             }
             g.order.pop_front();
+            if g.cross.get(&key.call()) == Some(&key) {
+                g.cross.remove(&key.call());
+            }
             if let Some(Entry {
                 state: State::Done(r),
                 ..
@@ -151,9 +211,14 @@ mod tests {
     fn key(xid: u32) -> CacheKey {
         CacheKey {
             client: IpAddr::from([127, 0, 0, 1]),
+            conn: 1,
             xid,
             fingerprint: 9,
         }
+    }
+
+    fn on(conn: u64, xid: u32) -> CacheKey {
+        CacheKey { conn, ..key(xid) }
     }
 
     fn cache(entries: usize, age_ms: u64) -> ReplyCache {
@@ -182,11 +247,77 @@ mod tests {
     }
 
     #[test]
+    fn the_same_call_on_a_live_connection_is_not_a_retransmission() {
+        let c = cache(100, 60_000);
+        assert!(matches!(c.begin(on(1, 7)), Begin::New));
+        c.finish(on(1, 7), Some(vec![1]));
+        assert!(
+            matches!(c.begin(on(2, 7)), Begin::New),
+            "another open connection is a new call"
+        );
+    }
+
+    #[test]
+    fn the_same_call_after_a_reconnect_replays() {
+        let c = cache(100, 60_000);
+        c.close_conn(1);
+        assert!(matches!(c.begin(on(1, 7)), Begin::New));
+        c.finish(on(1, 7), Some(vec![9]));
+        match c.begin(on(2, 7)) {
+            Begin::Replay(r) => assert_eq!(*r, vec![9]),
+            other => panic!("{other:?}"),
+        }
+        c.close_conn(2);
+        assert!(
+            matches!(c.begin(on(3, 7)), Begin::Replay(_)),
+            "and every later connection gets the same answer"
+        );
+    }
+
+    #[test]
+    fn a_call_still_running_never_gets_a_reply_for_another_connection() {
+        let c = cache(100, 60_000);
+        assert!(matches!(c.begin(on(1, 7)), Begin::New));
+        c.close_conn(1);
+        assert!(matches!(c.begin(on(2, 7)), Begin::InProgress));
+    }
+
+    #[test]
+    fn closed_connections_are_forgotten_in_bounded_time() {
+        let c = cache(4, 60_000);
+        for i in 0..1000 {
+            c.close_conn(i);
+        }
+        let g = c.lock();
+        assert!(g.closed.len() <= 64, "{}", g.closed.len());
+        assert!(!g.closed_set.contains(&0), "the oldest are dropped");
+    }
+
+    #[test]
     fn a_failed_call_is_forgotten() {
         let c = cache(10, 60_000);
         assert!(matches!(c.begin(key(1)), Begin::New));
         c.finish(key(1), None);
         assert!(matches!(c.begin(key(1)), Begin::New));
+    }
+
+    #[test]
+    fn the_cross_index_does_not_outlive_its_entries() {
+        let c = cache(50, 60_000);
+        for i in 0..5000u32 {
+            c.begin(key(i));
+            c.finish(key(i), Some(vec![0; 16]));
+        }
+        let g = c.lock();
+        assert!(
+            g.cross.len() <= g.map.len(),
+            "{} vs {}",
+            g.cross.len(),
+            g.map.len()
+        );
+        for call in g.cross.keys() {
+            assert!(g.map.contains_key(&g.cross[call]));
+        }
     }
 
     #[test]
@@ -203,6 +334,7 @@ mod tests {
             "{}",
             g.map.capacity()
         );
+        assert!(g.cross.capacity() <= 4 * 100 + 64 + 100);
         assert!(g.bytes <= 100 * 64);
     }
 
