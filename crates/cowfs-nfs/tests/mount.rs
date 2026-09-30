@@ -4,19 +4,49 @@
 //! `cargo test -p cowfs-nfs --test mount -j4 -- --ignored --test-threads=1 --nocapture`
 //!
 //! Needs `python3` for the batteries in `tests/battery/` and `cargo` for the build check.
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cowfs_nfs::{is_listed, mount_nfs_available, Mount, MountOptions};
 use cowfs_vfs_test::MemVfs;
 
+/// Force-unmounts the mount point if a test outlives its deadline, so a hung syscall fails with
+/// EIO instead of blocking the run. Dropping it (normally or by panic) cancels the timer.
+struct Watchdog(Option<mpsc::Sender<()>>);
+
+impl Watchdog {
+    fn start(path: PathBuf, secs: u64) -> Watchdog {
+        let (tx, rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if rx.recv_timeout(Duration::from_secs(secs)) == Err(mpsc::RecvTimeoutError::Timeout) {
+                eprintln!(
+                    "WATCHDOG: {} still busy after {secs}s, forcing unmount",
+                    path.display()
+                );
+                let _ = Command::new("/sbin/umount").arg("-f").arg(&path).status();
+            }
+        });
+        Watchdog(Some(tx))
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.0.take();
+    }
+}
+
 struct Mounted {
     mount: Option<Mount>,
+    _dog: Watchdog,
     _dir: tempfile::TempDir,
 }
 
@@ -37,6 +67,10 @@ impl Mounted {
 }
 
 fn mounted(opts: MountOptions) -> Option<Mounted> {
+    mounted_vfs(Arc::new(MemVfs::new()), opts)
+}
+
+fn mounted_vfs(vfs: Arc<dyn cowfs_vfs::Vfs>, opts: MountOptions) -> Option<Mounted> {
     if !mount_nfs_available() {
         eprintln!("SKIP: mount_nfs is not available");
         return None;
@@ -45,8 +79,9 @@ fn mounted(opts: MountOptions) -> Option<Mounted> {
         .prefix("cowfs-nfs-")
         .tempdir()
         .unwrap();
-    match Mount::new(Arc::new(MemVfs::new()), &dir.path().join("mnt"), opts) {
+    match Mount::new(vfs, &dir.path().join("mnt"), opts) {
         Ok(m) => Some(Mounted {
+            _dog: Watchdog::start(m.mountpoint().to_path_buf(), 1500),
             mount: Some(m),
             _dir: dir,
         }),
@@ -372,5 +407,47 @@ fn cargo_build_on_the_mount() {
             "{out}"
         );
     }
+    m.finish();
+}
+
+#[test]
+#[ignore = "mounts a filesystem; run with --ignored"]
+fn references_drain_after_a_workload_on_a_real_mount() {
+    let vfs = common::counting::CountingVfs::new();
+    let Some(m) = mounted_vfs(vfs.clone(), MountOptions::default()) else {
+        return;
+    };
+    let root = m.path().to_path_buf();
+    fs::write(root.join("target"), "v0").unwrap();
+    for i in 0..200 {
+        fs::write(root.join("tmp"), format!("v{i}")).unwrap();
+        fs::rename(root.join("tmp"), root.join("target")).unwrap();
+    }
+    let n: usize = std::env::var("COWFS_REFBALANCE_FILES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
+    for i in 0..n {
+        let p = root.join(format!("c{i}"));
+        fs::write(&p, "x").unwrap();
+        fs::remove_file(&p).unwrap();
+    }
+    fs::create_dir_all(root.join("d/sub")).unwrap();
+    fs::write(root.join("d/a"), "a").unwrap();
+    fs::hard_link(root.join("d/a"), root.join("d/l")).unwrap();
+    fs::rename(root.join("d/sub"), root.join("sub2")).unwrap();
+    fs::rename(root.join("d"), root.join("d2")).unwrap();
+    fs::remove_file(root.join("d2/a")).unwrap();
+    fs::remove_file(root.join("d2/l")).unwrap();
+    fs::remove_dir(root.join("d2")).unwrap();
+    fs::remove_dir(root.join("sub2")).unwrap();
+    fs::remove_file(root.join("target")).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        vfs.live(),
+        0,
+        "inodes still held after everything was removed"
+    );
+    assert_eq!(vfs.outstanding(), 0, "lookup references not given back");
     m.finish();
 }
