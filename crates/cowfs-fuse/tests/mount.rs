@@ -95,7 +95,9 @@ fn std_fs_round_trip() {
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
 fn unlinked_open_file_is_pinned_until_release() {
-    let Some(fx) = Fixture::new("") else { return };
+    let Some(fx) = Fixture::new("attr_ttl=0") else {
+        return;
+    };
     let mut f = OpenOptions::new()
         .read(true)
         .write(true)

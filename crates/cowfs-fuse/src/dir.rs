@@ -107,7 +107,7 @@ mod tests {
     fn list_all(vfs: &MemVfs, dir: Ino, page: usize) -> Vec<Vec<u8>> {
         let mut names = Vec::new();
         let mut offset = 0;
-        loop {
+        for _ in 0..20_000 {
             let mut sink = Collect {
                 cap: page,
                 got: vec![],
@@ -116,6 +116,7 @@ mod tests {
             let Some(last) = sink.got.last() else { break };
             offset = last.0;
             names.extend(sink.got.into_iter().map(|(_, n)| n));
+            assert!(names.len() < 100_000, "listing does not terminate");
         }
         names
     }
@@ -179,7 +180,7 @@ mod tests {
         }
         let mut seen = Vec::new();
         let mut offset = 0;
-        loop {
+        for _ in 0..20_000 {
             let mut sink = Collect {
                 cap: 10,
                 got: vec![],
