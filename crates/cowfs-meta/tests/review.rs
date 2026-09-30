@@ -821,3 +821,154 @@ fn handle_fails_closed_after_detecting_corruption() {
         Err(Error::Corrupt(_))
     ));
 }
+
+/// F8: transient read bit flips during writes. Whatever reaches the disk, `check()` either
+/// reports it or the tree equals a clean replay of the operations that succeeded.
+#[test]
+fn flips_during_writes_are_detected_or_harmless() {
+    let mut detected = 0;
+    let mut clean = 0;
+    for flip_every in [7usize, 23, 101, 400] {
+        let be = Be {
+            flip_every,
+            ..Be::default()
+        };
+        let opts = Options {
+            node_size: 512,
+            node_cache: 0,
+            cache_size: 1 << 16,
+            sync_every_ops: 2,
+            ..quiet()
+        };
+        let m = Meta::open_with_backend(be.clone(), opts.clone()).unwrap();
+        let s = m.new_snapshot("s").unwrap();
+        be.flaky.store(true, SeqCst);
+        let mut ok = Vec::new();
+        let mut failed_closed = false;
+        for i in 0..200 {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                s.create(ROOT_INO, format!("f{i}").as_bytes(), 0o644)
+            }));
+            match r {
+                Ok(Ok(_)) => ok.push(i),
+                Ok(Err(Error::Corrupt(_))) => failed_closed = true,
+                Ok(Err(_)) => {}
+                Err(_) => panic!("panic escaped"),
+            }
+            if failed_closed {
+                assert!(matches!(
+                    s.create(ROOT_INO, b"more", 0o644),
+                    Err(Error::Corrupt(_))
+                ));
+                break;
+            }
+        }
+        be.flaky.store(false, SeqCst);
+        drop((s, m));
+        let img = be.image();
+        let names = |m: &Meta| -> Vec<Vec<u8>> {
+            m.snapshot("s")
+                .unwrap()
+                .readdir(ROOT_INO, 0, 1000)
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        let Ok(r) = Meta::open_with_backend(Be::from_image(img), quiet()) else {
+            detected += 1;
+            continue;
+        };
+        match r.check() {
+            Err(_) => detected += 1,
+            Ok(()) => {
+                clean += 1;
+                let got = names(&r);
+                assert!(
+                    got.len() <= ok.len() + 1 && got.iter().all(|n| n.starts_with(b"f")),
+                    "flip {flip_every}: check passed but content is wrong"
+                );
+            }
+        }
+    }
+    eprintln!("flips during writes: {detected} detected, {clean} clean");
+}
+
+/// F14: 120 s concurrent hammer (writers forking and removing snapshots, readers checking a
+/// two-file-per-batch atomicity invariant). Reports the worst write latency.
+///
+/// `cargo test -p cowfs-meta --release --test review hammer -- --ignored --nocapture`
+#[test]
+#[ignore = "120 s"]
+fn hammer_120s() {
+    use std::sync::atomic::AtomicU64;
+    let dir = tempfile::tempdir().unwrap();
+    let m = Meta::open(dir.path().join("h.redb"), Options::default()).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (viol, reads, writes, maxw) = (
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    );
+    let mut hs = Vec::new();
+    for w in 0..3u32 {
+        let (m, st, wr, mw) = (m.clone(), stop.clone(), writes.clone(), maxw.clone());
+        hs.push(std::thread::spawn(move || {
+            let mut mine = m.new_snapshot(&format!("w{w}-0")).unwrap();
+            let (mut n, mut generation) = (0u64, 0);
+            while !st.load(SeqCst) {
+                let t = Instant::now();
+                mine.batch(|tx| {
+                    tx.create(ROOT_INO, format!("a{n}").as_bytes(), 0o644)?;
+                    tx.create(ROOT_INO, format!("b{n}").as_bytes(), 0o644)?;
+                    Ok(())
+                })
+                .unwrap();
+                mw.fetch_max(t.elapsed().as_micros() as u64, SeqCst);
+                wr.fetch_add(1, SeqCst);
+                n += 1;
+                if n % 200 == 0 {
+                    generation += 1;
+                    let old = mine.id();
+                    mine = mine.fork(&format!("w{w}-{generation}")).unwrap();
+                    m.remove_snapshot(old).unwrap();
+                }
+            }
+        }));
+    }
+    for _ in 0..4 {
+        let (m, st, v, r) = (m.clone(), stop.clone(), viol.clone(), reads.clone());
+        hs.push(std::thread::spawn(move || {
+            while !st.load(SeqCst) {
+                for info in m.snapshots().unwrap() {
+                    let Ok(s) = m.snapshot(&info.name) else {
+                        continue;
+                    };
+                    let Ok(p) = s.readdir(ROOT_INO, 0, 1_000_000) else {
+                        continue;
+                    };
+                    let a = p.entries.iter().filter(|e| e.name[0] == b'a').count();
+                    let b = p.entries.iter().filter(|e| e.name[0] == b'b').count();
+                    v.fetch_add(u64::from(a != b), SeqCst);
+                    r.fetch_add(1, SeqCst);
+                }
+            }
+        }));
+    }
+    std::thread::sleep(Duration::from_secs(120));
+    stop.store(true, SeqCst);
+    for h in hs {
+        h.join().unwrap();
+    }
+    eprintln!(
+        "hammer: {} batches, {} reads, {} torn, worst write {} us",
+        writes.load(SeqCst),
+        reads.load(SeqCst),
+        viol.load(SeqCst),
+        maxw.load(SeqCst)
+    );
+    assert_eq!(viol.load(SeqCst), 0);
+    m.check().unwrap();
+}

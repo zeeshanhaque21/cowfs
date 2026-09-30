@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -39,6 +39,23 @@ pub(crate) const REAP: TableDefinition<u64, [u8; 32]> = TableDefinition::new("re
 pub(crate) const MAGIC: u64 = 0x434f_5746_534d_4554;
 pub(crate) const FORMAT_VERSION: u64 = 2;
 const REAP_BUDGET: usize = 256;
+const GROUP_WAIT: Duration = Duration::from_millis(2);
+
+/// Counts callers that are inside `mutate`, so a commit leader can wait for them.
+struct Inflight<'a>(&'a AtomicUsize);
+
+impl<'a> Inflight<'a> {
+    fn enter(n: &'a AtomicUsize) -> Self {
+        n.fetch_add(1, SeqCst);
+        Self(n)
+    }
+}
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, SeqCst);
+    }
+}
 
 /// Hook run before every durable commit; the mount layer sets it to the block store's `sync`.
 pub type SyncHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
@@ -208,6 +225,7 @@ pub(crate) struct Inner {
     gc_cv: Condvar,
     bg: Bg,
     poisoned: AtomicBool,
+    inflight: AtomicUsize,
 }
 
 impl std::fmt::Debug for Inner {
@@ -556,6 +574,7 @@ impl Inner {
         f: impl FnOnce(&mut Tx<'_>) -> Result<T>,
     ) -> Result<T> {
         let (out, wait_for) = {
+            let _flight = Inflight::enter(&self.inflight);
             let mut guard_ = self.wlock()?;
             let s = &mut *guard_;
             self.check_writable(s)?;
@@ -640,6 +659,11 @@ impl Inner {
             }
             *led = true;
             drop(led);
+            // Let callers that are queued to apply their change join this commit.
+            let start = Instant::now();
+            while self.inflight.load(SeqCst) > 0 && start.elapsed() < GROUP_WAIT {
+                std::thread::yield_now();
+            }
             let r = match self.wlock() {
                 Ok(mut s) => self.commit(&mut s, Extra::None, false, true).map(|_| ()),
                 Err(e) => Err(e),
@@ -1088,6 +1112,7 @@ impl Meta {
                 cv: Condvar::new(),
             },
             poisoned: AtomicBool::new(false),
+            inflight: AtomicUsize::new(0),
             opts,
         });
         let thread = if background {

@@ -8,116 +8,13 @@
 
 use cowfs_meta::{BlockId, ChunkRef, Ino, Marker, Meta, Options, Snapshot, ROOT_INO};
 use std::path::Path;
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-const DEFAULT_LOCK: &str = "/Users/zeeshanhaque/Projects/cowfs/spikes/nfs-loopback/out/cpu.lock";
 const PER_DIR: usize = 1000;
 
-struct LockGuard(Option<std::path::PathBuf>);
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        if let Some(p) = &self.0 {
-            let _ = std::fs::remove_dir_all(p);
-        }
-    }
-}
-
-fn take_lock() -> LockGuard {
-    if std::env::var("COWFS_NO_LOCK").is_ok() {
-        return LockGuard(None);
-    }
-    let lock = std::path::PathBuf::from(
-        std::env::var("COWFS_CPU_LOCK").unwrap_or_else(|_| DEFAULT_LOCK.into()),
-    );
-    if let Some(parent) = lock.parent() {
-        std::fs::create_dir_all(parent).expect("create lock parent");
-    }
-    let start = Instant::now();
-    loop {
-        match std::fs::create_dir(&lock) {
-            Ok(()) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                assert!(
-                    start.elapsed() < Duration::from_secs(15 * 60),
-                    "cpu.lock busy for 15 minutes"
-                );
-                std::thread::sleep(Duration::from_secs(10));
-            }
-            Err(e) => panic!("cpu.lock: {e}"),
-        }
-    }
-    let owner = format!(
-        "cowfs-meta bench, pid {}, unix time {}\n",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-    );
-    let _ = std::fs::write(lock.join("owner"), owner);
-    LockGuard(Some(lock))
-}
-
-fn load1() -> f64 {
-    let out = Command::new("uptime").output().ok();
-    let text = out
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    text.split("averages:")
-        .nth(1)
-        .or_else(|| text.split("average:").nth(1))
-        .and_then(|s| s.trim().split([' ', ',']).next().map(str::to_string))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(f64::NAN)
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, n: usize) -> usize {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n as u64) as usize
-    }
-}
-
-fn median(v: &mut [f64]) -> f64 {
-    v.sort_by(|a, b| a.total_cmp(b));
-    v[v.len() / 2]
-}
-
-/// Runs `reps` batches; each returns the time it measured for `ops` operations.
-fn measure(
-    metric: &str,
-    inodes: usize,
-    reps: usize,
-    ops: usize,
-    mut f: impl FnMut(usize) -> Duration,
-) {
-    let (mut per_op, mut loads) = (Vec::new(), Vec::new());
-    for rep in 0..reps {
-        let before = load1();
-        let d = {
-            let _lock = take_lock();
-            f(rep)
-        };
-        let after = load1();
-        loads.push(before.max(after));
-        per_op.push(d.as_secs_f64() * 1e6 / ops as f64);
-    }
-    let mut sorted = per_op.clone();
-    let med = median(&mut sorted);
-    let load_max = loads.iter().copied().fold(0.0, f64::max);
-    let flag = if load_max > 30.0 { " HIGH-LOAD" } else { "" };
-    println!(
-        "| {metric} | {inodes} | {reps}x{ops} | {med:.1} | {:.1} | {:.1} | {:.0} | {load_max:.0}{flag} |",
-        sorted[0],
-        sorted[sorted.len() - 1],
-        1e6 / med,
-    );
-}
+#[path = "benchutil/mod.rs"]
+mod util;
+use util::{load1, measure, Rng};
 
 fn chunk(seed: u64) -> ChunkRef {
     ChunkRef {

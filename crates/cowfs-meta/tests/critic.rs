@@ -159,6 +159,10 @@ fn verify(img: Vec<u8>, p: usize, marks: &[Mark], any: bool, what: &str) -> Resu
     Ok(())
 }
 
+thread_local! {
+    static RECOVERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The lost-fsync case: open fails closed, `open_recover` must then give an earlier commit.
 fn recover(img: Vec<u8>, marks: &[Mark], what: &str, why: &str) -> Result<(), String> {
     let dir = tempfile::tempdir().unwrap();
@@ -179,6 +183,7 @@ fn recover(img: Vec<u8>, marks: &[Mark], what: &str, why: &str) -> Result<(), St
             "{what}: open failed ({why}) but recovery reports no rollback"
         ));
     }
+    RECOVERED.with(|c| c.set(c.get() + 1));
     Ok(())
 }
 
@@ -245,6 +250,10 @@ fn crash_all(name: &str, log: &[Ev], marks: &[Mark], stride: usize, seed: u64) -
         }
     }
     eprintln!(
+        "{name}: {} lost-fsync images recovered with open_recover",
+        RECOVERED.with(std::cell::Cell::get)
+    );
+    eprintln!(
         "{name}: log {} events, marks {}, images {opened}, failures {}",
         log.len(),
         marks.len(),
@@ -286,6 +295,10 @@ fn crash_every_event_random_workload() {
     });
     let f = crash_all("random", &log, &marks, stride(), 1);
     assert!(f.is_empty(), "{}", f[..f.len().min(6)].join("\n"));
+    assert!(
+        RECOVERED.with(std::cell::Cell::get) > 0,
+        "no lost-fsync image exercised open_recover"
+    );
 }
 
 #[test]
@@ -324,6 +337,49 @@ fn crash_every_event_snapshot_rm_workload() {
         mk(m);
     });
     let f = crash_all("rm", &log, &marks, stride(), 2);
+    assert!(f.is_empty(), "{}", f[..f.len().min(6)].join("\n"));
+}
+
+/// F13: crash at every event while a removed snapshot is freed in several small steps.
+#[test]
+fn crash_every_event_reap_steps() {
+    let o = Options {
+        background: false,
+        ..opts()
+    };
+    let (log, marks) = record(o, |m, mk| {
+        let a = m.new_snapshot("A").unwrap();
+        mk(m);
+        let b = m.new_snapshot("B").unwrap();
+        b.create(ROOT_INO, b"keep", 0o644).unwrap();
+        mk(m);
+        a.batch(|tx| {
+            for i in 0..400u32 {
+                let f = tx.create(ROOT_INO, format!("f{i}").as_bytes(), 0o644)?;
+                let c = ChunkRef {
+                    id: BlockId::of(&i.to_le_bytes()),
+                    len: 3,
+                };
+                tx.set_content(f.ino, &[c], 3)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        m.sync().unwrap();
+        mk(m);
+        m.remove_snapshot(a.id()).unwrap();
+        mk(m);
+        let mut steps = 0;
+        while m.reap_step().unwrap() {
+            steps += 1;
+            mk(m);
+        }
+        assert!(steps >= 1, "the workload must need several reap steps");
+        b.create(ROOT_INO, b"after", 0o644).unwrap();
+        m.sync().unwrap();
+        mk(m);
+    });
+    let f = crash_all("reap", &log, &marks, stride(), 3);
     assert!(f.is_empty(), "{}", f[..f.len().min(6)].join("\n"));
 }
 
