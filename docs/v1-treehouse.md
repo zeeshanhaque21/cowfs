@@ -203,6 +203,16 @@ Per acquisition:
 The whole re-provisioning is one `snapshot_reset` plus one small file write. No data is copied,
 which is what makes it O(1) and what makes the second and later slots nearly free.
 
+Two ordering rules the implementation depends on:
+
+- Where the slot's bookkeeping lives is resolved **before** the swap, while the slot's own `.git`
+  link is still valid. After the reset the link belongs to the base, so git can no longer say where
+  this slot's bookkeeping is, and a repair that asked then would be guessing. The directory git
+  names it after is the slot path's own leaf (`{repo}`, or `{repo}-{slot}` under `unique_leaf`),
+  never the slot number.
+- A slot whose `.git` is a directory is left completely alone. That is a real repository, not a
+  worktree link, and overwriting it would destroy a checkout.
+
 ### Return is the interesting half
 
 `treehouse return` resets the worktree with `git reset --hard` and `git clean -xdf`. Against a
@@ -214,10 +224,18 @@ content the next slot was going to reuse. So the wrapper inverts the order:
 3. Wait for `.nfs*` dirt in the slot to clear, bounded, with a clear message on timeout.
 4. `snapshot_reset {name: {pool_id}-{slot}, from: {pool_id}-empty, expect_no_holders: true}`. The
    slot is now empty, so treehouse's own reset and clean are instant and cannot produce
-   `.nfs` dirt.
-5. `treehouse return {slot} --force --root {pool} --if-lease-id {id}`, which releases the lease
-   and parks the slot.
+   `.nfs` dirt. It is reset to the empty snapshot and not to the base, because a base left in
+   place is exactly the warm tree treehouse is about to walk.
+5. `treehouse return {slot} --force --root {pool} --if-lease-id {id}`, which releases the lease and
+   parks the slot. The lease identity comes from `treehouse status` run from the main repository,
+   because run from inside a slot treehouse reports that slot as "you're here" with an empty
+   `lease_id`.
 6. Optionally `snapshot_rm {pool_id}-{slot}` to release the snapshot, or keep it for reuse.
+
+Mode (a) is the same flow with the snapshot steps left out, so it needs no cowfs daemon at all and
+only the holder checks and the wait apply. The mode is explicit, `--mode a` or `--mode b`, because
+guessing it from whether a root was given would make a mode (a) return demand a daemon it does not
+need.
 
 Pinning the release with `--if-lease-id` means a slot that was re-leased between our `ps` and our
 return is left alone instead of being reset under its new owner. The `expect_no_holders` check in
@@ -284,12 +302,25 @@ pays 12.8% to 28% per debug slot.
   with the same directory name distinct on a mount shared by every repository.
 - base snapshot: `{pool_id}-base`
 - main checkout snapshot: `{pool_id}-main`
+- empty snapshot: `{pool_id}-empty`, what a returned slot is reset to
 - slot snapshot: `{pool_id}-{slot}`, where `{slot}` is treehouse's slot name.
 - Every derived name goes through `cowfs_ctl::validate_snapshot_name`, so a repository whose name
   would produce an illegal snapshot name is refused with a clear message rather than sent to the
-  daemon. `short6` is 6 hex characters, so `-base` and `-main` cannot collide with a slot suffix.
+  daemon. `short6` is 6 hex characters, so `-base`, `-main` and `-empty` cannot collide with a slot
+  suffix.
+- A slot name is additionally checked to be a single path component. The snapshot validator alone
+  would accept `pool-..`, which is still wrong.
 - `-base` is derived, never configurable. A configurable base name is how two repositories end up
   sharing one warm base.
+- The pool id is read from the pool **directory**, which needs no git at all, falling back to the
+  repository only for a slot outside a pool. A run that crashed between the reset and the `.git`
+  repair has a broken link, and identity derived from git would be unavailable exactly then.
+- Paths that act as an identity are canonicalised at the control-API boundary. treehouse reports
+  `/private/var/...` where a caller on macOS holds `/var/...`, and without that a `base.repo`
+  lookup misses.
+- A slot path is passed on to treehouse exactly as the caller spelled it, never canonicalised:
+  treehouse records the path it was given and matches later calls against that string, so rewriting
+  it makes the slot read as unleased.
 
 ## Gap list
 
@@ -404,29 +435,39 @@ a holder with only an open fd or a flock is missed and the slot ends up `dirty`.
 ### Mode (b), end to end
 
 ```sh
-# 1. build a warm base: the repo's build runs in a real slot, then the base is refreshed
-cd ~/.cowfs/mnt/...-main
-cowfs-treehouse base refresh --repo "$PWD" --ref main --build 'cargo build --locked'
+POOL=~/.cowfs/mnt/th
 
-# 2. check freshness
+# 1. build a warm base: the repo's build runs in a real slot, then the base is refreshed
+cd ~/.cowfs/mnt/myrepo-1a2b3c-main
+cowfs-treehouse base refresh --repo "$PWD" --ref main --root $POOL \
+    --build 'cargo build --locked'
+
+# 2. check freshness. Exit 1 means stale, which is a real answer and not a crash
 cowfs-treehouse base status --repo "$PWD" --ref main
 
-# 3. install the hooks in the user config
-cowfs-treehouse hooks install --repo "$PWD" --root ~/.cowfs/mnt/th
+# 3. install the hook in the treehouse user config
+cowfs-treehouse hooks install --home "$HOME"
 
-# 4. acquire a slot
-cowfs-treehouse get --repo "$PWD" --root ~/.cowfs/mnt/th --json
+# 4. acquire a slot. Needs the real backend, see the gap list
+cowfs-treehouse get --repo "$PWD" --root $POOL --json
 
 # 5. return it
-cowfs-treehouse return --slot <path> --root ~/.cowfs/mnt/th
+cowfs-treehouse return --mode b --slot <path> --root $POOL --force
 
 # 6. discard it once the work is committed
-cowfs-treehouse discard --slot <path> --root ~/.cowfs/mnt/th
+cowfs-treehouse discard --slot <path> --root $POOL --force
 ```
 
-`hooks install` writes `post_create` into `~/.config/treehouse/config.toml` and refuses to touch
-repo-level `treehouse.toml`, because treehouse discards hooks there anyway. It is idempotent and
-never overwrites a `post_create` that is not its own, which it marks with a sentinel comment.
+`hooks install` writes `post_create` into `$HOME/.config/treehouse/config.toml` and never touches
+repo-level `treehouse.toml`, because treehouse discards hooks there anyway. It is idempotent, and
+it refuses rather than overwriting a `post_create` that is not its own, which it marks with a
+sentinel comment. Its default command is `cowfs-treehouse provision --slot $PWD`, because
+`post_create` runs with the worktree as its working directory and stock treehouse 3.1.0 sets no slot
+variable. The proposed upstream `pre_create` hook would supply `TREEHOUSE_SLOT_PATH`, which is the
+better form once it exists.
+
+`base refresh` refuses `--rustflags` outright rather than accepting it and quietly producing a base
+that dirties every slot it is cloned into.
 
 ### Exit codes
 
