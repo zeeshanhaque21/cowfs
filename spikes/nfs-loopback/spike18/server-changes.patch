@@ -1,0 +1,366 @@
+diff -ruN src/main.rs spike18/server/src/main.rs
+--- src/main.rs	2026-09-29 18:58:45
++++ spike18/server/src/main.rs	2026-09-29 22:15:13
+@@ -16,8 +16,13 @@
+ struct Mirror {
+     root: PathBuf,
+     hide_appledouble: bool,
++    deny_appledouble: bool,
++    lookup1: bool,
++    rtpref1m: bool,
+     trace: bool,
+     paths: Mutex<HashMap<u64, PathBuf>>,
++    wfds: Option<Mutex<HashMap<u64, std::sync::Arc<File>>>>,
++    rdc: Option<Mutex<HashMap<u64, (i64, i64, std::sync::Arc<Vec<(Vec<u8>, PathBuf)>>)>>>,
+ }
+ 
+ fn err(e: io::Error) -> nfsstat3 {
+@@ -59,7 +64,10 @@
+     }
+ 
+     fn attr_of(&self, id_hint: Option<u64>, p: &Path) -> Result<fattr3, nfsstat3> {
+-        let md = fs::symlink_metadata(p).map_err(err)?;
++        Ok(Self::attr_md(id_hint, &fs::symlink_metadata(p).map_err(err)?))
++    }
++
++    fn attr_md(id_hint: Option<u64>, md: &fs::Metadata) -> fattr3 {
+         let ft = md.file_type();
+         let ftype = if ft.is_dir() {
+             ftype3::NF3DIR
+@@ -68,7 +76,7 @@
+         } else {
+             ftype3::NF3REG
+         };
+-        Ok(fattr3 {
++        fattr3 {
+             ftype,
+             mode: md.mode() & 0o7777,
+             nlink: md.nlink() as u32,
+@@ -82,7 +90,7 @@
+             atime: ftime(md.atime(), md.atime_nsec()),
+             mtime: ftime(md.mtime(), md.mtime_nsec()),
+             ctime: ftime(md.ctime(), md.ctime_nsec()),
+-        })
++        }
+     }
+ 
+     fn attr_by_id(&self, id: u64) -> Result<fattr3, nfsstat3> {
+@@ -91,6 +99,9 @@
+     }
+ 
+     fn child(&self, dirid: u64, name: &filename3) -> Result<PathBuf, nfsstat3> {
++        if self.deny_appledouble && name.starts_with(b"._") {
++            return Err(nfsstat3::NFS3ERR_NOTSUPP);
++        }
+         Ok(self.path(dirid)?.join(OsStr::from_bytes(name)))
+     }
+ 
+@@ -165,6 +176,7 @@
+                 let parent = dir.parent().ok_or(nfsstat3::NFS3ERR_NOENT)?.to_path_buf();
+                 return if parent == self.root { Ok(ROOT_ID) } else { self.register(&parent) };
+             }
++            n if self.deny_appledouble && n.starts_with(b"._") => return Err(nfsstat3::NFS3ERR_NOENT),
+             _ => {}
+         }
+         self.register(&dir.join(OsStr::from_bytes(filename)))
+@@ -174,6 +186,36 @@
+         self.attr_by_id(id)
+     }
+ 
++    async fn lookup_attr(&self, dirid: fileid3, filename: &filename3) -> Result<(fileid3, Option<fattr3>), nfsstat3> {
++        let n: &[u8] = filename.as_ref();
++        if !self.lookup1 || n == b"." || n == b".." || (self.deny_appledouble && n.starts_with(b"._")) {
++            let id = self.lookup(dirid, filename).await?;
++            return Ok((id, self.getattr(id).await.ok()));
++        }
++        let p = self.child(dirid, filename)?;
++        let md = fs::symlink_metadata(&p).map_err(err)?;
++        self.remember(md.ino(), p);
++        Ok((md.ino(), Some(Self::attr_md(None, &md))))
++    }
++
++    async fn fsinfo(&self, root_fileid: fileid3) -> Result<fsinfo3, nfsstat3> {
++        let a = self.getattr(root_fileid).await.map_or(post_op_attr::Void, post_op_attr::attributes);
++        let pref = if self.rtpref1m { 1024 * 1024 } else { 1024 * 124 };
++        Ok(fsinfo3 {
++            obj_attributes: a,
++            rtmax: 1024 * 1024,
++            rtpref: pref,
++            rtmult: 1024 * 1024,
++            wtmax: 1024 * 1024,
++            wtpref: 1024 * 1024,
++            wtmult: 1024 * 1024,
++            dtpref: 1024 * 1024,
++            maxfilesize: 128 * 1024 * 1024 * 1024,
++            time_delta: nfstime3 { seconds: 0, nseconds: 1000000 },
++            properties: FSF_SYMLINK | FSF_HOMOGENEOUS | FSF_CANSETTIME,
++        })
++    }
++
+     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+         let p = self.path(id)?;
+         self.tr(format!("SETATTR {} mode={} size={} atime={} mtime={}", p.display(), matches!(setattr.mode, set_mode3::mode(_)), match setattr.size { set_size3::size(n) => n as i64, _ => -1 }, !matches!(setattr.atime, set_atime::DONT_CHANGE), !matches!(setattr.mtime, set_mtime::DONT_CHANGE)));
+@@ -192,6 +234,23 @@
+ 
+     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+         self.tr(format!("WRITE id={id} off={offset} len={}", data.len()));
++        if let Some(c) = &self.wfds {
++            let cached = c.lock().unwrap().get(&id).cloned();
++            let f = match cached {
++                Some(f) => f,
++                None => {
++                    let f = std::sync::Arc::new(Self::open_for_write(&self.path(id)?).map_err(err)?);
++                    let mut m = c.lock().unwrap();
++                    if m.len() >= 256 {
++                        m.clear();
++                    }
++                    m.insert(id, f.clone());
++                    f
++                }
++            };
++            f.write_all_at(data, offset).map_err(err)?;
++            return Ok(Self::attr_md(None, &f.metadata().map_err(err)?));
++        }
+         let path = self.path(id)?;
+         self.tr(format!("  WRITE path={}", path.display()));
+         let f = Self::open_for_write(&path).map_err(|e| {
+@@ -232,6 +291,9 @@
+         self.tr(format!("REMOVE dir={dirid} name={:?}", filename));
+         let p = self.child(dirid, filename)?;
+         let md = fs::symlink_metadata(&p).map_err(err)?;
++        if let Some(c) = &self.wfds {
++            c.lock().unwrap().remove(&md.ino());
++        }
+         if md.is_dir() {
+             fs::remove_dir(&p).map_err(err)
+         } else {
+@@ -260,13 +322,32 @@
+ 
+     async fn readdir(&self, dirid: fileid3, start_after: fileid3, max_entries: usize) -> Result<ReadDirResult, nfsstat3> {
+         let dir = self.path(dirid)?;
+-        let mut ents: Vec<(Vec<u8>, PathBuf)> = fs::read_dir(&dir)
+-            .map_err(err)?
+-            .filter_map(|e| e.ok())
+-            .filter(|e| !(self.hide_appledouble && e.file_name().as_bytes().starts_with(b"._")))
+-            .map(|e| (e.file_name().as_bytes().to_vec(), e.path()))
+-            .collect();
+-        ents.sort();
++        let list = || -> Result<Vec<(Vec<u8>, PathBuf)>, nfsstat3> {
++            let mut ents: Vec<(Vec<u8>, PathBuf)> = fs::read_dir(&dir)
++                .map_err(err)?
++                .filter_map(|e| e.ok())
++                .filter(|e| !(self.hide_appledouble && e.file_name().as_bytes().starts_with(b"._")))
++                .map(|e| (e.file_name().as_bytes().to_vec(), e.path()))
++                .collect();
++            ents.sort();
++            Ok(ents)
++        };
++        let ents = match &self.rdc {
++            None => std::sync::Arc::new(list()?),
++            Some(c) => {
++                // continuation pages reuse the listing taken at cookie 0, even if the dir changed since
++                let key = (0, 0);
++                let hit = c.lock().unwrap().get(&dirid).filter(|_| start_after != 0).map(|e| e.2.clone());
++                match hit {
++                    Some(v) => v,
++                    None => {
++                        let v = std::sync::Arc::new(list()?);
++                        c.lock().unwrap().insert(dirid, (key.0, key.1, v.clone()));
++                        v
++                    }
++                }
++            }
++        };
+         let mut out = ReadDirResult::default();
+         for i in (start_after as usize).min(ents.len())..ents.len() {
+             if out.entries.len() >= max_entries {
+@@ -309,27 +390,40 @@
+     let mut root = None;
+     let mut port = 11111u16;
+     let mut hide = false;
++    let mut deny = false;
++    let mut lookup1 = false;
++    let mut rtpref1m = false;
++    let mut wfd = false;
++    let mut rdc = false;
+     let mut trace = false;
+     let mut a = std::env::args().skip(1);
+     while let Some(x) = a.next() {
+         match x.as_str() {
+             "--root" => root = Some(PathBuf::from(a.next().unwrap())),
+             "--hide-appledouble" => hide = true,
++            "--deny-appledouble" => deny = true,
++            "--lookup1" => lookup1 = true,
++            "--rtpref1m" => rtpref1m = true,
++            "--wfd-cache" => wfd = true,
++            "--rd-cache" => rdc = true,
+             "--trace" => trace = true,
+             "--port" => port = a.next().unwrap().parse().unwrap(),
+             _ => panic!("unknown arg {x}"),
+         }
+     }
++    if std::env::var_os("NAME_STATS").is_some() {
++        nfsserve::enable_name_stats();
++    }
+     let root = fs::canonicalize(root.expect("--root required"))?;
+     let mut paths = HashMap::new();
+     paths.insert(ROOT_ID, root.clone());
+-    let fs = Mirror { root, hide_appledouble: hide, trace, paths: Mutex::new(paths) };
++    let fs = Mirror { root, hide_appledouble: hide, deny_appledouble: deny, lookup1, rtpref1m, trace, paths: Mutex::new(paths), wfds: wfd.then(|| Mutex::new(HashMap::new())), rdc: rdc.then(|| Mutex::new(HashMap::new())) };
+     let listener = NFSTcpListener::bind(&format!("127.0.0.1:{port}"), fs).await?;
+     eprintln!("listening on 127.0.0.1:{}", listener.get_listen_port());
+     tokio::spawn(async {
+         let mut s = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()).unwrap();
+         while s.recv().await.is_some() {
+-            eprint!("STATS\n{}", nfsserve::take_stats());
++            eprint!("STATS\n{}END\n", nfsserve::take_stats());
+         }
+     });
+     listener.handle_forever().await
+diff -ruN vendor/nfsserve/src/lib.rs spike18/server/vendor/nfsserve/src/lib.rs
+--- vendor/nfsserve/src/lib.rs	2026-09-29 11:55:52
++++ spike18/server/vendor/nfsserve/src/lib.rs	2026-09-29 20:50:56
+@@ -14,7 +14,7 @@
+ 
+ pub mod nfs;
+ mod nfs_handlers;
+-pub use nfs_handlers::take_stats;
++pub use nfs_handlers::{enable_name_stats, take_stats};
+ 
+ #[cfg(not(target_os = "windows"))]
+ pub mod fs_util;
+diff -ruN vendor/nfsserve/src/nfs_handlers.rs spike18/server/vendor/nfsserve/src/nfs_handlers.rs
+--- vendor/nfsserve/src/nfs_handlers.rs	2026-09-29 12:10:34
++++ spike18/server/vendor/nfsserve/src/nfs_handlers.rs	2026-09-29 22:22:01
+@@ -161,9 +161,74 @@
+     }
+     let sum = INFLIGHT_SUM.swap(0, Ordering::Relaxed);
+     s += &format!("TOTAL {} mean_inflight_at_arrival {:.2}\n", total, if total > 0 { sum as f64 / total as f64 } else { 0.0 });
++    s += &format!("LOOKUP_HIT {} LOOKUP_MISS {}\n", LK_HIT.swap(0, Ordering::Relaxed), LK_MISS.swap(0, Ordering::Relaxed));
++    if let Some(m) = NAMES.get() {
++        let m = std::mem::take(&mut *m.lock().unwrap());
++        let (mut hk, mut hc, mut mk, mut mc) = (0, 0u64, 0, 0u64);
++        let (mut adc, mut rep) = (0u64, 0u64);
++        let mut top: Vec<_> = Vec::new();
++        for ((d, n), (h, x)) in &m {
++            if *h > 0 { hk += 1; hc += *h as u64 }
++            if *x > 0 { mk += 1; mc += *x as u64 }
++            if n.starts_with(b"._") { adc += (*h + *x) as u64 }
++            rep += (*h + *x) as u64 - 1;
++            top.push((*h + *x, *x, *d, String::from_utf8_lossy(n).to_string()));
++        }
++        top.sort_by(|a, b| b.cmp(a));
++        s += &format!("LOOKUP_DISTINCT hit_keys {hk} hit_calls {hc} miss_keys {mk} miss_calls {mc} appledouble_calls {adc} repeat_calls {rep}\n");
++        for t in top.iter().take(25) {
++            s += &format!("  name {:?} dir {} calls {} misses {}\n", t.3, t.2, t.0, t.1);
++        }
++        let mut ext: HashMap<String, (u64, u64)> = HashMap::new();
++        for ((_, n), (h, x)) in &m {
++            let n = String::from_utf8_lossy(n);
++            let e = n.rsplit_once('.').map(|x| x.1.to_string()).unwrap_or_default();
++            let v = ext.entry(e).or_default();
++            v.0 += *h as u64;
++            v.1 += *x as u64;
++        }
++        let mut ev: Vec<_> = ext.into_iter().collect();
++        ev.sort_by(|a, b| (b.1 .0 + b.1 .1).cmp(&(a.1 .0 + a.1 .1)));
++        for (e, (h, x)) in ev.iter().take(12) {
++            s += &format!("  ext {:?} hits {} misses {}\n", e, h, x);
++        }
++    }
++    if let Some(m) = IDS.get() {
++        let m = std::mem::take(&mut *m.lock().unwrap());
++        for p in [1u32, 4] {
++            let v: Vec<_> = m.iter().filter(|((q, _), _)| *q == p).map(|(_, c)| *c).collect();
++            s += &format!("PROC{} distinct_ids {} calls {}\n", p, v.len(), v.iter().sum::<u64>());
++        }
++    }
+     s
+ }
+ 
++use std::collections::HashMap;
++static LK_HIT: AtomicU64 = AtomicU64::new(0);
++static LK_MISS: AtomicU64 = AtomicU64::new(0);
++static NAMES: std::sync::OnceLock<std::sync::Mutex<HashMap<(u64, Vec<u8>), (u32, u32)>>> = std::sync::OnceLock::new();
++static IDS: std::sync::OnceLock<std::sync::Mutex<HashMap<(u32, u64), u64>>> = std::sync::OnceLock::new();
++
++pub fn enable_name_stats() {
++    let _ = NAMES.set(Default::default());
++    let _ = IDS.set(Default::default());
++}
++
++fn note_lookup(dir: u64, name: &[u8], hit: bool) {
++    (if hit { &LK_HIT } else { &LK_MISS }).fetch_add(1, Ordering::Relaxed);
++    if let Some(m) = NAMES.get() {
++        let mut m = m.lock().unwrap();
++        let e = m.entry((dir, name.to_vec())).or_default();
++        if hit { e.0 += 1 } else { e.1 += 1 }
++    }
++}
++
++fn note_id(proc_: u32, id: u64) {
++    if let Some(m) = IDS.get() {
++        *m.lock().unwrap().entry((proc_, id)).or_default() += 1;
++    }
++}
++
+ async fn handle_nfs_inner(
+     xid: u32,
+     prog: NFSProgram,
+@@ -245,6 +310,7 @@
+         return Ok(());
+     }
+     let id = id.unwrap();
++    note_id(1, id);
+     match context.vfs.getattr(id).await {
+         Ok(fh) => {
+             debug!(" {:?} --> {:?}", xid, fh);
+@@ -310,12 +376,11 @@
+         Ok(v) => nfs::post_op_attr::attributes(v),
+         Err(_) => nfs::post_op_attr::Void,
+     };
+-    match context.vfs.lookup(dirid, &dirops.name).await {
+-        Ok(fid) => {
+-            let obj_attr = match context.vfs.getattr(fid).await {
+-                Ok(v) => nfs::post_op_attr::attributes(v),
+-                Err(_) => nfs::post_op_attr::Void,
+-            };
++    let lr = context.vfs.lookup_attr(dirid, &dirops.name).await;
++    note_lookup(dirid, &dirops.name, lr.is_ok());
++    match lr {
++        Ok((fid, a)) => {
++            let obj_attr = a.map_or(nfs::post_op_attr::Void, nfs::post_op_attr::attributes);
+ 
+             debug!("lookup success {:?} --> {:?}", xid, obj_attr);
+             make_success_reply(xid).serialize(output)?;
+@@ -553,6 +618,7 @@
+         return Ok(());
+     }
+     let id = id.unwrap();
++    note_id(4, id);
+ 
+     let obj_attr = match context.vfs.getattr(id).await {
+         Ok(v) => nfs::post_op_attr::attributes(v),
+@@ -1546,6 +1612,7 @@
+                 make_success_reply(xid).serialize(output)?;
+                 nfs::nfsstat3::NFS3ERR_NOT_SYNC.serialize(output)?;
+                 nfs::wcc_data::default().serialize(output)?;
++                return Ok(());
+             }
+         },
+     }
+diff -ruN vendor/nfsserve/src/vfs.rs spike18/server/vendor/nfsserve/src/vfs.rs
+--- vendor/nfsserve/src/vfs.rs	2026-09-29 12:10:34
++++ spike18/server/vendor/nfsserve/src/vfs.rs	2026-09-29 21:16:31
+@@ -114,6 +114,11 @@
+     /// This method should be fast as it is used very frequently.
+     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3>;
+ 
++    async fn lookup_attr(&self, dirid: fileid3, filename: &filename3) -> Result<(fileid3, Option<fattr3>), nfsstat3> {
++        let id = self.lookup(dirid, filename).await?;
++        Ok((id, self.getattr(id).await.ok()))
++    }
++
+     /// Sets the attributes of an id
+     /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
+     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3>;

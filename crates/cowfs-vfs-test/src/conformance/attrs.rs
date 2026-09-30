@@ -1,5 +1,8 @@
 //! `setattr` and the timestamp rules.
 //!
+//! APFS does not bump ctime for an atime-only `utimensat`, so only mode, mtime and size
+//! changes are required to bump it (see `attrs_atime_only_bumps_ctime` for the cowfs rule).
+//!
 //! Decisions pinned here: `setattr` is all or nothing; times given with `SetTime::At` are
 //! stored exactly (nanoseconds included); an explicit `mtime` in the same call as a
 //! truncate wins over the truncate's automatic mtime; every `setattr` that changes
@@ -228,11 +231,21 @@ pub fn setattr_bumps_ctime(c: &Ctx) -> Outcome {
     let b = c.fs.setattr(
         f,
         SetAttr {
-            atime: Some(SetTime::At(T1)),
+            mtime: Some(SetTime::At(T1)),
             ..Default::default()
         },
     )?;
-    ensure!(b.ctime > a.ctime, "utimes did not bump ctime");
+    ensure!(b.ctime > a.ctime, "utimes of mtime did not bump ctime");
+    c.tick();
+    let d = c.fs.setattr(
+        f,
+        SetAttr {
+            size: Some(2),
+            ..Default::default()
+        },
+    )?;
+    ensure!(d.ctime > b.ctime, "truncate did not bump ctime");
+    ensure_eq!(d.size, 2, "truncate did not apply");
     c.fs.setattr(f, SetAttr::default())?;
     Ok(())
 }
@@ -336,6 +349,28 @@ pub fn namespace_ops_update_times(c: &Ctx) -> Outcome {
     ensure!(
         moved.ctime > file.ctime,
         "cross-directory rename did not update the file ctime"
+    );
+    Ok(())
+}
+
+/// cowfs contract: an atime-only `setattr` bumps ctime like every other change. APFS does not,
+/// so this is a separate `Cowfs` check.
+pub fn attrs_atime_only_bumps_ctime(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    let old = c.fs.getattr(f)?;
+    c.tick();
+    let a = c.fs.setattr(
+        f,
+        SetAttr {
+            atime: Some(SetTime::At(T1)),
+            ..Default::default()
+        },
+    )?;
+    ensure_eq!(a.atime, T1, "atime");
+    ensure_eq!(a.mtime, old.mtime, "an atime-only setattr changed mtime");
+    ensure!(
+        a.ctime > old.ctime,
+        "an atime-only setattr did not bump ctime"
     );
     Ok(())
 }

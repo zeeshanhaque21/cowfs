@@ -252,3 +252,54 @@ fn a_panic_is_a_failure_and_does_not_affect_later_checks() {
         .as_ref()
         .is_err_and(|f| f.0.contains("backend bug")));
 }
+
+#[test]
+fn the_link_limit_check_is_skipped_without_a_declared_limit() {
+    let r = run_all(&mem, &opts("hardlink_limit"));
+    assert!(r.passed());
+    assert!(
+        r.results.is_empty(),
+        "the check ran without a declared limit"
+    );
+    assert_eq!(r.skipped_count(), 1);
+    assert!(r.table().contains("Options::link_limit"));
+
+    let small = || -> Arc<dyn Vfs> { Arc::new(MemVfs::with_link_max(50)) };
+    let o = Options {
+        link_limit: Some(50),
+        ..opts("hardlink_limit")
+    };
+    let r = run_all(&small, &o);
+    assert!(r.passed(), "{}", r.table());
+    assert_eq!(r.results.len(), 1);
+    assert_eq!(r.skipped_count(), 0);
+    // The default limit is far higher, so it still runs (slow), but the declared 50 is enforced.
+    let r = run_all(&mem, &o);
+    assert!(
+        !r.passed(),
+        "the default limit accepted more names than declared"
+    );
+}
+
+#[test]
+fn xattr_names_prefixed_is_opt_in() {
+    let r = run_all(&mem, &opts("xattr_name_validation"));
+    assert!(r.passed(), "{}", r.table());
+    let o = Options {
+        xattr_names: true,
+        ..opts("xattr_name_validation")
+    };
+    assert!(
+        run_all(&mem, &o).passed(),
+        "prefixed name rejected by MemVfs"
+    );
+    // A prefixed name is not what a bare-name backend would use, so both settings must pass.
+    assert!(run_all(
+        &mem,
+        &Options {
+            xattr_names: false,
+            ..o.clone()
+        }
+    )
+    .passed());
+}

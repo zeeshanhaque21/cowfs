@@ -1,6 +1,12 @@
 use super::*;
+use cowfs_vfs::{DirEntryPlus, ReadDirPlus};
 
 const XATTR_VALUE_MAX: usize = 65536;
+
+fn st_fault_readdir_attrs(v: &MemVfs) -> bool {
+    let st = v.lock();
+    st.f(Fault::ReaddirAttrsNoAttrs)
+}
 
 fn apply_times(n: &mut Node, ch: &SetAttr, t: Timestamp) {
     let pick = |s: SetTime| match s {
@@ -60,6 +66,7 @@ impl Vfs for MemVfs {
                 FileKind::Symlink => return Err(Error::InvalidArgument),
                 FileKind::Regular if size > MAX_FILE => return Err(Error::NoSpace),
                 FileKind::Regular => {}
+                _ => return Err(Error::NotSupported),
             }
         }
         let t = st.now();
@@ -465,6 +472,28 @@ impl Vfs for MemVfs {
             eof = entries.len() < max;
         }
         Ok(ReadDir { entries, eof })
+    }
+
+    fn readdir_attrs(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDirPlus> {
+        let listing = self.readdir(dir, cookie, max)?;
+        let mut entries = Vec::with_capacity(listing.entries.len());
+        if st_fault_readdir_attrs(self) {
+            return Ok(ReadDirPlus {
+                entries: Vec::new(),
+                eof: listing.eof,
+            });
+        }
+        for entry in listing.entries {
+            match self.lock().attr(entry.ino) {
+                Ok(attr) => entries.push(DirEntryPlus { entry, attr }),
+                Err(Error::Stale | Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(ReadDirPlus {
+            entries,
+            eof: listing.eof,
+        })
     }
 
     fn statfs(&self) -> Result<StatFs> {
