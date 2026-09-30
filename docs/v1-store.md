@@ -282,3 +282,19 @@ Where the time goes:
   A 165 KiB compressible block runs at 474 MiB/s, the sum of zstd decompression (896 MiB/s) and BLAKE3 (1153 MiB/s).
   The 1 GiB/s per thread target for verified reads is therefore out of reach for compressed blocks on this machine, and only close for raw ones.
 - Data on this corpus compresses 3.24x after dedup (320 MiB stored for 1,037 MiB of input, with 1,676 of 15,029 puts deduplicated).
+
+## Contract targets that are missed
+
+Two targets in `docs/v1-architecture.md` are missed single-threaded on this Mac, and the store does not claim them.
+
+- Chunk plus hash at least 800 MiB/s per thread: measured 573 to 597 MiB/s.
+  FastCDC and BLAKE3 are two serial passes that top out near 1.3 to 1.5 GiB/s and 0.9 to 1.3 GiB/s.
+  Their harmonic sum is about 540 to 710 MiB/s.
+- Verified read at least 1 GiB/s per thread: measured 394 to 472 MiB/s on a real mix of blocks.
+  BLAKE3 alone caps a hot raw block near 1.1 GiB/s, and compressed blocks add zstd decompression at about 0.85 GiB/s.
+  The contract requires the hash on every read, so skipping it to reach the number is not allowed.
+
+Recommendation for the lead, not applied to `docs/v1-architecture.md`: restate both targets per 8 threads instead of per thread.
+The independent critic measured verified reads at 3413 MiB/s on 8 threads, and the builder measured 2656 MiB/s under heavier load.
+Ingest already scales the same way (709 to 1172 MiB/s on 8 threads against about 200 on one).
+Every thread of a mount serving reads or an import runs the chunker, the hasher and the decoder independently, so the 8 thread figure is the one that matters for cowfs.
