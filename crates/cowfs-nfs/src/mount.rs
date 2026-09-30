@@ -8,9 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cowfs_vfs::Vfs;
-use nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use nfsserve::tcp::{Limits, MountGate, NFSTcp, NFSTcpListener};
 
-use crate::adapter::{AdapterOptions, CowNfs};
+use crate::adapter::{AdapterOptions, AppleDoubleMode, CowNfs};
+use crate::peer::same_user;
 
 const MOUNT_NFS: &str = "/sbin/mount_nfs";
 const MOUNT: &str = "/sbin/mount";
@@ -47,8 +48,17 @@ pub struct MountOptions {
     /// Client attribute cache lifetime in seconds. Changes made through another path than this
     /// mount (a control plane snapshot, say) can stay invisible for that long.
     pub actimeo: u32,
-    /// Hide `._*` AppleDouble sidecars from listings, see [`AdapterOptions::hide_appledouble`].
-    pub hide_appledouble: bool,
+    /// What to do with the `._name` files the macOS client writes for extended attributes.
+    pub appledouble: AppleDoubleMode,
+    /// Answer cheap metadata calls on the network thread, see [`AdapterOptions::inline_metadata`].
+    pub inline_metadata: bool,
+    /// Give the root file handle to one client only: the first MNT wins and later ones are
+    /// refused until [`Server::rearm_mount`].
+    pub one_shot_mount: bool,
+    /// Refuse MNT from a process of another user than the server's (best effort, uses `lsof`).
+    pub check_peer_uid: bool,
+    /// Connection and message bounds of the server.
+    pub limits: Limits,
     /// Print the per-procedure latency table to stderr on SIGUSR1.
     pub stats_on_sigusr1: bool,
     /// Limit for each `mount_nfs` and `umount` invocation.
@@ -61,7 +71,11 @@ impl Default for MountOptions {
             rsize: 131_072,
             wsize: 131_072,
             actimeo: 120,
-            hide_appledouble: true,
+            appledouble: AppleDoubleMode::default(),
+            inline_metadata: false,
+            one_shot_mount: true,
+            check_peer_uid: true,
+            limits: Limits::default(),
             stats_on_sigusr1: false,
             command_timeout: Duration::from_secs(20),
         }
@@ -80,7 +94,8 @@ impl MountOptions {
 
     fn adapter(&self, owner: Option<(u32, u32)>) -> AdapterOptions {
         AdapterOptions {
-            hide_appledouble: self.hide_appledouble,
+            appledouble: self.appledouble,
+            inline_metadata: self.inline_metadata,
             owner,
         }
     }
@@ -91,6 +106,7 @@ impl MountOptions {
 pub struct Server {
     runtime: Option<tokio::runtime::Runtime>,
     port: u16,
+    gate: Option<Arc<MountGate>>,
 }
 
 impl Server {
@@ -105,9 +121,17 @@ impl Server {
             .thread_name("cowfs-nfs")
             .enable_all()
             .build()?;
-        let fs = CowNfs::new(vfs, opts.adapter(owner));
-        let listener = runtime.block_on(NFSTcpListener::bind("127.0.0.1:0", fs))?;
+        let fs = CowNfs::new(vfs, opts.adapter(owner))?;
+        let mut listener = runtime.block_on(NFSTcpListener::bind("127.0.0.1:0", fs))?;
         let port = listener.get_listen_port();
+        listener.set_limits(opts.limits.clone());
+        let gate = opts.one_shot_mount.then(|| Arc::new(MountGate::new()));
+        if let Some(gate) = &gate {
+            listener.set_mount_gate(gate.clone());
+        }
+        if opts.check_peer_uid {
+            listener.set_peer_check(Arc::new(same_user));
+        }
         runtime.spawn(async move {
             let _ = listener.handle_forever().await;
         });
@@ -124,11 +148,19 @@ impl Server {
         Ok(Server {
             runtime: Some(runtime),
             port,
+            gate,
         })
     }
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Lets the next MNT take the root handle again, for a deliberate remount.
+    pub fn rearm_mount(&self) {
+        if let Some(g) = &self.gate {
+            g.rearm();
+        }
     }
 }
 
@@ -140,9 +172,9 @@ impl Drop for Server {
     }
 }
 
-struct CmdOutput {
-    status: ExitStatus,
-    stderr: String,
+pub(crate) struct CmdOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stderr: String,
 }
 
 fn drain(s: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
@@ -156,7 +188,7 @@ fn drain(s: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
 }
 
 /// Runs `cmd` and kills it after `timeout` (macOS has no `timeout` binary).
-fn run(cmd: &mut Command, timeout: Duration) -> Result<(CmdOutput, String), MountError> {
+pub(crate) fn run(cmd: &mut Command, timeout: Duration) -> Result<(CmdOutput, String), MountError> {
     let name = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .stdin(Stdio::null())
@@ -185,7 +217,7 @@ fn run(cmd: &mut Command, timeout: Duration) -> Result<(CmdOutput, String), Moun
     Ok((CmdOutput { status, stderr }, stdout))
 }
 
-fn checked(cmd: &mut Command, timeout: Duration) -> Result<String, MountError> {
+pub(crate) fn checked(cmd: &mut Command, timeout: Duration) -> Result<String, MountError> {
     let name = cmd.get_program().to_string_lossy().into_owned();
     let (out, stdout) = run(cmd, timeout)?;
     if out.status.success() {
@@ -351,10 +383,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_hide_appledouble() {
+    fn defaults_translate_appledouble_and_lock_down_the_mount() {
         let o = MountOptions::default();
-        assert!(o.hide_appledouble && !o.stats_on_sigusr1);
-        assert!(o.adapter(None).hide_appledouble);
+        assert!(o.appledouble == AppleDoubleMode::Translate && !o.stats_on_sigusr1);
+        assert!(o.one_shot_mount && o.check_peer_uid && !o.inline_metadata);
+        assert_eq!(o.adapter(None).appledouble, AppleDoubleMode::Translate);
     }
 
     #[test]

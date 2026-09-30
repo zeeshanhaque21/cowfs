@@ -1,8 +1,8 @@
 //! Translates NFSv3 operations to `Vfs` calls. `Adapter` is the synchronous core, `CowNfs` runs
 //! it on blocking tasks behind the async `NFSFileSystem` trait. No lock is held across a `Vfs` call.
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cowfs_vfs::{
@@ -10,53 +10,71 @@ use cowfs_vfs::{
     Vfs, NAME_MAX, ROOT_INO,
 };
 use nfsserve::nfs::{
-    cookie3, count3, createverf3, fattr3, fileid3, filename3, fsstat3, nfspath3, nfsstat3, sattr3,
-    set_mode3,
+    cookie3, count3, createverf3, fattr3, fileid3, filename3, fsstat3, nfs_fh3, nfspath3, nfsstat3,
+    sattr3, set_mode3,
 };
 use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult};
 
 use crate::convert::{fattr, set_attr};
 use crate::errors::nfsstat;
+use crate::handle::HandleCodec;
+use crate::sidecar::{is_side, SidecarBuffers};
 
-type NfsResult<T> = Result<T, nfsstat3>;
+pub(crate) type NfsResult<T> = Result<T, nfsstat3>;
 
 const APPLEDOUBLE: &[u8] = b"._";
 const SYMLINK_TARGET_MAX: usize = 1024;
 const READDIR_PAGE: usize = 512;
 
+/// What to do with the `._name` AppleDouble files the macOS client writes for extended attributes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AppleDoubleMode {
+    /// Serve `._name` as a view of the extended attributes of `name` and store nothing: the
+    /// attributes live in the `Vfs` as xattrs of the real file, so no sidecar inodes exist and
+    /// other mounts of the same data see no `._` files. Real files whose names start with `._`
+    /// are invisible on the mount.
+    #[default]
+    Translate,
+    /// Store the sidecars as ordinary files but hide them from listings. Removing a file
+    /// removes its sidecar, renaming moves it, removing a directory that holds only sidecars
+    /// removes them. The mounter cannot see the sidecars, other mounts see them.
+    Hide,
+    /// Treat `._` names like any other name.
+    Store,
+}
+
 /// Adapter behaviour switches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdapterOptions {
-    /// Hide `._*` entries from directory listings. The macOS client writes them next to files
-    /// that carry extended attributes. They are still stored and can still be looked up, they
-    /// are just not listed. Removing a file removes its sidecar, renaming moves it, and removing
-    /// a directory that holds only sidecars removes them.
-    pub hide_appledouble: bool,
+    pub appledouble: AppleDoubleMode,
+    /// Run cheap metadata calls (GETATTR, LOOKUP, FSSTAT) on the network thread instead of a
+    /// blocking task. Only correct when the `Vfs` answers them without blocking.
+    pub inline_metadata: bool,
     /// The (uid, gid) reported for every file. `Mount` sets it to the owner of the mount point,
     /// so tools that check ownership (git) accept the tree. `None` reports what the `Vfs` says.
     pub owner: Option<(u32, u32)>,
 }
 
-impl Default for AdapterOptions {
-    fn default() -> Self {
-        Self {
-            hide_appledouble: true,
-            owner: None,
-        }
-    }
-}
-
-/// True for AppleDouble sidecar names (`._name`).
+/// True for AppleDouble sidecar names: `._` followed by at least one more byte.
 pub fn is_appledouble(name: &[u8]) -> bool {
-    name.starts_with(APPLEDOUBLE)
+    name.len() > APPLEDOUBLE.len() && name.starts_with(APPLEDOUBLE)
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn stat(e: Error) -> nfsstat3 {
+pub(crate) fn stat(e: Error) -> nfsstat3 {
     nfsstat(&e)
+}
+
+/// A sidecar's file id names no directory.
+fn not_side(dir: Ino) -> NfsResult<()> {
+    if is_side(dir) {
+        Err(nfsstat3::NFS3ERR_NOTDIR)
+    } else {
+        Ok(())
+    }
 }
 
 /// A name that is about to be created: "." and ".." exist already.
@@ -82,39 +100,49 @@ fn verifier_times(verf: createverf3) -> (Timestamp, Timestamp) {
 
 /// The synchronous NFS to `Vfs` translation.
 pub struct Adapter {
-    vfs: Arc<dyn Vfs>,
-    opts: AdapterOptions,
-    generation: u64,
+    pub(crate) vfs: Arc<dyn Vfs>,
+    pub(crate) opts: AdapterOptions,
+    handles: HandleCodec,
     parents: Mutex<HashMap<Ino, Ino>>,
+    pub(crate) sidecars: Mutex<SidecarBuffers>,
 }
 
 impl std::fmt::Debug for Adapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Adapter")
             .field("opts", &self.opts)
-            .field("generation", &self.generation)
+            .field("generation", &self.handles.generation())
             .finish_non_exhaustive()
     }
 }
 
 impl Adapter {
-    pub fn new(vfs: Arc<dyn Vfs>, opts: AdapterOptions) -> Self {
-        let generation = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| {
-            u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)
-        });
-        Self {
+    /// Fails only if the operating system cannot supply random bytes for the handle key.
+    pub fn new(vfs: Arc<dyn Vfs>, opts: AdapterOptions) -> io::Result<Self> {
+        Ok(Self {
             vfs,
             opts,
-            generation,
+            handles: HandleCodec::new()?,
             parents: Mutex::new(HashMap::new()),
-        }
+            sidecars: Mutex::new(SidecarBuffers::default()),
+        })
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation
+        self.handles.generation()
     }
 
-    fn fa(&self, a: &Attr) -> fattr3 {
+    /// The file handle for `ino`.
+    pub fn handle(&self, ino: Ino) -> Vec<u8> {
+        self.handles.encode(ino)
+    }
+
+    /// The inode a file handle names, or the status that refuses it.
+    pub fn resolve(&self, handle: &[u8]) -> NfsResult<Ino> {
+        self.handles.decode(handle)
+    }
+
+    pub(crate) fn fa(&self, a: &Attr) -> fattr3 {
         let mut f = fattr(a);
         if let Some((uid, gid)) = self.opts.owner {
             f.uid = uid;
@@ -134,7 +162,7 @@ impl Adapter {
     }
 
     /// Looks a name up for the adapter's own use and gives the reference straight back.
-    fn peek(&self, dir: Ino, name: &[u8]) -> Result<Attr, Error> {
+    pub(crate) fn peek(&self, dir: Ino, name: &[u8]) -> Result<Attr, Error> {
         let a = self.vfs.lookup(dir, name)?;
         self.vfs.forget(a.ino, 1);
         Ok(a)
@@ -143,6 +171,8 @@ impl Adapter {
     /// Forgets what the adapter knows about an inode whose last name was just removed.
     fn reap(&self, ino: Ino) {
         lock(&self.parents).remove(&ino);
+        lock(&self.sidecars).remove(ino);
+        self.handles.bury(ino);
     }
 
     fn parent_of(&self, dir: Ino) -> NfsResult<Ino> {
@@ -156,10 +186,17 @@ impl Adapter {
     }
 
     pub fn getattr(&self, id: fileid3) -> NfsResult<fattr3> {
+        if is_side(id) {
+            return self.side_getattr(id);
+        }
         self.vfs.getattr(id).map(|a| self.fa(&a)).map_err(stat)
     }
 
     pub fn lookup(&self, dir: fileid3, name: &[u8]) -> NfsResult<(fileid3, fattr3)> {
+        not_side(dir)?;
+        if self.translating(name) {
+            return self.side_lookup(dir, name);
+        }
         match name {
             b"." => {
                 let a = self.vfs.getattr(dir).map_err(stat)?;
@@ -191,14 +228,23 @@ impl Adapter {
     }
 
     pub fn setattr(&self, id: fileid3, s: &sattr3) -> NfsResult<fattr3> {
+        if is_side(id) {
+            return self.side_setattr(id, s);
+        }
         self.apply(id, set_attr(s)).map(|a| self.fa(&a))
     }
 
     pub fn readlink(&self, id: fileid3) -> NfsResult<Vec<u8>> {
+        if is_side(id) {
+            return Err(nfsstat3::NFS3ERR_INVAL);
+        }
         self.vfs.readlink(id).map_err(stat)
     }
 
     pub fn read(&self, id: fileid3, offset: u64, count: count3) -> NfsResult<(Vec<u8>, bool)> {
+        if is_side(id) {
+            return self.side_read(id, offset, count);
+        }
         let data = self.vfs.read(id, offset, count).map_err(stat)?;
         let len = data.len() as u64;
         let eof = if len < u64::from(count) {
@@ -211,11 +257,17 @@ impl Adapter {
     }
 
     pub fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> NfsResult<(u32, fattr3)> {
+        if is_side(id) {
+            return self.side_write(id, offset, data);
+        }
         let n = self.vfs.write(id, offset, data).map_err(stat)?;
         Ok((n, self.getattr(id)?))
     }
 
     pub fn commit(&self, id: fileid3) -> NfsResult<()> {
+        if is_side(id) {
+            return self.side_getattr(id).map(drop);
+        }
         self.vfs.fsync(id, false).map_err(stat)
     }
 
@@ -226,6 +278,10 @@ impl Adapter {
         attr: &sattr3,
         guarded: bool,
     ) -> NfsResult<(fileid3, fattr3)> {
+        not_side(dir)?;
+        if self.translating(name) {
+            return self.side_create(dir, name, attr, guarded);
+        }
         new_name(name)?;
         let mode = match attr.mode {
             set_mode3::mode(m) => m,
@@ -262,6 +318,10 @@ impl Adapter {
         name: &[u8],
         verf: createverf3,
     ) -> NfsResult<(fileid3, fattr3)> {
+        not_side(dir)?;
+        if self.translating(name) {
+            return self.side_create_exclusive(dir, name);
+        }
         new_name(name)?;
         let (atime, mtime) = verifier_times(verf);
         match self.vfs.create(dir, name, 0o600) {
@@ -290,6 +350,8 @@ impl Adapter {
     }
 
     pub fn mkdir(&self, dir: fileid3, name: &[u8], attr: &sattr3) -> NfsResult<(fileid3, fattr3)> {
+        not_side(dir)?;
+        self.no_sidecar_name(name)?;
         new_name(name)?;
         let mode = match attr.mode {
             set_mode3::mode(m) => m,
@@ -306,6 +368,8 @@ impl Adapter {
         name: &[u8],
         target: &[u8],
     ) -> NfsResult<(fileid3, fattr3)> {
+        not_side(dir)?;
+        self.no_sidecar_name(name)?;
         new_name(name)?;
         if target.is_empty() || target.contains(&0) {
             return Err(nfsstat3::NFS3ERR_INVAL);
@@ -319,10 +383,24 @@ impl Adapter {
     }
 
     pub fn link(&self, file: fileid3, dir: fileid3, name: &[u8]) -> NfsResult<fattr3> {
+        not_side(dir)?;
+        if is_side(file) {
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
+        self.no_sidecar_name(name)?;
         new_name(name)?;
         let a = self.vfs.link(file, dir, name).map_err(stat)?;
         self.handed_out(None, &a);
         Ok(self.fa(&a))
+    }
+
+    /// Sidecars are created by CREATE only.
+    fn no_sidecar_name(&self, name: &[u8]) -> NfsResult<()> {
+        if self.translating(name) {
+            Err(nfsstat3::NFS3ERR_ACCES)
+        } else {
+            Ok(())
+        }
     }
 
     /// Removes one name and releases the inode if that was its last link.
@@ -343,9 +421,16 @@ impl Adapter {
     }
 
     pub fn remove(&self, dir: fileid3, name: &[u8]) -> NfsResult<()> {
+        not_side(dir)?;
         check_name(name)?;
+        if self.translating(name) {
+            return self.side_remove(dir, name);
+        }
         self.remove_one(dir, name)?;
-        if let (true, Some(side)) = (self.opts.hide_appledouble, Self::sidecar(name)) {
+        if let (true, Some(side)) = (
+            self.opts.appledouble == AppleDoubleMode::Hide,
+            Self::sidecar(name),
+        ) {
             let _ = self.remove_one(dir, &side);
         }
         Ok(())
@@ -375,10 +460,14 @@ impl Adapter {
     }
 
     pub fn rmdir(&self, dir: fileid3, name: &[u8]) -> NfsResult<()> {
+        not_side(dir)?;
         check_name(name)?;
+        if self.translating(name) {
+            return Err(nfsstat3::NFS3ERR_NOTDIR);
+        }
         let target = self.peek(dir, name).map_err(stat)?;
         match self.vfs.rmdir(dir, name) {
-            Err(Error::NotEmpty) if self.opts.hide_appledouble => {
+            Err(Error::NotEmpty) if self.opts.appledouble == AppleDoubleMode::Hide => {
                 self.purge_sidecars(target.ino)?;
                 self.vfs.rmdir(dir, name).map_err(stat)?;
             }
@@ -395,8 +484,16 @@ impl Adapter {
         to_dir: fileid3,
         to: &[u8],
     ) -> NfsResult<()> {
+        not_side(from_dir)?;
+        not_side(to_dir)?;
         check_name(from)?;
         check_name(to)?;
+        match (self.translating(from), self.translating(to)) {
+            // The attributes live on the inode and moved with it: nothing left to do.
+            (true, true) => return Ok(()),
+            (false, false) => {}
+            _ => return Err(nfsstat3::NFS3ERR_ACCES),
+        }
         let src = self.peek(from_dir, from).map_err(stat)?;
         let replaced = self.peek(to_dir, to).ok();
         self.vfs
@@ -410,8 +507,9 @@ impl Adapter {
                 self.reap(d.ino);
             }
         }
-        if self.opts.hide_appledouble {
+        if self.opts.appledouble == AppleDoubleMode::Hide {
             if let (Some(from_side), Some(to_side)) = (Self::sidecar(from), Self::sidecar(to)) {
+                let replaced_side = self.peek(to_dir, &to_side).ok();
                 let moved = self.vfs.rename(
                     from_dir,
                     &from_side,
@@ -421,6 +519,10 @@ impl Adapter {
                 );
                 if moved.is_err() {
                     let _ = self.remove_one(to_dir, &to_side);
+                } else if let Some(d) = replaced_side {
+                    if d.nlink <= 1 {
+                        self.reap(d.ino);
+                    }
                 }
             }
         }
@@ -436,6 +538,7 @@ impl Adapter {
         max: usize,
         with_attrs: bool,
     ) -> NfsResult<ReadDirResult> {
+        not_side(dir)?;
         let max = max.max(1);
         let mut out = ReadDirResult::default();
         let mut cookie = cookie;
@@ -451,7 +554,7 @@ impl Adapter {
                     break;
                 }
                 cookie = e.cookie;
-                if self.opts.hide_appledouble && is_appledouble(&e.name) {
+                if self.opts.appledouble != AppleDoubleMode::Store && is_appledouble(&e.name) {
                     continue;
                 }
                 if let Some(entry) = self.list_entry(dir, e, with_attrs) {
@@ -507,8 +610,21 @@ impl Adapter {
 pub struct CowNfs(Arc<Adapter>);
 
 impl CowNfs {
-    pub fn new(vfs: Arc<dyn Vfs>, opts: AdapterOptions) -> Self {
-        Self(Arc::new(Adapter::new(vfs, opts)))
+    pub fn new(vfs: Arc<dyn Vfs>, opts: AdapterOptions) -> io::Result<Self> {
+        Ok(Self(Arc::new(Adapter::new(vfs, opts)?)))
+    }
+
+    /// For calls a `Vfs` answers without blocking: inline if the option says so.
+    async fn run_cheap<T, F>(&self, f: F) -> NfsResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Adapter) -> NfsResult<T> + Send + 'static,
+    {
+        if self.0.opts.inline_metadata {
+            f(&self.0)
+        } else {
+            self.run(f).await
+        }
     }
 
     async fn run<T, F>(&self, f: F) -> NfsResult<T>
@@ -533,13 +649,23 @@ impl NFSFileSystem for CowNfs {
         self.0.generation()
     }
 
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        nfs_fh3 {
+            data: self.0.handle(id),
+        }
+    }
+
+    fn fh_to_id(&self, fh: &nfs_fh3) -> NfsResult<fileid3> {
+        self.0.resolve(&fh.data)
+    }
+
     async fn lookup(&self, dirid: fileid3, name: &filename3) -> NfsResult<(fileid3, fattr3)> {
         let name = name.clone();
-        self.run(move |a| a.lookup(dirid, &name)).await
+        self.run_cheap(move |a| a.lookup(dirid, &name)).await
     }
 
     async fn getattr(&self, id: fileid3) -> NfsResult<fattr3> {
-        self.run(move |a| a.getattr(id)).await
+        self.run_cheap(move |a| a.getattr(id)).await
     }
 
     async fn setattr(&self, id: fileid3, s: sattr3) -> NfsResult<fattr3> {
@@ -645,7 +771,7 @@ impl NFSFileSystem for CowNfs {
     }
 
     async fn fsstat(&self, _id: fileid3) -> NfsResult<fsstat3> {
-        self.run(|a| a.fsstat()).await
+        self.run_cheap(|a| a.fsstat()).await
     }
 }
 
@@ -658,10 +784,15 @@ mod tests {
         Adapter::new(
             Arc::new(MemVfs::new()),
             AdapterOptions {
-                hide_appledouble: hide,
-                owner: None,
+                appledouble: if hide {
+                    AppleDoubleMode::Hide
+                } else {
+                    AppleDoubleMode::Store
+                },
+                ..AdapterOptions::default()
             },
         )
+        .unwrap()
     }
 
     #[test]
@@ -682,7 +813,7 @@ mod tests {
     #[test]
     fn appledouble_names() {
         assert!(is_appledouble(b"._x"));
-        assert!(is_appledouble(b"._"));
+        assert!(!is_appledouble(b"._"), "needs a name after the prefix");
         assert!(!is_appledouble(b".x"));
         assert!(!is_appledouble(b"x._"));
         assert_eq!(Adapter::sidecar(b"x"), Some(b"._x".to_vec()));

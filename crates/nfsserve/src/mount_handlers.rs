@@ -108,6 +108,32 @@ pub async fn mountproc3_mnt(
         mountstat3::MNT3ERR_NOENT.serialize(output)?;
         return Ok(());
     };
+    if let Some(check) = context.peer_check.clone() {
+        let (peer, local) = (context.peer, context.local);
+        let allowed = tokio::task::spawn_blocking(move || check(peer, local))
+            .await
+            .unwrap_or(false);
+        if !allowed {
+            debug!(
+                "{:?} --> MNT3ERR_ACCES, the peer check refused {}",
+                xid, peer
+            );
+            make_success_reply(xid).serialize(output)?;
+            mountstat3::MNT3ERR_ACCES.serialize(output)?;
+            return Ok(());
+        }
+    }
+    if let Some(gate) = &context.mount_gate {
+        if !gate.claim(context.peer) {
+            debug!(
+                "{:?} --> MNT3ERR_ACCES, the root handle was already taken",
+                xid
+            );
+            make_success_reply(xid).serialize(output)?;
+            mountstat3::MNT3ERR_ACCES.serialize(output)?;
+            return Ok(());
+        }
+    }
     if let Ok(fileid) = context.vfs.path_to_id(&path).await {
         let response = mountres3_ok {
             fhandle: context.vfs.id_to_fh(fileid).data,

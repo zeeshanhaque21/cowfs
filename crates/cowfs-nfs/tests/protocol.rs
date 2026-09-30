@@ -4,7 +4,7 @@ mod common;
 use std::collections::HashSet;
 
 use common::*;
-use cowfs_nfs::{AdapterOptions, CowNfs, MountOptions};
+use cowfs_nfs::{AdapterOptions, AppleDoubleMode, CowNfs, MountOptions};
 use nfsserve::nfs::{ftype3, nfs_fh3, nfsstat3};
 use nfsserve::vfs::NFSFileSystem;
 
@@ -324,7 +324,7 @@ fn readdir_pages_are_complete_and_unique() {
     assert_eq!((st, page.len(), eof), (OK, 300, true));
     let (st, page, eof) = c.readdir_page(&d, page[299].cookie, true, 100_000);
     assert_eq!((st, page.len(), eof), (OK, 0, true));
-    let (st, ..) = c.readdir_page(&nfs_fh3 { data: vec![0; 16] }, 0, false, 4096);
+    let (st, ..) = c.readdir_page(&nfs_fh3 { data: vec![0; 40] }, 0, false, 4096);
     assert_eq!(st, STALE, "generation 0 predates this server");
 }
 
@@ -381,7 +381,11 @@ fn deleting_while_listing_neither_repeats_nor_drops() {
 
 #[test]
 fn appledouble_is_hidden_but_present() {
-    let (_s, mut c) = setup();
+    let opts = MountOptions {
+        appledouble: AppleDoubleMode::Hide,
+        ..MountOptions::default()
+    };
+    let (_s, mut c) = serve(memfs(), opts);
     let root = c.root.clone();
     c.create_file(&root, "doc");
     let side = c.create_file(&root, "._doc");
@@ -437,7 +441,7 @@ fn appledouble_is_hidden_but_present() {
 #[test]
 fn appledouble_shows_when_not_hidden() {
     let opts = MountOptions {
-        hide_appledouble: false,
+        appledouble: AppleDoubleMode::Store,
         ..MountOptions::default()
     };
     let (_s, mut c) = serve(memfs(), opts);
@@ -499,9 +503,9 @@ fn access_reports_owner_bits() {
 
 #[test]
 fn handles_encode_decode_and_expire() {
-    let fs = CowNfs::new(memfs(), AdapterOptions::default());
+    let fs = CowNfs::new(memfs(), AdapterOptions::default()).unwrap();
     let fh = fs.id_to_fh(77);
-    assert_eq!(fh.data.len(), 16);
+    assert_eq!(fh.data.len(), cowfs_nfs::HANDLE_LEN);
     assert_eq!(fs.fh_to_id(&fh), Ok(77));
     assert_eq!(
         fs.id_to_fh(77).data,
@@ -552,7 +556,7 @@ fn many_connections_share_one_server() {
             let port = s.port();
             let root = root.clone();
             std::thread::spawn(move || {
-                let mut c = Nfs::connect(port);
+                let mut c = Nfs::attach(port, root.clone());
                 for j in 0..50 {
                     let n = format!("t{i}-{j}");
                     let f = c.create_file(&root, &n);
@@ -578,7 +582,7 @@ fn oversized_and_bad_frames_do_not_kill_the_server() {
         bad.write_all(&(u32::MAX).to_be_bytes()).unwrap();
         bad.write_all(&[0; 64]).unwrap();
     }
-    let mut c2 = Nfs::connect(s.port());
+    let mut c2 = Nfs::attach(s.port(), root.clone());
     assert_eq!(c2.getattr(&root).0, OK);
     assert_eq!(c.getattr(&root).0, OK);
     let (acc, _) = c.raw(
@@ -592,8 +596,15 @@ fn oversized_and_bad_frames_do_not_kill_the_server() {
 
 #[test]
 fn owner_override_applies_to_every_reply() {
-    let server =
-        cowfs_nfs::Server::start(memfs(), &MountOptions::default(), Some((501, 20))).unwrap();
+    let server = cowfs_nfs::Server::start(
+        memfs(),
+        &MountOptions {
+            check_peer_uid: false,
+            ..MountOptions::default()
+        },
+        Some((501, 20)),
+    )
+    .unwrap();
     let mut c = Nfs::connect(server.port());
     let root = c.root.clone();
     assert_eq!((c.attrs(&root).uid, c.attrs(&root).gid), (501, 20));

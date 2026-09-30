@@ -11,12 +11,19 @@
 //! and the benchmark are `#[ignore]`d, see `tests/mount.rs` and `tests/bench.rs`.
 
 mod adapter;
+mod appledouble;
 mod convert;
 mod errors;
+mod handle;
 mod mount;
+mod peer;
+mod sidecar;
 
-pub use adapter::{is_appledouble, Adapter, AdapterOptions, CowNfs};
+pub use adapter::{is_appledouble, Adapter, AdapterOptions, AppleDoubleMode, CowNfs};
+pub use appledouble::Sidecar;
 pub use convert::{fattr, nfstime, set_attr, timestamp, FSID};
 pub use errors::nfsstat;
+pub use handle::{random_key, HandleCodec, HANDLE_LEN};
 pub use mount::{is_listed, mount_nfs_available, Mount, MountError, MountOptions, Server};
 pub use nfsserve::take_stats;
+pub use peer::same_user;

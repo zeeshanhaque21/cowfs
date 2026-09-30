@@ -1,18 +1,99 @@
 use std::io;
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tokio::sync::{mpsc, Semaphore};
+use tracing::{debug, info};
 
 use crate::context::RPCContext;
-use crate::rpcwire::*;
-use crate::transaction_tracker::TransactionTracker;
+use crate::reply_cache::ReplyCache;
+use crate::rpcwire::serve_connection;
 use crate::vfs::NFSFileSystem;
+
+/// Resource bounds of a server. The defaults suit one local client that mounts and then talks
+/// over one or two connections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Connections served at once. Further connections are closed as they arrive.
+    pub max_connections: usize,
+    /// How long an established connection may sit without a request.
+    pub idle_timeout: Duration,
+    /// How long a connection may take to send its first request, and any request to arrive once
+    /// its first byte has (slowloris bound).
+    pub frame_timeout: Duration,
+    /// Requests of one connection running at once, the reader stops reading beyond that.
+    pub max_in_flight: usize,
+    /// Largest RPC message accepted, in bytes: a maximal WRITE plus headers.
+    pub max_frame: usize,
+    /// Calls remembered for retransmission replay.
+    pub reply_cache_entries: usize,
+    /// Age after which a remembered call is forgotten.
+    pub reply_cache_age: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            idle_timeout: Duration::from_secs(15 * 60),
+            frame_timeout: Duration::from_secs(30),
+            max_in_flight: 32,
+            max_frame: 1024 * 1024 + 64 * 1024,
+            reply_cache_entries: 4096,
+            reply_cache_age: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Lets one client take the root file handle. The first peer to call MNT claims it, later MNT
+/// calls from other connections are refused until `rearm`. Unmounting does not rearm it, so a
+/// process that sends UMNT cannot reopen the gate.
+#[derive(Debug, Default)]
+pub struct MountGate {
+    claimed: Mutex<Option<SocketAddr>>,
+    refused: AtomicBool,
+}
+
+impl MountGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True if `peer` may mount: nobody has yet, or `peer` is the connection that already did.
+    pub fn claim(&self, peer: SocketAddr) -> bool {
+        let mut g = self.claimed.lock().unwrap_or_else(PoisonError::into_inner);
+        match *g {
+            None => {
+                *g = Some(peer);
+                true
+            }
+            Some(p) if p == peer => true,
+            Some(_) => {
+                self.refused.store(true, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Allows the next MNT to claim the gate, for a deliberate remount.
+    pub fn rearm(&self) {
+        *self.claimed.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// True if a MNT was refused since the gate was created.
+    pub fn refused_any(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
+}
+
+/// Decides whether the connection that sends MNT may mount: called with the (peer, local)
+/// address on a blocking thread. Only MNT is checked: the macOS kernel NFS client owns its
+/// sockets, so no process can be found behind them.
+pub type PeerCheck = Arc<dyn Fn(SocketAddr, SocketAddr) -> bool + Send + Sync>;
 
 /// A NFS Tcp Connection Handler
 pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
@@ -20,66 +101,12 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     port: u16,
     arcfs: Arc<T>,
     mount_signal: Option<mpsc::Sender<bool>>,
+    mount_gate: Option<Arc<MountGate>>,
+    peer_check: Option<PeerCheck>,
     export_name: Arc<String>,
-    transaction_tracker: Arc<TransactionTracker>,
-}
-
-/// processes an established socket
-async fn process_socket(
-    mut socket: tokio::net::TcpStream,
-    context: RPCContext,
-) -> Result<(), anyhow::Error> {
-    let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
-    let _ = socket.set_nodelay(true);
-
-    tokio::spawn(async move {
-        loop {
-            if let Err(e) = message_handler.read().await {
-                debug!("Message loop broken due to {:?}", e);
-                break;
-            }
-        }
-    });
-    loop {
-        tokio::select! {
-            _ = socket.readable() => {
-                let mut buf = [0; 128000];
-
-                match socket.try_read(&mut buf) {
-                    Ok(0) => {
-                        return Ok(());
-                    }
-                    Ok(n) => {
-                        let _ = socksend.write_all(&buf[..n]).await;
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!("Message handling closed : {:?}", e);
-                        return Err(e.into());
-                    }
-                }
-
-            },
-            reply = msgrecvchan.recv() => {
-                match reply {
-                    Some(Err(e)) => {
-                        debug!("Message handling closed : {:?}", e);
-                        return Err(e);
-                    }
-                    Some(Ok(mut msg)) => {
-                        if let Err(e) = write_fragment(&mut socket, &mut msg).await {
-                            error!("Write error {:?}", e);
-                        }
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!("Unexpected socket context termination"));
-                    }
-                }
-            }
-        }
-    }
+    limits: Limits,
+    reply_cache: Arc<ReplyCache>,
+    connections: Arc<Semaphore>,
 }
 
 impl<T: NFSFileSystem + Send + Sync + 'static> std::fmt::Debug for NFSTcpListener<T> {
@@ -95,7 +122,7 @@ pub trait NFSTcp: Send + Sync {
     /// Gets the true listening port. Useful if the bound port number is 0
     fn get_listen_port(&self) -> u16;
 
-    /// Gets the true listening IP. Useful on windows when the IP may be random
+    /// Gets the true listening IP.
     fn get_listen_ip(&self) -> IpAddr;
 
     /// Sets a mount listener. A "true" signal will be sent on a mount
@@ -113,14 +140,36 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
         let listener = TcpListener::bind(ipstr).await?;
         let port = listener.local_addr()?.port();
         info!("Listening on {:?}", ipstr);
+        let limits = Limits::default();
         Ok(NFSTcpListener {
             listener,
             port,
             arcfs: Arc::new(fs),
             mount_signal: None,
+            mount_gate: None,
+            peer_check: None,
             export_name: Arc::from("/".to_string()),
-            transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            reply_cache: reply_cache(&limits),
+            connections: Arc::new(Semaphore::new(limits.max_connections)),
+            limits,
         })
+    }
+
+    /// Replaces the resource bounds. Call before `handle_forever`.
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.reply_cache = reply_cache(&limits);
+        self.connections = Arc::new(Semaphore::new(limits.max_connections));
+        self.limits = limits;
+    }
+
+    /// Makes MNT one-shot, see `MountGate`. Call before `handle_forever`.
+    pub fn set_mount_gate(&mut self, gate: Arc<MountGate>) {
+        self.mount_gate = Some(gate);
+    }
+
+    /// Sets the check MNT callers must pass, see `PeerCheck`. Call before `handle_forever`.
+    pub fn set_peer_check(&mut self, check: PeerCheck) {
+        self.peer_check = Some(check);
     }
 
     /// Sets an optional NFS export name.
@@ -138,6 +187,14 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
                 .trim_start_matches('/')
         ))
     }
+}
+
+fn reply_cache(limits: &Limits) -> Arc<ReplyCache> {
+    Arc::new(ReplyCache::new(
+        limits.reply_cache_entries,
+        limits.reply_cache_entries.saturating_mul(4096),
+        limits.reply_cache_age,
+    ))
 }
 
 #[async_trait]
@@ -171,19 +228,34 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 }
                 Err(e) => return Err(e),
             };
+            let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+                debug!("connection limit reached, closing {peer}");
+                continue;
+            };
+            let _ = socket.set_nodelay(true);
+            let Ok(local) = socket.local_addr() else {
+                continue;
+            };
             let context = RPCContext {
                 local_port: self.port,
                 client_addr: peer.to_string(),
+                client_ip: peer.ip(),
+                peer,
                 auth: crate::rpc::auth_unix::default(),
                 vfs: self.arcfs.clone(),
                 mount_signal: self.mount_signal.clone(),
+                mount_gate: self.mount_gate.clone(),
+                peer_check: self.peer_check.clone(),
+                local,
                 export_name: self.export_name.clone(),
-                transaction_tracker: self.transaction_tracker.clone(),
+                reply_cache: self.reply_cache.clone(),
             };
+            let limits = self.limits.clone();
             info!("Accepting connection from {}", context.client_addr);
-            debug!("Accepting socket {:?} {:?}", socket, context);
             tokio::spawn(async move {
-                let _ = process_socket(socket, context).await;
+                let (rd, wr) = socket.into_split();
+                serve_connection(rd, wr, context, limits).await;
+                drop(permit);
             });
         }
     }
@@ -196,4 +268,28 @@ fn is_transient_accept_error(e: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::Interrupted
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn the_gate_admits_one_peer_until_rearmed() {
+        let g = MountGate::new();
+        assert!(g.claim(addr(1)));
+        assert!(
+            g.claim(addr(1)),
+            "the claiming connection may repeat itself"
+        );
+        assert!(!g.claim(addr(2)));
+        assert!(g.refused_any());
+        g.rearm();
+        assert!(g.claim(addr(2)));
+        assert!(!g.claim(addr(1)));
+    }
 }

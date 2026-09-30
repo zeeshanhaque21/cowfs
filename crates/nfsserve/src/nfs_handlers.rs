@@ -752,6 +752,9 @@ impl READDIR3args {
     }
 }
 
+/// Largest directory reply built, whatever the client asks for.
+const MAX_DIR_REPLY: u32 = 256 * 1024;
+const MAX_DIR_ENTRIES: u32 = 4096;
 const DIRENT_MIN_BYTES: u32 = 24;
 const DIRENTPLUS_MIN_BYTES: u32 = 140;
 
@@ -764,12 +767,14 @@ pub async fn nfsproc3_readdir(
     ctx: &RPCContext,
     plus: bool,
 ) -> Handled {
-    let Ok(args) = READDIR3args::read(input, plus) else {
+    let Ok(mut args) = READDIR3args::read(input, plus) else {
         garbage_args_reply_message(xid).serialize(output)?;
         return Ok(());
     };
+    args.dircount = args.dircount.min(MAX_DIR_REPLY);
+    args.maxcount = args.maxcount.min(MAX_DIR_REPLY);
     let dirid = fh_or_fail!(ctx, &args.dir, xid, output, post_op_attr::Void);
-    let mut want = args.dircount / DIRENT_MIN_BYTES;
+    let mut want = (args.dircount / DIRENT_MIN_BYTES).min(MAX_DIR_ENTRIES);
     if plus {
         want = want.min(args.maxcount / DIRENTPLUS_MIN_BYTES);
     }

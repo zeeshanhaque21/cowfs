@@ -2,9 +2,9 @@
 #![allow(non_camel_case_types, clippy::upper_case_acronyms)]
 
 mod context;
+mod reply_cache;
 mod rpc;
 mod rpcwire;
-mod write_counter;
 pub mod xdr;
 
 mod mount;
@@ -18,5 +18,4 @@ mod nfs_handlers;
 pub use nfs_handlers::take_stats;
 
 pub mod tcp;
-mod transaction_tracker;
 pub mod vfs;

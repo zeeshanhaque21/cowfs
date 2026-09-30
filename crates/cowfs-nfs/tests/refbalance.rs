@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use common::counting::CountingVfs;
 use common::*;
-use cowfs_nfs::{Adapter, AdapterOptions, MountOptions};
+use cowfs_nfs::{Adapter, AdapterOptions, AppleDoubleMode, MountOptions};
 use cowfs_vfs::ROOT_INO;
 use nfsserve::nfs::sattr3;
 
@@ -16,10 +16,15 @@ fn adapter(hide: bool) -> (Arc<CountingVfs>, Adapter) {
     let a = Adapter::new(
         v.clone(),
         AdapterOptions {
-            hide_appledouble: hide,
+            appledouble: if hide {
+                AppleDoubleMode::Hide
+            } else {
+                AppleDoubleMode::Store
+            },
             ..AdapterOptions::default()
         },
-    );
+    )
+    .unwrap();
     (v, a)
 }
 

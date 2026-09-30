@@ -114,7 +114,8 @@ pub struct Nfs {
 }
 
 /// A running server over `vfs` and a connected, mounted client.
-pub fn serve(vfs: Arc<dyn Vfs>, opts: MountOptions) -> (Server, Nfs) {
+pub fn serve(vfs: Arc<dyn Vfs>, mut opts: MountOptions) -> (Server, Nfs) {
+    opts.check_peer_uid = false;
     let server = Server::start(vfs, &opts, None).unwrap();
     let nfs = Nfs::connect(server.port());
     (server, nfs)
@@ -125,21 +126,33 @@ pub fn memfs() -> Arc<MemVfs> {
 }
 
 impl Nfs {
-    pub fn connect(port: u16) -> Nfs {
+    /// A connection that has not mounted: `root` is empty until `mount` succeeds.
+    pub fn attach(port: u16, root: nfs_fh3) -> Nfs {
         let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_nodelay(true).unwrap();
         s.set_read_timeout(Some(std::time::Duration::from_secs(20)))
             .unwrap();
-        let mut n = Nfs {
-            s,
-            xid: 0,
-            root: nfs_fh3::default(),
-        };
-        let (acc, mut r) = n.raw(MOUNT, 3, 1, Args::new().put(&b"/".to_vec()));
+        Nfs { s, xid: 0, root }
+    }
+
+    /// MNT of "/": the mount status and, on success, the root handle.
+    pub fn mount(&mut self) -> (u32, Option<nfs_fh3>) {
+        let (acc, mut r) = self.raw(MOUNT, 3, 1, Args::new().put(&b"/".to_vec()));
         assert_eq!(acc, 0);
-        assert_eq!(dec::<u32>(&mut r), 0);
+        let st = dec::<u32>(&mut r);
+        if st != 0 {
+            return (st, None);
+        }
         let h: Vec<u8> = dec(&mut r);
-        n.root = nfs_fh3 { data: h };
+        (st, Some(nfs_fh3 { data: h }))
+    }
+
+    /// Connects and mounts: the first client of a one-shot server.
+    pub fn connect(port: u16) -> Nfs {
+        let mut n = Nfs::attach(port, nfs_fh3::default());
+        let (st, root) = n.mount();
+        assert_eq!(st, 0, "MNT refused");
+        n.root = root.unwrap();
         n
     }
 

@@ -114,6 +114,7 @@ name = "cowfs-nfs"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "cowfs-vfs",
  "cowfs-vfs-test",
  "nfsserve",

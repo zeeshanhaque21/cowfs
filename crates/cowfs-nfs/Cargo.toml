@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 async-trait = "0.1"
+blake3.workspace = true
 cowfs-vfs = { path = "../cowfs-vfs" }
 nfsserve = { path = "../nfsserve" }
 thiserror.workspace = true
