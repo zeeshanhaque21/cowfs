@@ -20,7 +20,7 @@ fn err(kind: io::ErrorKind, msg: String) -> io::Error {
     io::Error::new(kind, msg)
 }
 
-fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+fn ensure_private_dir(dir: &Path, owner: u32) -> io::Result<()> {
     match fs::symlink_metadata(dir) {
         Ok(md) => {
             if !md.is_dir() {
@@ -29,7 +29,7 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
                     format!("{} is not a directory", dir.display()),
                 ));
             }
-            if md.uid() != sys::current_uid() || md.mode() & 0o077 != 0 {
+            if md.uid() != owner || md.mode() & 0o077 != 0 {
                 return Err(err(
                     io::ErrorKind::PermissionDenied,
                     format!(
@@ -47,15 +47,15 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Creates the private directory, takes the single-instance lock, removes a stale socket and binds.
+/// Creates the private directory (owned by `owner`), takes the single-instance lock, removes a stale socket and binds.
 ///
 /// Returns the listener and the lock file, which must be kept open for the server's lifetime.
-pub(crate) fn bind(path: &Path) -> io::Result<(UnixListener, File)> {
+pub(crate) fn bind(path: &Path, owner: u32) -> io::Result<(UnixListener, File)> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    ensure_private_dir(dir)?;
+    ensure_private_dir(dir, owner)?;
 
     let mut lock_name: OsString = path.as_os_str().to_owned();
     lock_name.push(".lock");

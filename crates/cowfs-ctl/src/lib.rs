@@ -9,17 +9,24 @@ mod server;
 mod socket;
 mod stub;
 mod sys;
+mod treehash;
 mod types;
+mod validate;
 
-pub use client::{Canceller, Client, ClientError};
+pub use client::{Canceller, Client, ClientError, ClientOptions};
 pub use error::{CtlError, CtlResult, ErrorCode};
 pub use frame::{
-    read_line, ClientFrame, FrameError, Hello, LineRead, ServerFrame, ServerHello,
-    MAX_REQUEST_LINE, MAX_RESPONSE_LINE, PROTOCOL_VERSION,
+    read_line, read_line_until, ClientFrame, FrameError, Hello, LineRead, ReadLimits, ServerFrame,
+    ServerHello, MAX_REQUEST_LINE, MAX_RESPONSE_LINE, PROTOCOL_VERSION,
 };
 pub use handler::{CancelToken, ControlHandler, OpContext};
-pub use server::{Server, ServerOptions, ShutdownHandle};
+pub use server::{PeerCheck, Server, ServerOptions, ShutdownHandle};
 pub use socket::default_socket_path;
 pub use stub::StubHandler;
 pub use sys::current_uid;
+pub use treehash::{hash_tree, TreeHash, HASH_ALGORITHM};
 pub use types::*;
+pub use validate::{
+    escape_control, name_key, validate_abs_path, validate_git_ref, validate_repo,
+    validate_snapshot_name, MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_REF_BYTES,
+};

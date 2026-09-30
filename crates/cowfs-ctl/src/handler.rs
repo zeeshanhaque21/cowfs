@@ -93,8 +93,8 @@ fn unsupported<T>(method: &str) -> CtlResult<T> {
 
 /// The operations a cowfs daemon implements. `ping` and `version` are answered by the framework.
 ///
-/// Called concurrently, one thread per in-flight request. Snapshot names are validated by the
-/// framework before the call. Long operations must check `ctx` and stop early on cancellation,
+/// Called concurrently, one thread per in-flight request. Snapshot names, repo paths, refs and
+/// import paths are validated by the framework before the call, see `validate`. Long operations must check `ctx` and stop early on cancellation,
 /// leaving the store consistent. Every method defaults to `unsupported`, so a backend implements
 /// what it has.
 pub trait ControlHandler: Send + Sync {
@@ -114,10 +114,26 @@ pub trait ControlHandler: Send + Sync {
         unsupported("snapshot_create")
     }
 
-    /// Removes a snapshot. `busy` if a process is using it.
-    fn snapshot_rm(&self, name: &str) -> CtlResult<()> {
-        let _ = name;
+    /// Removes a snapshot. With `expect_no_holders`, fails `busy` when the snapshot has a holder
+    /// (see "Busy" in `docs/v1-control-api.md`), evaluated atomically with the removal: under one
+    /// lock, so no holder can appear between the check and the removal.
+    fn snapshot_rm(&self, name: &str, expect_no_holders: bool) -> CtlResult<()> {
+        let _ = (name, expect_no_holders);
         unsupported("snapshot_rm")
+    }
+
+    /// Atomically replaces snapshot `name` with a fresh O(1) clone of `from`. One lock, and no
+    /// instant at which `name` is missing. With `expect_no_holders`, fails `busy` and changes
+    /// nothing when the snapshot has a holder. The framework checks that `name` and `from` are
+    /// valid and differ; the backend reports `not_found` when either is missing.
+    fn snapshot_reset(
+        &self,
+        name: &str,
+        from: &str,
+        expect_no_holders: bool,
+    ) -> CtlResult<SnapshotInfo> {
+        let _ = (name, from, expect_no_holders);
+        unsupported("snapshot_reset")
     }
 
     /// Renames a snapshot.

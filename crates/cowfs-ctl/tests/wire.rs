@@ -44,7 +44,25 @@ fn client_frames() -> Vec<(&'static str, ClientFrame)> {
         ),
         (
             "req snapshot_rm",
-            req(Request::SnapshotRm(SnapshotName { name: "a".into() })),
+            req(Request::SnapshotRm(SnapshotRm {
+                name: "a".into(),
+                expect_no_holders: true,
+            })),
+        ),
+        (
+            "req snapshot_rm force",
+            req(Request::SnapshotRm(SnapshotRm {
+                name: "a".into(),
+                expect_no_holders: false,
+            })),
+        ),
+        (
+            "req snapshot_reset",
+            req(Request::SnapshotReset(SnapshotReset {
+                name: "slot".into(),
+                from: "base".into(),
+                expect_no_holders: true,
+            })),
         ),
         (
             "req snapshot_rename",
@@ -81,7 +99,7 @@ fn client_frames() -> Vec<(&'static str, ClientFrame)> {
             })),
         ),
         ("req mount_info", req(Request::MountInfo(Empty {}))),
-        ("req shutdown", req(Request::Shutdown(Empty {}))),
+        ("req shutdown", req(Request::Shutdown(NoParams {}))),
     ]
 }
 
@@ -177,7 +195,15 @@ fn server_frames() -> Vec<(&'static str, ServerFrame)> {
                 name: "slot1".into(),
                 files: 12,
                 bytes: 3456,
-                verified: true,
+                verified: false,
+                hash_algorithm: "blake3".into(),
+                source_root_hash: "aa".repeat(32),
+                imported_root_hash: "bb".repeat(32),
+                mismatches: vec![ImportMismatch {
+                    path: "src/a.rs".into(),
+                    reason: "content".into(),
+                }],
+                mismatches_truncated: true,
             })),
         ),
         (
@@ -230,6 +256,17 @@ fn server_frames() -> Vec<(&'static str, ServerFrame)> {
             },
         ),
     ]
+    .into_iter()
+    .chain(ErrorCode::ALL.iter().map(|c| {
+        (
+            Box::leak(format!("error code {c}").into_boxed_str()) as &'static str,
+            ServerFrame::Error {
+                id: Some(7),
+                error: CtlError::new(c.clone(), "m"),
+            },
+        )
+    }))
+    .collect()
 }
 
 fn text(bytes: Vec<u8>) -> String {
@@ -260,22 +297,43 @@ fn every_server_frame_round_trips() {
 }
 
 #[test]
-fn methods_list_matches_request_variants() {
-    let names: Vec<String> = client_frames()
-        .into_iter()
+fn golden_covers_every_method_and_response_kind_and_error_code() {
+    let frames = client_frames();
+    let mut methods: Vec<&str> = frames
+        .iter()
         .filter_map(|(_, f)| match f {
-            ClientFrame::Request { request, .. } => Some(
-                serde_json::to_value(request).unwrap()["method"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-            ),
+            ClientFrame::Request { request, .. } => Some(request.method()),
             _ => None,
         })
         .collect();
-    let mut seen: Vec<&str> = names.iter().map(String::as_str).collect();
-    seen.dedup();
-    assert_eq!(seen, METHODS);
+    methods.dedup();
+    assert_eq!(
+        methods, METHODS,
+        "METHODS and the golden requests must agree, in order"
+    );
+
+    let frames = server_frames();
+    let mut kinds: Vec<&str> = frames
+        .iter()
+        .filter_map(|(_, f)| match f {
+            ServerFrame::Response { result, .. } => Some(result.kind()),
+            _ => None,
+        })
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let mut want: Vec<&str> = RESPONSE_KINDS.to_vec();
+    want.sort_unstable();
+    assert_eq!(kinds, want);
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/wire.tsv");
+    let golden = std::fs::read_to_string(path).unwrap();
+    for c in ErrorCode::ALL {
+        assert!(
+            golden.contains(&format!("\"code\":\"{}\"", c.as_str())),
+            "error code {c} is not in the golden file"
+        );
+    }
 }
 
 #[test]
@@ -315,13 +373,13 @@ fn golden_lines_decode() {
 #[test]
 fn unknown_fields_are_ignored() {
     let f = ClientFrame::decode(
-        br#"{"type":"request","id":1,"method":"snapshot_rm","params":{"name":"a","extra":[1]},"future":true}"#,
+        br#"{"type":"request","id":1,"method":"snapshot_promote","params":{"name":"a","extra":[1]},"future":true}"#,
     );
     assert_eq!(
         f,
         Ok(ClientFrame::Request {
             id: 1,
-            request: Request::SnapshotRm(SnapshotName { name: "a".into() })
+            request: Request::SnapshotPromote(SnapshotName { name: "a".into() })
         })
     );
     assert!(ClientFrame::decode(br#"{"type":"hello","versions":[1],"x":1}"#).is_ok());
@@ -350,14 +408,21 @@ fn unknown_fields_are_ignored() {
 
 #[test]
 fn missing_optional_fields_take_defaults() {
-    let f = ClientFrame::decode(br#"{"type":"request","id":1,"method":"gc"}"#);
+    let f = ClientFrame::decode(
+        br#"{"type":"request","id":1,"method":"snapshot_rm","params":{"name":"a"}}"#,
+    );
     assert_eq!(
         f,
         Ok(ClientFrame::Request {
             id: 1,
-            request: Request::Gc(GcParams { dry_run: false })
+            request: Request::SnapshotRm(SnapshotRm {
+                name: "a".into(),
+                expect_no_holders: true
+            })
         })
     );
+    let e = ClientFrame::decode(br#"{"type":"request","id":1,"method":"gc"}"#).unwrap_err();
+    assert_eq!(e.error.code, ErrorCode::InvalidParams, "gc has no default");
     let f = ClientFrame::decode(
         br#"{"type":"request","id":1,"method":"snapshot_create","params":{"name":"a"}}"#,
     );
@@ -385,6 +450,21 @@ fn unknown_variants_give_structured_errors() {
     let e =
         ClientFrame::decode(br#"{"type":"request","id":6,"method":"snapshot_rm"}"#).unwrap_err();
     assert_eq!((e.id, e.error.code), (Some(6), ErrorCode::InvalidParams));
+}
+
+#[test]
+fn unknown_response_kind_decodes_to_unknown_with_raw_data() {
+    let f = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"from_the_future","data":{"x":1}}}"#,
+    );
+    let Ok(ServerFrame::Response { result, .. }) = f else {
+        panic!("{f:?}")
+    };
+    assert_eq!(result.kind(), "from_the_future");
+    assert_eq!(result.data_json(), serde_json::json!({"x": 1}));
+    let bad =
+        ServerFrame::decode(br#"{"type":"response","id":1,"result":{"kind":"gc","data":{}}}"#);
+    assert!(bad.is_err(), "a known kind with bad data is still an error");
 }
 
 #[test]
@@ -502,7 +582,10 @@ fn error_codes_are_stable_strings() {
         (ErrorCode::ShuttingDown, "shutting_down"),
         (ErrorCode::IoError, "io_error"),
         (ErrorCode::Internal, "internal"),
+        (ErrorCode::TooManyConnections, "too_many_connections"),
+        (ErrorCode::Timeout, "timeout"),
     ];
+    assert_eq!(all.len(), ErrorCode::ALL.len(), "every code is pinned here");
     for (code, s) in all {
         assert_eq!(code.as_str(), s);
         assert_eq!(ErrorCode::parse(s), code);

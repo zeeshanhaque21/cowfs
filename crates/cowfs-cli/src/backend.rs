@@ -37,6 +37,8 @@ pub enum BackendKind {
     Stub {
         /// Pause between progress events.
         work_delay: Duration,
+        /// Run long operations to the end even when cancelled.
+        ignore_cancel: bool,
     },
     /// The real core.
     Real,
@@ -46,24 +48,34 @@ pub enum BackendKind {
 #[derive(Clone, Copy, Debug)]
 pub struct StubBackend {
     work_delay: Duration,
+    ignore_cancel: bool,
 }
 
 impl Backend for StubBackend {
     fn open(&self, config: &ServeConfig) -> Result<Arc<dyn ControlHandler>, BackendError> {
-        Ok(Arc::new(
-            StubHandler::new(
-                config.store.display().to_string(),
-                config.mount.display().to_string(),
-            )
-            .with_work(4, self.work_delay),
-        ))
+        let stub = StubHandler::new(
+            config.store.display().to_string(),
+            config.mount.display().to_string(),
+        )
+        .with_work(4, self.work_delay);
+        Ok(Arc::new(if self.ignore_cancel {
+            stub.ignoring_cancel()
+        } else {
+            stub
+        }))
     }
 }
 
 /// The factory `cowfs serve` uses. The `Real` arm is where the core is wired in later.
 pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>, BackendError> {
     match kind {
-        BackendKind::Stub { work_delay } => Ok(Box::new(StubBackend { work_delay })),
+        BackendKind::Stub {
+            work_delay,
+            ignore_cancel,
+        } => Ok(Box::new(StubBackend {
+            work_delay,
+            ignore_cancel,
+        })),
         BackendKind::Real => Err(BackendError::NotWired),
     }
 }

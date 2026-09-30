@@ -1,20 +1,32 @@
 use crate::error::CtlError;
 use crate::frame::{
-    read_line, ClientFrame, Hello, LineRead, ServerFrame, ServerHello, MAX_RESPONSE_LINE,
-    PROTOCOL_VERSION,
+    read_line_until, ClientFrame, Hello, LineRead, ReadLimits, ServerFrame, ServerHello,
+    MAX_RESPONSE_LINE, PROTOCOL_VERSION,
 };
 use crate::types::{ProgressEvent, Request, Response};
 use std::io::{self, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const POLL: Duration = Duration::from_millis(200);
+const REFUSED_RETRIES: u32 = 4;
 
 /// What can go wrong talking to a server.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    /// Connecting or reading or writing the socket failed. `NotFound` and `ConnectionRefused`
-    /// on connect mean no daemon is running.
+    /// Connecting to the socket failed. `NotFound` and `ConnectionRefused` mean no daemon is running.
+    #[error("cannot connect to {}: {source}", path.display())]
+    Connect {
+        /// The socket path.
+        path: PathBuf,
+        /// The underlying failure.
+        source: io::Error,
+    },
+    /// Reading or writing the socket failed.
     #[error("{0}")]
     Io(#[from] io::Error),
     /// The server sent an `error` frame.
@@ -26,13 +38,43 @@ pub enum ClientError {
     /// The server closed the connection.
     #[error("connection closed by the server")]
     Closed,
+    /// The server did not answer in time.
+    #[error("{0}")]
+    Timeout(String),
 }
 
 impl ClientError {
     /// True when the failure means that no daemon is listening on the socket.
     pub fn is_not_running(&self) -> bool {
-        matches!(self, ClientError::Io(e)
-            if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused))
+        matches!(self, ClientError::Connect { source, .. }
+            if matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused))
+    }
+
+    /// True when the server did not answer within a timeout.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, ClientError::Timeout(_))
+    }
+}
+
+/// Timeouts of a `Client`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientOptions {
+    /// Time allowed to open the socket.
+    pub connect_timeout: Duration,
+    /// Time allowed for the whole handshake.
+    pub handshake_timeout: Duration,
+    /// Longest silence tolerated while waiting for a response. Every frame, progress included,
+    /// starts the clock again, so a long operation that reports progress never trips it.
+    pub idle_timeout: Duration,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        ClientOptions {
+            connect_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(30),
+        }
     }
 }
 
@@ -43,6 +85,33 @@ fn write_frame(writer: &SharedWriter, frame: &ClientFrame) -> io::Result<()> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .write_all(&frame.encode())
+}
+
+fn connect_once(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let (tx, rx) = mpsc::channel();
+    let p = path.to_owned();
+    thread::spawn(move || {
+        let _ = tx.send(UnixStream::connect(p));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
+    }
+}
+
+// A full listen backlog can look like a refusal, so a refusal is retried briefly before it
+// is believed.
+fn connect(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let mut tries = 0;
+    loop {
+        match connect_once(path, timeout) {
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused && tries < REFUSED_RETRIES => {
+                tries += 1;
+                thread::sleep(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Cancels the request a `Client` currently has in flight. Cloneable and usable from another
@@ -72,12 +141,24 @@ pub struct Client {
     active: Arc<AtomicU64>,
     server: ServerHello,
     buf: Vec<u8>,
+    opts: ClientOptions,
 }
 
 impl Client {
-    /// Connects and performs the version handshake.
+    /// Connects with the default timeouts and performs the version handshake.
     pub fn connect(path: &Path) -> Result<Client, ClientError> {
-        let stream = UnixStream::connect(path)?;
+        Client::connect_with(path, ClientOptions::default())
+    }
+
+    /// Connects and performs the version handshake within the given timeouts.
+    pub fn connect_with(path: &Path, opts: ClientOptions) -> Result<Client, ClientError> {
+        let stream =
+            connect(path, opts.connect_timeout).map_err(|source| ClientError::Connect {
+                path: path.to_owned(),
+                source,
+            })?;
+        stream.set_read_timeout(Some(POLL))?;
+        stream.set_write_timeout(Some(opts.idle_timeout.max(Duration::from_secs(1))))?;
         let writer = Arc::new(Mutex::new(stream.try_clone()?));
         let mut client = Client {
             reader: BufReader::new(stream),
@@ -90,6 +171,7 @@ impl Client {
                 methods: Vec::new(),
             },
             buf: Vec::new(),
+            opts,
         };
         write_frame(
             &client.writer,
@@ -98,7 +180,7 @@ impl Client {
                 client: format!("cowfs-ctl/{}", env!("CARGO_PKG_VERSION")),
             }),
         )?;
-        client.server = match client.read_frame()? {
+        client.server = match client.read_frame(opts.handshake_timeout, "handshake")? {
             ServerFrame::Hello(h) => h,
             ServerFrame::Error { error, .. } => return Err(error.into()),
             _ => return Err(ClientError::Protocol("expected hello".into())),
@@ -146,7 +228,7 @@ impl Client {
     ) -> Result<Response, ClientError> {
         write_frame(&self.writer, &ClientFrame::Request { id, request })?;
         loop {
-            match self.read_frame()? {
+            match self.read_frame(self.opts.idle_timeout, "response")? {
                 ServerFrame::Progress { id: got, event } if got == id => on_progress(&event),
                 ServerFrame::Response { id: got, result } if got == id => return Ok(result),
                 ServerFrame::Error { id: got, error } if got == Some(id) || got.is_none() => {
@@ -157,14 +239,26 @@ impl Client {
         }
     }
 
-    fn read_frame(&mut self) -> Result<ServerFrame, ClientError> {
+    fn read_frame(&mut self, within: Duration, what: &str) -> Result<ServerFrame, ClientError> {
         self.buf.clear();
-        match read_line(&mut self.reader, &mut self.buf, MAX_RESPONSE_LINE)? {
+        let start = Instant::now();
+        let deadline = Some(start + within);
+        let limits = ReadLimits {
+            idle: &|| deadline,
+            hard: deadline,
+            line: None,
+            abort: &|| false,
+        };
+        match read_line_until(&mut self.reader, &mut self.buf, MAX_RESPONSE_LINE, &limits)? {
             LineRead::Line => {
                 ServerFrame::decode(&self.buf).map_err(|fe| ClientError::Protocol(fe.error.message))
             }
             LineRead::Eof => Err(ClientError::Closed),
             LineRead::TooLong => Err(ClientError::Protocol("response line too long".into())),
+            LineRead::Timeout | LineRead::Aborted => Err(ClientError::Timeout(format!(
+                "the server did not send a {what} within {}s",
+                within.as_secs().max(1)
+            ))),
         }
     }
 }

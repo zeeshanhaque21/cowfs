@@ -1,112 +1,17 @@
 //! The server framework and client against a real Unix socket.
 
+mod common;
+
+use common::*;
 use cowfs_ctl::*;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
-
-fn private_tempdir() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    dir
-}
-
-struct Fixture {
-    _dir: TempDir,
-    path: PathBuf,
-    server: Option<Server>,
-}
-
-impl Fixture {
-    fn server(&self) -> &Server {
-        self.server.as_ref().unwrap()
-    }
-}
-
-fn start_with(handler: impl ControlHandler + 'static, opts: ServerOptions) -> Fixture {
-    let dir = private_tempdir();
-    let path = dir.path().join("c.sock");
-    let server = Server::start(&path, Arc::new(handler), opts).unwrap();
-    Fixture {
-        _dir: dir,
-        path,
-        server: Some(server),
-    }
-}
-
-fn start(handler: impl ControlHandler + 'static) -> Fixture {
-    start_with(handler, ServerOptions::default())
-}
-
-fn stub() -> StubHandler {
-    StubHandler::new("/store", "/mount")
-}
-
-struct Raw {
-    stream: UnixStream,
-    reader: BufReader<UnixStream>,
-}
-
-impl Raw {
-    fn connect(path: &Path) -> Raw {
-        let stream = UnixStream::connect(path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let reader = BufReader::new(stream.try_clone().unwrap());
-        Raw { stream, reader }
-    }
-
-    fn hello(path: &Path) -> Raw {
-        let mut r = Raw::connect(path);
-        r.send(r#"{"type":"hello","versions":[1]}"#);
-        assert_eq!(r.recv()["type"], "hello");
-        r
-    }
-
-    fn send(&mut self, line: &str) {
-        self.stream.write_all(line.as_bytes()).unwrap();
-        self.stream.write_all(b"\n").unwrap();
-    }
-
-    fn recv(&mut self) -> Value {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).unwrap();
-        assert!(n > 0, "unexpected EOF");
-        serde_json::from_str(&line).unwrap()
-    }
-
-    fn assert_eof(&mut self) {
-        let mut line = String::new();
-        assert_eq!(
-            self.reader.read_line(&mut line).unwrap(),
-            0,
-            "expected EOF, got {line:?}"
-        );
-    }
-}
-
-fn wait_for(what: &str, cond: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !cond() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn code(err: ClientError) -> ErrorCode {
-    match err {
-        ClientError::Server(e) => e.code,
-        other => panic!("expected a server error, got {other:?}"),
-    }
-}
 
 #[test]
 fn end_to_end_every_method_with_the_real_client() {
@@ -204,24 +109,27 @@ fn end_to_end_every_method_with_the_real_client() {
     assert_eq!(p.processes[0].pid, 42);
     assert_eq!(
         code(
-            c.call(Request::SnapshotRm(SnapshotName {
-                name: "work".into()
+            c.call(Request::SnapshotRm(SnapshotRm {
+                name: "work".into(),
+                expect_no_holders: true
             }))
             .unwrap_err()
         ),
         ErrorCode::Busy
     );
     assert!(matches!(
-        c.call(Request::SnapshotRm(SnapshotName {
-            name: "trunk".into()
+        c.call(Request::SnapshotRm(SnapshotRm {
+            name: "trunk".into(),
+            expect_no_holders: true
         }))
         .unwrap(),
         Response::Ok(_)
     ));
     assert_eq!(
         code(
-            c.call(Request::SnapshotRm(SnapshotName {
-                name: "trunk".into()
+            c.call(Request::SnapshotRm(SnapshotRm {
+                name: "trunk".into(),
+                expect_no_holders: true
             }))
             .unwrap_err()
         ),
@@ -308,7 +216,7 @@ fn end_to_end_every_method_with_the_real_client() {
     );
 
     assert!(matches!(
-        c.call(Request::Shutdown(Empty {})).unwrap(),
+        c.call(Request::Shutdown(NoParams {})).unwrap(),
         Response::Ok(_)
     ));
     fx.server.unwrap().wait();
@@ -319,8 +227,10 @@ fn long_operations_stream_progress() {
     let fx = start(stub());
     let mut c = Client::connect(&fx.path).unwrap();
     let mut events = Vec::new();
-    c.call_with_progress(Request::Gc(GcParams::default()), |e| events.push(e.clone()))
-        .unwrap();
+    c.call_with_progress(Request::Gc(GcParams { dry_run: false }), |e| {
+        events.push(e.clone())
+    })
+    .unwrap();
     assert_eq!(events.len(), 10);
     assert_eq!(events[0].phase, "mark");
     assert_eq!(events[9].phase, "sweep");
@@ -372,6 +282,7 @@ fn handshake_is_required_and_times_out() {
     r.assert_eof();
 
     let mut silent = Raw::connect(&fx.path);
+    assert_eq!(silent.recv()["error"]["code"], "timeout");
     silent.assert_eof();
     assert!(Client::connect(&fx.path).is_ok());
 }
@@ -512,7 +423,7 @@ fn concurrent_clients() {
 fn responses_to_concurrent_requests_are_matched_by_id() {
     let fx = start(stub().with_work(50, Duration::from_millis(20)));
     let mut r = Raw::hello(&fx.path);
-    r.send(r#"{"type":"request","id":1,"method":"gc","params":{}}"#);
+    r.send(r#"{"type":"request","id":1,"method":"gc","params":{"dry_run":true}}"#);
     r.send(r#"{"type":"request","id":2,"method":"ping"}"#);
     let first_final = loop {
         let f = r.recv();
@@ -574,7 +485,7 @@ fn client_canceller_cancels_from_another_thread() {
             thread::sleep(Duration::from_millis(100));
             canceller.cancel().unwrap();
         });
-        c.call_with_progress(Request::Gc(GcParams::default()), |_| seen += 1)
+        c.call_with_progress(Request::Gc(GcParams { dry_run: false }), |_| seen += 1)
     });
     assert_eq!(code(result.unwrap_err()), ErrorCode::Cancelled);
     assert!(seen > 0 && started.elapsed() < Duration::from_secs(5));
@@ -618,7 +529,7 @@ fn disconnect_mid_stream_cancels_the_operation() {
         padding: 0,
     });
     let mut r = Raw::hello(&fx.path);
-    r.send(r#"{"type":"request","id":1,"method":"gc","params":{}}"#);
+    r.send(r#"{"type":"request","id":1,"method":"gc","params":{"dry_run":true}}"#);
     assert_eq!(r.recv()["type"], "progress");
     drop(r);
     wait_for("cancellation after disconnect", || {
@@ -641,7 +552,7 @@ fn slow_client_is_disconnected_and_its_operation_cancelled() {
         opts,
     );
     let mut r = Raw::hello(&fx.path);
-    r.send(r#"{"type":"request","id":1,"method":"gc","params":{}}"#);
+    r.send(r#"{"type":"request","id":1,"method":"gc","params":{"dry_run":true}}"#);
     wait_for("cancellation of a client that stopped reading", || {
         saw_cancel.load(Ordering::SeqCst)
     });
@@ -688,10 +599,10 @@ fn duplicate_ids_and_inflight_limit() {
     };
     let fx = start_with(stub().with_work(1000, Duration::from_millis(10)), opts);
     let mut r = Raw::hello(&fx.path);
-    r.send(r#"{"type":"request","id":1,"method":"gc","params":{}}"#);
-    r.send(r#"{"type":"request","id":1,"method":"gc","params":{}}"#);
-    r.send(r#"{"type":"request","id":2,"method":"gc","params":{}}"#);
-    r.send(r#"{"type":"request","id":3,"method":"gc","params":{}}"#);
+    r.send(r#"{"type":"request","id":1,"method":"gc","params":{"dry_run":true}}"#);
+    r.send(r#"{"type":"request","id":1,"method":"gc","params":{"dry_run":true}}"#);
+    r.send(r#"{"type":"request","id":2,"method":"gc","params":{"dry_run":true}}"#);
+    r.send(r#"{"type":"request","id":3,"method":"gc","params":{"dry_run":true}}"#);
     let mut errors = Vec::new();
     while errors.len() < 2 {
         let f = r.recv();
@@ -715,7 +626,7 @@ fn shutdown_request_stops_the_server_and_removes_the_socket() {
     let mut a = Client::connect(&fx.path).unwrap();
     let mut b = Client::connect(&fx.path).unwrap();
     assert!(matches!(
-        a.call(Request::Shutdown(Empty {})).unwrap(),
+        a.call(Request::Shutdown(NoParams {})).unwrap(),
         Response::Ok(_)
     ));
     fx.server.take().unwrap().wait();
@@ -735,7 +646,7 @@ fn shutdown_cancels_running_operations() {
         padding: 0,
     });
     let mut r = Raw::hello(&fx.path);
-    r.send(r#"{"type":"request","id":1,"method":"gc","params":{}}"#);
+    r.send(r#"{"type":"request","id":1,"method":"gc","params":{"dry_run":true}}"#);
     assert_eq!(r.recv()["type"], "progress");
     fx.server.take().unwrap().shutdown();
     assert!(saw_cancel.load(Ordering::SeqCst));
@@ -828,7 +739,7 @@ fn socket_and_directory_permissions() {
 #[test]
 fn peer_uid_mismatch_is_refused() {
     let opts = ServerOptions {
-        expected_uid: current_uid().wrapping_add(1),
+        peer_check: PeerCheck::new(|_| Ok(current_uid().wrapping_add(1))),
         ..ServerOptions::default()
     };
     let fx = start_with(stub(), opts);
@@ -840,6 +751,47 @@ fn peer_uid_mismatch_is_refused() {
         code(Client::connect(&fx.path).unwrap_err()),
         ErrorCode::PermissionDenied
     );
+}
+
+#[test]
+fn a_failing_peer_credential_lookup_fails_closed() {
+    let opts = ServerOptions {
+        peer_check: PeerCheck::new(|_| Err(std::io::Error::other("no credentials"))),
+        ..ServerOptions::default()
+    };
+    let fx = start_with(stub(), opts);
+    let mut r = Raw::connect(&fx.path);
+    assert_eq!(r.recv()["error"]["code"], "permission_denied");
+    r.assert_eof();
+}
+
+#[test]
+fn a_socket_directory_owned_by_someone_else_is_refused() {
+    let dir = private_tempdir();
+    let opts = ServerOptions {
+        expected_uid: current_uid().wrapping_add(1),
+        ..ServerOptions::default()
+    };
+    let err = Server::start(&dir.path().join("c.sock"), Arc::new(stub()), opts).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(!dir.path().join("c.sock").exists());
+}
+
+#[test]
+fn the_single_instance_lock_is_taken() {
+    let dir = private_tempdir();
+    let path = dir.path().join("c.sock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.path().join("c.sock.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let err = Server::start(&path, Arc::new(stub()), ServerOptions::default()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(err.to_string().contains("lock"), "{err}");
+    assert!(!path.exists(), "nothing was bound");
 }
 
 #[test]

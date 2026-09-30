@@ -1,39 +1,81 @@
 use crate::error::{CtlError, CtlResult, ErrorCode};
 use crate::frame::{
-    read_line, ClientFrame, LineRead, ServerFrame, ServerHello, MAX_REQUEST_LINE, PROTOCOL_VERSION,
+    read_line_until, ClientFrame, LineRead, ReadLimits, ServerFrame, ServerHello, MAX_REQUEST_LINE,
+    PROTOCOL_VERSION,
 };
 use crate::handler::{CancelToken, ControlHandler, OpContext};
 use crate::types::*;
+use crate::validate::{validate_abs_path, validate_git_ref, validate_repo, validate_snapshot_name};
 use crate::{socket, sys};
 use serde_json::json;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const MAX_DRAIN: u64 = 16 << 20;
 const SUPPORTED_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
+const POLL: Duration = Duration::from_millis(200);
+const MAX_DRAIN: u64 = 16 << 20;
+
+type PeerFn = dyn Fn(&UnixStream) -> io::Result<u32> + Send + Sync;
+
+/// Reads the uid of the process on the other end of a connection. The default asks the kernel;
+/// tests substitute one to exercise the failure paths.
+#[derive(Clone)]
+pub struct PeerCheck(Arc<PeerFn>);
+
+impl PeerCheck {
+    /// Reads the peer uid from the kernel (`SO_PEERCRED` or `getpeereid`).
+    pub fn system() -> Self {
+        PeerCheck(Arc::new(sys::peer_uid))
+    }
+
+    /// Uses `f` to find the peer uid.
+    pub fn new(f: impl Fn(&UnixStream) -> io::Result<u32> + Send + Sync + 'static) -> Self {
+        PeerCheck(Arc::new(f))
+    }
+}
+
+impl fmt::Debug for PeerCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PeerCheck")
+    }
+}
 
 /// Tunables of the server framework. The defaults are the ones in `docs/v1-control-api.md`.
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
     /// Reported in `hello` and `version`.
     pub server_name: String,
-    /// Peers with any other uid are refused. Defaults to the uid of this process.
+    /// The only uid allowed to connect, and the required owner of the socket directory.
+    /// Defaults to the uid of this process.
     pub expected_uid: u32,
-    /// How long a new connection may take to send `hello`.
+    /// How the peer uid is read.
+    pub peer_check: PeerCheck,
+    /// Total time a new connection has to complete the handshake.
     pub handshake_timeout: Duration,
+    /// A connection with nothing in flight and no request for this long is closed.
+    pub idle_timeout: Duration,
+    /// Time allowed from the first byte of a request line to its newline.
+    pub line_timeout: Duration,
     /// A client that does not drain its socket for this long is disconnected.
     pub write_timeout: Duration,
     /// Requests in flight per connection.
     pub max_inflight: usize,
+    /// Connections served at once. Others get `too_many_connections` and are closed.
+    pub max_connections: usize,
+    /// Requests in flight across all connections. Others get `busy`.
+    pub max_requests: usize,
+    /// After shutdown begins, how long handlers get to finish before they are abandoned.
+    pub shutdown_deadline: Duration,
 }
 
 impl Default for ServerOptions {
@@ -41,9 +83,15 @@ impl Default for ServerOptions {
         ServerOptions {
             server_name: format!("cowfs-ctl/{}", env!("CARGO_PKG_VERSION")),
             expected_uid: sys::current_uid(),
+            peer_check: PeerCheck::system(),
             handshake_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(300),
+            line_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(30),
             max_inflight: 32,
+            max_connections: 64,
+            max_requests: 64,
+            shutdown_deadline: Duration::from_secs(5),
         }
     }
 }
@@ -52,11 +100,29 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Shared {
     stopping: AtomicBool,
+    abandon_at: OnceLock<Instant>,
+    shutdown_after: Duration,
     next_conn: AtomicU64,
-    conns: Mutex<HashMap<u64, UnixStream>>,
+    requests: AtomicUsize,
+    conns: Mutex<HashMap<u64, Arc<Conn>>>,
+}
+
+impl Shared {
+    fn begin_shutdown(&self) {
+        let _ = self.abandon_at.set(Instant::now() + self.shutdown_after);
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    fn abandoned(&self) -> bool {
+        self.abandon_at.get().is_some_and(|d| Instant::now() >= *d)
+    }
 }
 
 /// Asks a running server to stop. Cheap to clone and safe to use from a signal thread.
@@ -64,9 +130,16 @@ struct Shared {
 pub struct ShutdownHandle(Arc<Shared>);
 
 impl ShutdownHandle {
-    /// Begins graceful shutdown: no new connections, in-flight requests are cancelled.
+    /// Begins graceful shutdown: the socket is removed and no new connections are accepted,
+    /// in-flight requests are cancelled, and after `ServerOptions::shutdown_deadline` handlers
+    /// that still run are abandoned.
     pub fn shutdown(&self) {
-        self.0.stopping.store(true, Ordering::SeqCst);
+        self.0.begin_shutdown();
+    }
+
+    /// True once shutdown has begun.
+    pub fn is_shutting_down(&self) -> bool {
+        self.0.stopping()
     }
 }
 
@@ -86,15 +159,22 @@ impl Server {
         handler: Arc<dyn ControlHandler>,
         opts: ServerOptions,
     ) -> io::Result<Server> {
-        let (listener, lock_file) = socket::bind(path)?;
+        let (listener, lock_file) = socket::bind(path, opts.expected_uid)?;
         listener.set_nonblocking(true)?;
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            stopping: AtomicBool::new(false),
+            abandon_at: OnceLock::new(),
+            shutdown_after: opts.shutdown_deadline,
+            next_conn: AtomicU64::new(0),
+            requests: AtomicUsize::new(0),
+            conns: Mutex::new(HashMap::new()),
+        });
         let thread = thread::Builder::new()
             .name("cowfs-ctl-accept".into())
             .spawn({
                 let shared = Arc::clone(&shared);
                 let path = path.to_owned();
-                move || accept_loop(listener, lock_file, &path, handler, &opts, &shared)
+                move || accept_loop(listener, lock_file, &path, handler, Arc::new(opts), &shared)
             })?;
         Ok(Server {
             path: path.to_owned(),
@@ -113,8 +193,8 @@ impl Server {
         ShutdownHandle(Arc::clone(&self.shared))
     }
 
-    /// Blocks until the server has stopped (a `shutdown` request or `ShutdownHandle::shutdown`)
-    /// and every connection is closed.
+    /// Blocks until the server has stopped (a `shutdown` request or `ShutdownHandle::shutdown`),
+    /// which takes at most `shutdown_deadline` plus a moment after shutdown begins.
     pub fn wait(mut self) {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -131,7 +211,7 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         if let Some(t) = self.thread.take() {
-            self.shared.stopping.store(true, Ordering::SeqCst);
+            self.shared.begin_shutdown();
             let _ = t.join();
         }
     }
@@ -142,41 +222,91 @@ fn accept_loop(
     lock_file: File,
     path: &Path,
     handler: Arc<dyn ControlHandler>,
-    opts: &ServerOptions,
+    opts: Arc<ServerOptions>,
     shared: &Arc<Shared>,
 ) {
-    let opts = Arc::new(opts.clone());
-    let mut workers: Vec<JoinHandle<()>> = Vec::new();
-    while !shared.stopping.load(Ordering::SeqCst) {
+    // Drain the backlog without sleeping between accepts: a slept-on backlog overflows under a burst.
+    while !shared.stopping() {
         match listener.accept() {
-            Ok((stream, _)) => {
-                workers.retain(|w| !w.is_finished());
-                let (handler, opts, shared) =
-                    (Arc::clone(&handler), Arc::clone(&opts), Arc::clone(shared));
-                if let Ok(w) = thread::Builder::new()
-                    .name("cowfs-ctl-conn".into())
-                    .spawn(move || serve_connection(stream, handler.as_ref(), &opts, &shared))
-                {
-                    workers.push(w);
-                }
-            }
+            Ok((stream, _)) => admit(stream, &handler, &opts, shared),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(1));
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => thread::sleep(Duration::from_millis(50)),
         }
     }
-    for stream in lock(&shared.conns).values() {
-        let _ = stream.shutdown(Shutdown::Both);
-    }
-    for w in workers {
-        let _ = w.join();
-    }
     let _ = fs::remove_file(path);
+    drop(listener);
+    for conn in lock(&shared.conns).values() {
+        conn.cancel_all();
+    }
+    loop {
+        if lock(&shared.conns).is_empty() {
+            break;
+        }
+        if shared.abandoned() {
+            let stragglers: Vec<Arc<Conn>> = lock(&shared.conns).values().cloned().collect();
+            for conn in stragglers {
+                conn.abandon_inflight();
+                conn.kill();
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     drop(lock_file);
 }
 
+fn admit(
+    stream: UnixStream,
+    handler: &Arc<dyn ControlHandler>,
+    opts: &Arc<ServerOptions>,
+    shared: &Arc<Shared>,
+) {
+    let Ok(conn) = Conn::new(&stream) else {
+        return;
+    };
+    let conn = Arc::new(conn);
+    let id = shared.next_conn.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut conns = lock(&shared.conns);
+        if conns.len() >= opts.max_connections {
+            drop(conns);
+            refuse(stream);
+            return;
+        }
+        conns.insert(id, Arc::clone(&conn));
+    }
+    let (handler, opts, shared2) = (Arc::clone(handler), Arc::clone(opts), Arc::clone(shared));
+    let spawned = thread::Builder::new().name("cowfs-ctl-conn".into()).spawn({
+        let conn = Arc::clone(&conn);
+        move || {
+            let _ = run_connection(&stream, &conn, &handler, &opts, &shared2);
+            if shared2.stopping() {
+                conn.abandon_inflight();
+            }
+            conn.kill();
+            lock(&shared2.conns).remove(&id);
+        }
+    });
+    if spawned.is_err() {
+        lock(&shared.conns).remove(&id);
+    }
+}
+
+fn refuse(mut stream: UnixStream) {
+    let frame = ServerFrame::Error {
+        id: None,
+        error: CtlError::new(ErrorCode::TooManyConnections, "too many connections"),
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+    let _ = stream.write_all(&frame.encode());
+    let _ = stream.set_nonblocking(true);
+    let _ = stream.read(&mut [0u8; 4096]);
+}
+
+#[derive(Debug)]
 struct Conn {
     stream: UnixStream,
     write_lock: Mutex<()>,
@@ -185,6 +315,16 @@ struct Conn {
 }
 
 impl Conn {
+    fn new(stream: &UnixStream) -> io::Result<Conn> {
+        stream.set_nonblocking(false)?;
+        Ok(Conn {
+            stream: stream.try_clone()?,
+            write_lock: Mutex::new(()),
+            dead: AtomicBool::new(false),
+            inflight: Mutex::new(HashMap::new()),
+        })
+    }
+
     fn send(&self, frame: &ServerFrame) -> bool {
         if self.dead.load(Ordering::SeqCst) {
             return false;
@@ -203,9 +343,35 @@ impl Conn {
         self.send(&ServerFrame::Error { id, error })
     }
 
+    /// Sends the terminal frame of request `id`, unless another path already did.
+    fn finish(&self, id: u64, frame: &ServerFrame) {
+        if lock(&self.inflight).remove(&id).is_some() {
+            self.send(frame);
+        }
+    }
+
     fn cancel_all(&self) {
         for token in lock(&self.inflight).values() {
             token.cancel();
+        }
+    }
+
+    fn inflight_empty(&self) -> bool {
+        lock(&self.inflight).is_empty()
+    }
+
+    /// Ends every request that is still running with `shutting_down`. Only sent when the server
+    /// is stopping: a client that left needs no frames.
+    fn abandon_inflight(&self) {
+        let ids: Vec<u64> = lock(&self.inflight).keys().copied().collect();
+        for id in ids {
+            self.finish(
+                id,
+                &ServerFrame::Error {
+                    id: Some(id),
+                    error: CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
+                },
+            );
         }
     }
 
@@ -216,50 +382,16 @@ impl Conn {
     }
 }
 
-fn serve_connection(
-    stream: UnixStream,
-    handler: &dyn ControlHandler,
-    opts: &ServerOptions,
-    shared: &Shared,
-) {
-    let conn_id = shared.next_conn.fetch_add(1, Ordering::SeqCst);
-    if let Ok(clone) = stream.try_clone() {
-        lock(&shared.conns).insert(conn_id, clone);
-    }
-    if !shared.stopping.load(Ordering::SeqCst) {
-        let _ = run_connection(stream, handler, opts, shared);
-    }
-    lock(&shared.conns).remove(&conn_id);
-}
-
 fn run_connection(
-    stream: UnixStream,
-    handler: &dyn ControlHandler,
-    opts: &ServerOptions,
-    shared: &Shared,
+    stream: &UnixStream,
+    conn: &Arc<Conn>,
+    handler: &Arc<dyn ControlHandler>,
+    opts: &Arc<ServerOptions>,
+    shared: &Arc<Shared>,
 ) -> io::Result<()> {
-    stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(opts.write_timeout))?;
-    stream.set_read_timeout(Some(opts.handshake_timeout))?;
-    let conn = Conn {
-        stream: stream.try_clone()?,
-        write_lock: Mutex::new(()),
-        dead: AtomicBool::new(false),
-        inflight: Mutex::new(HashMap::new()),
-    };
-    let result = run_frames(&conn, stream, handler, opts, shared);
-    conn.kill();
-    result
-}
-
-fn run_frames(
-    conn: &Conn,
-    stream: UnixStream,
-    handler: &dyn ControlHandler,
-    opts: &ServerOptions,
-    shared: &Shared,
-) -> io::Result<()> {
-    match sys::peer_uid(&stream) {
+    stream.set_read_timeout(Some(POLL))?;
+    match (opts.peer_check.0)(stream) {
         Ok(uid) if uid == opts.expected_uid => {}
         _ => {
             conn.send_error(
@@ -272,82 +404,94 @@ fn run_frames(
             return Ok(());
         }
     }
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream.try_clone()?);
     let mut buf = Vec::new();
-    if !handshake(conn, &mut reader, &mut buf, opts) {
+    let stop = || shared.stopping() || conn.dead.load(Ordering::SeqCst);
+
+    let hard = Instant::now() + opts.handshake_timeout;
+    let limits = ReadLimits {
+        idle: &|| Some(hard),
+        hard: Some(hard),
+        line: None,
+        abort: &stop,
+    };
+    match read_line_until(&mut reader, &mut buf, MAX_REQUEST_LINE, &limits)? {
+        LineRead::Line => {}
+        LineRead::TooLong => {
+            reject_oversized(conn, &mut reader);
+            return Ok(());
+        }
+        LineRead::Timeout => {
+            conn.send_error(
+                None,
+                CtlError::new(ErrorCode::Timeout, "handshake not completed in time"),
+            );
+            return Ok(());
+        }
+        LineRead::Eof | LineRead::Aborted => return Ok(()),
+    }
+    if !handshake(conn, &buf, opts) {
         return Ok(());
     }
-    reader.get_ref().set_read_timeout(None)?;
-    thread::scope(|scope| {
-        loop {
-            buf.clear();
-            match read_line(&mut reader, &mut buf, MAX_REQUEST_LINE) {
-                Ok(LineRead::Line) => {}
-                Ok(LineRead::TooLong) => {
-                    reject_oversized(conn, &mut reader);
-                    break;
-                }
-                Ok(LineRead::Eof) | Err(_) => break,
+
+    let mut last_activity = Instant::now();
+    loop {
+        buf.clear();
+        let idle_at = last_activity + opts.idle_timeout;
+        let idle = || conn.inflight_empty().then_some(idle_at);
+        let limits = ReadLimits {
+            idle: &idle,
+            hard: None,
+            line: Some(opts.line_timeout),
+            abort: &stop,
+        };
+        match read_line_until(&mut reader, &mut buf, MAX_REQUEST_LINE, &limits)? {
+            LineRead::Line => {}
+            LineRead::TooLong => {
+                reject_oversized(conn, &mut reader);
+                return Ok(());
             }
-            if buf.iter().all(u8::is_ascii_whitespace) {
-                continue;
+            LineRead::Timeout => {
+                conn.send_error(
+                    None,
+                    CtlError::new(ErrorCode::Timeout, "idle or slow client"),
+                );
+                return Ok(());
             }
-            match ClientFrame::decode(&buf) {
-                Err(fe) => {
-                    conn.send_error(fe.id, fe.error);
-                }
-                Ok(ClientFrame::Hello(_)) => {
-                    conn.send_error(
-                        None,
-                        CtlError::new(ErrorCode::MalformedFrame, "hello was already sent"),
-                    );
-                }
-                Ok(ClientFrame::Cancel { id }) => {
-                    if let Some(token) = lock(&conn.inflight).get(&id) {
-                        token.cancel();
-                    }
-                }
-                Ok(ClientFrame::Request { id, request }) => {
-                    if shared.stopping.load(Ordering::SeqCst) {
-                        conn.send_error(
-                            Some(id),
-                            CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
-                        );
-                        continue;
-                    }
-                    let token = CancelToken::new();
-                    let refusal = {
-                        let mut inflight = lock(&conn.inflight);
-                        if inflight.contains_key(&id) {
-                            Some(CtlError::new(
-                                ErrorCode::DuplicateId,
-                                "request id already in flight",
-                            ))
-                        } else if inflight.len() >= opts.max_inflight {
-                            Some(CtlError::new(
-                                ErrorCode::Busy,
-                                "too many requests in flight",
-                            ))
-                        } else {
-                            inflight.insert(id, token.clone());
-                            None
-                        }
-                    };
-                    if let Some(error) = refusal {
-                        conn.send_error(Some(id), error);
-                        continue;
-                    }
-                    scope.spawn(move || {
-                        run_request(conn, handler, opts, shared, id, request, token)
-                    });
+            LineRead::Aborted | LineRead::Eof => break,
+        }
+        last_activity = Instant::now();
+        if buf.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match ClientFrame::decode(&buf) {
+            Err(fe) => {
+                conn.send_error(fe.id, fe.error);
+            }
+            Ok(ClientFrame::Hello(_)) => {
+                conn.send_error(
+                    None,
+                    CtlError::new(ErrorCode::MalformedFrame, "hello was already sent"),
+                );
+            }
+            Ok(ClientFrame::Cancel { id }) => {
+                if let Some(token) = lock(&conn.inflight).get(&id) {
+                    token.cancel();
                 }
             }
-            if conn.dead.load(Ordering::SeqCst) {
-                break;
+            Ok(ClientFrame::Request { id, request }) => {
+                start_request(conn, handler, opts, shared, id, request);
             }
         }
-        conn.cancel_all();
-    });
+        if conn.dead.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+    }
+    // A closed write side of the client means no more requests, not cancel: let the requests in
+    // flight finish. A client that is really gone shows up as a failed write, which cancels them.
+    while !conn.inflight_empty() && !conn.dead.load(Ordering::SeqCst) && !shared.abandoned() {
+        thread::sleep(Duration::from_millis(10));
+    }
     Ok(())
 }
 
@@ -365,21 +509,8 @@ fn reject_oversized(conn: &Conn, reader: &mut BufReader<UnixStream>) {
     let _ = io::copy(&mut reader.by_ref().take(MAX_DRAIN), &mut io::sink());
 }
 
-fn handshake(
-    conn: &Conn,
-    reader: &mut BufReader<UnixStream>,
-    buf: &mut Vec<u8>,
-    opts: &ServerOptions,
-) -> bool {
-    match read_line(reader, buf, MAX_REQUEST_LINE) {
-        Ok(LineRead::Line) => {}
-        Ok(LineRead::TooLong) => {
-            reject_oversized(conn, reader);
-            return false;
-        }
-        Ok(LineRead::Eof) | Err(_) => return false,
-    }
-    let hello = match ClientFrame::decode(buf) {
+fn handshake(conn: &Conn, line: &[u8], opts: &ServerOptions) -> bool {
+    let hello = match ClientFrame::decode(line) {
         Ok(ClientFrame::Hello(h)) => h,
         Err(fe) if fe.error.code == ErrorCode::MalformedFrame => {
             conn.send_error(None, fe.error);
@@ -414,6 +545,87 @@ fn handshake(
     }))
 }
 
+struct RequestSlot(Arc<Shared>);
+
+impl Drop for RequestSlot {
+    fn drop(&mut self) {
+        self.0.requests.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn start_request(
+    conn: &Arc<Conn>,
+    handler: &Arc<dyn ControlHandler>,
+    opts: &Arc<ServerOptions>,
+    shared: &Arc<Shared>,
+    id: u64,
+    request: Request,
+) {
+    if shared.stopping() {
+        conn.send_error(
+            Some(id),
+            CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
+        );
+        return;
+    }
+    let token = CancelToken::new();
+    let refusal = {
+        let mut inflight = lock(&conn.inflight);
+        if inflight.contains_key(&id) {
+            Some(CtlError::new(
+                ErrorCode::DuplicateId,
+                "request id already in flight",
+            ))
+        } else if inflight.len() >= opts.max_inflight {
+            Some(CtlError::new(
+                ErrorCode::Busy,
+                "too many requests in flight",
+            ))
+        } else if shared.requests.fetch_add(1, Ordering::SeqCst) >= opts.max_requests {
+            shared.requests.fetch_sub(1, Ordering::SeqCst);
+            Some(CtlError::new(ErrorCode::Busy, "server is at capacity"))
+        } else {
+            inflight.insert(id, token.clone());
+            None
+        }
+    };
+    if let Some(error) = refusal {
+        conn.send_error(Some(id), error);
+        return;
+    }
+    let slot = RequestSlot(Arc::clone(shared));
+    let spawned = thread::Builder::new().name("cowfs-ctl-req".into()).spawn({
+        let (conn, handler, opts, shared) = (
+            Arc::clone(conn),
+            Arc::clone(handler),
+            Arc::clone(opts),
+            Arc::clone(shared),
+        );
+        move || {
+            run_request(
+                &conn,
+                handler.as_ref(),
+                &opts,
+                &shared,
+                id,
+                request,
+                token,
+                slot,
+            )
+        }
+    });
+    if spawned.is_err() {
+        conn.finish(
+            id,
+            &ServerFrame::Error {
+                id: Some(id),
+                error: CtlError::new(ErrorCode::Busy, "cannot start a worker"),
+            },
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_request(
     conn: &Conn,
     handler: &dyn ControlHandler,
@@ -422,6 +634,7 @@ fn run_request(
     id: u64,
     request: Request,
     token: CancelToken,
+    _slot: RequestSlot,
 ) {
     let ctx = OpContext::new(token, |event| {
         conn.send(&ServerFrame::Progress { id, event })
@@ -429,20 +642,23 @@ fn run_request(
     let is_shutdown = matches!(request, Request::Shutdown(_));
     let result = catch_unwind(AssertUnwindSafe(|| dispatch(handler, opts, request, &ctx)))
         .unwrap_or_else(|_| Err(CtlError::new(ErrorCode::Internal, "handler panicked")));
-    lock(&conn.inflight).remove(&id);
     let stop = is_shutdown && result.is_ok();
-    match result {
-        Ok(result) => conn.send(&ServerFrame::Response { id, result }),
-        Err(error) => conn.send_error(Some(id), error),
+    let frame = match result {
+        Ok(result) => ServerFrame::Response { id, result },
+        Err(mut error) => {
+            if error.code == ErrorCode::Cancelled && shared.stopping() {
+                error = CtlError::new(ErrorCode::ShuttingDown, "server is shutting down");
+            }
+            ServerFrame::Error {
+                id: Some(id),
+                error,
+            }
+        }
     };
+    conn.finish(id, &frame);
     if stop {
-        shared.stopping.store(true, Ordering::SeqCst);
+        shared.begin_shutdown();
     }
-}
-
-fn name(s: &str) -> CtlResult<()> {
-    cowfs_vfs::validate_name(s.as_bytes())
-        .map_err(|e| CtlError::invalid(format!("invalid snapshot name {s:?}: {e}")))
 }
 
 fn dispatch(
@@ -463,40 +679,51 @@ fn dispatch(
             snapshots: h.snapshot_list()?,
         }),
         Request::SnapshotCreate(p) => {
-            name(&p.name)?;
+            validate_snapshot_name(&p.name)?;
             if let Some(from) = &p.from {
-                name(from)?;
+                validate_snapshot_name(from)?;
             }
             Response::Snapshot(h.snapshot_create(p)?)
         }
         Request::SnapshotRm(p) => {
-            name(&p.name)?;
-            h.snapshot_rm(&p.name)?;
+            validate_snapshot_name(&p.name)?;
+            h.snapshot_rm(&p.name, p.expect_no_holders)?;
             Response::Ok(Empty {})
         }
+        Request::SnapshotReset(p) => {
+            validate_snapshot_name(&p.name)?;
+            validate_snapshot_name(&p.from)?;
+            if p.name == p.from {
+                return Err(CtlError::invalid("cannot reset a snapshot from itself"));
+            }
+            Response::Snapshot(h.snapshot_reset(&p.name, &p.from, p.expect_no_holders)?)
+        }
         Request::SnapshotRename(p) => {
-            name(&p.from)?;
-            name(&p.to)?;
+            validate_snapshot_name(&p.from)?;
+            validate_snapshot_name(&p.to)?;
             Response::Snapshot(h.snapshot_rename(&p.from, &p.to)?)
         }
         Request::SnapshotPromote(p) => {
-            name(&p.name)?;
+            validate_snapshot_name(&p.name)?;
             Response::Snapshot(h.snapshot_promote(&p.name)?)
         }
         Request::Gc(p) => Response::Gc(h.gc(p, ctx)?),
         Request::Fsck(_) => Response::Fsck(h.fsck(ctx)?),
         Request::Import(p) => {
-            name(&p.name)?;
+            validate_snapshot_name(&p.name)?;
+            validate_abs_path("path", &p.path)?;
             Response::Import(h.import(p, ctx)?)
         }
         Request::BaseRefresh(p) => {
+            validate_repo(&p.repo)?;
+            validate_git_ref(&p.git_ref)?;
             if let Some(n) = &p.name {
-                name(n)?;
+                validate_snapshot_name(n)?;
             }
             Response::BaseRefresh(h.base_refresh(p, ctx)?)
         }
         Request::Ps(p) => {
-            name(&p.snapshot)?;
+            validate_snapshot_name(&p.snapshot)?;
             Response::Processes(ProcessList {
                 processes: h.ps(&p.snapshot)?,
             })

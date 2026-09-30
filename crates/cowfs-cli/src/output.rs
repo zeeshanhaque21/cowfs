@@ -1,4 +1,4 @@
-use cowfs_ctl::{ProgressEvent, Response, SnapshotInfo, Unit};
+use cowfs_ctl::{escape_control as esc, ProgressEvent, Response, SnapshotInfo, Unit};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
@@ -47,20 +47,20 @@ pub fn utc(ms: u64) -> String {
 }
 
 fn snapshot_line(s: &SnapshotInfo) -> String {
-    let mut line = s.name.clone();
+    let mut line = esc(&s.name);
     if let Some(parent) = &s.parent {
-        let _ = write!(line, " (clone of {parent})");
+        let _ = write!(line, " (clone of {})", esc(parent));
     }
     if let Some(base) = &s.base {
         line.push_str(" [base");
         if let Some(repo) = &base.repo {
-            let _ = write!(line, " {repo}");
+            let _ = write!(line, " {}", esc(repo));
         }
         if let Some(git_ref) = &base.git_ref {
-            let _ = write!(line, " @ {git_ref}");
+            let _ = write!(line, " @ {}", esc(git_ref));
         }
         if let Some(commit) = &base.commit {
-            let _ = write!(line, " {commit}");
+            let _ = write!(line, " {}", esc(commit));
         }
         line.push(']');
     }
@@ -77,8 +77,8 @@ pub fn human(response: &Response) -> String {
         ),
         Response::Status(s) => format!(
             "store:      {}\nmount:      {}\nsnapshots:  {}\nblocks:     {}\nlogical:    {}\nstored:     {}\nuptime:     {}s",
-            s.store_path,
-            s.mount_path,
+            esc(&s.store_path),
+            esc(&s.mount_path),
             s.snapshot_count,
             s.block_count,
             bytes(s.logical_bytes),
@@ -109,7 +109,7 @@ pub fn human(response: &Response) -> String {
                 f.snapshots_checked
             );
             for p in &f.problems {
-                let _ = write!(out, "\n  {}: {}", p.kind, p.detail);
+                let _ = write!(out, "\n  {}: {}", esc(&p.kind), esc(&p.detail));
             }
             out
         }
@@ -117,17 +117,21 @@ pub fn human(response: &Response) -> String {
             "imported {} files ({}) into {}; {}",
             i.files,
             bytes(i.bytes),
-            i.name,
+            esc(&i.name),
             if i.verified {
-                "verified by hash"
+                format!("verified by hash ({} {})", i.hash_algorithm, esc(&i.imported_root_hash))
             } else {
-                "NOT verified"
+                format!(
+                    "NOT verified: {} mismatches{}",
+                    i.mismatches.len(),
+                    if i.mismatches_truncated { " (truncated)" } else { "" }
+                )
             }
         ),
         Response::BaseRefresh(r) => {
             let mut out = snapshot_line(&r.snapshot);
             if let Some(prev) = &r.previous_commit {
-                let _ = write!(out, "\nreplaced commit {prev}");
+                let _ = write!(out, "\nreplaced commit {}", esc(prev));
             }
             out
         }
@@ -139,15 +143,18 @@ pub fn human(response: &Response) -> String {
                 let holds: Vec<String> = proc
                     .holds
                     .iter()
-                    .map(|h| format!("{:?} {}", h.kind, h.path).to_lowercase())
+                    .map(|h| format!("{} {}", format!("{:?}", h.kind).to_lowercase(), esc(&h.path)))
                     .collect();
-                format!("{}  {}  [{}]", proc.pid, proc.command, holds.join(", "))
+                format!("{}  {}  [{}]", proc.pid, esc(&proc.command), holds.join(", "))
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        Response::Unknown { kind, data } => {
+            format!("(response kind {} is not known to this client) {data}", esc(kind))
+        }
         Response::MountInfo(m) => format!(
             "mount:    {}\nadapter:  {}\nmounted:  {}",
-            m.mount_path, m.adapter, m.mounted
+            esc(&m.mount_path), esc(&m.adapter), m.mounted
         ),
     }
 }
@@ -157,11 +164,11 @@ pub fn progress_line(e: &ProgressEvent) -> String {
     match e.total {
         Some(total) => format!(
             "{} {}/{}",
-            e.phase,
+            esc(&e.phase),
             count(e.done, e.unit),
             count(total, e.unit)
         ),
-        None => format!("{} {}", e.phase, count(e.done, e.unit)),
+        None => format!("{} {}", esc(&e.phase), count(e.done, e.unit)),
     }
 }
 
@@ -182,19 +189,22 @@ pub fn progress_bar(e: &ProgressEvent) -> String {
     }
 }
 
-/// Progress on stderr: an updating bar on a terminal, one line per phase otherwise.
+/// Progress on stderr: an updating bar on a terminal, one line per phase otherwise, and one
+/// `{"progress": {...}}` line per event in JSON mode.
 #[derive(Debug)]
 pub struct Progress {
     tty: bool,
+    json: bool,
     phase: Option<String>,
     drawn: bool,
 }
 
 impl Progress {
-    /// `tty` selects the updating bar.
-    pub fn new(tty: bool) -> Self {
+    /// `tty` selects the updating bar, `json` machine-readable lines.
+    pub fn new(tty: bool, json: bool) -> Self {
         Progress {
             tty,
+            json,
             phase: None,
             drawn: false,
         }
@@ -203,7 +213,9 @@ impl Progress {
     /// Shows one event.
     pub fn update(&mut self, e: &ProgressEvent) {
         let mut err = io::stderr().lock();
-        if self.tty {
+        if self.json {
+            let _ = writeln!(err, "{}", serde_json::json!({ "progress": e }));
+        } else if self.tty {
             let _ = write!(err, "\r\x1b[2K{}", progress_bar(e));
             self.drawn = true;
         } else if self.phase.as_deref() != Some(e.phase.as_str()) {
@@ -233,6 +245,30 @@ mod tests {
             unit,
             message: None,
         }
+    }
+
+    #[test]
+    fn human_output_escapes_control_characters() {
+        use cowfs_ctl::{SnapshotInfo, SnapshotList};
+        let evil = SnapshotInfo {
+            name: "a\u{1b}]0;PWNED\u{7}\nb".into(),
+            parent: Some("p\r".into()),
+            base: None,
+            created_unix_ms: 0,
+        };
+        let text = human(&Response::SnapshotList(SnapshotList {
+            snapshots: vec![evil],
+        }));
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "a newline in a name must not fake a second row"
+        );
+        assert!(text.contains("PWNED"), "escaped, not dropped");
     }
 
     #[test]

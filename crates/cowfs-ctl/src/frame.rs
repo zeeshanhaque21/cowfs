@@ -1,8 +1,9 @@
 use crate::error::{CtlError, ErrorCode};
-use crate::types::{ProgressEvent, Request, Response, METHODS};
+use crate::types::{ProgressEvent, Request, Response, METHODS, RESPONSE_KINDS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::io::{self, BufRead};
+use std::time::{Duration, Instant};
 
 /// The protocol major version this crate speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -159,7 +160,14 @@ fn decode_request(mut obj: Map<String, Value>, id: Option<u64>) -> Result<Client
     }
     let params = match obj.remove("params") {
         None | Some(Value::Null) => json!({}),
-        Some(p) => p,
+        Some(p @ Value::Object(_)) => p,
+        Some(_) => {
+            return Err(FrameError::new(
+                Some(id),
+                ErrorCode::InvalidParams,
+                "params must be an object",
+            ))
+        }
     };
     serde_json::from_value(json!({"method": method, "params": params}))
         .map(|request| ClientFrame::Request { id, request })
@@ -222,7 +230,7 @@ impl ServerFrame {
             }),
             "response" => Ok(ServerFrame::Response {
                 id: need_id()?,
-                result: serde_json::from_value(field("result")).map_err(bad)?,
+                result: decode_response(field("result")).map_err(bad)?,
             }),
             "error" => Ok(ServerFrame::Error {
                 id,
@@ -238,6 +246,19 @@ impl ServerFrame {
     }
 }
 
+fn decode_response(result: Value) -> Result<Response, serde_json::Error> {
+    match serde_json::from_value::<Response>(result.clone()) {
+        Ok(r) => Ok(r),
+        Err(e) => match result.get("kind").and_then(Value::as_str) {
+            Some(kind) if !RESPONSE_KINDS.contains(&kind) => Ok(Response::Unknown {
+                kind: kind.to_owned(),
+                data: result.get("data").cloned().unwrap_or(Value::Null),
+            }),
+            _ => Err(e),
+        },
+    }
+}
+
 /// Outcome of `read_line`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineRead {
@@ -247,6 +268,10 @@ pub enum LineRead {
     Eof,
     /// The line exceeded the limit.
     TooLong,
+    /// A deadline in `ReadLimits` passed.
+    Timeout,
+    /// `ReadLimits::abort` returned true.
+    Aborted,
 }
 
 /// Reads one `\n`-terminated line into `buf`, never holding more than `max` bytes.
@@ -273,5 +298,81 @@ pub fn read_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, max: usize) -> io::Re
         if newline.is_some() {
             return Ok(LineRead::Line);
         }
+    }
+}
+
+/// Deadlines for `read_line_until`. They are checked whenever the underlying read wakes up, so
+/// the stream needs a short read timeout (the callers use 200 ms).
+pub struct ReadLimits<'a> {
+    /// Deadline for the first byte of a line, re-evaluated on every wake-up.
+    pub idle: &'a dyn Fn() -> Option<Instant>,
+    /// Deadline for the whole call, whatever has arrived.
+    pub hard: Option<Instant>,
+    /// Time allowed from the first byte of a line to its newline.
+    pub line: Option<Duration>,
+    /// Polled on every wake-up.
+    pub abort: &'a dyn Fn() -> bool,
+}
+
+/// Like `read_line`, with total deadlines instead of per-read ones, so a peer that sends one
+/// byte at a time cannot hold the reader open. `buf` must be empty on entry.
+pub fn read_line_until<R: BufRead>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+    lim: &ReadLimits<'_>,
+) -> io::Result<LineRead> {
+    let mut line_deadline: Option<Instant> = None;
+    loop {
+        if (lim.abort)() {
+            return Ok(LineRead::Aborted);
+        }
+        let now = Instant::now();
+        let passed = |d: Option<Instant>| d.is_some_and(|d| now >= d);
+        if passed(lim.hard)
+            || passed(line_deadline)
+            || (buf.is_empty() && line_deadline.is_none() && passed((lim.idle)()))
+        {
+            return Ok(LineRead::Timeout);
+        }
+        let chunk = match r.fill_buf() {
+            Ok(c) => c,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            return Ok(LineRead::Eof);
+        }
+        if line_deadline.is_none() {
+            line_deadline = lim.line.map(|l| Instant::now() + l);
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let take = newline.unwrap_or(chunk.len());
+        if buf.len() + take > max {
+            return Ok(LineRead::TooLong);
+        }
+        buf.extend_from_slice(&chunk[..take]);
+        r.consume(take + usize::from(newline.is_some()));
+        if newline.is_some() {
+            return Ok(LineRead::Line);
+        }
+    }
+}
+
+impl std::fmt::Debug for ReadLimits<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadLimits")
+            .field("hard", &self.hard)
+            .field("line", &self.line)
+            .finish_non_exhaustive()
     }
 }

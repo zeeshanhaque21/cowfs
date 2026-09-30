@@ -1,6 +1,8 @@
 use crate::error::{CtlError, CtlResult, ErrorCode};
 use crate::handler::{ControlHandler, OpContext};
+use crate::treehash::{hash_tree, HASH_ALGORITHM};
 use crate::types::*;
+use crate::validate::{name_key, validate_snapshot_name};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -10,13 +12,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// A `ControlHandler` that keeps snapshots in memory and simulates the long operations.
 ///
 /// It backs the tests and `cowfs serve --stub`. Long operations emit `steps` progress events,
-/// sleeping `delay` between them and stopping early when cancelled.
+/// sleeping `delay` between them and stopping early when cancelled. Every operation runs under
+/// one lock, which is what a real backend must match for `snapshot_rm` and `snapshot_reset`.
 #[derive(Debug)]
 pub struct StubHandler {
     store_path: String,
     mount_path: String,
     steps: u64,
     delay: Duration,
+    ignore_cancel: bool,
     started: Instant,
     state: Mutex<State>,
 }
@@ -45,6 +49,7 @@ impl StubHandler {
             mount_path: mount_path.into(),
             steps: 4,
             delay: Duration::ZERO,
+            ignore_cancel: false,
             started: Instant::now(),
             state: Mutex::new(State::default()),
         }
@@ -57,15 +62,26 @@ impl StubHandler {
         self
     }
 
-    /// Makes `ps` report `process` as holding `snapshot`, which also makes `snapshot_rm` fail
-    /// with `busy`. The snapshot need not exist yet.
+    /// Makes long operations run to the end even when cancelled, like an uncooperative backend.
+    pub fn ignoring_cancel(mut self) -> Self {
+        self.ignore_cancel = true;
+        self
+    }
+
+    /// Makes `ps` report `process` as holding `snapshot`, which also makes `snapshot_rm` and
+    /// `snapshot_reset` fail with `busy`. The snapshot need not exist yet.
     pub fn with_process(self, snapshot: &str, process: ProcessInfo) -> Self {
+        self.add_process(snapshot, process);
+        self
+    }
+
+    /// Like `with_process`, on a live handler.
+    pub fn add_process(&self, snapshot: &str, process: ProcessInfo) {
         self.lock()
             .processes
             .entry(snapshot.to_owned())
             .or_default()
             .push(process);
-        self
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -74,31 +90,28 @@ impl StubHandler {
 
     fn work(&self, phase: &str, unit: Unit, ctx: &OpContext<'_>) -> CtlResult<()> {
         for done in 0..=self.steps {
-            ctx.progress(ProgressEvent {
+            let event = ProgressEvent {
                 phase: phase.to_owned(),
                 done,
                 total: Some(self.steps),
                 unit,
                 message: None,
-            })?;
+            };
+            if self.ignore_cancel {
+                let _ = ctx.progress(event);
+            } else {
+                ctx.progress(event)?;
+            }
             thread::sleep(self.delay);
         }
         Ok(())
-    }
-
-    fn insert(&self, info: SnapshotInfo) -> SnapshotInfo {
-        let mut st = self.lock();
-        st.blocks += 1;
-        st.bytes += STUB_BLOCK_BYTES;
-        st.snapshots.insert(info.name.clone(), info.clone());
-        info
     }
 }
 
 fn exists(name: &str) -> CtlError {
     CtlError::new(
         ErrorCode::AlreadyExists,
-        format!("snapshot {name:?} already exists"),
+        format!("snapshot {name:?} already exists or collides with an existing name"),
     )
 }
 
@@ -106,21 +119,35 @@ fn missing(name: &str) -> CtlError {
     CtlError::not_found(format!("snapshot {name:?} does not exist"))
 }
 
-fn tree_size(dir: &Path) -> std::io::Result<(u64, u64)> {
-    let (mut files, mut bytes) = (0, 0);
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let md = entry.metadata()?;
-        if md.is_dir() {
-            let (f, b) = tree_size(&entry.path())?;
-            files += f;
-            bytes += b;
-        } else {
-            files += 1;
-            bytes += md.len();
+impl State {
+    fn collides(&self, name: &str, except: Option<&str>) -> bool {
+        let key = name_key(name);
+        self.snapshots
+            .keys()
+            .any(|k| Some(k.as_str()) != except && name_key(k) == key)
+    }
+
+    fn holders(&self, name: &str) -> Option<&Vec<ProcessInfo>> {
+        self.processes.get(name).filter(|p| !p.is_empty())
+    }
+
+    fn busy(&self, name: &str) -> CtlResult<()> {
+        match self.holders(name) {
+            Some(p) => Err(CtlError::new(
+                ErrorCode::Busy,
+                format!("snapshot {name:?} is held by {} process(es)", p.len()),
+            )
+            .with_details(serde_json::json!({ "holders": p }))),
+            None => Ok(()),
         }
     }
-    Ok((files, bytes))
+
+    fn insert(&mut self, info: SnapshotInfo) -> SnapshotInfo {
+        self.blocks += 1;
+        self.bytes += STUB_BLOCK_BYTES;
+        self.snapshots.insert(info.name.clone(), info.clone());
+        info
+    }
 }
 
 impl ControlHandler for StubHandler {
@@ -142,18 +169,17 @@ impl ControlHandler for StubHandler {
     }
 
     fn snapshot_create(&self, params: SnapshotCreate) -> CtlResult<SnapshotInfo> {
-        {
-            let st = self.lock();
-            if st.snapshots.contains_key(&params.name) {
-                return Err(exists(&params.name));
-            }
-            if let Some(from) = &params.from {
-                if !st.snapshots.contains_key(from) {
-                    return Err(missing(from));
-                }
+        validate_snapshot_name(&params.name)?;
+        let mut st = self.lock();
+        if st.collides(&params.name, None) {
+            return Err(exists(&params.name));
+        }
+        if let Some(from) = &params.from {
+            if !st.snapshots.contains_key(from) {
+                return Err(missing(from));
             }
         }
-        Ok(self.insert(SnapshotInfo {
+        Ok(st.insert(SnapshotInfo {
             name: params.name,
             parent: params.from,
             base: None,
@@ -161,27 +187,50 @@ impl ControlHandler for StubHandler {
         }))
     }
 
-    fn snapshot_rm(&self, name: &str) -> CtlResult<()> {
+    fn snapshot_rm(&self, name: &str, expect_no_holders: bool) -> CtlResult<()> {
         let mut st = self.lock();
         if !st.snapshots.contains_key(name) {
             return Err(missing(name));
         }
-        if st.processes.get(name).is_some_and(|p| !p.is_empty()) {
-            return Err(CtlError::new(
-                ErrorCode::Busy,
-                format!("snapshot {name:?} is in use by a process"),
-            ));
+        if expect_no_holders {
+            st.busy(name)?;
         }
         st.snapshots.remove(name);
+        st.processes.remove(name);
         Ok(())
     }
 
+    fn snapshot_reset(
+        &self,
+        name: &str,
+        from: &str,
+        expect_no_holders: bool,
+    ) -> CtlResult<SnapshotInfo> {
+        let mut st = self.lock();
+        if !st.snapshots.contains_key(name) {
+            return Err(missing(name));
+        }
+        if !st.snapshots.contains_key(from) {
+            return Err(missing(from));
+        }
+        if expect_no_holders {
+            st.busy(name)?;
+        }
+        Ok(st.insert(SnapshotInfo {
+            name: name.to_owned(),
+            parent: Some(from.to_owned()),
+            base: None,
+            created_unix_ms: now_ms(),
+        }))
+    }
+
     fn snapshot_rename(&self, from: &str, to: &str) -> CtlResult<SnapshotInfo> {
+        validate_snapshot_name(to)?;
         let mut st = self.lock();
         if !st.snapshots.contains_key(from) {
             return Err(missing(from));
         }
-        if st.snapshots.contains_key(to) {
+        if st.collides(to, Some(from)) || (from != to && st.snapshots.contains_key(to)) {
             return Err(exists(to));
         }
         let Some(mut info) = st.snapshots.remove(from) else {
@@ -192,6 +241,9 @@ impl ControlHandler for StubHandler {
             if child.parent.as_deref() == Some(from) {
                 child.parent = Some(to.to_owned());
             }
+        }
+        if let Some(p) = st.processes.remove(from) {
+            st.processes.insert(to.to_owned(), p);
         }
         st.snapshots.insert(to.to_owned(), info.clone());
         Ok(info)
@@ -230,7 +282,7 @@ impl ControlHandler for StubHandler {
     }
 
     fn import(&self, params: ImportParams, ctx: &OpContext<'_>) -> CtlResult<ImportReport> {
-        if self.lock().snapshots.contains_key(&params.name) {
+        if self.lock().collides(&params.name, None) {
             return Err(exists(&params.name));
         }
         let dir = Path::new(&params.path);
@@ -240,11 +292,25 @@ impl ControlHandler for StubHandler {
                 params.path
             )));
         }
-        let (files, bytes) =
-            tree_size(dir).map_err(|e| CtlError::new(ErrorCode::IoError, e.to_string()))?;
+        let io_err = |e: std::io::Error| CtlError::new(ErrorCode::IoError, e.to_string());
+        let ingested = hash_tree(dir).map_err(io_err)?;
         self.work("ingest", Unit::Bytes, ctx)?;
         self.work("verify", Unit::Bytes, ctx)?;
-        self.insert(SnapshotInfo {
+        let reread = hash_tree(dir).map_err(io_err)?;
+        let verified = reread.root == ingested.root;
+        let mismatches = if verified {
+            Vec::new()
+        } else {
+            vec![ImportMismatch {
+                path: ".".into(),
+                reason: "source changed during import".into(),
+            }]
+        };
+        let mut st = self.lock();
+        if st.collides(&params.name, None) {
+            return Err(exists(&params.name));
+        }
+        st.insert(SnapshotInfo {
             name: params.name.clone(),
             parent: None,
             base: None,
@@ -252,9 +318,14 @@ impl ControlHandler for StubHandler {
         });
         Ok(ImportReport {
             name: params.name,
-            files,
-            bytes,
-            verified: true,
+            files: ingested.files,
+            bytes: ingested.bytes,
+            verified,
+            hash_algorithm: HASH_ALGORITHM.into(),
+            source_root_hash: reread.root,
+            imported_root_hash: ingested.root,
+            mismatches,
+            mismatches_truncated: false,
         })
     }
 
@@ -269,14 +340,15 @@ impl ControlHandler for StubHandler {
                 .map_or_else(|| "repo".into(), |n| n.to_string_lossy().into_owned());
             format!("{leaf}-base")
         });
+        validate_snapshot_name(&name)?;
         self.work("build", Unit::Items, ctx)?;
-        let previous_commit = self
-            .lock()
+        let mut st = self.lock();
+        let previous_commit = st
             .snapshots
             .get(&name)
             .and_then(|s| s.base.as_ref())
             .and_then(|b| b.commit.clone());
-        let snapshot = self.insert(SnapshotInfo {
+        let snapshot = st.insert(SnapshotInfo {
             name,
             parent: None,
             base: Some(BaseMeta {

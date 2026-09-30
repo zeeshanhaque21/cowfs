@@ -47,6 +47,7 @@ fn stub_kind_builds_a_working_backend() {
     let socket = dir.path().join("c.sock");
     let backend = make_backend(BackendKind::Stub {
         work_delay: Duration::ZERO,
+        ignore_cancel: false,
     })
     .unwrap();
     let server = start_server(backend.as_ref(), &config(), &socket).unwrap();

@@ -1,68 +1,59 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
-/// Stable error codes of the control protocol. Unknown codes from a newer peer decode as `Other`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ErrorCode {
-    MalformedFrame,
-    LineTooLong,
-    HandshakeRequired,
-    UnsupportedVersion,
-    PermissionDenied,
-    UnknownFrame,
-    UnknownMethod,
-    InvalidParams,
-    DuplicateId,
-    Busy,
-    NotFound,
-    AlreadyExists,
-    Unsupported,
-    Cancelled,
-    ShuttingDown,
-    IoError,
-    Internal,
-    Other(String),
+macro_rules! codes {
+    ($($v:ident => $s:literal),* $(,)?) => {
+        /// Stable error codes of the control protocol. Unknown codes from a newer peer decode as `Other`.
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        #[allow(missing_docs)]
+        pub enum ErrorCode {
+            $($v,)*
+            Other(String),
+        }
+
+        impl ErrorCode {
+            /// Every code this version defines.
+            pub const ALL: &'static [ErrorCode] = &[$(ErrorCode::$v),*];
+
+            /// The wire string of this code.
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(ErrorCode::$v => $s,)*
+                    ErrorCode::Other(s) => s,
+                }
+            }
+
+            /// Parses a wire string. Unknown strings become `Other`.
+            pub fn parse(s: &str) -> ErrorCode {
+                match s {
+                    $($s => ErrorCode::$v,)*
+                    other => ErrorCode::Other(other.to_owned()),
+                }
+            }
+        }
+    };
 }
 
-const CODES: &[(ErrorCode, &str)] = &[
-    (ErrorCode::MalformedFrame, "malformed_frame"),
-    (ErrorCode::LineTooLong, "line_too_long"),
-    (ErrorCode::HandshakeRequired, "handshake_required"),
-    (ErrorCode::UnsupportedVersion, "unsupported_version"),
-    (ErrorCode::PermissionDenied, "permission_denied"),
-    (ErrorCode::UnknownFrame, "unknown_frame"),
-    (ErrorCode::UnknownMethod, "unknown_method"),
-    (ErrorCode::InvalidParams, "invalid_params"),
-    (ErrorCode::DuplicateId, "duplicate_id"),
-    (ErrorCode::Busy, "busy"),
-    (ErrorCode::NotFound, "not_found"),
-    (ErrorCode::AlreadyExists, "already_exists"),
-    (ErrorCode::Unsupported, "unsupported"),
-    (ErrorCode::Cancelled, "cancelled"),
-    (ErrorCode::ShuttingDown, "shutting_down"),
-    (ErrorCode::IoError, "io_error"),
-    (ErrorCode::Internal, "internal"),
-];
-
-impl ErrorCode {
-    /// The wire string of this code.
-    pub fn as_str(&self) -> &str {
-        match self {
-            ErrorCode::Other(s) => s,
-            known => CODES
-                .iter()
-                .find(|(c, _)| c == known)
-                .map_or("internal", |(_, s)| s),
-        }
-    }
-
-    /// Parses a wire string. Unknown strings become `Other`.
-    pub fn parse(s: &str) -> ErrorCode {
-        CODES
-            .iter()
-            .find(|(_, name)| *name == s)
-            .map_or_else(|| ErrorCode::Other(s.to_owned()), |(c, _)| c.clone())
-    }
+codes! {
+    MalformedFrame => "malformed_frame",
+    LineTooLong => "line_too_long",
+    HandshakeRequired => "handshake_required",
+    UnsupportedVersion => "unsupported_version",
+    PermissionDenied => "permission_denied",
+    UnknownFrame => "unknown_frame",
+    UnknownMethod => "unknown_method",
+    InvalidParams => "invalid_params",
+    DuplicateId => "duplicate_id",
+    Busy => "busy",
+    NotFound => "not_found",
+    AlreadyExists => "already_exists",
+    Unsupported => "unsupported",
+    Cancelled => "cancelled",
+    ShuttingDown => "shutting_down",
+    IoError => "io_error",
+    Internal => "internal",
+    TooManyConnections => "too_many_connections",
+    Timeout => "timeout",
 }
 
 impl fmt::Display for ErrorCode {

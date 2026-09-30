@@ -3,13 +3,14 @@ use crate::cli::{BaseCommand, Cli, Command, SnapshotCommand};
 use crate::output::{human, Progress};
 use clap::CommandFactory;
 use cowfs_ctl::{
-    default_socket_path, BaseRefreshParams, Canceller, Client, ClientError, Empty, ErrorCode,
-    GcParams, ImportParams, PsParams, Request, Response, Server, ServerOptions, SnapshotCreate,
-    SnapshotName, SnapshotRename,
+    default_socket_path, escape_control, BaseRefreshParams, Canceller, Client, ClientError,
+    ClientOptions, Empty, ErrorCode, GcParams, ImportParams, NoParams, PsParams, Request, Response,
+    Server, ServerOptions, SnapshotCreate, SnapshotName, SnapshotRename, SnapshotReset, SnapshotRm,
 };
 use serde_json::{json, Value};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle, Signals};
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,10 +22,19 @@ use std::time::Duration;
 pub const EXIT_OK: i32 = 0;
 /// Exit code: the daemon returned an error, or another failure.
 pub const EXIT_ERROR: i32 = 1;
+/// Exit code: usage error, including an argument the protocol cannot carry.
+pub const EXIT_USAGE: i32 = 2;
 /// Exit code: the daemon is not running.
 pub const EXIT_NOT_RUNNING: i32 = 3;
+/// Exit code: the daemon did not answer in time.
+pub const EXIT_TIMEOUT: i32 = 4;
 /// Exit code: interrupted by Ctrl-C.
 pub const EXIT_INTERRUPTED: i32 = 130;
+
+/// Default seconds without a reply before a client call gives up.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// How long a Ctrl-C waits for the daemon's final frame before exiting anyway.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(2);
 
 /// Why `serve` could not start.
 #[derive(Debug, thiserror::Error)]
@@ -63,7 +73,10 @@ fn serve(backend: &dyn Backend, config: &ServeConfig, socket: &Path) -> Result<(
     let handle = server.handle();
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
     thread::spawn(move || {
-        if signals.forever().next().is_some() {
+        for _ in signals.forever() {
+            if handle.is_shutting_down() {
+                std::process::exit(EXIT_INTERRUPTED);
+            }
             handle.shutdown();
         }
     });
@@ -76,8 +89,17 @@ fn serve(backend: &dyn Backend, config: &ServeConfig, socket: &Path) -> Result<(
     Ok(())
 }
 
-fn out(line: &str) {
-    let _ = writeln!(io::stdout(), "{line}");
+/// Writes `text` and a newline to `w` and flushes. A broken pipe means the reader left on
+/// purpose and counts as success; any other failure is reported and is an error.
+pub fn write_line(w: &mut dyn Write, text: &str) -> i32 {
+    match writeln!(w, "{text}").and_then(|()| w.flush()) {
+        Ok(()) => EXIT_OK,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => EXIT_OK,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "cowfs: cannot write to stdout: {e}");
+            EXIT_ERROR
+        }
+    }
 }
 
 fn report(json: bool, code: &str, message: &str, details: Option<&Value>) {
@@ -86,22 +108,25 @@ fn report(json: bool, code: &str, message: &str, details: Option<&Value>) {
         if let (Some(d), Some(map)) = (details, error.as_object_mut()) {
             map.insert("details".into(), d.clone());
         }
-        let _ = writeln!(io::stderr(), "{}", json!({ "error": error }));
+        let _ = write_line(&mut io::stdout(), &json!({ "error": error }).to_string());
     } else {
-        let _ = writeln!(io::stderr(), "cowfs: {message}");
+        let _ = writeln!(io::stderr(), "cowfs: {}", escape_control(message));
     }
 }
 
-fn absolute(p: &Path) -> String {
-    std::path::absolute(p)
-        .unwrap_or_else(|_| p.to_owned())
-        .to_string_lossy()
-        .into_owned()
+fn utf8_path(p: &Path) -> Result<String, String> {
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_owned());
+    abs.to_str().map(str::to_owned).ok_or_else(|| {
+        format!(
+            "{} is not valid UTF-8, and the control protocol carries UTF-8 paths only",
+            abs.display()
+        )
+    })
 }
 
-fn request_for(command: &Command) -> Option<Request> {
-    Some(match command {
-        Command::Serve { .. } | Command::Completions { .. } => return None,
+fn request_for(command: &Command) -> Result<Option<Request>, String> {
+    Ok(Some(match command {
+        Command::Serve { .. } | Command::Completions { .. } => return Ok(None),
         Command::Status => Request::Status(Empty {}),
         Command::Snapshot { command } => match command {
             SnapshotCommand::List => Request::SnapshotList(Empty {}),
@@ -109,9 +134,15 @@ fn request_for(command: &Command) -> Option<Request> {
                 name: name.clone(),
                 from: from.clone(),
             }),
-            SnapshotCommand::Rm { name } => {
-                Request::SnapshotRm(SnapshotName { name: name.clone() })
-            }
+            SnapshotCommand::Rm { name, force } => Request::SnapshotRm(SnapshotRm {
+                name: name.clone(),
+                expect_no_holders: !force,
+            }),
+            SnapshotCommand::Reset { name, from, force } => Request::SnapshotReset(SnapshotReset {
+                name: name.clone(),
+                from: from.clone(),
+                expect_no_holders: !force,
+            }),
             SnapshotCommand::Rename { from, to } => Request::SnapshotRename(SnapshotRename {
                 from: from.clone(),
                 to: to.clone(),
@@ -123,7 +154,7 @@ fn request_for(command: &Command) -> Option<Request> {
         Command::Gc { dry_run } => Request::Gc(GcParams { dry_run: *dry_run }),
         Command::Fsck => Request::Fsck(Empty {}),
         Command::Import { dir, name } => Request::Import(ImportParams {
-            path: absolute(dir),
+            path: utf8_path(dir)?,
             name: name.clone(),
         }),
         Command::Base {
@@ -134,7 +165,7 @@ fn request_for(command: &Command) -> Option<Request> {
                     name,
                 },
         } => Request::BaseRefresh(BaseRefreshParams {
-            repo: absolute(repo),
+            repo: utf8_path(repo)?,
             git_ref: git_ref.clone(),
             name: name.clone(),
         }),
@@ -142,8 +173,8 @@ fn request_for(command: &Command) -> Option<Request> {
             snapshot: snapshot.clone(),
         }),
         Command::MountInfo => Request::MountInfo(Empty {}),
-        Command::Shutdown => Request::Shutdown(Empty {}),
-    })
+        Command::Shutdown => Request::Shutdown(NoParams {}),
+    }))
 }
 
 struct Interrupt {
@@ -167,6 +198,10 @@ impl Interrupt {
                 if let Some(c) = s.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
                     let _ = c.cancel();
                 }
+                thread::spawn(|| {
+                    thread::sleep(INTERRUPT_GRACE);
+                    std::process::exit(EXIT_INTERRUPTED);
+                });
             }
         });
         Ok(Interrupt {
@@ -191,7 +226,7 @@ impl Drop for Interrupt {
     }
 }
 
-fn client_command(json: bool, socket: &Path, request: Request) -> i32 {
+fn client_command(json: bool, socket: &Path, timeout: u64, request: Request) -> i32 {
     let interrupt = match Interrupt::install() {
         Ok(i) => i,
         Err(e) => {
@@ -208,7 +243,12 @@ fn client_command(json: bool, socket: &Path, request: Request) -> i32 {
         report(json, "cancelled", "interrupted", None);
         EXIT_INTERRUPTED
     };
-    let mut client = match Client::connect(socket) {
+    let opts = ClientOptions {
+        connect_timeout: Duration::from_secs(timeout.min(5)),
+        handshake_timeout: Duration::from_secs(timeout.min(5)),
+        idle_timeout: Duration::from_secs(timeout),
+    };
+    let mut client = match Client::connect_with(socket, opts) {
         Ok(c) => c,
         Err(_) if interrupt.fired() => return interrupted(),
         Err(e) => return client_failure(json, socket, &e),
@@ -217,29 +257,23 @@ fn client_command(json: bool, socket: &Path, request: Request) -> i32 {
     if interrupt.fired() {
         return interrupted();
     }
-    let mut progress = Progress::new(io::stderr().is_terminal());
+    let mut progress = Progress::new(io::stderr().is_terminal(), json);
     let result = client.call_with_progress(request, |e| progress.update(e));
     progress.finish();
     match result {
-        Ok(response) => {
-            print_response(json, &response);
-            EXIT_OK
-        }
+        Ok(response) => print_response(json, &response),
         Err(_) if interrupt.fired() => interrupted(),
         Err(e) => client_failure(json, socket, &e),
     }
 }
 
-fn print_response(json: bool, response: &Response) {
-    if json {
-        let data = serde_json::to_value(response)
-            .ok()
-            .and_then(|mut v| v.get_mut("data").map(Value::take))
-            .unwrap_or(Value::Null);
-        out(&data.to_string());
+fn print_response(json: bool, response: &Response) -> i32 {
+    let text = if json {
+        response.data_json().to_string()
     } else {
-        out(&human(response));
-    }
+        human(response)
+    };
+    write_line(&mut io::stdout(), &text)
 }
 
 fn client_failure(json: bool, socket: &Path, err: &ClientError) -> i32 {
@@ -251,7 +285,15 @@ fn client_failure(json: bool, socket: &Path, err: &ClientError) -> i32 {
         report(json, "not_running", &msg, None);
         return EXIT_NOT_RUNNING;
     }
+    if err.is_timeout() {
+        report(json, "timeout", &err.to_string(), None);
+        return EXIT_TIMEOUT;
+    }
     match err {
+        ClientError::Connect { source, .. } if source.kind() == io::ErrorKind::InvalidInput => {
+            report(json, "usage", &err.to_string(), None);
+            return EXIT_USAGE;
+        }
         ClientError::Server(e) => {
             let code = match &e.code {
                 ErrorCode::Other(s) => s.as_str(),
@@ -264,9 +306,39 @@ fn client_failure(json: bool, socket: &Path, err: &ClientError) -> i32 {
     EXIT_ERROR
 }
 
+fn env_nonempty(name: &str) -> Option<OsString> {
+    std::env::var_os(name).filter(|v| !v.is_empty())
+}
+
 /// Runs a parsed command line and returns the process exit code.
 pub fn run(cli: Cli) -> i32 {
-    let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
+    let socket = cli
+        .socket
+        .clone()
+        .or_else(|| env_nonempty("COWFS_SOCKET").map(PathBuf::from))
+        .unwrap_or_else(default_socket_path);
+    let timeout = match cli.timeout {
+        Some(t) => t,
+        None => match env_nonempty("COWFS_TIMEOUT") {
+            None => DEFAULT_TIMEOUT_SECS,
+            Some(v) => match v
+                .to_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|t| *t > 0)
+            {
+                Some(t) => t,
+                None => {
+                    report(
+                        cli.json,
+                        "usage",
+                        "COWFS_TIMEOUT must be a whole number of seconds, at least 1",
+                        None,
+                    );
+                    return EXIT_USAGE;
+                }
+            },
+        },
+    };
     match &cli.command {
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -278,10 +350,12 @@ pub fn run(cli: Cli) -> i32 {
             mount,
             stub,
             stub_delay_ms,
+            stub_ignore_cancel,
         } => {
             let kind = if *stub {
                 BackendKind::Stub {
                     work_delay: Duration::from_millis(*stub_delay_ms),
+                    ignore_cancel: *stub_ignore_cancel,
                 }
             } else {
                 BackendKind::Real
@@ -302,8 +376,45 @@ pub fn run(cli: Cli) -> i32 {
             }
         }
         command => match request_for(command) {
-            Some(request) => client_command(cli.json, &socket, request),
-            None => EXIT_ERROR,
+            Ok(Some(request)) => client_command(cli.json, &socket, timeout, request),
+            Ok(None) => EXIT_ERROR,
+            Err(msg) => {
+                report(cli.json, "usage", &msg, None);
+                EXIT_USAGE
+            }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Failing(io::ErrorKind);
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(self.0))
+        }
+    }
+
+    #[test]
+    fn write_errors_fail_the_command_but_a_closed_pipe_does_not() {
+        assert_eq!(write_line(&mut Vec::new(), "x"), EXIT_OK);
+        assert_eq!(
+            write_line(&mut Failing(io::ErrorKind::BrokenPipe), "x"),
+            EXIT_OK
+        );
+        assert_eq!(
+            write_line(&mut Failing(io::ErrorKind::StorageFull), "x"),
+            EXIT_ERROR
+        );
+        assert_eq!(
+            write_line(&mut Failing(io::ErrorKind::PermissionDenied), "x"),
+            EXIT_ERROR
+        );
     }
 }
