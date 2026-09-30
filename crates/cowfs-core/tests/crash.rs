@@ -16,9 +16,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use common::{pattern, Rng};
-use cowfs_core::{store_sync_hook, Core, Options};
+use cowfs_core::{Core, Options};
 use cowfs_meta::Meta;
-use cowfs_store::Store;
 use cowfs_vfs::{FileKind, Ino, RenameFlags, Vfs, ROOT_INO};
 use redb::StorageBackend;
 
@@ -202,14 +201,19 @@ fn size_mix(rng: &mut Rng) -> usize {
 impl World {
     fn new(seed: u64, hook: bool) -> World {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path().join("store"), store_opts()).unwrap());
         let backend = Backend::default();
-        let mut mo = meta_opts();
-        if hook {
-            mo.before_sync = Some(store_sync_hook(&store));
-        }
-        let meta = Meta::open_with_backend(backend.clone(), mo).unwrap();
-        let core = Core::from_parts(store, meta, core_opts(), dir.path()).unwrap();
+        // through Core::open_with_meta, so the store sync hook is wired by the production path
+        let opts = core_opts();
+        let core = Core::open_with_meta(dir.path(), opts, |_p, mo| {
+            if hook {
+                Meta::open_with_backend(backend.clone(), mo)
+            } else {
+                let mut mo = mo;
+                mo.before_sync = None;
+                Meta::open_with_backend(backend.clone(), mo)
+            }
+        })
+        .unwrap();
         core.create_snapshot("s0").unwrap();
         let view = core.snapshot_view("s0").unwrap();
         for d in DIRS {

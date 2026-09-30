@@ -135,6 +135,25 @@ impl Core {
         Self::from_parts(store, meta, opts, dir)
     }
 
+    /// Like [`Core::open`], but the metadata database is built by `make_meta`, which receives the
+    /// directory and the options with the store sync hook already set.
+    ///
+    /// The hook is wired here, in the production path, so a test that needs a different metadata
+    /// backend (a recording one, for crash injection) cannot forget it.
+    pub fn open_with_meta(
+        dir: impl AsRef<Path>,
+        opts: Options,
+        make_meta: impl FnOnce(&Path, cowfs_meta::Options) -> cowfs_meta::Result<Meta>,
+    ) -> Result<Core, Error> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir).map_err(|e| from_io(&e))?;
+        let store = Arc::new(Store::open(dir.join("store"), opts.store).map_err(from_store)?);
+        let mut mopts = opts.meta.clone();
+        mopts.before_sync = Some(store_sync_hook(&store));
+        let meta = make_meta(dir, mopts).map_err(from_meta)?;
+        Self::from_parts(store, meta, opts, dir)
+    }
+
     /// Builds a `Core` from an opened store and metadata. `meta` must have been opened with
     /// [`store_sync_hook`] as its `before_sync`, or durability ordering is lost.
     pub fn from_parts(

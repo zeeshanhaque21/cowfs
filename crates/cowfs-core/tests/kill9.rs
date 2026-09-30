@@ -52,6 +52,7 @@ fn kill_child() {
     let Ok(dir) = std::env::var("COWFS_KILL_DIR") else {
         return;
     };
+    // the production entry point: it wires the store sync hook
     let core = Core::open(&dir, opts()).unwrap();
     core.create_snapshot("s0").unwrap();
     let fs = core.snapshot_view("s0").unwrap();
