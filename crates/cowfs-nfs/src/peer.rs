@@ -37,10 +37,11 @@ fn owners(out: &str, peer: SocketAddr, local: SocketAddr) -> (Option<u32>, Optio
     (peer_uid, local_uid)
 }
 
-/// True if the process that owns the peer end of the connection runs as the same user as this
-/// server. A peer that `lsof` cannot see at all is another user's process (or a kernel socket)
-/// and is refused. If `lsof` cannot run the check is skipped: it is a second line of defence
-/// behind the one-shot mount and the handle MACs, not the first.
+/// False only if `lsof` positively shows that the process owning the peer end of the connection
+/// runs as another user than this server. That is a narrow check: the macOS kernel NFS client
+/// connects from a kernel socket that no process owns, and an unprivileged `lsof` cannot see other
+/// users' sockets either, so in both cases nothing is found and the peer is allowed. Do not rely
+/// on it. The protection that holds is the one-shot MNT and the keyed handle MACs.
 pub fn same_user(peer: SocketAddr, local: SocketAddr) -> bool {
     let port = format!("-iTCP:{}", peer.port());
     let out = run(
@@ -52,8 +53,7 @@ pub fn same_user(peer: SocketAddr, local: SocketAddr) -> bool {
         Ok((o, stdout)) if matches!(o.status.code(), Some(0 | 1)) => {
             match owners(&stdout, peer, local) {
                 (Some(p), Some(l)) => p == l,
-                (Some(_), None) => true,
-                (None, _) => false,
+                _ => true,
             }
         }
         _ => {
@@ -91,7 +91,10 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_nobody_owns_is_refused() {
-        assert!(!same_user(a(1), a(2)));
+    fn a_connection_nobody_is_seen_on_is_allowed() {
+        assert!(
+            same_user(a(1), a(2)),
+            "kernel sockets and other users' sockets are invisible"
+        );
     }
 }

@@ -10,6 +10,7 @@ pub struct CountingVfs {
     inner: Arc<MemVfs>,
     refs: Mutex<HashMap<Ino, i64>>,
     seen: Mutex<BTreeSet<Ino>>,
+    names: Mutex<Vec<Vec<u8>>>,
     pub lookups: std::sync::atomic::AtomicU64,
 }
 
@@ -19,6 +20,7 @@ impl CountingVfs {
             inner: Arc::new(MemVfs::new()),
             refs: Mutex::new(HashMap::new()),
             seen: Mutex::new(BTreeSet::new()),
+            names: Mutex::new(Vec::new()),
             lookups: Default::default(),
         })
     }
@@ -35,6 +37,28 @@ impl CountingVfs {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(a.ino);
         a
+    }
+
+    fn named(&self, n: &[u8]) {
+        self.names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(n.to_vec());
+    }
+
+    /// Names of `._` files that were ever created, linked or renamed to in the file system.
+    pub fn appledouble_names(&self) -> Vec<String> {
+        let names = self.names.lock().unwrap_or_else(PoisonError::into_inner);
+        names
+            .iter()
+            .filter(|n| n.starts_with(b"._"))
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect()
+    }
+
+    /// The wrapped file system, for looking at what was stored.
+    pub fn inner(&self) -> &MemVfs {
+        &self.inner
     }
 
     /// References handed out and not yet forgotten, summed over all inodes.
@@ -84,15 +108,19 @@ impl Vfs for CountingVfs {
         self.inner.readlink(i)
     }
     fn create(&self, p: Ino, n: &[u8], m: u32) -> Result<Attr> {
+        self.named(n);
         self.inner.create(p, n, m).map(|a| self.got(a))
     }
     fn mkdir(&self, p: Ino, n: &[u8], m: u32) -> Result<Attr> {
+        self.named(n);
         self.inner.mkdir(p, n, m).map(|a| self.got(a))
     }
     fn symlink(&self, p: Ino, n: &[u8], t: &[u8]) -> Result<Attr> {
+        self.named(n);
         self.inner.symlink(p, n, t).map(|a| self.got(a))
     }
     fn link(&self, i: Ino, p: Ino, n: &[u8]) -> Result<Attr> {
+        self.named(n);
         self.inner.link(i, p, n).map(|a| self.got(a))
     }
     fn unlink(&self, p: Ino, n: &[u8]) -> Result<()> {
@@ -102,6 +130,7 @@ impl Vfs for CountingVfs {
         self.inner.rmdir(p, n)
     }
     fn rename(&self, p: Ino, n: &[u8], np: Ino, nn: &[u8], f: RenameFlags) -> Result<()> {
+        self.named(nn);
         self.inner.rename(p, n, np, nn, f)
     }
     fn open(&self, i: Ino) -> Result<FileHandle> {

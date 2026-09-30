@@ -131,7 +131,7 @@ impl Sidecar {
             .collect();
         let entries: usize = attrs.iter().map(|(k, _)| entry_len(k.len() + 1)).sum();
         let data_start = FIRST_ENTRY + entries;
-        let data: usize = attrs.iter().map(|(_, v)| (v.len() + 3) & !3).sum();
+        let data: usize = attrs.iter().map(|(_, v)| v.len()).sum();
         let attr_end = data_start + data;
         let total_size = (BUF_SIZE - EMPTY_FORK_LEN).max(attr_end);
         let fork_len = if self.resource_fork.is_empty() {
@@ -168,7 +168,7 @@ impl Sidecar {
             b[entry_at + 11..entry_at + 11 + name.len()].copy_from_slice(name);
             entry_at += entry_len(name.len() + 1);
             b[data_at..data_at + value.len()].copy_from_slice(value);
-            data_at += (value.len() + 3) & !3;
+            data_at += value.len();
         }
 
         if self.resource_fork.is_empty() {

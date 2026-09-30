@@ -451,3 +451,64 @@ fn references_drain_after_a_workload_on_a_real_mount() {
     assert_eq!(vfs.outstanding(), 0, "lookup references not given back");
     m.finish();
 }
+
+fn sh(dir: &Path, script: &str) -> (bool, String) {
+    run_limited(
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(dir),
+        120,
+    )
+}
+
+#[test]
+#[ignore = "mounts a filesystem; run with --ignored"]
+fn xattrs_round_trip_without_sidecar_inodes() {
+    let vfs = common::counting::CountingVfs::new();
+    let Some(m) = mounted_vfs(vfs.clone(), MountOptions::default()) else {
+        return;
+    };
+    let root = m.path().to_path_buf();
+    let (ok, out) = sh(
+        &root,
+        r#"set -e
+        echo hello > f
+        xattr -w user.color blue f
+        xattr -w user.big "$(head -c 3000 /dev/zero | tr '\0' x)" f
+        test "$(xattr -p user.color f)" = blue
+        xattr -l f | grep -q user.color
+        xattr -d user.color f
+        ! xattr -p user.color f 2>/dev/null
+        xattr -p user.big f | wc -c | grep -q 3001
+        mkdir d
+        xattr -w user.dir yes d
+        test "$(xattr -p user.dir d)" = yes
+        xattr -w user.k v f
+        cp -Rp f g
+        test "$(xattr -p user.k g)" = v
+        xattr -c g
+        test -z "$(xattr -l g | grep user.)"
+        mv f h
+        test "$(xattr -p user.k h)" = v
+        ln h h2
+        test "$(xattr -p user.k h2)" = v
+        xattr -w user.ln 1 h2
+        test "$(xattr -p user.ln h)" = 1
+        rm h
+        test "$(xattr -p user.k h2)" = v
+        ls -A | grep -v '^\._' > /dev/null
+        test -z "$(ls -A | grep '^\._' || true)"
+        "#,
+    );
+    println!("{out}");
+    assert!(ok, "xattr script failed: {}", tail(&out, 12));
+    let f = vfs.inner();
+    assert!(
+        vfs.appledouble_names().is_empty(),
+        "sidecars were stored: {:?}",
+        vfs.appledouble_names()
+    );
+    let _ = f;
+    m.finish();
+}
