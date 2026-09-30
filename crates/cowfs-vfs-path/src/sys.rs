@@ -383,6 +383,9 @@ pub struct VfsStat {
     pub name_max: u64,
 }
 
+/// File system totals. `fstatvfs` counts blocks in 32 bits on macOS and wraps on a large
+/// file system, so macOS uses `fstatfs`, which is 64 bit.
+#[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_cast)]
 pub fn fstatvfs(fd: BorrowedFd<'_>) -> io::Result<VfsStat> {
     // SAFETY: `libc::statvfs` is plain old data; all zero bytes are a valid value.
@@ -401,6 +404,26 @@ pub fn fstatvfs(fd: BorrowedFd<'_>) -> io::Result<VfsStat> {
         files: s.f_files as u64,
         files_free: s.f_ffree as u64,
         name_max: s.f_namemax as u64,
+    })
+}
+
+/// File system totals from `fstatfs`, see the Linux variant.
+#[cfg(target_os = "macos")]
+pub fn fstatvfs(fd: BorrowedFd<'_>) -> io::Result<VfsStat> {
+    // SAFETY: `libc::statfs` is plain old data; all zero bytes are a valid value.
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: see module docs.
+    cvt(unsafe { libc::fstatfs(fd.as_raw_fd(), &mut s) })?;
+    // SAFETY: see module docs.
+    let name_max = unsafe { libc::fpathconf(fd.as_raw_fd(), libc::_PC_NAME_MAX) };
+    Ok(VfsStat {
+        block_size: u64::from(s.f_bsize),
+        blocks: s.f_blocks,
+        blocks_free: s.f_bfree,
+        blocks_available: s.f_bavail,
+        files: s.f_files,
+        files_free: s.f_ffree,
+        name_max: u64::try_from(name_max).unwrap_or(255),
     })
 }
 

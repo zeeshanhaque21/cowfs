@@ -173,3 +173,11 @@ fn read_at_a_huge_offset_is_empty_not_an_error() {
     assert!(v.read(a.ino, u64::MAX >> 1, 5).expect("read").is_empty());
     assert!(v.read(a.ino, u64::MAX, 5).expect("read").is_empty());
 }
+
+#[test]
+fn statfs_reports_the_backing_filesystem() {
+    let (_s, v) = fs();
+    let s = v.statfs().expect("statfs");
+    assert!(s.block_size > 0 && s.blocks > 0 && s.blocks_free <= s.blocks);
+    assert!(s.name_max >= 255);
+}
