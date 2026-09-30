@@ -1,8 +1,7 @@
 //! `Meta::check`: recomputes every invariant from the stored rows, in one pass per snapshot.
 //!
-//! Memory is about 40 bytes per inode plus about 50 bytes per tree node (counters, not data), so
-//! a million inodes need tens of megabytes. A directory's entries are checked with a streaming
-//! multiset hash, not by holding them.
+//! Memory is per-inode and per-node counters (no data), measured at +230 MB for 1M inodes. A
+//! directory's entries are checked with a streaming multiset hash, not by holding them.
 
 use crate::db::{
     decode_snap, meta_get, Inner, FORMAT_VERSION, MAGIC, META, NODES, REAP, REFS, SNAPSHOTS,
@@ -669,6 +668,33 @@ mod tests {
         m.h.inner.cache.clear_for_test();
         assert!(matches!(
             m.snapshot("s").unwrap().lookup(ROOT_INO, b"f2"),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn a_detected_corrupt_read_makes_the_handle_refuse_writes() {
+        let (_d, m) = open();
+        let root = *m.snapshots().unwrap()[0].root.as_bytes();
+        let good = {
+            let rtx = m.h.inner.db.begin_read().unwrap();
+            let t = rtx.open_table(NODES).unwrap();
+            let v = t.get(root).unwrap().unwrap().value().to_vec();
+            v
+        };
+        let put = |bytes: &[u8]| {
+            let wtx = m.h.inner.db.begin_write().unwrap();
+            wtx.open_table(NODES).unwrap().insert(root, bytes).unwrap();
+            wtx.commit().unwrap();
+            m.h.inner.cache.clear_for_test();
+        };
+        let s = m.snapshot("s").unwrap();
+        put(&[1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(s.lookup(ROOT_INO, b"f2"), Err(Error::Corrupt(_))));
+        put(&good);
+        assert!(s.lookup(ROOT_INO, b"f2").is_ok(), "the damage was healed");
+        assert!(matches!(
+            s.create(ROOT_INO, b"x", 0o644),
             Err(Error::Corrupt(_))
         ));
     }

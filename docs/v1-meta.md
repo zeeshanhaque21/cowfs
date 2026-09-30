@@ -387,7 +387,8 @@ The mitigation for the failure mode itself is the backup copy: take a copy of th
 4. The snapshot name index and the snapshot table agree.
 5. Roots waiting in the removal queue are counted like snapshot roots, so reference counts stay exact while a removed snapshot is freed in steps.
 
-Memory is about 40 bytes per inode and 50 bytes per tree node (counters only); directory rows are checked with a streaming multiset hash, never held.
+Memory holds per-inode counters and per-node counters (no data, no directory rows: a directory's entries are checked with a streaming multiset hash).
+Measured: +230 MB of resident memory for 1,001,000 inodes, which is not the bounded-memory checker the review asked for (see Measurements).
 
 ## Tests
 
@@ -441,46 +442,42 @@ The damaged-file test covers truncations and bit flips and requires an error or 
 
 ## Measurements
 
-Source: `cargo run --release -p cowfs-meta --example bench`.
-Machine: Apple M3 Max, APFS, shared with other agents.
-Load average (`uptime`) was 85 before and 82 after the run, and every row was measured at load1 between 73 and 106, so all rows are flagged high load and absolute numbers are pessimistic and noisy.
-Each row is n=5 to 9 repetitions of the stated batch, one batch at a time under the shared CPU lock.
-The tree is 1,000 files per directory with one 4 KiB chunk per file.
-Database file at 1,001,000 inodes: 519.7 MiB, about 520 bytes per inode.
+Every number below comes from `crates/cowfs-meta/examples/review_bench.rs` (modes `lookup`, `create`, `group`, `splice`, `rm`, `check`), the first design's `examples/bench.rs`, and the review's `critic_perf` for the "before" splice and remove rows.
+Machine: Apple M3 Max, APFS, shared with other agents and busy: load1 was 25 to 100 during all runs, so every row is flagged high load and absolute numbers are pessimistic.
+Each row is n=5 (n=7 for lookups) repetitions of the stated batch under the shared CPU lock (the "before" remove_snapshot and chunk rows are n=5 runs of `critic_perf`, also under the lock).
+Tree: 1,000 files per directory, one 4 KiB chunk per file.
 
-Baseline: redb alone on the same file system.
-A raw insert in a 1000-row transaction without fsync costs 0.8 us per row.
-A raw one-row transaction without fsync costs 18.7 us.
-A raw one-row transaction with fsync costs 11.9 ms (range 9.9 to 29.6 ms).
+| metric | before | after |
+|---|---|---|
+| lookup, 1M inodes, 1000 fixed names (hot) | 38.9 to 41.6 us (measured by the reviewer and by the first bench, one mixed pattern) | 1.9 us (range 1.6 to 4.7) |
+| lookup, 1M inodes, random file, node cache warm | same | 18.6 us (12.2 to 28.5) |
+| lookup, 1M inodes, absent name | not measured | 3.0 us (2.7 to 4.6) |
+| lookup, 1M inodes, random file, node cache cold (fresh open) | not measured | 28.8 us (27.4 to 62.1) |
+| lookup, 1M inodes, random file, node cache off | not measured | 56.6 us (48.6 to 72.4) |
+| create, one call per file, unbatched | 1,775 us (563 per s), 10,000 creates about 17 s | 208.6 us (4,793 per s; range 180 to 250 us), applied in memory, durable by policy |
+| create, 1000 per batch | 10.2 us | 35.4 us (under load 73 to 76; the first number was under load 102, not comparable) |
+| durable create, 1 thread | about 12 to 20 ms (one fsync each) | 19.3 ms (52 per s) |
+| durable create, 2 / 8 / 32 threads, group commit | none | 18.4 ms per op (54 per s) / 5.5 ms (182 per s) / 1.2 ms (827 per s) |
+| append one chunk, file of 1k / 10k / 100k / 1M chunks | 106 us / 393 us / 3.68 ms / set_content alone 1.48 s at 1M (whole list) | `splice_content`: 12.6 / 25.3 / 24.4 / 20.6 us |
+| replace one mid-file chunk, same sizes | not possible without the whole list | `splice_content`: 57 / 63 / 71 / 74 us |
+| append via `chunks()` + `set_content`, same sizes (kept for comparison) | as above | 0.61 ms / 5.6 ms / 353 ms / 1,110 ms |
+| remove_snapshot, 1M inodes: call returns after | 933 ms to 1.9 s (median 980 ms) | 19.7 ms (18.3 to 33.8) |
+| worst create latency by a concurrent writer while a 1M-inode removal is being reaped | 0.89 to 1.9 s (as long as the removal) | 4.9 ms (1.2 to 13.2) |
+| worst create latency including the durable commit of `remove_snapshot` itself | same | 28 ms (13.8 to 43.8) |
+| time until all nodes of the removed 1M-inode snapshot are freed | 0.9 s (inline) | 6.2 s (5.9 to 8.0), in the background |
+| `check()`, 1M inodes | 2.5 s, 747 MB resident (reviewer, one run) | 4.2 s (3.2 to 5.0), +230 MB resident (302 to 532 MB) |
 
-| metric | inodes | median | min - max |
-|---|---|---|---|
-| snapshot create (durable) | 1,001 | 22.6 ms | 14.5 - 26.3 ms |
-| snapshot create (durable) | 100,100 | 19.6 ms | 16.2 - 49.8 ms |
-| snapshot create (durable) | 1,001,000 | 32.3 ms | 21.7 - 49.7 ms |
-| snapshot remove, unchanged (durable) | 1,001 / 100,100 / 1,001,000 | 20.9 / 21.7 / 37.1 ms | 13.4 - 88.5 ms |
-| lookup | 1,001 / 100,100 / 1,001,000 | 3.0 / 16.4 / 41.6 us | 2.3 - 56.0 us |
-| set_content on one file, no fsync | 1,001,000 | 1.55 ms | 0.29 - 1.85 ms |
-| set_content plus fsync | 1,001,000 | 38.6 ms | 34.6 - 46.7 ms |
-| readdir of 100,000 entries, 1000 per page | 1,001,000 | 0.2 us per entry | 0.2 - 0.5 us |
-| create, one transaction per file | 1,001,000 | 1.78 ms (563 per s) | 1.59 - 1.94 ms |
-| create, 1000 per transaction | 1,001,000 | 10.2 us (97,900 per s) | 5.8 - 25.3 us |
-| rename in one directory | 1,001,000 | 2.05 ms | 1.98 - 2.16 ms |
-| rename across directories | 1,001,000 | 2.13 ms | 1.64 - 2.25 ms |
-| hardlink create | 1,001,000 | 1.68 ms | 1.46 - 2.00 ms |
-| live_blocks, full walk | 1,001,000 | 1.81 s (1,000,000 blocks) | 1.22 - 1.92 s |
-| live_blocks, one file changed, marker reused | 1,001,000 | 54.5 us (5 blocks) | 52.7 - 61.2 us |
+What these show and do not show:
 
-What the numbers show and do not show:
-
-- Snapshot create is dominated by the fsync, which the raw redb baseline also pays (about 12 ms).
-  The ranges at the three sizes overlap, but the median at 1,001,000 inodes (32 ms) is higher than at 1,001 and 100,100 (20 to 23 ms), so "flat" is supported to within a factor of 1.6 at load above 70 and is not proven tighter than that.
-  The operation reads one row, writes one row and one reference count, and touches no tree node, which is the reason to expect flatness.
-- A single-file write in the million-inode tree costs 1.5 ms median with a 0.29 ms minimum without fsync.
-  It rewrites the leaf-to-root path (3 to 4 nodes) and re-hashes each with BLAKE3.
-  It does not grow with tree size in these runs (100,100 inodes: 2.8 ms, 1,001,000: 1.55 ms), and the spread at this load is larger than any size effect.
-- One-transaction-per-operation costs 1.7 to 2.1 ms, versus 10 us per file when batched.
-  Per-transaction overhead (path rewrite, redb commit, and one redb transaction each) dominates, so a mount adapter should batch bursts.
-- The skipping walk visits 5 blocks against 1,000,000 for the full walk after one file changes.
-  That is a count of blocks yielded and is exact, not a timing claim.
-- Not measured: the effect of BLAKE3 NEON (opt-in cargo feature, needs a C compiler); memory use; concurrent readers during writes.
+- Hot lookup is single digit microseconds.
+  A random lookup in a 1M-inode tree is 18.6 us, not single digit: the node cache (32,768 nodes of 4 KiB) holds a small part of a 520 MB tree, so most random lookups read and hash nodes.
+  That target is met only for a hot working set.
+- Unbatched mutation is no longer bounded by fsync, because it does not wait for one.
+  The price is the loss window in "Applied and durable".
+  With `Ack::Durable` each call waits for an fsync, and group commit raises throughput with concurrency (52 per s for one thread, 827 per s for 32), which is fsync-bound on this disk (raw redb one-row fsync commit 10 to 12 ms).
+- `splice_content` cost is flat from 1k to 1M chunks within the noise; the whole-list path grows linearly (0.6 ms to 1.1 s).
+  The bytes written by an append are flat as well: 33 KB at 10 chunks, 140 KB at 50,000, 197 KB at 100,000 (redb page and path overhead, a leaf-to-root path).
+- Writer stall during removal is bounded by one reap step of at most 256 nodes or 4 ms of work; the remaining 28 ms in the whole window is the durable commit that `remove_snapshot` itself performs, which is above the 20 ms target at load 70.
+- `check()` is slower in this run than in the review's (load differs: 54 here) and uses less memory, but it is not bounded-memory: +230 MB at 1M inodes.
+  The target (streaming, bounded) was not reached.
+- Not measured: memory of the node cache, recovery time after an unclean shutdown (the review measured 4.8 s at 1M inodes for redb's repair; nothing here changes it), concurrent readers during writes.
