@@ -106,12 +106,12 @@
         {
           "id": "7",
           "title": "#7 chunking, hashing and block store",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 7,
-          "owner": "critic round 3 (subagent)",
+          "owner": "builder (subagent)",
           "pr": "#24",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/24",
-          "detail": "Round-2 findings N1-N8 fixed, re-verified by me: 89 crate tests pass, fmt/clippy clean, scope clean, BlockId/ChunkRef untouched, CI green. Builder's evidence: 1800 simulated power-loss cases, 0 acked blocks lost, 0 wrong bytes, corrupt_synced reported after benign torn tail 271/1800 before, 0 after; 256 MiB pack opens in 1 ms with index, 227 ms full verified rebuild; header CRC added (format v2, 56-byte header, v1 refused); salvage(), verify_all(), acknowledge_corruption(), torn-tail sidecar, transactional roll, SYNCED base; 50 mutants 48 killed (2 equivalent); builds on Rust 1.89. Open: possible 25-35% single-thread slowdown (ingest 287 to 191 MiB/s, verified read 771 to 521) on the one clean pass, inconclusive on noisy passes; N9 cold-cache verify-on-dedup cost not measurable; sealed-pack cut at a record boundary only noticed via index checkpoint; default test time 2:17. Round-3 critic running a proper A/B of the old and new code, crash-during-recovery harness, and mutants on the new logic.",
+          "detail": "Round-2 findings N1-N8 fixed, re-verified by me: 89 crate tests pass, fmt/clippy clean, scope clean, BlockId/ChunkRef untouched, CI green. Builder's evidence: 1800 simulated power-loss cases, 0 acked blocks lost, 0 wrong bytes, corrupt_synced reported after benign torn tail 271/1800 before, 0 after; 256 MiB pack opens in 1 ms with index, 227 ms full verified rebuild; header CRC added (format v2, 56-byte header, v1 refused); salvage(), verify_all(), acknowledge_corruption(), torn-tail sidecar, transactional roll, SYNCED base; 50 mutants 48 killed (2 equivalent); builds on Rust 1.89. Open: possible 25-35% single-thread slowdown (ingest 287 to 191 MiB/s, verified read 771 to 521) on the one clean pass, inconclusive on noisy passes; N9 cold-cache verify-on-dedup cost not measurable; sealed-pack cut at a record boundary only noticed via index checkpoint; default test time 2:17. Round-3 critic running a proper A/B of the old and new code, crash-during-recovery harness, and mutants on the new logic. | ROUND-3 VERDICT: NOT mergeable. F1 stale index.cix plus reused pack id loses acked blocks (2 of 6 after acknowledge_corruption then put, sync, crash); F2 whole-pack ACKED entry hides later corruption; F3 zero-filled last pack header makes open fail closed; F4 in-place move-down not crash-atomic (double fault loses an acked block); F5 loss reported only once, then clean; F6 unbounded torn sidecars, unsynced, truncates even when the sidecar write fails; F7 forged valid-CRC headers drop valid blocks (attacker model); F8 new_pack collides with next roll (GC). Held up: 4000 crash cases 0 acked lost, 0 wrong bytes; 180 s stress clean; header CRC; compat with core and meta. A/B: no performance regression (instructions equal within 0.3%, earlier 25-35% slowdown was load noise). 7 of 12 new mutants survived. Builder fixing with pack-id high-water, content-bound ACKED, copy-then-swap recovery, persistent loss marker.",
           "ci": "CI: pass (linux, macos) at 3e78b5d"
         },
         {
@@ -144,7 +144,7 @@
           "owner": "subagent (space bunny)",
           "pr": "#39",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/39",
-          "detail": "Builder writes docs/v1-gc.md first, then mark (subtree skipping, hole refs skipped, core pinned blocks via an ExtraRoots trait, epoch/grace protocol so blocks created during a mark are never swept), access-time hints (hint only), compaction (copy live records, fsync, manifest/watermark/index ordering, atomic swap), dry run, progress and cancellation. Crash injection at every compaction step, kill -9 loop, concurrent stress, negative control. Worktree slot 11, branch v1/10-gc."
+          "detail": "Builder writes docs/v1-gc.md first, then mark (subtree skipping, hole refs skipped, core pinned blocks via an ExtraRoots trait, epoch/grace protocol so blocks created during a mark are never swept), access-time hints (hint only), compaction (copy live records, fsync, manifest/watermark/index ordering, atomic swap), dry run, progress and cancellation. Crash injection at every compaction step, kill -9 loop, concurrent stress, negative control. Worktree slot 11, branch v1/10-gc. | NOTE from store critic: new_pack() collides with the next roll (AlreadyExists) and pack ids must never be reused; GC must use the store's new pack-id allocator once the store fix lands."
         },
         {
           "id": "11",
