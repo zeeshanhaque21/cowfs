@@ -14,5 +14,13 @@ libc = "0.2"
 [dev-dependencies]
 proptest.workspace = true
 
+[features]
+# Runs every Fault against the whole suite (slow). See the crate docs.
+mutation-tests = []
+
+[[test]]
+name = "mutations_full"
+required-features = ["mutation-tests"]
+
 [lints]
 workspace = true

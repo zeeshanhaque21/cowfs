@@ -15,7 +15,7 @@ pub const LINK_MAX: u32 = 65_000;
 /// Deliberate defects, used only to prove the conformance suite fails when a backend is wrong.
 /// Never enable one outside tests.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fault {
     InodeCookies,
     PositionCookies,
