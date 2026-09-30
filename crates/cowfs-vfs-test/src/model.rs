@@ -294,7 +294,12 @@ impl Oracle {
         }
         match (src, self.get(b)) {
             (Node::Dir(_), Ok(Node::Leaf(_))) => errs.push(Error::NotDir),
-            (Node::Leaf(_), Ok(Node::Dir(_))) => errs.push(Error::IsDir),
+            (Node::Leaf(_), Ok(Node::Dir(d))) => {
+                errs.push(Error::IsDir);
+                if !d.kids.is_empty() && a.starts_with(b) {
+                    errs.push(Error::NotEmpty);
+                }
+            }
             (Node::Dir(_), Ok(Node::Dir(d))) if !d.kids.is_empty() => errs.push(Error::NotEmpty),
             _ => {}
         }
@@ -569,7 +574,7 @@ pub fn run(fs: &dyn Vfs, ops: &[Op]) -> Result<(), String> {
         let got = exec(fs, op);
         let agree = match (&want, &got) {
             (Ok(a), Ok(b)) => a == b,
-            (Err(errs), Err(e)) => errs.contains(e),
+            (Err(errs), Err(e)) => crate::conformance::errno_matches(e, errs),
             _ => false,
         };
         if !agree {
@@ -585,6 +590,80 @@ pub fn run(fs: &dyn Vfs, ops: &[Op]) -> Result<(), String> {
             .map_err(|e| format!("after op {i} {op:?}: {e}"))?;
     }
     Ok(())
+}
+
+/// Deterministic random operation sequences for `run`, for callers without proptest.
+/// The same `(seed, len)` always gives the same sequence.
+pub fn random_ops(seed: u64, len: usize) -> Vec<Op> {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, m: u64) -> u64 {
+            self.next() % m
+        }
+    }
+    fn path(r: &mut Rng) -> Vec<u8> {
+        let n = match r.below(7) {
+            0..=2 => 1,
+            3..=5 => 2,
+            _ => 3,
+        };
+        (0..n).map(|_| r.below(3) as u8).collect()
+    }
+    fn mode(r: &mut Rng) -> u16 {
+        match r.below(3) {
+            0 => 0o644,
+            1 => 0o444,
+            _ => r.next() as u16,
+        }
+    }
+    let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let table = [5u64, 6, 2, 3, 3, 2, 5, 4, 2, 1, 2, 2];
+    (0..len)
+        .map(|_| {
+            let mut x = r.below(table.iter().sum());
+            let mut k = table.len() - 1;
+            for (i, w) in table.iter().enumerate() {
+                if x < *w {
+                    k = i;
+                    break;
+                }
+                x -= w;
+            }
+            match k {
+                0 => Op::Create(path(&mut r), mode(&mut r)),
+                1 => Op::Mkdir(path(&mut r), mode(&mut r)),
+                2 => Op::Symlink(path(&mut r), r.below(3) as u8),
+                3 => Op::Link(path(&mut r), path(&mut r)),
+                4 => Op::Unlink(path(&mut r)),
+                5 => Op::Rmdir(path(&mut r)),
+                6 => Op::Rename(path(&mut r), path(&mut r), r.below(2) == 0),
+                7 => Op::Write(
+                    path(&mut r),
+                    r.below(10_000) as u16,
+                    r.below(6000) as u16,
+                    r.next() as u8,
+                ),
+                8 => Op::Truncate(path(&mut r), r.below(12_000) as u16),
+                9 => Op::SetMode(path(&mut r), r.next() as u16),
+                10 => Op::Read(path(&mut r), r.below(12_000) as u16, r.below(8000) as u16),
+                _ => Op::Xattr(
+                    path(&mut r),
+                    r.below(3) as u8,
+                    if r.below(2) == 0 {
+                        None
+                    } else {
+                        Some(r.next() as u8)
+                    },
+                ),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -665,5 +744,16 @@ mod tests {
                 other => panic!("{fault:?} was not detected: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn oracle_accepts_the_linux_answer_for_a_file_onto_its_ancestor() {
+        let mut o = Oracle::new();
+        o.apply(&Op::Mkdir(vec![0], 0o755)).unwrap();
+        o.apply(&Op::Create(vec![0, 0], 0o644)).unwrap();
+        let errs = o
+            .apply(&Op::Rename(vec![0, 0], vec![0], false))
+            .unwrap_err();
+        assert!(errs.contains(&Error::IsDir) && errs.contains(&Error::NotEmpty));
     }
 }

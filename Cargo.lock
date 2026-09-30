@@ -112,6 +112,7 @@ name = "cowfs-vfs-test"
 version = "0.0.0"
 dependencies = [
  "cowfs-vfs",
+ "libc",
  "proptest",
 ]
 

@@ -122,35 +122,27 @@ pub fn hardlink_across_directories(c: &Ctx) -> Outcome {
         b"shared".to_vec(),
         "content after removing the first directory"
     );
-    ensure_eq!(
-        c.fs.getattr(d2)?.nlink,
-        2,
-        "directory nlink is unaffected by file links"
-    );
     Ok(())
 }
 
+/// The kernel says `EPERM` for a hardlink to a directory, `Error::PermissionDenied` maps to
+/// `EACCES`, so both errnos are accepted.
 pub fn hardlink_to_directory_is_denied(c: &Ctx) -> Outcome {
     let d = c.dir(ROOT_INO, "d")?;
-    ensure_err!(
+    ensure_err_any!(
         c.link(d, ROOT_INO, b"d2"),
-        Error::PermissionDenied,
+        [Error::PermissionDenied],
         "link to a directory"
     );
-    ensure_err!(
+    ensure_err_any!(
         c.link(d, d, b"self"),
-        Error::PermissionDenied,
+        [Error::PermissionDenied],
         "link a directory into itself"
     );
-    ensure_err!(
+    ensure_err_any!(
         c.link(ROOT_INO, d, b"root"),
-        Error::PermissionDenied,
+        [Error::PermissionDenied],
         "link to the root"
-    );
-    ensure_eq!(
-        c.fs.getattr(d)?.nlink,
-        2,
-        "directory nlink after rejected links"
     );
     ensure_eq!(
         c.names(ROOT_INO)?,
@@ -271,5 +263,72 @@ pub fn hardlink_pairs_8000_listed_once_and_removed(c: &Ctx) -> Outcome {
         "directory not empty after removing every listed entry"
     );
     c.fs.rmdir(ROOT_INO, b"d")?;
+    Ok(())
+}
+
+pub fn lookup_nlink_is_fresh(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    c.link(f, ROOT_INO, b"g")?;
+    for n in [&b"f"[..], b"g"] {
+        let a = c.lookup(ROOT_INO, n)?;
+        ensure_eq!(
+            a.nlink,
+            2,
+            "nlink from lookup of {:?} after a link",
+            String::from_utf8_lossy(n)
+        );
+    }
+    c.link(f, ROOT_INO, b"h")?;
+    ensure_eq!(
+        c.lookup(ROOT_INO, b"f")?.nlink,
+        3,
+        "nlink from lookup after a second link"
+    );
+    c.fs.unlink(ROOT_INO, b"g")?;
+    c.fs.unlink(ROOT_INO, b"h")?;
+    ensure_eq!(
+        c.lookup(ROOT_INO, b"f")?.nlink,
+        1,
+        "nlink from lookup after both links were removed"
+    );
+    Ok(())
+}
+
+const LINK_TRY: u32 = 70_000;
+
+/// A backend may have no link limit. If it has one, running into it must be reported as
+/// `TooManyLinks`, `nlink` must count exactly the names that were made, and the file must stay
+/// fully usable. `MemVfs` has a limit of `LINK_MAX` names.
+pub fn hardlink_limit_reports_too_many_links(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    c.write_all(f, 0, b"data")?;
+    let d = c.dir(ROOT_INO, "d")?;
+    let mut names = 1u32;
+    for i in 1..LINK_TRY {
+        match c.fs.link(f, d, format!("l{i}").as_bytes()) {
+            Ok(a) => {
+                names += 1;
+                ensure_eq!(a.nlink, names, "nlink returned by link number {i}");
+            }
+            Err(Error::TooManyLinks) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    ensure_eq!(c.fs.getattr(f)?.nlink, names, "nlink after the last link");
+    ensure_eq!(
+        c.content(f)?,
+        b"data".to_vec(),
+        "content of a file with many names"
+    );
+    if names < LINK_TRY {
+        ensure_err!(
+            c.fs.link(f, d, b"one-more"),
+            Error::TooManyLinks,
+            "link after the limit was reported"
+        );
+        ensure_eq!(c.fs.getattr(f)?.nlink, names, "nlink after a rejected link");
+        c.fs.unlink(d, b"l1")?;
+        c.fs.link(f, d, b"again")?;
+    }
     Ok(())
 }

@@ -217,3 +217,31 @@ pub fn invalid_names_rejected_by_creating_ops(c: &Ctx) -> Outcome {
     ensure_eq!(c.fs.getattr(f)?.nlink, 1, "nlink after rejected links");
     Ok(())
 }
+
+/// Sidecar names such as `._x` (macOS AppleDouble) and `.DS_Store` are hidden by some adapters,
+/// never by a backend: they are plain names.
+pub fn appledouble_names_are_ordinary(c: &Ctx) -> Outcome {
+    let names: [&[u8]; 5] = [b"._x", b"._", b".DS_Store", b"._.DS_Store", b".localized"];
+    for n in names {
+        let a = c.create(ROOT_INO, n, 0o644)?;
+        ensure_eq!(
+            c.lookup(ROOT_INO, n)?.ino,
+            a.ino,
+            "lookup of {:?}",
+            String::from_utf8_lossy(n)
+        );
+    }
+    let mut listed = c.names(ROOT_INO)?;
+    listed.sort();
+    let mut want: Vec<Vec<u8>> = names.iter().map(|n| n.to_vec()).collect();
+    want.sort();
+    ensure_eq!(listed, want, "listing of sidecar-style names");
+    let d = c.dir(ROOT_INO, "d")?;
+    c.create(d, b"._inside", 0o644)?;
+    ensure_eq!(
+        c.names(d)?,
+        vec![b"._inside".to_vec()],
+        "sidecar name in a subdirectory"
+    );
+    Ok(())
+}

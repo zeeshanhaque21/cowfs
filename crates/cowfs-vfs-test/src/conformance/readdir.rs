@@ -450,3 +450,20 @@ pub fn readdir_resume_from_removed_entry_cookie(c: &Ctx) -> Outcome {
     ensure_eq!(got, want, "entries after the cookie of a removed entry");
     Ok(())
 }
+
+/// cowfs contract: `max` is at least 1. A caller that loops until `eof` would spin forever on a
+/// backend that answers 0 with no entries and `eof` false, so 0 is `InvalidArgument`.
+pub fn readdir_max_zero_is_invalid(c: &Ctx) -> Outcome {
+    ensure_err!(
+        c.fs.readdir(ROOT_INO, 0, 0),
+        Error::InvalidArgument,
+        "readdir with max 0 of an empty directory"
+    );
+    populate(c, ROOT_INO, 3, "e")?;
+    ensure_err!(
+        c.fs.readdir(ROOT_INO, 0, 0),
+        Error::InvalidArgument,
+        "readdir with max 0 of a non-empty directory"
+    );
+    Ok(())
+}
