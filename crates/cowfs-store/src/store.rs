@@ -80,7 +80,7 @@ pub struct Store {
 /// On failure nothing is left behind, so the caller can simply try again.
 fn create_pack(io: &Io, store: &Path, id: u32) -> io::Result<File> {
     let path = pack::pack_path(store, id);
-    let file = match OpenOptions::new()
+    let (file, reuse) = match OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
@@ -88,20 +88,22 @@ fn create_pack(io: &Io, store: &Path, id: u32) -> io::Result<File> {
     {
         Ok(f) => {
             io.created(&path);
-            f
+            (f, false)
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             let f = open_pack(store, id)?;
             if f.metadata()?.len() > PACK_HEADER_LEN {
                 return Err(e);
             }
-            f
+            (f, true)
         }
         Err(e) => return Err(e),
     };
     let init = || -> io::Result<()> {
-        file.set_len(0)?;
-        file.write_all_at(&pack::header_bytes(), 0)?;
+        if reuse {
+            io.truncate(&file, &path, 0)?;
+        }
+        io.write_at(&file, &path, 0, &pack::header_bytes())?;
         io.sync_file(&file, &path)?;
         io.sync_dir(&pack::pack_dir(store))
     };
@@ -328,7 +330,7 @@ impl Store {
                     return Err(bad_pack("truncated header"));
                 }
                 io.truncate(&file, &path, 0)?;
-                file.write_all_at(&pack::header_bytes(), 0)?;
+                io.write_at(&file, &path, 0, &pack::header_bytes())?;
                 io.sync_file(&file, &path)?;
                 len = PACK_HEADER_LEN;
             } else if let Err(reason) = pack::header_check(&file)? {
@@ -438,7 +440,7 @@ impl Store {
                 for r in &tail {
                     buf.resize(r.total as usize, 0);
                     file.read_exact_at(&mut buf, r.offset)?;
-                    file.write_all_at(&buf, w)?;
+                    io.write_at(&file, &path, w, &buf)?;
                     index.insert_verified(
                         r.id,
                         Loc {
@@ -526,9 +528,9 @@ impl Store {
         // sits below this mark. A mark that is already ahead of the packs is left alone.
         let here = Mark { pack: id, len };
         if wm.mark().is_none() {
-            wm.init(&io, here)?;
+            wm.init(here)?;
         } else {
-            wm.advance(&io, here)?;
+            wm.advance(here)?;
         }
         let synced = wm
             .mark()
@@ -600,7 +602,10 @@ impl Store {
             self.roll(&mut w)?;
         }
         let offset = u32::try_from(w.len).map_err(|_| io::Error::other("pack offset overflow"))?;
-        if let Err(e) = w.file.write_all_at(&rec, w.len) {
+        if let Err(e) = self
+            .io
+            .write_at(&w.file, &pack::pack_path(&self.dir, w.id), w.len, &rec)
+        {
             let _ = w.file.set_len(w.len);
             return Err(e.into());
         }
@@ -762,7 +767,7 @@ impl Store {
             self.wm
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .advance(&self.io, Mark { pack: id, len })?;
+                .advance(Mark { pack: id, len })?;
             let mut w = self.writer();
             w.synced = w.synced.max((id, len));
         }
@@ -990,7 +995,7 @@ impl Store {
             self.wm
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .reset(&self.io, mark, base)?;
+                .reset(mark, base)?;
             let mut w = self.writer();
             w.synced = w.synced.max((mark.pack, mark.len));
         }
