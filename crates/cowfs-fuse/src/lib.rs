@@ -121,4 +121,4 @@ pub use options::{MountMode, MountOptions};
 #[cfg(target_os = "linux")]
 pub use lifecycle::{sweep_stale_mounts, Unmounted};
 #[cfg(target_os = "linux")]
-pub use mount::{run, Invalidator, Mount};
+pub use mount::{run, Health, Invalidator, Mount};

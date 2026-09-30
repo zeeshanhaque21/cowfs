@@ -41,7 +41,12 @@ fn session(
         (opts.auto_unmount, MountOption::AutoUnmount),
     ];
     m.extend(flags.into_iter().filter(|f| f.0).map(|f| f.1));
+    let refresh = opts.refresh_open_pages;
+    let period = opts.attr_lifetime();
     let se = Session::new(Fs::new(vfs, opts, shared.clone()), mountpoint, &m)?;
+    if refresh {
+        shared.start_open_refresh(period);
+    }
     let _ = shared.notifier.set(se.notifier());
     Ok(se)
 }
@@ -53,7 +58,13 @@ pub fn run(
     mountpoint: impl AsRef<Path>,
     opts: MountOptions,
 ) -> Result<(), MountError> {
-    let mut se = session(vfs, mountpoint.as_ref(), opts, Arc::new(Shared::new()))?;
+    let workers = opts.workers;
+    let mut se = session(
+        vfs,
+        mountpoint.as_ref(),
+        opts,
+        Arc::new(Shared::new(workers)),
+    )?;
     Ok(se.run()?)
 }
 
@@ -143,8 +154,21 @@ pub struct Mount {
     path: PathBuf,
     shared: Arc<Shared>,
     unmount_timeout: Duration,
+    lane_bound: Duration,
     registered: u64,
     thread: Option<JoinHandle<io::Result<()>>>,
+}
+
+/// What `Mount::health` reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// The request loop runs, the mount is in `/proc/mounts`, and no lane is stuck.
+    Ok,
+    /// A lane has had a request in flight for longer than `lane_bound`. The mount still serves
+    /// everything not queued behind that lane; the caller decides what to do.
+    Wedged(usize),
+    /// The mount is failed or gone: every request answers `ENOTCONN`.
+    Failed,
 }
 
 impl Mount {
@@ -156,7 +180,8 @@ impl Mount {
     ) -> Result<Self, MountError> {
         let path = mountpoint.as_ref().to_owned();
         let unmount_timeout = opts.unmount_timeout;
-        let shared = Arc::new(Shared::new());
+        let lane_bound = opts.lane_bound;
+        let shared = Arc::new(Shared::new(opts.workers));
         let mut se = session(vfs, &path, opts, shared.clone())?;
         let thread = std::thread::Builder::new()
             .name("cowfs-fuse".into())
@@ -166,6 +191,7 @@ impl Mount {
             path,
             shared,
             unmount_timeout,
+            lane_bound,
             registered,
             thread: Some(thread),
         })
@@ -182,6 +208,33 @@ impl Mount {
         !self.failed()
             && self.thread.as_ref().is_some_and(|t| !t.is_finished())
             && lifecycle::is_mounted(&self.path)
+    }
+
+    /// Logs every lane that stays wedged for longer than `lane_bound`. The mount is not torn
+    /// down: a stuck `Vfs` call cannot be killed, and dropping the mount would lose the work
+    /// queued behind it. Call it from a supervisor, or poll `health`.
+    pub fn watch_lanes(&self) {
+        for (lane, ino, held) in self.wedged_lanes() {
+            log::error!("lane {lane} has had inode {ino} in flight for {:.1}s (limit {:?}); the Vfs is not answering for it", held.as_secs_f64(), self.lane_bound);
+        }
+    }
+
+    /// Whether the mount is healthy: not failed, request loop running, in `/proc/mounts`, and
+    /// no lane stuck for longer than `lane_bound`. A wedged lane means the `Vfs` is not
+    /// answering for that inode, not that the mount is gone.
+    pub fn health(&self) -> Health {
+        if self.failed() || !lifecycle::is_mounted(&self.path) {
+            return Health::Failed;
+        }
+        match self.wedged_lanes().first() {
+            None => Health::Ok,
+            Some((lane, ..)) => Health::Wedged(*lane),
+        }
+    }
+
+    /// Lanes with a request in flight for longer than `lane_bound`, as (lane, inode, held).
+    pub fn wedged_lanes(&self) -> Vec<(usize, Ino, Duration)> {
+        self.shared.wedged(self.lane_bound)
     }
 
     /// True once `Vfs` panics reached `max_panics`. The mount then answers `ENOTCONN` to
@@ -210,6 +263,7 @@ impl Mount {
         let Some(thread) = self.thread.take() else {
             return Ok(Unmounted::Clean);
         };
+        self.shared.stop_refresh();
         lifecycle::deregister(self.registered);
         let how = lifecycle::unmount(&self.path, self.unmount_timeout)?;
         if how == Unmounted::Lazy {

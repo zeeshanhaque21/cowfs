@@ -2,16 +2,18 @@
 //! the request loop thread, slow operations on keyed worker lanes.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cowfs_vfs::{
-    validate_name, Attr, FileHandle, FileKind, Ino, SetAttr, SetTime, Vfs, MODE_MASK, ROOT_INO,
+    validate_name, Attr, Error, FileHandle, FileKind, Ino, SetAttr, SetTime, Vfs, MODE_MASK,
+    ROOT_INO,
 };
 use fuser::consts::{FOPEN_KEEP_CACHE, FUSE_PARALLEL_DIROPS};
 use fuser::{
@@ -39,6 +41,9 @@ pub(crate) struct Shared {
     pub(crate) epoch: AtomicU64,
     panics: AtomicU32,
     failed: AtomicBool,
+    in_flight: Mutex<Vec<Option<(Ino, Instant)>>>,
+    open_handles: Mutex<HashMap<Ino, u32>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -50,23 +55,115 @@ impl std::fmt::Debug for Shared {
 }
 
 impl Shared {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(workers: usize) -> Self {
         Self {
             table: Mutex::new(Table::default()),
             notifier: OnceLock::new(),
             epoch: AtomicU64::new(0),
             panics: AtomicU32::new(0),
             failed: AtomicBool::new(false),
+            in_flight: Mutex::new(vec![None; workers]),
+            open_handles: Mutex::new(HashMap::new()),
+            stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Records that a descriptor is open on `ino`, or that one was closed.
+    pub(crate) fn set_open(&self, ino: Ino, delta: i32) {
+        let mut open = self.open_handles.lock().unwrap_or_else(|e| e.into_inner());
+        let n = open.entry(ino).or_default();
+        *n = n.saturating_add_signed(delta);
+        if *n == 0 {
+            open.remove(&ino);
+        }
+    }
+
+    /// Drops the cached pages and attributes of every inode with an open descriptor, so a file
+    /// rewritten behind the mount is seen through a descriptor that is already open. Bounded by
+    /// the open handles, which is why this runs on a timer rather than over all cached inodes.
+    fn refresh_open_pages(&self) {
+        let open: Vec<Ino> = self
+            .open_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        let Some(n) = self.notifier.get() else { return };
+        for ino in open {
+            // (0, -1) is "drop every page"; (-1, 0) is attributes only, which leaves the pages
+            // of an open descriptor in place. Verified on the Linux 7.0 test kernel.
+            if let Err(e) = n.inval_inode(ino, 0, -1) {
+                log::warn!("page refresh of inode {ino} failed: {e}");
+            }
+        }
+    }
+
+    /// In `MountMode::Shared`, revalidates open descriptors every `period` so the kernel's
+    /// cached pages expire with the attribute lifetime. Nothing to do in `SoleWriter`, where
+    /// every change is announced through the `Invalidator`.
+    pub(crate) fn start_open_refresh(self: &Arc<Self>, period: Duration) {
+        if period.is_zero() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let stop = self.stop.clone();
+        let _ = std::thread::Builder::new()
+            .name("cowfs-fuse-refresh".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(period);
+                    let Some(sh) = weak.upgrade() else { return };
+                    sh.refresh_open_pages();
+                }
+            });
+    }
+
+    pub(crate) fn stop_refresh(&self) {
+        self.stop.store(true, Ordering::Release);
     }
 
     pub(crate) fn table(&self) -> MutexGuard<'_, Table> {
         self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// True once `Vfs` panics reached `max_panics`: every request then fails with `ENOTCONN`.
+    /// True once `Vfs` panics reached `max_panics` or the tree became unknown: every request
+    /// then fails with `ENOTCONN`.
     pub(crate) fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    /// Fails the mount: every request answers `ENOTCONN` until it is unmounted, so the
+    /// mountpoint never looks like an empty but valid directory.
+    pub(crate) fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    /// Sets or clears the in-flight record of a lane.
+    pub(crate) fn set_in_flight(&self, lane: usize, slot: Option<(Ino, Instant)>) {
+        if let Some(cell) = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(lane)
+        {
+            *cell = slot;
+        }
+    }
+
+    /// Lanes that have had a request in flight for longer than `bound`, as
+    /// (lane, inode, seconds). The mount is not torn down: the caller decides.
+    pub(crate) fn wedged(&self, bound: Duration) -> Vec<(usize, Ino, Duration)> {
+        let now = Instant::now();
+        let held = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        held.iter()
+            .enumerate()
+            .filter_map(|(lane, slot)| {
+                let (ino, since) = (*slot)?;
+                let held = now.saturating_duration_since(since);
+                (held >= bound).then_some((lane, ino, held))
+            })
+            .collect()
     }
 }
 
@@ -95,16 +192,22 @@ fn offset(o: i64) -> R<u64> {
     u64::try_from(o).map_err(|_| libc::EINVAL)
 }
 
-fn file_type(kind: FileKind) -> FileType {
-    match kind {
+/// An unknown kind is a bug in the `Vfs`, not a filesystem state: EIO, never a silent regular file.
+fn file_type(ino: Ino, kind: FileKind) -> R<FileType> {
+    Ok(match kind {
         FileKind::Regular => FileType::RegularFile,
         FileKind::Directory => FileType::Directory,
         FileKind::Symlink => FileType::Symlink,
-    }
+        _ => {
+            log::error!("the Vfs reported a file kind this adapter does not know for inode {ino}");
+            return Err(libc::EIO);
+        }
+    })
 }
 
-fn file_attr(a: &Attr, uid: u32, gid: u32) -> FileAttr {
-    FileAttr {
+fn file_attr(a: &Attr, uid: u32, gid: u32) -> R<FileAttr> {
+    let kind = file_type(a.ino, a.kind)?;
+    Ok(FileAttr {
         ino: a.ino,
         size: a.size,
         blocks: a.blocks,
@@ -112,7 +215,7 @@ fn file_attr(a: &Attr, uid: u32, gid: u32) -> FileAttr {
         mtime: convert::to_system_time(a.mtime),
         ctime: convert::to_system_time(a.ctime),
         crtime: UNIX_EPOCH,
-        kind: file_type(a.kind),
+        kind,
         perm: u16::try_from(a.mode & MODE_MASK).unwrap_or(0),
         nlink: a.nlink,
         uid,
@@ -120,7 +223,7 @@ fn file_attr(a: &Attr, uid: u32, gid: u32) -> FileAttr {
         rdev: 0,
         blksize: BLKSIZE,
         flags: 0,
-    }
+    })
 }
 
 fn negative_attr() -> FileAttr {
@@ -165,12 +268,20 @@ fn xattr_reply(size: u32, value: &[u8], reply: ReplyXattr) {
     }
 }
 
-struct Sink(ReplyDirectory);
+struct Sink {
+    reply: ReplyDirectory,
+    bad_kind: i32,
+}
 
 impl DirSink for Sink {
     fn add(&mut self, ino: Ino, offset: i64, kind: FileKind, n: &[u8]) -> bool {
-        self.0
-            .add(ino, offset, file_type(kind), OsStr::from_bytes(n))
+        match file_type(ino, kind) {
+            Ok(t) => self.reply.add(ino, offset, t, OsStr::from_bytes(n)),
+            Err(e) => {
+                self.bad_kind = e;
+                true
+            }
+        }
     }
 }
 
@@ -183,7 +294,15 @@ impl Core {
             return Err(libc::ENOTCONN);
         }
         match catch_unwind(AssertUnwindSafe(|| f(&*self.vfs))) {
-            Ok(r) => r.map_err(|e| e.errno()),
+            Ok(r) => r.map_err(|e| {
+                if e == Error::Retry {
+                    return libc::EAGAIN;
+                }
+                if matches!(e, Error::Io(_) | Error::Corrupt(_)) {
+                    log::error!("Vfs error: {e}");
+                }
+                e.errno()
+            }),
             Err(p) => {
                 self.panicked(&p);
                 Err(libc::EIO)
@@ -212,7 +331,7 @@ impl Core {
         }
     }
 
-    fn fattr(&self, a: &Attr, unlinked_ok: bool) -> FileAttr {
+    fn fattr(&self, a: &Attr, unlinked_ok: bool) -> R<FileAttr> {
         let (s, changed) = convert::sanitize(a, unlinked_ok);
         if changed {
             log::warn!(
@@ -240,7 +359,7 @@ impl Core {
             });
             return Err(libc::EIO);
         }
-        Ok(self.fattr(a, false))
+        self.fattr(a, false)
     }
 
     fn lookup(&self, parent: Ino, n: &OsStr) -> R<FileAttr> {
@@ -252,13 +371,13 @@ impl Core {
     fn getattr(&self, ino: Ino, open: bool) -> R<FileAttr> {
         let a = self.call(|v| v.getattr(ino))?;
         let unlinked = open || self.sh.table().is_unnamed(ino);
-        Ok(self.fattr(&a, unlinked))
+        self.fattr(&a, unlinked)
     }
 
     fn setattr(&self, ino: Ino, changes: SetAttr) -> R<FileAttr> {
         let a = self.call(|v| v.setattr(ino, changes))?;
         let unlinked = self.sh.table().is_unnamed(ino);
-        Ok(self.fattr(&a, unlinked))
+        self.fattr(&a, unlinked)
     }
 
     fn forget(&self, ino: Ino, count: u64) {
@@ -270,6 +389,14 @@ impl Core {
             v.forget(ino, count);
             Ok(())
         });
+    }
+
+    /// The `Vfs` says `open` never fails for what the caller intends, so an `open` failure here
+    /// is the backend failing to pin, not a permission question.
+    fn open_pin(&self, ino: Ino) -> R<u64> {
+        let h = self.call(|v| v.open(ino))?;
+        self.sh.set_open(ino, 1);
+        Ok(h.0)
     }
 
     fn open_flags(&self) -> u32 {
@@ -284,10 +411,18 @@ impl Core {
         let n = name(n)?;
         let a = self.call(|v| v.create(parent, n, mode & MODE_MASK))?;
         let attr = self.referenced(parent, n, &a, true)?;
-        match self.call(|v| v.open(a.ino)) {
-            Ok(h) => Ok((attr, h.0)),
+        match self.open_pin(a.ino) {
+            Ok(h) => Ok((attr, h)),
             Err(e) => {
                 self.forget(a.ino, 1);
+                // The caller is told the create failed, so it must not exist: leave it and a
+                // retry hits EEXIST.
+                if let Err(u) = self.call(|v| v.unlink(parent, n)) {
+                    log::error!("create of {} then open failed ({e}); unlink failed too ({u}), so the tree is unknown", String::from_utf8_lossy(n));
+                    self.sh.fail();
+                } else {
+                    self.sh.table().unname(parent, n);
+                }
                 Err(e)
             }
         }
@@ -357,8 +492,8 @@ impl Fs {
 
     /// Runs `f` for a request of `class` on `key`'s inode. A class that has been cheap runs right
     /// here on the loop thread, skipping the hand-off. Otherwise `f` goes to the lane that owns
-    /// `key`, a FIFO, so requests for one inode keep their order while unrelated inodes run in
-    /// parallel and a slow request no longer delays unrelated ones. `pinned` forces the lane.
+    /// `key`, a FIFO, so the `Vfs` sees the requests for one inode in the order the kernel issued
+    /// them. `pinned` forces the lane.
     fn dispatch(
         &self,
         class: Class,
@@ -375,8 +510,66 @@ impl Fs {
         if self.lanes.is_empty() || (!pinned && self.core.cost.cheap(class)) {
             return job();
         }
-        let i = lane_index(key, self.lanes.len());
-        let _ = self.lanes[i].send(Box::new(job));
+        let slot = lane_index(key, self.lanes.len());
+        let sh = self.core.sh.clone();
+        let job = Box::new(move || {
+            sh.set_in_flight(slot, Some((key, Instant::now())));
+            job();
+            sh.set_in_flight(slot, None);
+        }) as Job;
+        if let Err(e) = self.lanes[slot].send(job) {
+            log::error!("lane {slot} is gone ({e}); the request is abandoned with the mount");
+        }
+    }
+
+    /// Runs `f` for a request that touches two inodes, such as a rename, ordered after all
+    /// earlier requests on both lanes and before all later ones. The work runs on the
+    /// higher-numbered lane; it is entered from the lower one, which then waits for it. Lane
+    /// numbers are taken in a fixed order, so opposite-direction renames cannot deadlock: the
+    /// lower lane only ever waits for a higher one.
+    fn dispatch2(&self, class: Class, keys: [Ino; 2], f: impl FnOnce(&Core) + Send + 'static) {
+        let c = self.core.clone();
+        let job = move || {
+            let start = Instant::now();
+            f(&c);
+            c.cost.record(class, start.elapsed());
+        };
+        if self.lanes.is_empty() || self.core.cost.cheap(class) {
+            return job();
+        }
+        let n = self.lanes.len();
+        let (a, b) = (lane_index(keys[0], n), lane_index(keys[1], n));
+        if a == b {
+            // Both parents share a lane (a same-directory rename): one lane is enough, and
+            // handing it to itself would wait for itself.
+            let sh = self.core.sh.clone();
+            let job: Job = Box::new(move || {
+                sh.set_in_flight(a, Some((keys[0], Instant::now())));
+                job();
+                sh.set_in_flight(a, None);
+            });
+            if let Err(e) = self.lanes[a].send(job) {
+                log::error!("lane {a} is gone: {e}");
+            }
+            return;
+        }
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let (done_tx, done_rx) = mpsc::channel();
+        let sh = self.core.sh.clone();
+        let hi_job: Job = Box::new(move || {
+            sh.set_in_flight(hi, Some((keys[0], Instant::now())));
+            job();
+            sh.set_in_flight(hi, None);
+            let _ = done_tx.send(());
+        });
+        let tx = self.lanes[hi].clone();
+        let lo_job: Job = Box::new(move || {
+            let _ = tx.send(hi_job);
+            let _ = done_rx.recv();
+        });
+        if let Err(e) = self.lanes[lo].send(lo_job) {
+            log::error!("lane {lo} is gone: {e}; the request is abandoned with the mount");
+        }
     }
 
     fn lane(&self, class: Class, key: Ino, f: impl FnOnce(&Core) + Send + 'static) {
@@ -566,7 +759,7 @@ impl Filesystem for Fs {
             Err(errno) => return reply.error(errno),
         };
         let (n, nn) = (n.to_owned(), newname.to_owned());
-        self.lane(Class::Meta, parent, move |c| {
+        self.dispatch2(Class::Meta, [parent, newparent], move |c| {
             let r = name(&n)
                 .and_then(|n| Ok((n, name(&nn)?)))
                 .and_then(|(n, nn)| {
@@ -600,8 +793,8 @@ impl Filesystem for Fs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        self.lane(Class::Open, ino, move |c| match c.call(|v| v.open(ino)) {
-            Ok(h) => reply.opened(h.0, c.open_flags()),
+        self.lane(Class::Open, ino, move |c| match c.open_pin(ino) {
+            Ok(h) => reply.opened(h, c.open_flags()),
             Err(e) => reply.error(e),
         });
     }
@@ -697,10 +890,14 @@ impl Filesystem for Fs {
         reply: ReplyEmpty,
     ) {
         self.lane(Class::Close, ino, move |c| {
+            c.sh.set_open(ino, -1);
             empty(c.call(|v| v.release(FileHandle(fh))), reply);
         });
     }
 
+    /// The trait makes `fsync(ROOT_INO, false)` the whole-mount barrier. fuser 0.15 exposes no
+    /// `syncfs` request, so `syncfs(2)` takes the kernel fallback, an `fsync` of the root, which
+    /// lands here.
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
         self.lane(Class::Fsync, ino, move |c| {
             empty(c.call(|v| v.fsync(ino, datasync)), reply)
@@ -723,10 +920,14 @@ impl Filesystem for Fs {
     fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, off: i64, reply: ReplyDirectory) {
         self.lane(Class::Dir, ino, move |c| {
             let parent = c.sh.table().parent_of(ino);
-            let mut sink = Sink(reply);
-            match c.call(|v| dir::fill(v, ino, parent, off, &mut sink)) {
-                Ok(()) => sink.0.ok(),
-                Err(e) => sink.0.error(e),
+            let mut sink = Sink { reply, bad_kind: 0 };
+            let r = match c.call(|v| dir::fill(v, ino, parent, off, &mut sink)) {
+                Ok(()) if sink.bad_kind != 0 => Err(sink.bad_kind),
+                other => other,
+            };
+            match r {
+                Ok(()) => sink.reply.ok(),
+                Err(e) => sink.reply.error(e),
             }
         });
     }
@@ -885,7 +1086,7 @@ mod tests {
             mtime: t,
             ctime: t,
         };
-        let f = file_attr(&a, 11, 12);
+        let f = file_attr(&a, 11, 12).unwrap();
         assert_eq!(
             (f.ino, f.size, f.blocks, f.nlink, f.uid, f.gid),
             (7, 9, 1, 3, 11, 12)

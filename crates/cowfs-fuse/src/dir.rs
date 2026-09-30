@@ -12,6 +12,11 @@ pub const BATCH: usize = 256;
 
 const OFFSET_SHIFT: u64 = 2;
 
+/// Consecutive empty pages tolerated before the listing is declared broken. The trait does not
+/// say an empty page means the end, so a short or holey listing is retried a bounded number of
+/// times rather than silently truncated; a `Vfs` that never reaches eof then fails loudly.
+pub const MAX_EMPTY_PAGES: usize = 8;
+
 /// Where a `readdir` request resumes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Start {
@@ -46,6 +51,12 @@ pub trait DirSink {
 
 /// Lists `dir` from FUSE `offset` into `sink`, synthesizing `.` (the directory itself) and
 /// `..` (`parent`, which the caller tracks because the `Vfs` has no parent lookup).
+///
+/// Entries are resumed with the `Vfs` cookie, which is opaque: it only has to be stable and
+/// must not go backwards. A `Vfs` that ignores the position, or whose first entry carries
+/// cookie 0 (which the trait reserves for "from the start"), is served by counting entries and
+/// replaying the listing from the start on each call. An empty page that is not the end is
+/// retried, `MAX_EMPTY_PAGES` times, and then fails loudly rather than truncating the listing.
 pub fn fill(
     vfs: &dyn Vfs,
     dir: Ino,
@@ -62,24 +73,51 @@ pub fn fill(
     {
         return Ok(());
     }
-    let mut cookie = match start {
+    // Cookie mode resumes with the Vfs cookie. Counted mode serves a Vfs that ignores the
+    // position or numbers from 0, by replaying and dropping `skip` entries.
+    let mut counted = false;
+    let mut skip = offset - 2;
+    let mut next = match start {
         Start::After(c) => c,
         _ => 0,
     };
+    let mut empty_pages = 0usize;
     loop {
-        let batch = vfs.readdir(dir, cookie, BATCH)?;
+        let batch = vfs.readdir(dir, if counted { 0 } else { next }, BATCH)?;
+        if !counted && batch.entries.first().is_some_and(|e| e.cookie <= next) {
+            counted = true;
+            empty_pages = 0;
+            continue;
+        }
         for e in &batch.entries {
-            if e.cookie <= cookie {
-                return Err(Error::Io("readdir cookie did not advance".into()));
+            if !counted {
+                if e.cookie < next {
+                    return Err(Error::Io("readdir cookie went backwards".into()));
+                }
+                next = e.cookie;
+            } else if skip > 0 {
+                skip -= 1;
+                continue;
+            } else {
+                next += 1;
             }
-            let off = offset_for_cookie(e.cookie).ok_or(Error::Range)?;
+            let off = offset_for_cookie(next).ok_or(Error::Range)?;
             if sink.add(e.ino, off, e.kind, &e.name) {
                 return Ok(());
             }
-            cookie = e.cookie;
         }
-        if batch.eof || batch.entries.is_empty() {
+        if batch.eof {
             return Ok(());
+        }
+        if batch.entries.is_empty() {
+            empty_pages += 1;
+            if empty_pages > MAX_EMPTY_PAGES {
+                return Err(Error::Io(format!(
+                    "readdir of inode {dir} returned {MAX_EMPTY_PAGES} empty pages without eof"
+                )));
+            }
+        } else {
+            empty_pages = 0;
         }
     }
 }

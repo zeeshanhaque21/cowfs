@@ -158,3 +158,40 @@ fn impossible_attributes_from_the_vfs_do_not_brick_the_mount() {
     fx.vfs.bad_attrs.store(false, SeqCst);
     assert_eq!(fs::metadata(fx.p("f")).unwrap().len(), 0);
 }
+
+/// F1: the real `Shared` contract for a file descriptor that is already open.
+#[test]
+#[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
+fn held_descriptor_sees_a_rewrite_behind_the_mount_after_a_revalidation() {
+    let Some(fx) = Fixture::with("", |v| {
+        let a = v.create(ROOT_INO, b"held", 0o644).unwrap();
+        v.write(a.ino, 0, b"old").unwrap();
+    }) else {
+        return;
+    };
+    use std::os::unix::fs::FileExt;
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fx.p("held"))
+        .unwrap();
+    assert_eq!(f.read_at(&mut [0u8; 3], 0).unwrap(), 3);
+    let ino = fx.raw().lookup(ROOT_INO, b"held").unwrap().ino;
+    fx.raw().write(ino, 0, b"new").unwrap();
+    let mut seen = None;
+    for _ in 0..40 {
+        let mut b = [0u8; 3];
+        let _ = f.read_at(&mut b, 0);
+        if &b == b"new" {
+            seen = Some(b);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        seen,
+        Some(*b"new"),
+        "a held descriptor must see the rewrite behind the mount; the Vfs holds {:?}",
+        fx.raw().read(ino, 0, 3).unwrap()
+    );
+}

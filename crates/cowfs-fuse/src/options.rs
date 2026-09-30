@@ -41,6 +41,11 @@ pub struct MountOptions {
     /// Linux 7.0), so a name created behind the mount, such as a new snapshot directory at
     /// the mount root, becomes visible only after this long.
     pub negative_ttl: Duration,
+    /// In `Shared` mode, drop the cached pages of open descriptors every `attr_ttl`, so a
+    /// descriptor that is already open sees a file rewritten behind the mount. This is what
+    /// makes the `Shared` staleness bound true through an open descriptor, not just the next
+    /// open. Default true. Off means open descriptors may serve old pages indefinitely.
+    pub refresh_open_pages: bool,
     /// Mount read-only. The kernel then rejects every write with `EROFS`. Default false.
     pub read_only: bool,
     /// Let the kernel enforce mode bits. When false, only `access(2)` is checked by the
@@ -64,6 +69,9 @@ pub struct MountOptions {
     /// slow until seen to be fast, and one slow request sends it back to the lanes. Zero
     /// sends everything to the lanes. Default 100 us.
     pub inline_below: Duration,
+    /// How long a request may stay in flight on a lane before `health` reports it as wedged.
+    /// A wedged lane is logged and reported, never torn down. Default 60 s.
+    pub lane_bound: Duration,
     /// `Vfs` panics tolerated before the mount is marked failed and answers `ENOTCONN`.
     /// Default 3.
     pub max_panics: u32,
@@ -83,12 +91,14 @@ impl Default for MountOptions {
             entry_ttl: Duration::from_secs(1),
             attr_ttl: Duration::from_secs(1),
             negative_ttl: Duration::from_secs(1),
+            refresh_open_pages: true,
             read_only: false,
             default_permissions: true,
             allow_other: false,
             auto_unmount: false,
             workers: std::thread::available_parallelism().map_or(4, |n| n.get().min(8)),
             inline_below: Duration::from_micros(100),
+            lane_bound: Duration::from_secs(60),
             max_panics: 3,
             unmount_timeout: Duration::from_secs(5),
             paranoid_ino: false,
@@ -160,6 +170,8 @@ impl MountOptions {
                 };
                 self.mode = MountMode::SoleWriter { ttl };
             }
+            "refresh_open_pages" => flag(value).map(|_| self.refresh_open_pages = true)?,
+            "norefresh_open_pages" => flag(value).map(|_| self.refresh_open_pages = false)?,
             "ro" => flag(value).map(|_| self.read_only = true)?,
             "rw" => flag(value).map(|_| self.read_only = false)?,
             "default_permissions" => flag(value).map(|_| self.default_permissions = true)?,
@@ -170,6 +182,7 @@ impl MountOptions {
             "inline_below_us" => {
                 self.inline_below = Duration::from_micros(u64::from(count(value)?));
             }
+            "lane_bound" => self.lane_bound = secs(value)?,
             "max_panics" => self.max_panics = count(value)?.max(1),
             "unmount_timeout" => self.unmount_timeout = secs(value)?,
             "paranoid_ino" => flag(value).map(|_| self.paranoid_ino = true)?,
@@ -181,7 +194,7 @@ impl MountOptions {
 
 /// Parses a comma separated option string such as `ttl=60,noneg,ro` on top of the defaults.
 /// Keys: `fsname=<name>`, `ttl=<secs>` (both `Shared` lifetimes), `entry_ttl=<secs>`,
-/// `attr_ttl=<secs>`, `neg_ttl=<secs>`, `noneg`, `shared`, `sole_writer[=<secs>]` (default
+/// `attr_ttl=<secs>`, `neg_ttl=<secs>`, `noneg`, `norefresh_open_pages`, `shared`, `sole_writer[=<secs>]` (default
 /// 3600), `ro`/`rw`, `default_permissions`/`nodefault_permissions`, `allow_other`,
 /// `auto_unmount`, `workers=<n>`, `inline_below_us=<n>`, `max_panics=<n>`, `unmount_timeout=<secs>`, `paranoid_ino`.
 /// Later tokens win.
@@ -215,6 +228,7 @@ mod tests {
         );
         assert_eq!(o.mode, MountMode::Shared);
         assert!(!o.keep_cache() && o.default_permissions);
+        assert!(o.refresh_open_pages);
         assert!(!o.read_only && !o.allow_other && !o.auto_unmount && !o.paranoid_ino);
         assert_eq!(
             (o.max_panics, o.unmount_timeout),
@@ -289,6 +303,7 @@ mod tests {
             "neg=yes",
             "neg_ttl",
             "noneg=1",
+            "norefresh_open_pages=1",
             "allow_other=1",
             "workers=-1",
             "workers",
