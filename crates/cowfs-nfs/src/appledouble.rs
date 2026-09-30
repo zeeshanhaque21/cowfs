@@ -126,6 +126,7 @@ impl Sidecar {
         Self::encode_capped(self, MAX_ATTRS)
     }
 
+    #[cfg(test)]
     fn encode_all(s: &Sidecar) -> Vec<u8> {
         Sidecar::encode_capped(s, usize::MAX)
     }
@@ -407,7 +408,7 @@ mod tests {
 
     #[test]
     fn every_count_and_size_of_attributes_survives_a_round_trip() {
-        let mut sizes = vec![0usize, 1, 3, 4, 127, 128, 1000, 4096];
+        let sizes = [0usize, 1, 3, 4, 127, 128, 1000, 4096];
         // 255 is where the client stops, so that is where the property has to hold.
         for n in 0..=MAX_ATTRS {
             let mut s = Sidecar::default();
@@ -433,7 +434,7 @@ mod tests {
                 .insert(format!("user.a{i:03}x").into_bytes(), vec![1; 100]);
         }
         // What a client writes is not truncated, so the adapter must be able to say no to it.
-        assert!(Sidecar::decode(&encode_all(&over)).is_none());
+        assert!(Sidecar::decode(&Sidecar::encode_all(&over)).is_none());
         // What the adapter synthesises is truncated, because the client stops there anyway. The
         // attributes themselves stay in the Vfs.
         let shown = Sidecar::decode(&over.encode()).unwrap();
