@@ -163,7 +163,7 @@ pub fn small_reads_are_never_torn(c: &Ctx) -> Outcome {
             let off = word * N as u64;
             if t < 3 {
                 let v = (t * 60 + i % 50 + 2) as u8;
-                ensure_eq!(c.fs.write(f, off, &vec![v; N])? as usize, N, "short write");
+                ensure_eq!(c.fs.write(f, off, &[v; N])? as usize, N, "short write");
                 let got = c.fs.read(f, off, N as u32)?;
                 ensure_eq!(got.len(), N, "read length at {off}");
                 ensure!(
