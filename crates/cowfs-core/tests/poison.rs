@@ -8,7 +8,7 @@ mod common;
 
 use common::*;
 use cowfs_core::{Core, Options};
-use cowfs_vfs::{Error, SetAttr, Vfs, ROOT_INO};
+use cowfs_vfs::{Error, SetAttr, Vfs};
 
 fn one_pack(dir: &std::path::Path) -> std::path::PathBuf {
     let mut v: Vec<_> = std::fs::read_dir(dir.join("store/packs"))
@@ -140,8 +140,8 @@ fn a_damaged_chunk_found_by_a_truncate_poisons_only_that_file() {
     .unwrap();
     c.create_snapshot("s").unwrap();
     let r = root_entry(&c, "s").ino;
-    let f = mkfile(&c, r, "f", &pattern(600_000, 7));
-    let g = mkfile(&c, r, "g", b"other").ino;
+    mkfile(&c, r, "f", &pattern(600_000, 7));
+    mkfile(&c, r, "g", b"other").ino;
     c.sync().unwrap();
     drop(c);
     damage(dir.path());
