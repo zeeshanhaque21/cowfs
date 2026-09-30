@@ -405,6 +405,9 @@ impl Vfs for PathVfs {
             }
             s.open_fd(ino)?.file
         };
+        if offset > i64::MAX as u64 - u64::from(READ_MAX) {
+            return Ok(Vec::new());
+        }
         let mut buf = vec![0u8; size.min(READ_MAX) as usize];
         let mut got = 0;
         while got < buf.len() {

@@ -31,7 +31,7 @@ pub(crate) fn io_err(e: io::Error) -> Error {
         libc::ENOSPC | libc::EDQUOT => Error::NoSpace,
         libc::EACCES | libc::EPERM => Error::PermissionDenied,
         libc::EMLINK => Error::TooManyLinks,
-        libc::ENOTSUP | libc::EOPNOTSUPP => Error::NotSupported,
+        n if n == libc::ENOTSUP || n == libc::EOPNOTSUPP => Error::NotSupported,
         libc::ESTALE => Error::Stale,
         libc::ERANGE | libc::E2BIG => Error::Range,
         libc::EROFS => Error::ReadOnly,

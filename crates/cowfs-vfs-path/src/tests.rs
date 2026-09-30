@@ -164,3 +164,12 @@ fn errno_mapping() {
     assert_eq!(e(libc::EPERM), Error::PermissionDenied);
     assert!(matches!(e(libc::EBADF), Error::Io(_)));
 }
+
+#[test]
+fn read_at_a_huge_offset_is_empty_not_an_error() {
+    let (_s, v) = fs();
+    let a = v.create(ROOT_INO, b"a", 0o644).expect("create");
+    v.write(a.ino, 0, b"x").expect("write");
+    assert!(v.read(a.ino, u64::MAX >> 1, 5).expect("read").is_empty());
+    assert!(v.read(a.ino, u64::MAX, 5).expect("read").is_empty());
+}
