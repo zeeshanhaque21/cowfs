@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cowfs_nfs::{is_listed, mount_nfs_available, Mount, MountOptions};
+use cowfs_nfs::{is_listed, mount_nfs_available, AppleDoubleMode, Mount, MountOptions};
 use cowfs_vfs_test::MemVfs;
 
 /// Force-unmounts the mount point if a test outlives its deadline, so a hung syscall fails with
@@ -689,5 +689,160 @@ fn a_killed_host_leaves_a_mount_that_sweep_removes() {
         assert!(swept.is_empty(), "a live mount was swept: {swept:?}");
         assert!(mount_table_has(&live));
         o.finish();
+    }
+}
+
+#[test]
+#[ignore = "mounts a filesystem; run with --ignored"]
+fn copy_tools_carry_xattrs_and_leave_no_sidecar_inodes() {
+    let vfs = common::counting::CountingVfs::new();
+    let Some(m) = mounted_vfs(vfs.clone(), MountOptions::default()) else {
+        return;
+    };
+    let root = m.path().to_path_buf();
+    let (ok, out) = sh(
+        &root,
+        r#"set -e
+        mkdir src src/sub
+        echo data > src/a
+        xattr -w user.k v src/a
+        echo x > src/sub/b
+        xattr -w user.z 9 src/sub/b
+        cp -Rp src cp1
+        test "$(xattr -p user.k cp1/a)" = v
+        test "$(xattr -p user.z cp1/sub/b)" = 9
+        tar cf t.tar src
+        mkdir tarx
+        tar xf t.tar -C tarx
+        test "$(xattr -p user.k tarx/src/a)" = v
+        rsync -aX src/ rs/
+        test "$(xattr -p user.k rs/a)" = v
+        test "$(xattr -p user.z rs/sub/b)" = 9
+        ditto src dt
+        test "$(xattr -p user.k dt/a)" = v
+        mkdir g
+        cd g
+        git init -q .
+        echo 1 > f
+        git add f
+        git -c user.email=a@b -c user.name=n commit -qm m
+        xattr -w user.q 1 f
+        test -z "$(git status --porcelain)"
+        cd ..
+        for d in . src src/sub cp1 tarx/src rs dt g; do
+            test -z "$(ls -A $d | grep '^\._' || true)"
+        done
+        echo hello > prov
+        xattr -l prov | grep -q com.apple.provenance
+        "#,
+    );
+    println!("{out}");
+    assert!(ok, "script failed: {}", tail(&out, 12));
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        vfs.appledouble_names().is_empty(),
+        "sidecars reached the Vfs: {:?}",
+        vfs.appledouble_names()
+    );
+    let inner = vfs.inner();
+    let lookup =
+        |parent: u64, name: &[u8]| cowfs_vfs::Vfs::lookup(inner, parent, name).unwrap().ino;
+    let src = lookup(cowfs_vfs::ROOT_INO, b"src");
+    let a = lookup(src, b"a");
+    let names = cowfs_vfs::Vfs::listxattr(inner, a).unwrap();
+    assert!(
+        names.contains(&b"user.k".to_vec()),
+        "xattr not stored on the file: {names:?}"
+    );
+    let prov = lookup(cowfs_vfs::ROOT_INO, b"prov");
+    let names = cowfs_vfs::Vfs::listxattr(inner, prov).unwrap();
+    assert!(
+        names.contains(&b"com.apple.provenance".to_vec()),
+        "{names:?}"
+    );
+    m.finish();
+}
+
+#[test]
+#[ignore = "mounts a filesystem; run with --ignored"]
+fn hide_mode_still_stores_and_hides_sidecars() {
+    let vfs = common::counting::CountingVfs::new();
+    let opts = MountOptions {
+        appledouble: AppleDoubleMode::Hide,
+        ..MountOptions::default()
+    };
+    let Some(m) = mounted_vfs(vfs.clone(), opts) else {
+        return;
+    };
+    let root = m.path().to_path_buf();
+    fs::write(root.join("doc"), "x").unwrap();
+    let names: Vec<String> = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["doc"], "listing hides the sidecar");
+    assert!(
+        !vfs.appledouble_names().is_empty(),
+        "the client's sidecar is stored in Hide mode"
+    );
+    fs::remove_file(root.join("doc")).unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(vfs.live(), 0, "removing the file removed its sidecar too");
+    m.finish();
+}
+
+fn total_rpcs(stats: &str) -> u64 {
+    stats
+        .lines()
+        .find_map(|l| l.strip_prefix("TOTAL "))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+#[test]
+#[ignore = "mounts a filesystem; prints a table"]
+fn rpcs_per_operation_by_appledouble_mode() {
+    println!("| mode | create+write+close | open+write+close (existing) | inodes for 200 files |");
+    println!("|---|---|---|---|");
+    for (name, mode) in [
+        ("Translate", AppleDoubleMode::Translate),
+        ("Hide", AppleDoubleMode::Hide),
+        ("Store", AppleDoubleMode::Store),
+    ] {
+        let opts = MountOptions {
+            appledouble: mode,
+            ..MountOptions::default()
+        };
+        let vfs = common::counting::CountingVfs::new();
+        let Some(m) = mounted_vfs(vfs.clone(), opts) else {
+            return;
+        };
+        let root = m.path().to_path_buf();
+        let n = 100u64;
+        for i in 0..n {
+            fs::write(root.join(format!("e{i}")), b"x").unwrap();
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        cowfs_nfs::take_stats();
+        for i in 0..n {
+            fs::write(root.join(format!("c{i}")), vec![1u8; 4096]).unwrap();
+        }
+        let create = total_rpcs(&cowfs_nfs::take_stats());
+        for i in 0..n {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .open(root.join(format!("e{i}")))
+                .unwrap();
+            f.write_all(&[2u8; 4096]).unwrap();
+        }
+        let existing = total_rpcs(&cowfs_nfs::take_stats());
+        println!(
+            "| {name} | {:.1} | {:.1} | {} |",
+            create as f64 / n as f64,
+            existing as f64 / n as f64,
+            vfs.live()
+        );
+        m.finish();
     }
 }

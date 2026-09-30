@@ -6,6 +6,7 @@
 //! never seen the files it times: every timed call is a cold round trip. Timed batches hold the
 //! shared CPU lock (`COWFS_CPU_LOCK`, default the spike lock directory); the lock is never held
 //! across setup. `COWFS_BENCH_REPS` sets the repetitions (default 5, minimum 5 for a report).
+//! `COWFS_BENCH_INLINE=1` turns `inline_metadata` on.
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -175,6 +176,15 @@ fn timed(d: &Dirs) -> [f64; 6] {
     out
 }
 
+fn bench_options() -> MountOptions {
+    let inline = std::env::var("COWFS_BENCH_INLINE").is_ok_and(|v| v == "1");
+    println!("inline_metadata = {inline}");
+    MountOptions {
+        inline_metadata: inline,
+        ..MountOptions::default()
+    }
+}
+
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(f64::total_cmp);
     v[v.len() / 2]
@@ -200,11 +210,7 @@ fn latency_floor_against_native() {
         .tempdir()
         .unwrap();
     let vfs = Arc::new(MemVfs::new());
-    let mount = match Mount::new(
-        vfs.clone(),
-        &mnt_dir.path().join("mnt"),
-        MountOptions::default(),
-    ) {
+    let mount = match Mount::new(vfs.clone(), &mnt_dir.path().join("mnt"), bench_options()) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("SKIP: cannot mount: {e}");

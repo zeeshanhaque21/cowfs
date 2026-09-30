@@ -615,3 +615,49 @@ fn owner_override_applies_to_every_reply() {
     let (_, _, obj, dir) = c.lookup(&root, "f");
     assert_eq!((obj.unwrap().gid, dir.unwrap().uid), (20, 501));
 }
+
+#[test]
+fn failures_still_carry_attributes() {
+    let (_s, mut c) = setup();
+    let root = c.root.clone();
+    let f = c.create_file(&root, "f");
+
+    let (st, mut r) = c.call(6, Args::new().put(&root).put(&0u64).put(&10u32));
+    assert_eq!(st, ISDIR);
+    assert!(attr(dec(&mut r)).is_some(), "READ failure");
+    let (st, mut r) = c.call(5, Args::new().put(&f));
+    assert_eq!(st, INVAL);
+    assert!(attr(dec(&mut r)).is_some(), "READLINK failure");
+    let (st, mut r) = c.call(
+        16,
+        Args::new().put(&f).put(&0u64).put(&[0u8; 8]).put(&4096u32),
+    );
+    assert_eq!(st, NOTDIR);
+    assert!(attr(dec(&mut r)).is_some(), "READDIR failure");
+
+    let wcc_after = |mut r: Rd| -> bool {
+        let w: nfsserve::nfs::wcc_data = dec(&mut r);
+        attr(w.after).is_some() && matches!(w.before, nfsserve::nfs::pre_op_attr::attributes(_))
+    };
+    let (st, r) = c.call(
+        9,
+        Args::new().put(&dirop(&root, "f")).put(&sattr_mode(0o755)),
+    );
+    assert_eq!(st, EXIST);
+    assert!(wcc_after(r), "MKDIR failure");
+    let (st, r) = c.call(12, Args::new().put(&dirop(&root, "missing")));
+    assert_eq!(st, NOENT);
+    assert!(wcc_after(r), "REMOVE failure");
+    let (st, r) = c.call(13, Args::new().put(&dirop(&root, "f")));
+    assert_eq!(st, NOTDIR);
+    assert!(wcc_after(r), "RMDIR failure");
+    let a = Args::new()
+        .put(&root)
+        .put(&0u64)
+        .put(&1u32)
+        .put(&2u32)
+        .put(&b"x".to_vec());
+    let (st, r) = c.call(7, a);
+    assert_eq!(st, ISDIR);
+    assert!(wcc_after(r), "WRITE failure");
+}
