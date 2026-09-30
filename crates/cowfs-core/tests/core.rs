@@ -322,7 +322,7 @@ fn forget_accounting_drains_every_map() {
             c.forget(a.ino, 1);
         }
         c.unlink(d, name.as_bytes()).unwrap();
-        c.forget(a.ino, if i % 3 == 0 { 1 } else { 1 });
+        c.forget(a.ino, 1);
         if i % 10_000 == 9_999 {
             c.flush().unwrap();
         }

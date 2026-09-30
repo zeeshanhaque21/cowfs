@@ -503,10 +503,7 @@ impl World {
                 MOp::Compare(k) => self.compare(*k as usize % self.sides.len(), &what),
                 MOp::Reopen => self.reopen(),
                 _ => {
-                    let i = match op_side(op, self.sides.len()) {
-                        Some(i) => i,
-                        None => 0,
-                    };
+                    let i = op_side(op, self.sides.len()).unwrap_or_default();
                     let s = &mut self.sides[i];
                     let a = apply(&mut s.core, op);
                     let b = apply(&mut s.mem, op);
