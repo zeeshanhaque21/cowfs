@@ -36,13 +36,33 @@ Shared types live in `cowfs-store`:
   Mount adapters that are async (the NFS server) call it from blocking tasks.
 - `Ino` is opaque and unique per live file across the whole mount, including across snapshots.
   Two snapshots that share content must report different inode numbers, or tools such as `find -samefile` and `rsync -H` would treat them as hardlinks.
+- An `Ino` is never reused for a different file within a mount's lifetime.
+  NFS filehandles and kernel dentry caches outlive the file, and a reused number would let a stale handle read another file's bytes (found in the spike 12 critic review).
+  Every `Vfs` implementation must guarantee this, and the conformance suite should check it.
 - The mount root lists the snapshots as directories (`/<snapshot>/`).
   That synthetic layer belongs to `cowfs-core`, not to the adapters.
 - Snapshot creation, removal, garbage collection and fsck are control-plane operations and are not part of `Vfs`.
 - Reads and writes are by inode.
   `open` and `release` exist to pin an inode so that an unlinked file stays usable, and NFS, which is stateless, never needs them.
+- Every `Vfs` method is atomic and safe under arbitrary concurrent calls (linearizable).
+  No layer promises per-inode ordering beyond what the kernel or protocol already imposes: a dependent request is issued only after the reply to the one it depends on.
+  Adapters may overlap independent requests, so an implementation must never depend on an adapter to serialise calls.
 - `readdir` excludes `.` and `..` and uses cookies that stay valid while entries come and go (the spike 2 bug).
 - Every `Vfs` implementation must pass the conformance suite in `cowfs-vfs-test`, and the suite is where POSIX semantics are pinned down.
+
+### Deliberately not in the `Vfs` trait
+
+These were raised as gaps by the adapter builders and judged correct as they are, so they are not to be re-filed:
+
+- `lookup_parent`: both adapters keep their own parent map, because they need the parent after a rename, which a point-in-time query cannot give.
+- `access` and permission enforcement: adapters check mode bits themselves.
+- `uid` and `gid` in `SetAttr`: adding them invites implementers to honour `chown`. It is accepted and ignored.
+- An async trait: the trait is synchronous, and async adapters call it from blocking tasks.
+- `fallocate`, `copy_file_range`, hole queries (`SEEK_HOLE`), `RENAME_EXCHANGE`, special files, `dev` and `rdev`, and locks: adapters answer `ENOTSUP` or let the kernel handle them.
+- Core's hole flag, virtual inode alias table and snapshot rename belong to `cowfs-store`, `cowfs-core` and the control plane, not to `Vfs`.
+
+`Error` and `FileKind` are `#[non_exhaustive]`, so later variants are not breaking changes.
+`readdir_attrs` has a default implementation and can be overridden when attributes are cheap.
 
 ## cowfs-store contract
 

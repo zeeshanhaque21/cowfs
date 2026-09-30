@@ -1,7 +1,13 @@
 use thiserror::Error;
 
 /// Errors a `Vfs` may return. Adapters map them to errno or protocol status codes.
+///
+/// New variants may be added, so match with a wildcard arm. `Io` always maps to `EIO` and
+/// drops the source errno, which is why `NoSpace` is its own variant. `PermissionDenied`
+/// maps to `EACCES`, but linking a directory is `EPERM` on Linux and macOS, so adapters
+/// map that case themselves.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     #[error("no such file or directory")]
     NotFound,
@@ -39,6 +45,8 @@ pub enum Error {
     Corrupt(String),
     #[error("i/o error: {0}")]
     Io(String),
+    #[error("temporarily unavailable, retry")]
+    Retry,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -64,6 +72,7 @@ impl Error {
             Error::ReadOnly => libc::EROFS,
             Error::CrossDevice => libc::EXDEV,
             Error::Corrupt(_) | Error::Io(_) => libc::EIO,
+            Error::Retry => libc::EAGAIN,
         }
     }
 }

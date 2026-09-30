@@ -9,10 +9,13 @@ use cowfs_vfs::{
 
 use crate::pages::{Pages, MAX_FILE, PAGE};
 
+/// Default limit on the number of names of one file or symlink (like ext4's 65000).
+pub const LINK_MAX: u32 = 65_000;
+
 /// Deliberate defects, used only to prove the conformance suite fails when a backend is wrong.
 /// Never enable one outside tests.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fault {
     InodeCookies,
     PositionCookies,
@@ -29,11 +32,120 @@ pub enum Fault {
     ModeNotMasked,
     ReadPadsEof,
     SymlinkSetattrFollows,
+    LinkNoCtime,
+    UnlinkLeaksSpace,
+    TruncateKeepsPages,
+    RenameNonEmptyDirOk,
+    HoleGarbage,
+    ReaddirMax1Skips,
+    ForgetOffByOne,
+    RmdirNoParentNlink,
+    SymlinkSizeChars,
+    CreateModeNotMasked,
+    SetattrModeNotMasked,
+    XattrReplaceIgnored,
+    XattrCreateIgnored,
+    ReadlinkAnyOk,
+    UnlinkedNlinkOne,
+    RenameNewIno,
+    ReadPadsCrossing,
+    ConcurrentCreateRace,
+    WriteNoCtime,
+    BlocksZero,
+    DirNlinkCountsFiles,
+    DirParentStale,
+    RenameDestNoDrop,
+    RenameDirOverDirNlink,
+    ShortWrite,
+    ShortRead32K,
+    LookupNoRef,
+    LinkResurrects,
+    UnlinkGhostEntry,
+    RenameDirZeroesChildren,
+    WriteEnforcesMode,
+    ModeDriftOnWrite,
+    StaleNlinkLookup,
+    HidesDotUnderscore,
+    TruncateNoMtime,
+    SetattrNoCtime,
+    CreateNoParentTimes,
+    BlocksDouble,
+    ReadShort1,
+    XattrRemoveNoop,
+    ReaddirMaxZeroOk,
+    XattrNameUnchecked,
+    InoReuse,
+    ReaddirAttrsNoAttrs,
+}
+
+impl Fault {
+    /// Every fault, so tests can prove each one is expected to be caught.
+    pub const ALL: &[Fault] = &[
+        Fault::InodeCookies,
+        Fault::PositionCookies,
+        Fault::EofOffByOne,
+        Fault::DotEntries,
+        Fault::NoHardlinkNlink,
+        Fault::RenameNoReplace,
+        Fault::LinkReplaces,
+        Fault::NoCtimeUpdate,
+        Fault::WriteNoMtime,
+        Fault::UnlinkFreesOpen,
+        Fault::StaleNeverReclaims,
+        Fault::TruncateNoZeroFill,
+        Fault::ModeNotMasked,
+        Fault::ReadPadsEof,
+        Fault::SymlinkSetattrFollows,
+        Fault::LinkNoCtime,
+        Fault::UnlinkLeaksSpace,
+        Fault::TruncateKeepsPages,
+        Fault::RenameNonEmptyDirOk,
+        Fault::HoleGarbage,
+        Fault::ReaddirMax1Skips,
+        Fault::ForgetOffByOne,
+        Fault::RmdirNoParentNlink,
+        Fault::SymlinkSizeChars,
+        Fault::CreateModeNotMasked,
+        Fault::SetattrModeNotMasked,
+        Fault::XattrReplaceIgnored,
+        Fault::XattrCreateIgnored,
+        Fault::ReadlinkAnyOk,
+        Fault::UnlinkedNlinkOne,
+        Fault::RenameNewIno,
+        Fault::ReadPadsCrossing,
+        Fault::ConcurrentCreateRace,
+        Fault::WriteNoCtime,
+        Fault::BlocksZero,
+        Fault::DirNlinkCountsFiles,
+        Fault::DirParentStale,
+        Fault::RenameDestNoDrop,
+        Fault::RenameDirOverDirNlink,
+        Fault::ShortWrite,
+        Fault::ShortRead32K,
+        Fault::LookupNoRef,
+        Fault::LinkResurrects,
+        Fault::UnlinkGhostEntry,
+        Fault::RenameDirZeroesChildren,
+        Fault::WriteEnforcesMode,
+        Fault::ModeDriftOnWrite,
+        Fault::StaleNlinkLookup,
+        Fault::HidesDotUnderscore,
+        Fault::TruncateNoMtime,
+        Fault::SetattrNoCtime,
+        Fault::CreateNoParentTimes,
+        Fault::BlocksDouble,
+        Fault::ReadShort1,
+        Fault::XattrRemoveNoop,
+        Fault::ReaddirMaxZeroOk,
+        Fault::XattrNameUnchecked,
+        Fault::InoReuse,
+        Fault::ReaddirAttrsNoAttrs,
+    ];
 }
 
 struct Dir {
     entries: BTreeMap<Vec<u8>, (u64, Ino)>,
-    order: BTreeMap<u64, Vec<u8>>,
+    order: BTreeMap<u64, (Vec<u8>, Ino)>,
     next_seq: u64,
     parent: Ino,
 }
@@ -63,6 +175,9 @@ struct State {
     next_handle: u64,
     last: Timestamp,
     fault: Option<Fault>,
+    leak: u64,
+    link_max: u32,
+    freed: Vec<Ino>,
 }
 
 /// In-memory reference implementation of `Vfs`, guarded by one coarse lock.
@@ -86,16 +201,22 @@ impl Default for MemVfs {
 
 impl MemVfs {
     pub fn new() -> Self {
-        Self::build(None)
+        Self::build(None, LINK_MAX)
+    }
+
+    /// A filesystem whose files and symlinks refuse a new name once they have `link_max` names,
+    /// with `Error::TooManyLinks`.
+    pub fn with_link_max(link_max: u32) -> Self {
+        Self::build(None, link_max)
     }
 
     /// A deliberately broken filesystem for mutation checks.
     #[doc(hidden)]
     pub fn with_fault(fault: Fault) -> Self {
-        Self::build(Some(fault))
+        Self::build(Some(fault), LINK_MAX)
     }
 
-    fn build(fault: Option<Fault>) -> Self {
+    fn build(fault: Option<Fault>, link_max: u32) -> Self {
         let mut st = State {
             nodes: HashMap::new(),
             handles: HashMap::new(),
@@ -103,6 +224,9 @@ impl MemVfs {
             next_handle: 1,
             last: Timestamp::default(),
             fault,
+            leak: 0,
+            link_max,
+            freed: Vec::new(),
         };
         let t = st.now();
         st.nodes.insert(
@@ -212,12 +336,30 @@ impl State {
     fn attr(&self, ino: Ino) -> Result<Attr> {
         let n = self.node(ino)?;
         let (size, blocks) = match &n.body {
-            Body::File(p) => (p.size, p.blocks()),
+            Body::File(p) => (
+                p.size,
+                if self.f(Fault::BlocksZero) {
+                    0
+                } else if self.f(Fault::BlocksDouble) {
+                    p.blocks() * 2
+                } else {
+                    p.blocks()
+                },
+            ),
             Body::Dir(_) => (PAGE, PAGE / 512),
-            Body::Symlink { target, .. } => (target.len() as u64, 0),
+            Body::Symlink { target, .. } => (
+                if self.f(Fault::SymlinkSizeChars) {
+                    String::from_utf8_lossy(target).chars().count() as u64
+                } else {
+                    target.len() as u64
+                },
+                0,
+            ),
         };
         let nlink = if self.f(Fault::NoHardlinkNlink) && n.kind() == FileKind::Regular {
             n.nlink.min(1)
+        } else if self.f(Fault::UnlinkedNlinkOne) && n.nlink == 0 && n.kind() == FileKind::Regular {
+            1
         } else {
             n.nlink
         };
@@ -258,14 +400,20 @@ impl State {
                 n.mtime = t;
             }
         }
-        self.bump_ctime(ino, t);
+        if !self.f(Fault::WriteNoCtime) {
+            self.bump_ctime(ino, t);
+        }
     }
 
     fn alloc(&mut self, body: Body, mode: u32, nlink: u32) -> (Ino, Timestamp) {
         let t = self.now();
-        let ino = self.next_ino;
+        let ino = if self.f(Fault::InoReuse) && self.freed.pop().is_some() {
+            self.next_ino - 1
+        } else {
+            self.next_ino
+        };
         self.next_ino += 1;
-        let mode = if self.f(Fault::ModeNotMasked) {
+        let mode = if self.f(Fault::ModeNotMasked) || self.f(Fault::CreateModeNotMasked) {
             mode
         } else {
             mode & MODE_MASK
@@ -279,14 +427,17 @@ impl State {
         let seq = d.next_seq;
         d.next_seq += 1;
         d.entries.insert(name.to_vec(), (seq, ino));
-        d.order.insert(seq, name.to_vec());
+        d.order.insert(seq, (name.to_vec(), ino));
         Ok(())
     }
 
     fn del_entry(&mut self, parent: Ino, name: &[u8]) -> Result<Ino> {
+        let ghost = self.f(Fault::UnlinkGhostEntry);
         let d = self.dir_mut(parent)?;
         let (seq, ino) = d.entries.remove(name).ok_or(Error::NotFound)?;
-        d.order.remove(&seq);
+        if !ghost {
+            d.order.remove(&seq);
+        }
         Ok(ino)
     }
 
@@ -306,10 +457,22 @@ impl State {
             return;
         };
         let pinned = n.opens > 0 || n.lookups > 0;
+        let leak_it = self.f(Fault::UnlinkLeaksSpace);
+        let leaked = if let Body::File(p) = &n.body {
+            p.blocks() / 8
+        } else {
+            0
+        };
         if n.nlink == 0
             && (!pinned || (self.f(Fault::UnlinkFreesOpen) && n.kind() == FileKind::Regular))
         {
+            if leak_it {
+                self.leak += leaked;
+            }
             self.nodes.remove(&ino);
+            if self.f(Fault::InoReuse) {
+                self.freed.push(ino);
+            }
         }
     }
 
@@ -327,8 +490,10 @@ impl State {
         let is_dir = matches!(body, Body::Dir(_));
         let (ino, t) = self.alloc(body, mode, if is_dir { 2 } else { 1 });
         self.add_entry(parent, name, ino)?;
-        self.touch_dir(parent, t);
-        if is_dir {
+        if !self.f(Fault::CreateNoParentTimes) {
+            self.touch_dir(parent, t);
+        }
+        if is_dir || self.f(Fault::DirNlinkCountsFiles) {
             self.node_mut(parent)?.nlink += 1;
         }
         self.handed_out(ino)
