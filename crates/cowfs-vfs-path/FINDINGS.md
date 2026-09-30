@@ -1,146 +1,211 @@
 # cowfs-vfs-path findings (#34)
 
-`PathVfs` runs the conformance suite (114 checks, heavy ones included) on native filesystems as a control and through the mounted FUSE and NFS adapters.
-Nothing here is a claim from reading code: every cell below is from a run whose log was read.
+`PathVfs` runs the conformance suite on native filesystems as a control and through the mounted FUSE and NFS adapters.
+Round 2 uses the revised suite (127 checks, levels Posix, Portable, Cowfs) merged from `v1/vfs-test` at 83b9a57.
+Every number below is from a run whose log was read.
 Suite and adapter sources were not touched.
+Single run per environment, except where a repeat count is given.
 
 ## Environments
 
-| name | what | adapter source |
+| name | what | source |
 |---|---|---|
-| APFS | Mac data volume (macOS 26), `$TMPDIR` | - |
-| APFS-cs | 4 GiB sparse image, `Case-sensitive APFS`, detached afterwards | - |
+| APFS | Mac data volume, default case-insensitive | - |
+| APFS-cs | 4 GiB sparse image, `Case-sensitive APFS` (detached afterwards) | - |
 | btrfs | OrbStack VM `cowfs-spike3`, VM root | - |
 | ext4 | same VM, 3 GiB loop-mounted ext4 image | - |
-| FUSE | same VM, `cowfs-fuse` (origin/v1/11-fuse 5a42c12) serving a `MemVfs`, `PathVfs` rooted in the mount | v1/11-fuse |
-| NFS | Mac, `cowfs-nfs` (origin/v1/12-nfs e93a3d4) serving a `MemVfs`, default `actimeo=120` | v1/12-nfs |
-| NFS-a0 | same with `actimeo=0` | v1/12-nfs |
+| FUSE | same VM, `cowfs-fuse` (origin/v1/11-fuse 5a42c12) over a `MemVfs`, `PathVfs` rooted in the mount | scratch copy |
+| NFS mount | Mac, `cowfs-nfs` (origin/v1/12-nfs 4fa0086) over a `MemVfs`, default options, `PathVfs` rooted in the mount | scratch copy |
+| NFS raw | same server, no mount: the suite drives it through the raw NFSv3 RPC client of `cowfs-nfs/tests` wrapped as a `Vfs` (`NfsVfs`, scratch test, no xattr procedures because NFSv3 has none) | scratch copy |
 
-Both adapters were built in scratch copies under `spikes/nfs-loopback/out/pathvfs/`, with the current `cowfs-vfs-test` copied over their older one.
+The scratch copies live under `spikes/nfs-loopback/out/pathvfs/` with the current `cowfs-vfs-test` copied over their older one.
 No adapter branch was modified.
-Single run per environment, except the torn-read check (10 repeated runs, see below).
 
-## Matrix
+## Posix level (56 checks)
 
-Only checks that fail somewhere are listed.
-75 checks pass everywhere.
-Class codes: S = the suite assumes something the filesystem does not do, Q = real quirk of that filesystem, N = behaviour of the macOS NFS client as seen by any program on the mount, PV = PathVfs bug (fixed, none open).
+| environment | ran | failed |
+|---|---|---|
+| APFS | 56 | 0 |
+| APFS-cs | 56 | 0 |
+| btrfs | 56 | 0 |
+| ext4 | 56 | 0 |
+| FUSE mount | 56 | 0 |
+| NFS mount | 56 | 10 |
+| NFS raw, default (`AppleDoubleMode::Translate`) | 56 | 1 |
+| NFS raw, `AppleDoubleMode::Store` | 56 | 0 |
 
-| check | APFS | APFS-cs | btrfs | ext4 | FUSE | NFS | NFS-a0 | class and evidence |
-|---|---|---|---|---|---|---|---|---|
-| `basic::root_is_directory` | ok | ok | FAIL | ok | ok | ok | ok | S: suite pins directory nlink = 2 + subdirs; btrfs reports 1 for every directory |
-| `basic::new_file_attrs` | ok | ok | FAIL | ok | ok | ok | ok | S: same directory nlink assumption (btrfs) |
-| `basic::dir_nlink_counts_subdirs` | FAIL | FAIL | FAIL | ok | ok | ok | ok | S: APFS counts every child in a directory nlink (got 5, want 3); btrfs always 1; ext4 matches the suite |
-| `basic::statfs_sane` | ok | ok | FAIL | ok | ok | FAIL | FAIL | btrfs: S (statfs reports files=0, files_free cannot drop). NFS: UNEXPLAINED - fails in both full runs, passes alone with actimeo=0 |
-| `io::sparse_write_far_past_eof` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N, plausibly client (st_blocks = ceil(size/512) for sparse files, probe2); adapter sends used=blocks*512 (convert.rs:37) so NOT confirmed |
-| `io::write_updates_mtime_and_ctime` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N (write-back: mtime unchanged after pwrite until fsync/close, probe3) |
-| `attrs::setattr_bumps_ctime` | FAIL | FAIL | ok | ok | ok | ok | ok | Q: APFS does not bump ctime when only atime is set (utimensat, mtime omitted) |
-| `attrs::namespace_ops_update_times` | ok | ok | ok | ok | ok | FAIL | ok | NFS: N (client attribute cache, passes with actimeo=0) |
-| `names::non_utf8_names` | FAIL | FAIL | ok | ok | ok | ok | ok | Q: APFS rejects non-UTF-8 names (EILSEQ) |
-| `names::names_are_exact_bytes` | FAIL | FAIL | ok | ok | ok | ok | ok | Q: APFS treats NFC and NFD names as one name (EEXIST); also on the case-sensitive volume |
-| `dirs::mkdir_rmdir_errors` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename (an unlinked file that is still open stays as .nfs* and blocks rmdir) |
-| `dirs::rmdir_updates_parent` | FAIL | FAIL | FAIL | ok | ok | FAIL | FAIL | APFS/btrfs: S (directory nlink). NFS: N (fstat of a removed directory through a held fd fails, probe8) |
-| `dirs::deeply_nested_directories` | FAIL | FAIL | FAIL | ok | ok | ok | ok | S: directory nlink (APFS, btrfs) |
-| `readdir::readdir_delete_returned_entries_between_pages` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename leaves .nfs* entries that are listed and never removed by the suite |
-| `readdir::readdir_delete_upcoming_entries_between_pages` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename (.nfs* entries in the listing) |
-| `readdir::readdir_delete_everything_between_pages` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename (.nfs* entries in the listing) |
-| `rename::rename_file_over_file` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename of the replaced file (nlink stays 1) |
-| `rename::rename_dir_over_empty_dir` | FAIL | FAIL | FAIL | ok | ok | FAIL | FAIL | APFS/btrfs: S (directory nlink). NFS: N (replaced directory has no attributes any more: Stale, or a cached nlink 2) |
-| `rename::rename_dir_cross_directory_fixes_nlink` | FAIL | FAIL | FAIL | ok | ok | ok | ok | S: directory nlink (APFS, btrfs) |
-| `rename::rename_no_replace` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N (macOS NFS client returns ENOTSUP for renamex_np RENAME_EXCL even onto a missing name, probe7b) |
-| `rename::rename_open_file_keeps_handle_working` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename |
-| `rename::rename_updates_times` | ok | ok | ok | ok | ok | FAIL | ok | NFS: N (client attribute cache, passes with actimeo=0) |
-| `links::hardlink_nlink_counts_names` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename |
-| `links::hardlink_unlink_one_other_survives` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename |
-| `links::hardlink_across_directories` | FAIL | FAIL | FAIL | ok | ok | FAIL | FAIL | APFS/btrfs: S (directory nlink). NFS: N silly rename (rmdir of a directory holding .nfs*) |
-| `links::hardlink_to_directory_is_denied` | ok | ok | FAIL | ok | ok | ok | ok | btrfs: S (directory nlink) |
-| `links::hardlink_pairs_8000_listed_once_and_removed` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename (24000 entries removed, 16000 expected); with actimeo=0 it exceeds the 300 s runner timeout instead |
-| `lifecycle::unlink_while_open_keeps_data` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename (nlink 1 instead of 0) |
-| `lifecycle::unlink_while_open_reclaimed_after_release_and_forget` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename |
-| `lifecycle::forget_keeps_inode_with_handle` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: N silly rename |
-| `lifecycle::rmdir_reclaimed_after_forget` | FAIL | FAIL | ok | ok | ok | FAIL | FAIL | APFS: Q (removed directory keeps nlink 2). NFS: N (no attributes for a removed directory) |
-| `symlinks::symlink_size_is_target_length` | FAIL | FAIL | ok | ok | ok | FAIL | FAIL | S: suite uses a 4095 byte target, macOS caps symlink targets at 1024 (APFS, NFS adapter SYMLINK_TARGET_MAX = 1024, adapter.rs:24) |
-| `xattrs::xattr_set_get_list_remove` | FAIL | FAIL | ok | ok | ok | FAIL | FAIL | Q: macOS adds com.apple.provenance to new files (bytes decode to that name), APFS and NFS |
-| `xattrs::xattr_empty_and_large_values` | FAIL | FAIL | FAIL | FAIL | ok | FAIL | FAIL | macOS: Q com.apple.provenance in listxattr. btrfs/ext4: S (a 60,000 byte value gives ENOSPC; ext4 keeps xattrs in one block) |
-| `xattrs::xattr_list_order_is_stable` | FAIL | FAIL | ok | ok | ok | FAIL | FAIL | Q: com.apple.provenance (got 11 names, want 10) |
-| `xattrs::xattr_on_directory_and_symlink` | ok | ok | FAIL | FAIL | FAIL | ok | ok | S: Linux refuses user.* xattrs on symlinks (EPERM); FUSE fails in the kernel before the adapter sees it |
-| `xattrs::xattr_shared_by_hardlinks` | ok | ok | ok | ok | ok | ok | FAIL | NFS-a0 only: UNEXPLAINED (NoAttr through the second name); suspect per-name AppleDouble sidecars, NOT checked |
-| `concurrency::concurrent_readers_and_writers_of_one_file` | ok | ok | FAIL | ok | FAIL | ok | ok | S: Linux buffered read and write are not atomic per 4 KiB block; native btrfs and ext4 fail 6 of 10 repeated runs |
-| `concurrency::concurrent_rename_unlink_lookup` | FAIL | FAIL | FAIL | ok | ok | ok | ok | S: directory nlink (APFS, btrfs) |
+No check tagged Posix fails on a native filesystem.
+The level holds on APFS, btrfs and ext4 as far as one run each shows.
 
-|  | APFS | APFS-cs | btrfs | ext4 | FUSE | NFS | NFS-a0 |
-|---|---|---|---|---|---|---|---|
-| passed | 99 | 99 | 100 | 112 | 112 | 88 | 89 |
-| failed | 15 | 15 | 14 | 2 | 2 | 26 | 25 |
+NFS mount, the 10 Posix failures, all macOS client behaviour and none an adapter defect on the evidence here:
+- Silly rename (an unlinked file that is still open stays as `.nfs.<id>` until closed, and `rmdir` of its directory is ENOTEMPTY): `mkdir_rmdir_errors`, `readdir_delete_returned_entries_between_pages`, `readdir_delete_upcoming_entries_between_pages`, `readdir_delete_everything_between_pages`, `rename_file_over_file`, `lookup_nlink_is_fresh`, `hardlink_unlink_one_other_survives`, `hardlink_across_directories`, `hardlink_pairs_8000_listed_once_and_removed`.
+  The same 9 pass over the raw protocol, which holds no descriptors.
+- `appledouble_names_are_ordinary`: the adapter's default `Translate` mode makes `._x` names invisible on purpose.
+  It fails over the raw protocol in that mode and passes in `Store` mode.
+  This is a documented adapter mode that contradicts a Posix check, so either the check needs a Cowfs tag or the default is wrong for a generic tree.
+  That is the suite and NFS owners' call.
 
-## Adapter bugs
+## Full level (127 checks, heavy included)
 
-None confirmed.
+Counts are from the full runs, taken before the two `PathVfs` fixes of round 2.
+After them `readdir_max_zero_is_invalid` passes on APFS, btrfs, ext4, FUSE and NFS mount (re-run, one check each), which removes one failure from each of those.
+`xattr_name_validation` still fails on all of them except FUSE.
+APFS-cs and NFS raw were not re-run after the fixes.
 
-FUSE: every check that fails through the mount also fails on native Linux (`xattr_on_directory_and_symlink` on all three, `concurrent_readers_and_writers_of_one_file` on btrfs and, intermittently, ext4).
-FUSE passes `xattr_empty_and_large_values` and the directory nlink checks that btrfs fails, because `MemVfs` is more permissive than btrfs.
-That is a property of the backing `MemVfs`, not a defect.
+| environment | passed | failed |
+|---|---|---|
+| APFS | 109 | 18 |
+| APFS-cs | 109 | 18 |
+| btrfs | 110 | 17 |
+| ext4 | 122 | 5 |
+| FUSE | 124 | 3 |
+| NFS mount | 95 | 32 |
+| NFS raw | 105 | 22 |
 
-NFS: 18 checks pass on APFS and fail through the mount.
-For 16 of them (12 silly rename, 1 RENAME_EXCL, 1 write mtime, 2 attribute cache) a plain program with no `PathVfs` sees the same behaviour on the mount (probe scripts and logs `nfs-probe*.log`, `apfs-probe*.log` in the out directory).
-The other 2 are listed as unexplained below.
-The probes show the mount's behaviour, not whether the adapter or the client causes it; for silly rename and the attribute cache that is well known NFS client behaviour, for the rest it is not separated.
-- Silly rename: an open file that is unlinked stays in its directory as `.nfs.<id>.<n>` until closed, then vanishes; `rmdir` of a directory holding one is ENOTEMPTY.
-  `PathVfs` must hold a descriptor across an unlink to keep the inode usable, as the trait requires, so every unlink-while-referenced check trips it.
-  Checks: `mkdir_rmdir_errors`, `readdir_delete_*` (3), `rename_file_over_file`, `rename_open_file_keeps_handle_working`, `hardlink_nlink_counts_names`, `hardlink_unlink_one_other_survives`, `hardlink_across_directories`, `hardlink_pairs_8000_...`, `unlink_while_open_*` (2), `forget_keeps_inode_with_handle`.
-- `renamex_np(RENAME_EXCL)` returns ENOTSUP on the mount even onto a missing name, and EEXIST onto an existing one (`rename_no_replace`).
-- `pwrite` without close does not move mtime until `fsync` (`write_updates_mtime_and_ctime`).
-- A directory that was removed while a descriptor is held answers ENOENT to `fstat` (`rmdir_updates_parent`, `rmdir_reclaimed_after_forget`, `rename_dir_over_empty_dir`).
-- Attribute cache: `namespace_ops_update_times` and `rename_updates_times` pass with `actimeo=0`.
+Failing checks only.
+The 50 rows below leave out `readdir_max_zero_is_invalid`, fixed in `PathVfs` and re-run green where it failed.
+Class codes: S = the suite assumes something the filesystem does not do, Q = a real quirk of that filesystem, N = behaviour of the macOS NFS client, PV = `PathVfs` bug (none open).
 
-Consequence: through NFS with `PathVfs` as the client, the whole "unlink while open / forget / rmdir while referenced" area cannot be judged.
-Those checks say nothing about the adapter until a client that does not hold descriptors (a raw NFSv3 RPC client, as in `cowfs-nfs/tests/common`) runs them.
-That was not done here.
+| level | check | APFS | APFS-cs | btrfs | ext4 | FUSE | NFS mount | NFS raw | class and evidence |
+|---|---|---|---|---|---|---|---|---|---|
+| cowfs | `basic::root_is_directory` | ok | ok | FAIL | ok | ok | ok | ok | S: directory nlink formula (btrfs = 1) |
+| cowfs | `basic::new_file_attrs` | ok | ok | FAIL | ok | ok | ok | ok | S: directory nlink formula (btrfs) |
+| cowfs | `basic::dir_nlink_counts_subdirs` | FAIL | FAIL | FAIL | ok | ok | ok | ok | S: directory nlink (APFS = 2 + all children, btrfs = 1) |
+| portable | `basic::statfs_sane` | ok | ok | FAIL | ok | ok | FAIL | ok | btrfs: S, `files` is 0. NFS mount: N, client caches statfs (probe4); NFS raw passes |
+| cowfs | `basic::statfs_free_after_unlink` | FAIL | FAIL | FAIL | ok | ok | FAIL | ok | S: APFS and btrfs free counts do not move on unlink at once. NFS mount: N (client statfs cache) |
+| portable | `io::sparse_write_far_past_eof` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N. Raw GETATTR `used` is 4096 for a 1 GiB hole, so the adapter is right and the macOS client reports st_blocks = ceil(size/512) |
+| portable | `io::write_updates_mtime_and_ctime` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N, client write-back leaves mtime until fsync or close |
+| portable | `attrs::setattr_bumps_ctime` | FAIL | FAIL | ok | ok | ok | ok | ok | Q: APFS does not bump ctime for an atime-only utimensat |
+| portable | `attrs::namespace_ops_update_times` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N, client attribute cache (passes with actimeo=0) |
+| cowfs | `names::validate_name_cases` | ok | ok | ok | ok | ok | ok | FAIL | NFS raw: my NfsVfs maps NFS3ERR_EXIST for "." to Exists; the adapter does that on purpose (adapter.rs new_name). Not a bug |
+| cowfs | `names::non_utf8_names` | FAIL | FAIL | ok | ok | ok | ok | ok | Q: APFS rejects invalid UTF-8 (EILSEQ) |
+| cowfs | `names::names_are_exact_bytes` | FAIL | FAIL | ok | ok | ok | ok | ok | Q: APFS treats NFC and NFD as one name |
+| cowfs | `names::invalid_names_rejected_by_creating_ops` | ok | ok | ok | ok | ok | ok | FAIL | NFS raw: same as validate_name_cases |
+| posix | `names::appledouble_names_are_ordinary` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: adapter default `AppleDoubleMode::Translate` makes `._x` names invisible. Passes in Store mode (raw run, 56/56 Posix). Documented adapter behaviour that contradicts a Posix check |
+| posix | `dirs::mkdir_rmdir_errors` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N silly rename (`.nfs*` blocks rmdir) |
+| cowfs | `dirs::rmdir_updates_parent` | FAIL | FAIL | FAIL | ok | ok | FAIL | FAIL | S: directory nlink (APFS, btrfs). NFS: getattr of a removed directory is STALE/ENOENT by protocol |
+| cowfs | `dirs::deeply_nested_directories` | FAIL | FAIL | FAIL | ok | ok | ok | ok | S: directory nlink (APFS, btrfs) |
+| cowfs | `dirs::create_in_removed_directory_fails` | ok | ok | ok | ok | ok | ok | FAIL | NFS raw: server answers STALE for a removed directory handle (RFC 1813), suite wants NotFound. Protocol-correct |
+| posix | `readdir::readdir_delete_returned_entries_between_pages` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N silly rename |
+| posix | `readdir::readdir_delete_upcoming_entries_between_pages` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N silly rename |
+| posix | `readdir::readdir_delete_everything_between_pages` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N silly rename |
+| posix | `rename::rename_file_over_file` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N silly rename of the replaced file |
+| cowfs | `rename::rename_dir_over_empty_dir` | FAIL | FAIL | FAIL | ok | ok | FAIL | FAIL | S: directory nlink (APFS, btrfs). NFS: replaced directory is STALE or cached |
+| cowfs | `rename::rename_dir_cross_directory_fixes_nlink` | FAIL | FAIL | FAIL | ok | ok | ok | ok | S: directory nlink (APFS, btrfs) |
+| cowfs | `rename::rename_dir_across_parents_keeps_parent_links` | ok | ok | FAIL | ok | ok | ok | ok | S: directory nlink (btrfs) |
+| portable | `rename::rename_no_replace` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N, macOS client returns ENOTSUP for RENAME_EXCL onto a missing name |
+| cowfs | `rename::rename_open_file_keeps_handle_working` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: needs an open handle, which NFSv3 does not have (mount: silly rename, raw: STALE) |
+| portable | `rename::rename_updates_times` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N, client attribute cache |
+| cowfs | `links::hardlink_nlink_counts_names` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: needs unlink-while-open (see rename_open_file...) |
+| posix | `links::lookup_nlink_is_fresh` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N silly rename keeps a name |
+| posix | `links::hardlink_unlink_one_other_survives` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N silly rename |
+| posix | `links::hardlink_across_directories` | ok | ok | ok | ok | ok | FAIL | ok | APFS/btrfs pass now; NFS mount: N silly rename |
+| posix | `links::hardlink_pairs_8000_listed_once_and_removed` | ok | ok | ok | ok | ok | FAIL | ok | NFS mount: N silly rename (24000 removals, 16000 expected) |
+| cowfs | `links::hardlink_limit_reports_too_many_links` | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | ok | S: native limits (ext4 65000 links) cannot be reached inside the 60 s timeout, leaked thread on every native run. NFS mount: EMLINK reached after 540 s |
+| cowfs | `lifecycle::unlink_while_open_keeps_data` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: needs unlink-while-open (mount: silly rename, raw: STALE, NFSv3 is stateless) |
+| cowfs | `lifecycle::unlink_while_open_reclaimed_after_release_and_forget` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: same |
+| cowfs | `lifecycle::forget_keeps_inode_with_handle` | ok | ok | ok | ok | ok | FAIL | FAIL | NFS: same |
+| cowfs | `lifecycle::rmdir_reclaimed_after_forget` | FAIL | FAIL | ok | ok | ok | FAIL | FAIL | APFS: Q, removed directory keeps nlink 2. NFS: no attributes for a removed directory (STALE/ENOENT) |
+| cowfs | `lifecycle::two_handles_pin_until_last_release` | ok | ok | ok | ok | ok | ok | FAIL | NFS raw: no handles in NFSv3, `open` cannot pin |
+| portable | `symlinks::symlink_size_is_target_length` | FAIL | FAIL | ok | ok | ok | FAIL | FAIL | S: 4095 byte target, macOS limit 1024 (adapter SYMLINK_TARGET_MAX = 1024 too) |
+| portable | `xattrs::xattr_set_get_list_remove` | FAIL | FAIL | ok | ok | ok | FAIL | FAIL | Q: macOS adds com.apple.provenance to new files. NFS raw: my NfsVfs has no xattr procedures |
+| portable | `xattrs::xattr_create_and_replace_flags` | ok | ok | ok | ok | ok | ok | FAIL | NFS raw: no xattr procedures in NFSv3 |
+| portable | `xattrs::xattr_missing_is_no_attr` | ok | ok | ok | ok | ok | ok | FAIL | NFS raw: no xattr procedures in NFSv3 |
+| cowfs | `xattrs::xattr_empty_and_large_values` | FAIL | FAIL | FAIL | FAIL | ok | FAIL | FAIL | S: 60,000 bytes is ENOSPC on ext4 and btrfs; macOS: com.apple.provenance in the list |
+| portable | `xattrs::xattr_list_order_is_stable` | FAIL | FAIL | ok | ok | ok | FAIL | FAIL | Q: com.apple.provenance (11 names, want 10) |
+| cowfs | `xattrs::xattr_on_directory_and_symlink` | ok | ok | FAIL | FAIL | FAIL | ok | FAIL | S: Linux refuses user.* xattrs on symlinks (EPERM); FUSE fails in the kernel |
+| portable | `xattrs::xattr_shared_by_hardlinks` | ok | ok | ok | ok | ok | ok | FAIL | NFS raw: no xattr procedures in NFSv3 |
+| cowfs | `xattrs::xattr_name_validation` | FAIL | FAIL | FAIL | FAIL | ok | FAIL | FAIL | S: a 255 byte name without a namespace prefix is ENOTSUP on Linux (probable cause, the failing step is the max-length setxattr; not isolated); macOS: com.apple.provenance in the list after the rejected calls |
+| portable | `concurrency::concurrent_readers_and_writers_of_one_file` | ok | ok | FAIL | ok | ok | ok | ok | S: torn reads on native Linux at 512 and 4096 bytes (torn-probe.log), never on APFS |
+| cowfs | `concurrency::concurrent_rename_unlink_lookup` | FAIL | FAIL | FAIL | ok | ok | ok | ok | S: directory nlink (APFS, btrfs) |
 
-Not explained, so not classified:
-- `statfs_sane` on NFS: fails in both full runs, passes alone with `actimeo=0` (`nfs-iso-statfs_sane.log`).
-  Suspect: deferred deletion of the previous check's files on the mount changes free-inode counts mid-check.
-  Not verified.
-- `sparse_write_far_past_eof` on NFS: `st_blocks` is `ceil(size/512)` even for a hole (`nfs-probe2.log`: 2049 blocks for a 1 MiB sparse file, 8 on APFS), and it fails in isolation too.
-  `convert.rs:37` sends `used = blocks * 512`, so the client may ignore `used`, or the adapter may not send it.
-  Only a raw GETATTR on the wire settles it.
-- `xattr_shared_by_hardlinks` on NFS-a0 only: NoAttr through the second name.
-  Passes on the default NFS run, so it may be flaky.
-- `rename_dir_over_empty_dir` on NFS: the failure is `nlink 2, want 0` on the default run and `Stale` on NFS-a0, so it depends on attribute caching.
+## Suite levels to change (the list for the suite builder)
 
-Watch item for the NFS adapter: `.nfs.*` entries appear in listings.
-The adapter hides `._*` sidecars but not these.
-Whether that matters to users is the NFS agent's call.
+No Posix-tagged check fails natively.
+These non-Posix checks fail natively and their level is doubtful:
 
-## Suite bugs and wrong assumptions
+1. `concurrency::concurrent_readers_and_writers_of_one_file` is Portable.
+   It fails on native ext4 and btrfs (6 of 10 repeated runs each) and never on APFS.
+   The check uses 4096 byte, 4096 aligned reads and writes, so cross-page tearing is not the cause.
+   `torn-probe.log` (3 writers, 3 readers, one file, 3 s per size, page size 4096):
+   ext4 torn 0 of 1.1M reads at 8 bytes, 1 of 1.1M at 64, 191 of 818k at 512, 139 of 280k at 4096.
+   btrfs 0, 2 of 1.2M, 297 of 816k, 96 of 317k.
+   tmpfs 0, 0, 8 of 898k, 25 of 315k.
+   APFS 0 at every size (about 300k to 470k reads each).
+   The honest guarantee: POSIX text says a read is atomic against a concurrent write, Linux buffered I/O does not provide that for reads that overlap a write of 512 bytes or more, even within one page.
+   Only very small (8 to 64 byte) accesses were not torn in about a million reads each.
+   Proposed level: Cowfs.
+2. `basic::statfs_sane` is Portable and fails on btrfs, which reports `files` 0 so `files_free` cannot drop.
+   Proposed: tolerate `files == 0`, or Cowfs.
+3. `xattrs::xattr_set_get_list_remove` and `xattr_list_order_is_stable` are Portable and fail on macOS because the OS adds `com.apple.provenance` to new files.
+   Proposed: ignore `com.apple.*` names in those two assertions, or Cowfs.
+4. `attrs::setattr_bumps_ctime` is Portable and fails on APFS, which does not bump ctime for an atime-only `utimensat`.
+   Proposed: Cowfs, or assert the bump only when mtime or mode changes.
+5. `symlinks::symlink_size_is_target_length` is Portable and fails on APFS with a 4095 byte target (limit 1024).
+   The level text already says so, so it is properly leveled, but a variant with targets up to 1000 bytes would be Posix.
+6. `xattrs::xattr_name_validation` is Cowfs and fails natively: the last step sets a 255 byte name without a namespace prefix.
+   Probe (`xattr-name-probe.log`) on ext4 and btrfs: 255 bytes with no prefix is ENOTSUP, `user.` plus 250 bytes (255 total) works, `user.` plus 251 bytes is ERANGE.
+   The cowfs contract says 1 to `NAME_MAX` bytes; a native filesystem also needs a namespace.
+   Level is right, the check will only pass on backends that accept bare names.
+7. `links::hardlink_limit_reports_too_many_links` is Cowfs and hangs on every native run past the 60 s timeout (a leaked thread in each of four runs).
+   On ext4 the limit is 65000 links.
+   Through the NFS mount it reached EMLINK after 540 s.
+   Level is right, but the timeout and the run cost need a look.
+8. `basic::statfs_free_after_unlink` is Cowfs and fails on APFS and btrfs, whose free counts do not move at once.
+   Level is right.
 
-None of these is fixed here (the suite is not ours to edit).
+Properly leveled Cowfs, confirmed failing natively for the known reasons: every directory `nlink` check, `xattr_on_directory_and_symlink` (Linux refuses `user.*` on symlinks), `xattr_empty_and_large_values` (60,000 bytes is ENOSPC on ext4 and btrfs), `non_utf8_names` and `names_are_exact_bytes` (APFS), `rmdir_reclaimed_after_forget` (APFS keeps nlink 2 on a removed directory).
 
-1. Directory `nlink`.
-   The suite pins `2 + subdirectories`.
-   ext4 matches.
-   btrfs reports 1 for every directory.
-   APFS reports 2 + all children (a directory with one subdirectory, one file and one symlink: got 5, want 3).
-   POSIX does not define directory `nlink`.
-   Affects 10 checks on btrfs and 8 on APFS.
-   Suggest a suite option to skip directory nlink, or check only that it is at least 2 on ext4-like backends.
-2. `xattr_on_directory_and_symlink`: Linux forbids `user.*` xattrs on symlinks (EPERM).
-3. `xattr_empty_and_large_values`: a 60,000 byte value gives ENOSPC on ext4 and btrfs.
-   The suite says larger values are backend defined, but 60,000 is inside what it requires.
-4. `concurrent_readers_and_writers_of_one_file`: Linux buffered I/O does not make a read atomic against a write of the same page.
-   Repeated 10 times on native ext4: 4 pass, 6 fail; native btrfs: 4 pass, 6 fail (`vm-torn.sh`).
-   XFS-style atomicity is not something Linux promises in general.
-5. `symlink_size_is_target_length`: a 4095 byte target is over the macOS limit of 1024.
-6. `statfs_sane`: assumes `files_free` drops when a file is created; btrfs reports `files = 0`.
-7. macOS: `com.apple.provenance` is added to new files, so "a new file has no attributes" and exact `listxattr` comparisons fail on any macOS filesystem.
-8. `setattr_bumps_ctime`: APFS does not bump ctime for an atime-only `utimensat`.
-9. The runner drops a check's `Vfs` on its own thread after the result is out, so a backend whose drop deletes files races the next check's `statfs`.
-   Handled in the test harness here by waiting for cleanup.
+## Adapter findings
 
-APFS-cs: the 15 failures are identical to the default volume.
-No failing check is explained by case sensitivity.
-`names_are_exact_bytes` fails on APFS-cs because NFC and NFD names alias (probe).
-On the default (case-insensitive) volume it may fail earlier on `a`/`A`; the log message is the same ("file exists"), so which name aliased there was not checked.
+### Bug: the duplicate request cache ignores the connection
+
+Reproducer (scratch test `drc_two_connections.rs`, raw protocol, no mount, output read):
+1. Connection A sends CREATE `x` with xid 5, then REMOVE `x` with xid 6.
+2. Connection B, same client IP, sends the identical CREATE `x` bytes with xid 5.
+3. B is told status 0 (success) and `x` does not exist: LOOKUP `x` returns NOENT.
+
+The cache in `nfsserve/src/reply_cache.rs` is keyed by client address, xid and a hash of the call, not by connection, so a second connection replays the first one's cached reply and the call is never executed.
+Real clients pick xids per connection, so collisions are unlikely with the macOS client, but two clients on one host (or a client that restarts its xid counter) are exposed, and a non-idempotent call silently does nothing.
+Evidence at suite level: with every pooled connection starting at xid 1 the concurrent suite checks (`concurrent_creates_in_one_directory`, `concurrent_rename_unlink_lookup`) hang and panic; with distinct xid bases they pass (12.5 s and 2.6 s).
+Suspected cause: the key should include the connection (peer port or a connection id).
+
+### Protocol level: the checks silly rename made unjudgeable
+
+Over the raw NFSv3 protocol, with no client holding a descriptor, all 9 silly-rename Posix failures pass: `mkdir_rmdir_errors`, the three `readdir_delete_*`, `rename_file_over_file`, `lookup_nlink_is_fresh`, `hardlink_unlink_one_other_survives`, `hardlink_across_directories`, `hardlink_pairs_8000_listed_once_and_removed`.
+So the adapter's unlink, rename, rmdir, readdir cookie and nlink behaviour is correct at the protocol level for those.
+The Cowfs `lifecycle` checks that need an open handle (`unlink_while_open_keeps_data`, `unlink_while_open_reclaimed_after_release_and_forget`, `forget_keeps_inode_with_handle`, `two_handles_pin_until_last_release`, `rename_open_file_keeps_handle_working`, `hardlink_nlink_counts_names`) fail raw with `Stale` after the last name is removed.
+That is expected: NFSv3 is stateless, a handle of a removed file is STALE (RFC 1813), and `NfsVfs::open` cannot pin anything.
+They cannot be judged over NFSv3 at all, so they say nothing about the adapter.
+`create_in_removed_directory_fails` and `rmdir_updates_parent` fail raw for the same reason (STALE where the suite wants NotFound or attributes).
+`validate_name_cases` and `invalid_names_rejected_by_creating_ops` fail raw because the adapter answers EXIST for `.` on purpose (`adapter.rs new_name`); my `NfsVfs` maps that to `Exists`.
+The xattr and `symlink_size_is_target_length` failures are NFSv3 limits (no xattr procedures) and the adapter's 1024 byte symlink cap.
+
+### Sparse-file blocks (client, not adapter)
+
+Raw GETATTR (`nfs-raw-getattr.log`): `used` is 4096 for a 1 MiB and for a 1 GiB sparse file, 1048576 for a dense 1 MiB file, 0 for an empty one.
+So the adapter reports the right allocation.
+Through the mount `st_blocks` is `ceil(size/512)` (2049 for the 1 MiB hole, 2097153 for the 1 GiB hole), so the macOS client ignores `used`.
+`sparse_write_far_past_eof` on the NFS mount is client behaviour (class N).
+
+### statfs flake (client cache)
+
+`statfs_sane` and `statfs_free_after_unlink` fail on the NFS mount and pass over the raw protocol.
+`probe4` on the mount: a statfs read directly after a 1 MiB write, with no delay, shows no change in free blocks or free inodes.
+After 0.2 s or more it does.
+The macOS client caches `statfs` for a short time, so a check that measures right after the write sees the old numbers.
+Earlier round-1 runs passed `statfs_sane` alone and failed it in full runs, which fits a timing race with the previous check's deferred cleanup rather than an adapter fault.
+Class N.
+
+### Not an adapter fault, listed for completeness
+
+- `rename_no_replace` on the mount: the macOS client returns ENOTSUP for `RENAME_EXCL` even onto a missing name; the raw protocol passes.
+- `write_updates_mtime_and_ctime`, `namespace_ops_update_times`, `rename_updates_times`: client write-back and attribute cache (the last two pass with `actimeo=0`; the first does not, because the mtime stays until `fsync` or close).
+
+### Left unexplained
+
+- `xattr_shared_by_hardlinks` failed once in a round-1 run with `actimeo=0` (NoAttr through the second name) and passed in every other run, including round 2. Not reproduced, cause unknown.
+- `rename_dir_over_empty_dir` on the NFS mount failed with `nlink 2, want 0` in one run and `Stale` in another, so it depends on attribute caching; not pinned down further.
 
 ## PathVfs bugs the runs found (all fixed, all with tests where a filesystem is not needed)
 
@@ -149,6 +214,8 @@ On the default (case-insensitive) volume it may fail earlier on `a`/`A`; the log
 - `statfs` on macOS used `fstatvfs`, whose 32-bit block counts wrap on a large volume (NFS run: "blocks is 0"); it uses `fstatfs` now.
 - Linux build warning: unreachable pattern `ENOTSUP | EOPNOTSUPP`.
 - Test harness: the next check started while the previous check's tree was still being deleted.
+- Round 2: `readdir` with `max` 0 succeeded (contract: `InvalidArgument`), fixed and re-run green on APFS, btrfs, ext4, FUSE and NFS mount.
+- Round 2: `setxattr` did not validate names (empty, NUL, over 255 bytes) before the filesystem saw them. Fixed. `xattr_name_validation` still fails natively for another reason, see the matrix.
 
 ## Known gaps in PathVfs
 
@@ -161,7 +228,7 @@ On the default (case-insensitive) volume it may fail earlier on `a`/`A`; the log
 
 ## Reproducing
 
-Native, from the repo root (add `COWFS_CONFORMANCE_HEAVY=1` for the 50,000 entry and 8 MiB checks):
+Native, from the repo root (add `COWFS_CONFORMANCE_HEAVY=1` for the 50,000 entry and 8 MiB checks, `COWFS_CONFORMANCE_LEVEL=posix|portable|cowfs` to select a level):
 
 ```text
 COWFS_PATHVFS_NATIVE_DIR=/some/dir cargo test -p cowfs-vfs-path --test native -j4 -- --ignored --nocapture
