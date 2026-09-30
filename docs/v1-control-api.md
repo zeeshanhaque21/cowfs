@@ -412,9 +412,9 @@ Within major version 1:
 | Code | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | The daemon returned an error, or another failure, including a failed write to stdout. |
+| 1 | The daemon returned an error, or another failure, including a failed write to stdout, and a socket path that exists but is not a socket or cannot be reached (the message names the path). |
 | 2 | Usage error (bad arguments, a socket path too long, a path that is not UTF-8). |
-| 3 | The daemon is not running (no socket, or connection refused). |
+| 3 | The daemon is not running: the socket path does not exist, or it is a socket that refuses connections (stale). |
 | 4 | The daemon did not answer within `--timeout`. |
 | 130 | Interrupted. |
 

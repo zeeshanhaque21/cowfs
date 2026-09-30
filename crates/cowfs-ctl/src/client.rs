@@ -5,6 +5,7 @@ use crate::frame::{
 };
 use crate::types::{ProgressEvent, Request, Response};
 use std::io::{self, BufReader, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +100,19 @@ fn connect_once(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     }
 }
 
+// Linux answers a connect to a regular file with ECONNREFUSED and macOS with ENOTSOCK. "No
+// daemon" is decided from the path instead: missing, or a socket nobody listens on.
+fn classify(path: &Path, source: io::Error) -> io::Error {
+    if source.kind() == io::ErrorKind::ConnectionRefused {
+        if let Ok(md) = std::fs::symlink_metadata(path) {
+            if !md.file_type().is_socket() {
+                return io::Error::other("exists and is not a socket");
+            }
+        }
+    }
+    source
+}
+
 // A full listen backlog can look like a refusal, so a refusal is retried briefly before it
 // is believed.
 fn connect(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
@@ -155,7 +169,7 @@ impl Client {
         let stream =
             connect(path, opts.connect_timeout).map_err(|source| ClientError::Connect {
                 path: path.to_owned(),
-                source,
+                source: classify(path, source),
             })?;
         stream.set_read_timeout(Some(POLL))?;
         stream.set_write_timeout(Some(opts.idle_timeout.max(Duration::from_secs(1))))?;

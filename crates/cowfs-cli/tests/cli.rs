@@ -653,6 +653,28 @@ fn errors_name_the_socket_path() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains(file.to_str().unwrap()));
 
+    let under_file = file.join("c.sock");
+    let out = Command::new(BIN)
+        .arg("--socket")
+        .arg(&under_file)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a parent that is a file is an error, not no-daemon"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains(under_file.to_str().unwrap()));
+
+    let out = Command::new(BIN)
+        .arg("--socket")
+        .arg(dir.path().join("absent.sock"))
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "a missing socket is no daemon");
+
     let long = dir.path().join("x".repeat(200)).join("c.sock");
     let out = Command::new(BIN)
         .arg("--socket")
