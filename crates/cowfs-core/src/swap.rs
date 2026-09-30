@@ -122,9 +122,6 @@ impl Core {
             ));
         }
         let src_sc = self.inner.snap_by_name(src)?;
-        if self.inner.snap_by_name(new).is_ok() {
-            return Err(ControlError::Exists);
-        }
         if !replace {
             self.inner.check_new_name(new)?;
         }

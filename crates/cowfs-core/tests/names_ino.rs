@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use cowfs_core::{name_key, validate_snapshot_name, ControlError, Core};
-use cowfs_vfs::{Error, Vfs, ROOT_INO};
+use cowfs_vfs::{Error, Vfs};
 
 /// F4: a number handed out in one session is never handed out in the next, so a stale NFS
 /// file handle gets `Stale` and never another file's bytes.

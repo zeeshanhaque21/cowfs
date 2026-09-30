@@ -140,7 +140,7 @@ fn a_damaged_chunk_found_by_a_truncate_poisons_only_that_file() {
     .unwrap();
     c.create_snapshot("s").unwrap();
     let r = root_entry(&c, "s").ino;
-    let f = mkfile(&c, r, "f", &pattern(600_000, 7)).ino;
+    let f = mkfile(&c, r, "f", &pattern(600_000, 7));
     let g = mkfile(&c, r, "g", b"other").ino;
     c.sync().unwrap();
     drop(c);

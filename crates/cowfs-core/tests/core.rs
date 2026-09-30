@@ -78,7 +78,6 @@ fn snapshot_name_rules() {
         "main",
         "with space",
         "日本",
-        ".hidden",
         "a.b",
         "x".repeat(255).as_str(),
     ] {
@@ -88,6 +87,8 @@ fn snapshot_name_rules() {
         "",
         ".",
         "..",
+        ".hidden",
+        ".git",
         "a/b",
         "a\0b",
         "._x",

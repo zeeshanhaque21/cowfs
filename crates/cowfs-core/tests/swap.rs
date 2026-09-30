@@ -27,6 +27,13 @@ fn content(c: &Core, snap: &str, name: &str) -> String {
     String::from_utf8(read_all(&fs, a.ino)).expect("utf8")
 }
 
+fn damage(dir: &std::path::Path) {
+    let pack = one_pack(dir);
+    let mut bytes = std::fs::read(&pack).unwrap();
+    bytes[16 + 52 + 70_000] ^= 0x55;
+    std::fs::write(&pack, &bytes).unwrap();
+}
+
 fn one_pack(dir: &std::path::Path) -> std::path::PathBuf {
     let mut v: Vec<_> = std::fs::read_dir(dir.join("store/packs"))
         .unwrap()
@@ -105,9 +112,11 @@ fn promote_base_survives_a_failure_at_every_step() {
     }
 }
 
-/// F2 with the critic's repro: a corrupt block makes the flush inside the swap fail.
+/// The critic's a3 repro, after F3: the write over the damage is EIO at once, so the queue never
+/// carries it, and a promote of a snapshot with one damaged file succeeds (the damaged file keeps
+/// its last committed content in the new snapshot).
 #[test]
-fn promote_base_keeps_the_old_base_when_the_store_is_damaged() {
+fn a_damaged_block_does_not_stop_a_promote() {
     let dir = tempfile::tempdir().unwrap();
     let c = Core::open(dir.path(), test_opts()).unwrap();
     c.create_snapshot("base").unwrap();
@@ -116,32 +125,32 @@ fn promote_base_keeps_the_old_base_when_the_store_is_damaged() {
     c.create_snapshot("src").unwrap();
     let rs = root_entry(&c, "src").ino;
     let big = mkfile(&c, rs, "big", &pattern(600_000, 7));
+    let small = mkfile(&c, rs, "small", b"intact");
     c.sync().unwrap();
     c.drop_caches();
-    let pack = one_pack(dir.path());
-    let mut bytes = std::fs::read(&pack).unwrap();
-    bytes[16 + 52 + 70_000] ^= 0x55;
-    std::fs::write(&pack, &bytes).unwrap();
-    let _ = c.write(big.ino, 70_000, b"over the damage");
-    match c.promote_base("src", "base") {
-        Err(ControlError::Fs(Error::Corrupt(_))) | Err(ControlError::Fs(Error::Io(_))) => {}
-        other => panic!("expected a store error, got {other:?}"),
-    }
-    assert_eq!(
-        content(&c, "base", "f"),
-        "old base",
-        "the old base was lost"
-    );
+    damage(dir.path());
+    assert!(matches!(
+        c.write(big.ino, 70_000, b"over"),
+        Err(Error::Corrupt(_))
+    ));
+    let e = c
+        .promote_base("src", "base")
+        .expect("the swap is not blocked by one damaged file");
+    assert_eq!(e.name, "base");
+    let r2 = root_entry(&c, "base").ino;
+    assert_eq!(read_all(&c, c.lookup(r2, b"small").unwrap().ino), b"intact");
+    assert!(matches!(
+        c.read(c.lookup(r2, b"big").unwrap().ino, 60_000, 40_000),
+        Err(Error::Corrupt(_))
+    ));
+    let _ = small;
+    c.check().unwrap();
     drop(c);
-    if let Ok(c) = Core::open(dir.path(), test_opts()) {
-        assert!(!c.store().recovery().has_corruption());
-        let fs = c.snapshot_view("src").unwrap();
-        let a = fs.lookup(ROOT_INO, b"big").unwrap();
-        assert!(
-            matches!(fs.read(a.ino, 60_000, 40_000), Err(Error::Corrupt(_))),
-            "a damaged chunk was served"
-        );
-    }
+    // the metadata is intact and the damaged chunk is still never served
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    let r3 = root_entry(&c, "base").ino;
+    assert_eq!(read_all(&c, c.lookup(r3, b"small").unwrap().ino), b"intact");
+    c.check().unwrap();
 }
 
 /// F2: a rename that fails leaves both names as they were, and one that succeeds changes no
