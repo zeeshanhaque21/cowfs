@@ -49,10 +49,10 @@
         {
           "id": "6",
           "title": "#6 artifact byte-identity across slots at different paths",
-          "state": "running",
+          "state": "done",
           "issue": 6,
-          "owner": "subagent",
-          "detail": "Native builds at different absolute paths, with and without path remapping, dedup measured with the spike 1 tool. Partial prior evidence: a copied warm base at a new path was Fresh (#2). Running."
+          "owner": "lead",
+          "detail": "Independent debug slots cost 12.8%-28% of slot 1 after dedup, 1.8% release. Remapping or CARGO_INCREMENTAL=0 brings it under 3%. Clone-seeded plus one edit: 8.8%-10.3%. Slot-specific remap makes a copied target dirty. Mount namespaces (#17) not needed for dedup on these crates. Two small crates, one run per cell. docs/spikes/6-artifact-byte-identity.md"
         },
         {
           "id": "18",
