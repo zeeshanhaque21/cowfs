@@ -448,18 +448,18 @@ Machine: Apple M3 Max, APFS, shared with about 20 other sessions, load1 between 
 |---|---|
 | `cargo test -p cowfs-core --test conformance` | 132 passed, 0 failed, 2 ignored (heavy) |
 | `COWFS_CONFORMANCE_HEAVY=1 cargo test -p cowfs-core --test conformance -- --ignored` | 2 passed (`roundtrip_8_mib`, `readdir_50000_entries`) |
-| `cargo test -p cowfs-core` (whole crate, after the meta, store, vfs-test and vfs merges) | 0 failed, 413 s |
+| `cargo test -p cowfs-core` (whole crate, after the meta, store, vfs-test and vfs merges) | 0 failed, 413 s (657 s inside the workspace run) |
 | `COWFS_CRASH_SEEDS=3 COWFS_CRASH_OPS=120 cargo test -p cowfs-core --test crash` | 280 crash images over 3 workloads, 0 failures; negative control fails as required |
-| `COWFS_KILL_ROUNDS=120 cargo test -p cowfs-core --test kill9` | 120 rounds, 7,849 steps completed, 7,400 fsynced steps, 0 failures, 0 rounds killed before the first step |
+| `COWFS_KILL_ROUNDS=120 cargo test -p cowfs-core --test kill9` | 120 rounds, 10,675 steps completed, 10,205 fsynced steps, 0 failures, 0 rounds killed before the first step |
 | `PROPTEST_CASES=300 cargo test -p cowfs-core --test model` | 2 tests, 300 cases each, 0 failures |
-| `FSX_OPS=100000 FSX_SEED=1 cargo test -p cowfs-core --release --test critic -- --ignored fsx` | 100,000 ops, 0 mismatches, 406 s |
-| `FSX_OPS=100000 FSX_SEED=2 cargo test -p cowfs-core --release --test critic -- --ignored fsx` | 100,000 ops, 0 mismatches, 439 s |
-| `HAMMER_SECS=180 cargo test -p cowfs-core --release --test critic -- --ignored hammer` | 180 s, 98,360 overlapping writes, 0 torn blocks, same content after a reopen |
-| `cargo test -p cowfs-core --release --test critic -- --ignored barrier_storm` | 2,000 create-then-list cycles in 2.39 s (1.2 ms per barrier), 2,000 batches |
-| `N_FILES=500000 cargo test -p cowfs-core --release --test critic -- --ignored many_files` | 500,000 files in 38.9 s, 131 nodes, 130 aliases, 192,600 dentries (bounded by the cache), 0 pending |
+| `FSX_OPS=100000 FSX_SEED=1 cargo test -p cowfs-core --release --test critic -- --ignored fsx` | 100,000 ops, 0 mismatches, 457 s |
+| `FSX_OPS=100000 FSX_SEED=2 cargo test -p cowfs-core --release --test critic -- --ignored fsx` | 100,000 ops, 0 mismatches, 358 s |
+| `HAMMER_SECS=180 cargo test -p cowfs-core --release --test critic -- --ignored hammer` | 180 s, 124,542 overlapping writes, 0 torn blocks, same content after a reopen |
+| `cargo test -p cowfs-core --release --test critic -- --ignored barrier_storm` | 2,000 create-then-list cycles in 0.77 s (0.38 ms per barrier), 2,000 batches |
+| `N_FILES=500000 cargo test -p cowfs-core --release --test critic -- --ignored many_files` | 500,000 files in 44.8 s, 131 nodes, 130 aliases, 180,300 dentries (bounded by the cache), 0 pending |
 | `LOCK_STRESS_SECS=60 cargo test -p cowfs-core --test locks -- mixed` | 60 s of 12 concurrent threads, no deadlock, `check()` clean, `fsck` clean |
 | `python3 scripts/mutants.py` (14 mutants, per-mutant `CARGO_TARGET_DIR`) | 14 killed, 0 survivors (`target/benchout/mutants-after-critic-fixes.out`) |
-| full verification command (fmt, clippy -D warnings, `cargo test --workspace`, `cargo doc`) after the last meta merge | exit 0; 386 s wall including a build, at load1 46 to 85 |
+| full verification command (fmt, clippy -D warnings, `cargo test --workspace`, `cargo doc`) after the store, meta, vfs-test and vfs merges | exit 0; 657 s wall at load1 32 to 56 |
 
 The two mutants the first round of this review survived are now killed: `m01` (the store sync hook not wired in the production path) by `crash.rs`, which now goes through `Core::open_with_meta` so the wiring is in production code, and `m05` (a read-modify-write that drops the last byte) by the new real-chunk-boundary test in `chunks.rs`.
 
@@ -520,7 +520,7 @@ What they show and do not show:
 | `aliases_drain_for_committed_files_with_no_references`, 20,000 creates | 1 alias, 2 nodes, 3,617 dentries; RSS growth from 5,000 to 20,000 files 1.4 KiB per file |
 | same, 500,000 creates (`ALIAS_FILES=500000`) | 130 aliases, 131 nodes, RSS growth from 5,000 to 500,000 files 122 bytes per file; the residue is redb mapping a growing database file (967 bytes per file measured on `cowfs-meta` alone), not a per-file map |
 | `reader_stall_during_a_slow_write`: a 1 GiB write in flight (52.3 s of storing) while another file is stat'd, looked up and read, release | getattr p50 2.4 us, max 8.0 ms; lookup p50 4.0 us, max 8.9 ms; read p50 6.4 us, max 14.9 ms |
-| `barrier_storm`: 2,000 create-then-list cycles | 2.39 s total, 1.2 ms per barrier |
+| `barrier_storm`: 2,000 create-then-list cycles | 0.77 s total, 0.38 ms per barrier (release); 2.39 s in an earlier run at load 120 |
 
 The cold-read profile (`sample`, 26 windows of 2 s over a `core_bench --only seq` run at load1 86 to 98, 116,023 samples) splits the busy time as roughly 51 percent kernel write and read syscalls, 31 percent the benchmark's own data generator, 11 percent BLAKE3 over all samples and 6 percent `memcpy`; the windows that land entirely in the read are 84 to 87 percent `memcpy`.
 So the read path's cost here is copying, not hashing, and the obvious cheap win is one copy too many (store decompression into the block cache, then the cache into the caller's buffer) rather than anything about the hash.
