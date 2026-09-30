@@ -511,7 +511,7 @@ fn pick(t: &MTree, i: usize) -> u64 {
 }
 
 fn pick_dir(t: &MTree, i: usize) -> u64 {
-    if i % 16 == 0 {
+    if i.is_multiple_of(16) {
         return pick(t, i / 16);
     }
     let dirs: Vec<u64> = t
