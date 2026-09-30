@@ -96,7 +96,7 @@ pub type mode3 = u32;
 pub type count3 = u32;
 
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum nfsstat3 {
     /// Indicates the call completed successfully.
@@ -198,7 +198,7 @@ xdr_enum_serde!(nfsstat3);
 
 /// File Type
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, Default, FromPrimitive, ToPrimitive)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum ftype3 {
     /// Regular File
@@ -220,7 +220,7 @@ pub enum ftype3 {
 xdr_enum_serde!(ftype3);
 /// Device Number information. Ex: Major / Minor device
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct specdata3 {
     pub specdata1: u32,
@@ -243,7 +243,7 @@ impl Default for nfs_fh3 {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct nfstime3 {
     pub seconds: u32,
@@ -252,7 +252,7 @@ pub struct nfstime3 {
 xdr_struct!(nfstime3, seconds, nseconds);
 
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct fattr3 {
     pub ftype: ftype3,
     pub mode: mode3,
