@@ -2,8 +2,8 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{PoisonError, RwLock};
@@ -264,10 +264,6 @@ pub(crate) fn save(
     let crc = crc32c::crc32c(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
 
-    let tmp = store.join(format!("{FILE_NAME}.tmp"));
-    let mut f = File::create(&tmp)?;
-    f.write_all(&buf)?;
-    io.sync_file(&f, &tmp)?;
-    io.rename(&tmp, &store.join(FILE_NAME))?;
-    io.sync_dir(store)
+    io.log_whole(store, FILE_NAME, &buf);
+    io.write_whole(store, FILE_NAME, &buf)
 }

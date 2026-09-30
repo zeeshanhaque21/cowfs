@@ -365,3 +365,82 @@ Machine load average was 84 to 117 at the start and 49 to 118 at the end, so eve
 
 Verify-on-dedup costs nothing measurable: the first duplicate pass after a reopen reads and compares every stored block, and runs at the same speed as the old trust-the-index path, because that pass is bound by chunking and hashing.
 Single-thread verified read moved from 612 to 525 MiB/s, which is inside the load noise of these runs but is not proven to be noise.
+
+## Round 2: measured results
+
+### Simulated power loss
+
+The harness (`tests/round2.rs`, `power_loss_orderings`, ported from the critic) runs a random put, sync and checkpoint history, copies the files, then damages the copy the way a crash can: the active pack is cut at a random length at or after the watermark, random 512 byte or 4096 byte sectors past the watermark are zeroed or filled with junk, and the watermark file is left alone, has its newest slot torn, or has both slots torn.
+It then opens the copy, checks that every acknowledged block reads back with the right bytes, writes five more blocks, syncs, checkpoints, reopens, and requires a clean report.
+`COWFS_POWERLOSS_SEEDS=400` gives the full 1800 cases.
+The default is 60 seeds (270 cases).
+
+| Code | Cases | Acked blocks lost | Wrong bytes served | Reported corruption after one more sync |
+|---|---|---|---|---|
+| Before (85727dc, critic's run) | 1800 | 0 | 0 | 271, about 15% (watermark intact or newest slot torn: 113 of 1600; both slots torn: 158 of 200) |
+| After | 1800 | 0 | 0 | 0 |
+
+With both watermark slots torn, open cannot tell a torn tail from corruption, so it reports the damage once (`watermark_missing` and `has_corruption()`), cuts the tail into a sidecar, rewrites the watermark, and the next open is clean.
+That happened in 158 of the 200 such cases and in none of the 1600 cases where at least one slot survived.
+The first mark of a store is written into both slots, so a single torn write cannot destroy it.
+
+### Full-size pack
+
+`examples/big_pack.rs`: one 256 MiB pack of 4096 incompressible 64 KiB blocks, release build, machine load 15 to 35.
+
+| Case | Open time | Readable | Expected lost | Wrongly lost |
+|---|---|---|---|---|
+| Clean, index loaded | 1 ms | 4096 | 0 | 0 |
+| Clean, index deleted (full rebuild, every block hash-verified) | 227 ms | 4096 | 0 | 0 |
+| 1 MiB zeroed at offset 1 MiB | 238 ms | 4079 | 17 | 0 |
+| 2 bytes flipped in each of the first 1100 records | 311 ms | 2996 | 1100 | 0 |
+| 2 bytes flipped in each of the first 3000 records | 342 ms | 1096 | 3000 | 0 |
+| 2 bytes flipped in every other record | 1.11 s | 2048 | 2048 | 0 |
+
+Before, the second case lost all 4095 blocks, about 3000 of them valid, to the 64 MiB resync budget.
+A 4 MiB flood of fake headers opens in well under a second, and a flood of headers that pass their own CRC is bounded by the payload cap (tests `f3_fake_header_flood_opens_quickly` and `a_flood_of_forged_headers_with_valid_checksums_opens_fast`).
+
+### Throughput before and after round 2
+
+Commit 85727dc against this code, same data as above, n=5 per row.
+The machine is shared and other sessions moved the load between runs, so the figures are not precise.
+
+| Metric, MiB/s | Before, pass 1 (load 35 to 16) | After, pass 1 | Before, pass 2 (load 56 to 65) | After, pass 2 | Before, pass 3 (load 64 to 71) | After, pass 3 |
+|---|---|---|---|---|---|---|
+| Chunk plus hash, 1 thread | 945 | 946 | 720 | 650 | 718 | 488 |
+| Ingest plus sync, 1 thread | 287 | 191 | 34 | 36 | 98 | 49 |
+| Ingest plus sync, 8 threads | 1108 | 1016 | 165 | 109 | 82 | 191 |
+| Verified read, 1 thread | 771 | 521 | 364 | 372 | 249 | 479 |
+| Verified read, 8 threads | 4305 | 3106 | 1988 | 2558 | 764 | 2458 |
+| Re-ingest of duplicates, 1 thread, warm session | 1004 | 745 | 586 | 550 | 443 | 735 |
+| Re-ingest of duplicates, 1 thread, first pass after reopen | 1065 | 783 | 280 | 288 | 251 | 550 |
+
+Only pass 1 ran on a moderately quiet machine, and it shows the new code 25 to 35% slower on single-thread ingest, verified read and duplicate re-ingest.
+Passes 2 and 3 show no consistent direction.
+So a real slowdown on those paths is neither proven nor ruled out.
+The changes on those paths are small (two CRC32C calls over 48 bytes per record, one more field in the index entry), and the clean pass was the first run of the session, which also favours the first binary.
+A quiet-machine A/B was not possible.
+
+### Verify-on-dedup with a cold cache
+
+Not measured.
+Purging the OS page cache needs root, and a file set larger than this Mac's 128 GiB of RAM is not practical.
+The in-cache cost is the row "first pass after reopen" above: the first duplicate `put` of each block per session reads the stored record and compares it, and that pass ran at 250 to 1065 MiB/s in the three passes, compared with 443 to 1004 for the warm-session pass.
+With a cold cache the first pass after every reopen costs one full sequential read of the stored bytes of every block that is deduplicated, so it is bound by the disk read speed, not by the hash.
+
+### Mutation testing
+
+`tests/mutate.py` applies 50 textual mutations one at a time to a scratch copy, runs the store suite with a separate `CARGO_TARGET_DIR` per mutant, and records `target/mut/results.txt`.
+Results on the final code: 48 mutants killed, 2 survived (W7 and H5 after the reruns that followed the first pass).
+Survivors:
+
+- W7 (the `durable` helper returns 0 instead of `u64::MAX` for sealed packs): equivalent.
+  The value is only used for the last pack, so it has no observable effect.
+- H5 (`get` skips the index length range check): equivalent.
+  A loaded index is validated at open, and `put` only writes correct lengths, so no entry reaches `get` with an out-of-range length.
+  It stays as a second line of defence.
+
+The earlier labels N17, N18, N19 and N22 were from round 1 on commit 85727dc: N17 is the padding check (now H2), N18 is the decoded-length check at `record.rs:128`, `Ok(v) if v.len() == header.ulen as usize => Ok(v)` replaced by `Ok(v) => Ok(v)` (now H3), N19 is `if !locate_ok(&loc)` at `store.rs:499` in `get` replaced by `if false` (now H5), and N22 is the `header.id != id || header.slen != loc.slen || header.ulen != loc.ulen` check at `store.rs:515` replaced by `if false` (now H4).
+
+A known gap that no mutant can show: a sealed pack that is cut short at a record boundary is only noticed through the index checkpoint, because nothing else records a sealed pack's length.
+Without the index, open sees a shorter but well-formed pack.

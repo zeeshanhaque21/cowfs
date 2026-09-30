@@ -47,6 +47,7 @@ fn decode(b: &[u8]) -> Option<(u64, Mark, u32)> {
 }
 
 pub(crate) struct Wm {
+    io: Io,
     file: File,
     path: PathBuf,
     seq: u64,
@@ -89,6 +90,7 @@ impl Wm {
             .filter_map(|s| decode(s))
             .max_by_key(|(seq, _, _)| *seq);
         Ok(Wm {
+            io: io.clone(),
             file,
             path,
             seq: best.map_or(0, |(s, _, _)| s),
@@ -108,28 +110,33 @@ impl Wm {
 
     /// Record `mark` durably. The caller must already have fsynced the data it describes.
     /// A mark that is not above the current one is ignored.
-    pub(crate) fn advance(&mut self, io: &Io, mark: Mark) -> io::Result<()> {
+    pub(crate) fn advance(&mut self, mark: Mark) -> io::Result<()> {
         if self.mark.is_some_and(|m| m >= mark) {
             return Ok(());
         }
-        self.write(io, mark, self.base)
+        self.write(mark, self.base)
     }
 
     /// First mark of a store. Writes two slots so tearing the newest one still leaves a valid mark.
-    pub(crate) fn init(&mut self, io: &Io, mark: Mark) -> io::Result<()> {
-        self.write(io, mark, self.base)?;
-        self.write(io, mark, self.base)
+    pub(crate) fn init(&mut self, mark: Mark) -> io::Result<()> {
+        self.write(mark, self.base)?;
+        self.write(mark, self.base)
     }
 
     /// Set the mark and base unconditionally, even downward. Used to accept a reported loss.
-    pub(crate) fn reset(&mut self, io: &Io, mark: Mark, base: u32) -> io::Result<()> {
-        self.write(io, mark, base)
+    pub(crate) fn reset(&mut self, mark: Mark, base: u32) -> io::Result<()> {
+        self.write(mark, base)
     }
 
-    fn write(&mut self, io: &Io, mark: Mark, base: u32) -> io::Result<()> {
+    fn write(&mut self, mark: Mark, base: u32) -> io::Result<()> {
+        let io = self.io.clone();
         let seq = self.seq + 1;
-        self.file
-            .write_all_at(&encode(seq, mark, base), (seq % 2) * SLOT as u64)?;
+        self.io.write_at(
+            &self.file,
+            &self.path,
+            (seq % 2) * SLOT as u64,
+            &encode(seq, mark, base),
+        )?;
         io.sync_file(&self.file, &self.path)?;
         self.seq = seq;
         self.mark = Some(mark);
@@ -154,7 +161,7 @@ mod tests {
         let mut wm = Wm::open(&io, dir.path()).unwrap();
         assert_eq!(wm.mark(), None);
         for len in [16, 20, 30] {
-            wm.advance(&io, Mark { pack: 0, len }).unwrap();
+            wm.advance(Mark { pack: 0, len }).unwrap();
         }
         let s = slots(&dir.path().join(FILE_NAME));
         assert_eq!(s.len(), 2, "two slots at two offsets");
@@ -168,8 +175,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let io = Io::new(None, true);
         let mut wm = Wm::open(&io, dir.path()).unwrap();
-        wm.advance(&io, Mark { pack: 0, len: 16 }).unwrap();
-        wm.advance(&io, Mark { pack: 0, len: 99 }).unwrap();
+        wm.advance(Mark { pack: 0, len: 16 }).unwrap();
+        wm.advance(Mark { pack: 0, len: 99 }).unwrap();
         drop(wm);
         let path = dir.path().join(FILE_NAME);
         let mut b = std::fs::read(&path).unwrap();
@@ -185,14 +192,36 @@ mod tests {
     }
 
     #[test]
+    fn the_first_mark_is_written_twice_so_tearing_the_newest_slot_leaves_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Io::new(None, true);
+        let mut wm = Wm::open(&io, dir.path()).unwrap();
+        wm.init(Mark { pack: 0, len: 16 }).unwrap();
+        drop(wm);
+        let path = dir.path().join(FILE_NAME);
+        let mut b = std::fs::read(&path).unwrap();
+        let newest = slots(&path)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|s| (s.0, i)))
+            .max()
+            .unwrap()
+            .1;
+        b[newest * SLOT + 16] ^= 0xff;
+        std::fs::write(&path, &b).unwrap();
+        let wm = Wm::open(&io, dir.path()).unwrap();
+        assert_eq!(wm.mark(), Some(Mark { pack: 0, len: 16 }));
+    }
+
+    #[test]
     fn advance_never_regresses_but_reset_does() {
         let dir = tempfile::tempdir().unwrap();
         let io = Io::new(None, true);
         let mut wm = Wm::open(&io, dir.path()).unwrap();
-        wm.advance(&io, Mark { pack: 3, len: 50 }).unwrap();
-        wm.advance(&io, Mark { pack: 2, len: 90 }).unwrap();
+        wm.advance(Mark { pack: 3, len: 50 }).unwrap();
+        wm.advance(Mark { pack: 2, len: 90 }).unwrap();
         assert_eq!(wm.mark(), Some(Mark { pack: 3, len: 50 }));
-        wm.reset(&io, Mark { pack: 1, len: 20 }, 1).unwrap();
+        wm.reset(Mark { pack: 1, len: 20 }, 1).unwrap();
         drop(wm);
         let wm = Wm::open(&io, dir.path()).unwrap();
         assert_eq!((wm.mark(), wm.base()), (Some(Mark { pack: 1, len: 20 }), 1));

@@ -116,16 +116,19 @@ fn checkpoint_orders_pack_watermark_index_rename_dir() {
     s.put(b"hello").unwrap();
     take(&t);
     s.checkpoint().unwrap();
-    assert_eq!(
-        take(&t),
-        vec![
+    let ops = take(&t);
+    assert_in_order(
+        &ops,
+        &[
             sync(P0),
             sync("SYNCED"),
+            create("index.cix.tmp"),
             sync("index.cix.tmp"),
             Op::Rename("index.cix.tmp".into(), "index.cix".into()),
             dir_sync(&name(dir.path())),
-        ]
+        ],
     );
+    assert_eq!(ops.last(), Some(&dir_sync(&name(dir.path()))), "{ops:?}");
 }
 
 #[test]
