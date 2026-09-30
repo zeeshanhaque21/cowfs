@@ -86,7 +86,6 @@ pub struct Adapter {
     opts: AdapterOptions,
     generation: u64,
     parents: Mutex<HashMap<Ino, Ino>>,
-    refs: Mutex<HashMap<Ino, u64>>,
 }
 
 impl std::fmt::Debug for Adapter {
@@ -108,7 +107,6 @@ impl Adapter {
             opts,
             generation,
             parents: Mutex::new(HashMap::new()),
-            refs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -125,9 +123,11 @@ impl Adapter {
         f
     }
 
-    /// Records a reference handed to the client, and the parent of a directory.
+    /// Notes the parent of a directory just handed to the client and gives back the `Vfs`
+    /// reference the call took. The adapter pins nothing: NFS handles are stateless, and pinned
+    /// references would keep removed inodes alive (and blocked from garbage collection).
     fn handed_out(&self, parent: Option<Ino>, a: &Attr) {
-        *lock(&self.refs).entry(a.ino).or_insert(0) += 1;
+        self.vfs.forget(a.ino, 1);
         if let (Some(p), FileKind::Directory) = (parent, a.kind) {
             lock(&self.parents).insert(a.ino, p);
         }
@@ -140,13 +140,9 @@ impl Adapter {
         Ok(a)
     }
 
-    /// Drops the references held for an inode whose last name was just removed.
+    /// Forgets what the adapter knows about an inode whose last name was just removed.
     fn reap(&self, ino: Ino) {
-        let n = lock(&self.refs).remove(&ino).unwrap_or(0);
         lock(&self.parents).remove(&ino);
-        if n > 0 {
-            self.vfs.forget(ino, n);
-        }
     }
 
     fn parent_of(&self, dir: Ino) -> NfsResult<Ino> {

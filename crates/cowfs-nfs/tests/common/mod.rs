@@ -1,5 +1,7 @@
 //! A tiny NFSv3 client over raw RPC frames, enough to drive the server in-process.
 #![allow(dead_code)]
+pub mod counting;
+
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
