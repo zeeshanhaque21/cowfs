@@ -202,7 +202,7 @@ impl Adapter {
         Ok((!sc.is_empty()).then(|| sc.encode()))
     }
 
-    fn side_attr(&self, t: &Attr, size: usize) -> fattr3 {
+    fn side_attr(&self, t: &Attr, size: usize) -> NfsResult<fattr3> {
         let size = size as u64;
         self.fa(&Attr {
             ino: t.ino | SIDE_BIT,
@@ -264,12 +264,12 @@ impl Adapter {
     pub(crate) fn side_lookup(&self, dir: Ino, name: &[u8]) -> NfsResult<(fileid3, fattr3)> {
         let t = self.side_target(dir, name)?;
         let bytes = self.side_bytes(&t)?.ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        Ok((t.ino | SIDE_BIT, self.side_attr(&t, bytes.len())))
+        Ok((t.ino | SIDE_BIT, self.side_attr(&t, bytes.len())?))
     }
 
     pub(crate) fn side_getattr(&self, id: fileid3) -> NfsResult<fattr3> {
         let (t, bytes) = self.side_file(id & !SIDE_BIT)?;
-        Ok(self.side_attr(&t, bytes.len()))
+        self.side_attr(&t, bytes.len())
     }
 
     pub(crate) fn side_read(
@@ -314,7 +314,7 @@ impl Adapter {
         }
         let cur = self.side_store(&t, buf)?;
         let n = u32::try_from(data.len()).unwrap_or(u32::MAX);
-        Ok((n, self.side_attr(&cur, cur.size as usize)))
+        Ok((n, self.side_attr(&cur, cur.size as usize)?))
     }
 
     /// SETATTR on a sidecar: only the size matters, mode and times are accepted and ignored.
@@ -327,7 +327,7 @@ impl Adapter {
         let (t, mut buf) = self.side_file(id & !SIDE_BIT)?;
         let changes: SetAttr = set_attr(s);
         let Some(size) = changes.size else {
-            return Ok(self.side_attr(&t, buf.len()));
+            return self.side_attr(&t, buf.len());
         };
         let size = usize::try_from(size)
             .ok()
@@ -335,7 +335,7 @@ impl Adapter {
             .ok_or(nfsstat3::NFS3ERR_FBIG)?;
         buf.resize(size, 0);
         let cur = self.side_store(&t, buf)?;
-        Ok(self.side_attr(&cur, cur.size as usize))
+        self.side_attr(&cur, cur.size as usize)
     }
 
     /// CREATE of `._name`: the sidecar exists from now on, empty if it had no attributes.
@@ -357,7 +357,7 @@ impl Adapter {
                 0
             }
         };
-        Ok((t.ino | SIDE_BIT, self.side_attr(&t, len)))
+        Ok((t.ino | SIDE_BIT, self.side_attr(&t, len)?))
     }
 
     /// CREATE with mode EXCLUSIVE: a retry finds the file it created.

@@ -102,6 +102,12 @@ fn verifier_times(verf: createverf3) -> (Timestamp, Timestamp) {
     (word(&verf[0..4]), word(&verf[4..8]))
 }
 
+/// One page of a listing: the entries, with their attributes when the request asked for them.
+struct Page {
+    entries: Vec<(DirEntry, Option<Attr>)>,
+    eof: bool,
+}
+
 /// The synchronous NFS to `Vfs` translation.
 pub struct Adapter {
     pub(crate) vfs: Arc<dyn Vfs>,
@@ -148,13 +154,13 @@ impl Adapter {
         self.handles.decode(handle)
     }
 
-    pub(crate) fn fa(&self, a: &Attr) -> fattr3 {
-        let mut f = fattr(a);
+    pub(crate) fn fa(&self, a: &Attr) -> NfsResult<fattr3> {
+        let mut f = fattr(a)?;
         if let Some((uid, gid)) = self.opts.owner {
             f.uid = uid;
             f.gid = gid;
         }
-        f
+        Ok(f)
     }
 
     /// Notes the parent of a directory just handed to the client and gives back the `Vfs`
@@ -204,7 +210,7 @@ impl Adapter {
         if is_side(id) {
             return self.side_getattr(id);
         }
-        self.vfs.getattr(id).map(|a| self.fa(&a)).map_err(stat)
+        self.vfs.getattr(id).map_err(stat).and_then(|a| self.fa(&a))
     }
 
     pub fn lookup(&self, dir: fileid3, name: &[u8]) -> NfsResult<(fileid3, fattr3)> {
@@ -218,7 +224,7 @@ impl Adapter {
                 if a.kind != FileKind::Directory {
                     return Err(nfsstat3::NFS3ERR_NOTDIR);
                 }
-                Ok((dir, self.fa(&a)))
+                Ok((dir, self.fa(&a)?))
             }
             b".." => {
                 let p = self.parent_of(dir)?;
@@ -228,7 +234,7 @@ impl Adapter {
                 check_name(name)?;
                 let a = self.vfs.lookup(dir, name).map_err(stat)?;
                 self.handed_out(Some(dir), &a);
-                Ok((a.ino, self.fa(&a)))
+                Ok((a.ino, self.fa(&a)?))
             }
         }
     }
@@ -246,7 +252,7 @@ impl Adapter {
         if is_side(id) {
             return self.side_setattr(id, s);
         }
-        self.apply(id, set_attr(s)).map(|a| self.fa(&a))
+        self.apply(id, set_attr(s)).and_then(|a| self.fa(&a))
     }
 
     pub fn readlink(&self, id: fileid3) -> NfsResult<Vec<u8>> {
@@ -311,7 +317,7 @@ impl Adapter {
                     changes.size = None;
                 }
                 let a = self.apply(a.ino, changes)?;
-                Ok((a.ino, self.fa(&a)))
+                Ok((a.ino, self.fa(&a)?))
             }
             Err(Error::Exists) if !guarded => {
                 let existing = self.vfs.lookup(dir, name).map_err(stat)?;
@@ -321,7 +327,7 @@ impl Adapter {
                 }
                 self.handed_out(Some(dir), &existing);
                 let a = self.apply(existing.ino, changes)?;
-                Ok((a.ino, self.fa(&a)))
+                Ok((a.ino, self.fa(&a)?))
             }
             Err(e) => Err(stat(e)),
         }
@@ -348,13 +354,13 @@ impl Adapter {
                     ..SetAttr::default()
                 };
                 let a = self.vfs.setattr(a.ino, changes).map_err(stat)?;
-                Ok((a.ino, self.fa(&a)))
+                Ok((a.ino, self.fa(&a)?))
             }
             Err(Error::Exists) => {
                 let a = self.vfs.lookup(dir, name).map_err(stat)?;
                 if a.kind == FileKind::Regular && a.atime == atime && a.mtime == mtime {
                     self.handed_out(Some(dir), &a);
-                    Ok((a.ino, self.fa(&a)))
+                    Ok((a.ino, self.fa(&a)?))
                 } else {
                     self.vfs.forget(a.ino, 1);
                     Err(nfsstat3::NFS3ERR_EXIST)
@@ -373,7 +379,7 @@ impl Adapter {
         };
         let a = self.vfs.mkdir(dir, name, mode).map_err(stat)?;
         self.handed_out(Some(dir), &a);
-        Ok((a.ino, self.fa(&a)))
+        Ok((a.ino, self.fa(&a)?))
     }
 
     pub fn symlink(
@@ -392,7 +398,7 @@ impl Adapter {
         }
         let a = self.vfs.symlink(dir, name, target).map_err(stat)?;
         self.handed_out(Some(dir), &a);
-        Ok((a.ino, self.fa(&a)))
+        Ok((a.ino, self.fa(&a)?))
     }
 
     pub fn link(&self, file: fileid3, dir: fileid3, name: &[u8]) -> NfsResult<fattr3> {
@@ -403,7 +409,7 @@ impl Adapter {
         new_name(name)?;
         let a = self.vfs.link(file, dir, name).map_err(stat)?;
         self.handed_out(None, &a);
-        Ok(self.fa(&a))
+        self.fa(&a)
     }
 
     /// Removes one name and releases the inode if that was its last link.
@@ -546,16 +552,33 @@ impl Adapter {
         with_attrs: bool,
     ) -> NfsResult<ReadDirResult> {
         not_side(dir)?;
+        // The Vfs rejects a max of 0, and the kernel never asks for nothing, so clamp rather
+        // than turn a zero into an error the client cannot act on.
         let max = max.max(1);
         let mut out = ReadDirResult::default();
         let mut cookie = cookie;
         loop {
-            let page = self
-                .vfs
-                .readdir(dir, cookie, max - out.entries.len())
-                .map_err(stat)?;
+            let want = max - out.entries.len();
+            // One call for the attributes too, so a Vfs that can list them cheaply does.
+            let page: Page = if with_attrs {
+                let p = self.vfs.readdir_attrs(dir, cookie, want).map_err(stat)?;
+                Page {
+                    eof: p.eof,
+                    entries: p
+                        .entries
+                        .into_iter()
+                        .map(|e| (e.entry, Some(e.attr)))
+                        .collect(),
+                }
+            } else {
+                let p = self.vfs.readdir(dir, cookie, want).map_err(stat)?;
+                Page {
+                    eof: p.eof,
+                    entries: p.entries.into_iter().map(|e| (e, None)).collect(),
+                }
+            };
             let mut consumed_all = true;
-            for e in &page.entries {
+            for (e, attr) in &page.entries {
                 if out.entries.len() == max {
                     consumed_all = false;
                     break;
@@ -564,7 +587,7 @@ impl Adapter {
                 if self.opts.appledouble == AppleDoubleMode::Hide && is_appledouble(&e.name) {
                     continue;
                 }
-                if let Some(entry) = self.list_entry(dir, e, with_attrs) {
+                if let Some(entry) = self.list_entry(dir, e, attr.as_ref(), with_attrs) {
                     out.entries.push(entry);
                 }
             }
@@ -579,13 +602,19 @@ impl Adapter {
         Ok(out)
     }
 
-    fn list_entry(&self, dir: Ino, e: &DirEntry, with_attrs: bool) -> Option<NfsDirEntry> {
+    fn list_entry(
+        &self,
+        dir: Ino,
+        e: &DirEntry,
+        listed: Option<&Attr>,
+        with_attrs: bool,
+    ) -> Option<NfsDirEntry> {
         let attr = if with_attrs {
-            let a = self.vfs.getattr(e.ino).ok()?;
+            let a = listed?;
             if a.kind == FileKind::Directory {
                 lock(&self.parents).insert(a.ino, dir);
             }
-            Some(self.fa(&a))
+            Some(self.fa(a).ok()?)
         } else {
             None
         };
@@ -868,6 +897,15 @@ mod tests {
             all.readdir(ROOT_INO, 0, 10, false).unwrap().entries.len(),
             1
         );
+    }
+
+    #[test]
+    fn a_zero_entry_budget_is_clamped_not_passed_on() {
+        // The trait says the Vfs must reject a max of 0, so the adapter never sends one.
+        let a = adapter(false);
+        a.create(ROOT_INO, b"f", &sattr3::default(), true).unwrap();
+        let got = a.readdir(ROOT_INO, 0, 0, false).unwrap();
+        assert_eq!((got.entries.len(), got.end), (1, true));
     }
 
     #[test]

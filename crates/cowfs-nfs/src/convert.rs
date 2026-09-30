@@ -1,7 +1,8 @@
 //! Conversions between `cowfs_vfs` types and NFSv3 wire types.
 use cowfs_vfs::{Attr, FileKind, SetAttr, SetTime, Timestamp, MODE_MASK};
 use nfsserve::nfs::{
-    fattr3, ftype3, nfstime3, sattr3, set_atime, set_mode3, set_mtime, set_size3, specdata3,
+    fattr3, ftype3, nfsstat3, nfstime3, sattr3, set_atime, set_mode3, set_mtime, set_size3,
+    specdata3,
 };
 
 /// The `fsid` reported for the one file system a server exports ("cowfs" in ASCII).
@@ -22,13 +23,23 @@ pub fn timestamp(t: nfstime3) -> Timestamp {
     }
 }
 
-pub fn fattr(a: &Attr) -> fattr3 {
-    fattr3 {
-        ftype: match a.kind {
-            FileKind::Regular => ftype3::NF3REG,
-            FileKind::Directory => ftype3::NF3DIR,
-            FileKind::Symlink => ftype3::NF3LNK,
-        },
+/// `FileKind` is `#[non_exhaustive]`, so a kind this build does not know is a server fault and
+/// not something to serve as a regular file.
+pub fn ftype(kind: FileKind) -> Result<ftype3, nfsstat3> {
+    Ok(match kind {
+        FileKind::Regular => ftype3::NF3REG,
+        FileKind::Directory => ftype3::NF3DIR,
+        FileKind::Symlink => ftype3::NF3LNK,
+        other => {
+            eprintln!("cowfs-nfs: the Vfs reported an unknown file kind: {other:?}");
+            return Err(nfsstat3::NFS3ERR_SERVERFAULT);
+        }
+    })
+}
+
+pub fn fattr(a: &Attr) -> Result<fattr3, nfsstat3> {
+    Ok(fattr3 {
+        ftype: ftype(a.kind)?,
         mode: a.mode & MODE_MASK,
         nlink: a.nlink,
         uid: a.uid,
@@ -41,7 +52,7 @@ pub fn fattr(a: &Attr) -> fattr3 {
         atime: nfstime(a.atime),
         mtime: nfstime(a.mtime),
         ctime: nfstime(a.ctime),
-    }
+    })
 }
 
 /// uid and gid are dropped: everything belongs to the mounter.
@@ -97,7 +108,7 @@ mod tests {
 
     #[test]
     fn attributes_convert_exactly() {
-        let f = fattr(&attr(FileKind::Regular));
+        let f = fattr(&attr(FileKind::Regular)).unwrap();
         assert_eq!(f.ftype, ftype3::NF3REG);
         assert_eq!((f.mode, f.nlink, f.uid, f.gid), (0o4755, 3, 501, 20));
         assert_eq!(
@@ -107,8 +118,14 @@ mod tests {
         assert_eq!((f.atime.seconds, f.atime.nseconds), (10, 1));
         assert_eq!((f.mtime.seconds, f.mtime.nseconds), (11, 999_999_999));
         assert_eq!((f.ctime.seconds, f.ctime.nseconds), (12, 500));
-        assert_eq!(fattr(&attr(FileKind::Directory)).ftype, ftype3::NF3DIR);
-        assert_eq!(fattr(&attr(FileKind::Symlink)).ftype, ftype3::NF3LNK);
+        assert_eq!(
+            fattr(&attr(FileKind::Directory)).unwrap().ftype,
+            ftype3::NF3DIR
+        );
+        assert_eq!(
+            fattr(&attr(FileKind::Symlink)).unwrap().ftype,
+            ftype3::NF3LNK
+        );
     }
 
     #[test]
@@ -116,7 +133,7 @@ mod tests {
         let mut a = attr(FileKind::Regular);
         a.mode = 0o170_755;
         a.blocks = u64::MAX;
-        let f = fattr(&a);
+        let f = fattr(&a).unwrap();
         assert_eq!(f.mode, 0o755);
         assert_eq!(f.used, u64::MAX);
     }

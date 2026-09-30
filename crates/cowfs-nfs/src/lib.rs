@@ -33,6 +33,15 @@
 //!
 //! # What this crate requires of every `Vfs`
 //!
+//! - Every method may block and each is atomic, so the adapter must not rely on the order of two
+//!   calls. It holds no lock across a `Vfs` call: the only locks it takes are over its own
+//!   sidecar state, and they are per inode.
+//! - `fsync(ROOT_INO, false)` is the whole-mount barrier. NFS COMMIT maps to `fsync(ino, false)`
+//!   for every handle, the root included, and never to a data-only sync, so the name a file was
+//!   created under is durable when COMMIT returns.
+//! - `readdir` with `max == 0` is `InvalidArgument`, so the adapter clamps a zero budget to one
+//!   entry instead of passing it on or turning it into an error the client cannot act on.
+//! - `open`, `release` and `flush` are not called: NFSv3 has no procedure for them.
 //! - An `Ino` is never reused for a different file within a mount's lifetime. The adapter adds a
 //!   per-inode generation to file handles as a second line of defence (a handle minted before the
 //!   last name of an inode went away is `STALE`), but only for removals it performed itself.
