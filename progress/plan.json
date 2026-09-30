@@ -195,13 +195,13 @@
         {
           "id": "29",
           "title": "#29 cowfs-vfs trait, MemVfs and conformance suite",
-          "state": "fixing",
-          "owner": "builder (subagent)",
+          "state": "ready",
+          "owner": "lead",
           "issue": 29,
           "pr": "#30",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/30",
-          "detail": "Critic verdict: mergeable as the cowfs contract after fixes, NOT a POSIX suite. Oracle vs real APFS/btrfs/ext4 (100k ops each): directory nlink=2+subdirs only holds on ext4 (btrfs reports 1, APFS 2+entries); setuid, xattr size, non-UTF-8 and NFC assumptions over-specify; oracle bug on rename onto own non-empty ancestor (ENOTEMPTY on Linux); 0.5% of ops have multiple allowed errors and MemVfs errno differs from the real one. 34 new faults: 6 slipped through. No per-check skip. Builder is adding check levels (Posix/Portable/Cowfs), Options::skip with reasons, the 6 checks, faster default tests, MemVfs edge fixes. Public API stays source-compatible for core/fuse/nfs/pathvfs.",
-          "ci": "CI: linux pass, macos pending"
+          "detail": "Critic findings fixed and re-verified by me: 127 checks tagged Posix/Portable/Cowfs, Options::skip with reasons shown in the report, oracle precedence fixed, 57 faults all caught (full release run 62 s, passes), default crate tests about 20 s, no flakes in 20 runs or under 8 CPU burners (builder's numbers). Not done: oracle does not check timestamps, blocks, xattr flags or short reads (direct checks cover them). The Posix level is unverified on native filesystems until #34 runs it. Needs a CI job for the feature-gated full mutation run.",
+          "ci": "CI: pass (linux, macos)"
         },
         {
           "id": "26",
