@@ -177,12 +177,21 @@
 //! # Other decisions the suite pins (all `Cowfs` unless stated)
 //!
 //! Files and symlinks report the number of names as `nlink`; a symlink's size is its target
-//! length in bytes; the root is `ROOT_INO`; `Attr.blocks` is in 512-byte units and 0 for an
-//! empty file; an inode with no names, handles or references is `Stale`; a removed but still
-//! referenced directory reports `nlink` 0 and refuses new entries with `NotFound`; `readdir`
-//! `max` of 0 is `InvalidArgument`; hardlinks stop at a backend limit with `TooManyLinks`
-//! (`MemVfs` at `LINK_MAX`, configurable with `MemVfs::with_link_max`). Each category module
-//! documents its own.
+//! length in bytes; the root is `ROOT_INO`; `Attr.blocks` is the logical allocation of non-hole
+//! data in 512-byte units and 0 for an empty file; a `StatFs` field of 0 means unknown; an
+//! inode with no names, handles or references is `Stale`; an inode number is never reused for a
+//! different file and 0 is never an inode; a removed but still referenced directory reports
+//! `nlink` 0 and refuses new entries with `NotFound`; `open` never fails because of intent and
+//! `release` of an unknown handle is `InvalidArgument`; `readdir` `max` of 0 is
+//! `InvalidArgument` and cookie 0 is reserved; every name-taking operation validates names;
+//! hardlinks stop at a backend limit with `TooManyLinks` (`MemVfs` at `LINK_MAX`, configurable
+//! with `MemVfs::with_link_max`). Each category module documents its own.
+//!
+//! Four contract sentences are not pinned by a check, because this layer cannot observe them:
+//! `fsync` making the creating name durable (that needs a crash harness, and `cowfs-store`
+//! owns it), `write` rejecting more than `u32::MAX` bytes (a 4 GiB test buffer), a synthetic
+//! read-only `ROOT_INO` (`ReadOnly` and `CrossDevice`, which `MemVfs` does not have) and
+//! `Error::Retry`, which no `MemVfs` operation returns.
 //!
 //! # Validating the suite
 //!

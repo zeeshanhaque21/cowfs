@@ -208,7 +208,8 @@ pub fn dir_nlink_counts_subdirs(c: &Ctx) -> Outcome {
     Ok(())
 }
 
-/// btrfs reports `files` 0, so the inode count is only checked when the backend reports it.
+/// A `StatFs` field of 0 means unknown, not zero (btrfs reports `files` 0), so the inode count
+/// is only checked when the backend reports it.
 /// The macOS NFS client caches statfs for about 0.2 s, so a check that measures free space
 /// right after a write sees old numbers; only inequalities are asserted, never a delta.
 pub fn statfs_sane(c: &Ctx) -> Outcome {
