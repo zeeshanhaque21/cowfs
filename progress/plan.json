@@ -85,11 +85,11 @@
         },
         {
           "id": "pr22",
-          "title": "PR #22 spikes 1-6 (draft)",
-          "state": "waiting",
+          "title": "PR #22 spikes 1-6 (merged)",
+          "state": "done",
           "pr": "#22",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/22",
-          "detail": "Draft PR with all spike write-ups. Base of the v1 stack: #23 skeleton, then #24 store and #25 meta."
+          "detail": "Merged to main."
         },
         {
           "id": "37",
@@ -97,6 +97,14 @@
           "state": "pending",
           "issue": 37,
           "detail": "Deferred from #18. After v1 is complete: measure FUSE-T and macFUSE against the real core on the seeded-build and git status workloads, and against the amended macOS warm-build budget."
+        },
+        {
+          "id": "pr23",
+          "title": "PR #23 v1 skeleton, architecture contract, CI (merged)",
+          "state": "done",
+          "pr": "#23",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/23",
+          "detail": "Merged to main. CI green on Linux and macOS."
         }
       ]
     },
@@ -111,7 +119,7 @@
           "owner": "critic round 3 (subagent)",
           "pr": "#24",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/24",
-          "detail": "Round-2 findings N1-N8 fixed, re-verified by me: 89 crate tests pass, fmt/clippy clean, scope clean, BlockId/ChunkRef untouched, CI green. Builder's evidence: 1800 simulated power-loss cases, 0 acked blocks lost, 0 wrong bytes, corrupt_synced reported after benign torn tail 271/1800 before, 0 after; 256 MiB pack opens in 1 ms with index, 227 ms full verified rebuild; header CRC added (format v2, 56-byte header, v1 refused); salvage(), verify_all(), acknowledge_corruption(), torn-tail sidecar, transactional roll, SYNCED base; 50 mutants 48 killed (2 equivalent); builds on Rust 1.89. Open: possible 25-35% single-thread slowdown (ingest 287 to 191 MiB/s, verified read 771 to 521) on the one clean pass, inconclusive on noisy passes; N9 cold-cache verify-on-dedup cost not measurable; sealed-pack cut at a record boundary only noticed via index checkpoint; default test time 2:17. Round-3 critic running a proper A/B of the old and new code, crash-during-recovery harness, and mutants on the new logic.",
+          "detail": "Round-2 findings N1-N8 fixed, re-verified by me: 89 crate tests pass, fmt/clippy clean, scope clean, BlockId/ChunkRef untouched, CI green. Builder's evidence: 1800 simulated power-loss cases, 0 acked blocks lost, 0 wrong bytes, corrupt_synced reported after benign torn tail 271/1800 before, 0 after; 256 MiB pack opens in 1 ms with index, 227 ms full verified rebuild; header CRC added (format v2, 56-byte header, v1 refused); salvage(), verify_all(), acknowledge_corruption(), torn-tail sidecar, transactional roll, SYNCED base; 50 mutants 48 killed (2 equivalent); builds on Rust 1.89. Open: possible 25-35% single-thread slowdown (ingest 287 to 191 MiB/s, verified read 771 to 521) on the one clean pass, inconclusive on noisy passes; N9 cold-cache verify-on-dedup cost not measurable; sealed-pack cut at a record boundary only noticed via index checkpoint; default test time 2:17. Round-3 critic running a proper A/B of the old and new code, crash-during-recovery harness, and mutants on the new logic. | Now based on main (#24). Round-3 critic running.",
           "ci": "CI: pass (linux, macos) at 3e78b5d"
         },
         {
@@ -149,12 +157,12 @@
         {
           "id": "11",
           "title": "#11 Linux FUSE mount",
-          "state": "ready",
+          "state": "reviewing",
           "issue": 11,
           "owner": "lead",
           "pr": "#31",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/31",
-          "detail": "Critic findings fixed, re-verified by me at 98c0f24: 43 unit tests on Mac, and in the Linux VM 46 unit + 39 mount + 5 regress tests pass, no mounts left. Defaults now safe: ttl 1 s, keep_cache off, opt-in SoleWriter with an Invalidator; Vfs panics become EIO then a clean unmount; keyed-lane worker pool (slow read no longer delays stat: 856 ms to 0.2 ms, builder's n=1); signal cleanup and stale-mount sweep; inode-reuse paranoid mode. Decisions for lead: cross-adapter permission policy (FUSE denies later O_WRONLY on a 0444 file, NFS allows), SoleWriter wiring by core/control plane (invalidate from outside Vfs calls), add 'Ino never reused' text to architecture doc (done on v1/vfs-trait), add a Linux mount CI job (command in report). 2 survivors: one equivalent, one control.",
+          "detail": "Critic findings fixed, re-verified by me at 98c0f24: 43 unit tests on Mac, and in the Linux VM 46 unit + 39 mount + 5 regress tests pass, no mounts left. Defaults now safe: ttl 1 s, keep_cache off, opt-in SoleWriter with an Invalidator; Vfs panics become EIO then a clean unmount; keyed-lane worker pool (slow read no longer delays stat: 856 ms to 0.2 ms, builder's n=1); signal cleanup and stale-mount sweep; inode-reuse paranoid mode. Decisions for lead: cross-adapter permission policy (FUSE denies later O_WRONLY on a 0444 file, NFS allows), SoleWriter wiring by core/control plane (invalidate from outside Vfs calls), add 'Ino never reused' text to architecture doc (done on v1/vfs-trait), add a Linux mount CI job (command in report). 2 survivors: one equivalent, one control. | Round-2 critic running (ordering under the worker pool, staleness, panics).",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -171,12 +179,12 @@
         {
           "id": "13",
           "title": "#13 CLI and Unix-socket control API",
-          "state": "ready",
+          "state": "reviewing",
           "issue": 13,
           "owner": "lead",
           "pr": "#33",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/33",
-          "detail": "Critic findings fixed, re-verified. Linux CI failure fixed: connecting to a regular file gives ECONNREFUSED on Linux and ENOTSOCK on macOS; exit 3 now means missing path or a socket that refuses, exit 1 for a path that is not a socket. Full suite passes in the Linux VM, first Linux run of SO_PEERCRED. Decisions for lead: snapshot_reset/busy semantics, name rules vs core, import hash scope. Not built: real backend (seam only), no TTY test.",
+          "detail": "Critic findings fixed, re-verified. Linux CI failure fixed: connecting to a regular file gives ECONNREFUSED on Linux and ENOTSOCK on macOS; exit 3 now means missing path or a socket that refuses, exit 1 for a path that is not a socket. Full suite passes in the Linux VM, first Linux run of SO_PEERCRED. Decisions for lead: snapshot_reset/busy semantics, name rules vs core, import hash scope. Not built: real backend (seam only), no TTY test. | Round-2 critic running (finishing race, resource bounds, snapshot_reset atomicity).",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -236,13 +244,21 @@
         {
           "id": "34",
           "title": "#34 cowfs-vfs-path: run the suite on native filesystems and through mounts",
-          "state": "fixing",
+          "state": "reviewing",
           "owner": "builder (subagent)",
           "issue": 34,
           "pr": "#35",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/35",
-          "detail": "Suite run on APFS, btrfs, ext4, FUSE and NFS. Posix level (56 checks): 0 failures natively and through FUSE; NFS mount 10 (9 silly rename, 1 AppleDouble Translate hides ._ names). FUSE adapter: no bug. NFS adapter bug found: the reply cache ignores the connection, so a second connection's identical xid replays the first connection's reply and the call never runs (sent to the #12 builder). Suite level corrections sent to the #29 builder (torn reads on ext4/btrfs/tmpfs at 512/4096 B, statfs files=0 on btrfs, com.apple.* xattrs, atime-only ctime, xattr name prefix, LINK_MAX hang). Client-side, not adapter: sparse blocks, statfs caching, silly rename. 2 unexplained flakes.",
+          "detail": "Suite run on APFS, btrfs, ext4, FUSE and NFS. Posix level (56 checks): 0 failures natively and through FUSE; NFS mount 10 (9 silly rename, 1 AppleDouble Translate hides ._ names). FUSE adapter: no bug. NFS adapter bug found: the reply cache ignores the connection, so a second connection's identical xid replays the first connection's reply and the call never runs (sent to the #12 builder). Suite level corrections sent to the #29 builder (torn reads on ext4/btrfs/tmpfs at 512/4096 B, statfs files=0 on btrfs, com.apple.* xattrs, atime-only ctime, xattr name prefix, LINK_MAX hang). Client-side, not adapter: sparse blocks, statfs caching, silly rename. 2 unexplained flakes. | Critic running (root escape, unsafe audit, independent rerun of the matrix).",
           "ci": "CI: pass (linux, macos) at 88e5834"
+        },
+        {
+          "id": "27",
+          "title": "#27 cowfs-vfs trait: freeze review",
+          "state": "reviewing",
+          "pr": "#27",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/27",
+          "detail": "Critic deciding whether the Vfs contract can be frozen. Merges first in the stack: #30, #31, #32, #33 are based on it."
         }
       ]
     },
@@ -283,5 +299,6 @@
         }
       ]
     }
-  ]
+  ],
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead; order: #27, #24, #25, #30, then #31 #33 #35, then #32 #36"
 }

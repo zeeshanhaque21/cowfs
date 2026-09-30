@@ -5,7 +5,8 @@ status.json is progress/plan.json with live data overlaid from the running
 dedup spike (out/full/slots.jsonl, run.pid, report.json).
 Usage: serve.py [port]   (binds 127.0.0.1)
 """
-import json, os, subprocess, sys, threading, time
+import json, os, re, subprocess, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -110,8 +111,56 @@ def spike1_live(item):
     return item
 
 
+REPO = "zeeshanhaque21/cowfs"
+_pr_cache = {}
+_pr_lock = threading.Lock()
+
+
+def _gh(path):
+    r = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=30)
+    return json.loads(r.stdout)
+
+
+def _fetch_pr(n):
+    j = _gh(f"repos/{REPO}/pulls/{n}")
+    sha = j["head"]["sha"]
+    runs = _gh(f"repos/{REPO}/commits/{sha}/check-runs").get("check_runs", [])
+    ci = ",".join(f"{r['name'].split('(')[-1].rstrip(')')}:{r['conclusion'] or r['status']}" for r in runs) or "no checks"
+    return {"state": j["state"], "merged": j["merged"], "draft": j["draft"], "base": j["base"]["ref"], "sha": sha[:7], "ci": ci, "at": time.time()}
+
+
+def pr_info(n):
+    with _pr_lock:
+        c = _pr_cache.get(n)
+    if c and time.time() - c["at"] < 60:
+        return c
+    try:
+        c = _fetch_pr(n)
+        with _pr_lock:
+            _pr_cache[n] = c
+    except Exception:
+        pass
+    return c
+
+
+def overlay_prs(plan):
+    items = [it for ph in plan["phases"] for it in ph["items"] if it.get("pr")]
+    nums = {int(re.sub(r"\D", "", it["pr"])) for it in items}
+    with ThreadPoolExecutor(8) as ex:
+        info = dict(zip(nums, ex.map(pr_info, nums)))
+    for it in items:
+        i = info.get(int(re.sub(r"\D", "", it["pr"])))
+        if not i:
+            continue
+        status = "merged" if i["merged"] else ("draft" if i["draft"] else i["state"])
+        it["ci"] = f"{it['pr']} {status} @{i['sha']} base {i['base']} | CI {i['ci']}"
+        if i["merged"]:
+            it["state"] = "done"
+
+
 def build_status():
     plan = json.load(open(os.path.join(HERE, "plan.json")))
+    overlay_prs(plan)
     closed = slices = 0
     for ph in plan["phases"]:
         for it in ph["items"]:
