@@ -110,22 +110,24 @@
         {
           "id": "8",
           "title": "#8 Merkle tree and O(1) writable snapshots",
-          "state": "building",
+          "state": "reviewing",
           "issue": 8,
-          "owner": "subagent",
+          "owner": "critic (subagent)",
           "pr": "#25",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/25",
-          "detail": "Built together with #9 in one crate. Design note first (docs/v1-meta.md): hardlinks need an inode layer, a pure Merkle tree cannot express them. Worktree ~/.treehouse/cowfs-7c1bf8/2, branch v1/8-9-meta."
+          "detail": "Builder done: persistent content-addressed B+tree per snapshot in redb, O(1) snapshots (create 20-32 ms fsync-bound, flat within 1.6x at load 73-106), crash harness 3,176 crash points and kill -9 rounds with 0 failures (builder's numbers; I re-ran the default suite: 26 tests pass, builder claimed 39). Design note lists 11 decisions for review, including identity (snapshot id, inode), 2 ms unbatched ops and setattr size shrinking only to a chunk boundary. Critic is attacking crash consistency, panic guard, refcount settlement and the API core needs. docs/v1-meta.md",
+          "ci": "CI: pending"
         },
         {
           "id": "9",
           "title": "#9 redb metadata store with crash consistency",
-          "state": "building",
+          "state": "reviewing",
           "issue": 9,
-          "owner": "subagent",
+          "owner": "critic (subagent)",
           "pr": "#25",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/25",
-          "detail": "redb with a crash-injection harness (custom StorageBackend and kill -9 rounds) checked by a consistency verifier."
+          "detail": "Builder done: persistent content-addressed B+tree per snapshot in redb, O(1) snapshots (create 20-32 ms fsync-bound, flat within 1.6x at load 73-106), crash harness 3,176 crash points and kill -9 rounds with 0 failures (builder's numbers; I re-ran the default suite: 26 tests pass, builder claimed 39). Design note lists 11 decisions for review, including identity (snapshot id, inode), 2 ms unbatched ops and setattr size shrinking only to a chunk boundary. Critic is attacking crash consistency, panic guard, refcount settlement and the API core needs. docs/v1-meta.md",
+          "ci": "CI: pending"
         },
         {
           "id": "10",
@@ -204,9 +206,12 @@
         {
           "id": "26",
           "title": "#26 cowfs-core: Vfs over store and meta",
-          "state": "blocked",
+          "state": "building",
           "issue": 26,
-          "detail": "The layer the original plan lacked: file IO, write-back cache, re-chunking, open-handle tracking, snapshot namespace. Starts when the store, meta and conformance suite land."
+          "detail": "Integration branch (vfs-test + store + meta merged, builds clean). Builder writes docs/v1-core.md first, then Vfs over store and meta: Ino mapping, synthetic snapshot root, write-back batching, partial-chunk writes, dentry cache, durability ordering. Must pass the conformance suite; crash and kill -9 tests. Worktree slot 9, branch v1/26-core.",
+          "owner": "subagent",
+          "pr": "#36",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/36"
         },
         {
           "id": "34",
