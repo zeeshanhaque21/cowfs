@@ -29,6 +29,7 @@ fn many_threads_put_overlapping_blocks() {
             Options {
                 max_pack_size: 1 << 20,
                 checkpoint_on_drop: false,
+                ..Default::default()
             },
         )
         .unwrap();

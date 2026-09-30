@@ -49,11 +49,12 @@ pub(crate) enum Event<'a> {
         header: &'a Header,
         payload: &'a [u8],
     },
-    /// Bytes that are not part of any valid record. `trailing` means none follows to the end.
+    /// Bytes that are not part of any valid record. `exhausted` means the resync budget ran out,
+    /// so the rest of the pack was not searched and nothing is known about it.
     Gap {
         offset: u64,
         len: u64,
-        trailing: bool,
+        exhausted: bool,
     },
 }
 
@@ -83,30 +84,83 @@ fn read_record(
     Ok(Some(header))
 }
 
+/// Upper bound on payload bytes that one scan reads while testing resync candidates.
+pub(crate) const RESYNC_BUDGET: u64 = 64 << 20;
+
+fn magic_at(window: &[u8], from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(i) = window[at..].iter().position(|&b| b == RECORD_MAGIC[0]) {
+        let p = at + i;
+        if window.len() - p >= RECORD_MAGIC.len() && window[p..p + 4] == RECORD_MAGIC {
+            return Some(p);
+        }
+        at = p + 1;
+    }
+    None
+}
+
+enum Found {
+    At(u64),
+    Nothing,
+    Exhausted,
+}
+
 /// Smallest offset in `from..end` where a valid record begins.
-fn find_record(file: &File, from: u64, end: u64, payload: &mut Vec<u8>) -> io::Result<Option<u64>> {
+/// Spends at most `budget` bytes of payload reads on candidates, then gives up.
+fn find_record(
+    file: &File,
+    from: u64,
+    end: u64,
+    payload: &mut Vec<u8>,
+    budget: &mut u64,
+) -> io::Result<Found> {
     let mut window = vec![0u8; SEARCH_WINDOW];
     let mut base = from;
     while base + (HEADER_LEN as u64) <= end {
         let n = window.len().min((end - base) as usize);
         file.read_exact_at(&mut window[..n], base)?;
         let mut at = 0;
-        while let Some(i) = window[at..n]
-            .windows(RECORD_MAGIC.len())
-            .position(|w| w == RECORD_MAGIC)
-        {
-            let cand = base + (at + i) as u64;
-            if read_record(file, cand, end, payload)?.is_some() {
-                return Ok(Some(cand));
+        while let Some(p) = magic_at(&window[..n], at) {
+            let cand = base + p as u64;
+            let raw = window[p..n].first_chunk::<HEADER_LEN>();
+            let head = match raw {
+                Some(raw) => Header::parse(raw).ok(),
+                None => peek_header(file, cand, end)?,
+            };
+            if let Some(h) = head.filter(|h| cand + h.total_len() <= end) {
+                if *budget < u64::from(h.slen) {
+                    return Ok(Found::Exhausted);
+                }
+                *budget -= u64::from(h.slen);
+                if read_record(file, cand, end, payload)?.is_some() {
+                    return Ok(Found::At(cand));
+                }
             }
-            at += i + 1;
+            at = p + 1;
         }
         if base + (n as u64) >= end {
             break;
         }
         base += (n - (RECORD_MAGIC.len() - 1)) as u64;
     }
-    Ok(None)
+    Ok(Found::Nothing)
+}
+
+/// The header at `pos` if it is structurally valid and its record fits before `end`.
+fn peek_header(file: &File, pos: u64, end: u64) -> io::Result<Option<Header>> {
+    if pos + HEADER_LEN as u64 > end {
+        return Ok(None);
+    }
+    let mut raw = [0u8; HEADER_LEN];
+    file.read_exact_at(&mut raw, pos)?;
+    Ok(Header::parse(&raw)
+        .ok()
+        .filter(|h| pos + h.total_len() <= end))
+}
+
+/// The id a header at `pos` claims, if its structure is valid. Unverified.
+pub(crate) fn peek_id(file: &File, pos: u64, end: u64) -> Option<crate::BlockId> {
+    peek_header(file, pos, end).ok().flatten().map(|h| h.id)
 }
 
 /// Scan `file[from..end]`, calling `visit` for every valid record and every invalid gap in order.
@@ -117,6 +171,7 @@ pub(crate) fn scan(
     mut visit: impl FnMut(Event<'_>) -> Result<()>,
 ) -> Result<()> {
     let mut payload = Vec::new();
+    let mut budget = RESYNC_BUDGET;
     let mut pos = from;
     while pos < end {
         if let Some(header) = read_record(file, pos, end, &mut payload)? {
@@ -128,20 +183,20 @@ pub(crate) fn scan(
             pos += header.total_len();
             continue;
         }
-        match find_record(file, pos + 1, end, &mut payload)? {
-            Some(next) => {
+        match find_record(file, pos + 1, end, &mut payload, &mut budget)? {
+            Found::At(next) => {
                 visit(Event::Gap {
                     offset: pos,
                     len: next - pos,
-                    trailing: false,
+                    exhausted: false,
                 })?;
                 pos = next;
             }
-            None => {
+            found => {
                 visit(Event::Gap {
                     offset: pos,
                     len: end - pos,
-                    trailing: true,
+                    exhausted: matches!(found, Found::Exhausted),
                 })?;
                 break;
             }

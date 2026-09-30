@@ -279,9 +279,14 @@ fn stale_index_pointing_past_a_shorter_pack_is_ignored() {
     let s = open(dir.path());
     assert!(!s.recovery().index_loaded);
     assert!(!s.contains(id));
-    assert!(s.recovery().truncated_bytes > 0);
+    assert!(
+        s.recovery().has_corruption(),
+        "a pack shorter than its watermark is corruption"
+    );
+    assert_eq!(s.recovery().truncated_bytes, 0);
     s.put(&d).unwrap();
     assert_eq!(s.get(id).unwrap(), d);
+    assert_eq!(pack_ids(dir.path()).len(), 2, "appends go to a new pack");
 }
 
 #[test]
@@ -294,6 +299,7 @@ fn packs_roll_over_and_all_blocks_stay_readable() {
             cowfs_store::Options {
                 max_pack_size: 100_000,
                 checkpoint_on_drop: false,
+                ..Default::default()
             },
         )
         .unwrap();

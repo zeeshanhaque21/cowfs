@@ -1,11 +1,15 @@
 //! In-memory block index and its on-disk checkpoint. See `docs/v1-store.md`.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{PoisonError, RwLock};
 
+use crate::fsio::Io;
+use crate::record::HEADER_LEN;
 use crate::{BlockId, BLOCK_ID_LEN};
 
 const SHARDS: usize = 64;
@@ -20,22 +24,62 @@ pub(crate) struct Loc {
     pub offset: u32,
     pub slen: u32,
     pub ulen: u32,
+    /// The record was hash-verified in this session. Never persisted.
+    pub verified: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct Index {
     shards: Vec<RwLock<HashMap<BlockId, Loc>>>,
+    blocks: AtomicU64,
+    ulen: AtomicU64,
+    stored: AtomicU64,
+}
+
+/// Index-wide totals, kept current so `stats` is O(1).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Totals {
+    pub blocks: u64,
+    pub ulen: u64,
+    pub stored: u64,
+}
+
+fn stored_len(loc: &Loc) -> u64 {
+    HEADER_LEN as u64 + u64::from(loc.slen)
 }
 
 impl Index {
     pub(crate) fn new() -> Self {
         Self {
             shards: (0..SHARDS).map(|_| RwLock::new(HashMap::new())).collect(),
+            blocks: AtomicU64::new(0),
+            ulen: AtomicU64::new(0),
+            stored: AtomicU64::new(0),
         }
     }
 
     fn shard(&self, id: &BlockId) -> &RwLock<HashMap<BlockId, Loc>> {
         &self.shards[usize::from(id.as_bytes()[0]) % SHARDS]
+    }
+
+    fn add(&self, loc: &Loc) {
+        self.blocks.fetch_add(1, Relaxed);
+        self.ulen.fetch_add(u64::from(loc.ulen), Relaxed);
+        self.stored.fetch_add(stored_len(loc), Relaxed);
+    }
+
+    fn sub(&self, loc: &Loc) {
+        self.blocks.fetch_sub(1, Relaxed);
+        self.ulen.fetch_sub(u64::from(loc.ulen), Relaxed);
+        self.stored.fetch_sub(stored_len(loc), Relaxed);
+    }
+
+    pub(crate) fn totals(&self) -> Totals {
+        Totals {
+            blocks: self.blocks.load(Relaxed),
+            ulen: self.ulen.load(Relaxed),
+            stored: self.stored.load(Relaxed),
+        }
     }
 
     pub(crate) fn get(&self, id: &BlockId) -> Option<Loc> {
@@ -53,21 +97,81 @@ impl Index {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         match map.entry(id) {
-            std::collections::hash_map::Entry::Occupied(_) => false,
-            std::collections::hash_map::Entry::Vacant(v) => {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
                 v.insert(loc);
+                self.add(&loc);
                 true
             }
         }
     }
 
-    pub(crate) fn entries(&self) -> Vec<(BlockId, Loc)> {
+    /// Insert a hash-verified record. It wins over an existing entry that was never verified.
+    pub(crate) fn insert_verified(&self, id: BlockId, loc: Loc) {
+        let mut map = self
+            .shard(&id)
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        match map.entry(id) {
+            Entry::Vacant(v) => {
+                v.insert(loc);
+                self.add(&loc);
+            }
+            Entry::Occupied(mut o) if !o.get().verified => {
+                self.sub(o.get());
+                o.insert(loc);
+                self.add(&loc);
+            }
+            Entry::Occupied(_) => {}
+        }
+    }
+
+    /// Set the entry for `id` unconditionally.
+    pub(crate) fn replace(&self, id: BlockId, loc: Loc) {
+        let mut map = self
+            .shard(&id)
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(old) = map.insert(id, loc) {
+            self.sub(&old);
+        }
+        self.add(&loc);
+    }
+
+    /// Mark the entry verified if it still points at `loc`.
+    pub(crate) fn mark_verified(&self, id: &BlockId, loc: Loc) {
+        let mut map = self
+            .shard(id)
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(cur) = map.get_mut(id) {
+            if (cur.pack, cur.offset) == (loc.pack, loc.offset) {
+                cur.verified = true;
+            }
+        }
+    }
+
+    /// Copy the entries `keep` accepts, one shard at a time so writers only wait on that shard.
+    pub(crate) fn snapshot(&self, keep: impl Fn(&Loc) -> bool) -> Vec<(BlockId, Loc)> {
         let mut out = Vec::new();
         for shard in &self.shards {
             let map = shard.read().unwrap_or_else(PoisonError::into_inner);
-            out.extend(map.iter().map(|(k, v)| (*k, *v)));
+            out.extend(map.iter().filter(|(_, v)| keep(v)).map(|(k, v)| (*k, *v)));
         }
         out
+    }
+
+    pub(crate) fn ids(&self) -> Vec<BlockId> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let map = shard.read().unwrap_or_else(PoisonError::into_inner);
+            out.extend(map.keys().copied());
+        }
+        out
+    }
+
+    pub(crate) fn entries(&self) -> Vec<(BlockId, Loc)> {
+        self.snapshot(|_| true)
     }
 }
 
@@ -124,6 +228,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<Checkpoint> {
             offset: c.u32()?,
             slen: c.u32()?,
             ulen: c.u32()?,
+            verified: false,
         };
         entries.push((id, loc));
     }
@@ -137,6 +242,7 @@ pub(crate) fn load(store: &Path) -> Option<Checkpoint> {
 
 /// Atomically replace `index.cix`.
 pub(crate) fn save(
+    io: &Io,
     store: &Path,
     packs: &[(u32, u64)],
     entries: &[(BlockId, Loc)],
@@ -161,7 +267,7 @@ pub(crate) fn save(
     let tmp = store.join(format!("{FILE_NAME}.tmp"));
     let mut f = File::create(&tmp)?;
     f.write_all(&buf)?;
-    f.sync_all()?;
-    fs::rename(&tmp, store.join(FILE_NAME))?;
-    File::open(store)?.sync_all()
+    io.sync_file(&f, &tmp)?;
+    io.rename(&tmp, &store.join(FILE_NAME))?;
+    io.sync_dir(store)
 }

@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use common::{fixture, install, opts, parse_pack, random, Fixture};
+use common::{fixture, install_wm, opts, parse_pack, random, Fixture};
 use cowfs_store::{BlockId, Error, Store};
 
 const SMALL: &[(usize, bool)] = &[
@@ -15,7 +15,7 @@ const SMALL: &[(usize, bool)] = &[
 const BIG_PACK: u64 = 1 << 20;
 
 fn open(dir: &std::path::Path) -> Store {
-    Store::open(dir, opts()).unwrap()
+    Store::open_unsynced(dir, opts()).unwrap()
 }
 
 fn data_of(fx: &Fixture) -> HashMap<BlockId, &Vec<u8>> {
@@ -35,14 +35,21 @@ fn crash_at_every_offset(fx: &Fixture) {
             .map(|(i, p)| (i as u32, &p[..]))
             .collect();
         packs[last].1 = &fx.packs[last][..cut];
-        install(dir.path(), &packs, None);
-
         let kept_end = recs[last]
             .iter()
             .filter(|r| r.2 <= cut)
             .map(|r| r.2)
             .max()
             .unwrap_or(16);
+        let mark = if cut >= 16 {
+            Some((last as u32, kept_end as u64))
+        } else if last > 0 {
+            Some((last as u32 - 1, fx.packs[last - 1].len() as u64))
+        } else {
+            None
+        };
+        install_wm(dir.path(), &packs, None, mark);
+
         let check = |s: &Store| {
             for (p, rs) in recs.iter().enumerate() {
                 for (id, _, end) in rs {
@@ -104,14 +111,13 @@ fn torn_middle_record_is_skipped_and_neighbours_survive() {
         let mut b = pack.clone();
         b[c..recs[m].2].fill(0);
         let changed = b != *pack;
-        install(dir.path(), &[(0, &b)], None);
+        install_wm(dir.path(), &[(0, &b)], None, Some((0, b.len() as u64)));
         let s = open(dir.path());
+        assert_eq!(s.recovery().truncated_bytes, 0, "zeroed from {c}");
+        assert_eq!(s.recovery().has_corruption(), changed, "zeroed from {c}");
         for (i, (id, d)) in fx.blocks.iter().enumerate() {
             if i == m && changed {
-                assert!(
-                    matches!(s.get(*id), Err(Error::NotFound(_))),
-                    "zeroed from {c}"
-                );
+                assert!(s.get(*id).is_err(), "zeroed from {c}");
             } else {
                 assert_eq!(&s.get(*id).unwrap(), d, "zeroed from {c}");
             }
@@ -129,11 +135,13 @@ fn garbage_after_the_last_record_is_cut_off() {
         for garbage in [vec![0u8; glen], random(glen as u64, glen)] {
             let mut b = fx.packs[0].clone();
             b.extend_from_slice(&garbage);
-            install(dir.path(), &[(0, &b)], None);
+            let durable = fx.packs[0].len() as u64;
+            install_wm(dir.path(), &[(0, &b)], None, Some((0, durable)));
             let s = open(dir.path());
             for (id, d) in &fx.blocks {
                 assert_eq!(&s.get(*id).unwrap(), d);
             }
+            assert!(!s.recovery().has_corruption());
             assert_eq!(s.recovery().truncated_bytes, glen as u64);
             assert!(s.fsck().unwrap().is_clean());
         }
@@ -147,10 +155,16 @@ fn flip_check(fx: &Fixture, positions: impl Iterator<Item = (usize, u8)>, with_i
     for (byte, bit) in positions {
         let mut b = fx.packs[0].clone();
         b[byte] ^= 1 << bit;
-        install(dir.path(), &[(0, &b)], with_index.then_some(&fx.index[..]));
+        let mark = Some((0, b.len() as u64));
+        install_wm(
+            dir.path(),
+            &[(0, &b)],
+            with_index.then_some(&fx.index[..]),
+            mark,
+        );
         let hit = recs.iter().position(|r| (r.1..r.2).contains(&byte));
         let ctx = format!("byte {byte} bit {bit}");
-        let s = match Store::open(dir.path(), opts()) {
+        let s = match Store::open_unsynced(dir.path(), opts()) {
             Err(_) => {
                 assert!(hit.is_none(), "open failed for a record flip, {ctx}");
                 continue;
@@ -166,11 +180,39 @@ fn flip_check(fx: &Fixture, positions: impl Iterator<Item = (usize, u8)>, with_i
                 assert_eq!(&s.get(*id).unwrap(), d, "{ctx}");
             }
         }
-        let seen = s.recovery().truncated_bytes > 0
-            || !s.recovery().gaps.is_empty()
-            || !s.fsck().unwrap().is_clean();
-        assert!(seen, "flip not detected, {ctx}");
+        assert_eq!(s.recovery().truncated_bytes, 0, "synced bytes cut, {ctx}");
+        let on_disk = std::fs::metadata(common::pack_path(dir.path(), 0))
+            .unwrap()
+            .len();
+        assert_eq!(on_disk, b.len() as u64, "synced bytes deleted, {ctx}");
+        if !with_index {
+            assert!(s.recovery().has_corruption(), "flip not reported, {ctx}");
+        }
+        assert!(!s.fsck().unwrap().is_clean(), "flip not detected, {ctx}");
     }
+}
+
+#[test]
+fn without_a_watermark_nothing_is_ever_truncated() {
+    let fx = fixture(SMALL, BIG_PACK);
+    let recs = parse_pack(&fx.packs[0]);
+    let last = recs[recs.len() - 1];
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = fx.packs[0].clone();
+    b[last.2 - 3] ^= 0x40;
+    b.extend_from_slice(&[9u8; 70]);
+    common::install(dir.path(), &[(0, &b)], None);
+    let s = open(dir.path());
+    assert!(s.recovery().watermark_missing);
+    assert!(s.recovery().has_corruption());
+    assert_eq!(s.recovery().truncated_bytes, 0);
+    let on_disk = std::fs::metadata(common::pack_path(dir.path(), 0))
+        .unwrap()
+        .len();
+    assert_eq!(on_disk, b.len() as u64);
+    let extra = random(5, 99);
+    let id = s.put(&extra).unwrap();
+    assert_eq!(s.get(id).unwrap(), extra);
 }
 
 fn every_bit(len: usize) -> impl Iterator<Item = (usize, u8)> {

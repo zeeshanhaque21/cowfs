@@ -100,6 +100,7 @@ pub fn fixture(specs: &[(usize, bool)], max_pack_size: u64) -> Fixture {
             Options {
                 max_pack_size,
                 checkpoint_on_drop: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -141,7 +142,65 @@ pub fn install(dir: &Path, packs: &[(u32, &[u8])], index: Option<&[u8]>) {
         fs::write(pack_path(dir, *id), bytes).unwrap();
     }
     let _ = fs::remove_file(index_path(dir));
+    let _ = fs::remove_file(dir.join("SYNCED"));
     if let Some(bytes) = index {
         fs::write(index_path(dir), bytes).unwrap();
     }
+}
+
+/// Bytes of a `SYNCED` watermark file saying pack `pack` is durable up to `len`.
+pub fn wm_bytes(pack: u32, len: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 64];
+    b[..8].copy_from_slice(&2u64.to_le_bytes());
+    b[8..12].copy_from_slice(&pack.to_le_bytes());
+    b[16..24].copy_from_slice(&len.to_le_bytes());
+    let crc = crc32c::crc32c(&b[..24]);
+    b[24..28].copy_from_slice(&crc.to_le_bytes());
+    b
+}
+
+/// Like [`install`], and also write a watermark when `mark` is given.
+pub fn install_wm(
+    dir: &Path,
+    packs: &[(u32, &[u8])],
+    index: Option<&[u8]>,
+    mark: Option<(u32, u64)>,
+) {
+    install(dir, packs, index);
+    if let Some((pack, len)) = mark {
+        fs::write(dir.join("SYNCED"), wm_bytes(pack, len)).unwrap();
+    }
+}
+
+/// Encode a record with a valid CRC, whatever the payload and claimed id.
+pub fn record(codec: u8, ulen: u32, id: [u8; 32], payload: &[u8]) -> Vec<u8> {
+    let mut r = b"CWRB".to_vec();
+    r.extend_from_slice(&[codec, 0, 0, 0]);
+    r.extend_from_slice(&ulen.to_le_bytes());
+    r.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    r.extend_from_slice(&id);
+    let crc = crc32c::crc32c_append(crc32c::crc32c(&r), payload);
+    r.extend_from_slice(&crc.to_le_bytes());
+    r.extend_from_slice(payload);
+    r
+}
+
+/// Encode an index checkpoint with a valid CRC.
+pub fn index_bytes(packs: &[(u32, u64)], entries: &[(BlockId, [u32; 4])]) -> Vec<u8> {
+    let mut b = b"COWIDX01".to_vec();
+    b.extend_from_slice(&(packs.len() as u32).to_le_bytes());
+    b.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (id, len) in packs {
+        b.extend_from_slice(&id.to_le_bytes());
+        b.extend_from_slice(&len.to_le_bytes());
+    }
+    for (id, loc) in entries {
+        b.extend_from_slice(id.as_bytes());
+        for v in loc {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let crc = crc32c::crc32c(&b);
+    b.extend_from_slice(&crc.to_le_bytes());
+    b
 }

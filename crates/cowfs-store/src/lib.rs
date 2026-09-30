@@ -2,16 +2,23 @@
 
 mod chunk;
 mod error;
+mod fdcache;
+mod fsio;
 mod index;
 mod pack;
 mod record;
 mod store;
+mod types;
+mod wm;
 
 use std::fmt;
 
 pub use chunk::{chunks, Chunks, AVG_CHUNK_LEN, MAX_CHUNK_LEN, MIN_CHUNK_LEN};
 pub use error::{Error, Result};
-pub use store::{Damage, FsckReport, Gap, Options, RecoveryReport, Stats, Store};
+#[doc(hidden)]
+pub use fsio::{Op, Trace};
+pub use store::Store;
+pub use types::{CorruptRegion, Damage, FsckReport, Gap, Options, RecoveryReport, Stats};
 
 /// Length of a [`BlockId`] in bytes.
 pub const BLOCK_ID_LEN: usize = 32;
