@@ -202,13 +202,13 @@
         {
           "id": "29",
           "title": "#29 cowfs-vfs trait, MemVfs and conformance suite",
-          "state": "fixing",
-          "owner": "builder (subagent)",
+          "state": "ready",
+          "owner": "lead",
           "issue": 29,
           "pr": "#30",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/30",
-          "detail": "Critic findings fixed and re-verified by me: 127 checks tagged Posix/Portable/Cowfs, Options::skip with reasons shown in the report, oracle precedence fixed, 57 faults all caught (full release run 62 s, passes), default crate tests about 20 s, no flakes in 20 runs or under 8 CPU burners (builder's numbers). Not done: oracle does not check timestamps, blocks, xattr flags or short reads (direct checks cover them). The Posix level is unverified on native filesystems until #34 runs it. Needs a CI job for the feature-gated full mutation run. | Update: native runs found level mistakes (see #34); builder fixing.",
-          "ci": "CI: pass (linux, macos)"
+          "detail": "Critic findings fixed and native-evidence level corrections applied; re-verified by me at f584c00: default tests pass (130 in the main suite), fmt/clippy clean, full mutation run passes in release (61 s), scope clean (architecture doc only differs because the branch lags v1/vfs-trait). 129 checks: 55 Posix, 24 Portable, 50 Cowfs (2 heavy). Options added: xattr_names, link_limit (LINK_MAX check skips with a reason unless declared), com.apple.* xattrs ignored, atime-only ctime moved to Cowfs, honest tearing guarantee. Caveat from builder: small_reads_are_never_torn is a write-then-read on an aligned 8-byte word, not a concurrent-reader check. Not done: oracle still does not check timestamps, blocks, xattr flags or short reads (direct checks cover them). Needs a CI job for the feature-gated mutation run.",
+          "ci": "CI: linux pass, macos pending at f584c00"
         },
         {
           "id": "26",
