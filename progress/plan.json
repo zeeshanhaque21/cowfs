@@ -99,12 +99,12 @@
         {
           "id": "7",
           "title": "#7 chunking, hashing and block store",
-          "state": "fixing",
+          "state": "reviewing",
           "issue": 7,
-          "owner": "builder (subagent)",
+          "owner": "critic round 2 (subagent)",
           "pr": "#24",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/24",
-          "detail": "Critic verdict: NOT mergeable. Reproduced: F1 put reports Ok for an unreadable block, F2 forged/embedded record poisons an id, F4 a single bit flip in the last SYNCED record makes recovery truncate (delete) it, plus fd-per-pack exhaustion, missing dir fsyncs, O(n) checkpoint under the writer lock, unvalidated alloc, no rust-version, and fsync/BLAKE3 mutants surviving. Builder is fixing with regression tests (durable watermark distinguishes torn tail from corruption). Perf misses stand: chunk+hash ~590 vs 800 MiB/s, verified read ~430 vs 1024 (BLAKE3-bound single thread; 3413 MiB/s at 8 threads).",
+          "detail": "Round 1 findings F1-F10 fixed (I re-ran: 65 crate tests pass, fmt/clippy clean, CI green, BlockId/ChunkRef unchanged): put verifies before dedup, records hash-verified on rebuild, durable SYNCED watermark so a bit flip in a synced record is quarantined and reported instead of truncated, fd LRU, directory fsyncs, O(1) stats, non-blocking checkpoint, rust-version 1.89. Benchmarks (load 50-120): chunk+hash 636, ingest 8 threads 1000, verified read 525 MiB/s single thread. Perf targets still missed (800 / 1024 single thread, BLAKE3-bound); builder recommends restating per 8 threads (4170 measured). Recovery was rewritten, so a round-2 critic is attacking the watermark protocol, quarantine, resync budget, fd cache and mutants. Store never built on Rust 1.89.",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -165,8 +165,8 @@
           "owner": "builder (subagent)",
           "pr": "#33",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/33",
-          "detail": "Critic verdict: NOT mergeable. No cross-user hole, but: no client timeout (status hung 25 s), shutdown waits 6 s for handlers ignoring cancel while the socket stays and new clients hang, unbounded connections (3000 idle -> 3003 threads), slowloris; half-close cancels; unsafe snapshot names accepted (.nfs, ._, case/NFC collisions); no atomic snapshot_reset for treehouse mode (b); import verified is a bare bool. Builder is fixing with regression tests and killing surviving mutants.",
-          "ci": "CI: pass (linux, macos)"
+          "detail": "All critic findings fixed with regression tests (builder: 104 tests, 5 clean runs; I re-ran on Mac: pass). New protocol: snapshot_reset, strict params, name validation, checkable import report, client timeouts, bounded shutdown, connection caps. Linux CI fails: errors_name_the_socket_path expects exit 1, gets 3 (errno differs by OS); builder fixing and running the suite in the Linux VM. Decisions for lead: snapshot_reset/busy semantics, name rules to reconcile with core, import hash scope (names, modes, content, symlink targets; not owner/mtime/xattrs).",
+          "ci": "CI: ubuntu FAIL, macos pass"
         },
         {
           "id": "14",
