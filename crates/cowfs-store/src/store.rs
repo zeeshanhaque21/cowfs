@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::fdcache::FdCache;
 use crate::fsio::{Io, Trace};
 use crate::index::{self, Index, Loc};
-use crate::pack::{self, Event, PACK_HEADER_LEN};
+use crate::pack::{self, Deep, Event, PACK_HEADER_LEN};
 use crate::record::{self, Codec, Header, HEADER_LEN};
 use crate::types::{
     CorruptRegion, Damage, FsckReport, Gap, Options, RecoveryReport, SalvageReport, Stats,
@@ -100,18 +100,15 @@ fn set_durable(io: &Io, dir: &Path, id: u32, durable: u64) -> io::Result<()> {
     io.write_whole(&pack::pack_dir(dir), &pack::cut_name(id), &b)
 }
 
-fn file_is_all_zero(file: &File, len: u64) -> io::Result<bool> {
-    let mut buf = vec![0u8; 1 << 16];
-    let mut at = 0u64;
-    while at < len {
-        let n = buf.len().min((len - at) as usize);
-        file.read_exact_at(&mut buf[..n], at)?;
-        if buf[..n].iter().any(|&b| b != 0) {
-            return Ok(false);
-        }
-        at += n as u64;
-    }
-    Ok(true)
+/// Write a pack header again after the old one was lost. Only the zeros go, so no durable byte of
+/// a record can be touched by it.
+fn rewrite_header(io: &Io, dir: &Path, id: u32) -> io::Result<u32> {
+    let path = pack::pack_path(dir, id);
+    let file = open_pack(dir, id)?;
+    let nonce = pack::new_nonce(id);
+    io.write_at(&file, &path, 0, &pack::header_bytes(nonce))?;
+    io.sync_file(&file, &path)?;
+    Ok(nonce)
 }
 
 /// Create pack `id`, or reuse an empty leftover from a failed earlier attempt.
@@ -154,24 +151,22 @@ fn create_pack(io: &Io, store: &Path, id: u32) -> io::Result<File> {
     }
 }
 
-/// Sidecars of one pack, oldest first.
-fn torn_index(dir: &Path, pack: u32) -> Vec<u32> {
+/// Every sidecar in the store, oldest first. A pack id is never reused, so a higher pack id is a
+/// later crash, and inside a pack a higher index is a later one still.
+fn torn_index(dir: &Path) -> Vec<(u32, u32, u64)> {
     let Ok(rd) = fs::read_dir(pack::pack_dir(dir)) else {
         return Vec::new();
     };
-    let mut v: Vec<u32> = rd
+    let mut v: Vec<(u32, u32, u64)> = rd
         .filter_map(|e| {
             let e = e.ok()?;
             let n = e.file_name().to_string_lossy().into_owned();
             let (head, tail) = n.split_once(".torn-")?;
-            if head
-                != pack::pack_path(Path::new(""), pack)
-                    .file_name()?
-                    .to_string_lossy()
-            {
-                return None;
-            }
-            tail.parse().ok()
+            Some((
+                pack::parse_pack_name(head)?,
+                tail.parse().ok()?,
+                e.metadata().map_or(0, |m| m.len()),
+            ))
         })
         .collect();
     v.sort_unstable();
@@ -197,7 +192,9 @@ fn save_torn(
     recovery: &mut RecoveryReport,
 ) -> Result<()> {
     let (from, len) = tail;
-    let n = torn_index(dir, pack).last().map_or(0, |n| n + 1);
+    let n = (0u32..)
+        .find(|n| !torn_path(dir, pack, *n).exists())
+        .unwrap();
     let path = torn_path(dir, pack, n);
     let take = (len - from).min(TORN_KEEP);
     let mut buf = vec![0u8; take as usize];
@@ -230,31 +227,17 @@ fn save_torn(
         bytes: take,
     });
 
-    let mut all: Vec<(u32, u64)> = torn_index(dir, pack)
-        .into_iter()
-        .map(|i| {
-            (
-                i,
-                fs::metadata(torn_path(dir, pack, i)).map_or(0, |m| m.len()),
-            )
-        })
-        .collect();
+    // Retention is for the whole store, not for one pack, so a crash loop cannot fill the disk.
+    let mut all = torn_index(dir);
     let keep = options.max_torn_sidecars.max(1);
-    let mut total: u64 = all.iter().map(|(_, n)| n).sum();
+    let mut total: u64 = all.iter().map(|(_, _, n)| *n).sum();
     while all.len() > keep || (total > options.max_torn_sidecar_bytes && all.len() > 1) {
-        let Some((i, size)) = all.first().copied() else {
-            break;
-        };
-        if all.len() == 1 && total > options.max_torn_sidecar_bytes {
-            break;
-        }
-        let p = torn_path(dir, pack, i);
-        if fs::remove_file(&p).is_ok() {
+        let (pack, i, size) = all.remove(0);
+        if fs::remove_file(torn_path(dir, pack, i)).is_ok() {
             io.sync_dir(&pack::pack_dir(dir))?;
             recovery.sidecars_pruned += 1;
             total = total.saturating_sub(size);
         }
-        all.remove(0);
     }
     Ok(())
 }
@@ -361,6 +344,7 @@ impl Store {
         ids.sort_unstable();
         let mut lens: BTreeMap<u32, u64> = BTreeMap::new();
         let mut nonces: HashMap<u32, u32> = HashMap::new();
+        let mut head_lost: Vec<u32> = Vec::new();
         let mut sealed_len: HashMap<u32, u64> = HashMap::new();
         for &id in &ids {
             let path = pack::pack_path(&dir, id);
@@ -382,16 +366,11 @@ impl Store {
                     Ok(nonce) => {
                         nonces.insert(id, nonce);
                     }
-                    Err("empty pack (no data was written)") if Some(id) == ids.last().copied() => {
-                        // File size persisted, data did not. Only safe when no byte is non-zero.
-                        if !file_is_all_zero(&file, len)? {
-                            return Err(Error::BadPack {
-                                path,
-                                reason: "zero header but the file holds data",
-                            });
-                        }
-                        io.truncate(&file, &path, 0)?;
-                        len = reset_header(&io, &dir, &mut file, id)?;
+                    Err("empty pack (no data was written)") => {
+                        // The header sector was lost: a crash between creating the file and writing
+                        // it, or a torn write to sector zero. Records past it are still scanned, so
+                        // whatever verifies is kept. The header is written again after the scan.
+                        head_lost.push(id);
                     }
                     Err(reason) => {
                         return Err(Error::BadPack { path, reason });
@@ -604,18 +583,18 @@ impl Store {
                 save_torn(&io, &dir, id, &file, (t, len), &options, &mut recovery)?;
                 // The label is what lets a later open tell a torn tail from corruption once this
                 // pack is no longer the active one, and what lets an interrupted cut be finished.
-                if is_active {
-                    set_durable(&io, &dir, id, t)?;
-                }
-                if is_active && !tail.is_empty() {
+                set_durable(&io, &dir, id, t)?;
+                if tail.is_empty() {
+                    // Nothing verifiable past the tear, so it goes now.
+                    io.truncate(&file, &path, t)?;
+                } else {
                     // Verifiable records sit past the tear. Copy them into a new pack and fsync it
-                    // there first, so the old pack never loses a byte in the middle of a move.
+                    // there first, so this pack never loses a byte in the middle of a move. A pack
+                    // that was already retired can land here too: a crash between labelling it and
+                    // moving its records leaves the records here and nowhere else.
                     relocated = tail;
                     have_tail = true;
                     cut_at = Some((id, t));
-                } else {
-                    // Nothing verifiable past the tear, so it goes now.
-                    io.truncate(&file, &path, t)?;
                 }
                 recovery.torn_tail_discarded += len - t;
                 len = t;
@@ -629,6 +608,10 @@ impl Store {
             }
         }
         recovery.truncated_bytes = recovery.torn_tail_discarded;
+        for &id in &head_lost {
+            let nonce = rewrite_header(&io, &dir, id)?;
+            nonces.insert(id, nonce);
+        }
 
         let counters = Counters::default();
         let (id, file, mut len) = match (last, last_file) {
@@ -1288,6 +1271,15 @@ impl Store {
         self.fsck()
     }
 
+    /// Blocks that `open` found damaged in this session, for a caller that wants to put them again.
+    ///
+    /// A block that has been put again is not in the list, so a caller can work through it until
+    /// the list is empty.
+    pub fn damaged_blocks(&self) -> Vec<BlockId> {
+        let d = self.damaged.read().unwrap_or_else(PoisonError::into_inner);
+        d.keys().copied().collect()
+    }
+
     /// Accept the damage `open` reported, so later opens stop reporting it.
     ///
     /// Every region in `recovery().corrupt_synced` and every missing pack is recorded in `ACKED`
@@ -1362,13 +1354,9 @@ impl Store {
         let mut report = SalvageReport::default();
         for (&pack_id, &len) in &lens {
             let file = self.reads.get(pack_id)?;
-            pack::scan(&file, PACK_HEADER_LEN, len, |event| {
+            pack::scan_deep(&file, len, |event| {
                 match event {
-                    Event::Record {
-                        offset,
-                        header,
-                        payload,
-                    } if record::verify(header, payload) => {
+                    Deep::Record { offset, header } => {
                         report.records += 1;
                         let loc = Loc {
                             pack: pack_id,
@@ -1393,12 +1381,7 @@ impl Store {
                             Some(_) => {}
                         }
                     }
-                    Event::Record { offset, header, .. } => report.damaged.push(Gap {
-                        pack: pack_id,
-                        offset,
-                        len: header.total_len(),
-                    }),
-                    Event::Gap { offset, len, .. } => report.damaged.push(Gap {
+                    Deep::Gap { offset, len } => report.damaged.push(Gap {
                         pack: pack_id,
                         offset,
                         len,

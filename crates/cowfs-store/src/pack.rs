@@ -102,6 +102,7 @@ pub(crate) enum Event<'a> {
     Record {
         offset: u64,
         header: &'a Header,
+        /// The stored bytes, for a caller that verifies the hash as well.
         payload: &'a [u8],
     },
     /// Bytes that are not part of any valid record. `exhausted` means the search gave up because
@@ -137,6 +138,26 @@ fn read_record(
         return Ok(None);
     }
     Ok(Some(header))
+}
+
+/// How much payload reading a scan may do. [`Work::Bounded`] is what an open uses, so that
+/// crafted input cannot make it read without limit; [`Work::Unlimited`] is for salvage, which is
+/// run by an operator on a store that already needs repair.
+#[derive(Clone, Copy)]
+pub(crate) enum Work {
+    /// Stop when the bound runs out.
+    Bounded(u64),
+    /// Read whatever the bytes claim.
+    Unlimited,
+}
+
+impl Work {
+    fn charge(&mut self, slen: u32) -> bool {
+        match self {
+            Self::Bounded(b) => charge(b, slen),
+            Self::Unlimited => true,
+        }
+    }
 }
 
 /// Take `slen` bytes from the work bound. A candidate that exactly fits is still read.
@@ -178,7 +199,7 @@ fn find_record(
     from: u64,
     end: u64,
     payload: &mut Vec<u8>,
-    budget: &mut u64,
+    budget: &mut Work,
 ) -> io::Result<Found> {
     let mut window = vec![0u8; SEARCH_WINDOW];
     let mut base = from;
@@ -193,10 +214,9 @@ fn find_record(
                 None => peek_header(file, cand, end)?,
             };
             if let Some(h) = head.filter(|h| cand + h.total_len() <= end) {
-                if !charge(budget, h.slen) {
+                if !budget.charge(h.slen) {
                     return Ok(Found::Exhausted);
                 }
-                *budget -= u64::from(h.slen);
                 if read_record(file, cand, end, payload)?.is_some() {
                     return Ok(Found::At(cand));
                 }
@@ -228,6 +248,64 @@ pub(crate) fn peek_id(file: &File, pos: u64, end: u64) -> Option<crate::BlockId>
     peek_header(file, pos, end).ok().flatten().map(|h| h.id)
 }
 
+/// What a deep scan found. A deep scan trusts nothing in the bytes: a record counts only when its
+/// header, its checksums and the BLAKE3 hash of its payload all agree.
+pub(crate) enum Deep {
+    /// A record whose bytes verify. The payload is not handed out: it was already checked.
+    Record { offset: u64, header: Header },
+    /// Bytes that hold no verifiable record.
+    Gap { offset: u64, len: u64 },
+}
+
+/// Slide over every byte of `file[..end]` and yield what verifies.
+///
+/// It is linear in the pack size plus one payload read per position that carries the record magic,
+/// so a pack full of forged headers costs one read per header. It is a repair tool, so it does not
+/// stop early: see [`Work::Unlimited`].
+pub(crate) fn scan_deep(
+    file: &File,
+    end: u64,
+    mut visit: impl FnMut(Deep) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut work = Work::Unlimited;
+    let mut payload = Vec::new();
+    let mut pos = PACK_HEADER_LEN;
+    while pos < end {
+        match find_record(file, pos, end, &mut payload, &mut work)? {
+            Found::At(off) => {
+                let Some(header) = read_record(file, off, end, &mut payload)? else {
+                    break;
+                };
+                let total = header.total_len();
+                // The checksums in the header are only as good as the bytes that carry them, so the
+                // payload hash decides. This is what a forged header with valid checksums fails.
+                let found = crate::record::verify(&header, &payload);
+                visit(if found {
+                    Deep::Record {
+                        offset: off,
+                        header,
+                    }
+                } else {
+                    Deep::Gap {
+                        offset: off,
+                        len: total,
+                    }
+                })?;
+                pos = off + total;
+            }
+            Found::Nothing => {
+                visit(Deep::Gap {
+                    offset: pos,
+                    len: end - pos,
+                })?;
+                pos = end;
+            }
+            Found::Exhausted => break,
+        }
+    }
+    Ok(())
+}
+
 /// Scan `file[from..end]`, calling `visit` for every valid record and every invalid gap in order.
 pub(crate) fn scan(
     file: &File,
@@ -236,7 +314,7 @@ pub(crate) fn scan(
     mut visit: impl FnMut(Event<'_>) -> Result<()>,
 ) -> Result<()> {
     let mut payload = Vec::new();
-    let mut budget = 2 * end.saturating_sub(from) + (1 << 20);
+    let mut budget = Work::Bounded(2 * end.saturating_sub(from) + (1 << 20));
     let mut pos = from;
     while pos < end {
         if let Some(header) = read_record(file, pos, end, &mut payload)? {
