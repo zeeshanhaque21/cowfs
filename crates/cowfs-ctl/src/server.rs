@@ -3,7 +3,7 @@ use crate::frame::{
     read_line_until, ClientFrame, LineRead, ReadLimits, ServerFrame, ServerHello, MAX_REQUEST_LINE,
     PROTOCOL_VERSION,
 };
-use crate::handler::{CancelToken, ControlHandler, OpContext};
+use crate::handler::{CancelToken, ControlHandler, HolderGuard, OpContext};
 use crate::types::*;
 use crate::validate::{validate_abs_path, validate_git_ref, validate_repo, validate_snapshot_name};
 use crate::{socket, sys};
@@ -64,6 +64,11 @@ pub struct ServerOptions {
     pub handshake_timeout: Duration,
     /// A connection with nothing in flight and no request for this long is closed.
     pub idle_timeout: Duration,
+    /// A connection with nothing in flight and no traffic for this long may be evicted to make
+    /// room for a new one when the server is at `max_connections`.
+    pub evict_idle: Duration,
+    /// How long a refused or drained connection is given to finish reading what the peer sent.
+    pub drain_deadline: Duration,
     /// Time allowed from the first byte of a request line to its newline.
     pub line_timeout: Duration,
     /// A client that does not drain its socket for this long is disconnected.
@@ -85,13 +90,15 @@ impl Default for ServerOptions {
             expected_uid: sys::current_uid(),
             peer_check: PeerCheck::system(),
             handshake_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(300),
+            idle_timeout: Duration::from_secs(30),
+            evict_idle: Duration::from_secs(10),
             line_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(30),
             max_inflight: 32,
             max_connections: 64,
             max_requests: 64,
             shutdown_deadline: Duration::from_secs(5),
+            drain_deadline: Duration::from_millis(250),
         }
     }
 }
@@ -102,18 +109,30 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[derive(Debug)]
 struct Shared {
+    epoch: Instant,
     stopping: AtomicBool,
     abandon_at: OnceLock<Instant>,
     shutdown_after: Duration,
     next_conn: AtomicU64,
     requests: AtomicUsize,
     conns: Mutex<HashMap<u64, Arc<Conn>>>,
+    snapshot_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Shared {
     fn begin_shutdown(&self) {
         let _ = self.abandon_at.set(Instant::now() + self.shutdown_after);
         self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    /// The lock that serialises every change of `name`.
+    fn snapshot_lock(&self, name: &str) -> Arc<Mutex<()>> {
+        let mut locks = lock(&self.snapshot_locks);
+        Arc::clone(
+            locks
+                .entry(name.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     fn stopping(&self) -> bool {
@@ -162,12 +181,14 @@ impl Server {
         let (listener, lock_file) = socket::bind(path, opts.expected_uid)?;
         listener.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
+            epoch: Instant::now(),
             stopping: AtomicBool::new(false),
             abandon_at: OnceLock::new(),
             shutdown_after: opts.shutdown_deadline,
             next_conn: AtomicU64::new(0),
             requests: AtomicUsize::new(0),
             conns: Mutex::new(HashMap::new()),
+            snapshot_locks: Mutex::new(HashMap::new()),
         });
         let thread = thread::Builder::new()
             .name("cowfs-ctl-accept".into())
@@ -236,6 +257,7 @@ fn accept_loop(
             Err(_) => thread::sleep(Duration::from_millis(50)),
         }
     }
+    drain_backlog(&listener, &opts, shared);
     let _ = fs::remove_file(path);
     drop(listener);
     for conn in lock(&shared.conns).values() {
@@ -258,6 +280,169 @@ fn accept_loop(
     drop(lock_file);
 }
 
+// A connection that reached the kernel queue but was never accepted gets nothing from a plain
+// close: closing the listener resets it. Each one is answered with `shutting_down` and a polite
+// close, bounded by count and by the drain deadline.
+fn drain_backlog(listener: &UnixListener, opts: &ServerOptions, shared: &Shared) {
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut drained = 0;
+    loop {
+        if drained >= 256 || Instant::now() > until {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                drained += 1;
+                let opts = opts.clone();
+                let _ = thread::Builder::new()
+                    .name("cowfs-ctl-drain".into())
+                    .spawn(move || serve_drained(&stream, &opts));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let _ = shared.epoch;
+}
+
+// A client that was queued but never accepted still gets a hello and a terminal frame per
+// request, so a `cowfs` call in flight at shutdown never sees a bare EOF.
+fn serve_drained(stream: &UnixStream, opts: &ServerOptions) {
+    let Ok(clone) = stream.try_clone() else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(POLL));
+    let mut reader = BufReader::new(clone);
+    let mut buf = Vec::new();
+    let hard = Instant::now() + opts.drain_deadline;
+    let mut frames = 0;
+    while Instant::now() < hard && frames < 16 {
+        frames += 1;
+        buf.clear();
+        let limits = ReadLimits {
+            idle: &|| Some(hard),
+            hard: Some(hard),
+            line: None,
+            abort: &|| false,
+        };
+        match read_line_until(&mut reader, &mut buf, MAX_REQUEST_LINE, &limits) {
+            Ok(LineRead::Line) => {}
+            _ => break,
+        }
+        match ClientFrame::decode(&buf) {
+            Ok(ClientFrame::Hello(hello)) => {
+                let Some(version) = hello
+                    .versions
+                    .iter()
+                    .copied()
+                    .filter(|v| SUPPORTED_VERSIONS.contains(v))
+                    .max()
+                else {
+                    break;
+                };
+                let frame = ServerFrame::Hello(ServerHello {
+                    version,
+                    server: opts.server_name.clone(),
+                    methods: METHODS.iter().map(|m| (*m).to_owned()).collect(),
+                });
+                if !send_on(stream, &frame) {
+                    break;
+                }
+            }
+            Ok(ClientFrame::Request { id, .. }) => {
+                let frame = ServerFrame::Error {
+                    id: Some(id),
+                    error: CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
+                };
+                if !send_on(stream, &frame) {
+                    break;
+                }
+            }
+            Ok(ClientFrame::Cancel { .. }) => {}
+            Err(fe) => {
+                let frame = ServerFrame::Error {
+                    id: fe.id,
+                    error: fe.error,
+                };
+                if !send_on(stream, &frame) {
+                    break;
+                }
+            }
+        }
+    }
+    close_after_reply(stream, None, opts.drain_deadline);
+}
+
+// Once the server is stopping, the requests already in the socket are answered with
+// `shutting_down` instead of being dropped.
+fn answer_pending(
+    stream: &UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    buf: &mut Vec<u8>,
+    opts: &ServerOptions,
+) {
+    let hard = Instant::now() + opts.drain_deadline;
+    let mut frames = 0;
+    while Instant::now() < hard && frames < 16 {
+        frames += 1;
+        buf.clear();
+        let limits = ReadLimits {
+            idle: &|| Some(hard),
+            hard: Some(hard),
+            line: None,
+            abort: &|| false,
+        };
+        if !matches!(
+            read_line_until(reader, buf, MAX_REQUEST_LINE, &limits),
+            Ok(LineRead::Line)
+        ) {
+            return;
+        }
+        if let Ok(ClientFrame::Request { id, .. }) = ClientFrame::decode(buf) {
+            let frame = ServerFrame::Error {
+                id: Some(id),
+                error: CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
+            };
+            if !send_on(stream, &frame) {
+                return;
+            }
+        }
+    }
+}
+
+fn send_on(stream: &UnixStream, frame: &ServerFrame) -> bool {
+    let Ok(mut w) = stream.try_clone() else {
+        return false;
+    };
+    w.write_all(&frame.encode()).is_ok()
+}
+
+// Writes the frame, half-closes, drains what the peer already sent, then closes. Closing with
+// unread input in the receive queue makes the kernel send RST, which destroys the frame.
+fn close_after_reply(stream: &UnixStream, frame: Option<&ServerFrame>, deadline: Duration) {
+    let Ok(write) = stream.try_clone() else {
+        return;
+    };
+    let _ = write.set_write_timeout(Some(deadline.max(Duration::from_millis(50))));
+    if let Some(frame) = frame {
+        let mut w = &write;
+        let _ = w.write_all(&frame.encode());
+        let _ = w.flush();
+    }
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let until = Instant::now() + deadline;
+    let mut sink = [0u8; 8192];
+    while Instant::now() < until {
+        match (&*stream).read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
 fn admit(
     stream: UnixStream,
     handler: &Arc<dyn ControlHandler>,
@@ -272,9 +457,27 @@ fn admit(
     {
         let mut conns = lock(&shared.conns);
         if conns.len() >= opts.max_connections {
-            drop(conns);
-            refuse(stream);
-            return;
+            // Idle connections give way to a new one; anything with a request in flight stays.
+            let idle = |c: &Arc<Conn>| {
+                c.inflight_empty() && shared.epoch.elapsed() >= c.last_active() + opts.evict_idle
+            };
+            let victim = conns
+                .iter()
+                .filter(|(_, c)| idle(c))
+                .min_by_key(|(_, c)| c.last_active())
+                .map(|(k, _)| *k);
+            match victim {
+                Some(victim) => {
+                    if let Some(old) = conns.remove(&victim) {
+                        old.kill();
+                    }
+                }
+                None => {
+                    drop(conns);
+                    refuse(&stream, opts.drain_deadline);
+                    return;
+                }
+            }
         }
         conns.insert(id, Arc::clone(&conn));
     }
@@ -282,11 +485,16 @@ fn admit(
     let spawned = thread::Builder::new().name("cowfs-ctl-conn".into()).spawn({
         let conn = Arc::clone(&conn);
         move || {
-            let _ = run_connection(&stream, &conn, &handler, &opts, &shared2);
+            let Ok(clone) = stream.try_clone() else {
+                return;
+            };
+            let mut reader = BufReader::new(clone);
+            let _ = run_connection(&mut reader, &conn, &handler, &opts, &shared2);
             if shared2.stopping() {
                 conn.abandon_inflight();
             }
             conn.kill_after_finish();
+            conn.drain_and_close(&mut reader, opts.drain_deadline);
             lock(&shared2.conns).remove(&id);
         }
     });
@@ -295,15 +503,12 @@ fn admit(
     }
 }
 
-fn refuse(mut stream: UnixStream) {
+fn refuse(stream: &UnixStream, deadline: Duration) {
     let frame = ServerFrame::Error {
         id: None,
         error: CtlError::new(ErrorCode::TooManyConnections, "too many connections"),
     };
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-    let _ = stream.write_all(&frame.encode());
-    let _ = stream.set_nonblocking(true);
-    let _ = stream.read(&mut [0u8; 4096]);
+    close_after_reply(stream, Some(&frame), deadline);
 }
 
 #[derive(Debug)]
@@ -312,6 +517,7 @@ struct Conn {
     write_lock: Mutex<()>,
     dead: AtomicBool,
     finishing: AtomicUsize,
+    last_active: AtomicU64,
     inflight: Mutex<HashMap<u64, CancelToken>>,
 }
 
@@ -323,6 +529,7 @@ impl Conn {
             write_lock: Mutex::new(()),
             dead: AtomicBool::new(false),
             finishing: AtomicUsize::new(0),
+            last_active: AtomicU64::new(0),
             inflight: Mutex::new(HashMap::new()),
         })
     }
@@ -389,50 +596,83 @@ impl Conn {
         }
     }
 
+    /// Milliseconds since the server started at which this connection last had traffic.
+    fn last_active(&self) -> Duration {
+        Duration::from_millis(self.last_active.load(Ordering::SeqCst))
+    }
+
+    fn touch(&self, epoch: &Instant) {
+        let ms = u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_active.fetch_max(ms, Ordering::SeqCst);
+    }
+
+    /// Marks the connection dead and half-closes it. The close itself belongs to
+    /// `drain_and_close`, which owns the reader.
     fn kill(&self) {
         self.dead.store(true, Ordering::SeqCst);
         self.cancel_all();
+        let _ = self.stream.shutdown(Shutdown::Write);
+    }
+
+    /// Reads away what the peer already sent, then closes for good.
+    fn drain_and_close(&self, reader: &mut BufReader<UnixStream>, deadline: Duration) {
+        let _ = reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(50)));
+        let until = Instant::now() + deadline;
+        let mut sink = [0u8; 8192];
+        while Instant::now() < until {
+            match reader.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
 
 fn run_connection(
-    stream: &UnixStream,
+    reader: &mut BufReader<UnixStream>,
     conn: &Arc<Conn>,
     handler: &Arc<dyn ControlHandler>,
     opts: &Arc<ServerOptions>,
     shared: &Arc<Shared>,
 ) -> io::Result<()> {
+    let owned = reader.get_ref().try_clone()?;
+    let stream: &UnixStream = &owned;
     stream.set_write_timeout(Some(opts.write_timeout))?;
     stream.set_read_timeout(Some(POLL))?;
     match (opts.peer_check.0)(stream) {
         Ok(uid) if uid == opts.expected_uid => {}
         _ => {
-            conn.send_error(
-                None,
-                CtlError::new(
-                    ErrorCode::PermissionDenied,
-                    "peer uid does not match the server",
-                ),
+            close_after_reply(
+                stream,
+                Some(&ServerFrame::Error {
+                    id: None,
+                    error: CtlError::new(
+                        ErrorCode::PermissionDenied,
+                        "peer uid does not match the server",
+                    ),
+                }),
+                opts.drain_deadline,
             );
             return Ok(());
         }
     }
-    let mut reader = BufReader::new(stream.try_clone()?);
     let mut buf = Vec::new();
-    let stop = || shared.stopping() || conn.dead.load(Ordering::SeqCst);
+    let gone = || conn.dead.load(Ordering::SeqCst);
 
     let hard = Instant::now() + opts.handshake_timeout;
     let limits = ReadLimits {
         idle: &|| Some(hard),
         hard: Some(hard),
         line: None,
-        abort: &stop,
+        abort: &gone,
     };
-    match read_line_until(&mut reader, &mut buf, MAX_REQUEST_LINE, &limits)? {
+    match read_line_until(reader, &mut buf, MAX_REQUEST_LINE, &limits)? {
         LineRead::Line => {}
         LineRead::TooLong => {
-            reject_oversized(conn, &mut reader);
+            reject_oversized(conn, reader);
             return Ok(());
         }
         LineRead::Timeout => {
@@ -450,6 +690,10 @@ fn run_connection(
 
     let mut last_activity = Instant::now();
     loop {
+        if shared.stopping() {
+            answer_pending(stream, reader, &mut buf, opts);
+            return Ok(());
+        }
         buf.clear();
         let idle_at = last_activity + opts.idle_timeout;
         let idle = || conn.inflight_empty().then_some(idle_at);
@@ -457,12 +701,12 @@ fn run_connection(
             idle: &idle,
             hard: None,
             line: Some(opts.line_timeout),
-            abort: &stop,
+            abort: &gone,
         };
-        match read_line_until(&mut reader, &mut buf, MAX_REQUEST_LINE, &limits)? {
+        match read_line_until(reader, &mut buf, MAX_REQUEST_LINE, &limits)? {
             LineRead::Line => {}
             LineRead::TooLong => {
-                reject_oversized(conn, &mut reader);
+                reject_oversized(conn, reader);
                 return Ok(());
             }
             LineRead::Timeout => {
@@ -475,6 +719,7 @@ fn run_connection(
             LineRead::Aborted | LineRead::Eof => break,
         }
         last_activity = Instant::now();
+        conn.touch(&shared.epoch);
         if buf.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -654,8 +899,10 @@ fn run_request(
         conn.send(&ServerFrame::Progress { id, event })
     });
     let is_shutdown = matches!(request, Request::Shutdown(_));
-    let result = catch_unwind(AssertUnwindSafe(|| dispatch(handler, opts, request, &ctx)))
-        .unwrap_or_else(|_| Err(CtlError::new(ErrorCode::Internal, "handler panicked")));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        dispatch(handler, opts, shared, request, &ctx)
+    }))
+    .unwrap_or_else(|_| Err(CtlError::new(ErrorCode::Internal, "handler panicked")));
     let stop = is_shutdown && result.is_ok();
     let frame = match result {
         Ok(result) => ServerFrame::Response { id, result },
@@ -675,9 +922,11 @@ fn run_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     h: &dyn ControlHandler,
     opts: &ServerOptions,
+    shared: &Shared,
     request: Request,
     ctx: &OpContext<'_>,
 ) -> CtlResult<Response> {
@@ -701,7 +950,11 @@ fn dispatch(
         }
         Request::SnapshotRm(p) => {
             validate_snapshot_name(&p.name)?;
-            h.snapshot_rm(&p.name, p.expect_no_holders)?;
+            let held = shared.snapshot_lock(&p.name);
+            let source = |n: &str| h.holders(n);
+            let guard = HolderGuard::new(&p.name, p.expect_no_holders, held, &source);
+            guard.check_holders()?;
+            h.remove(&p.name, &guard)?;
             Response::Ok(Empty {})
         }
         Request::SnapshotReset(p) => {
@@ -710,7 +963,11 @@ fn dispatch(
             if p.name == p.from {
                 return Err(CtlError::invalid("cannot reset a snapshot from itself"));
             }
-            Response::Snapshot(h.snapshot_reset(&p.name, &p.from, p.expect_no_holders)?)
+            let held = shared.snapshot_lock(&p.name);
+            let source = |n: &str| h.holders(n);
+            let guard = HolderGuard::new(&p.name, p.expect_no_holders, held, &source);
+            guard.check_holders()?;
+            Response::Snapshot(h.swap(&p.name, &p.from, &guard)?)
         }
         Request::SnapshotRename(p) => {
             validate_snapshot_name(&p.from)?;
@@ -739,7 +996,7 @@ fn dispatch(
         Request::Ps(p) => {
             validate_snapshot_name(&p.snapshot)?;
             Response::Processes(ProcessList {
-                processes: h.ps(&p.snapshot)?,
+                processes: h.holders(&p.snapshot)?,
             })
         }
         Request::MountInfo(_) => Response::MountInfo(h.mount_info()?),

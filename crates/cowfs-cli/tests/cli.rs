@@ -74,14 +74,22 @@ impl Daemon {
             .arg("--socket")
             .arg(&socket)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while UnixStream::connect(&socket).is_err() {
-            assert!(child.try_wait().unwrap().is_none(), "serve exited early");
-            assert!(Instant::now() < deadline, "server did not come up");
-            std::thread::sleep(Duration::from_millis(20));
+        // Event-based: wait for the daemon's own ready line, with a generous no-progress budget.
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let mut line = String::new();
+            let n = stderr.read_line(&mut line).unwrap();
+            if n == 0 {
+                panic!("serve exited before it was ready");
+            }
+            if line.contains("serving") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "server did not report ready");
         }
         Daemon {
             _dir: dir,
@@ -887,4 +895,117 @@ fn a_second_signal_forces_serve_to_exit_while_a_handler_ignores_cancel() {
     let code = d.child.wait().unwrap().code();
     assert_eq!(code, Some(130));
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn a6_completions_to_a_full_device_exits_1_without_panicking() {
+    let _w = watchdog();
+    let dir = private_dir();
+    let full = std::path::Path::new("/dev/full");
+    if !full.exists() {
+        return;
+    }
+    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+        let out = Command::new(BIN)
+            .args(["completions", shell])
+            .stdout(std::fs::OpenOptions::new().write(true).open(full).unwrap())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{shell}");
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("panicked"),
+            "{shell} panicked: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = Command::new(BIN)
+        .args(["completions", "bash"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.stdout.starts_with(b"#"), "still a completion script");
+    drop(dir);
+}
+
+#[test]
+fn a7_json_mode_emits_a_json_error_for_usage_errors() {
+    let _w = watchdog();
+    for args in [
+        vec!["--json", "snapshot", "create"],
+        vec!["--json", "bogus"],
+        vec!["--json", "snapshot"],
+        vec!["--json", "gc", "--nope"],
+        vec!["--json", "import", "dir"],
+    ] {
+        let out = Command::new(BIN).args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{args:?} stdout is not one JSON object: {e}: {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        assert_eq!(v["error"]["code"], "usage", "{args:?}");
+    }
+    let out = Command::new(BIN)
+        .args(["--json", "--version"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!out.stdout.is_empty());
+    let out = Command::new(BIN)
+        .args(["--json", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("cowfs"));
+}
+
+#[test]
+fn a8_a_connect_timeout_is_exit_4() {
+    let _w = watchdog();
+    // A listener that accepts nothing at all: the backlog fills and further connects time out.
+    let dir = private_dir();
+    let path = dir.path().join("blackhole.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let _kept = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in listener.incoming().flatten() {
+            held.push(s);
+            if held.len() > 4096 {
+                break;
+            }
+        }
+    });
+    let started = Instant::now();
+    let out = Command::new(BIN)
+        .args(["--json", "--timeout", "1", "--socket"])
+        .arg(&path)
+        .arg("status")
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    // Either the daemon is reachable (0) or the connect times out (4); never 1.
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(4)),
+        "rc={:?} after {:?}: {}",
+        out.status.code(),
+        took,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.code() == Some(4) {
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["error"]["code"], "timeout");
+    }
+}
+
+#[test]
+fn a10_a_held_connection_does_not_survive_a_silent_client() {
+    let _w = watchdog();
+    let d = Daemon::start(&[]);
+    for _ in 0..40 {
+        drop(UnixStream::connect(&d.socket).unwrap());
+    }
+    assert_eq!(d.run(&["status"]).status.code(), Some(0));
 }

@@ -81,6 +81,20 @@ pub fn start_with(handler: impl ControlHandler + 'static, opts: ServerOptions) -
     }
 }
 
+/// A fixture from an already-boxed handler, so a test can keep a handle to it.
+pub fn start_arc(handler: Arc<dyn ControlHandler>, opts: ServerOptions) -> Fixture {
+    let watchdog = Watchdog::start(120);
+    let dir = private_tempdir();
+    let path = dir.path().join("c.sock");
+    let server = Server::start(&path, handler, opts).unwrap();
+    Fixture {
+        _dir: dir,
+        path,
+        server: Some(server),
+        _watchdog: watchdog,
+    }
+}
+
 pub fn start(handler: impl ControlHandler + 'static) -> Fixture {
     start_with(handler, ServerOptions::default())
 }

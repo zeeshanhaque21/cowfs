@@ -344,10 +344,12 @@ fn m3_destructive_params_are_strict() {
 
 #[test]
 fn m6_rm_and_reset_are_atomic_against_a_holder_appearing() {
+    let h = Arc::new(stub());
+    let held: Arc<std::sync::Mutex<()>> = Arc::new(std::sync::Mutex::new(()));
     for round in 0..40 {
-        let h = Arc::new(stub());
+        let base = format!("base{round}");
         h.snapshot_create(SnapshotCreate {
-            name: "base".into(),
+            name: base.clone(),
             from: None,
         })
         .unwrap();
@@ -362,11 +364,16 @@ fn m6_rm_and_reset_are_atomic_against_a_holder_appearing() {
             holds: vec![],
         };
         let h2 = Arc::clone(&h);
-        let adder = thread::spawn(move || h2.add_process("slot", holder));
+        let h3 = Arc::clone(&h);
+        let held2 = Arc::clone(&held);
+        let adder = thread::spawn(move || h2.add_holder("slot", holder, &held2));
+        let source = |n: &str| h3.holders(n);
+        let _ = &source;
+        let guard = HolderGuard::new("slot", true, Arc::clone(&held), &source);
         let outcome = if round % 2 == 0 {
-            h.snapshot_rm("slot", true)
+            h.remove("slot", &guard)
         } else {
-            h.snapshot_reset("slot", "base", true).map(|_| ())
+            h.swap("slot", &base, &guard).map(|_| ())
         };
         adder.join().unwrap();
         let present = h.snapshot_list().unwrap().iter().any(|s| s.name == "slot");
@@ -375,8 +382,15 @@ fn m6_rm_and_reset_are_atomic_against_a_holder_appearing() {
             Ok(()) => assert!(present, "reset left no snapshot under the name"),
             Err(e) => {
                 assert_eq!(e.code, ErrorCode::Busy);
-                assert!(present && !h.ps("slot").unwrap().is_empty());
+                assert!(present && !h.holders("slot").unwrap().is_empty());
             }
+        }
+        if present {
+            h.remove(
+                "slot",
+                &HolderGuard::new("slot", false, Arc::clone(&held), &|n: &str| h.holders(n)),
+            )
+            .ok();
         }
     }
 }
@@ -556,7 +570,7 @@ fn m6_snapshot_reset_is_atomic_and_refuses_when_busy() {
             &mut r,
             7,
             "snapshot_reset",
-            json!({"name": "slot", "from": "ghost"})
+            json!({"name": "slot2", "from": "ghost"})
         )),
         "not_found"
     );
@@ -565,7 +579,7 @@ fn m6_snapshot_reset_is_atomic_and_refuses_when_busy() {
             &mut r,
             8,
             "snapshot_reset",
-            json!({"name": "slot", "from": "slot"})
+            json!({"name": "slot", "from": "slot"}),
         )),
         "invalid_params"
     );

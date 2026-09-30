@@ -49,14 +49,24 @@ pub fn validate_snapshot_name(name: &str) -> CtlResult<()> {
 }
 
 /// The collision key of a snapshot name: NFC, lowercased, NFC again. Two names with the same key
-/// alias each other on a case-insensitive or normalising mount, so a backend must refuse to
-/// hold both.
+/// alias each other on a case-insensitive or normalising mount, so a backend must refuse to hold
+/// both.
+///
+/// Folding can grow a name past `MAX_NAME_BYTES` (255 bytes of dotted capital I fold to 382
+/// bytes), so a key longer than the bound is replaced by a hash of the folded form. That keeps
+/// the key a valid, bounded snapshot name, at the cost of a theoretical hash collision.
 pub fn name_key(name: &str) -> String {
-    name.nfc()
+    let folded: String = name
+        .nfc()
         .collect::<String>()
         .to_lowercase()
         .nfc()
-        .collect()
+        .collect();
+    if folded.len() <= MAX_NAME_BYTES {
+        return folded;
+    }
+    let digest = blake3::hash(folded.as_bytes()).to_hex().to_string();
+    format!("#{digest}")
 }
 
 /// An absolute path with no control characters, at most 4096 bytes. `what` names the field in the error.
@@ -141,6 +151,23 @@ mod tests {
         assert_eq!(name_key("Foo"), name_key("fOO"));
         assert_eq!(name_key("caf\u{e9}"), name_key("cafe\u{301}"));
         assert_ne!(name_key("a"), name_key("b"));
+        let long = "\u{130}".repeat(126);
+        assert!(
+            long.len() <= MAX_NAME_BYTES && long.len() > 250,
+            "{}",
+            long.len()
+        );
+        let key = name_key(&long);
+        assert!(
+            key.len() <= MAX_NAME_BYTES,
+            "the key must be bounded, got {} bytes",
+            key.len()
+        );
+        assert!(validate_snapshot_name(&key).is_ok(), "{key}");
+        assert_ne!(name_key(&format!("{long}a")), name_key(&long));
+        for n in ["\u{df}", "i", "I", "\u{212a}", "\u{c5}"] {
+            assert!(validate_snapshot_name(&name_key(n)).is_ok(), "{n}");
+        }
     }
 
     #[test]

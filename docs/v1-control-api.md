@@ -152,6 +152,9 @@ The functions are public in `cowfs-ctl` (`validate_snapshot_name`, `name_key`, `
   The key is NFC, lowercased, then NFC again, so `Foo` and `foo`, or a precomposed and a decomposed `cafe` collide.
   A rename that only changes the case of the same snapshot is allowed.
   The collision is `already_exists`.
+  Folding can grow a name past 255 bytes, so a key longer than the bound becomes `#` plus a BLAKE3
+  hash of the folded form: the key is always a valid snapshot name, at the cost of a theoretical
+  hash collision.
   This function is the API-level contract and is kept small so it can be reconciled with the naming rules of `cowfs-core`.
 - `repo` and `import.path`: absolute, at most 4096 bytes, no control characters.
   An absolute path can never be read as an option by a tool it is passed to.
@@ -170,12 +173,30 @@ A real backend must count both, because on an NFS loopback or FUSE mount the ada
 `busy` carries `details: {"holders": [ProcessInfo]}` when the backend knows them.
 
 `ps` then `snapshot_rm` is racy by nature: a process can start between the two calls.
-So the authoritative check is inside the operation.
-`snapshot_rm` and `snapshot_reset` take `expect_no_holders` (default `true`).
-The backend evaluates it under the same lock as the removal or swap, so no holder can appear between the check and the change.
+So the authoritative check is inside the operation, and the framework owns the lock that makes it
+atomic:
+
+- The framework keeps one lock per snapshot name.
+- For `snapshot_rm` and `snapshot_reset` it builds a `HolderGuard` and runs `check_holders` itself,
+  so a holder present when the request arrives is refused before the handler is called.
+- It then calls the handler's `remove(name, &guard)` or `swap(name, from, &guard)`.
+  A handler must hold `guard.lock()` across its holder check and its change, and whoever adds or
+  removes a holder must take the same lock.
+  A handler that ignores this is not conformant: `cowfs_ctl::handler_conformance` fails it, and it
+  must pass before a daemon is wired in.
+- `expect_no_holders: false` skips the check, and is what `cowfs snapshot rm --force` sends.
+
 The result is either done, or `busy` with nothing changed.
-`expect_no_holders: false` skips the check, and is what `cowfs snapshot rm --force` sends.
-The cost of `ps` is a process scan and is bounded by the request timeouts, not by the protocol.
+`busy` is checked before `not_found`, so a snapshot with a holder reports `busy` even when the
+source snapshot is also missing.
+The cost of `ps` and of the holder check is a process scan, bounded by the request timeouts.
+There is no bounded "wait until free" call in v1: a caller that gets `busy` retries.
+`cowfs_ctl::handler_conformance(handler, add_holder)` is the reusable check a backend must pass:
+it verifies that a holder makes both operations `busy` and change nothing, that `holders` reports
+injected holders, that the swap is atomic and leaves exactly one snapshot, and that concurrent
+changes of one snapshot are serialised.
+`add_holder` must add the holder while holding the same lock `guard.lock()` returns, which is what
+a real adapter must do.
 
 ### `snapshot_reset`
 
@@ -304,21 +325,23 @@ Server defaults, all in `ServerOptions`:
 
 | Limit | Default | On violation |
 |---|---|---|
-| Connections served at once | 64 | The new connection gets `too_many_connections` and is closed. |
+| Connections served at once | 64 | The least recently active idle connection is evicted and the new one admitted; if every connection has a request in flight, the new connection gets `too_many_connections` and is closed. |
+| Idle for eviction | 10 s | A connection with nothing in flight and no traffic for this long may be evicted to make room. A connection with a request in flight is never evicted. |
 | Requests in flight per connection | 32 | `busy` for the request. |
 | Requests in flight, all connections | 64 | `busy` for the request. |
 | Handshake, total from accept | 10 s | `timeout`, close. Not extended by partial data. |
 | A request line, first byte to newline | 10 s | `timeout`, close. This stops a client that sends one byte every few seconds. |
-| Idle connection (nothing in flight, no request) | 300 s | `timeout`, close. A connection with a request in flight is never idle. |
+| Idle connection (nothing in flight, no request) | 30 s | `timeout`, close. A connection with a request in flight is never idle. |
 | Write to a client | 30 s | Close, cancel the connection's requests. |
 | Request line size | 1 MiB | `line_too_long`, close. |
 
 The server uses one thread per connection and one per request, so the caps above bound the thread count: at most 64 connection threads plus 64 request threads.
-The flood test opens 3000 connections and checks the thread count stays under the cap and a real client is served.
+The flood test opens 3000 connections and checks the thread count stays under the cap, and a second test fills the cap with idle connections and checks a legitimate client is still served within the eviction window.
+The bounds are not only about resources: a connection that is idle, or accepted while the server is stopping, gets a structured answer rather than silence.
 
 Client defaults, `ClientOptions`, and the CLI `--timeout`:
 
-- Connect: 5 s.
+- Connect: 5 s, and a connect that never completes is exit 4 like any other timeout.
   A refusal is retried briefly, because a full listen backlog reports the same error as no listener.
 - Handshake: 5 s in total.
 - Response: no frame of any kind for 30 s (`--timeout`, `COWFS_TIMEOUT`).
@@ -328,7 +351,14 @@ Client defaults, `ClientOptions`, and the CLI `--timeout`:
 ## Shutdown
 
 - A `shutdown` request, `ShutdownHandle::shutdown` or a signal in `cowfs serve` begins shutdown.
-- First, the socket file is removed and the listener is closed, so new clients get "no daemon" at once (exit 3) instead of a connection nobody serves.
+- First, the accept queue is drained: every connection that connected but was not accepted yet is
+  answered with its `hello` and a `shutting_down` error per request, then closed politely, so a
+  `cowfs` call in flight at shutdown never sees a bare EOF.
+  Closing a queued connection without answering makes the kernel send RST, which is why this exists.
+- Then the socket file is removed and the listener is closed, so new clients get "no daemon" at once
+  (exit 3) instead of a connection nobody serves.
+- Every close after an error reply follows the same discipline: write the frame, half-close, read
+  away what the peer already sent, then close.
 - In-flight requests are cancelled.
   Handlers that stop send their final frame, which is `shutting_down` (a `cancelled` result is rewritten to it).
 - The server waits up to the shutdown deadline (5 s by default).
@@ -354,8 +384,11 @@ Within major version 1:
 
 ## Server framework
 
-- `ControlHandler` (`cowfs-ctl`) is the trait a daemon implements: `status`, `snapshot_*`, `gc`, `fsck`, `import`, `base_refresh`, `ps`, `mount_info`, `shutdown`.
-  `ping` and `version` are answered by the framework.
+- `ControlHandler` (`cowfs-ctl`) is the trait a daemon implements: `status`, `snapshot_list`, `snapshot_create`, `remove`, `swap`, `holders`, `gc`, `fsck`, `import`, `base_refresh`, `mount_info`, `shutdown`.
+  `ping`, `version` and `ps` (which is `holders`) are answered by the framework.
+- `remove` and `swap` replace the old `snapshot_rm` and `snapshot_reset` methods: they take a
+  `&HolderGuard` instead of a boolean, which is the whole enforcement mechanism.
+  PR #38 (cowfs-treehouse) and any real backend must adapt to that signature.
 - Names, paths and refs are validated before the call, see "Validation done by the framework".
 - It is `Send + Sync` and called concurrently from one thread per in-flight request.
   Handlers own their locking.
@@ -395,6 +428,8 @@ Within major version 1:
 - Human output by default, with control characters escaped.
   `--json` prints the response `data` object as one line on stdout.
 - With `--json`, an error is one object on stdout: `{"error": {"code": ..., "message": ..., "details"?: ...}}`, and stdout carries nothing else.
+  That includes argument errors: a bad command line in `--json` mode prints the same object and exits 2.
+  `--help` and `--version` stay clap text on stdout with exit 0.
   The CLI's own codes are `not_running`, `timeout`, `usage`, `io_error`, `cancelled` and `serve_failed`, next to the protocol codes.
 - Progress goes to stderr and never to stdout.
   On a terminal it is a single updating bar line.
