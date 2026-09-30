@@ -104,7 +104,7 @@ impl World {
                 })
                 .expect("lookup");
             for i in 0..files {
-                let data = body(65_536, d * 1000 + i);
+                let data = body(65_536, d * files + i);
                 let chunks = self.store.ingest_bytes(&data).expect("ingest");
                 let name = format!("f{i:04}");
                 let ino = snap

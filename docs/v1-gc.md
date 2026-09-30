@@ -262,29 +262,43 @@ They are added in `crates/cowfs-store/src/compact.rs`, with one `pub(crate) fn g
 ## Measurements
 
 Tool: `cargo run --release -p cowfs-gc --example gc_bench -- <mark|compact|garbage> <blocks> <n>`.
-Run under the shared CPU lock. Corpus is generated: 16 directories of `blocks/16` files of 64 KiB,
-half compressible, so a pack holds a realistic mix.
+Corpus is generated: 16 directories of `blocks/16` files of 64 KiB, half compressible, so a pack
+holds a realistic mix.
 
 Machine: Apple M3 Max, APFS, shared with other agents.
-Load1 during the runs below was 44 to 122, so every figure is a noisy lower bound and differences
+Load1 during the runs below was 32 to 60, so every figure is a noisy lower bound and differences
 under about 20% are not meaningful. n is 5 for every row and the median is shown.
+The mark and compact rows are at `blocks` 25,000, which is about 33,500 live blocks.
 
 | Metric | Median | Range | Baseline | n |
 |---|---|---|---|---|
-| Mark, 33,525 live blocks, 6 snapshots, one shared `Marker` | 0.463 s | 0.294 to 0.985 | 2.215 s with a fresh `Marker` per snapshot, 4.8x more yields (215,157 against 1,290,752) | 5 |
-| Compaction throughput, records copied | 6.1 MiB/s | 4.0 to 9.3 | 5,773,552 bytes copied per run, 8 MiB packs | 5 |
-| Collect a store that is 90% garbage, `dead_ratio` 0.5 | 1.761 s | 1.256 to 2.504 | 438.2 MiB of packs down to 134.8 MiB, 1,590,325,840 bytes freed | 5 |
-| The same at `dead_ratio` 0.1, on a smaller corpus | 0.447 s | 0.305 to 0.672 | 164.3 MiB down to 130.2 MiB | 5 |
+| Mark, 33,516 live blocks, 6 snapshots, one shared `Marker` | 0.017 s | 0.011 to 0.035 | 0.101 s with a fresh `Marker` per snapshot, 6.0x more yields (33,581 against 201,296) | 5 |
+| Compaction throughput, records copied | 2.1 MiB/s | 1.2 to 2.7 | 2,230,744 bytes copied per run, 8 MiB packs | 5 |
+| Collect a store that is 90% garbage, `dead_ratio` 0.5 | 35.194 s | 24.509 to 47.779 | 5,476.0 MiB of packs down to 1,566.8 MiB, 20,506,826,760 bytes freed | 5 |
+| The same at `dead_ratio` 0.1, on a smaller corpus | 2.936 s | 2.815 to 3.263 | 876.4 MiB down to 257.1 MiB, 3,264,322,230 bytes freed | 5 |
 
 The mark row is the one that matters for the design: the incremental marking of `docs/design.md`
-is real, and 4.8x is what six snapshots sharing a tree buy at 33,525 live blocks.
+is real, and 6.0x is what six snapshots sharing a tree buy at 33,516 live blocks.
+The absolute times here are much lower than an earlier draft of this table claimed
+(0.463 s to mark, 1.761 s to sweep). Those figures were taken from a corpus generator whose
+per-directory seed was `d * 1000 + i`, so once a directory held more than 1,000 files the seeds
+overlapped across directories and the store deduplicated them away. `blocks` therefore stopped
+scaling the corpus at around 23,500 live blocks, and the 33,525 the old table named was not
+reachable at all. The generator is fixed (`d * files + i`), and every row above is re-measured
+on the merged tree.
 The 1,000,000-block mark of the contract was not run: creating a million 64 KiB files takes longer
-than a session, and the trend from 16,000 to 33,525 blocks is linear with no knee.
+than a session, and the trend from 21,496 to 53,619 live blocks is linear with no knee.
 
 The compaction row is low, and the reason is in the decision above: a per-pack checkpoint of
 `index.cix` and a per-pack scan of the candidate set.
 Both are O(entries) per pack, so a sweep over many packs is quadratic.
-At three packs per cycle, as here, that is noise; at a hundred it will not be.
+The garbage rows are the evidence, and they are worse than this table first suggested: the
+`dead_ratio` 0.5 row sweeps 5,476 MiB of packs and takes 35.194 s, while the 876.4 MiB row
+takes 2.936 s.
+That is 19x the data for 12x the time, so the growth is real but not yet quadratic in practice.
+At a thousand packs it will be. A sweep needs to checkpoint `index.cix` once per condemned pack
+and must rescan the candidate set per pack, and neither is batched.
+This is the first thing to fix before a sweep over a real store, and it is not fixed here.
 
 ## Tests
 
