@@ -144,9 +144,7 @@ fn create_pack(io: &Io, store: &Path, id: u32) -> io::Result<File> {
         }
         reset_header(io, store, &mut file, id)
     };
-    let made = init()
-        .and_then(|_| io.sync_dir(&pack::pack_dir(store)))
-        .map(|()| ());
+    let made = init().and_then(|_| io.sync_dir(&pack::pack_dir(store)));
     match made {
         Ok(()) => Ok(file),
         Err(e) => {
@@ -194,11 +192,11 @@ fn save_torn(
     dir: &Path,
     pack: u32,
     file: &File,
-    from: u64,
-    len: u64,
+    tail: (u64, u64),
     options: &Options,
     recovery: &mut RecoveryReport,
 ) -> Result<()> {
+    let (from, len) = tail;
     let n = torn_index(dir, pack).last().map_or(0, |n| n + 1);
     let path = torn_path(dir, pack, n);
     let take = (len - from).min(TORN_KEEP);
@@ -603,7 +601,7 @@ impl Store {
                 });
             }
             if let Some(t) = torn_from {
-                save_torn(&io, &dir, id, &file, t, len, &options, &mut recovery)?;
+                save_torn(&io, &dir, id, &file, (t, len), &options, &mut recovery)?;
                 // The label is what lets a later open tell a torn tail from corruption once this
                 // pack is no longer the active one, and what lets an interrupted cut be finished.
                 if is_active {

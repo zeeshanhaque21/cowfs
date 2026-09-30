@@ -120,14 +120,14 @@ pub(crate) fn save(io: &Io, dir: &Path, entries: Vec<Entry>) -> io::Result<()> {
 }
 
 /// The entry that governs this region, newest first. A nonce or id mismatch does not match.
-pub(crate) fn find<'a>(
-    table: &'a Table,
+pub(crate) fn find(
+    table: &Table,
     pack: u32,
     nonce: u32,
     offset: u64,
     len: u64,
     id: Option<BlockId>,
-) -> Option<&'a Entry> {
+) -> Option<&Entry> {
     let mut best: Option<&Entry> = None;
     for e in table.by_start.get(&(pack, offset))? {
         if !(e.nonce == nonce || e.nonce == 0)

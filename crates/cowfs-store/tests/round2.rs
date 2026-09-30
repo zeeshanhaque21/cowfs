@@ -472,7 +472,7 @@ fn q1_repair_by_put_makes_later_opens_clean_with_and_without_the_index() {
         .unwrap();
     f.write_at(
         &[0xAB; 8],
-        (PACK_HEADER.len() as u64 + ((REC_HDR + 5000) * 2 + REC_HDR + 100) as u64),
+        PACK_HEADER.len() as u64 + ((REC_HDR + 5000) * 2 + REC_HDR + 100) as u64,
     )
     .unwrap();
     drop(f);
@@ -527,7 +527,7 @@ fn unknown_damage_needs_an_acknowledgement_that_survives_index_loss() {
         .unwrap();
     f.write_at(
         &[0xEE; 10],
-        (PACK_HEADER.len() as u64 + REC_HDR as u64 + 3008),
+        PACK_HEADER.len() as u64 + REC_HDR as u64 + 3008,
     )
     .unwrap();
     drop(f);
