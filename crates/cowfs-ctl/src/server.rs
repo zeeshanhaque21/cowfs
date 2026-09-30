@@ -8,7 +8,7 @@ use crate::{socket, sys};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+const MAX_DRAIN: u64 = 16 << 20;
 const SUPPORTED_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
 
 /// Tunables of the server framework. The defaults are the ones in `docs/v1-control-api.md`.
@@ -283,10 +284,7 @@ fn run_frames(
             match read_line(&mut reader, &mut buf, MAX_REQUEST_LINE) {
                 Ok(LineRead::Line) => {}
                 Ok(LineRead::TooLong) => {
-                    conn.send_error(
-                        None,
-                        CtlError::new(ErrorCode::LineTooLong, "request line too long"),
-                    );
+                    reject_oversized(conn, &mut reader);
                     break;
                 }
                 Ok(LineRead::Eof) | Err(_) => break,
@@ -353,6 +351,20 @@ fn run_frames(
     Ok(())
 }
 
+/// Sends `line_too_long`, then drains what the client is still sending so that closing does not
+/// reset the connection and destroy the error frame.
+fn reject_oversized(conn: &Conn, reader: &mut BufReader<UnixStream>) {
+    conn.send_error(
+        None,
+        CtlError::new(ErrorCode::LineTooLong, "request line too long"),
+    );
+    let _ = conn.stream.shutdown(Shutdown::Write);
+    let _ = reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = io::copy(&mut reader.by_ref().take(MAX_DRAIN), &mut io::sink());
+}
+
 fn handshake(
     conn: &Conn,
     reader: &mut BufReader<UnixStream>,
@@ -362,10 +374,7 @@ fn handshake(
     match read_line(reader, buf, MAX_REQUEST_LINE) {
         Ok(LineRead::Line) => {}
         Ok(LineRead::TooLong) => {
-            conn.send_error(
-                None,
-                CtlError::new(ErrorCode::LineTooLong, "request line too long"),
-            );
+            reject_oversized(conn, reader);
             return false;
         }
         Ok(LineRead::Eof) | Err(_) => return false,
