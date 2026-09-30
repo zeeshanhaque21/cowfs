@@ -317,11 +317,7 @@ impl Vfs for MemVfs {
         };
         let mut eof;
         if by_position || by_inode {
-            let list: Vec<(&Vec<u8>, Ino)> = d
-                .order
-                .values()
-                .filter_map(|n| d.entries.get(n).map(|e| (n, e.1)))
-                .collect();
+            let list: Vec<(&Vec<u8>, Ino)> = d.order.values().map(|(n, i)| (n, *i)).collect();
             let start = if cookie == 0 {
                 0
             } else if by_inode {
@@ -345,9 +341,10 @@ impl Vfs for MemVfs {
                 .peekable();
             let mut taken = 0;
             while taken < max {
-                let Some((seq, name)) = it.next() else { break };
-                let ino = d.entries.get(name).map_or(0, |e| e.1);
-                entries.extend(mk(name, ino, *seq));
+                let Some((seq, (name, ino))) = it.next() else {
+                    break;
+                };
+                entries.extend(mk(name, *ino, *seq));
                 taken += 1;
             }
             eof = it.peek().is_none();

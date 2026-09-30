@@ -159,6 +159,10 @@ impl Oracle {
                     Node::Dir(_) => None,
                 };
                 let (dp, n) = split(d);
+                let parent_is_file = matches!(self.get(dp), Ok(Node::Leaf(_)));
+                if parent_is_file && leaf.is_none() {
+                    return Err(vec![Error::NotDir, Error::PermissionDenied]);
+                }
                 let dir = self.dir_mut(dp)?;
                 let exists = dir.kids.contains_key(&n);
                 match leaf {
@@ -265,6 +269,8 @@ impl Oracle {
 
     fn rename(&mut self, a: &[u8], b: &[u8], no_replace: bool) -> Result<Obs, Errs> {
         let ((ap, an), (bp, bn)) = (split(a), split(b));
+        self.get(ap)?;
+        self.get(bp)?;
         self.dir_mut(ap)?;
         self.dir_mut(bp)?;
         let src = self.get(a)?;

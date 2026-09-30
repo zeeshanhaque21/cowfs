@@ -33,7 +33,7 @@ pub enum Fault {
 
 struct Dir {
     entries: BTreeMap<Vec<u8>, (u64, Ino)>,
-    order: BTreeMap<u64, Vec<u8>>,
+    order: BTreeMap<u64, (Vec<u8>, Ino)>,
     next_seq: u64,
     parent: Ino,
 }
@@ -279,7 +279,7 @@ impl State {
         let seq = d.next_seq;
         d.next_seq += 1;
         d.entries.insert(name.to_vec(), (seq, ino));
-        d.order.insert(seq, name.to_vec());
+        d.order.insert(seq, (name.to_vec(), ino));
         Ok(())
     }
 

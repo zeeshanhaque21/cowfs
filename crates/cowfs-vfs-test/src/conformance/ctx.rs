@@ -156,6 +156,7 @@ impl Ctx {
     pub fn list_paged(&self, dir: Ino, page: usize) -> std::result::Result<Vec<DirEntry>, Failure> {
         let mut out: Vec<DirEntry> = Vec::new();
         let mut cookie = 0;
+        let mut resumed_from = std::collections::HashSet::new();
         loop {
             let r = self.fs.readdir(dir, cookie, page)?;
             ensure!(
@@ -165,6 +166,10 @@ impl Ctx {
             );
             if let Some(last) = r.entries.last() {
                 cookie = last.cookie;
+                ensure!(
+                    resumed_from.insert(cookie),
+                    "cookie {cookie} ended two pages: the listing went round in a loop"
+                );
             } else {
                 ensure!(r.eof, "readdir returned no entries but eof is false");
             }
