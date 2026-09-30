@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::ctl::Daemon;
 use crate::error::{Error, Result};
 use crate::naming;
-use crate::th::{Lease, Treehouse};
+use crate::th::Treehouse;
 
 /// How a snapshot is made to appear at a slot's path.
 ///
@@ -290,6 +290,66 @@ fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(text))
 }
 
+/// A lease that comes back unless it is deliberately kept.
+///
+/// A pool slot is a scarce, shared resource: on the real cowfs pool `max_trees` is 12 and eleven
+/// other agents hold slots, so every early return, failed build and missing daemon must give the
+/// slot back rather than burn it. The guard returns it on drop and is disarmed only on success.
+#[derive(Debug)]
+pub struct LeaseGuard<'a> {
+    treehouse: &'a Treehouse,
+    slot: PathBuf,
+    lease_id: String,
+    armed: bool,
+}
+
+impl<'a> LeaseGuard<'a> {
+    /// Leases a slot and arms the guard.
+    pub fn acquire(treehouse: &'a Treehouse, repo: &Path) -> Result<LeaseGuard<'a>> {
+        let lease = treehouse.get_lease(repo, &[])?;
+        Ok(LeaseGuard {
+            treehouse,
+            slot: lease.path,
+            lease_id: lease.lease_id,
+            armed: true,
+        })
+    }
+
+    /// The leased worktree path.
+    pub fn slot(&self) -> &Path {
+        &self.slot
+    }
+
+    /// The lease identity, which is what the release is pinned to.
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    /// Keeps the lease: the caller is taking the slot and will release it itself.
+    pub fn keep(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LeaseGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best effort: the caller's own error is the one that matters, and a second attempt would
+        // fail the same way. Never panics out of a drop.
+        if let Err(e) = self
+            .treehouse
+            .return_slot(&self.slot, true, self.lease_id.as_str())
+        {
+            eprintln!(
+                "cowfs-treehouse: could not return the leased slot {}: {e}",
+                self.slot.display()
+            );
+        }
+    }
+}
+
 /// Acquires a slot and provisions it, which is `cowfs-treehouse get`.
 pub fn get(
     daemon: &mut Daemon,
@@ -300,15 +360,26 @@ pub fn get(
 ) -> Result<Acquired> {
     let main = naming::main_repo_root(repo)?;
     let extra: Vec<&str> = extra_treehouse.iter().map(String::as_str).collect();
-    let lease: Lease = th.get_lease(&main, &extra)?;
+    let lease = th.get_lease(&main, &extra)?;
+    let lease_id = lease.lease_id.clone();
+    let slot_path = lease.path.clone();
+    // The materialiser refuses today (gap 1), so without this every mode (b) attempt would burn a
+    // pool slot. The caller still gets the original failure.
+    let mut guard = LeaseGuard {
+        treehouse: th,
+        slot: lease.path.clone(),
+        lease_id: lease.lease_id.clone(),
+        armed: true,
+    };
     let mut out = Provision {
         daemon,
         materialiser,
-        slot_path: lease.path.clone(),
+        slot_path,
         pool_id: None,
     }
     .run()?;
-    out.lease_id = lease.lease_id;
+    guard.keep();
+    out.lease_id = lease_id;
     Ok(out)
 }
 
@@ -443,10 +514,13 @@ impl BaseRefresh<'_> {
                         "a build needs a treehouse root so a slot can be leased".to_owned(),
                     )
                 })?;
-                let lease = th.get_lease(&main, &[])?;
-                run_build(&lease.path, self.build.as_deref().unwrap_or_default())?;
-                th.return_slot(&lease.path, true, Some(lease.lease_id.as_str()))?;
-                (true, Some(lease.path))
+                let mut guard = LeaseGuard::acquire(th, &main)?;
+                let slot = guard.slot().to_path_buf();
+                // The `?` runs while the guard is still armed, so a failed build hands the slot
+                // back on the way out instead of burning one of the pool's.
+                run_build(&slot, self.build.as_deref().unwrap_or_default())?;
+                guard.keep();
+                (true, Some(slot))
             }
         };
 

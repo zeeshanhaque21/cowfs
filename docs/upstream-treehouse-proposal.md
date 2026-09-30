@@ -126,6 +126,18 @@ provisioner that claims the path is responsible for the `.git` file and for
 
 ## 2. `pre_return`
 
+### The seam already exists
+
+This is smaller than it looks. `internal/pool/pool.go:1047` `ReleaseConditional` already takes a
+`beforeReset func() error` and `cmd/get.go:251` already passes `killLingeringProcesses` into it,
+inside `ReleaseConditional`'s `beforeReset` position, under the same pool state lock and
+immediately before the destructive reset. The lock is what makes it valuable: a writer cannot slip
+in between the emptiness check and the reset.
+
+So `pre_return` is mostly a matter of wiring that existing parameter to a hook list, the way
+`AcquireWithOptions` already wires `postCreate`. No new transaction, no new lock, no new ordering to
+reason about.
+
 ### Motivation
 
 `treehouse return` destroys the worktree's content: `git reset --hard` and `git clean -xdf`. For
@@ -135,6 +147,12 @@ has to do it **before** the destructive reset, and today there is no hook at tha
 
 `pre_destroy` is close but not equivalent: it runs only for `destroy` and `prune`, never for
 `return`, and it runs after treehouse has already decided what is removable.
+
+Without the hook, the cowfs companion has to swap the slot's snapshot to an empty one *before* it
+calls `treehouse return`, which works but leaves a window: between the reset and the release, a
+concurrent `get` can observe a slot that is empty and not yet returned. The window is small and the
+release is pinned with `--if-lease-id`, so it is not a correctness hole today. It is the reason the
+hook is still worth asking for.
 
 ### Interface
 
@@ -155,8 +173,10 @@ type Hooks struct {
   lock the emptiness check uses.
 - **Environment.** As for `pre_create`, plus `TREEHOUSE_LEASE_ID` and `TREEHOUSE_LEASE_HOLDER`
   when the slot is leased, so a hook can key on the lease identity the release is pinned to.
-- **Exit status.** Logged and non-fatal, exactly like every other hook. It is advisory, not a veto:
-  a return that the operator asked for must not be silently cancelled by a hook.
+- **Exit status.** Logged and non-fatal, exactly like every other hook, and for the same reason as
+  every other hook: a hook must not be able to turn "return this slot" into "do nothing", because
+  that failure would be invisible in the pool's state. A return the operator asked for either
+  happens or fails.
 
 Deliberately **not** claiming semantics, unlike `pre_create`. A return either happens or it does
 not, and a hook that could stop one would make `treehouse return` unreliable in a way that is hard

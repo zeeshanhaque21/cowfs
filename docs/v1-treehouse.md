@@ -237,6 +237,31 @@ only the holder checks and the wait apply. The mode is explicit, `--mode a` or `
 guessing it from whether a root was given would make a mode (a) return demand a daemon it does not
 need.
 
+### `--root` does not sandbox a path argument
+
+treehouse v3.1.0 resolves the pool of `return <path>` and `destroy <path>` **from the path itself**
+(`cmd/return_cmd.go:567`, `cmd/destroy.go:195`) and only falls back to `--root`. So `--root` alone
+is not a containment boundary, and a caller that builds `--root` from one variable and `--slot` from
+another releases whatever pool the slot is in.
+
+Three layers, because one is not enough:
+
+1. `cowfs-treehouse` refuses, before any daemon or treehouse call, unless the canonical slot path is
+   at least three components under `canonical(--root)/.treehouse`. Exit 2.
+2. The pool id a slot yields is cross-checked against the pool id derived from the repository the
+   slot belongs to, so a path whose pool directory lies about which repository it serves is refused.
+3. `Treehouse::return_slot` and `Treehouse::destroy` assert containment again, because they are the
+   layer that hands a path to a binary that would ignore the root.
+
+And a release is never unpinned: the lease identity is read from `treehouse status` run in the main
+repository, and a slot whose identity cannot be read is a hard error rather than an unpinned
+`return`. Without the pin, a slot re-leased between the lookup and the release is handed back under
+its new owner.
+
+`--root` is passed on every treehouse invocation and `TREEHOUSE_ROOT` is explicitly **removed** from
+the child environment. treehouse falls back to that variable, so exporting both would let a dropped
+`--root` pass unnoticed.
+
 Pinning the release with `--if-lease-id` means a slot that was re-leased between our `ps` and our
 return is left alone instead of being reset under its new owner. The `expect_no_holders` check in
 step 4 is the authoritative one, evaluated by the daemon under the same lock as the reset; `ps` is
@@ -338,6 +363,8 @@ Ordered by what blocks what.
 | 8 | `base_refresh` must record the real commit, not a synthetic one, for staleness detection to mean anything. The stub records `stub-{git_ref}`. | staleness detection against a real backend | cowfs-core |
 | 9 | AppleDouble `._*` files: not a snapshot problem, a mount problem. The mount must hide them or translate them, or `git status` in a slot reports them. | mode (a) and (b) on macOS | cowfs adapters |
 | 10 | `treehouse` with `vcs = "jj"` uses a different remote-URL lookup, so `pool_id` derivation in the companion is the git backend only. | jj pools | accepted limitation, documented |
+| 11 | A lease taken for a multi-step flow has to come back on every error path. `base refresh` and `get` hold one in an RAII guard; a build failure, a missing daemon or the gap 1 materialiser all hand the slot back. | nothing; a correctness property | fixed, `tests/regressions.rs` |
+| 12 | `terminate` never signals pid 0, 1, the caller, any ancestor, or a pid that has already exited. The liveness check is inside `signalable` so there is no ordering in which a stale pid reaches a signal. | nothing; a safety property | fixed, `tests/regressions.rs` |
 
 The upstream proposal for gaps 3, 4 and 5 is `docs/upstream-treehouse-proposal.md`.
 Gap 5 is the same change spike 5 proposed. Gaps 3 and 4 are one small hook-key addition.
@@ -376,6 +403,40 @@ An alternative that needs no protocol change is for the mount to accept a
 `--slot-export {snapshot}={path}` option at `serve` time, driven by the companion, and for the
 companion to shell out to that. It is less clean, because the mount configuration then depends on
 which slots exist.
+
+### What the daemon must refuse for `mount_snapshot`
+
+A client-chosen `path` is a mount primitive, so the client cannot be the one that keeps it inside a
+treehouse pool. Every rule below is enforced by the daemon, regardless of what the client asks for,
+and each one is `invalid_params` unless noted.
+
+| Rule | Why it has to be a server-side rule |
+|---|---|
+| `path` must be absolute, at most 4096 bytes, and free of control characters. | The existing `validate_abs_path` rule, so an absolute path can never be read as an option by a tool it is passed to. |
+| `path` must be inside a configured export root, and at least three components below it: `{root}/{pool}/{slot}/{repo}`. | This is the containment that `cowfs-treehouse` checks client side (`naming::assert_in_pool`) and the daemon must re-check, because a control-socket client is not the companion. Without it, a compromised or buggy client mounts a snapshot over an arbitrary directory. |
+| No component of `path` may be a symlink, resolved from the export root down. | A symlinked parent is the classic way a path check is bypassed: the check sees a name inside the root while the kernel follows the link out of it. Resolution must be component by component with `O_NOFOLLOW`, not a single `realpath` at the end. |
+| `path` must not contain `..`, and must not resolve to an existing symlink. | Same class, and it is why the pool-id check in `cowfs-treehouse` compares canonical forms. |
+| `path` must be absent, or an empty directory that contains nothing but `.` and `..`. | Mounting over a non-empty directory hides real data, and the slot directory treehouse just created with `git worktree add` is never empty in mode (b). Refusing a non-empty target is what stops a bad path from silently shadowing a checkout. |
+| `path` must not be the mount point, an ancestor of the mount point, or the store directory. | Otherwise the export lands inside itself and the store becomes unreachable. |
+| The daemon's uid must own `path` and every component up to the export root, and the export root must not be group or other writable. | The same rule the socket directory already obeys. A world-writable parent lets another user aim the mount. |
+| `name` must pass `validate_snapshot_name`, and the snapshot must exist. | No traversal by another route: a snapshot name is a directory name, and the rule that bans a leading dot is what keeps `.nfs*` and AppleDouble out. |
+| `name` must not already be exported at a different `path`. | One snapshot, one export. Two would mean two live mountpoints for one writable tree. |
+| `expect_no_holders` defaults to true and is evaluated under the same lock as the export, exactly as for `snapshot_reset`. | The race this protocol already solved: a holder appearing between the check and the change. |
+| The whole operation is atomic: the export is either fully visible or not visible at all. | A half-built export is a slot path that exists but shows nothing, which reads as an empty worktree. |
+| A crash mid-export leaves either the old export or none, never a stale mountpoint. | Same crash rule as every other cowfs operation. |
+| The daemon owns the lifetime: an export is unmounted by `unmount_snapshot` or at daemon shutdown, never by the client killing a process. | Otherwise a crashed client leaves a live mountpoint nothing knows about. |
+
+`unmount_snapshot {path}` mirrors it: `path` must be one the daemon exported, must pass the same
+containment rules, and must be `busy` (nothing changed) while any holder is inside it or the mount
+adapter holds the tree. That is the same `busy` semantics as `snapshot_rm`, so the caller already
+knows how to handle it.
+
+A rejected `mount_snapshot` must be safe to retry: nothing is created, and a later attempt with a
+good path succeeds. A test that mounts at a bad path, then at a good one, and checks the first left
+no trace is the cheapest proof of the whole list.
+
+Nothing here is a suggestion. A server-side rule the daemon enforces regardless of client intent is
+what turns a mount primitive into a capability the companion can hold.
 
 ## What needs the real core or a real mount
 

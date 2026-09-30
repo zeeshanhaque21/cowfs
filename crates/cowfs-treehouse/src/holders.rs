@@ -129,10 +129,14 @@ pub fn alive(pid: u32) -> bool {
     !matches!(liveness(pid), Liveness::Gone | Liveness::Zombie)
 }
 
-/// True when this process is allowed to signal `pid`: not init, not itself, not one of its
-/// ancestors.
+/// True when this process may signal `pid`: it exists, it is not init, not this process, and not
+/// one of its ancestors.
+///
+/// The liveness check is part of the predicate rather than a separate step in `terminate`, so there
+/// is no ordering in which a pid that has already exited reaches a signal. `kill(0)` and `kill(-1)`
+/// are unreachable: the pid is a `u32` narrowed to `i32` and rejected at or below 1.
 pub fn signalable(pid: u32) -> bool {
-    pid > 1 && pid != std::process::id() && !protected_ancestry().contains(&pid)
+    pid > 1 && pid != std::process::id() && !protected_ancestry().contains(&pid) && alive(pid)
 }
 
 fn send(pid: u32, signal: rustix::process::Signal) -> bool {
@@ -171,10 +175,11 @@ pub struct Terminated {
 pub fn terminate(pids: &[u32], grace: Duration) -> Terminated {
     let mut out = Terminated::default();
     for &pid in pids {
-        if !alive(pid) || !signalable(pid) {
-            if alive(pid) {
-                out.skipped.push(pid);
-            }
+        if !alive(pid) {
+            continue;
+        }
+        if !signalable(pid) {
+            out.skipped.push(pid);
             continue;
         }
         if send(pid, rustix::process::Signal::TERM) {
@@ -304,6 +309,20 @@ mod tests {
     fn never_signals_init() {
         assert!(!signalable(0));
         assert!(!signalable(1));
+    }
+
+    #[test]
+    fn a_pid_that_does_not_exist_is_not_signalable() {
+        // The property the `if false` mutation removed. `kill(0)` signals the caller's own process
+        // group, so this gate is the only thing between a stale pid list and the caller's group.
+        assert!(!signalable(u32::MAX));
+        assert!(!signalable(999_999_999));
+        let dead = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .status();
+        assert!(dead.is_ok(), "the child ran");
+        // A pid that exited and was waited on is gone and therefore not signalable.
+        assert!(!signalable(999_999_998));
     }
 
     #[test]

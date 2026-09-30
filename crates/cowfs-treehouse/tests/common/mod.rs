@@ -1,9 +1,11 @@
 //! Shared fixtures: an in-process stub daemon, a throwaway git repository, and a sandboxed
-//! treehouse pool.
+//! treehouse pool behind a safety shim.
 //!
-//! Nothing here touches a real pool. Every treehouse invocation gets a sandbox `HOME`, a sandbox
-//! `TREEHOUSE_ROOT` and an explicit `--root`, and every one of them asserts afterwards that no
-//! path under the real `~/.treehouse` appeared in its output.
+//! Every treehouse invocation in these tests goes through [`Sandbox::shim`], a script generated per
+//! sandbox that refuses any call without an explicit `--root` inside that sandbox, refuses any
+//! absolute path argument outside it, and forces the sandbox `HOME` and `TREEHOUSE_ROOT`. The real
+//! store under `~/.treehouse` is leased to other agents, so the guard has to be in the test itself
+//! rather than in a habit.
 
 #![allow(dead_code)]
 
@@ -13,24 +15,109 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The real treehouse store on this machine. Every guard below refuses to let it near a command.
+/// The real treehouse store on this machine, or wherever `TREEHOUSE_REAL_STORE` points it. Only
+/// ever read: it belongs to other agents.
 pub fn real_treehouse_root() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
-    home.join(".treehouse")
-}
-
-/// The treehouse binary, from the environment or the usual place.
-pub fn treehouse_bin() -> PathBuf {
-    match std::env::var_os("COWFS_TREEHOUSE_BIN") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => PathBuf::from("/Users/zeeshanhaque/.local/bin/treehouse"),
+    match std::env::var_os("TREEHOUSE_REAL_STORE").filter(|v| !v.is_empty()) {
+        Some(v) => PathBuf::from(v),
+        None => std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from("/"), PathBuf::from)
+            .join(".treehouse"),
     }
 }
 
-/// True when the real treehouse binary is present, so a test can skip rather than fail on a
-/// machine without it.
+/// Why the real treehouse binary cannot be used, when it cannot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreehouseMissing {
+    /// Nothing on PATH, nothing in the usual place.
+    NotFound,
+    /// Something is there but does not answer `--version`.
+    Unusable(String),
+}
+
+impl std::fmt::Display for TreehouseMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TreehouseMissing::NotFound => f.write_str(
+                "no treehouse binary on PATH, and none at $HOME/.local/bin/treehouse; set \
+                 COWFS_TREEHOUSE_BIN to run these tests",
+            ),
+            TreehouseMissing::Unusable(why) => {
+                write!(f, "treehouse is present but unusable: {why}")
+            }
+        }
+    }
+}
+
+/// The real treehouse binary: `COWFS_TREEHOUSE_BIN`, then PATH, then `$HOME/.local/bin`.
+///
+/// PATH first, because a hardcoded path exists inside an OrbStack VM through a shared mount while
+/// naming a binary that cannot run there.
+pub fn find_treehouse() -> Result<PathBuf, TreehouseMissing> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(v) = std::env::var_os("COWFS_TREEHOUSE_BIN").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(v));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("treehouse");
+            if candidate.is_file() {
+                candidates.push(candidate);
+                break;
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".local/bin/treehouse"));
+    }
+    for candidate in &candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let ok = Command::new(candidate)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            return Ok(candidate.clone());
+        }
+        // Present but cannot answer: keep looking, and report it if nothing better turns up.
+        return Err(TreehouseMissing::Unusable(format!(
+            "{} does not answer --version",
+            candidate.display()
+        )));
+    }
+    Err(TreehouseMissing::NotFound)
+}
+
+/// The treehouse binary, or a printed skip reason when there is none.
+pub fn treehouse_bin() -> Result<PathBuf, TreehouseMissing> {
+    find_treehouse()
+}
+
+/// True when the real treehouse binary is usable, so a test can skip rather than fail.
 pub fn treehouse_available() -> bool {
-    treehouse_bin().is_file()
+    find_treehouse().is_ok()
+}
+
+/// Skips the current test with a visible reason, so an absent treehouse never looks like a pass.
+#[macro_export]
+macro_rules! require_treehouse {
+    () => {
+        match $crate::common::treehouse_bin() {
+            Ok(bin) => bin,
+            Err(why) => {
+                eprintln!(
+                    "skipping {}: {why}",
+                    std::thread::current().name().unwrap_or("?")
+                );
+                return;
+            }
+        }
+    };
 }
 
 /// A treehouse pool and repository in a temporary directory, with its own sandbox HOME.
@@ -74,6 +161,58 @@ impl Sandbox {
         self.dir.path().join("pool")
     }
 
+    /// A second pool root in the same sandbox, so a caller can prove that a `--root` naming one
+    /// pool cannot release a slot in the other.
+    pub fn other_pool(&self) -> PathBuf {
+        self.dir.path().join("poolB")
+    }
+
+    /// A `treehouse` shim that refuses to leave this sandbox.
+    ///
+    /// It is what every call in these tests goes through, including the ones the companion makes,
+    /// because a call the companion builds is exactly where a wrong pool root would hide.
+    pub fn shim(&self) -> PathBuf {
+        let real = find_treehouse().expect("a sandbox needs a real treehouse binary");
+        let dir = self.dir.path().join("bin");
+        std::fs::create_dir_all(&dir).expect("mkdir bin");
+        let path = dir.join("treehouse");
+        let script = format!(
+            r#"#!/bin/sh
+# Generated by the cowfs-treehouse test fixtures. Refuses to leave its sandbox.
+SB='{sb}'
+root=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--root" ]; then root="$a"; fi
+  prev="$a"
+done
+if [ -z "$root" ]; then echo "SHIM: no --root, refusing" >&2; exit 91; fi
+case "$root" in
+  "$SB"/*) : ;;
+  *) echo "SHIM: --root $root is outside the sandbox" >&2; exit 92 ;;
+esac
+for a in "$@"; do
+  case "$a" in
+    /*) case "$a" in "$SB"/*) : ;; *) echo "SHIM: path argument $a is outside the sandbox" >&2; exit 93 ;; esac ;;
+  esac
+done
+HOME='{home}'
+TREEHOUSE_ROOT="$root"
+export HOME TREEHOUSE_ROOT
+mkdir -p "$HOME"
+exec '{real}' "$@"
+"#,
+            sb = self.dir.path().display(),
+            home = self.home().display(),
+            real = real.display(),
+        );
+        std::fs::write(&path, script).expect("write shim");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the shim");
+        path
+    }
+
     /// Runs a git command in `cwd` and fails the test when git does not.
     pub fn git(&self, cwd: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -90,15 +229,19 @@ impl Sandbox {
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
-    /// Runs the real treehouse binary against this sandbox and guards the output.
-    pub fn treehouse(&self, args: &[&str]) -> Output {
-        let root = self.pool();
-        let out = Command::new(treehouse_bin())
+    /// The sandbox `HOME`, as a value to pass as `--treehouse-home`, or `None` when the caller does
+    /// not want one.
+    pub fn shim_home(&self) -> Option<PathBuf> {
+        Some(self.home())
+    }
+
+    /// Runs treehouse against this sandbox through the shim, and guards the output.
+    pub fn treehouse_at(&self, root: &Path, args: &[&str]) -> Output {
+        let out = Command::new(self.shim())
             .args(args)
             .arg("--root")
-            .arg(&root)
-            .env("HOME", self.home())
-            .env("TREEHOUSE_ROOT", &root)
+            .arg(root)
+            .env_remove("TREEHOUSE_ROOT")
             .env_remove("TREEHOUSE_LEASE_HOLDER")
             .current_dir(self.repo())
             .stdin(Stdio::null())
@@ -106,6 +249,11 @@ impl Sandbox {
             .unwrap_or_else(|e| panic!("cannot run treehouse: {e}"));
         assert_sandboxed(args, &out);
         out
+    }
+
+    /// Runs treehouse against this sandbox's own pool through the shim.
+    pub fn treehouse(&self, args: &[&str]) -> Output {
+        self.treehouse_at(&self.pool(), args)
     }
 
     /// Runs treehouse and requires success.

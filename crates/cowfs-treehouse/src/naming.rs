@@ -137,6 +137,79 @@ pub fn pool_id_of_slot_path(slot_path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The directory a treehouse root resolves to. treehouse appends `.treehouse` to any explicit
+/// root, so the pool lives one level below what the caller names.
+pub fn pool_root_dir(root: &Path) -> PathBuf {
+    root.join(".treehouse")
+}
+
+/// The treehouse root a slot path belongs to, when it looks like it is in one at all.
+///
+/// Used where no `--root` was passed, such as the `post_create` hook, which runs with the worktree
+/// as its working directory and nothing else.
+pub fn pool_root_of(slot: &Path) -> Option<PathBuf> {
+    // {root}/.treehouse/{pool}/{slot}/{repo}
+    let pool_root = slot.parent()?.parent()?.parent()?;
+    if pool_root.file_name()? != ".treehouse" {
+        return None;
+    }
+    pool_root.parent().map(Path::to_path_buf)
+}
+
+/// Requires `slot` to be a slot directory of the pool under `root`.
+///
+/// Necessary because treehouse v3.1.0 resolves the pool of `return <path>` and `destroy <path>`
+/// **from the path itself** (`cmd/return_cmd.go:567`, `cmd/destroy.go:195`) and only falls back to
+/// `--root`, so `--root` does not sandbox a path argument at all. Without this a caller that builds
+/// `--root` from one variable and `--slot` from another releases another pool's worktree.
+pub fn assert_in_pool(slot: &Path, root: &Path) -> Result<()> {
+    let pool = canonical(&pool_root_dir(root));
+    let want = canonical(slot);
+    let rel = want.strip_prefix(&pool).map_err(|_| {
+        Error::Usage(format!(
+            "{} is outside the named treehouse pool {}; --root does not constrain a path \
+             argument, because treehouse takes the pool from the path",
+            pool.display(),
+            slot.display()
+        ))
+    })?;
+    // {pool}/{slot}/{repo}: three components, so a path one or two levels up is not a slot.
+    if rel.components().count() < 3 {
+        return Err(Error::Usage(format!(
+            "{} is not a slot directory, which is {{pool}}/{{slot}}/{{repo}}",
+            slot.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The pool id of a slot, cross-checked against the repository it belongs to.
+///
+/// The pool directory name *is* the pool id, so the path is enough to name it, but a path can lie.
+/// When the slot's own git metadata resolves to a repository, the id derived from that repository
+/// must agree, or the snapshot names would address a pool the caller never named.
+pub fn pool_id_in_pool(slot: &Path, root: &Path) -> Result<String> {
+    assert_in_pool(slot, root)?;
+    let from_path = pool_id_of_slot_path(slot).ok_or_else(|| {
+        Error::Usage(format!(
+            "cannot read a pool id out of {}; it is not {{pool}}/{{slot}}/{{repo}}",
+            slot.display()
+        ))
+    })?;
+    if let Ok(main) = main_repo_root(slot) {
+        if let Ok(derived) = pool_id(&main) {
+            if derived != from_path {
+                return Err(Error::Usage(format!(
+                    "the pool directory {from_path:?} in {} does not belong to the repository \
+                     {main:?}, whose pool id is {derived:?}; refusing to act on it",
+                    slot.display()
+                )));
+            }
+        }
+    }
+    Ok(from_path)
+}
+
 fn finish(name: String) -> Result<String> {
     // A derived name that starts with a dash would be read as an option by any tool it is passed
     // to, which the API validator allows and this must not.
@@ -271,6 +344,53 @@ mod tests {
     #[test]
     fn relative_repo_root_is_refused() {
         assert!(pool_id(Path::new("relative/path")).is_err());
+    }
+
+    #[test]
+    fn containment_rejects_a_path_outside_the_named_root() {
+        let root = Path::new("/sandbox/pool");
+        let inside = Path::new("/sandbox/pool/.treehouse/repo-abc123/1/repo");
+        assert!(
+            assert_in_pool(inside, root).is_ok(),
+            "a slot in the pool is fine"
+        );
+        for outside in [
+            Path::new("/sandbox/other/.treehouse/repo-abc123/1/repo"),
+            Path::new("/elsewhere/.treehouse/cowfs-7c1bf8/10/cowfs"),
+            Path::new("/sandbox/pool"),
+        ] {
+            let err = assert_in_pool(outside, root).expect_err("must be refused");
+            assert!(matches!(err, Error::Usage(_)), "{err:?}");
+            assert!(
+                err.to_string().contains("outside") || err.to_string().contains("not a slot"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn containment_needs_three_components_below_the_pool() {
+        let root = Path::new("/sandbox/pool");
+        assert!(assert_in_pool(Path::new("/sandbox/pool/.treehouse/repo-a/1"), root).is_err());
+        assert!(assert_in_pool(Path::new("/sandbox/pool/.treehouse/repo-a/1/repo"), root).is_ok());
+    }
+
+    #[test]
+    fn pool_root_dir_is_the_named_root_plus_dot_treehouse() {
+        assert_eq!(
+            pool_root_dir(Path::new("/sandbox/pool")),
+            PathBuf::from("/sandbox/pool/.treehouse")
+        );
+    }
+
+    #[test]
+    fn a_slot_reports_the_root_it_lives_under_and_nothing_else_does() {
+        assert_eq!(
+            pool_root_of(Path::new("/sandbox/pool/.treehouse/repo-a/1/repo")),
+            Some(PathBuf::from("/sandbox/pool"))
+        );
+        assert_eq!(pool_root_of(Path::new("/tmp/notapool/x/y")), None);
+        assert_eq!(pool_root_of(Path::new("/")), None);
     }
 
     #[test]

@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{treehouse_available, treehouse_bin, Fixture, Sandbox, Watchdog};
+use common::{Fixture, Sandbox, Watchdog};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -20,6 +20,11 @@ use std::time::Duration;
 /// codes rather than the library.
 fn companion() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_cowfs-treehouse"))
+}
+
+/// The sandboxed treehouse shim, so every companion call in this file is guarded too.
+fn shim_of(s: &Sandbox) -> String {
+    s.shim().display().to_string()
 }
 
 /// The `cowfs` binary, built alongside it in the same target directory.
@@ -91,13 +96,7 @@ fn lease(s: &Sandbox) -> (PathBuf, String) {
 #[test]
 fn the_pool_id_the_companion_derives_is_the_pool_directory_treehouse_creates() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
-        eprintln!(
-            "skipping: no treehouse binary at {}",
-            treehouse_bin().display()
-        );
-        return;
-    }
+    crate::require_treehouse!();
     let s = Sandbox::new();
     let (slot, _) = lease(&s);
 
@@ -123,14 +122,12 @@ fn the_pool_id_the_companion_derives_is_the_pool_directory_treehouse_creates() {
 #[test]
 fn return_without_a_root_is_refused_rather_than_guessing_a_pool() {
     let _w = Watchdog::start(60);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let s = Sandbox::new();
     let (slot, _) = lease(&s);
     let out = run(&[
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "return",
@@ -146,9 +143,7 @@ fn return_without_a_root_is_refused_rather_than_guessing_a_pool() {
 #[test]
 fn a_cwd_holder_in_a_slot_is_terminated_and_the_slot_returns_clean() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let s = Sandbox::new();
     let (slot, lease_id) = lease(&s);
     let q = slot.display().to_string();
@@ -160,7 +155,7 @@ fn a_cwd_holder_in_a_slot_is_terminated_and_the_slot_returns_clean() {
     // Mode (a): no daemon at all, and no --socket either.
     let out = run(&[
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "--json",
@@ -194,9 +189,7 @@ fn a_cwd_holder_in_a_slot_is_terminated_and_the_slot_returns_clean() {
 #[test]
 fn an_open_fd_holder_is_named_through_the_control_api_and_the_return_refuses_while_it_is_listed() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let dir = common::private_tempdir();
     let stub = common::stub_in(dir.path());
     let s = Sandbox::new();
@@ -236,7 +229,7 @@ fn an_open_fd_holder_is_named_through_the_control_api_and_the_return_refuses_whi
         "--socket",
         &stub.socket.display().to_string(),
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "--json",
@@ -267,9 +260,7 @@ fn an_open_fd_holder_is_named_through_the_control_api_and_the_return_refuses_whi
 #[test]
 fn a_mode_b_return_empties_the_slot_and_hands_it_back() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let dir = common::private_tempdir();
     let stub = common::stub_in(dir.path());
     let s = Sandbox::new();
@@ -294,7 +285,7 @@ fn a_mode_b_return_empties_the_slot_and_hands_it_back() {
         "--socket",
         &stub.socket.display().to_string(),
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "--json",
@@ -348,9 +339,7 @@ fn a_mode_b_return_empties_the_slot_and_hands_it_back() {
 #[test]
 fn discard_releases_the_lease_and_drops_the_snapshot() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let dir = common::private_tempdir();
     let stub = common::stub_in(dir.path());
     let s = Sandbox::new();
@@ -368,7 +357,7 @@ fn discard_releases_the_lease_and_drops_the_snapshot() {
         "--socket",
         &stub.socket.display().to_string(),
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "--json",
@@ -404,9 +393,7 @@ fn discard_releases_the_lease_and_drops_the_snapshot() {
 #[test]
 fn a_holder_that_appears_between_the_scan_and_the_swap_is_still_caught() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let dir = common::private_tempdir();
     let stub = common::stub_in(dir.path());
     let s = Sandbox::new();
@@ -451,9 +438,7 @@ fn a_holder_that_appears_between_the_scan_and_the_swap_is_still_caught() {
 #[test]
 fn the_wrapper_waits_for_silly_rename_dirt_and_refuses_when_it_stays() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let dir = common::private_tempdir();
     let stub = common::stub_in(dir.path());
     let s = Sandbox::new();
@@ -471,7 +456,7 @@ fn the_wrapper_waits_for_silly_rename_dirt_and_refuses_when_it_stays() {
         "--socket",
         &stub.socket.display().to_string(),
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "return",
@@ -502,7 +487,7 @@ fn the_wrapper_waits_for_silly_rename_dirt_and_refuses_when_it_stays() {
         "--socket",
         &stub.socket.display().to_string(),
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "return",
@@ -526,9 +511,7 @@ fn the_wrapper_waits_for_silly_rename_dirt_and_refuses_when_it_stays() {
 #[test]
 fn a_slot_can_be_reacquired_after_a_return_and_gets_the_same_slot() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let s = Sandbox::new();
     let (first, _) = lease(&s);
     s.treehouse_ok(&["return", &first.display().to_string(), "--force"]);
@@ -543,8 +526,9 @@ fn a_slot_can_be_reacquired_after_a_return_and_gets_the_same_slot() {
 #[test]
 fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
     let _w = Watchdog::start(180);
-    let (Some(cowfs), true) = (cowfs_bin(), treehouse_available()) else {
-        eprintln!("skipping: needs both cowfs and treehouse");
+    let _ = crate::require_treehouse!();
+    let Some(cowfs) = cowfs_bin() else {
+        eprintln!("skipping: the cowfs binary is not built next to the companion");
         return;
     };
     let dir = common::private_tempdir();
@@ -581,7 +565,7 @@ fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
         "--socket",
         &sock.display().to_string(),
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "--json",
@@ -647,9 +631,7 @@ fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
 #[test]
 fn base_refresh_refuses_per_slot_compiler_flags() {
     let _w = Watchdog::start(60);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let dir = common::private_tempdir();
     let stub = common::stub_in(dir.path());
     let s = Sandbox::new();
@@ -671,9 +653,7 @@ fn base_refresh_refuses_per_slot_compiler_flags() {
 #[test]
 fn base_status_reports_stale_and_provision_refuses_without_a_base() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let dir = common::private_tempdir();
     let stub = common::stub_in(dir.path());
     let s = Sandbox::new();
@@ -711,7 +691,7 @@ fn base_status_reports_stale_and_provision_refuses_without_a_base() {
         "--socket",
         &stub.socket.display().to_string(),
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "provision",
@@ -760,9 +740,7 @@ fn hooks_install_writes_the_user_config_and_is_idempotent() {
 #[test]
 fn provision_really_runs_when_treehouse_calls_the_hook() {
     let _w = Watchdog::start(180);
-    if !treehouse_available() {
-        return;
-    }
+    crate::require_treehouse!();
     let dir = common::private_tempdir();
     let stub = common::stub_in(dir.path());
     let s = Sandbox::new();
@@ -835,17 +813,17 @@ fn provision_really_runs_when_treehouse_calls_the_hook() {
 #[test]
 fn real_pools_are_untouched() {
     let _w = Watchdog::start(120);
-    if !treehouse_available() {
+    crate::require_treehouse!();
+    if real_pool_hashes().is_empty() {
         eprintln!(
-            "skipping: no treehouse binary at {}",
-            treehouse_bin().display()
+            "skipping: no real treehouse store at {}, so there is nothing to compare against",
+            common::real_treehouse_root().display()
         );
         return;
     }
     // Snapshot the real store, drive the companion hard against a sandbox, then compare. Pools
     // other agents are legitimately using may move, so those are reported rather than asserted on.
     let before = real_pool_hashes();
-    assert!(!before.is_empty(), "the real store is readable");
 
     let s = Sandbox::new();
     let (slot, _) = lease(&s);
@@ -854,7 +832,7 @@ fn real_pools_are_untouched() {
     std::thread::sleep(Duration::from_millis(200));
     run(&[
         "--treehouse-bin",
-        &treehouse_bin().display().to_string(),
+        &shim_of(&s),
         "--treehouse-home",
         &s.home().display().to_string(),
         "return",

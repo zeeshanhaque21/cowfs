@@ -145,6 +145,10 @@ pub struct ProvisionArgs {
     /// The pool id, when it is already known
     #[arg(long)]
     pub pool_id: Option<String>,
+    /// Treehouse root. Required whenever the slot is inside a pool, because the pool identity is
+    /// cross-checked against it.
+    #[arg(long)]
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,8 +310,26 @@ fn dispatch(cli: &Cli, env: &Env) -> Result<i32> {
             Ok(EXIT_OK)
         }
         Command::Provision(a) => {
+            // The hook runs with the worktree as its cwd and no root, so the pool it belongs to is
+            // derived from the slot path. A slot under a pool whose name disagrees with the
+            // repository is refused rather than acted on.
             let mut daemon = connect(env)?;
             let materialiser = mode_b::CowfsMaterialiser;
+            let root = a
+                .root
+                .clone()
+                .or_else(|| crate::naming::pool_root_of(&a.slot));
+            if let Some(root) = root.as_deref() {
+                let from_pool = crate::naming::pool_id_in_pool(&a.slot, root)?;
+                if let Some(want) = a.pool_id.as_deref() {
+                    if want != from_pool {
+                        return Err(Error::Usage(format!(
+                            "--pool-id {want:?} disagrees with the pool directory {from_pool:?} in {}",
+                            a.slot.display()
+                        )));
+                    }
+                }
+            }
             let out = mode_b::Provision {
                 daemon: &mut daemon,
                 materialiser: &materialiser,
@@ -411,6 +433,9 @@ fn do_return(
     discard: bool,
 ) -> Result<mode_a::ReturnOutcome> {
     let slot = resolve_slot(cli, root, &a.slot)?;
+    // Before anything else: treehouse takes the pool of a path argument from the path, so --root
+    // alone does not keep a return inside the pool the caller named.
+    crate::naming::assert_in_pool(&slot, root)?;
     let th = treehouse_of(cli, Some(root))?;
     let (snapshot, reset_to) = if mode_b_snapshot {
         let Some(daemon) = daemon.as_mut() else {
@@ -418,10 +443,7 @@ fn do_return(
                 "--mode b needs a cowfs daemon, so pass --socket or start one".to_owned(),
             ));
         };
-        let pool_id = match crate::pool_id_of_slot_path(&slot) {
-            Some(id) => id,
-            None => crate::pool_id(&crate::main_repo_root(&slot)?)?,
-        };
+        let pool_id = crate::naming::pool_id_in_pool(&slot, root)?;
         let name = slot
             .parent()
             .and_then(std::path::Path::file_name)

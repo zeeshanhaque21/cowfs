@@ -20,6 +20,8 @@ pub struct Setup {
     pub pool_root: PathBuf,
     /// The main checkout to keep on the mount, when one was given.
     pub main_checkout: Option<PathBuf>,
+    /// Whether `apfs_sharing` is turned on in any treehouse config that applies.
+    pub apfs_sharing: bool,
     /// Whether the mount is a network mount, which is what makes silly-renames possible.
     pub network_mount: bool,
     /// The mount options read from the kernel.
@@ -73,6 +75,27 @@ impl AppleDouble {
             }
         }
     }
+}
+
+/// Whether a treehouse config file turns `apfs_sharing` on.
+///
+/// The docs say to leave it off on a cowfs mount: on a macOS APFS volume it re-materialises the
+/// slot's tracked files with `clonefile`, which is the job the block store already does, and it is
+/// the only treehouse step that would rewrite a slot after a snapshot has been placed under it.
+pub fn apfs_sharing_configured(config: &Path) -> bool {
+    const FRESH: &str = "fresh";
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return false;
+    };
+    text.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("apfs_sharing") && t.contains(FRESH)
+    })
+}
+
+/// The treehouse user config path.
+pub fn user_config(home: &Path) -> PathBuf {
+    home.join(".config/treehouse/config.toml")
 }
 
 /// Walks `root` counting entries whose name starts with `prefix`, stopping at `limit`.
@@ -153,6 +176,23 @@ pub fn setup(
         appledouble.found == 0,
         appledouble.reason.clone(),
     );
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
+    let user_sharing = apfs_sharing_configured(&user_config(&home));
+    let repo_sharing = main_checkout
+        .map(|c| apfs_sharing_configured(&c.join("treehouse.toml")))
+        .unwrap_or(false);
+    report.check(
+        "apfs_sharing off",
+        !user_sharing && !repo_sharing,
+        if user_sharing || repo_sharing {
+            "apfs_sharing = \"fresh\" is set; it rewrites a slot's tracked files after a snapshot \
+             has been placed under it, so it must be off on a cowfs mount"
+                .to_owned()
+        } else {
+            "off, which is what a cowfs mount wants".to_owned()
+        },
+    );
+
     let locallocks = if network_mount { Some(false) } else { None };
     if network_mount {
         report.fail(
@@ -174,6 +214,7 @@ pub fn setup(
         )));
     }
     Ok(Setup {
+        apfs_sharing: user_sharing || repo_sharing,
         mount: mount.to_path_buf(),
         pool_root: pool_root.to_path_buf(),
         main_checkout: main_checkout.map(Path::to_path_buf),
@@ -575,7 +616,20 @@ pub fn return_slot(
         }
     }
 
-    th.return_slot(&opts.slot, opts.force, outcome.lease_id.as_deref())?;
+    // No pin means no release. An unpinned return can hand back a slot somebody else re-leased
+    // between our lookup and this call, which is the one race the lease identity exists for.
+    let pin = outcome
+        .lease_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "refusing to release {} unpinned: no lease identity could be read for it, so it \
+                 cannot be proven to still be the slot we leased",
+                opts.slot.display()
+            ))
+        })?;
+    th.return_slot(&opts.slot, opts.force, pin)?;
 
     if opts.drop_snapshot {
         if let Some(snapshot) = &opts.snapshot {
@@ -643,6 +697,21 @@ mod tests {
         let b = AppleDouble::scan(clean.path());
         assert_eq!(b.policy, "translate");
         assert_eq!(b.found, 1);
+    }
+
+    #[test]
+    fn apfs_sharing_is_read_out_of_a_config_and_is_off_by_default() {
+        assert!(!apfs_sharing_configured(Path::new(
+            "/nonexistent/treehouse.toml"
+        )));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("treehouse.toml");
+        std::fs::write(&cfg, "max_trees = 16\napfs_sharing = \"fresh\"\n").expect("write");
+        assert!(apfs_sharing_configured(&cfg));
+        std::fs::write(&cfg, "# apfs_sharing = \"fresh\"\n").expect("write");
+        assert!(!apfs_sharing_configured(&cfg), "a comment is not a setting");
+        std::fs::write(&cfg, "apfs_sharing = \"off\"\n").expect("write");
+        assert!(!apfs_sharing_configured(&cfg));
     }
 
     #[test]

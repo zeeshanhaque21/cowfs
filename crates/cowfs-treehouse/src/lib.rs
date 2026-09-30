@@ -32,15 +32,15 @@ pub use mode_a::{
     ReturnOptions, ReturnOutcome, Setup,
 };
 pub use mode_b::{
-    base_promote, base_status, get, hooks_install, user_config_path_for, worktree_git_dir,
-    Acquired, BaseRefresh, BaseRefreshed, BaseStatus, CowfsMaterialiser, HookAction, Materialiser,
-    PromoteOptions, Provision, RecordingMaterialiser, DEFAULT_NFS_TIMEOUT,
-    DEFAULT_TREEHOUSE_TIMEOUT,
+    base_promote, base_status, get, hooks_install, plan_git_link, rewrite_git_link,
+    user_config_path_for, worktree_git_dir, Acquired, BaseRefresh, BaseRefreshed, BaseStatus,
+    CowfsMaterialiser, GitLink, HookAction, LeaseGuard, Materialiser, PromoteOptions, Provision,
+    RecordingMaterialiser, DEFAULT_NFS_TIMEOUT, DEFAULT_TREEHOUSE_TIMEOUT,
 };
 pub use naming::{
-    base_snapshot, empty_snapshot, from_client_error, from_ctl_error, main_repo_root,
-    main_snapshot, pool_id, pool_id_of_slot_path, resolve_commit, short6, slot_of, slot_snapshot,
-    validate_slot,
+    assert_in_pool, base_snapshot, empty_snapshot, from_client_error, from_ctl_error,
+    main_repo_root, main_snapshot, pool_id, pool_id_in_pool, pool_id_of_slot_path, pool_root_dir,
+    pool_root_of, resolve_commit, short6, slot_of, slot_snapshot, validate_slot,
 };
 pub use report::{Check, Report};
 pub use th::{default_bin, implicit_root, Lease, PoolEntry, Treehouse};

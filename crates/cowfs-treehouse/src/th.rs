@@ -46,9 +46,17 @@ pub struct PoolEntry {
 
 /// The `treehouse` binary, always driven with an explicit pool root.
 ///
-/// Every invocation carries `--root` and `TREEHOUSE_ROOT`, and optionally a sandbox `HOME`, so a
-/// caller cannot reach a pool it did not name. A relative root is refused because treehouse
-/// resolves it against the repository root, which would make the target depend on the cwd.
+/// Every invocation carries `--root`, so a caller cannot reach a pool it did not name. `--root` is
+/// the only thing that pins the pool: `TREEHOUSE_ROOT` is deliberately not exported, because treehouse
+/// falls back to it and the redundancy would let a dropped `--root` pass unnoticed.
+///
+/// `--root` is nevertheless **not** sufficient on its own. treehouse v3.1.0 resolves the pool of
+/// `return <path>` and `destroy <path>` from the path itself (`cmd/return_cmd.go:567`,
+/// `cmd/destroy.go:195`), so every call that takes a path also asserts containment against this
+/// root; see [`Treehouse::return_slot`].
+///
+/// A relative root is refused because treehouse resolves it against the repository root, which would
+/// make the target depend on the cwd.
 #[derive(Clone, Debug)]
 pub struct Treehouse {
     bin: PathBuf,
@@ -92,7 +100,9 @@ impl Treehouse {
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(&self.bin);
         cmd.args(args).arg("--root").arg(&self.root);
-        cmd.env("TREEHOUSE_ROOT", &self.root);
+        // TREEHOUSE_ROOT is intentionally not set. treehouse prefers the flag but falls back to the
+        // environment, so exporting both would make a dropped --root invisible to the tests.
+        cmd.env_remove("TREEHOUSE_ROOT");
         if let Some(home) = &self.home {
             cmd.env("HOME", home);
         }
@@ -154,26 +164,38 @@ impl Treehouse {
         })
     }
 
-    /// `treehouse return <path> --force`, pinned to a lease identity when one is known so a slot
-    /// that was re-leased since we looked is left alone.
-    pub fn return_slot(&self, path: &Path, force: bool, if_lease_id: Option<&str>) -> Result<()> {
-        let path = path.display().to_string();
-        let mut args: Vec<&str> = vec!["return", &path];
+    /// `treehouse return <path> --force`, pinned to a lease identity.
+    ///
+    /// The pin is required, not optional: treehouse takes the pool from `path`, so without this
+    /// assertion a caller that names one root and passes a slot in another would release it. And
+    /// without a pin a slot that was re-leased between our lookup and this call would be handed
+    /// back under its new owner.
+    pub fn return_slot(&self, path: &Path, force: bool, if_lease_id: &str) -> Result<()> {
+        let id = if if_lease_id.trim().is_empty() {
+            return Err(Error::Usage(format!(
+                "refusing to release {} unpinned: no lease identity was read for it",
+                path.display()
+            )));
+        } else {
+            if_lease_id
+        };
+        crate::naming::assert_in_pool(path, &self.root)?;
+        let text = path.display().to_string();
+        let mut args: Vec<&str> = vec!["return", &text];
         if force {
             args.push("--force");
         }
-        if let Some(id) = if_lease_id.filter(|id| !id.is_empty()) {
-            args.push("--if-lease-id");
-            args.push(id);
-        }
-        self.run(&args).map(|_| ())
+        args.push("--if-lease-id");
+        args.push(id);
+        self.run_in(Some(path), &args).map(|_| ())
     }
 
     /// `treehouse destroy <path> --yes`. Destroy is a dry run without `--yes`, so this never
-    /// removes anything by accident.
+    /// removes anything by accident. Containment is asserted for the same reason as a return.
     pub fn destroy(&self, path: &Path) -> Result<String> {
-        let path = path.display().to_string();
-        self.run(&["destroy", &path, "--yes"])
+        crate::naming::assert_in_pool(path, &self.root)?;
+        let text = path.display().to_string();
+        self.run_in(Some(path), &["destroy", &text, "--yes"])
     }
 
     /// `treehouse --version`.
@@ -261,6 +283,41 @@ mod tests {
         let th = Treehouse::new(PathBuf::from("/bin/sh"), dir.as_path(), None).expect("th");
         let err = th.run(&["-c", "echo boom >&2; exit 3"]).expect_err("fails");
         assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn a_release_without_a_pin_is_refused_before_treehouse_runs() {
+        let dir = std::env::temp_dir();
+        let th = Treehouse::new(PathBuf::from("/bin/echo"), &dir, None).expect("th");
+        let slot = dir.join(".treehouse/pool/1/repo");
+        let err = th.return_slot(&slot, true, "  ").expect_err("no pin");
+        assert!(matches!(err, Error::Usage(_)), "{err:?}");
+        assert!(err.to_string().contains("unpinned"), "{err}");
+    }
+
+    #[test]
+    fn a_release_outside_the_named_root_is_refused_before_treehouse_runs() {
+        let dir = std::env::temp_dir();
+        let th = Treehouse::new(PathBuf::from("/bin/echo"), &dir, None).expect("th");
+        let elsewhere = PathBuf::from("/definitely/not/the/named/pool/.treehouse/p/1/repo");
+        let err = th
+            .return_slot(&elsewhere, true, "abc")
+            .expect_err("outside");
+        assert!(matches!(err, Error::Usage(_)), "{err:?}");
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn the_root_is_carried_by_the_flag_and_not_by_the_environment() {
+        // If the flag were dropped, treehouse would fall back to TREEHOUSE_ROOT and a test could not
+        // tell. The command builder must therefore remove it from the environment.
+        let dir = std::env::temp_dir();
+        let th = Treehouse::new(PathBuf::from("/bin/sh"), &dir, None).expect("th");
+        std::env::set_var("TREEHOUSE_ROOT", "/should/not/leak");
+        let script = "test -z \"$TREEHOUSE_ROOT\" && echo cleared";
+        let out = th.run(&["-c", script]).expect("run");
+        assert!(out.contains("cleared"), "{out}");
+        std::env::remove_var("TREEHOUSE_ROOT");
     }
 
     #[test]
