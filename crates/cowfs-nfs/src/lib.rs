@@ -9,9 +9,27 @@
 //! # AppleDouble (`AppleDoubleMode`)
 //!
 //! The macOS client keeps extended attributes (`com.apple.provenance` on every new file) in
-//! `._name` files. `Translate` (default) parses and synthesises them in the adapter and maps the
-//! attributes to `Vfs` xattrs of the real file, so no sidecar inode ever exists. `Hide` stores
-//! them and hides them from listings. `Store` treats `._` names like any other.
+//! `._name` files. Three modes:
+//!
+//! - `Hide` (the default, and what the mount used before `Translate` existed): the sidecars are
+//!   stored as ordinary files and hidden from listings.
+//! - `Translate`: `._name` is served as a view of the extended attributes of `name`, stored in the
+//!   `Vfs` as xattrs of the real file, so no sidecar inode exists and another mount of the same
+//!   data sees no `._` file. A `._name` with no `name` to hold the attributes is stored as a real
+//!   file instead, which is what an archive extraction and a checkout of a tree that tracks `._*`
+//!   need; such a file stays a real file, and is never merged into `name`. A whole-file write at
+//!   offset 0 whose bytes cannot be a sidecar is refused, so a real file under a reserved name is
+//!   never accepted and then dropped.
+//! - `Store`: `._` names are ordinary names.
+//!
+//! # Mount options and a dead server
+//!
+//! `locallocks` is required (rustc incremental compilation aborts without it), `rsize` and `wsize`
+//! are 128 KiB, `actimeo` 120, and the mount is `hard`. `soft` is available and was measured on
+//! macOS 26.6.2: with `soft,timeo=6,retrans=2` a `ls` or `touch` of an uncached path still blocked
+//! for more than 20 s after the server was killed, the same as `hard`, and a soft mount can also
+//! fail a write half way through. So it is off by default. What does unblock a caller is
+//! [`install_signal_cleanup`] on SIGTERM and [`sweep_stale_mounts`] after a crash.
 //!
 //! # What this crate requires of every `Vfs`
 //!
