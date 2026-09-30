@@ -74,6 +74,8 @@ pub enum Fault {
     XattrRemoveNoop,
     ReaddirMaxZeroOk,
     XattrNameUnchecked,
+    InoReuse,
+    ReaddirAttrsNoAttrs,
 }
 
 impl Fault {
@@ -136,6 +138,8 @@ impl Fault {
         Fault::XattrRemoveNoop,
         Fault::ReaddirMaxZeroOk,
         Fault::XattrNameUnchecked,
+        Fault::InoReuse,
+        Fault::ReaddirAttrsNoAttrs,
     ];
 }
 
@@ -173,6 +177,7 @@ struct State {
     fault: Option<Fault>,
     leak: u64,
     link_max: u32,
+    freed: Vec<Ino>,
 }
 
 /// In-memory reference implementation of `Vfs`, guarded by one coarse lock.
@@ -221,6 +226,7 @@ impl MemVfs {
             fault,
             leak: 0,
             link_max,
+            freed: Vec::new(),
         };
         let t = st.now();
         st.nodes.insert(
@@ -401,7 +407,11 @@ impl State {
 
     fn alloc(&mut self, body: Body, mode: u32, nlink: u32) -> (Ino, Timestamp) {
         let t = self.now();
-        let ino = self.next_ino;
+        let ino = if self.f(Fault::InoReuse) && self.freed.pop().is_some() {
+            self.next_ino - 1
+        } else {
+            self.next_ino
+        };
         self.next_ino += 1;
         let mode = if self.f(Fault::ModeNotMasked) || self.f(Fault::CreateModeNotMasked) {
             mode
@@ -460,6 +470,9 @@ impl State {
                 self.leak += leaked;
             }
             self.nodes.remove(&ino);
+            if self.f(Fault::InoReuse) {
+                self.freed.push(ino);
+            }
         }
     }
 

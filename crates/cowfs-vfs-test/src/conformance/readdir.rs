@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use cowfs_vfs::{DirEntry, Error, FileKind, Ino, ROOT_INO};
 
+use super::basic::stable_eq;
 use super::{Ctx, Failure, Outcome};
 
 type Names = Vec<Vec<u8>>;
@@ -464,6 +465,62 @@ pub fn readdir_max_zero_is_invalid(c: &Ctx) -> Outcome {
         c.fs.readdir(ROOT_INO, 0, 0),
         Error::InvalidArgument,
         "readdir with max 0 of a non-empty directory"
+    );
+    Ok(())
+}
+
+/// `readdir_attrs` returns the same listing as `readdir` plus each entry's attributes, and its
+/// `eof` and paging behaviour are identical. Entries whose inode vanished between the two calls
+/// may be dropped, but nothing else may change.
+pub fn readdir_attrs_matches_readdir(c: &Ctx) -> Outcome {
+    populate(c, ROOT_INO, 60, "e")?;
+    let mut cookie = 0;
+    let mut compared = 0;
+    for _ in 0..1000 {
+        let plain = c.fs.readdir(ROOT_INO, cookie, 7)?;
+        let plus = c.fs.readdir_attrs(ROOT_INO, cookie, 7)?;
+        ensure_eq!(plus.eof, plain.eof, "eof differs at cookie {cookie}");
+        ensure_eq!(
+            plus.entries.len(),
+            plain.entries.len(),
+            "entry count differs at cookie {cookie}"
+        );
+        for (a, b) in plain.entries.iter().zip(&plus.entries) {
+            ensure_eq!(&b.entry, a, "entry differs at cookie {cookie}");
+            let attr = c.fs.getattr(a.ino)?;
+            ensure!(
+                stable_eq(&b.attr, &attr),
+                "attributes differ from getattr for {:?}",
+                String::from_utf8_lossy(&a.name)
+            );
+            ensure_eq!(b.attr.ino, a.ino, "attribute inode");
+            ensure_eq!(b.attr.kind, a.kind, "attribute kind");
+            compared += 1;
+        }
+        match plain.entries.last() {
+            Some(l) if !plain.eof => cookie = l.cookie,
+            _ => break,
+        }
+    }
+    ensure_eq!(compared, 60, "entries compared");
+    let one = c.fs.readdir_attrs(ROOT_INO, 0, 1)?;
+    ensure_eq!(one.entries.len(), 1, "readdir_attrs with max 1");
+    let empty = c.dir(ROOT_INO, "empty")?;
+    let r = c.fs.readdir_attrs(empty, 0, 10)?;
+    ensure!(
+        r.entries.is_empty() && r.eof,
+        "readdir_attrs of an empty directory"
+    );
+    let f = c.file(ROOT_INO, "f")?;
+    ensure_err!(
+        c.fs.readdir_attrs(f, 0, 10),
+        Error::NotDir,
+        "readdir_attrs of a file"
+    );
+    ensure_err!(
+        c.fs.readdir_attrs(ROOT_INO, 0, 0),
+        Error::InvalidArgument,
+        "readdir_attrs with max 0"
     );
     Ok(())
 }

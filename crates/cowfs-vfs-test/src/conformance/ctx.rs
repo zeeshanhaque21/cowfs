@@ -27,6 +27,12 @@ pub type Outcome = std::result::Result<(), Failure>;
 /// `create`, `mkdir`, `symlink` and `link` so `forget_all` can drop exactly that many.
 pub struct Ctx {
     pub fs: Arc<dyn Vfs>,
+    /// How the backend wants the xattr name-prefixed cases of `xattr_name_validation` run
+    /// (from `Options::xattr_names`).
+    pub xattr_names_prefixed: bool,
+    /// The backend's declared hardlink limit, when it is small enough to reach cheaply
+    /// (from `Options::link_limit`).
+    pub link_limit: Option<u32>,
     refs: Mutex<HashMap<Ino, u64>>,
 }
 
@@ -56,7 +62,17 @@ impl Ctx {
     pub fn new(fs: Arc<dyn Vfs>) -> Self {
         Self {
             fs,
+            xattr_names_prefixed: false,
+            link_limit: None,
             refs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_options(fs: Arc<dyn Vfs>, opts: &super::Options) -> Self {
+        Self {
+            xattr_names_prefixed: opts.xattr_names,
+            link_limit: opts.link_limit,
+            ..Self::new(fs)
         }
     }
 

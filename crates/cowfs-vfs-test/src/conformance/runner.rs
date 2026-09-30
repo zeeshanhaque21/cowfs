@@ -61,6 +61,14 @@ pub struct Check {
     pub run: fn(&Ctx) -> Outcome,
 }
 
+impl Check {
+    /// Whether the check only makes sense when the backend declares a hardlink limit it can
+    /// reach quickly (`Options::link_limit`). True for `hardlink_limit_reports_too_many_links`.
+    pub fn link_limit_required(&self) -> bool {
+        self.name == "hardlink_limit_reports_too_many_links"
+    }
+}
+
 impl fmt::Debug for Check {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}::{}", self.category, self.name)
@@ -96,7 +104,17 @@ pub fn run_check_timed(
     factory: &dyn Fn() -> Arc<dyn Vfs>,
     timeout: Option<Duration>,
 ) -> (Outcome, bool) {
-    let ctx = Ctx::new(factory());
+    run_check_with(check, factory, &Options::default(), timeout)
+}
+
+/// Like `run_check_timed` but the context sees `Options` (the xattr and link-limit knobs).
+pub fn run_check_with(
+    check: &Check,
+    factory: &dyn Fn() -> Arc<dyn Vfs>,
+    opts: &Options,
+    timeout: Option<Duration>,
+) -> (Outcome, bool) {
+    let ctx = Ctx::with_options(factory(), opts);
     let run = check.run;
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -180,6 +198,14 @@ pub struct Options {
     /// Hang timeout for every check. `None` means `DEFAULT_TIMEOUT`, or `DEFAULT_HEAVY_TIMEOUT`
     /// for heavy checks.
     pub timeout: Option<Duration>,
+    /// The backend's xattr names carry a namespace prefix, so the valid-name case of
+    /// `xattr_name_validation` uses `user.` plus `NAME_MAX - 5` bytes. Linux needs this.
+    /// (Alternatively skip that check with a reason.)
+    pub xattr_names: bool,
+    /// The backend's hardlink limit, when it is small enough that the check can reach it inside
+    /// the timeout. `None` means the check is reported as skipped. Native filesystems allow
+    /// 65,000 or more, so the check is meant for backends that declare a smaller one.
+    pub link_limit: Option<u32>,
 }
 
 impl Options {
@@ -195,6 +221,13 @@ impl Options {
                 .ok()
                 .and_then(|v| Level::parse(&v)),
             skip: Vec::new(),
+            xattr_names: matches!(
+                std::env::var("COWFS_CONFORMANCE_XATTR_NAMES").as_deref(),
+                Ok("1") | Ok("prefixed")
+            ),
+            link_limit: std::env::var("COWFS_CONFORMANCE_LINK_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok()),
             timeout: std::env::var("COWFS_CONFORMANCE_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -339,8 +372,16 @@ pub fn run_all(factory: &dyn Fn() -> Arc<dyn Vfs>, opts: &Options) -> Report {
             report.skipped_heavy += 1;
             continue;
         }
+        if check.link_limit_required() && opts.link_limit.is_none() {
+            report.skipped.push(Skipped {
+                check,
+                reason: "backend did not declare a small hardlink limit (Options::link_limit)"
+                    .into(),
+            });
+            continue;
+        }
         let start = Instant::now();
-        let (outcome, leaked) = run_check_timed(&check, factory, opts.timeout);
+        let (outcome, leaked) = run_check_with(&check, factory, opts, opts.timeout);
         report.results.push(CheckResult {
             check,
             outcome,
