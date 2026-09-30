@@ -213,10 +213,10 @@
         {
           "id": "26",
           "title": "#26 cowfs-core: Vfs over store and meta",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 26,
-          "detail": "Builder done, re-verified by me: 127 conformance checks pass through Core (2 heavy separately), 18 core tests, model proptests, crash images 280 and kill -9 120 rounds with 0 failures, negative control finds a dangling chunk. Benchmarks at load 54-111: lookups at or above native (miss 2.7M/s vs 460k/s), data 6-57x slower than APFS page cache (seq read 637 MiB/s, write 239), snapshot create 12-21 ms at 100k files. Core refuses to open a store with corrupt_synced. Open: virtual-inode alias table, chunk lists loaded whole (splice_content unused), flush() does nothing, snapshot rename/promote not atomic (needs Meta::rename_snapshot), batch timestamps, ChunkRef hole flag, early ino reservation. Critic attacking durability ordering, write-back semantics, partial chunks, ino reuse, caches, concurrency and mutants.",
-          "owner": "critic (subagent)",
+          "detail": "Critic verdict: NOT mergeable. F1 deadlock: ensure_file holds the node write lock then takes the meta read lock while commit holds meta write then node read (repro hangs; builder's stress/kill9 never hit it). F2 promote_base removes base then forks: a failed fork loses base. F3 one corrupt block wedges the whole snapshot (fsync, readdir, fork, merkle_root all return Corrupt; other files' acked data lost at reopen) and a partial overwrite inside a corrupt chunk succeeds. Also: virtual inos reused across restart (wrong bytes), snapshot names accept .git/newline/ESC and case/NFC duplicates unlike the CLI, readdir flushes unrelated dirty data (48 MiB, 179 ms), alias table unbounded (469 MB after 500k creates), zero-id hole refs look dangling to GC. Held up: durability ordering, fsx 20k ops vs model, 60 s of overlapping writers (0 torn), hook failure recovery, EIO on corrupt reads. Bench (load 11-15): seq read 1351 MiB/s (13.6x slower than APFS page cache), 4K read 21.6k/s, seq write+fsync 390 MiB/s, lookups faster than std::fs. Builder fixing and re-merging fixed store and meta.",
+          "owner": "builder (subagent)",
           "pr": "#36",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/36",
           "ci": "CI: ubuntu pass, macos FAIL (a cowfs-meta test from the merged in-flight meta branch, not core)"
