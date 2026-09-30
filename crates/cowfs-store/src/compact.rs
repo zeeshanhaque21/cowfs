@@ -441,7 +441,7 @@ impl Store {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(m) = wm.mark() {
                 let base = wm.base().max(lowest);
-                wm.reset(g.io, m, base)?;
+                wm.reset(m, base)?;
             }
         }
         self.forget_pack(id);
