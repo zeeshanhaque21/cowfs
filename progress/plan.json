@@ -149,12 +149,12 @@
         {
           "id": "11",
           "title": "#11 Linux FUSE mount",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 11,
-          "owner": "lead",
+          "owner": "builder (subagent)",
           "pr": "#31",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/31",
-          "detail": "Critic findings fixed, re-verified by me at 98c0f24: 43 unit tests on Mac, and in the Linux VM 46 unit + 39 mount + 5 regress tests pass, no mounts left. Defaults now safe: ttl 1 s, keep_cache off, opt-in SoleWriter with an Invalidator; Vfs panics become EIO then a clean unmount; keyed-lane worker pool (slow read no longer delays stat: 856 ms to 0.2 ms, builder's n=1); signal cleanup and stale-mount sweep; inode-reuse paranoid mode. Decisions for lead: cross-adapter permission policy (FUSE denies later O_WRONLY on a 0444 file, NFS allows), SoleWriter wiring by core/control plane (invalidate from outside Vfs calls), add 'Ino never reused' text to architecture doc (done on v1/vfs-trait), add a Linux mount CI job (command in report). 2 survivors: one equivalent, one control. | Builder done and verified by me at 98c0f24 (CI green). Round-2 critic still running, no report yet. Must merge main and add wildcard arms for the non_exhaustive Error/FileKind before merge.",
+          "detail": "Critic findings fixed, re-verified by me at 98c0f24: 43 unit tests on Mac, and in the Linux VM 46 unit + 39 mount + 5 regress tests pass, no mounts left. Defaults now safe: ttl 1 s, keep_cache off, opt-in SoleWriter with an Invalidator; Vfs panics become EIO then a clean unmount; keyed-lane worker pool (slow read no longer delays stat: 856 ms to 0.2 ms, builder's n=1); signal cleanup and stale-mount sweep; inode-reuse paranoid mode. Decisions for lead: cross-adapter permission policy (FUSE denies later O_WRONLY on a 0444 file, NFS allows), SoleWriter wiring by core/control plane (invalidate from outside Vfs calls), add 'Ino never reused' text to architecture doc (done on v1/vfs-trait), add a Linux mount CI job (command in report). 2 survivors: one equivalent, one control. | ROUND-2 VERDICT: NOT mergeable. Could not break: O_APPEND (50 grow+append rounds byte-exact), panic budget, Invalidator (all 5 paths), sweep safety, permissions, signals/kill -9/remount, pjdfstest 0 regressions; 16 of 16 mutants killed (round 1: 8 survived); perf claims reproduce (head-of-line 1002 ms to 0.1 ms). Blockers: F3 create + failed open leaks the file (caller retries and gets EEXIST); F4 an empty non-eof readdir page is read as EOF, so `ls` shows nothing with no error, and a zero-based first cookie is swallowed; F1 shared-mode 'visible within a second' is false for a descriptor that stays open (stale 4 s+); F2 the crate doc promises per-inode FIFO ordering that the class-based inline/lane split does not deliver (63 getattrs on one inode inside a 4 s read; 1047 overlapping cross-directory renames); F5 is_alive() true while a lane is wedged. Builder fixing and merging main; the ordering contract was added to the trait docs (#41).",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -165,7 +165,7 @@
           "owner": "builder (subagent)",
           "pr": "#32",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/32",
-          "detail": "Reply-cache connection bug FIXED and re-verified by me at 5122ff1 (110 crate tests, 5 new dupcache tests, ignored mount suite 17/17, no mounts left, CI green). Round-2 critic verdict: NOT mergeable with Translate as default. F1 ._x created before x exists (unzip exits 50, tarfile and ditto fail, git clone with tracked ._ files leaves a broken index; Hide and Store succeed); F2 a write to a real ._x file is accepted then lost after restart; F3 more than ~150 xattrs on a file make all its xattrs invisible (fix patch provided). Also: sidecar handles do not go stale on inode reuse, concurrent sidecar writes lose chunks, silent connections fill the cap, one-shot MNT can be raced by a polling attacker, SIGKILL of the host hangs ls/touch, inline_metadata stalls the server with a blocking Vfs, RPC claim not reproduced (14.3 to 13.4, not 19 to 13), 14 of 24 new-code mutants killed. Held up: SETATTR guard correct, reference balance 0 leaks in all 3 modes, handle MAC sound, RSS bounded (3-24 MiB), SIGTERM cleanup 66/66. Builder switching default to Hide first, then fixing Translate. | Round-2 fixes in progress (head 954f6ee). Live CI red on both platforms at the clippy step (mid-edit). Default AppleDoubleMode must be Hide until Translate passes the archive-extraction and git-clone tests.",
+          "detail": "Round-2 critic blockers F1-F10 fixed with regression tests (builder, head 5673a79): ._x with no main file stored as a real file (unzip, tar, ditto, git clone work in Translate, Hide and Store), writes to a real ._x are refused not dropped, 200+ xattrs survive, sidecar handles go stale on inode reuse, per-inode sidecar locking, silent connections cannot lock out a client, MNT answers only for a random per-server export path and one connection gets the root handle, reply cache per connection, inline_metadata removed (cannot be made safe), sweep matches only cowfs mounts. 37 of 37 mutants killed; ignored mount suite 19/19. SHIPS WITH AppleDoubleMode::Hide as the default; Translate is opt-in until a round-3 critic reviews the new code. Live CI is RED because the branch is behind main: two exhaustive matches (FileKind in convert.rs:27, Error in errors.rs:6) broke on the frozen non_exhaustive trait. I reproduced it in a scratch merge. Builder is merging main and fixing them. F8 partial: a dead server still hangs ls/touch for 20 s+ on macOS 26 with hard or soft mounts; cure is install_signal_cleanup plus sweep_stale_mounts. Not tested with a second uid.",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -243,6 +243,14 @@
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/35",
           "detail": "Suite run on APFS, btrfs, ext4, FUSE and NFS. Posix level (56 checks): 0 failures natively and through FUSE; NFS mount 10 (9 silly rename, 1 AppleDouble Translate hides ._ names). FUSE adapter: no bug. NFS adapter bug found: the reply cache ignores the connection, so a second connection's identical xid replays the first connection's reply and the call never runs (sent to the #12 builder). Suite level corrections sent to the #29 builder (torn reads on ext4/btrfs/tmpfs at 512/4096 B, statfs files=0 on btrfs, com.apple.* xattrs, atime-only ctime, xattr name prefix, LINK_MAX hang). Client-side, not adapter: sparse blocks, statfs caching, silly rename. 2 unexplained flakes. | Critic verdict NOT mergeable; builder fixing F1 (hardlink reclaim / Ino reuse), F8 (bitwise-OR errno bug), F9 (stale dir cache), F4 (8000-pair timeout), 8 surviving mutants. Live CI: ubuntu FAILS at `cargo test --workspace` on the in-progress head 3f779a8, macOS passes.",
           "ci": "CI: pass (linux, macos) at 88e5834"
+        },
+        {
+          "id": "41",
+          "title": "#41 docs(vfs): concurrency contract (merged)",
+          "state": "done",
+          "pr": "#41",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/41",
+          "detail": "Added the Vfs concurrency contract to the trait docs and the architecture doc (every method atomic and linearizable; no per-inode ordering beyond what the kernel or protocol imposes). Found by the FUSE round-2 critic. Doc-only, CI green on Linux and macOS, merged to main."
         }
       ]
     },
@@ -284,5 +292,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25. Waiting on a critic or fixer: #24 #31 #32 #33 #35 #36 #39. #38 is verified but stacked on #33 (API changing): merges after #33 plus a short round-2 critic. Each must merge main and adopt the frozen trait first."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41. Waiting: #24 #31 #33 #35 #32 #36 (fixing), #38 (verified, stacked on #33), #39 (building). Each must merge main and adopt the frozen trait first."
 }
