@@ -110,23 +110,23 @@
         {
           "id": "8",
           "title": "#8 Merkle tree and O(1) writable snapshots",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 8,
-          "owner": "critic (subagent)",
+          "owner": "builder (subagent)",
           "pr": "#25",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/25",
-          "detail": "Builder done: persistent content-addressed B+tree per snapshot in redb, O(1) snapshots (create 20-32 ms fsync-bound, flat within 1.6x at load 73-106), crash harness 3,176 crash points and kill -9 rounds with 0 failures (builder's numbers; I re-ran the default suite: 26 tests pass, builder claimed 39). Design note lists 11 decisions for review, including identity (snapshot id, inode), 2 ms unbatched ops and setattr size shrinking only to a chunk boundary. Critic is attacking crash consistency, panic guard, refcount settlement and the API core needs. docs/v1-meta.md",
+          "detail": "Critic verdict: NOT mergeable. Tree, refcounts and crash atomicity held against a harsher harness (reordering, 512 B/4 KiB tearing, every-event crash, snapshot-remove crash). Blockers: F1 before_sync hook runs BEFORE the closure so a put-then-set_content batch made durable metadata reference unsynced blocks in 10 of 30 commits; F2 clean drop makes metadata durable even when the hook fails; F3 inode numbers are reused after a crash (100 creates, crash, next ino 2), aliasing stale handles. Also: no flush timer, lost fsync makes the file unopenable (fails closed), lookup 39 us at 1M, 1.7 ms per unbatched op, remove_snapshot stalls writers 837 ms, no magic check, 4 mutants survive. Builder fixing with API changes for core listed in docs/v1-meta.md.",
           "ci": "CI: pending"
         },
         {
           "id": "9",
           "title": "#9 redb metadata store with crash consistency",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 9,
-          "owner": "critic (subagent)",
+          "owner": "builder (subagent)",
           "pr": "#25",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/25",
-          "detail": "Builder done: persistent content-addressed B+tree per snapshot in redb, O(1) snapshots (create 20-32 ms fsync-bound, flat within 1.6x at load 73-106), crash harness 3,176 crash points and kill -9 rounds with 0 failures (builder's numbers; I re-ran the default suite: 26 tests pass, builder claimed 39). Design note lists 11 decisions for review, including identity (snapshot id, inode), 2 ms unbatched ops and setattr size shrinking only to a chunk boundary. Critic is attacking crash consistency, panic guard, refcount settlement and the API core needs. docs/v1-meta.md",
+          "detail": "Critic verdict: NOT mergeable. Tree, refcounts and crash atomicity held against a harsher harness (reordering, 512 B/4 KiB tearing, every-event crash, snapshot-remove crash). Blockers: F1 before_sync hook runs BEFORE the closure so a put-then-set_content batch made durable metadata reference unsynced blocks in 10 of 30 commits; F2 clean drop makes metadata durable even when the hook fails; F3 inode numbers are reused after a crash (100 creates, crash, next ino 2), aliasing stale handles. Also: no flush timer, lost fsync makes the file unopenable (fails closed), lookup 39 us at 1M, 1.7 ms per unbatched op, remove_snapshot stalls writers 837 ms, no magic check, 4 mutants survive. Builder fixing with API changes for core listed in docs/v1-meta.md.",
           "ci": "CI: pending"
         },
         {
