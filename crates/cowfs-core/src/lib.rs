@@ -440,7 +440,7 @@ impl Inner {
         let mut freed = 0usize;
         self.nodes.retain(|ino, n| {
             if ino::snap_of(*ino) == Some(sc.id) {
-                freed += n.st.rd().dirty_bytes();
+                freed += n.st.try_read().map_or(0, |st| st.dirty_bytes());
                 false
             } else {
                 true
@@ -483,7 +483,7 @@ impl Inner {
         });
         for n in nodes {
             let fl = ino::snap_of(n.ino).and_then(|s| flushed.get(&s)).copied();
-            let st = n.st.rd();
+            let Ok(st) = n.st.try_read() else { continue };
             let uncommitted = fl.is_none_or(|fl| n.seq.load(Ordering::Acquire) > fl);
             if let Some(f) = &st.file {
                 if st.is_orphan() || uncommitted {
@@ -510,7 +510,7 @@ impl Inner {
             n.pinned()
                 || n.seq.load(Ordering::Acquire) > fl
                 || n.ns_seq.load(Ordering::Acquire) > fl
-                || n.st.rd().dirty_bytes() > 0
+                || n.st.try_read().map_or(true, |st| st.dirty_bytes() > 0)
         });
         self.dents.shrink_all(&|d| {
             ino::snap_of(d)

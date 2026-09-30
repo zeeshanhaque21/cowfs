@@ -370,19 +370,22 @@ impl Inner {
     }
 
     /// Loads a file's chunk list from meta if it is not loaded yet.
+    ///
+    /// The meta read happens with no node lock held (lock order: the meta lock is a leaf), and the
+    /// result is published under the node lock. If another thread loaded one meanwhile, the first
+    /// result wins, which is the same bytes.
     pub(crate) fn ensure_file(&self, sc: &SnapCtx, node: &Node) -> Result<()> {
         if node.st.rd().file.is_some() {
-            return Ok(());
-        }
-        let mut st = node.st.wr();
-        if st.file.is_some() {
             return Ok(());
         }
         let refs = match self.meta_of(node.ino) {
             Some(m) => sc.snap.chunks(mino(m)).map_err(from_meta).map_err(stale)?,
             None => Vec::new(),
         };
-        st.file = Some(FileData::new(refs));
+        let mut st = node.st.wr();
+        if st.file.is_none() {
+            st.file = Some(FileData::new(refs));
+        }
         Ok(())
     }
 
@@ -397,8 +400,8 @@ impl Inner {
             .map_err(from_meta)
             .map_err(stale)?
             .into();
-        node.st.wr().target = Some(t.clone());
-        Ok(t)
+        let mut st = node.st.wr();
+        Ok(st.target.get_or_insert_with(|| t.clone()).clone())
     }
 
     /// Gives a node that is about to become an orphan everything meta is about to drop.
@@ -531,7 +534,8 @@ impl Inner {
         if batch.ops.is_empty() && batch.touched.is_empty() {
             return Ok(());
         }
-        match self.commit(sc, &batch) {
+        let states = self.restore_states(&batch);
+        match self.commit(sc, &batch, &states) {
             Ok(created) => {
                 {
                     let mut al = self.aliases.wr();
@@ -562,14 +566,31 @@ impl Inner {
     }
 
     /// The cached mode and times of a node that a batch has to write.
+    ///
+    /// Read with no meta lock held: the commit closure runs inside meta's writer lock, so a node
+    /// lock taken there would invert the order (see `docs/v1-core.md`, "Lock order").
     fn restore_state(&self, ino: Ino) -> Option<(u32, Timestamp, Timestamp)> {
         let n = self.nodes.get(&ino)?;
         let st = n.st.rd();
         (st.attr.nlink > 0).then_some((st.attr.mode, st.attr.atime, st.attr.mtime))
     }
 
-    fn commit(&self, sc: &SnapCtx, b: &Batch) -> Result<Vec<(Ino, u64)>> {
+    /// States of every touched node, read before the commit opens meta's writer lock.
+    fn restore_states(&self, b: &Batch) -> HashMap<Ino, (u32, Timestamp, Timestamp)> {
+        b.touched
+            .iter()
+            .filter_map(|i| self.restore_state(*i).map(|s| (*i, s)))
+            .collect()
+    }
+
+    fn commit(
+        &self,
+        sc: &SnapCtx,
+        b: &Batch,
+        states: &HashMap<Ino, (u32, Timestamp, Timestamp)>,
+    ) -> Result<Vec<(Ino, u64)>> {
         use cowfs_meta::Error as M;
+        let alias = self.aliases.rd().clone();
         let res = sc.snap.batch(|tx| {
             let mut newly: HashMap<Ino, u64> = HashMap::new();
             let resolve =
@@ -579,7 +600,7 @@ impl Inner {
                         Id::Virt { .. } => newly
                             .get(&ino)
                             .copied()
-                            .or_else(|| self.aliases.rd().meta_of(ino))
+                            .or_else(|| alias.meta_of(ino))
                             .map(mino)
                             .ok_or(M::Invalid("queued operation names an unknown inode")),
                         Id::Root => Err(M::Invalid("queued operation names the mount root")),
@@ -639,16 +660,16 @@ impl Inner {
                 if b.elided.contains(ino) {
                     continue;
                 }
-                let Some((mode, atime, mtime)) = self.restore_state(*ino) else {
+                let Some((mode, atime, mtime)) = states.get(ino) else {
                     continue;
                 };
                 let Ok(m) = resolve(*ino, &newly) else {
                     continue;
                 };
                 let set = cowfs_meta::SetAttr {
-                    mode: Some(mode),
-                    atime: Some(to_meta_ts(atime)),
-                    mtime: Some(to_meta_ts(mtime)),
+                    mode: Some(*mode),
+                    atime: Some(to_meta_ts(*atime)),
+                    mtime: Some(to_meta_ts(*mtime)),
                     size: None,
                 };
                 match tx.setattr(m, set) {

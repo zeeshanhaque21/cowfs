@@ -57,7 +57,9 @@ pub(crate) fn virt(snap: u64, n: u64) -> Result<Ino> {
 }
 
 /// Virtual inode number to meta inode number and back, for files created by this mount session.
-#[derive(Debug, Default)]
+///
+/// `Clone` so a commit can take a copy of the map before opening meta's writer lock.
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Aliases {
     fwd: HashMap<Ino, u64>,
     rev: HashMap<(u64, u64), Ino>,
