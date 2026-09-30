@@ -145,12 +145,12 @@
         {
           "id": "11",
           "title": "#11 Linux FUSE mount",
-          "state": "fixing",
+          "state": "ready",
           "issue": 11,
-          "owner": "builder (subagent)",
+          "owner": "lead",
           "pr": "#31",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/31",
-          "detail": "Critic verdict: NOT mergeable. Blockers: (1) 3600 s ttl + keep_cache leaves changes behind the mount invisible for up to an hour and caused silent data corruption (O_APPEND at a stale size overwrote data); nothing wires the invalidate API and the kernel ignores negative-entry invalidation (verified on 7.0). (2) A Vfs panic hangs the read and the mount vanishes with no error. (3) Single-threaded loop: one 1 s read delayed a stat 852 ms; 4 readers at 100 ms gave lookup p50 835 ms. Also SIGTERM leaves the mount, 8 of 21 mutants survive, inode reuse untested. Passed: 15/15 mount tests, fsx 1e5 ops x2, git/tar/cp/mmap, race test, forget accounting, latency floor reproduces. Builder fixing: short default ttl, opt-in SoleWriter with an Invalidator, catch_unwind, keyed-lane worker pool.",
+          "detail": "Critic findings fixed, re-verified by me at 98c0f24: 43 unit tests on Mac, and in the Linux VM 46 unit + 39 mount + 5 regress tests pass, no mounts left. Defaults now safe: ttl 1 s, keep_cache off, opt-in SoleWriter with an Invalidator; Vfs panics become EIO then a clean unmount; keyed-lane worker pool (slow read no longer delays stat: 856 ms to 0.2 ms, builder's n=1); signal cleanup and stale-mount sweep; inode-reuse paranoid mode. Decisions for lead: cross-adapter permission policy (FUSE denies later O_WRONLY on a 0444 file, NFS allows), SoleWriter wiring by core/control plane (invalidate from outside Vfs calls), add 'Ino never reused' text to architecture doc (done on v1/vfs-trait), add a Linux mount CI job (command in report). 2 survivors: one equivalent, one control.",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -161,7 +161,7 @@
           "owner": "critic round 2 (subagent)",
           "pr": "#32",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/32",
-          "detail": "Round-1 findings fixed with regression tests (I re-ran: 38 nfsserve/adapter + protocol tests pass, fmt/clippy clean, CI green): reference-balance leak, AppleDouble Translate (sidecar to xattrs, no sidecar inodes; 200 files = 200 inodes vs 400), one-shot MNT + keyed MAC handles + generations, DoS bounds, retransmission reply cache, inode-reuse STALE, signal cleanup + stale-mount sweep. Mutants 21/22 killed. Caveats: latency at load 42-65 (inline_metadata helps writes and reads, noisy), no before/after RPC baseline, lsof peer-uid check adds almost nothing, RSS soak 3 to 40 MiB unexplained, real files named ._x invisible under Translate. Translate is new stateful code, so a round-2 critic is attacking it.",
+          "detail": "Round-1 findings fixed with regression tests (I re-ran: 38 nfsserve/adapter + protocol tests pass, fmt/clippy clean, CI green): reference-balance leak, AppleDouble Translate (sidecar to xattrs, no sidecar inodes; 200 files = 200 inodes vs 400), one-shot MNT + keyed MAC handles + generations, DoS bounds, retransmission reply cache, inode-reuse STALE, signal cleanup + stale-mount sweep. Mutants 21/22 killed. Caveats: latency at load 42-65 (inline_metadata helps writes and reads, noisy), no before/after RPC baseline, lsof peer-uid check adds almost nothing, RSS soak 3 to 40 MiB unexplained, real files named ._x invisible under Translate. Translate is new stateful code, so a round-2 critic is attacking it. | Update: #34 found a real bug: reply cache ignores the connection (cross-connection xid collision replays the wrong reply). Builder fixing while the round-2 critic reviews.",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -202,12 +202,12 @@
         {
           "id": "29",
           "title": "#29 cowfs-vfs trait, MemVfs and conformance suite",
-          "state": "ready",
-          "owner": "lead",
+          "state": "fixing",
+          "owner": "builder (subagent)",
           "issue": 29,
           "pr": "#30",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/30",
-          "detail": "Critic findings fixed and re-verified by me: 127 checks tagged Posix/Portable/Cowfs, Options::skip with reasons shown in the report, oracle precedence fixed, 57 faults all caught (full release run 62 s, passes), default crate tests about 20 s, no flakes in 20 runs or under 8 CPU burners (builder's numbers). Not done: oracle does not check timestamps, blocks, xattr flags or short reads (direct checks cover them). The Posix level is unverified on native filesystems until #34 runs it. Needs a CI job for the feature-gated full mutation run.",
+          "detail": "Critic findings fixed and re-verified by me: 127 checks tagged Posix/Portable/Cowfs, Options::skip with reasons shown in the report, oracle precedence fixed, 57 faults all caught (full release run 62 s, passes), default crate tests about 20 s, no flakes in 20 runs or under 8 CPU burners (builder's numbers). Not done: oracle does not check timestamps, blocks, xattr flags or short reads (direct checks cover them). The Posix level is unverified on native filesystems until #34 runs it. Needs a CI job for the feature-gated full mutation run. | Update: native runs found level mistakes (see #34); builder fixing.",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -229,8 +229,8 @@
           "issue": 34,
           "pr": "#35",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/35",
-          "detail": "PathVfs built; suite ran on APFS (99/114), case-sensitive APFS (99), btrfs (100), ext4 (112), FUSE (112, same 2 failures as native ext4, so no FUSE adapter bug), NFS (88, 26 fail). No adapter bug confirmed; 12 NFS failures are the client's silly rename (.nfs.* files), 1 is RENAME_EXCL ENOTSUP. Suite bugs found: dir nlink formula, symlink xattrs, 60 kB xattr, 4095-byte symlink targets, and concurrent read/write shows torn reads natively on ext4 and btrfs (6 of 10 runs). Silly rename makes unlink-while-open, forget and rmdir-while-referenced unjudgeable through NFS: now being run at protocol level. Builder is fixing Linux clippy, merging the revised suite and rerunning the matrix at Posix level.",
-          "ci": "CI: ubuntu FAIL (clippy, Linux-only lints), macos pass"
+          "detail": "Suite run on APFS, btrfs, ext4, FUSE and NFS. Posix level (56 checks): 0 failures natively and through FUSE; NFS mount 10 (9 silly rename, 1 AppleDouble Translate hides ._ names). FUSE adapter: no bug. NFS adapter bug found: the reply cache ignores the connection, so a second connection's identical xid replays the first connection's reply and the call never runs (sent to the #12 builder). Suite level corrections sent to the #29 builder (torn reads on ext4/btrfs/tmpfs at 512/4096 B, statfs files=0 on btrfs, com.apple.* xattrs, atime-only ctime, xattr name prefix, LINK_MAX hang). Client-side, not adapter: sparse blocks, statfs caching, silly rename. 2 unexplained flakes.",
+          "ci": "CI: pass (linux, macos) at 88e5834"
         }
       ]
     },
