@@ -1,0 +1,26 @@
+[package]
+name = "cowfs-vfs-test"
+description = "MemVfs reference implementation and the conformance suite every cowfs Vfs backend must pass"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cowfs-vfs = { path = "../cowfs-vfs" }
+libc = "0.2"
+
+[dev-dependencies]
+proptest.workspace = true
+
+[features]
+# Runs every Fault against the whole suite (slow). See the crate docs.
+mutation-tests = []
+
+[[test]]
+name = "mutations_full"
+required-features = ["mutation-tests"]
+
+[lints]
+workspace = true
