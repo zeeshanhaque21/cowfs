@@ -144,12 +144,56 @@ impl Fixture {
     ///
     /// The fixture itself is not, because it owns a `TempDir` and a `Mutex`, so a threaded test
     /// takes these instead and leaves the fixture to the main thread.
+    /// Take over a directory a caller owns, with handles the caller already opened.
+    pub fn adopt(
+        dir: PathBuf,
+        store: Arc<Store>,
+        meta: Arc<Meta>,
+        gc: Gc,
+        sopts: StoreOptions,
+        gopts: Options,
+    ) -> Fixture {
+        Fixture {
+            dir,
+            store,
+            meta,
+            gc,
+            keep: Arc::new(Mutex::new(None)),
+            sopts,
+            gopts,
+        }
+    }
+
     pub fn parts(&self) -> Parts<'_> {
         Parts {
             store: Arc::clone(&self.store),
             meta: Arc::clone(&self.meta),
             gc: &self.gc,
         }
+    }
+
+    /// Close the store and the database and keep the directory, so a test can damage the files and
+    /// reopen them. The caller owns the returned path and deletes it.
+    pub fn persist(self) -> PathBuf {
+        let path = self.path().to_path_buf();
+        let keep = self.keep.lock().unwrap().take();
+        let Self {
+            dir,
+            store,
+            meta,
+            gc,
+            keep: _,
+            sopts: _,
+            gopts: _,
+        } = self;
+        drop(gc);
+        drop(store);
+        drop(meta);
+        let _ = dir;
+        // The `TempDir` would delete the directory on drop, so it is leaked on purpose. A test that
+        // damages files owns the cleanup and does it with `fs::remove_dir_all`.
+        std::mem::forget(keep);
+        path
     }
 
     /// Store a file's content and set it on a snapshot, the way a mount would.

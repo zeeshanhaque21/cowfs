@@ -994,6 +994,9 @@ impl Store {
             let mut w = self.writer();
             w.synced = w.synced.max((mark.pack, mark.len));
         }
+        // The handle keeps reporting the loss it was asked about: `recovery` is what `open` found,
+        // and rewriting that would make a report disagree with the file. A reopened store reads the
+        // `ACKED` file and is clean.
         Ok(entries.len())
     }
 

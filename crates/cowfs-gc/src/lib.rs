@@ -345,12 +345,15 @@ impl Gc {
                 continue;
             }
             match self.copy_one(plan, &live, &mut budget, &mut progress) {
-                Ok(rw) => {
+                // `None` means the copy was abandoned part way: the pack is left whole and the
+                // next cycle starts it again.
+                Ok(Some(rw)) => {
                     r.packs_rewritten += 1;
                     r.records_copied += rw.records;
                     r.bytes_copied += rw.bytes;
                     copied.push(rw);
                 }
+                Ok(None) => r.skip(plan.id, SkipReason::NotReached),
                 Err(e) => r.error(e),
             }
             progress.packs_done += 1;
@@ -368,6 +371,10 @@ impl Gc {
             }
             live.extend(self.pinned_now(roots));
             for rw in &copied {
+                if self.is_cancelled() {
+                    r.skip(rw.from, SkipReason::NotReached);
+                    continue;
+                }
                 if rw.condemned.iter().any(|b| live.contains(b)) {
                     r.skip(rw.from, SkipReason::BecameLive);
                     continue;
@@ -376,6 +383,8 @@ impl Gc {
                     Ok(freed) => {
                         r.packs_unlinked += 1;
                         r.freed_bytes += freed;
+                        progress.freed_bytes = r.freed_bytes;
+                        self.emit(&progress);
                     }
                     Err(e) => r.error(e),
                 }
@@ -443,40 +452,34 @@ impl Gc {
         v
     }
 
+    /// Copy one candidate. `Ok(None)` means the copy was abandoned: the budget ran out or the
+    /// cycle was cancelled, and the pack is left whole for the next cycle.
     fn copy_one(
         &self,
         plan: &PackPlan,
         live: &HashSet<BlockId>,
         budget: &mut u64,
         progress: &mut Progress,
-    ) -> Result<Rewrite> {
+    ) -> Result<Option<Rewrite>> {
         let is_live = |b: BlockId| live.contains(&b);
         let mut c = self.store.begin_compaction(plan, &is_live)?;
+        if c.outstanding_bytes() > 0 && *budget > 0 && c.outstanding_bytes() > *budget {
+            // The whole copy does not fit in what is left of the budget, so do not start it.
+            return Ok(None);
+        }
         while !self.store.copy_batch(&mut c, self.opts.batch_bytes)? {
             let owed = c.outstanding_bytes();
             progress.bytes_copied += c.written();
-            if self.is_cancelled() {
-                return Ok(Rewrite {
-                    from: plan.id,
-                    to: c.to(),
-                    condemned: Vec::new(),
-                    ..Rewrite::default()
-                });
+            if self.is_cancelled() || (*budget > 0 && owed > *budget) {
+                return Ok(None);
             }
-            if *budget > 0 {
-                *budget = budget.saturating_sub(owed.min(*budget));
-                if *budget == 0 {
-                    return Ok(Rewrite {
-                        from: plan.id,
-                        to: c.to(),
-                        condemned: Vec::new(),
-                        ..Rewrite::default()
-                    });
-                }
-            }
+            *budget = budget.saturating_sub(owed);
         }
         progress.bytes_copied += c.written();
-        Ok(self.store.finish_compaction(&c)?)
+        if *budget > 0 {
+            *budget = budget.saturating_sub(c.written());
+        }
+        Ok(Some(self.store.finish_compaction(&c)?))
     }
 
     /// Flush the hints, then drop every persisted block nothing references any more.
