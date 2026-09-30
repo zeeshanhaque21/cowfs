@@ -101,6 +101,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cowfs-vfs-path"
+version = "0.0.0"
+dependencies = [
+ "cowfs-vfs",
+ "cowfs-vfs-test",
+ "libc",
+]
+
+[[package]]
 name = "cowfs-vfs-test"
 version = "0.0.0"
 dependencies = [
