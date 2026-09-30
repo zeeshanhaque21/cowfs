@@ -480,4 +480,6 @@ What these show and do not show:
 - Writer stall during removal is bounded by one reap step of at most 256 nodes or 4 ms of work; the remaining 28 ms in the whole window is the durable commit that `remove_snapshot` itself performs, which is above the 20 ms target at load 70.
 - `check()` is slower in this run than in the review's (load differs: 54 here) and uses less memory, but it is not bounded-memory: +230 MB at 1M inodes.
   The target (streaming, bounded) was not reached.
+- The 120 s hammer (`cargo test -p cowfs-meta --release --test review hammer -- --ignored --nocapture`, load about 48): 138,573 batches, 8,828 snapshot reads, 0 torn reads, `check()` clean, worst single write 1.85 s.
+  The cause of that worst case is not attributed (candidates: a durable fork or removal commit, or writer starvation on the session lock with four readers); no measurement here separates them.
 - Not measured: memory of the node cache, recovery time after an unclean shutdown (the review measured 4.8 s at 1M inodes for redb's repair; nothing here changes it), concurrent readers during writes.
