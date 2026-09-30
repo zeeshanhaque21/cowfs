@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 cowfs-store = { path = "../cowfs-store" }
+blake3.workspace = true
+redb = "4.3"
 thiserror.workspace = true
 
 [dev-dependencies]
