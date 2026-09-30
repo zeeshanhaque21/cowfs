@@ -126,13 +126,13 @@ impl std::fmt::Debug for Core {
 
 impl Core {
     /// Opens (creating if needed) the store and metadata under `dir`.
-    pub fn open(dir: impl AsRef<Path>, mut opts: Options) -> Result<Core, Error> {
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir).map_err(|e| from_io(&e))?;
-        let store = Arc::new(Store::open(dir.join("store"), opts.store).map_err(from_store)?);
-        opts.meta.before_sync = Some(store_sync_hook(&store));
-        let meta = Meta::open(dir.join("meta.redb"), opts.meta.clone()).map_err(from_meta)?;
-        Self::from_parts(store, meta, opts, dir)
+    ///
+    /// The store sync hook is wired in [`Core::open_with_meta`], the one place that does it, so no
+    /// entry point can forget it.
+    pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Core, Error> {
+        Self::open_with_meta(dir, opts, |dir, o| {
+            Meta::open(dir.join("meta.redb"), o).map_err(|e| e)
+        })
     }
 
     /// Like [`Core::open`], but the metadata database is built by `make_meta`, which receives the

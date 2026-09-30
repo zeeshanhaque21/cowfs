@@ -20,8 +20,8 @@ C = "crates/cowfs-core/src/"
 
 M = {
  "m01_open_drops_before_sync": ("lib.rs",
-   "opts.meta.before_sync = Some(store_sync_hook(&store));",
-   "opts.meta.before_sync = None;"),
+   "        mopts.before_sync = Some(store_sync_hook(&store));",
+   "        mopts.before_sync = None;"),
  "m02_rename_keeps_old_dentry": ("ns.rs",
    "        self.dents.put(parent, name, None, seq);\n        self.dents\n            .put(new_parent, new_name, Some((src, skind)), seq);",
    "        self.dents\n            .put(new_parent, new_name, Some((src, skind)), seq);"),
@@ -53,8 +53,8 @@ M = {
    "        self.inner.check_new_name(name)?;\n        self.inner.flush_snapshot(&sc)?;\n        let snap = sc.snap.fork",
    "        self.inner.check_new_name(name)?;\n        let snap = sc.snap.fork"),
  "m12_unlink_keeps_dentry": ("ns.rs",
-   "        pn.ns_seq.store(seq, Ordering::Release);\n        self.dents.put(parent, name, None, seq);\n        drop(_ns);",
-   "        pn.ns_seq.store(seq, Ordering::Release);\n        drop(_ns);"),
+   "        pn.ns_seq.store(seq, Ordering::Release);\n        self.dents.put(parent, name, None, seq);\n        drop(_ns);\n        self.maybe_wake(&sc);\n        Ok(())\n    }\n\n    pub(crate) fn op_rmdir",
+   "        pn.ns_seq.store(seq, Ordering::Release);\n        drop(_ns);\n        self.maybe_wake(&sc);\n        Ok(())\n    }\n\n    pub(crate) fn op_rmdir"),
  "m13_content_before_data_flush_skipped_hole_zero": ("file.rs",
    "            prefix = hole_refs(a - total);",
    "            prefix = hole_refs(a - total - 1);"),
