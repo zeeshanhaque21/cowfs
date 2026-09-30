@@ -80,8 +80,11 @@ dependencies = [
  "cowfs-store",
  "cowfs-vfs",
  "cowfs-vfs-test",
+ "crc32c",
  "fs2",
+ "libc",
  "proptest",
+ "redb",
  "tempfile",
  "thiserror",
 ]

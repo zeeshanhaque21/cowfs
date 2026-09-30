@@ -18,6 +18,9 @@ thiserror.workspace = true
 cowfs-vfs-test = { path = "../cowfs-vfs-test" }
 proptest.workspace = true
 tempfile.workspace = true
+redb = "4.3"
+crc32c = "0.6"
+libc = "0.2"
 
 [lints]
 workspace = true

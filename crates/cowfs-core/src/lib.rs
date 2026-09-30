@@ -161,6 +161,13 @@ impl Core {
         opts: Options,
         dir: &Path,
     ) -> Result<Core, Error> {
+        let rec = store.recovery();
+        if rec.has_corruption() {
+            return Err(Error::Corrupt(format!(
+                "block store lost durable data to corruption: {:?}",
+                rec.corrupt_synced
+            )));
+        }
         let md = std::fs::metadata(dir).map_err(|e| from_io(&e))?;
         let total = fs2::total_space(dir).unwrap_or(1 << 40);
         let avail = fs2::available_space(dir).unwrap_or(total);
