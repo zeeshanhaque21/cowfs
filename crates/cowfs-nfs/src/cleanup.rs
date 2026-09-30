@@ -63,7 +63,8 @@ pub fn install_signal_cleanup() -> io::Result<()> {
     result
 }
 
-/// Mounts of `localhost:/` under `prefix` in the output of `nfsstat -m`, with the port they talk to.
+/// Mounts of a cowfs export under `prefix` in the output of `nfsstat -m`, with the port they talk
+/// to. Anything else is another file system's mount and is left alone.
 fn localhost_mounts(nfsstat: &str, prefix: &Path) -> Vec<(PathBuf, u16)> {
     let mut out = Vec::new();
     let mut current: Option<PathBuf> = None;
@@ -71,7 +72,7 @@ fn localhost_mounts(nfsstat: &str, prefix: &Path) -> Vec<(PathBuf, u16)> {
         if !line.starts_with(char::is_whitespace) {
             current = line
                 .rsplit_once(" from ")
-                .filter(|(_, server)| *server == "localhost:/")
+                .filter(|(_, server)| crate::mount::is_our_export(server))
                 .map(|(path, _)| PathBuf::from(path))
                 .filter(|p| p.starts_with(prefix));
         } else if let Some(path) = &current {
@@ -120,34 +121,39 @@ pub fn sweep_stale_mounts(prefix: &Path) -> Result<Vec<PathBuf>, MountError> {
 mod tests {
     use super::*;
 
+    const COWFS: &str = "localhost:/cowfs-0123456789abcdef0123456789abcdef";
     const SAMPLE: &str = "\
 /Users/z/OrbStack from OrbStack:/OrbStack
   -- Original mount options:
      NFS parameters: vers=4.0,port=63709,soft
-/tmp/cowfs/a from localhost:/
+/tmp/cowfs/a from COWFS
   -- Original mount options:
      General mount flags: 0x0
      NFS parameters: vers=3,tcp,port=11111,mountport=11111,locallocks,rsize=131072
-/tmp/cowfs/b from localhost:/
+/tmp/cowfs/b from localhost:/cowfs-ffffffffffffffffffffffffffffffff
   -- Original mount options:
      NFS parameters: locallocks,vers=3,tcp,rsize=1,wsize=1,actimeo=1,port=4711,mountport=4711
 /tmp/other/c from localhost:/
   -- Original mount options:
      NFS parameters: vers=3,tcp,port=5
-/tmp/cowfs/d from otherhost:/
+/tmp/cowfs/d from localhost:/cowfs-nothex
   -- Original mount options:
-     NFS parameters: vers=3,tcp,port=6
+     NFS parameters: vers=3,tcp,port=7
+/tmp/cowfs/e from otherhost:/cowfs-0123456789abcdef0123456789abcdef
+  -- Original mount options:
+     NFS parameters: vers=3,tcp,port=8
 ";
 
     #[test]
     fn only_localhost_v3_mounts_under_the_prefix_are_candidates() {
-        let got = localhost_mounts(SAMPLE, Path::new("/tmp/cowfs"));
+        let got = localhost_mounts(&SAMPLE.replace("COWFS", COWFS), Path::new("/tmp/cowfs"));
         assert_eq!(
             got,
             vec![
                 (PathBuf::from("/tmp/cowfs/a"), 11111),
                 (PathBuf::from("/tmp/cowfs/b"), 4711)
-            ]
+            ],
+            "only mounts of a cowfs export, never localhost:/ of another tool"
         );
         assert!(localhost_mounts(SAMPLE, Path::new("/nowhere")).is_empty());
         assert!(localhost_mounts("", Path::new("/")).is_empty());

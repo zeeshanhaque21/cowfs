@@ -493,12 +493,16 @@ impl Adapter {
         check_name(from)?;
         check_name(to)?;
         match (self.side_of(from_dir, from), self.side_of(to_dir, to)) {
-            // The attributes live on the inode and moved with it: nothing left to do.
-            (true, true) => return Ok(()),
+            // The attributes live on the inode and moved with it, so there is nothing to do.
+            (true, _) => return Ok(()),
+            // A real file cannot be moved onto the view of another file.
+            (false, true) if !self.translating(from_dir, from) => {
+                return Err(nfsstat3::NFS3ERR_ACCES);
+            }
+            // A plain name moved onto a view: that view is the file's own attributes already.
+            (false, true) => return Ok(()),
             // Both are ordinary names, including a `._name` with no main file to hold attributes.
             (false, false) => {}
-            // A sidecar is not a file that can be moved to or from another name.
-            _ => return Err(nfsstat3::NFS3ERR_ACCES),
         }
         let src = self.peek(from_dir, from).map_err(stat)?;
         let replaced = self.peek(to_dir, to).ok();

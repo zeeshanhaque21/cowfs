@@ -26,13 +26,19 @@
 //!
 //! # Security model
 //!
-//! The server listens on 127.0.0.1 only. The root handle is given to one connection (the first
-//! MNT, one-shot, `Server::rearm_mount` for a remount). Every handle carries a keyed BLAKE3 MAC
-//! (random key per server instance), so a process that never obtained handles from the client
-//! cannot forge or guess one. A best-effort `lsof` check rejects MNT from a process of another
-//! user when it can see the socket; the kernel NFS client's socket is invisible to it, so this
-//! adds little. Residual risk: any process that can read the mounting client's memory or the
-//! kernel NFS state, and any process of the same user that can use the mount point itself.
+//! The server listens on 127.0.0.1 only, and answers MNT for one export path
+//! (`localhost:/cowfs-<32 random hex digits>`) that only `mount_nfs` is told. A local process that
+//! finds the port cannot guess the path, so it cannot become a client at all; that is what
+//! protects the root handle, which is then given to one connection (the first MNT, one-shot,
+//! `Server::rearm_mount` for a remount). Every handle carries a keyed BLAKE3 MAC (random key per
+//! server instance), so a process that never obtained handles from the client cannot forge one.
+//!
+//! Residual risk, stated plainly: any process that can read the mounting client's memory or the
+//! kernel NFS state can take a real handle; any process of the same user can use the mount point
+//! itself; and the export path reaches the process table of any process that can see the
+//! `mount_nfs` command line while it runs. `check_peer_uid` (an `lsof` lookup) is off by default
+//! because the kernel NFS client's socket is invisible to it, so it cannot tell an attacker from
+//! the client.
 //!
 //! Tests: `cargo test -p cowfs-nfs` runs the unit and in-process protocol tests. The mount tests
 //! and the benchmark are `#[ignore]`d, see `tests/mount.rs` and `tests/bench.rs`.
@@ -53,6 +59,8 @@ pub use cleanup::{install_signal_cleanup, sweep_stale_mounts};
 pub use convert::{fattr, nfstime, set_attr, timestamp, FSID};
 pub use errors::nfsstat;
 pub use handle::{random_key, HandleCodec, HANDLE_LEN};
-pub use mount::{is_listed, mount_nfs_available, Mount, MountError, MountOptions, Server};
+pub use mount::{
+    is_listed, is_our_export, mount_nfs_available, Mount, MountError, MountOptions, Server,
+};
 pub use nfsserve::take_stats;
 pub use peer::same_user;

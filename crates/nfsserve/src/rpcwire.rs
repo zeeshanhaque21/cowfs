@@ -37,6 +37,9 @@ async fn handle_rpc(
     context
         .active
         .store(crate::tcp::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    context
+        .served
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut recv = rpc_msg::default();
     recv.deserialize(input)?;
     let xid = recv.xid;

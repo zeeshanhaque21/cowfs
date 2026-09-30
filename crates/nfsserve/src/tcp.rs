@@ -115,9 +115,10 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
 #[derive(Debug)]
 struct Live {
     id: u64,
-    /// When this connection last had a request, shared with its context so every request
-    /// refreshes it.
+    /// When this connection last had a request, and how many it has carried, both shared with
+    /// its context so every request refreshes them.
     active: Arc<AtomicU64>,
+    served: Arc<AtomicU64>,
     kick: tokio::sync::watch::Sender<bool>,
 }
 
@@ -252,8 +253,9 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
             };
             let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
             let active = Arc::new(AtomicU64::new(now_ms()));
+            let served = Arc::new(AtomicU64::new(0));
             let (kick, kicked) = tokio::sync::watch::channel(false);
-            self.enter(conn, active.clone(), kick.clone());
+            self.enter(conn, active.clone(), served.clone(), kick.clone());
             let context = RPCContext {
                 local_port: self.port,
                 conn,
@@ -269,6 +271,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 export_name: self.export_name.clone(),
                 reply_cache: self.reply_cache.clone(),
                 active,
+                served,
             };
             let limits = self.limits.clone();
             let live = self.live.clone();
@@ -288,17 +291,28 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
     /// Records a new connection, and if the cap is full kicks the one that has been quiet
     /// longest. A local process cannot be told apart from the real client by address, so
     /// refusing the newcomer is what lets it lock the client out.
-    fn enter(&self, conn: u64, active: Arc<AtomicU64>, kick: tokio::sync::watch::Sender<bool>) {
+    fn enter(
+        &self,
+        conn: u64,
+        active: Arc<AtomicU64>,
+        served: Arc<AtomicU64>,
+        kick: tokio::sync::watch::Sender<bool>,
+    ) {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         live.retain(|l| l.active.load(Ordering::Relaxed) + 3_600_000 > now_ms());
         if live.len() >= self.limits.max_connections {
-            if let Some(oldest) = live
+            if let Some(i) = live
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, l)| l.active.load(Ordering::Relaxed))
+                .min_by_key(|(_, l)| {
+                    (
+                        l.served.load(Ordering::Relaxed),
+                        l.active.load(Ordering::Relaxed),
+                    )
+                })
                 .map(|(i, _)| i)
             {
-                let victim = live.remove(oldest);
+                let victim = live.remove(i);
                 let _ = victim.kick.send(true);
                 debug!("connection limit reached, kicked connection {}", victim.id);
             }
@@ -306,6 +320,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
         live.push(Live {
             id: conn,
             active,
+            served,
             kick,
         });
     }

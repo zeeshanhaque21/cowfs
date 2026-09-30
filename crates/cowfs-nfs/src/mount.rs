@@ -17,6 +17,30 @@ const MOUNT_NFS: &str = "/sbin/mount_nfs";
 const MOUNT: &str = "/sbin/mount";
 const UMOUNT: &str = "/sbin/umount";
 
+/// The export the server answers MNT for: a name only this process knows, in a shape
+/// [`sweep_stale_mounts`](crate::sweep_stale_mounts) can recognise later as one of ours.
+pub(crate) fn secret_path() -> io::Result<String> {
+    let mut hex = String::with_capacity(EXPORTS.len() + 32);
+    hex.push_str(EXPORTS);
+    for b in crate::handle::random_key()?.iter().take(16) {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    Ok(hex)
+}
+
+/// The fixed part of the export name. A mount of ours is `localhost:/cowfs-<32 hex digits>`.
+pub const EXPORTS: &str = "cowfs-";
+
+/// True if a `mount` or `nfsstat` source of the form `localhost:/path` is one of ours.
+pub fn is_our_export(source: &str) -> bool {
+    let Some(path) = source.strip_prefix("localhost:/") else {
+        return false;
+    };
+    path.starts_with(EXPORTS)
+        && path.len() == EXPORTS.len() + 32
+        && path[EXPORTS.len()..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// What can go wrong mounting or unmounting.
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
@@ -55,7 +79,9 @@ pub struct MountOptions {
     /// Give the root file handle to one client only: the first MNT wins and later ones are
     /// refused until [`Server::rearm_mount`].
     pub one_shot_mount: bool,
-    /// Refuse MNT from a process of another user than the server's (best effort, uses `lsof`).
+    /// Refuse MNT from a process of another user than the server's. Best effort with `lsof`,
+    /// which cannot see the kernel NFS client's socket, so it is off by default and adds nothing
+    /// over the secret export name.
     pub check_peer_uid: bool,
     /// Connection and message bounds of the server.
     pub limits: Limits,
@@ -74,7 +100,7 @@ impl Default for MountOptions {
             appledouble: AppleDoubleMode::default(),
             inline_metadata: false,
             one_shot_mount: true,
-            check_peer_uid: true,
+            check_peer_uid: false,
             limits: Limits::default(),
             stats_on_sigusr1: false,
             command_timeout: Duration::from_secs(20),
@@ -107,6 +133,7 @@ pub struct Server {
     runtime: Option<tokio::runtime::Runtime>,
     port: u16,
     gate: Option<Arc<MountGate>>,
+    export: String,
 }
 
 impl Server {
@@ -124,6 +151,10 @@ impl Server {
         let fs = CowNfs::new(vfs, opts.adapter(owner))?;
         let mut listener = runtime.block_on(NFSTcpListener::bind("127.0.0.1:0", fs))?;
         let port = listener.get_listen_port();
+        // The only thing that answers MNT is this path, and only `mount_nfs` is told what it is.
+        // A local process that polls the port learns the port, not the path.
+        let export = secret_path()?;
+        listener.with_export_name(export.clone());
         listener.set_limits(opts.limits.clone());
         let gate = opts.one_shot_mount.then(|| Arc::new(MountGate::new()));
         if let Some(gate) = &gate {
@@ -149,7 +180,13 @@ impl Server {
             runtime: Some(runtime),
             port,
             gate,
+            export,
         })
+    }
+
+    /// The path that answers MNT. `mount_nfs` is the only thing that is told this.
+    pub fn export_name(&self) -> &str {
+        &self.export
     }
 
     pub fn port(&self) -> u16 {
@@ -294,11 +331,12 @@ impl Mount {
         }
         let md = std::fs::metadata(&mountpoint)?;
         let server = Server::start(vfs, &opts, Some((md.uid(), md.gid())))?;
+        let source = format!("localhost:/{}", server.export_name());
         let mounted = checked(
             Command::new(MOUNT_NFS)
                 .arg("-o")
                 .arg(opts.nfs_option_string(server.port()))
-                .arg("localhost:/")
+                .arg(&source)
                 .arg(&mountpoint),
             timeout,
         );
@@ -396,7 +434,11 @@ mod tests {
     fn defaults_hide_appledouble_and_lock_down_the_mount() {
         let o = MountOptions::default();
         assert!(o.appledouble == AppleDoubleMode::Hide && !o.stats_on_sigusr1);
-        assert!(o.one_shot_mount && o.check_peer_uid && !o.inline_metadata);
+        assert!(o.one_shot_mount && !o.check_peer_uid && !o.inline_metadata);
+        assert!(
+            o.appledouble == AppleDoubleMode::Hide,
+            "the safe mode is the default"
+        );
         assert_eq!(o.adapter(None).appledouble, AppleDoubleMode::Hide);
     }
 

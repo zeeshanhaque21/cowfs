@@ -12,6 +12,7 @@ use nfsserve::nfs::{nfs_fh3, nfsstat3};
 use nfsserve::tcp::Limits;
 
 const MNT_ACCES: u32 = 13;
+const MNT_NOENT: u32 = 2;
 
 fn opts(limits: Limits) -> MountOptions {
     MountOptions {
@@ -60,9 +61,14 @@ fn only_the_first_mnt_gets_the_root_handle() {
     let (s, mut first) = serve(memfs(), MountOptions::default());
     let root = first.root.clone();
     let mut other = Nfs::attach(s.port(), nfs_fh3::default());
-    assert_eq!(other.mount().0, MNT_ACCES, "a second process cannot mount");
+    let own = format!("/{}", s.export_name());
     assert_eq!(
-        first.mount().0,
+        other.mount_path(&own).0,
+        MNT_ACCES,
+        "a second process cannot mount"
+    );
+    assert_eq!(
+        first.mount_path(&own).0,
         0,
         "the claiming connection may repeat itself"
     );
@@ -75,11 +81,55 @@ fn only_the_first_mnt_gets_the_root_handle() {
     s.rearm_mount();
     let mut again = Nfs::attach(s.port(), nfs_fh3::default());
     assert_eq!(
-        again.mount().0,
+        again.mount_path(&own).0,
         0,
         "a deliberate remount is possible after rearm"
     );
-    assert_eq!(other.mount().0, MNT_ACCES, "and closes the gate behind it");
+    assert_eq!(
+        other.mount_path(&own).0,
+        MNT_ACCES,
+        "and closes the gate behind it"
+    );
+}
+
+#[test]
+fn only_the_servers_own_export_path_answers_mnt() {
+    let (s, c) = serve(memfs(), MountOptions::default());
+    let root = c.root.clone();
+    for path in [
+        "/",
+        "/cowfs",
+        "/cowfs-",
+        "/cowfs-00000000000000000000000000000000",
+        "/cowfs-000000000000000000000000000000000",
+        "/cowfs-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "/other",
+    ] {
+        let mut a = Nfs::attach(s.port(), nfs_fh3::default());
+        let (st, h) = a.mount_path(path);
+        assert_eq!(st, MNT_NOENT, "{path} must not answer MNT");
+        assert!(h.is_none());
+    }
+    // The one path that works is the one only mount_nfs was told.
+    let mut right = Nfs::attach(s.port(), nfs_fh3::default());
+    let (st, h) = right.mount_path(&format!("/{}", s.export_name()));
+    assert_ne!(st, MNT_NOENT, "the real export path answers");
+    let _ = (root, h);
+}
+
+#[test]
+fn two_servers_never_answer_each_others_mnt() {
+    let (a, _ca) = serve(memfs(), MountOptions::default());
+    let (b, _cb) = serve(memfs(), MountOptions::default());
+    let (_c, _cc) = serve(memfs(), MountOptions::default());
+    assert_ne!(a.export_name(), b.export_name(), "the secret is per server");
+    for (server, other) in [(&a, &b), (&b, &a)] {
+        let mut x = Nfs::attach(server.port(), nfs_fh3::default());
+        assert_eq!(
+            x.mount_path(&format!("/{}", other.export_name())).0,
+            MNT_NOENT
+        );
+    }
 }
 
 #[test]
@@ -89,7 +139,13 @@ fn a_gate_off_server_lets_everyone_mount() {
         ..MountOptions::default()
     };
     let (s, _c) = serve(memfs(), o);
-    assert_eq!(Nfs::attach(s.port(), nfs_fh3::default()).mount().0, 0);
+    let mut x = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(x.mount_path(&format!("/{}", s.export_name())).0, 0);
+    let mut y = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(
+        y.mount_path("/cowfs-0123456789abcdef0123456789abcdef").0,
+        MNT_NOENT
+    );
 }
 
 #[test]
@@ -278,11 +334,19 @@ fn a_connection_flood_is_capped_and_the_server_recovers() {
     std::thread::sleep(Duration::from_millis(500));
     let mut open = 0;
     for x in &mut socks {
-        x.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+        let _ = x.set_read_timeout(Some(Duration::from_millis(1)));
         let mut b = [0u8; 1];
-        if !matches!(x.read(&mut b), Ok(0)) {
-            open += 1;
-        }
+        // A kicked connection is closed or reset, both of which count as not open.
+        let alive = match x.read(&mut b) {
+            Ok(0) => false,
+            Err(e)
+                if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::BrokenPipe =>
+            {
+                false
+            }
+            Ok(_) | Err(_) => true,
+        };
+        open += usize::from(alive);
     }
     assert!(
         open <= Limits::default().max_connections,
