@@ -431,7 +431,9 @@ impl Vfs for PathVfs {
             }
             s.open_fd(ino)?.file
         };
-        if offset > i64::MAX as u64 {
+        // The loop reads at most READ_MAX bytes per call, so this keeps every offset it touches
+        // inside what `off_t` can hold.
+        if offset > i64::MAX as u64 - u64::from(READ_MAX) {
             return Ok(Vec::new());
         }
         let mut buf = vec![0u8; size.min(READ_MAX) as usize];
