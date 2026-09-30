@@ -217,5 +217,68 @@ fn main() {
         v.push(n as f64 / t / 1e3);
     }
     report("contains (index lookup), 1 thread", "k/s", &v);
+
+    println!("hot single-block get (cache-hot, CPU bound), 2000 iterations per run:");
+    for (label, want_compressible) in [
+        ("compressible block", true),
+        ("incompressible block", false),
+    ] {
+        let pick = data
+            .iter()
+            .flat_map(|d| chunks(d))
+            .filter(|c| c.len() >= 128 * 1024)
+            .find_map(|c| {
+                let z = zstd::bulk::compress(c, 3).unwrap();
+                ((z.len() * 100 <= c.len() * 95) == want_compressible).then_some((c, z))
+            });
+        let Some((c, z)) = pick else {
+            println!("  no {label} of 128 KiB or more in the sample");
+            continue;
+        };
+        let id = BlockId::of(c);
+        let stored = if want_compressible { z.len() } else { c.len() };
+        let rec = vec![7u8; 52 + stored];
+        let mib = c.len() as f64 / (1 << 20) as f64;
+        let bench = |f: &dyn Fn()| -> Vec<f64> {
+            (0..runs)
+                .map(|_| {
+                    let (_, t) = timed(|| (0..2000).for_each(|_| f()));
+                    mib * 2000.0 / t
+                })
+                .collect()
+        };
+        println!("  {label}: {} bytes, stored {stored}", c.len());
+        report(
+            "    get() total",
+            "MiB/s",
+            &bench(&|| drop(black_box(s.get(id).unwrap()))),
+        );
+        report(
+            "    crc32c of the record",
+            "MiB/s",
+            &bench(&|| {
+                black_box(crc32c::crc32c(&rec));
+            }),
+        );
+        report(
+            "    blake3 of the block",
+            "MiB/s",
+            &bench(&|| {
+                black_box(blake3::hash(c));
+            }),
+        );
+        if want_compressible {
+            report(
+                "    zstd decompress",
+                "MiB/s",
+                &bench(&|| drop(black_box(zstd::bulk::decompress(&z, c.len()).unwrap()))),
+            );
+        }
+        report(
+            "    memcpy of the block",
+            "MiB/s",
+            &bench(&|| drop(black_box(c.to_vec()))),
+        );
+    }
     println!("fsck: {:?}", s.fsck().unwrap().is_clean());
 }
