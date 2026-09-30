@@ -125,7 +125,9 @@ Encoding: tag byte, entry count, an offset table, then the entries, so that a lo
 The node id is BLAKE3 (keyed derivation context `cowfs-meta node v1`) of the encoded bytes.
 An internal node's bytes contain its children's ids, so the id of a node commits to its whole subtree.
 The id of the root node is the Merkle root of the snapshot.
-Every node read re-hashes and compares against the id it was looked up by, so a bit flip is a `Corrupt` error and never data.
+A node is re-hashed and compared against the id it was looked up by each time it is loaded from the database, so a bit flip is a `Corrupt` error and never data.
+Verified nodes are kept in a bounded in-memory cache (`Options::node_cache`, default 16384 nodes).
+Because nodes are immutable and named by their hash, a cache entry never goes stale.
 
 ### Snapshots are O(1)
 
@@ -314,7 +316,59 @@ They do not prove it.
 6. Only regular files, directories, and symlinks: no device nodes, FIFOs, or sockets, and no uid or gid.
 7. `setattr(size)` shrinks only to a chunk boundary, and any other shrink is `set_content` after the caller has written the new tail chunk into the store.
 8. Removing a snapshot frees its unique nodes in one write transaction, so removing a large snapshot holds the writer lock for a while.
+9. Every unbatched operation is its own redb transaction (about 1.7 to 2.1 ms at load above 70), so adapters must batch bursts.
+10. BLAKE3 runs the portable code path; enabling its `neon` feature is a workspace dependency change left to the lead.
+11. redb panics on damaged pages are caught and reported as `Corrupt`.
+
+## Robustness against a damaged file
+
+redb 4.3 panics on some damaged pages instead of returning an error, including inside `Database::drop`.
+Every entry point that touches redb runs inside a guard that turns such a panic into `Error::Corrupt`, and the database handle is wrapped so its close-time commit cannot panic out of `drop`.
+Panics from caller code (a `batch` closure) are not swallowed: they abort the transaction and are re-raised.
+The damaged-file test covers truncations and bit flips and requires an error or a valid tree.
 
 ## Measurements
 
-Filled in from `crates/cowfs-meta/examples/bench.rs`.
+Source: `cargo run --release -p cowfs-meta --example bench`.
+Machine: Apple M3 Max, APFS, shared with other agents.
+Load average (`uptime`) was 85 before and 82 after the run, and every row was measured at load1 between 73 and 106, so all rows are flagged high load and absolute numbers are pessimistic and noisy.
+Each row is n=5 to 9 repetitions of the stated batch, one batch at a time under the shared CPU lock.
+The tree is 1,000 files per directory with one 4 KiB chunk per file.
+Database file at 1,001,000 inodes: 519.7 MiB, about 520 bytes per inode.
+
+Baseline: redb alone on the same file system.
+A raw insert in a 1000-row transaction without fsync costs 0.8 us per row.
+A raw one-row transaction without fsync costs 18.7 us.
+A raw one-row transaction with fsync costs 11.9 ms (range 9.9 to 29.6 ms).
+
+| metric | inodes | median | min - max |
+|---|---|---|---|
+| snapshot create (durable) | 1,001 | 22.6 ms | 14.5 - 26.3 ms |
+| snapshot create (durable) | 100,100 | 19.6 ms | 16.2 - 49.8 ms |
+| snapshot create (durable) | 1,001,000 | 32.3 ms | 21.7 - 49.7 ms |
+| snapshot remove, unchanged (durable) | 1,001 / 100,100 / 1,001,000 | 20.9 / 21.7 / 37.1 ms | 13.4 - 88.5 ms |
+| lookup | 1,001 / 100,100 / 1,001,000 | 3.0 / 16.4 / 41.6 us | 2.3 - 56.0 us |
+| set_content on one file, no fsync | 1,001,000 | 1.55 ms | 0.29 - 1.85 ms |
+| set_content plus fsync | 1,001,000 | 38.6 ms | 34.6 - 46.7 ms |
+| readdir of 100,000 entries, 1000 per page | 1,001,000 | 0.2 us per entry | 0.2 - 0.5 us |
+| create, one transaction per file | 1,001,000 | 1.78 ms (563 per s) | 1.59 - 1.94 ms |
+| create, 1000 per transaction | 1,001,000 | 10.2 us (97,900 per s) | 5.8 - 25.3 us |
+| rename in one directory | 1,001,000 | 2.05 ms | 1.98 - 2.16 ms |
+| rename across directories | 1,001,000 | 2.13 ms | 1.64 - 2.25 ms |
+| hardlink create | 1,001,000 | 1.68 ms | 1.46 - 2.00 ms |
+| live_blocks, full walk | 1,001,000 | 1.81 s (1,000,000 blocks) | 1.22 - 1.92 s |
+| live_blocks, one file changed, marker reused | 1,001,000 | 54.5 us (5 blocks) | 52.7 - 61.2 us |
+
+What the numbers show and do not show:
+
+- Snapshot create is dominated by the fsync, which the raw redb baseline also pays (about 12 ms).
+  The ranges at the three sizes overlap, but the median at 1,001,000 inodes (32 ms) is higher than at 1,001 and 100,100 (20 to 23 ms), so "flat" is supported to within a factor of 1.6 at load above 70 and is not proven tighter than that.
+  The operation reads one row, writes one row and one reference count, and touches no tree node, which is the reason to expect flatness.
+- A single-file write in the million-inode tree costs 1.5 ms median with a 0.29 ms minimum without fsync.
+  It rewrites the leaf-to-root path (3 to 4 nodes) and re-hashes each with BLAKE3.
+  It does not grow with tree size in these runs (100,100 inodes: 2.8 ms, 1,001,000: 1.55 ms), and the spread at this load is larger than any size effect.
+- One-transaction-per-operation costs 1.7 to 2.1 ms, versus 10 us per file when batched.
+  Per-transaction overhead (path rewrite, redb commit, and one redb transaction each) dominates, so a mount adapter should batch bursts.
+- The skipping walk visits 5 blocks against 1,000,000 for the full walk after one file changes.
+  That is a count of blocks yielded and is exact, not a timing claim.
+- Not measured: the effect of BLAKE3 NEON (opt-in cargo feature, needs a C compiler); memory use; concurrent readers during writes.
