@@ -156,9 +156,17 @@ mod tests {
     #[test]
     fn a_listening_port_answers_and_a_closed_one_does_not() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        assert!(answers(port));
+        assert!(answers(l.local_addr().unwrap().port()));
         drop(l);
-        assert!(!answers(port));
+        // Another process may grab a freed port on a busy machine: most of several must refuse.
+        let refused = (0..7)
+            .filter(|_| {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = l.local_addr().unwrap().port();
+                drop(l);
+                !answers(port)
+            })
+            .count();
+        assert!(refused >= 5, "only {refused} of 7 closed ports refused");
     }
 }

@@ -19,7 +19,7 @@ pub const HANDLE_LEN: usize = 40;
 const MAC_LEN: usize = 16;
 /// Removed inodes remembered for the epoch check. Beyond it the oldest are forgotten, which only
 /// weakens the reuse check for a `Vfs` that breaks the "an Ino is never reused" contract.
-const MAX_REMEMBERED: usize = 1 << 20;
+const MAX_REMEMBERED: usize = 1 << 18;
 
 #[derive(Debug, Default)]
 struct Buried {
