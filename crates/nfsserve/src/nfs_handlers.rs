@@ -771,7 +771,6 @@ pub async fn nfsproc3_readdir(
         garbage_args_reply_message(xid).serialize(output)?;
         return Ok(());
     };
-    args.dircount = args.dircount.min(MAX_DIR_REPLY);
     args.maxcount = args.maxcount.min(MAX_DIR_REPLY);
     let dirid = fh_or_fail!(ctx, &args.dir, xid, output, post_op_attr::Void);
     let mut want = (args.dircount / DIRENT_MIN_BYTES).min(MAX_DIR_ENTRIES);
