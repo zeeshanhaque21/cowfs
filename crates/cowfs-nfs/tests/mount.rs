@@ -512,3 +512,182 @@ fn xattrs_round_trip_without_sidecar_inodes() {
     let _ = f;
     m.finish();
 }
+
+/// Runs as a child of the signal tests below: mounts, announces itself and waits to be killed.
+#[test]
+#[ignore = "helper process of the signal tests"]
+fn child_host() {
+    let Ok(dir) = std::env::var("COWFS_CHILD_MOUNT") else {
+        return;
+    };
+    Mount::install_signal_cleanup().unwrap();
+    let m = Mount::new(
+        Arc::new(MemVfs::new()),
+        Path::new(&dir),
+        MountOptions::default(),
+    )
+    .unwrap();
+    println!("READY {}", m.mountpoint().display());
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(Duration::from_secs(120));
+}
+
+struct Child {
+    child: std::process::Child,
+    lines: mpsc::Receiver<String>,
+    mountpoint: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_host() -> Option<Child> {
+    if !mount_nfs_available() {
+        eprintln!("SKIP: mount_nfs is not available");
+        return None;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("cowfs-nfs-host-")
+        .tempdir()
+        .unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_host",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("COWFS_CHILD_MOUNT", dir.path().join("mnt"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for l in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let _ = tx.send(l);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(l) => {
+                if let Some(p) = l.split("READY ").nth(1) {
+                    return Some(Child {
+                        child,
+                        lines,
+                        mountpoint: PathBuf::from(p.trim()),
+                        _dir: dir,
+                    });
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child host never became ready");
+            }
+        }
+    }
+}
+
+fn mount_table_has(path: &Path) -> bool {
+    let out = Command::new("/sbin/mount").output().unwrap();
+    is_listed(&String::from_utf8_lossy(&out.stdout), path)
+}
+
+fn wait_exit(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if let Some(st) = child.try_wait().unwrap() {
+            return Some(st);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+#[test]
+#[ignore = "mounts a filesystem; run with --ignored"]
+fn sigterm_of_the_host_unmounts_before_it_exits() {
+    let Some(mut h) = spawn_host() else {
+        return;
+    };
+    assert!(mount_table_has(&h.mountpoint));
+    std::fs::write(h.mountpoint.join("f"), "x").unwrap();
+    let pid = h.child.id().to_string();
+    assert!(Command::new("/bin/kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap()
+        .success());
+    let status = wait_exit(&mut h.child, 60);
+    if status.is_none() {
+        let _ = h.child.kill();
+        let _ = Command::new("/sbin/umount")
+            .arg("-f")
+            .arg(&h.mountpoint)
+            .status();
+    }
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(128 + 15),
+        "the host exits after unmounting"
+    );
+    assert!(
+        !mount_table_has(&h.mountpoint),
+        "a dead host left its mount behind"
+    );
+    let (ok, out) = run_limited(Command::new("/bin/ls").arg(&h.mountpoint), 10);
+    assert!(ok, "ls hung or failed on the leftover path: {out}");
+    let _ = &h.lines;
+}
+
+#[test]
+#[ignore = "mounts a filesystem; run with --ignored"]
+fn a_killed_host_leaves_a_mount_that_sweep_removes() {
+    let Some(mut h) = spawn_host() else {
+        return;
+    };
+    let other = mounted(MountOptions::default());
+    let pid = h.child.id().to_string();
+    assert!(Command::new("/bin/kill")
+        .args(["-KILL", &pid])
+        .status()
+        .unwrap()
+        .success());
+    assert!(wait_exit(&mut h.child, 30).is_some());
+    assert!(
+        mount_table_has(&h.mountpoint),
+        "SIGKILL cannot clean up: the mount is stale"
+    );
+
+    let prefix = h.mountpoint.parent().unwrap().to_path_buf();
+    let dog = Watchdog::start(h.mountpoint.clone(), 120);
+    let swept = cowfs_nfs::sweep_stale_mounts(&prefix).unwrap();
+    drop(dog);
+    assert_eq!(
+        swept,
+        vec![h.mountpoint.canonicalize().unwrap_or(h.mountpoint.clone())]
+    );
+    assert!(!mount_table_has(&h.mountpoint));
+    let (ok, out) = run_limited(Command::new("/bin/ls").arg(&h.mountpoint), 10);
+    assert!(ok, "ls hung after the sweep: {out}");
+
+    if let Some(o) = other {
+        let live = o.path().to_path_buf();
+        let swept = cowfs_nfs::sweep_stale_mounts(live.parent().unwrap()).unwrap();
+        assert!(swept.is_empty(), "a live mount was swept: {swept:?}");
+        assert!(mount_table_has(&live));
+        o.finish();
+    }
+}

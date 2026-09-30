@@ -249,7 +249,7 @@ pub fn mount_nfs_available() -> bool {
     cfg!(target_os = "macos") && Path::new(MOUNT_NFS).exists()
 }
 
-fn unmount_path(path: &Path, timeout: Duration) -> Result<(), MountError> {
+pub(crate) fn unmount_path(path: &Path, timeout: Duration) -> Result<(), MountError> {
     let mut last = String::new();
     for force in [false, true] {
         let mut cmd = Command::new(UMOUNT);
@@ -318,8 +318,15 @@ impl Mount {
             mount.server = None;
             return Err(MountError::NotMounted(mount.mountpoint.clone()));
         }
+        crate::cleanup::register(&mount.mountpoint);
         std::fs::read_dir(&mount.mountpoint)?.for_each(drop);
         Ok(mount)
+    }
+
+    /// Makes the process unmount every mount on SIGTERM, SIGINT and SIGHUP before it exits,
+    /// see [`crate::install_signal_cleanup`].
+    pub fn install_signal_cleanup() -> io::Result<()> {
+        crate::cleanup::install_signal_cleanup()
     }
 
     pub fn mountpoint(&self) -> &Path {
@@ -335,7 +342,10 @@ impl Mount {
             return Ok(());
         };
         match unmount_path(&self.mountpoint, self.timeout) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                crate::cleanup::unregister(&self.mountpoint);
+                Ok(())
+            }
             Err(e) => {
                 self.server = Some(server);
                 Err(e)

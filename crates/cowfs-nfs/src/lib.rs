@@ -12,6 +12,7 @@
 
 mod adapter;
 mod appledouble;
+mod cleanup;
 mod convert;
 mod errors;
 mod handle;
@@ -21,6 +22,7 @@ mod sidecar;
 
 pub use adapter::{is_appledouble, Adapter, AdapterOptions, AppleDoubleMode, CowNfs};
 pub use appledouble::Sidecar;
+pub use cleanup::{install_signal_cleanup, sweep_stale_mounts};
 pub use convert::{fattr, nfstime, set_attr, timestamp, FSID};
 pub use errors::nfsstat;
 pub use handle::{random_key, HandleCodec, HANDLE_LEN};
