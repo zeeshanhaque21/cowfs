@@ -4,12 +4,11 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use common::{compressible, index_bytes, install_wm, opts, pack_path, random, record};
+use common::{compressible, index_bytes, install_wm, opts, pack_path, random, record, PACK_HEADER};
 use cowfs_store::{BlockId, Error, Op, Options, Store, Trace};
 
 const P0: &str = "pack-00000000.cpk";
 const P1: &str = "pack-00000001.cpk";
-const PACK_HEADER: [u8; 16] = *b"COWPACK\0\x01\0\0\0\0\0\0\0";
 
 fn trace() -> Trace {
     Arc::new(Mutex::new(Vec::new()))
@@ -245,8 +244,10 @@ fn a_record_with_nonzero_padding_and_a_valid_checksum_is_quarantined() {
     let id = BlockId::of(&d);
     let mut rec = record(0, 300, *id.as_bytes(), &d);
     rec[5] = 1;
-    let crc = crc32c::crc32c_append(crc32c::crc32c(&rec[..48]), &d);
-    rec[48..52].copy_from_slice(&crc.to_le_bytes());
+    let hcrc = crc32c::crc32c(&rec[..48]);
+    rec[48..52].copy_from_slice(&hcrc.to_le_bytes());
+    let rcrc = crc32c::crc32c_append(hcrc, &d);
+    rec[52..56].copy_from_slice(&rcrc.to_le_bytes());
     let mut pack = PACK_HEADER.to_vec();
     pack.extend_from_slice(&rec);
     install_wm(

@@ -46,28 +46,64 @@ pub struct CorruptRegion {
 }
 
 /// What [`crate::Store::open`] found and repaired.
+///
+/// Two kinds of damage are kept apart.
+/// A torn tail is bytes after the durable watermark: the store never promised them, so open cuts
+/// them and only reports how much (`torn_tail_discarded`). That is normal after a crash.
+/// `corrupt_synced` and `missing_synced` are damage to data that a completed `sync` had made durable.
+/// That is data loss and callers that must not serve a store with lost data should refuse to mount
+/// when [`RecoveryReport::has_corruption`] is true.
 #[derive(Clone, Debug, Default)]
 pub struct RecoveryReport {
     /// The index checkpoint was valid and used.
     pub index_loaded: bool,
-    /// The durable-watermark file was missing or unreadable, so nothing was truncated.
+    /// The durable-watermark file was missing or unreadable, so damage could not be classified.
     pub watermark_missing: bool,
     /// Records found by scanning packs (beyond the checkpoint) and hash-verified.
     pub records_scanned: u64,
     /// Bytes cut from the end of the last pack as a torn tail (only beyond the durable watermark).
+    /// The first megabyte of each cut is kept in `<pack>.torn-<n>` next to the pack.
+    pub torn_tail_discarded: u64,
+    /// Same value as `torn_tail_discarded`, kept for source compatibility.
     pub truncated_bytes: u64,
+    /// Valid records found after a torn region and moved down over it, so nothing verifiable is lost.
+    pub recovered_from_tail: u64,
     /// Bad regions that were skipped but not removed. Nothing in them is served or indexed.
     pub gaps: Vec<Gap>,
-    /// The subset of bad regions inside durable bytes. A non-empty list means data was lost to
-    /// corruption. Callers should refuse to mount.
+    /// The subset of bad regions inside durable bytes, and packs shorter than the watermark says.
+    /// A non-empty list means data was lost to corruption.
     pub corrupt_synced: Vec<CorruptRegion>,
+    /// Pack ids that the watermark says must exist and do not.
+    pub missing_synced: Vec<u32>,
+    /// Damaged regions whose block has a verified copy elsewhere, so nothing is lost. Informational.
+    pub superseded: Vec<CorruptRegion>,
+    /// Damaged regions that [`crate::Store::acknowledge_corruption`] accepted earlier. Informational.
+    pub acknowledged: Vec<CorruptRegion>,
 }
 
 impl RecoveryReport {
     /// True when open found damage to bytes that had been made durable.
+    ///
+    /// Open does not re-read data covered by the index checkpoint, so bit rot there is not
+    /// reported here. Use [`crate::Store::verify_all`] to find it.
     pub fn has_corruption(&self) -> bool {
-        !self.corrupt_synced.is_empty() || (self.watermark_missing && !self.gaps.is_empty())
+        !self.corrupt_synced.is_empty()
+            || !self.missing_synced.is_empty()
+            || (self.watermark_missing && (self.torn_tail_discarded > 0 || !self.gaps.is_empty()))
     }
+}
+
+/// Result of [`crate::Store::salvage`].
+#[derive(Clone, Debug, Default)]
+pub struct SalvageReport {
+    /// Records that passed structure, checksum and hash checks.
+    pub records: u64,
+    /// Verified records whose id was not indexed at all.
+    pub newly_indexed: u64,
+    /// Verified records that replaced an index entry that could not be read.
+    pub repaired: u64,
+    /// Regions that hold no verifiable record.
+    pub damaged: Vec<Gap>,
 }
 
 /// Counters and sizes, see [`crate::Store::stats`].

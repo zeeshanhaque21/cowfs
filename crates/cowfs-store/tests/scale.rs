@@ -6,10 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{index_bytes, install_wm, opts, random, record};
+use common::{index_bytes, install_wm, opts, random, record, PACK_HEADER};
 use cowfs_store::{BlockId, Error, Store};
 
-const PACK_HEADER: [u8; 16] = *b"COWPACK\0\x01\0\0\0\0\0\0\0";
 const LOCK_ENV: &str = "COWFS_LOCK_CHILD_DIR";
 
 fn million_id_store(dir: &std::path::Path) {

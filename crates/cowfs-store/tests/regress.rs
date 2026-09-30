@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::time::{Duration, Instant};
 
-use common::{index_bytes, index_path, opts, pack_path, random, record};
+use common::{index_bytes, index_path, opts, pack_path, random, record, REC_HDR};
 use cowfs_store::{BlockId, Options, Store};
 
 #[test]
@@ -23,7 +23,7 @@ fn f1_put_never_acks_a_block_that_is_unreadable() {
         .write(true)
         .open(pack_path(dir.path(), 0))
         .unwrap();
-    f.write_all_at(&[0xff], 16 + 52 + 100).unwrap();
+    f.write_all_at(&[0xff], 16 + REC_HDR as u64 + 100).unwrap();
     drop(f);
     let s = Store::open(dir.path(), opts()).unwrap();
     if s.put(&d).is_ok() {
@@ -50,11 +50,11 @@ fn f2_forged_inner_record_does_not_poison_an_id() {
     let bytes = fs::read(&p).unwrap();
     let at = bytes
         .windows(4)
-        .skip(16 + 52)
+        .skip(16 + REC_HDR)
         .position(|w| w == b"CWRB")
         .unwrap()
         + 16
-        + 52;
+        + REC_HDR;
     fs::write(&p, &bytes[..at + inner.len() + 5]).unwrap();
     let s = Store::open(dir.path(), opts()).unwrap();
     assert!(!s.contains(target), "forged record was indexed");
@@ -75,9 +75,9 @@ fn f3_fake_header_flood_opens_quickly() {
     hdr.extend_from_slice(&[0, 0, 0, 0]);
     hdr.extend_from_slice(&262143u32.to_le_bytes());
     hdr.extend_from_slice(&262143u32.to_le_bytes());
-    hdr.extend_from_slice(&[0u8; 36]);
+    hdr.extend_from_slice(&[0u8; 40]);
     let mut bytes = fs::read(&p).unwrap();
-    for _ in 0..(4 << 20) / 52 {
+    for _ in 0..(4 << 20) / REC_HDR {
         bytes.extend_from_slice(&hdr);
     }
     fs::write(&p, &bytes).unwrap();
@@ -134,7 +134,7 @@ fn f8_index_claiming_a_huge_record_is_rejected_before_allocation() {
         .unwrap()
         .set_len(big)
         .unwrap();
-    let slen = (big - 16 - 52) as u32;
+    let slen = (big - 16 - REC_HDR as u64) as u32;
     fs::write(
         index_path(dir.path()),
         index_bytes(&[(0, big)], &[(ia, [0, 16, slen, slen])]),

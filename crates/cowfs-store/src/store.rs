@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
+use crate::ack::{self, Entry};
 use crate::chunk::{chunks, Chunker};
 use crate::error::{Error, Result};
 use crate::fdcache::FdCache;
@@ -15,11 +16,17 @@ use crate::fsio::{Io, Trace};
 use crate::index::{self, Index, Loc};
 use crate::pack::{self, Event, PACK_HEADER_LEN};
 use crate::record::{self, Codec, Header, HEADER_LEN};
-use crate::types::{CorruptRegion, Damage, FsckReport, Gap, Options, RecoveryReport, Stats};
+use crate::types::{
+    CorruptRegion, Damage, FsckReport, Gap, Options, RecoveryReport, SalvageReport, Stats,
+};
 use crate::wm::{Mark, Wm};
 use crate::{BlockId, ChunkRef, MAX_BLOCK_LEN, MAX_CHUNK_LEN};
 
 const MAX_PACK_LIMIT: u64 = 1 << 31;
+/// Most bytes of a torn tail kept in a `.torn-<n>` file next to the pack.
+const TORN_KEEP: u64 = 1 << 20;
+/// Most missing pack ids listed in a recovery report.
+const MAX_LISTED: usize = 1 << 16;
 
 #[derive(Debug, Default)]
 struct Counters {
@@ -69,18 +76,84 @@ pub struct Store {
     recovery: RecoveryReport,
 }
 
+/// Create pack `id`, or reuse an empty leftover from a failed earlier attempt.
+/// On failure nothing is left behind, so the caller can simply try again.
 fn create_pack(io: &Io, store: &Path, id: u32) -> io::Result<File> {
     let path = pack::pack_path(store, id);
-    let file = OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(&path)?;
-    io.created(&path);
-    file.write_all_at(&pack::header_bytes(), 0)?;
-    io.sync_file(&file, &path)?;
-    io.sync_dir(&pack::pack_dir(store))?;
+        .open(&path)
+    {
+        Ok(f) => {
+            io.created(&path);
+            f
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let f = open_pack(store, id)?;
+            if f.metadata()?.len() > PACK_HEADER_LEN {
+                return Err(e);
+            }
+            f
+        }
+        Err(e) => return Err(e),
+    };
+    let init = || -> io::Result<()> {
+        file.set_len(0)?;
+        file.write_all_at(&pack::header_bytes(), 0)?;
+        io.sync_file(&file, &path)?;
+        io.sync_dir(&pack::pack_dir(store))
+    };
+    if let Err(e) = init() {
+        let _ = fs::remove_file(&path);
+        return Err(e);
+    }
     Ok(file)
+}
+
+/// Read the record `loc` names and check that it decodes to data hashing to `id`.
+fn verify_at(dir: &Path, id: BlockId, loc: Loc) -> bool {
+    if !locate_ok(&loc) {
+        return false;
+    }
+    let Ok(file) = File::open(pack::pack_path(dir, loc.pack)) else {
+        return false;
+    };
+    let mut buf = vec![0u8; HEADER_LEN + loc.slen as usize];
+    if file.read_exact_at(&mut buf, u64::from(loc.offset)).is_err() {
+        return false;
+    }
+    let (head, payload) = buf.split_at(HEADER_LEN);
+    let Ok(raw) = <&[u8; HEADER_LEN]>::try_from(head) else {
+        return false;
+    };
+    let Ok(header) = Header::parse(raw) else {
+        return false;
+    };
+    header.id == id
+        && header.slen == loc.slen
+        && header.ulen == loc.ulen
+        && Header::expected_crc(raw, payload) == header.crc
+        && record::verify(&header, payload)
+}
+
+/// Keep the first megabyte of a discarded tail for forensics. Best effort.
+fn save_torn(dir: &Path, pack: u32, file: &File, from: u64, len: u64) {
+    let n = (0u32..)
+        .find(|n| !torn_path(dir, pack, *n).exists())
+        .unwrap_or(0);
+    let take = (len - from).min(TORN_KEEP) as usize;
+    let mut buf = vec![0u8; take];
+    if file.read_exact_at(&mut buf, from).is_ok() {
+        let _ = fs::write(torn_path(dir, pack, n), &buf);
+    }
+}
+
+fn torn_path(dir: &Path, pack: u32, n: u32) -> PathBuf {
+    let mut p = pack::pack_path(dir, pack).into_os_string();
+    p.push(format!(".torn-{n}"));
+    PathBuf::from(p)
 }
 
 fn open_pack(store: &Path, id: u32) -> io::Result<File> {
@@ -99,6 +172,15 @@ struct Bad {
     offset: u64,
     len: u64,
     id: Option<BlockId>,
+}
+
+/// A verified record that sits after a torn region and will be moved down over it.
+struct Tail {
+    offset: u64,
+    total: u64,
+    id: BlockId,
+    slen: u32,
+    ulen: u32,
 }
 
 impl Store {
@@ -156,18 +238,36 @@ impl Store {
 
         let mut wm = Wm::open(&io, &dir)?;
         let mark = wm.mark();
+        let acked = ack::load(&dir);
         let mut recovery = RecoveryReport {
             watermark_missing: mark.is_none() && !ids.is_empty(),
             ..RecoveryReport::default()
         };
-        let durable = |id: u32| -> Option<u64> {
-            let m = mark?;
-            Some(match id.cmp(&m.pack) {
-                std::cmp::Ordering::Less => u64::MAX,
-                std::cmp::Ordering::Equal => m.len,
-                std::cmp::Ordering::Greater => 0,
-            })
+        // A pack below the last one is sealed, and a pack is only sealed after an fsync.
+        // In the last pack only bytes below the watermark are known durable.
+        let durable = |id: u32| -> u64 {
+            if Some(id) != last {
+                return u64::MAX;
+            }
+            match mark {
+                Some(m) if m.pack == id => m.len,
+                Some(m) if m.pack > id => u64::MAX,
+                _ => PACK_HEADER_LEN,
+            }
         };
+        if mark.is_some() || !ids.is_empty() {
+            let lo = if mark.is_some() {
+                wm.base()
+            } else {
+                ids.first().copied().unwrap_or(0)
+            };
+            let hi = mark.map_or(0, |m| m.pack).max(last.unwrap_or(0));
+            recovery.missing_synced = (lo..=hi)
+                .filter(|p| !lens.contains_key(p))
+                .filter(|&p| !ack::covers(&acked, p, ack::WHOLE_PACK.0, ack::WHOLE_PACK.1))
+                .take(MAX_LISTED)
+                .collect();
+        }
 
         let index = Index::new();
         let mut starts: HashMap<u32, u64> = HashMap::new();
@@ -192,7 +292,7 @@ impl Store {
             }
         }
 
-        let mut damaged: HashMap<BlockId, (u32, u64)> = HashMap::new();
+        let mut regions: Vec<CorruptRegion> = Vec::new();
         let mut rescan = BTreeSet::new();
         let mut last_file: Option<File> = None;
         let mut last_damaged = false;
@@ -204,125 +304,181 @@ impl Store {
                 path: path.clone(),
                 reason,
             };
+            let is_last = Some(id) == last;
             if len < PACK_HEADER_LEN {
-                if Some(id) != last {
+                if !is_last {
                     return Err(bad_pack("truncated header"));
                 }
                 io.truncate(&file, &path, 0)?;
                 file.write_all_at(&pack::header_bytes(), 0)?;
                 io.sync_file(&file, &path)?;
                 len = PACK_HEADER_LEN;
-            } else if !pack::header_ok(&file)? {
-                return Err(bad_pack("bad header or unsupported version"));
+            } else if let Err(reason) = pack::header_check(&file)? {
+                return Err(bad_pack(reason));
             }
             if len > u64::from(u32::MAX) {
                 return Err(bad_pack("pack larger than 4 GiB"));
             }
             let dur = durable(id);
-            if let Some(d) = dur.filter(|&d| d != u64::MAX && len < d) {
-                recovery.corrupt_synced.push(CorruptRegion {
+            if dur != u64::MAX && len < dur {
+                regions.push(CorruptRegion {
                     pack: id,
                     offset: len,
-                    len: d - len,
+                    len: dur - len,
                     id: None,
                 });
                 rescan.insert(id);
-                if Some(id) == last {
-                    last_damaged = true;
-                }
+                last_damaged |= is_last;
             }
 
             let start = starts.get(&id).copied().unwrap_or(PACK_HEADER_LEN);
             let mut bad: Vec<Bad> = Vec::new();
-            let mut valid_end = start;
-            let mut exhausted = false;
+            let mut torn_from: Option<u64> = None;
+            let mut tail: Vec<Tail> = Vec::new();
             let mut scanned = 0u64;
+            let mut exhausted = false;
             pack::scan(&file, start, len, |event| {
-                match event {
+                let (offset, blen, bid) = match event {
                     Event::Record {
                         offset,
                         header,
                         payload,
                     } => {
                         if record::verify(header, payload) {
-                            scanned += 1;
-                            valid_end = offset + header.total_len();
-                            index.insert_verified(
-                                header.id,
-                                Loc {
-                                    pack: id,
-                                    offset: offset as u32,
+                            if torn_from.is_some() {
+                                tail.push(Tail {
+                                    offset,
+                                    total: header.total_len(),
+                                    id: header.id,
                                     slen: header.slen,
                                     ulen: header.ulen,
-                                    verified: true,
-                                },
-                            );
-                        } else {
-                            bad.push(Bad {
-                                offset,
-                                len: header.total_len(),
-                                id: Some(header.id),
-                            });
+                                });
+                            } else {
+                                scanned += 1;
+                                index.insert_verified(
+                                    header.id,
+                                    Loc {
+                                        pack: id,
+                                        offset: offset as u32,
+                                        slen: header.slen,
+                                        ulen: header.ulen,
+                                        verified: true,
+                                    },
+                                );
+                            }
+                            return Ok(());
                         }
+                        (offset, header.total_len(), Some(header.id))
                     }
                     Event::Gap {
                         offset,
                         len: glen,
                         exhausted: ex,
-                        ..
                     } => {
                         exhausted |= ex;
-                        bad.push(Bad {
-                            offset,
-                            len: glen,
-                            id: pack::peek_id(&file, offset, len),
-                        });
+                        (offset, glen, pack::peek_id(&file, offset, len))
                     }
+                };
+                if is_last && offset >= dur && !exhausted && torn_from.is_none() {
+                    torn_from = Some(offset);
                 }
+                bad.push(Bad {
+                    offset,
+                    len: blen,
+                    id: bid,
+                });
                 Ok(())
             })?;
             recovery.records_scanned += scanned;
 
-            let can_cut = Some(id) == last
-                && !exhausted
-                && valid_end < len
-                && dur.is_some_and(|d| valid_end >= d);
-            let cut = can_cut.then_some(valid_end);
-            for b in bad.iter().filter(|b| cut.is_none_or(|c| b.offset < c)) {
+            for b in bad
+                .iter()
+                .filter(|b| torn_from.is_none_or(|t| b.offset < t))
+            {
                 recovery.gaps.push(Gap {
                     pack: id,
                     offset: b.offset,
                     len: b.len,
                 });
                 rescan.insert(id);
-                if Some(id) == last {
-                    last_damaged = true;
-                }
-                if let Some(d) = dur.filter(|&d| b.offset < d) {
-                    recovery.corrupt_synced.push(CorruptRegion {
-                        pack: id,
-                        offset: b.offset,
-                        len: b.len.min(d - b.offset),
-                        id: b.id,
-                    });
-                    if let Some(bid) = b.id {
-                        damaged.insert(bid, (id, b.offset));
-                    }
-                }
+                last_damaged |= is_last;
+                regions.push(CorruptRegion {
+                    pack: id,
+                    offset: b.offset,
+                    len: if b.offset < dur {
+                        b.len.min(dur - b.offset)
+                    } else {
+                        b.len
+                    },
+                    id: b.id,
+                });
             }
-            if let Some(c) = cut {
-                io.truncate(&file, &path, c)?;
-                recovery.truncated_bytes += len - c;
-                len = c;
+            if let Some(t) = torn_from {
+                save_torn(&dir, id, &file, t, len);
+                let mut w = t;
+                let mut buf = Vec::new();
+                for r in &tail {
+                    buf.resize(r.total as usize, 0);
+                    file.read_exact_at(&mut buf, r.offset)?;
+                    file.write_all_at(&buf, w)?;
+                    index.insert_verified(
+                        r.id,
+                        Loc {
+                            pack: id,
+                            offset: w as u32,
+                            slen: r.slen,
+                            ulen: r.ulen,
+                            verified: true,
+                        },
+                    );
+                    w += r.total;
+                }
+                io.truncate(&file, &path, w)?;
+                recovery.torn_tail_discarded += len - w;
+                recovery.recovered_from_tail += tail.len() as u64;
+                recovery.records_scanned += tail.len() as u64;
+                len = w;
             }
-            if scanned > 0 || cut.is_some() {
+            if scanned > 0 || torn_from.is_some() {
                 io.sync_file(&file, &path)?;
             }
             lens.insert(id, len);
-            if Some(id) == last {
+            if is_last {
                 last_file = Some(file);
             }
         }
+        recovery.truncated_bytes = recovery.torn_tail_discarded;
+
+        let mut damaged: HashMap<BlockId, (u32, u64)> = HashMap::new();
+        for r in regions {
+            if let Some(x) = r.id {
+                damaged.insert(x, (r.pack, r.offset));
+            }
+            if ack::covers(&acked, r.pack, r.offset, r.len) {
+                recovery.acknowledged.push(r);
+                continue;
+            }
+            let elsewhere = |x: BlockId| {
+                index.get(&x).is_some_and(|l| {
+                    let at = u64::from(l.offset);
+                    let inside = l.pack == r.pack && at >= r.offset && at < r.offset + r.len;
+                    if inside {
+                        return false;
+                    }
+                    if !l.verified && !verify_at(&dir, x, l) {
+                        return false;
+                    }
+                    index.mark_verified(&x, l);
+                    true
+                })
+            };
+            if r.id.is_some_and(elsewhere) {
+                recovery.superseded.push(r);
+                continue;
+            }
+            recovery.corrupt_synced.push(r);
+        }
+
         let counters = Counters::default();
         let (id, file, len) = match (last, last_file) {
             (Some(id), Some(f))
@@ -348,11 +504,18 @@ impl Store {
         counters.packs.store(lens.len() as u64, Relaxed);
         counters.pack_bytes.store(lens.values().sum(), Relaxed);
 
-        let fresh_or_clean = ids.is_empty() || (recovery.gaps.is_empty() && rescan.is_empty());
-        if fresh_or_clean {
-            wm.advance(&io, Mark { pack: id, len })?;
+        // Every byte scanned above was fsynced and any torn tail is gone, so nothing unresolved
+        // sits below this mark. A mark that is already ahead of the packs is left alone.
+        let here = Mark { pack: id, len };
+        if wm.mark().is_none() {
+            wm.init(&io, here)?;
+        } else {
+            wm.advance(&io, here)?;
         }
-        let synced = wm.mark().map_or((0, 0), |m| (m.pack, m.len));
+        let synced = wm
+            .mark()
+            .filter(|m| *m <= here)
+            .map_or((0, 0), |m| (m.pack, m.len));
 
         Ok(Store {
             dir: dir.clone(),
@@ -754,6 +917,129 @@ impl Store {
             if in_scan && verified.get(&(loc.pack, loc.offset)) != Some(&id) {
                 report.damage.push(Damage::IndexEntry { id });
             }
+        }
+        Ok(report)
+    }
+}
+
+impl Store {
+    /// Same as [`Store::fsck`]: re-read and re-hash every block of every pack.
+    ///
+    /// `open` does not re-read data covered by the index checkpoint, so bit rot there shows up
+    /// only on `get` or here. Run this when a clean bill of health matters.
+    pub fn verify_all(&self) -> Result<FsckReport> {
+        self.fsck()
+    }
+
+    /// Accept the damage `open` reported, so later opens stop reporting it.
+    ///
+    /// Every region in `recovery().corrupt_synced` is recorded in the `ACKED` file, and when the
+    /// watermark named packs that are gone it is lowered to what exists. The damaged bytes stay on
+    /// disk and the blocks in them stay unreadable until they are `put` again. Returns the number
+    /// of entries recorded. A damaged region whose block has a verified copy elsewhere needs no
+    /// acknowledgement: it is reported as `superseded`.
+    pub fn acknowledge_corruption(&self) -> Result<usize> {
+        let r = &self.recovery;
+        let mut entries: Vec<Entry> = r
+            .corrupt_synced
+            .iter()
+            .map(|c| Entry {
+                pack: c.pack,
+                offset: c.offset,
+                len: c.len,
+            })
+            .collect();
+        entries.extend(r.missing_synced.iter().map(|&pack| Entry {
+            pack,
+            offset: ack::WHOLE_PACK.0,
+            len: ack::WHOLE_PACK.1,
+        }));
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        self.sync()?;
+        ack::append(&self.io, &self.dir, &entries)?;
+        if !r.missing_synced.is_empty() {
+            let (mark, base) = {
+                let w = self.writer();
+                let base = w.pack_lens().keys().next().copied().unwrap_or(0);
+                (
+                    Mark {
+                        pack: w.id,
+                        len: w.len,
+                    },
+                    base,
+                )
+            };
+            self.wm
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .reset(&self.io, mark, base)?;
+            let mut w = self.writer();
+            w.synced = w.synced.max((mark.pack, mark.len));
+        }
+        Ok(entries.len())
+    }
+
+    /// Re-index every verifiable record in every pack, including damaged ones.
+    ///
+    /// A record is indexed when its structure, checksum and hash all check out. It replaces an
+    /// index entry only when that entry cannot be read. Nothing is written to the packs.
+    /// Right after an `open` that rebuilt the index there is nothing left to find.
+    pub fn salvage(&self) -> Result<SalvageReport> {
+        let lens = self.writer().pack_lens();
+        let mut report = SalvageReport::default();
+        for (&pack_id, &len) in &lens {
+            let file = self.reads.get(pack_id)?;
+            pack::scan(&file, PACK_HEADER_LEN, len, |event| {
+                match event {
+                    Event::Record {
+                        offset,
+                        header,
+                        payload,
+                    } if record::verify(header, payload) => {
+                        report.records += 1;
+                        let loc = Loc {
+                            pack: pack_id,
+                            offset: offset as u32,
+                            slen: header.slen,
+                            ulen: header.ulen,
+                            verified: true,
+                        };
+                        match self.index.get(&header.id) {
+                            None => {
+                                self.index.insert_verified(header.id, loc);
+                                report.newly_indexed += 1;
+                            }
+                            Some(cur)
+                                if (cur.pack, cur.offset) != (pack_id, loc.offset)
+                                    && !cur.verified
+                                    && self.get(header.id).is_err() =>
+                            {
+                                self.index.replace(header.id, loc);
+                                report.repaired += 1;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    Event::Record { offset, header, .. } => report.damaged.push(Gap {
+                        pack: pack_id,
+                        offset,
+                        len: header.total_len(),
+                    }),
+                    Event::Gap { offset, len, .. } => report.damaged.push(Gap {
+                        pack: pack_id,
+                        offset,
+                        len,
+                    }),
+                }
+                Ok(())
+            })?;
+        }
+        if report.newly_indexed + report.repaired > 0 {
+            self.dirty.store(true, Relaxed);
+            let mut d = self.damaged.write().unwrap_or_else(PoisonError::into_inner);
+            d.retain(|id, _| self.index.get(id).is_none());
         }
         Ok(report)
     }

@@ -14,7 +14,8 @@ Only the declared field enforces this: the crate was not built with a 1.89 toolc
 ```
 <store>/
   LOCK                  advisory lock, held while a Store is open
-  SYNCED                durable watermark, two CRC-protected 32 byte slots
+  SYNCED                durable watermark and pack base, two CRC-protected 32 byte slots
+  ACKED                 optional list of accepted losses (see "Repair and acknowledgement")
   index.cix             optional index checkpoint (rebuildable, see below)
   packs/pack-00000000.cpk
   packs/pack-00000001.cpk
@@ -30,12 +31,12 @@ A pack starts with a 16 byte header, followed by records with no padding and no 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | magic `COWPACK\0` |
-| 8 | 4 | format version, `1` |
+| 8 | 4 | format version, `2` |
 | 12 | 4 | reserved, zero |
 
 ### Record
 
-Every record has a fixed 52 byte header followed by `stored_len` payload bytes.
+Every record has a fixed 56 byte header followed by `stored_len` payload bytes.
 
 | Offset | Size | Field |
 |---|---|---|
@@ -45,18 +46,22 @@ Every record has a fixed 52 byte header followed by `stored_len` payload bytes.
 | 8 | 4 | `uncompressed_len`, at most 262144 |
 | 12 | 4 | `stored_len` |
 | 16 | 32 | `BlockId`, BLAKE3-256 of the uncompressed bytes |
-| 48 | 4 | CRC32C over header bytes 0..48 followed by the payload |
-| 52 | n | payload |
+| 48 | 4 | header CRC32C over bytes 0..48 |
+| 52 | 4 | record CRC32C over bytes 0..48 followed by the payload |
+| 56 | n | payload |
 
 Validity rules: codec 0 needs `stored_len == uncompressed_len`.
 Codec 1 needs `stored_len < uncompressed_len`.
 The zero bytes must be zero.
-A record that breaks a rule, or whose CRC fails, is invalid.
+A record that breaks a rule, or whose header CRC or record CRC fails, is invalid.
+The header CRC lets a scanner reject a fake or damaged header without reading its payload.
 The zero length block (empty data) is a valid raw record.
 
 A record is self-describing, so a pack can be parsed with no other file.
 The format has no in-place mutation, no back pointers and no pack-level footer.
 Compaction (#10) can therefore copy live records into a new pack id and delete the old pack.
+Format version 2 added the header CRC.
+A pack with another version is refused at open with a clear error (`unsupported pack format version`): version 1 was never released, so there is no reader for it.
 The `index.cix` checkpoint must be dropped or rewritten by the compaction step, because it names pack ids and offsets.
 
 ## Compression and hashing
@@ -105,6 +110,10 @@ A checkpoint is taken only after the packs it describes are synced, so every ent
   A pack is fsynced before the next one is created, so a sealed pack is always durable.
   After `sync` returns, every `put` that returned earlier is durable.
   A `sync` with nothing new since the last one does no I/O.
+- Rolling to a new pack is transactional.
+  If creating the next pack fails (for example `EMFILE`), the half-made file is removed, no counter or writer state changes, and the error is returned.
+  A later `put` retries and succeeds once resources return.
+  An empty leftover pack file at the next id is reused, and one that holds data is never overwritten (the roll fails instead).
 - Creating a store or a pack fsyncs the new file and every directory entry that names it: the store directory and its parent, `packs/`, `LOCK`, `SYNCED`, and each pack.
   Renaming `index.cix` into place is followed by an fsync of the store directory.
 - A crash may lose puts after the last `sync`.
@@ -115,7 +124,9 @@ A checkpoint is taken only after the packs it describes are synced, so every ent
 
 ### The watermark
 
-`SYNCED` holds `(pack, len)`: everything in packs below `pack`, and the first `len` bytes of pack `pack`, were fsynced before this value was written.
+`SYNCED` holds `(pack, len)` and `base`, the lowest pack id that must exist.
+Missing packs between `base` and the highest known pack are reported as `missing_synced`.
+`(pack, len)` means: everything in packs below `pack`, and the first `len` bytes of pack `pack`, were fsynced before this value was written.
 It exists so that recovery can tell a torn tail (bytes after the watermark, never promised durable) from corruption of synced data (bytes before it).
 It has two 32 byte slots written alternately, each with a sequence number and a CRC, so a torn write of one slot leaves the other.
 
@@ -128,7 +139,9 @@ A crash between 1 and 2 leaves the watermark lower than the truth.
 That is safe: the extra bytes are treated as tail, and open indexes every valid record in them and only cuts what does not verify.
 A watermark higher than the truth is impossible unless a disk lies.
 If a pack is shorter than the watermark says, open reports that as corruption.
-A missing or unreadable `SYNCED` next to existing packs is reported (`watermark_missing`) and nothing is truncated.
+A missing or unreadable `SYNCED` next to existing packs is reported (`watermark_missing`), and the whole last pack is then treated as unclassifiable: any damage in it is reported, loudly, once.
+Open never advances the watermark over a region that is not resolved (cut or verified), and never lowers it.
+When the watermark names a pack that is not on disk, open reports `missing_synced` and `sync` keeps fsyncing whatever it appends.
 
 ## Concurrency
 
@@ -164,45 +177,75 @@ A missing or unreadable `SYNCED` next to existing packs is reported (`watermark_
 
 ## Recovery on open
 
-1. Create the store directories durably, take the lock, list `packs/pack-*.cpk` in id order and read the watermark.
+Two kinds of damage are kept apart in `RecoveryReport`.
+
+- A torn tail is bytes after the durable watermark in the last pack.
+  The store never promised them, so a crash may leave any prefix, any hole and any junk there.
+  Open cuts them and reports the size in `torn_tail_discarded`.
+  This is informational and is not corruption.
+- Corruption is damage to bytes that a completed `sync` had made durable, or a pack that is shorter or missing compared with the watermark.
+  It is listed in `corrupt_synced` and `missing_synced`, and `has_corruption()` is true.
+
+Steps:
+
+1. Create the store directories durably, take the lock, list `packs/pack-*.cpk` in id order, read `SYNCED` and `ACKED`.
 2. Validate each pack header.
    A last pack shorter than 16 bytes is a crash between create and first write, and is reset to an empty pack.
-   Any other bad header is an error, because it is not a pack we wrote.
-3. Load `index.cix`.
+   Any other bad header or unknown version is an error.
+3. Report packs that the watermark says must exist (`base` up to the highest pack) and are gone, unless `ACKED` covers them.
+4. Load `index.cix`.
    Discard it if the CRC fails, if a listed pack is missing or shorter than its recorded length, or if any entry lies outside its pack or claims a length above the maximum block size or above its uncompressed length.
    A discarded index means every pack is scanned from its start.
    Entries from a loaded index are trusted for location only and start unverified.
-4. Scan each pack from its indexed length (or from the pack header) to its end.
-   A record whose structure and CRC pass is decoded and its BLAKE3 compared with its id.
-   Only a record that passes both is indexed, and it replaces an unverified entry for the same id.
-   A record that fails either is quarantined: it is reported as a gap and never indexed, so a forged or embedded record cannot claim an id.
-   An invalid record starts a search for the next position where a valid record begins, so one damaged record never hides the valid records after it.
-5. The search has a bound.
-   A candidate costs a payload read only if its header is structurally valid and fits in the pack.
-   Each scan of a pack may read at most 64 MiB of payload for candidates, plus one linear pass over the bytes to find magic.
-   When the budget runs out the rest of the pack is reported as one gap and is never truncated, because nothing is known about it.
-   A 4 MiB flood of fake headers therefore opens in well under a second (test `f3_fake_header_flood_opens_quickly`, previously 14 s in a debug build and 3 s in release).
-6. Classify each bad region with the watermark.
-   A region that starts at or after the watermark, in the last pack, with nothing valid after it and a completed search, is a torn tail.
-   The pack is truncated to the end of its last valid record and fsynced.
-   A region that starts before the watermark is corruption of synced data.
-   It is never truncated and its bytes stay on disk.
-   It is listed in `RecoveryReport::corrupt_synced` with pack, offset, length and the id its header claims, when that header still parses.
-   `get` of a claimed id returns `Error::Corrupt`, not `NotFound`, and `fsck` lists the region.
-   Open still succeeds so that the other blocks stay readable and the damage can be inspected.
-7. A pack that contains any bad region is not appended to.
-   Open starts a new pack, and the next checkpoint marks the damaged pack for a rescan so the damage is reported again on every open.
-8. Every pack that contributed records or a truncation is fsynced.
-   If nothing was damaged, the watermark is advanced to the end of the active pack.
-9. Append to the last pack, or start a new one if it is at least `max_pack_size` or was damaged.
+5. Scan each pack from its indexed length (or from the pack header) to its end.
+   A record whose header CRC, structure and record CRC pass is decoded and its BLAKE3 compared with its id.
+   Only a record that passes all of them is indexed, and it replaces an unverified entry for the same id.
+   A record that fails is quarantined: reported as a gap, never indexed, so a forged or embedded record cannot claim an id.
+6. Resynchronising after a bad region searches for the next position whose header CRC passes.
+   A candidate costs a payload read only if its header CRC passes and its record fits in the pack, and only a header written by us passes.
+   Accidental damage (crashes, bit rot) cannot produce a header with a valid CRC, so the search is linear in the bytes scanned.
+   Against crafted input the payload bytes read for candidates are capped at twice the pack bytes plus 1 MiB.
+   Only when that cap is hit is the rest of the pack reported as one gap, and then it is never cut.
+   A damaged record therefore never hides the valid records after it: only records that overlap damaged bytes are lost.
+7. Classify each bad region with the watermark.
+   In the last pack, the first bad region at or after the watermark starts the torn tail.
+   Everything from there is preserved (first 1 MiB) in `<pack>.torn-<n>`, valid records after it are moved down over it (`recovered_from_tail`), and the pack is truncated and fsynced.
+   A bad region before the watermark, or in a sealed pack, is corruption: never cut, never erased, listed in `corrupt_synced` with pack, offset, length and the id its header claims when that still parses.
+   `get` of such an id returns `Error::Corrupt`, and `fsck` lists the region.
+8. A pack that contains any bad region is not appended to: open starts a new pack.
+9. Every pack that contributed records or a cut is fsynced, then the watermark is advanced to the end of the active pack.
+   Nothing unresolved sits below it, so a later `sync` can never bless leftover damage as durable.
+   A pre-existing mark that is already ahead of the packs is left alone, and the writer's own synced position starts at zero so `sync` still fsyncs.
 
-`Store::recovery()` returns what steps 3 to 8 found.
-Callers that must not serve a store with lost data (for example the mount layer) check `RecoveryReport::has_corruption()` and refuse to mount.
-`has_corruption()` is true for any `corrupt_synced` entry, and for any gap when the watermark file was missing, since then nothing can be classified as torn.
+`Store::recovery()` returns what steps 3 to 9 found.
+Callers that must not serve a store with lost data (the mount layer) check `RecoveryReport::has_corruption()` and refuse to mount.
+`has_corruption()` is true for any `corrupt_synced` or `missing_synced` entry, and, when the watermark file itself is missing, for any damage in the last pack, since then nothing can be classified as torn.
 
-A bit flip in a synced record is now corruption, not a torn tail: it is reported, the bytes are kept, and the block reads as an error.
-Only bytes the store never promised durable are ever cut.
-`fsck` and `get` never return wrong data in any case.
+### What open does not check
+
+Open does not re-read data that the index checkpoint covers, so bit rot in checkpointed data is not visible in `RecoveryReport`.
+It shows up on `get` (an error, never wrong data) and in `Store::verify_all()`, which is `fsck`.
+A mount that wants a clean bill of health calls `verify_all()`.
+Open stays O(records since the last checkpoint) on purpose.
+Data that a pack holds between the watermark and its true end (sealed, but past the watermark of an earlier mark) is likewise not re-read.
+
+### Repair and acknowledgement
+
+- Re-`put` of a block whose stored copy is damaged writes a fresh record, and later opens report the old region as `superseded` (informational) instead of corruption.
+  This works with and without the index, because the check finds a verified copy of the claimed id elsewhere.
+- A region whose header is destroyed cannot be matched to a block.
+  `Store::acknowledge_corruption()` appends the current `corrupt_synced` regions and missing packs to `ACKED`, fsynced, and lowers the watermark base for missing packs.
+  Later opens list them under `acknowledged` and `has_corruption()` is false.
+  The bytes stay on disk and the blocks stay unreadable until they are put again.
+- `Store::salvage()` re-indexes every record that verifies (structure, both CRCs, hash) in every pack, including packs with damaged regions, and repairs index entries that cannot be read.
+  It never writes to a pack.
+
+### A known window: rot after verification
+
+`put` trusts the in-memory verified bit of an entry that this session already wrote, read or verified.
+If the stored bytes rot after that, `put` still returns Ok and `get` returns `Error::Corrupt`.
+The bit is not persisted, so after a reopen the next `put` re-reads the record, sees the damage and rewrites it.
+Callers that need certainty within a session use `get` or `verify_all`.
 
 ## fsck
 
@@ -233,6 +276,9 @@ Store::stats(&self) -> Stats
 Store::iter_ids(&self) -> impl Iterator<Item = BlockId>
 Store::fsck(&self) -> Result<FsckReport>
 Store::recovery(&self) -> &RecoveryReport              // .has_corruption(), .corrupt_synced, .gaps
+Store::verify_all(&self) -> Result<FsckReport>        // same as fsck
+Store::acknowledge_corruption(&self) -> Result<usize>  // accept reported losses, see Recovery
+Store::salvage(&self) -> Result<SalvageReport>         // re-index every verifiable record
 chunks(&[u8]) -> impl Iterator<Item = &[u8]>           // FastCDC 16/64/256 KiB
 ```
 

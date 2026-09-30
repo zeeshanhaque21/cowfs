@@ -4,11 +4,11 @@ use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use common::{fixture, index_path, install, opts, pack_path, random, Fixture};
+use common::{
+    fixture, index_path, install, opts, pack_path, random, Fixture, PACK_HEADER, REC_HDR,
+};
 use cowfs_store::{BlockId, Store};
 use proptest::prelude::*;
-
-const PACK_HEADER: [u8; 16] = *b"COWPACK\0\x01\0\0\0\0\0\0\0";
 
 fn base() -> &'static Fixture {
     static FX: OnceLock<Fixture> = OnceLock::new();
@@ -150,8 +150,8 @@ proptest! {
         let entries: Vec<_> = locs
             .into_iter()
             .map(|(id, a, b, ulen)| {
-                let offset = 16 + a % (plen as u32 - 52 - 16);
-                let slen = b % (plen as u32 - offset - 52 + 1);
+                let offset = 16 + a % (plen as u32 - REC_HDR as u32 - 16);
+                let slen = b % (plen as u32 - offset - REC_HDR as u32 + 1);
                 (BlockId::from_bytes(id), [0, offset, slen, ulen % 300])
             })
             .collect();

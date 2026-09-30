@@ -1,5 +1,6 @@
 //! Content-addressed block store. Contract: `docs/v1-architecture.md`.
 
+mod ack;
 mod chunk;
 mod error;
 mod fdcache;
@@ -18,7 +19,9 @@ pub use error::{Error, Result};
 #[doc(hidden)]
 pub use fsio::{Op, Trace};
 pub use store::Store;
-pub use types::{CorruptRegion, Damage, FsckReport, Gap, Options, RecoveryReport, Stats};
+pub use types::{
+    CorruptRegion, Damage, FsckReport, Gap, Options, RecoveryReport, SalvageReport, Stats,
+};
 
 /// Length of a [`BlockId`] in bytes.
 pub const BLOCK_ID_LEN: usize = 32;

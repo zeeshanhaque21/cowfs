@@ -8,8 +8,9 @@ use zstd::bulk::{Compressor, Decompressor};
 use crate::{BlockId, BLOCK_ID_LEN, MAX_BLOCK_LEN};
 
 pub(crate) const RECORD_MAGIC: [u8; 4] = *b"CWRB";
-pub(crate) const HEADER_LEN: usize = 52;
-const CRC_AT: usize = 48;
+pub(crate) const HEADER_LEN: usize = 56;
+const HCRC_AT: usize = 48;
+const RCRC_AT: usize = 52;
 const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,10 +34,13 @@ impl Header {
         HEADER_LEN as u64 + u64::from(self.slen)
     }
 
-    /// Structural checks only: magic, padding, codec and length rules.
+    /// Header-only checks: magic, header checksum, padding, codec and length rules.
     pub(crate) fn parse(buf: &[u8; HEADER_LEN]) -> Result<Header, &'static str> {
         if buf[..4] != RECORD_MAGIC {
             return Err("bad record magic");
+        }
+        if crc32c::crc32c(&buf[..HCRC_AT]) != u32_at(buf, HCRC_AT) {
+            return Err("bad header checksum");
         }
         if buf[5..8] != [0, 0, 0] {
             return Err("nonzero padding");
@@ -59,13 +63,13 @@ impl Header {
             ulen,
             slen,
             id: BlockId::from_bytes(id),
-            crc: u32_at(buf, CRC_AT),
+            crc: u32_at(buf, RCRC_AT),
         })
     }
 
     /// CRC that `crc` must equal, given the raw header bytes and the payload.
     pub(crate) fn expected_crc(raw: &[u8; HEADER_LEN], payload: &[u8]) -> u32 {
-        crc32c::crc32c_append(crc32c::crc32c(&raw[..CRC_AT]), payload)
+        crc32c::crc32c_append(crc32c::crc32c(&raw[..HCRC_AT]), payload)
     }
 }
 
@@ -103,8 +107,10 @@ pub(crate) fn encode(id: BlockId, data: &[u8]) -> io::Result<Vec<u8>> {
     rec.extend_from_slice(&(data.len() as u32).to_le_bytes());
     rec.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     rec.extend_from_slice(id.as_bytes());
-    let crc = crc32c::crc32c_append(crc32c::crc32c(&rec), payload);
-    rec.extend_from_slice(&crc.to_le_bytes());
+    let hcrc = crc32c::crc32c(&rec);
+    let rcrc = crc32c::crc32c_append(hcrc, payload);
+    rec.extend_from_slice(&hcrc.to_le_bytes());
+    rec.extend_from_slice(&rcrc.to_le_bytes());
     rec.extend_from_slice(payload);
     Ok(rec)
 }
