@@ -6,7 +6,7 @@
 //! `nlink` 0. The suite counts references exactly: one per `create`, `mkdir`, `symlink`,
 //! `link` or `lookup` that returned the inode.
 
-use cowfs_vfs::{Error, SetAttr, ROOT_INO};
+use cowfs_vfs::{Error, FileHandle, SetAttr, ROOT_INO};
 
 use super::basic::all_ops_stale;
 use super::{Ctx, Outcome};
@@ -196,5 +196,79 @@ pub fn two_handles_pin_until_last_release(c: &Ctx) -> Outcome {
     );
     c.fs.release(h2)?;
     ensure_err!(c.fs.getattr(f), Error::Stale, "after the second release");
+    Ok(())
+}
+
+/// cowfs contract (`Ino` docs): an inode number is never reused for a different file for the
+/// lifetime of a mount, and 0 is never a valid number. A stale NFS handle or kernel dentry
+/// would otherwise read another file's bytes.
+pub fn inode_numbers_are_never_reused(c: &Ctx) -> Outcome {
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(ROOT_INO);
+    for round in 0..200u32 {
+        let name = format!("f{round}").into_bytes();
+        let f = c.create(ROOT_INO, &name, 0o644)?.ino;
+        ensure!(f != 0, "round {round}: created file has inode 0");
+        ensure!(seen.insert(f), "round {round}: inode {f} was reused");
+        let d = c
+            .mkdir(ROOT_INO, format!("d{round}").as_bytes(), 0o755)?
+            .ino;
+        ensure!(d != 0, "round {round}: created directory has inode 0");
+        ensure!(seen.insert(d), "round {round}: inode {d} was reused");
+        let s = c
+            .symlink(ROOT_INO, format!("s{round}").as_bytes(), b"t")?
+            .ino;
+        ensure!(s != 0, "round {round}: created symlink has inode 0");
+        ensure!(seen.insert(s), "round {round}: inode {s} was reused");
+        c.fs.unlink(ROOT_INO, &name)?;
+        c.forget_all(f);
+        c.fs.rmdir(ROOT_INO, format!("d{round}").as_bytes())?;
+        c.forget_all(d);
+        c.fs.unlink(ROOT_INO, format!("s{round}").as_bytes())?;
+        c.forget_all(s);
+        ensure!(
+            c.fs.getattr(f).is_err() && c.fs.getattr(d).is_err(),
+            "round {round}: a reclaimed inode was still reachable"
+        );
+    }
+    let big = c.file(ROOT_INO, "big")?;
+    ensure!(
+        big != 0 && seen.insert(big),
+        "inode {big} is invalid or reused"
+    );
+    Ok(())
+}
+
+/// `open` never fails because of intent, so a directory and a symlink open fine. `release` of
+/// an unknown or already released handle is `InvalidArgument`, and `fsync` succeeds for every
+/// kind, including the root, which is the whole-mount barrier.
+pub fn open_release_and_fsync_contract(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    let d = c.dir(ROOT_INO, "d")?;
+    let s = c.symlink(ROOT_INO, b"s", b"t")?.ino;
+    for (what, ino) in [("file", f), ("directory", d), ("symlink", s)] {
+        let h = c.fs.open(ino)?;
+        ensure!(
+            c.fs.open(ino)? != h,
+            "{what}: two opens returned the same handle"
+        );
+        c.fs.release(h)?;
+        ensure_err!(
+            c.fs.release(h),
+            Error::InvalidArgument,
+            "release of a released handle"
+        );
+        ensure_err!(
+            c.fs.release(FileHandle(0xDEAD_BEEF)),
+            Error::InvalidArgument,
+            "release of an unknown handle"
+        );
+        c.fs.flush(ino)?;
+        c.fs.fsync(ino, false)?;
+        c.fs.fsync(ino, true)?;
+    }
+    c.fs.fsync(ROOT_INO, false)?;
+    c.fs.fsync(ROOT_INO, true)?;
+    ensure_err!(c.fs.open(0), Error::Stale, "open of inode 0");
     Ok(())
 }
