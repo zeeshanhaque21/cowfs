@@ -160,13 +160,13 @@
         {
           "id": "13",
           "title": "#13 CLI and Unix-socket control API",
-          "state": "fixing",
+          "state": "ready",
           "issue": 13,
-          "owner": "builder (subagent)",
+          "owner": "lead",
           "pr": "#33",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/33",
-          "detail": "All critic findings fixed with regression tests (builder: 104 tests, 5 clean runs; I re-ran on Mac: pass). New protocol: snapshot_reset, strict params, name validation, checkable import report, client timeouts, bounded shutdown, connection caps. Linux CI fails: errors_name_the_socket_path expects exit 1, gets 3 (errno differs by OS); builder fixing and running the suite in the Linux VM. Decisions for lead: snapshot_reset/busy semantics, name rules to reconcile with core, import hash scope (names, modes, content, symlink targets; not owner/mtime/xattrs).",
-          "ci": "CI: ubuntu FAIL, macos pass"
+          "detail": "Critic findings fixed, re-verified. Linux CI failure fixed: connecting to a regular file gives ECONNREFUSED on Linux and ENOTSOCK on macOS; exit 3 now means missing path or a socket that refuses, exit 1 for a path that is not a socket. Full suite passes in the Linux VM, first Linux run of SO_PEERCRED. Decisions for lead: snapshot_reset/busy semantics, name rules vs core, import hash scope. Not built: real backend (seam only), no TTY test.",
+          "ci": "CI: pass (linux, macos)"
         },
         {
           "id": "14",
