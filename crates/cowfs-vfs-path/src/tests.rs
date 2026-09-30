@@ -369,6 +369,68 @@ fn a_pinned_descriptor_lets_a_read_only_file_be_written_after_the_cache_is_cold(
 }
 
 #[test]
+fn an_inode_never_names_another_file_after_the_number_is_reused() {
+    let (scratch, v) = fs();
+    let a = v.create(ROOT_INO, b"a", 0o644).expect("create").ino;
+    v.write(a, 0, b"mine").expect("write");
+    let b = v.create(ROOT_INO, b"b", 0o644).expect("create").ino;
+    v.write(b, 0, b"other").expect("write");
+    // Another writer puts `b` where `a`'s name was.
+    std::fs::rename(scratch.0.join("b"), scratch.0.join("a")).expect("replace the name");
+    for i in 0..400 {
+        let n = format!("pad{i}");
+        v.create(ROOT_INO, n.as_bytes(), 0o644).expect("pad");
+    }
+    // The old inode is `Stale` or still its own file. It must never be the file that took the
+    // name, which is what reopening without an identity check would return.
+    match v.read(a, 0, 5) {
+        Ok(got) => assert_eq!(got, b"mine".to_vec(), "inode {a} now names another file"),
+        Err(Error::Stale) => {}
+        Err(e) => panic!("read a by inode: {e:?}"),
+    }
+}
+
+#[test]
+fn an_inode_number_is_never_handed_out_twice() {
+    let (_s, v) = fs();
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..3000 {
+        let n = format!("f{i}");
+        let a = v.create(ROOT_INO, n.as_bytes(), 0o644).expect("create");
+        assert!(a.ino != ROOT_INO && a.ino != 0, "reserved inode handed out");
+        assert!(seen.insert(a.ino), "inode {} handed out twice", a.ino);
+        v.unlink(ROOT_INO, n.as_bytes()).expect("unlink");
+        v.forget(a.ino, 1);
+    }
+}
+
+#[test]
+fn setattr_masks_the_mode_on_the_backing_filesystem_too() {
+    use std::os::unix::fs::PermissionsExt;
+    let (scratch, v) = fs();
+    let f = v.create(ROOT_INO, b"f", 0o644).expect("create");
+    let a = v
+        .setattr(
+            f.ino,
+            SetAttr {
+                mode: Some(0o170_755),
+                ..Default::default()
+            },
+        )
+        .expect("setattr");
+    assert_eq!(a.mode, 0o755, "reported mode");
+    let on_disk = std::fs::metadata(scratch.0.join("f"))
+        .expect("stat")
+        .permissions()
+        .mode();
+    assert_eq!(
+        on_disk & 0o7777,
+        0o755,
+        "the file on disk kept bits outside MODE_MASK"
+    );
+}
+
+#[test]
 fn mode_never_lands_on_a_symlink_target() {
     let (scratch, v) = fs();
     std::fs::write(scratch.0.join("outside"), b"sentinel").expect("write outside");
@@ -408,6 +470,13 @@ fn a_renamed_file_is_still_reachable_by_its_inode() {
     }
     v.rename(ROOT_INO, b"a", ROOT_INO, b"b", RenameFlags::default())
         .expect("rename");
+    // No lookup first: the table has to know the new name by itself, otherwise `link` has no
+    // name to work from and the file is unreachable through the Vfs.
+    assert_eq!(
+        v.link(f, ROOT_INO, b"c").expect("link after rename").ino,
+        f,
+        "link after rename"
+    );
     assert_eq!(
         v.lookup(ROOT_INO, b"b").expect("lookup").ino,
         f,
@@ -418,7 +487,6 @@ fn a_renamed_file_is_still_reachable_by_its_inode() {
         b"data",
         "reopen by inode"
     );
-    assert_eq!(v.link(f, ROOT_INO, b"c").expect("link after rename").ino, f);
 }
 
 #[test]
