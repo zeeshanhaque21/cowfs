@@ -30,7 +30,7 @@ impl Inner {
         match kind {
             FileKind::Regular => {}
             FileKind::Directory => return Err(Error::IsDir),
-            FileKind::Symlink => return Err(Error::InvalidArgument),
+            _ => return Err(Error::InvalidArgument),
         }
         Ok((self.snapctx(ino)?, n))
     }
@@ -139,9 +139,9 @@ impl Inner {
         if let Some(size) = ch.size {
             match kind {
                 FileKind::Directory => return Err(Error::IsDir),
-                FileKind::Symlink => return Err(Error::InvalidArgument),
                 FileKind::Regular if size > MAX_FILE => return Err(Error::NoSpace),
                 FileKind::Regular => {}
+                _ => return Err(Error::InvalidArgument),
             }
         }
         if ch.size.is_some() {

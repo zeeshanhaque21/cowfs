@@ -50,6 +50,8 @@ impl NodeState {
                 a.blocks = DIR_SIZE / 512;
             }
             FileKind::Symlink => a.blocks = 0,
+            // FileKind is non_exhaustive: an unknown kind reports no blocks
+            _ => a.blocks = 0,
         }
         a
     }

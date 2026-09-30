@@ -1,6 +1,6 @@
 //! Shared state, node loading, and the flush and commit machinery.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -232,7 +232,7 @@ impl Inner {
         let mut al = self.aliases.wr();
         // keep every alias that is NOT eligible for release: a pinned node (a caller may hold the
         // number), one with unflushed data, an unlinked one, or one with no node at all
-        let keep: Vec<Ino> = al
+        let keep: HashSet<Ino> = al
             .live()
             .filter(|ino| {
                 self.nodes.get(ino).is_none_or(|n| {
@@ -410,7 +410,7 @@ impl Inner {
     }
 
     /// Caches a node from attributes meta just returned, so the caller's next `node()` needs no read.
-    fn seed_node(&self, ino: Ino, a: &cowfs_meta::Attr) {
+    pub(crate) fn seed_node(&self, ino: Ino, a: &cowfs_meta::Attr) {
         if self.nodes.get(&ino).is_some() {
             return;
         }
@@ -528,6 +528,7 @@ impl Inner {
                 self.ensure_target(sc, node)?;
             }
             FileKind::Directory => {}
+            _ => {}
         }
         if node.st.rd().xattrs.is_none() {
             let mut map = BTreeMap::new();

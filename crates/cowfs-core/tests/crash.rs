@@ -537,7 +537,7 @@ fn walk(fs: &dyn Vfs, dir: Ino, prefix: &str, out: &mut BTreeMap<String, Vec<u8>
             let name = format!("{prefix}{}", String::from_utf8_lossy(&e.name));
             match e.kind {
                 FileKind::Directory => walk(fs, e.ino, &format!("{name}/"), out),
-                FileKind::Regular => {
+                _ => {
                     let a = fs.getattr(e.ino).expect("getattr");
                     let mut data = Vec::new();
                     while (data.len() as u64) < a.size {
@@ -551,7 +551,6 @@ fn walk(fs: &dyn Vfs, dir: Ino, prefix: &str, out: &mut BTreeMap<String, Vec<u8>
                     }
                     out.insert(name, data);
                 }
-                FileKind::Symlink => {}
             }
         }
         if r.eof {

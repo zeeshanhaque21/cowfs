@@ -370,7 +370,7 @@ fn dump(fs: &dyn Vfs) -> BTreeMap<Vec<u8>, Entry> {
                     (*blake(&data).as_bytes(), Vec::new())
                 }
                 FileKind::Symlink => ([0; 32], fs.readlink(a.ino).expect("readlink")),
-                FileKind::Directory => ([0; 32], Vec::new()),
+                FileKind::Directory | _ => ([0; 32], Vec::new()),
             };
             let mut xattrs = BTreeMap::new();
             for n in fs.listxattr(a.ino).expect("listxattr") {

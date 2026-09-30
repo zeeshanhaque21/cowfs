@@ -130,9 +130,7 @@ impl Core {
     /// The store sync hook is wired in [`Core::open_with_meta`], the one place that does it, so no
     /// entry point can forget it.
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Core, Error> {
-        Self::open_with_meta(dir, opts, |dir, o| {
-            Meta::open(dir.join("meta.redb"), o).map_err(|e| e)
-        })
+        Self::open_with_meta(dir, opts, |dir, o| Meta::open(dir.join("meta.redb"), o))
     }
 
     /// Like [`Core::open`], but the metadata database is built by `make_meta`, which receives the

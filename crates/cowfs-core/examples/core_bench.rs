@@ -632,6 +632,8 @@ fn snapshots(cfg: &Cfg, rows: &mut Vec<Row>) {
     }
 }
 
+type Section = fn(&Cfg, &mut Vec<Row>);
+
 fn main() {
     let quick = std::env::var("COWFS_BENCH_QUICK").is_ok_and(|v| v == "1");
     let cfg = if quick {
@@ -659,18 +661,29 @@ fn main() {
     let mut rows = Vec::new();
     println!("| metric | n | cowfs-core median | range | std::fs median | core time / baseline time | max load1 |");
     println!("|---|---|---|---|---|---|---|");
-    let sections: [fn(&Cfg, &mut Vec<Row>); 5] = [
-        create_rate,
-        lookups,
-        cargo_replay,
-        seq_and_random,
-        snapshots,
+    let sections: [(&str, Section); 5] = [
+        ("create", create_rate),
+        ("lookups", lookups),
+        ("cargo", cargo_replay),
+        ("seq", seq_and_random),
+        ("snapshots", snapshots),
     ];
-    for s in sections {
-        let before = rows.len();
-        s(&cfg, &mut rows);
-        for r in &rows[before..] {
-            r.print();
+    // COWFS_BENCH_ONLY runs one section (for a long `sample` profile), COWFS_BENCH_REPEAT repeats it
+    let only = std::env::var("COWFS_BENCH_ONLY").ok();
+    let repeat: usize = std::env::var("COWFS_BENCH_REPEAT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    for (name, s) in sections {
+        if only.as_deref().is_some_and(|o| o != name) {
+            continue;
+        }
+        for _ in 0..repeat {
+            let before = rows.len();
+            s(&cfg, &mut rows);
+            for r in &rows[before..] {
+                r.print();
+            }
         }
     }
     println!("uptime at end: load1 {}", load1());

@@ -576,7 +576,14 @@ impl Inner {
         let (pn, name) = from;
         let (qn, new_name) = to;
         self.barrier(sc)?;
-        let src = sn.ino;
+        // The barrier commits, which may release virtual inode numbers nothing holds any more
+        // (`Inner::maybe_drop_alias`). Re-resolve both names to the numbers the mount uses now.
+        let re = |ino: Ino| match self.meta_of(ino) {
+            Some(m) => self.canon(sc.id, m).unwrap_or(ino),
+            None => ino,
+        };
+        let src = re(sn.ino);
+        let dst = dst.map(|(d, k)| (re(d), k));
         let mut cur = qn.ino;
         loop {
             if cur == src {
@@ -620,12 +627,23 @@ impl Inner {
             self.ctr.inodes_net.fetch_sub(1, Ordering::Relaxed);
         }
         self.adjust_kids(pn, qn, dst.is_some());
-        for n in [pn, qn, sn] {
+        for n in [pn, qn] {
             self.refresh_dir_attr(sc, n)?;
         }
+        // The moved directory's number comes from meta now: the node we were handed may be keyed by
+        // a virtual number the barrier above released, which nothing can name any more.
+        let moved = sc
+            .snap
+            .lookup(mino(qm), new_name)
+            .map_err(from_meta)
+            .map_err(stale)?;
+        let moved_ino = pack(sc.id, moved.ino.0)?;
+        self.seed_node(moved_ino, &moved);
+        let moved_node = self.node(moved_ino)?;
+        self.refresh_dir_attr(sc, &moved_node)?;
         self.dents.put(pn.ino, name, None, 0);
         self.dents
-            .put(qn.ino, new_name, Some((src, FileKind::Directory)), 0);
+            .put(qn.ino, new_name, Some((moved_ino, FileKind::Directory)), 0);
         if let Some(d) = &dn {
             self.try_reclaim(d);
         }

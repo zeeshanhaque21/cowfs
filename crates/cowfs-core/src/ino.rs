@@ -1,6 +1,6 @@
 //! Inode number shapes and the alias table. See `docs/v1-core.md`, "Inode numbers".
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 
 use cowfs_meta::SnapshotId;
@@ -108,7 +108,7 @@ impl Aliases {
     }
 
     /// Drops every alias except those in `keep`, so `canon` can never return a released number.
-    pub(crate) fn retain_only(&mut self, keep: &[Ino]) {
+    pub(crate) fn retain_only(&mut self, keep: &HashSet<Ino>) {
         self.fwd.retain(|v, _| keep.contains(v));
         self.rev = self
             .fwd
