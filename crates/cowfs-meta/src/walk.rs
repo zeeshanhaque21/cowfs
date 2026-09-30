@@ -1,11 +1,10 @@
 //! Walking a snapshot for the blocks it references, skipping subtrees already visited.
 
 use crate::node::{Node, NodeId};
-use crate::ptree::load;
+use crate::ptree::{NodeSource, RoNodes, TableSource};
 use crate::types::{decode_chunks, K_CHUNK};
 use crate::Result;
 use cowfs_store::BlockId;
-use redb::ReadOnlyTable;
 use std::collections::{HashSet, VecDeque};
 
 /// Tree nodes already walked. Share one marker across snapshots to skip common subtrees.
@@ -42,7 +41,7 @@ struct Frame {
 /// A node is added to the marker only after everything below it was yielded, so dropping the
 /// iterator early never makes the marker claim blocks that were not seen.
 pub struct LiveBlocks<'m> {
-    nodes: ReadOnlyTable<[u8; 32], &'static [u8]>,
+    nodes: RoNodes,
     marker: &'m mut Marker,
     stack: Vec<Frame>,
     queue: VecDeque<BlockId>,
@@ -56,11 +55,7 @@ impl std::fmt::Debug for LiveBlocks<'_> {
 }
 
 impl<'m> LiveBlocks<'m> {
-    pub(crate) fn new(
-        nodes: ReadOnlyTable<[u8; 32], &'static [u8]>,
-        root: NodeId,
-        marker: &'m mut Marker,
-    ) -> Result<Self> {
+    pub(crate) fn new(nodes: RoNodes, root: NodeId, marker: &'m mut Marker) -> Result<Self> {
         let mut it = Self {
             nodes,
             marker,
@@ -74,7 +69,11 @@ impl<'m> LiveBlocks<'m> {
 
     fn push(&mut self, id: NodeId) -> Result<()> {
         if !self.marker.seen.contains(&id) {
-            let node = load(&self.nodes, &id)?;
+            let node = TableSource {
+                table: &self.nodes,
+                cache: None,
+            }
+            .node(&id)?;
             self.stack.push(Frame { id, node, idx: 0 });
         }
         Ok(())

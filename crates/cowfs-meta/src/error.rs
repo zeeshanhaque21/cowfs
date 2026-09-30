@@ -50,6 +50,25 @@ pub enum Error {
     /// The `before_sync` hook failed, so the durable commit did not happen.
     #[error("before_sync hook failed: {0}")]
     Hook(std::io::Error),
+    /// The compare-and-swap version of a file's content did not match.
+    #[error("content version conflict")]
+    Conflict,
+    /// The requested size is inside a chunk. The caller must re-chunk the tail, `put` the new
+    /// tail block, then replace the tail with `splice_content` or `set_content`.
+    #[error("size is not on a chunk boundary: re-chunk the tail")]
+    NeedsRechunk,
+    /// A fixed limit was reached (inode numbers, snapshot ids).
+    #[error("limit reached: {0}")]
+    LimitExceeded(&'static str),
+    /// A hook or other callback called back into the store from inside a commit.
+    #[error("re-entered the metadata store from a before_sync hook")]
+    Reentrant,
+    /// The store was closed.
+    #[error("metadata store is closed")]
+    Closed,
+    /// The file is not a cowfs-meta database, or has an unsupported format version.
+    #[error("not a usable cowfs-meta database: {0}")]
+    Format(String),
 }
 
 /// Result alias for this crate.

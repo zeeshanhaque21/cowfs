@@ -1,67 +1,153 @@
 //! Persistent content-addressed B+tree over redb tables.
 //!
-//! Stored nodes are immutable. A transaction edits an in-memory copy of only the nodes on the
-//! paths it touches, and `flush` hashes and writes the copies bottom-up.
+//! Stored nodes are immutable. Edits happen on in-memory copies of the nodes on the touched paths
+//! (`MemTree`); memory nodes are `Arc`-shared so a savepoint is one `clone`. `write` hashes and
+//! stores the copies bottom-up without changing the tree, and the caller calls `reset` once the
+//! enclosing transaction has committed.
 
+use crate::db::NODES;
+use crate::error::guard;
 use crate::node::{self, encode, encoded_size, entry_cost, Node, NodeId};
 use crate::{Error, Result};
-use redb::{ReadableTable, Table};
+use redb::{ReadOnlyTable, ReadableDatabase, ReadableTable, Table};
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, Mutex};
 
 pub(crate) type NodesTable<'t> = Table<'t, [u8; 32], &'static [u8]>;
 pub(crate) type RefsTable<'t> = Table<'t, [u8; 32], u64>;
+pub(crate) type RoNodes = ReadOnlyTable<[u8; 32], &'static [u8]>;
+pub(crate) type Entry = (Vec<u8>, Vec<u8>);
 
 /// Read access to stored nodes by id.
 pub(crate) trait NodeSource {
     fn read(&self, id: &NodeId) -> Result<Option<Vec<u8>>>;
 
-    /// Loads, hash-verifies and parses a node.
-    fn node(&self, id: &NodeId) -> Result<Arc<Node>> {
-        let bytes = self
-            .read(id)?
-            .ok_or_else(|| Error::Corrupt(format!("missing tree node {id}")))?;
-        if node::hash(&bytes) != *id {
-            return Err(Error::Corrupt(format!("tree node {id} fails its hash")));
+    /// Loads, hash-verifies and parses a node (through the cache when there is one).
+    fn node(&self, id: &NodeId) -> Result<Arc<Node>>;
+}
+
+fn verified(bytes: Vec<u8>, id: &NodeId) -> Result<Arc<Node>> {
+    if node::hash(&bytes) != *id {
+        return Err(Error::Corrupt(format!("tree node {id} fails its hash")));
+    }
+    Ok(Arc::new(Node::parse(bytes)?))
+}
+
+fn load_through(
+    cache: &NodeCache,
+    id: &NodeId,
+    read: impl FnOnce() -> Result<Option<Vec<u8>>>,
+) -> Result<Arc<Node>> {
+    if let Some(n) = cache.get(id) {
+        return Ok(n);
+    }
+    let bytes = read()?.ok_or_else(|| Error::Corrupt(format!("missing tree node {id}")))?;
+    let n = verified(bytes, id)?;
+    cache.put(*id, n.clone());
+    Ok(n)
+}
+
+#[derive(Default)]
+pub(crate) struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, b: &[u8]) {
+        if let Some(h) = b.get(..8).and_then(|s| <[u8; 8]>::try_from(s).ok()) {
+            self.0 = u64::from_le_bytes(h);
         }
-        Ok(Arc::new(Node::parse(bytes)?))
     }
 }
 
+type IdMap<V> = HashMap<NodeId, V, BuildHasherDefault<IdHasher>>;
+
 const SHARDS: usize = 16;
 
-/// Cache of verified nodes. Nodes are immutable and named by their hash, so an entry never goes stale.
+struct Slot {
+    id: NodeId,
+    node: Arc<Node>,
+    hot: bool,
+}
+
+#[derive(Default)]
+struct Shard {
+    map: IdMap<usize>,
+    slots: Vec<Slot>,
+    hand: usize,
+}
+
+/// Bounded cache of verified nodes with CLOCK eviction. Nodes are immutable and named by their
+/// hash, so an entry never goes stale.
 pub(crate) struct NodeCache {
-    shards: Vec<Mutex<HashMap<NodeId, Arc<Node>>>>,
+    shards: Vec<Mutex<Shard>>,
     per_shard: usize,
 }
 
 impl NodeCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect(),
             per_shard: capacity.div_ceil(SHARDS),
         }
     }
 
-    fn shard(&self, id: &NodeId) -> std::sync::MutexGuard<'_, HashMap<NodeId, Arc<Node>>> {
-        let i = usize::from(id.as_bytes()[0]) % SHARDS;
+    fn shard(&self, id: &NodeId) -> std::sync::MutexGuard<'_, Shard> {
+        let i = usize::from(id.as_bytes()[31]) % SHARDS;
         self.shards[i].lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn get(&self, id: &NodeId) -> Option<Arc<Node>> {
-        self.shard(id).get(id).cloned()
+    pub(crate) fn get(&self, id: &NodeId) -> Option<Arc<Node>> {
+        if self.per_shard == 0 {
+            return None;
+        }
+        let mut s = self.shard(id);
+        let i = *s.map.get(id)?;
+        s.slots[i].hot = true;
+        Some(s.slots[i].node.clone())
     }
 
-    fn put(&self, id: NodeId, n: Arc<Node>) {
+    pub(crate) fn put(&self, id: NodeId, node: Arc<Node>) {
         if self.per_shard == 0 {
             return;
         }
+        let cap = self.per_shard;
         let mut s = self.shard(&id);
-        if s.len() >= self.per_shard {
-            s.clear();
+        if let Some(&i) = s.map.get(&id) {
+            s.slots[i].hot = true;
+            return;
         }
-        s.insert(id, n);
+        if s.slots.len() < cap {
+            let i = s.slots.len();
+            s.slots.push(Slot {
+                id,
+                node,
+                hot: false,
+            });
+            s.map.insert(id, i);
+            return;
+        }
+        loop {
+            let h = s.hand;
+            s.hand = (h + 1) % cap;
+            if s.slots[h].hot {
+                s.slots[h].hot = false;
+                continue;
+            }
+            let old = s.slots[h].id;
+            s.map.remove(&old);
+            s.slots[h] = Slot {
+                id,
+                node,
+                hot: false,
+            };
+            s.map.insert(id, h);
+            return;
+        }
     }
 }
 
@@ -71,53 +157,71 @@ impl std::fmt::Debug for NodeCache {
     }
 }
 
-/// A node source that consults the shared cache before the database.
-pub(crate) struct Cached<T> {
-    pub(crate) table: T,
-    pub(crate) cache: Arc<NodeCache>,
+/// Reads nodes from the latest committed state, opening a redb read view only on a cache miss.
+pub(crate) struct Lazy<'a> {
+    db: &'a redb::Database,
+    cache: &'a NodeCache,
+    table: OnceCell<RoNodes>,
 }
 
-impl<T: ReadableTable<[u8; 32], &'static [u8]>> NodeSource for Cached<T> {
+impl<'a> Lazy<'a> {
+    pub(crate) fn new(db: &'a redb::Database, cache: &'a NodeCache) -> Self {
+        Self {
+            db,
+            cache,
+            table: OnceCell::new(),
+        }
+    }
+
+    fn table(&self) -> Result<&RoNodes> {
+        if let Some(t) = self.table.get() {
+            return Ok(t);
+        }
+        let t = guard(|| Ok(self.db.begin_read()?.open_table(NODES)?))?;
+        Ok(self.table.get_or_init(|| t))
+    }
+}
+
+impl NodeSource for Lazy<'_> {
     fn read(&self, id: &NodeId) -> Result<Option<Vec<u8>>> {
-        self.table.read(id)
+        let t = self.table()?;
+        guard(|| Ok(t.get(*id.as_bytes())?.map(|g| g.value().to_vec())))
     }
 
     fn node(&self, id: &NodeId) -> Result<Arc<Node>> {
-        cached_node(self, &self.cache, id)
+        load_through(self.cache, id, || self.read(id))
     }
 }
 
-fn cached_node<S: NodeSource>(src: &S, cache: &NodeCache, id: &NodeId) -> Result<Arc<Node>> {
-    if let Some(n) = cache.get(id) {
-        return Ok(n);
-    }
-    let bytes = src
-        .read(id)?
-        .ok_or_else(|| Error::Corrupt(format!("missing tree node {id}")))?;
-    if node::hash(&bytes) != *id {
-        return Err(Error::Corrupt(format!("tree node {id} fails its hash")));
-    }
-    let n = Arc::new(Node::parse(bytes)?);
-    cache.put(*id, n.clone());
-    Ok(n)
+/// Node source over an open read table (used by `check` and the block walker).
+pub(crate) struct TableSource<'a> {
+    pub(crate) table: &'a RoNodes,
+    pub(crate) cache: Option<&'a NodeCache>,
 }
 
-impl<T: ReadableTable<[u8; 32], &'static [u8]>> NodeSource for T {
+impl NodeSource for TableSource<'_> {
     fn read(&self, id: &NodeId) -> Result<Option<Vec<u8>>> {
-        Ok(self.get(*id.as_bytes())?.map(|g| g.value().to_vec()))
+        Ok(self.table.get(*id.as_bytes())?.map(|g| g.value().to_vec()))
     }
-}
 
-/// Loads a node and verifies its hash against the id it was looked up by.
-pub(crate) fn load<S: NodeSource>(src: &S, id: &NodeId) -> Result<Arc<Node>> {
-    src.node(id)
+    fn node(&self, id: &NodeId) -> Result<Arc<Node>> {
+        match self.cache {
+            Some(c) => load_through(c, id, || self.read(id)),
+            None => {
+                let bytes = self
+                    .read(id)?
+                    .ok_or_else(|| Error::Corrupt(format!("missing tree node {id}")))?;
+                verified(bytes, id)
+            }
+        }
+    }
 }
 
 /// Point lookup in a stored tree.
-pub(crate) fn get<S: NodeSource>(src: &S, root: &NodeId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+fn get_stored(src: &dyn NodeSource, root: &NodeId, key: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut id = *root;
     loop {
-        let n = load(src, &id)?;
+        let n = src.node(&id)?;
         if n.is_leaf() {
             return Ok(n.search(key).ok().map(|i| n.val(i).to_vec()));
         }
@@ -133,11 +237,11 @@ pub(crate) struct Cursor {
 
 impl Cursor {
     /// Positions the cursor at the first entry whose key is at least `key`.
-    pub(crate) fn seek<S: NodeSource>(src: &S, root: &NodeId, key: &[u8]) -> Result<Cursor> {
+    pub(crate) fn seek(src: &dyn NodeSource, root: &NodeId, key: &[u8]) -> Result<Cursor> {
         let mut stack = Vec::new();
         let mut id = *root;
         loop {
-            let n = load(src, &id)?;
+            let n = src.node(&id)?;
             if n.is_leaf() {
                 let idx = n.search(key).unwrap_or_else(|i| i);
                 stack.push((n, idx));
@@ -149,7 +253,7 @@ impl Cursor {
         }
     }
 
-    pub(crate) fn next<S: NodeSource>(&mut self, src: &S) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    pub(crate) fn next(&mut self, src: &dyn NodeSource) -> Result<Option<Entry>> {
         loop {
             let Some((node, idx)) = self.stack.last_mut() else {
                 return Ok(None);
@@ -168,7 +272,7 @@ impl Cursor {
                 if *pi < p.len() {
                     let mut id = p.child(*pi);
                     loop {
-                        let n = load(src, &id)?;
+                        let n = src.node(&id)?;
                         let leaf = n.is_leaf();
                         if !leaf {
                             id = n.child(0);
@@ -186,13 +290,13 @@ impl Cursor {
     }
 }
 
-type Entry = (Vec<u8>, Vec<u8>);
-
+#[derive(Clone)]
 enum Kid {
     Id(NodeId),
-    Mem(Box<MNode>),
+    Mem(Arc<MNode>),
 }
 
+#[derive(Clone)]
 enum MNode {
     Leaf(Vec<Entry>),
     Internal(Vec<(Vec<u8>, Kid)>),
@@ -223,9 +327,9 @@ impl MNode {
 }
 
 impl Kid {
-    fn mem<S: NodeSource>(&mut self, src: &S) -> Result<&mut MNode> {
+    fn mem(&mut self, src: &dyn NodeSource) -> Result<&mut MNode> {
         if let Kid::Id(id) = self {
-            let n = load(src, id)?;
+            let n = src.node(id)?;
             let m = if n.is_leaf() {
                 MNode::Leaf(
                     (0..n.len())
@@ -239,15 +343,15 @@ impl Kid {
                         .collect(),
                 )
             };
-            *self = Kid::Mem(Box::new(m));
+            *self = Kid::Mem(Arc::new(m));
         }
         match self {
-            Kid::Mem(m) => Ok(m),
+            Kid::Mem(m) => Ok(Arc::make_mut(m)),
             Kid::Id(_) => Err(Error::Corrupt("unreachable".into())),
         }
     }
 
-    fn size<S: NodeSource>(&mut self, src: &S) -> Result<usize> {
+    fn size(&mut self, src: &dyn NodeSource) -> Result<usize> {
         Ok(self.mem(src)?.size())
     }
 }
@@ -291,10 +395,13 @@ fn internal_cost(e: &(Vec<u8>, Kid)) -> usize {
     entry_cost(e.0.len(), 32)
 }
 
-/// A tree being edited inside a write transaction.
+/// A tree being edited in memory. Cloning is a savepoint: it shares every memory node.
+#[derive(Clone)]
 pub(crate) struct MemTree {
     root: Kid,
     max: usize,
+    edits: u64,
+    dirty_bytes: usize,
 }
 
 impl MemTree {
@@ -302,54 +409,80 @@ impl MemTree {
         Self {
             root: Kid::Id(root),
             max,
+            edits: 0,
+            dirty_bytes: 0,
         }
     }
 
     pub(crate) fn empty(max: usize) -> Self {
         Self {
-            root: Kid::Mem(Box::new(MNode::Leaf(Vec::new()))),
+            root: Kid::Mem(Arc::new(MNode::Leaf(Vec::new()))),
             max,
+            edits: 0,
+            dirty_bytes: 0,
         }
     }
 
-    /// True when the tree was never edited, so its root is still the stored one.
-    pub(crate) fn unchanged(&self) -> bool {
-        matches!(self.root, Kid::Id(_))
+    /// True when the tree differs from its stored root.
+    pub(crate) fn is_dirty(&self) -> bool {
+        matches!(self.root, Kid::Mem(_))
     }
 
-    pub(crate) fn get<S: NodeSource>(&self, src: &S, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn edits(&self) -> u64 {
+        self.edits
+    }
+
+    pub(crate) fn dirty_bytes(&self) -> usize {
+        self.dirty_bytes
+    }
+
+    pub(crate) fn get(&self, src: &dyn NodeSource, key: &[u8]) -> Result<Option<Vec<u8>>> {
         get_kid(&self.root, src, key)
     }
 
     /// First entry with a key at least `key`.
-    pub(crate) fn seek_ge<S: NodeSource>(&self, src: &S, key: &[u8]) -> Result<Option<Entry>> {
-        seek_kid(&self.root, src, key)
+    pub(crate) fn seek_ge(&self, src: &dyn NodeSource, key: &[u8]) -> Result<Option<Entry>> {
+        let mut out = Vec::new();
+        scan_kid(&self.root, src, key, &[], 1, &mut out)?;
+        Ok(out.pop())
     }
 
-    pub(crate) fn insert<S: NodeSource>(
-        &mut self,
-        src: &S,
-        key: &[u8],
-        val: Vec<u8>,
-    ) -> Result<()> {
+    /// Up to `limit` entries with keys at least `from` that start with `prefix`, in key order.
+    pub(crate) fn scan(
+        &self,
+        src: &dyn NodeSource,
+        from: &[u8],
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<Entry>> {
+        let mut out = Vec::new();
+        scan_kid(&self.root, src, from, prefix, limit, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn insert(&mut self, src: &dyn NodeSource, key: &[u8], val: Vec<u8>) -> Result<()> {
+        self.edits += 1;
+        self.dirty_bytes += key.len() + val.len() + 8;
         let extra = insert_kid(&mut self.root, src, key, val, self.max)?;
         if !extra.is_empty() {
             let old = std::mem::replace(&mut self.root, Kid::Id(NodeId::from_bytes([0; 32])));
             let mut es = vec![(Vec::new(), old)];
             es.extend(extra);
-            self.root = Kid::Mem(Box::new(MNode::Internal(es)));
+            self.root = Kid::Mem(Arc::new(MNode::Internal(es)));
         }
         Ok(())
     }
 
-    pub(crate) fn remove<S: NodeSource>(&mut self, src: &S, key: &[u8]) -> Result<bool> {
+    pub(crate) fn remove(&mut self, src: &dyn NodeSource, key: &[u8]) -> Result<bool> {
         if self.get(src, key)?.is_none() {
             return Ok(false);
         }
+        self.edits += 1;
+        self.dirty_bytes += key.len() + 8;
         remove_kid(&mut self.root, src, key, self.max)?;
         while let MNode::Internal(es) = self.root.mem(src)? {
             match es.len() {
-                0 => self.root = Kid::Mem(Box::new(MNode::Leaf(Vec::new()))),
+                0 => self.root = Kid::Mem(Arc::new(MNode::Leaf(Vec::new()))),
                 1 => {
                     let (_, only) = es
                         .pop()
@@ -362,52 +495,88 @@ impl MemTree {
         Ok(true)
     }
 
-    /// Writes every modified node and returns the new root id.
-    pub(crate) fn flush(&mut self, w: &mut NodeWriter<'_>) -> Result<NodeId> {
-        flush_kid(&mut self.root, w)
+    /// The root id this tree would have if written now. Writes nothing.
+    pub(crate) fn root_id(&self) -> NodeId {
+        dry_kid(&self.root)
+    }
+
+    /// Stores every modified node and returns the new root id. The tree is left as it was, so a
+    /// failed transaction loses nothing; call `reset` after the commit succeeds.
+    pub(crate) fn write(&self, w: &mut NodeWriter<'_>) -> Result<NodeId> {
+        write_kid(&self.root, w)
+    }
+
+    /// Makes `root` the stored root and drops the in-memory copies.
+    pub(crate) fn reset(&mut self, root: NodeId) {
+        self.root = Kid::Id(root);
+        self.dirty_bytes = 0;
     }
 }
 
-fn get_kid<S: NodeSource>(kid: &Kid, src: &S, key: &[u8]) -> Result<Option<Vec<u8>>> {
+fn get_kid(kid: &Kid, src: &dyn NodeSource, key: &[u8]) -> Result<Option<Vec<u8>>> {
     match kid {
-        Kid::Id(id) => get(src, id, key),
+        Kid::Id(id) => get_stored(src, id, key),
         Kid::Mem(m) => match &**m {
             MNode::Leaf(es) => Ok(es
                 .binary_search_by(|(k, _)| k.as_slice().cmp(key))
                 .ok()
                 .map(|i| es[i].1.clone())),
-            MNode::Internal(es) => {
-                let ci = route(es, key);
-                get_kid(&es[ci].1, src, key)
-            }
+            MNode::Internal(es) => get_kid(&es[route(es, key)].1, src, key),
         },
     }
 }
 
-fn seek_kid<S: NodeSource>(kid: &Kid, src: &S, key: &[u8]) -> Result<Option<Entry>> {
+/// Appends entries at or after `from` to `out` while they start with `prefix` and `out` is shorter
+/// than `limit`. Returns true when the scan is finished (limit or prefix range left behind).
+fn scan_kid(
+    kid: &Kid,
+    src: &dyn NodeSource,
+    from: &[u8],
+    prefix: &[u8],
+    limit: usize,
+    out: &mut Vec<Entry>,
+) -> Result<bool> {
     match kid {
-        Kid::Id(id) => Cursor::seek(src, id, key)?.next(src),
+        Kid::Id(id) => {
+            let mut cur = Cursor::seek(src, id, from)?;
+            while out.len() < limit {
+                match cur.next(src)? {
+                    Some((k, v)) if k.starts_with(prefix) => out.push((k, v)),
+                    Some(_) => return Ok(true),
+                    None => return Ok(false),
+                }
+            }
+            Ok(true)
+        }
         Kid::Mem(m) => match &**m {
             MNode::Leaf(es) => {
-                let i = es.partition_point(|(k, _)| k.as_slice() < key);
-                Ok(es.get(i).cloned())
+                let start = es.partition_point(|(k, _)| k.as_slice() < from);
+                for (k, v) in &es[start..] {
+                    if out.len() >= limit {
+                        return Ok(true);
+                    }
+                    if !k.starts_with(prefix) {
+                        return Ok(true);
+                    }
+                    out.push((k.clone(), v.clone()));
+                }
+                Ok(out.len() >= limit)
             }
             MNode::Internal(es) => {
-                let ci = route(es, key);
-                for (_, child) in &es[ci..] {
-                    if let Some(e) = seek_kid(child, src, key)? {
-                        return Ok(Some(e));
+                for (_, child) in &es[route(es, from)..] {
+                    if out.len() >= limit || scan_kid(child, src, from, prefix, limit, out)? {
+                        return Ok(true);
                     }
                 }
-                Ok(None)
+                Ok(false)
             }
         },
     }
 }
 
-fn insert_kid<S: NodeSource>(
+fn insert_kid(
     kid: &mut Kid,
-    src: &S,
+    src: &dyn NodeSource,
     key: &[u8],
     val: Vec<u8>,
     max: usize,
@@ -420,7 +589,7 @@ fn insert_kid<S: NodeSource>(
                 Err(i) => es.insert(i, (key.to_vec(), val)),
             }
             for piece in split_pieces(es, max, &leaf_cost) {
-                out.push((piece[0].0.clone(), Kid::Mem(Box::new(MNode::Leaf(piece)))));
+                out.push((piece[0].0.clone(), Kid::Mem(Arc::new(MNode::Leaf(piece)))));
             }
         }
         MNode::Internal(es) => {
@@ -432,7 +601,7 @@ fn insert_kid<S: NodeSource>(
             for piece in split_pieces(es, max, &internal_cost) {
                 out.push((
                     piece[0].0.clone(),
-                    Kid::Mem(Box::new(MNode::Internal(piece))),
+                    Kid::Mem(Arc::new(MNode::Internal(piece))),
                 ));
             }
         }
@@ -440,7 +609,7 @@ fn insert_kid<S: NodeSource>(
     Ok(out)
 }
 
-fn remove_kid<S: NodeSource>(kid: &mut Kid, src: &S, key: &[u8], max: usize) -> Result<()> {
+fn remove_kid(kid: &mut Kid, src: &dyn NodeSource, key: &[u8], max: usize) -> Result<()> {
     match kid.mem(src)? {
         MNode::Leaf(es) => {
             if let Ok(i) = es.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
@@ -456,10 +625,10 @@ fn remove_kid<S: NodeSource>(kid: &mut Kid, src: &S, key: &[u8], max: usize) -> 
     Ok(())
 }
 
-fn fix_child<S: NodeSource>(
+fn fix_child(
     es: &mut Vec<(Vec<u8>, Kid)>,
     ci: usize,
-    src: &S,
+    src: &dyn NodeSource,
     max: usize,
 ) -> Result<()> {
     let size = es[ci].1.size(src)?;
@@ -487,7 +656,8 @@ fn fix_child<S: NodeSource>(
     let Kid::Mem(right) = right else {
         return Err(Error::Corrupt("unreachable".into()));
     };
-    match (es[l].1.mem(src)?, *right) {
+    let right = Arc::try_unwrap(right).unwrap_or_else(|a| (*a).clone());
+    match (es[l].1.mem(src)?, right) {
         (MNode::Leaf(a), MNode::Leaf(b)) => a.extend(b),
         (MNode::Internal(a), MNode::Internal(b)) => a.extend(b),
         _ => return Err(Error::Corrupt("sibling nodes differ in level".into())),
@@ -495,35 +665,51 @@ fn fix_child<S: NodeSource>(
     Ok(())
 }
 
-fn flush_kid(kid: &mut Kid, w: &mut NodeWriter<'_>) -> Result<NodeId> {
-    let m = match kid {
-        Kid::Id(id) => return Ok(*id),
-        Kid::Mem(m) => m,
-    };
-    let (bytes, children) = match &mut **m {
+fn encode_mem(
+    m: &MNode,
+    mut child_id: impl FnMut(&Kid) -> Result<NodeId>,
+) -> Result<(Vec<u8>, Vec<NodeId>)> {
+    match m {
         MNode::Leaf(es) => {
             let refs: Vec<(&[u8], &[u8])> = es
                 .iter()
                 .map(|(k, v)| (k.as_slice(), v.as_slice()))
                 .collect();
-            (encode(true, &refs), Vec::new())
+            Ok((encode(true, &refs), Vec::new()))
         }
         MNode::Internal(es) => {
             let mut ids = Vec::with_capacity(es.len());
-            for (_, k) in es.iter_mut() {
-                ids.push(flush_kid(k, w)?);
+            for (_, k) in es {
+                ids.push(child_id(k)?);
             }
             let refs: Vec<(&[u8], &[u8])> = es
                 .iter()
                 .zip(&ids)
                 .map(|((k, _), id)| (k.as_slice(), id.as_bytes().as_slice()))
                 .collect();
-            (encode(false, &refs), ids)
+            Ok((encode(false, &refs), ids))
         }
-    };
-    let id = w.intern(&bytes, &children)?;
-    *kid = Kid::Id(id);
-    Ok(id)
+    }
+}
+
+fn dry_kid(kid: &Kid) -> NodeId {
+    match kid {
+        Kid::Id(id) => *id,
+        Kid::Mem(m) => match encode_mem(m, |k| Ok(dry_kid(k))) {
+            Ok((bytes, _)) => node::hash(&bytes),
+            Err(_) => NodeId::from_bytes([0; 32]),
+        },
+    }
+}
+
+fn write_kid(kid: &Kid, w: &mut NodeWriter<'_>) -> Result<NodeId> {
+    match kid {
+        Kid::Id(id) => Ok(*id),
+        Kid::Mem(m) => {
+            let (bytes, children) = encode_mem(m, |k| write_kid(k, w))?;
+            w.intern(&bytes, &children)
+        }
+    }
 }
 
 /// Writes nodes and tracks reference-count changes for one transaction.
@@ -532,16 +718,6 @@ pub(crate) struct NodeWriter<'t> {
     pub(crate) refs: RefsTable<'t>,
     delta: HashMap<NodeId, i64>,
     cache: Arc<NodeCache>,
-}
-
-impl NodeSource for NodeWriter<'_> {
-    fn read(&self, id: &NodeId) -> Result<Option<Vec<u8>>> {
-        self.nodes.read(id)
-    }
-
-    fn node(&self, id: &NodeId) -> Result<Arc<Node>> {
-        cached_node(self, &self.cache, id)
-    }
 }
 
 impl<'t> NodeWriter<'t> {
@@ -562,6 +738,7 @@ impl<'t> NodeWriter<'t> {
             for c in children {
                 *self.delta.entry(*c).or_default() += 1;
             }
+            self.cache.put(id, Arc::new(Node::parse(bytes.to_vec())?));
         }
         Ok(id)
     }

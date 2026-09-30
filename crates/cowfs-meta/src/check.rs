@@ -1,12 +1,20 @@
-//! `Meta::check`: recomputes every invariant from the stored rows.
+//! `Meta::check`: recomputes every invariant from the stored rows, in one pass per snapshot.
+//!
+//! Memory is about 40 bytes per inode plus about 50 bytes per tree node (counters, not data), so
+//! a million inodes need tens of megabytes. A directory's entries are checked with a streaming
+//! multiset hash, not by holding them.
 
-use crate::db::{decode_snap, meta_get, Inner, META, NODES, REFS, SNAPSHOTS, SNAP_NAMES};
+use crate::db::{
+    decode_snap, meta_get, Inner, FORMAT_VERSION, MAGIC, META, NODES, REAP, REFS, SNAPSHOTS,
+    SNAP_NAMES,
+};
 use crate::node::NodeId;
-use crate::ptree::{load, Cursor};
+use crate::ptree::{Cursor, IdHasher, NodeSource, TableSource};
 use crate::types::*;
 use crate::{Error, Result};
-use redb::{ReadOnlyTable, ReadableDatabase, ReadableTable, ReadableTableMetadata};
-use std::collections::{HashMap, HashSet};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 
 const MAX_REPORTED: usize = 50;
 
@@ -21,21 +29,33 @@ impl Errs {
     }
 }
 
-type Nodes = ReadOnlyTable<[u8; 32], &'static [u8]>;
+type NodeMap<V> = HashMap<NodeId, V, BuildHasherDefault<IdHasher>>;
 
 pub(crate) fn check(inner: &Inner) -> Result<()> {
     let rtx = inner.db.begin_read()?;
-    let nodes = rtx.open_table(NODES)?;
+    let nodes_t = rtx.open_table(NODES)?;
     let refs = rtx.open_table(REFS)?;
     let snaps = rtx.open_table(SNAPSHOTS)?;
     let names = rtx.open_table(SNAP_NAMES)?;
     let meta = rtx.open_table(META)?;
+    let reap = rtx.open_table(REAP)?;
     let mut errs = Errs::default();
+    let src = TableSource {
+        table: &nodes_t,
+        cache: None,
+    };
 
-    let next_ino = meta_get(&meta, "next_ino")?;
+    if meta.get("magic")?.map(|g| g.value()) != Some(MAGIC) {
+        errs.push("missing or wrong magic".into());
+    }
+    if meta_get(&meta, "version")? != FORMAT_VERSION {
+        errs.push("unsupported format version".into());
+    }
+    let reserved = meta_get(&meta, "ino_reserved")?;
     let next_snapshot = meta_get(&meta, "next_snapshot")?;
-    if next_ino < 2 {
-        errs.push(format!("next_ino {next_ino} below 2"));
+    let next_reap = meta_get(&meta, "next_reap")?;
+    if !(2..=INO_LIMIT).contains(&reserved) {
+        errs.push(format!("ino_reserved {reserved} outside 2..={INO_LIMIT}"));
     }
 
     let mut infos = Vec::new();
@@ -66,42 +86,56 @@ pub(crate) fn check(inner: &Inner) -> Result<()> {
         ));
     }
 
-    let mut expected: HashMap<NodeId, u64> = HashMap::new();
-    let mut heights: HashMap<NodeId, u32> = HashMap::new();
-    for info in &infos {
-        *expected.entry(info.root).or_default() += 1;
-        walk(&nodes, &info.root, &mut heights, &mut expected, &mut errs)?;
+    let mut roots: Vec<NodeId> = infos.iter().map(|i| i.root).collect();
+    let mut reap_rows = 0u64;
+    for r in reap.iter()? {
+        let (k, v) = r?;
+        reap_rows += 1;
+        if k.value() >= next_reap {
+            errs.push(format!("reap entry {} at or above next_reap", k.value()));
+        }
+        roots.push(NodeId::from_bytes(v.value()));
+    }
+    let _ = reap_rows;
+
+    let mut graph: NodeMap<(u32, u64)> = NodeMap::default();
+    for root in &roots {
+        graph.entry(*root).or_insert((u32::MAX, 0)).1 += 1;
+    }
+    for root in &roots {
+        walk(&src, root, &mut graph, &mut errs)?;
     }
     for r in refs.iter()? {
         let (k, v) = r?;
         let id = NodeId::from_bytes(k.value());
-        match expected.get(&id) {
-            Some(&n) if n == v.value() => {}
-            Some(&n) => errs.push(format!(
+        match graph.get(&id) {
+            Some(&(_, n)) if n == v.value() => {}
+            Some(&(_, n)) => errs.push(format!(
                 "node {id} has count {} but {n} references",
                 v.value()
             )),
             None => errs.push(format!("count stored for unreachable node {id}")),
         }
     }
-    if refs.len()? != expected.len() as u64 {
+    if refs.len()? != graph.len() as u64 {
         errs.push(format!(
             "{} counts stored for {} reachable nodes",
             refs.len()?,
-            expected.len()
+            graph.len()
         ));
     }
-    if nodes.len()? != heights.len() as u64 {
+    if nodes_t.len()? != graph.len() as u64 {
         errs.push(format!(
             "{} nodes stored but {} reachable",
-            nodes.len()?,
-            heights.len()
+            nodes_t.len()?,
+            graph.len()
         ));
     }
+    drop(graph);
 
     for info in &infos {
         let mut e = Errs::default();
-        check_snapshot(&nodes, &info.root, next_ino, &mut e)?;
+        check_snapshot(&src, &info.root, reserved, &mut e)?;
         for m in e.0 {
             errs.push(format!("snapshot {:?}: {m}", info.name));
         }
@@ -115,16 +149,17 @@ pub(crate) fn check(inner: &Inner) -> Result<()> {
 }
 
 fn walk(
-    nodes: &Nodes,
+    src: &dyn NodeSource,
     id: &NodeId,
-    heights: &mut HashMap<NodeId, u32>,
-    expected: &mut HashMap<NodeId, u64>,
+    graph: &mut NodeMap<(u32, u64)>,
     errs: &mut Errs,
 ) -> Result<u32> {
-    if let Some(&h) = heights.get(id) {
-        return Ok(h);
+    if let Some(&(h, _)) = graph.get(id) {
+        if h != u32::MAX {
+            return Ok(h);
+        }
     }
-    let n = load(nodes, id)?;
+    let n = src.node(id)?;
     let mut height = 0;
     if n.is_leaf() {
         for i in 1..n.len() {
@@ -146,24 +181,27 @@ fn walk(
         let mut first = None;
         for i in 0..n.len() {
             let c = n.child(i);
-            *expected.entry(c).or_default() += 1;
-            let h = walk(nodes, &c, heights, expected, errs)?;
+            graph.entry(c).or_insert((u32::MAX, 0)).1 += 1;
+            let h = walk(src, &c, graph, errs)?;
             if *first.get_or_insert(h) != h {
                 errs.push(format!("node {id} has children of different heights"));
             }
         }
         height = first.map_or(0, |h| h + 1);
     }
-    heights.insert(*id, height);
+    graph.entry(*id).or_insert((u32::MAX, 0)).0 = height;
     Ok(height)
 }
 
 struct Group {
     ino: u64,
     rec: Option<InodeRec>,
-    names: Vec<(Vec<u8>, Ino, FileType, u64)>,
-    cookies: HashMap<u64, (Ino, FileType, Vec<u8>)>,
-    segs: Vec<(u32, usize, u64)>,
+    name_rows: u64,
+    cookie_rows: u64,
+    name_sum: u64,
+    cookie_sum: u64,
+    next_off: u64,
+    extents: u64,
     link: Option<usize>,
 }
 
@@ -172,71 +210,85 @@ impl Group {
         Self {
             ino,
             rec: None,
-            names: Vec::new(),
-            cookies: HashMap::new(),
-            segs: Vec::new(),
+            name_rows: 0,
+            cookie_rows: 0,
+            name_sum: 0,
+            cookie_sum: 0,
+            next_off: 0,
+            extents: 0,
             link: None,
         }
     }
 }
 
 #[derive(Default)]
-struct Snap {
-    inodes: HashMap<u64, InodeRec>,
-    dirents: Vec<(u64, Ino, FileType)>,
+struct Info {
+    kind: u8,
+    nlink: u32,
+    parent: u64,
+    names: u32,
+    subdirs: u32,
+    dirent_parent: u64,
+    declared: u8,
+    mismatch: bool,
+    seen: bool,
 }
 
-fn finish(g: Group, next_ino: u64, s: &mut Snap, errs: &mut Errs) {
+fn kind_code(k: FileType) -> u8 {
+    match k {
+        FileType::File => 1,
+        FileType::Dir => 2,
+        FileType::Symlink => 3,
+    }
+}
+
+fn entry_hash(cookie: u64, child: u64, kind: FileType, name: &[u8]) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(&cookie.to_le_bytes());
+    h.update(&child.to_le_bytes());
+    h.update(&[kind_code(kind)]);
+    h.update(name);
+    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap_or([0; 8]))
+}
+
+fn finish(g: Group, reserved: u64, infos: &mut HashMap<u64, Info>, errs: &mut Errs) {
     let ino = g.ino;
-    if ino == 0 || ino >= next_ino {
-        errs.push(format!("inode number {ino} outside 1..{next_ino}"));
+    if ino == 0 || ino >= reserved {
+        errs.push(format!("inode number {ino} outside 1..{reserved}"));
     }
     let Some(rec) = g.rec else {
         errs.push(format!("records for inode {ino} but no inode record"));
         return;
     };
     let dir = rec.kind == FileType::Dir;
-    if !dir && (!g.names.is_empty() || !g.cookies.is_empty()) {
+    if !dir && (g.name_rows != 0 || g.cookie_rows != 0) {
         errs.push(format!("non-directory inode {ino} has directory entries"));
     }
-    if g.names.len() != g.cookies.len() {
-        errs.push(format!("directory {ino} has mismatched entry indexes"));
-    }
-    for (name, child, kind, cookie) in &g.names {
-        match g.cookies.get(cookie) {
-            Some((c, k, n)) if c == child && k == kind && n == name => {}
-            _ => errs.push(format!(
-                "directory {ino} entry {name:?} disagrees with its cookie row"
-            )),
-        }
-        if *cookie == 0 || *cookie >= rec.next_cookie {
-            errs.push(format!(
-                "directory {ino} cookie {cookie} outside next_cookie"
-            ));
-        }
-        s.dirents.push((ino, *child, *kind));
+    if g.name_rows != g.cookie_rows || g.name_sum != g.cookie_sum {
+        errs.push(format!(
+            "directory {ino} name rows and cookie rows disagree"
+        ));
     }
     match rec.kind {
         FileType::File => {
             if g.link.is_some() {
                 errs.push(format!("file {ino} has a link target"));
             }
-            let mut total = 0u64;
-            for (i, (idx, n, sum)) in g.segs.iter().enumerate() {
-                if *idx as usize != i || *n == 0 || *n > CHUNKS_PER_SEGMENT {
-                    errs.push(format!("file {ino} chunk segment {idx} malformed"));
-                }
-                total += sum;
-            }
-            if total > rec.size {
+            if g.next_off != rec.covered {
                 errs.push(format!(
-                    "file {ino} chunks cover {total} bytes but size is {}",
-                    rec.size
+                    "file {ino} extents cover {} bytes but covered is {}",
+                    g.next_off, rec.covered
+                ));
+            }
+            if rec.covered > rec.size {
+                errs.push(format!(
+                    "file {ino} covers {} bytes but size is {}",
+                    rec.covered, rec.size
                 ));
             }
         }
         FileType::Symlink => {
-            if !g.segs.is_empty() {
+            if g.extents != 0 || rec.covered != 0 {
                 errs.push(format!("symlink {ino} has chunks"));
             }
             if g.link != Some(rec.size as usize) || rec.size == 0 {
@@ -244,20 +296,29 @@ fn finish(g: Group, next_ino: u64, s: &mut Snap, errs: &mut Errs) {
             }
         }
         FileType::Dir => {
-            if !g.segs.is_empty() || g.link.is_some() || rec.size != 0 {
+            if g.extents != 0 || g.link.is_some() || rec.size != 0 || rec.covered != 0 {
                 errs.push(format!("directory {ino} has file data"));
             }
         }
     }
-    s.inodes.insert(ino, rec);
+    let e = infos.entry(ino).or_default();
+    e.kind = kind_code(rec.kind);
+    e.nlink = rec.nlink;
+    e.parent = rec.parent;
+    e.seen = true;
 }
 
-fn check_snapshot(nodes: &Nodes, root: &NodeId, next_ino: u64, errs: &mut Errs) -> Result<()> {
-    let mut s = Snap::default();
-    let mut cur = Cursor::seek(nodes, root, &[])?;
+fn check_snapshot(
+    src: &TableSource<'_>,
+    root: &NodeId,
+    reserved: u64,
+    errs: &mut Errs,
+) -> Result<()> {
+    let mut infos: HashMap<u64, Info> = HashMap::new();
+    let mut cur = Cursor::seek(src, root, &[])?;
     let mut prev: Option<Vec<u8>> = None;
     let mut group: Option<Group> = None;
-    while let Some((k, v)) = cur.next(nodes)? {
+    while let Some((k, v)) = cur.next(src)? {
         if prev.as_ref().is_some_and(|p| *p >= k) {
             errs.push("keys out of order across the tree".into());
         }
@@ -270,34 +331,70 @@ fn check_snapshot(nodes: &Nodes, root: &NodeId, next_ino: u64, errs: &mut Errs) 
         };
         if group.as_ref().is_some_and(|g| g.ino != ino.0) {
             if let Some(g) = group.take() {
-                finish(g, next_ino, &mut s, errs);
+                finish(g, reserved, &mut infos, errs);
             }
         }
         let g = group.get_or_insert_with(|| Group::new(ino.0));
-        let mut bad = |what: &str, e: Error| errs.push(format!("inode {}: {what}: {e}", ino.0));
         match kind {
             K_INODE => match InodeRec::decode(&v) {
                 Ok(r) => g.rec = Some(r),
-                Err(e) => bad("inode record", e),
+                Err(e) => errs.push(format!("inode {}: inode record: {e}", ino.0)),
             },
             K_NAME => match decode_name_val(&v) {
-                Ok((c, t, cookie)) => g.names.push((suffix.to_vec(), c, t, cookie)),
-                Err(e) => bad("dirent", e),
+                Ok((c, t, cookie)) => {
+                    g.name_rows += 1;
+                    g.name_sum = g.name_sum.wrapping_add(entry_hash(cookie, c.0, t, suffix));
+                    match g.rec {
+                        Some(r) if cookie == 0 || cookie >= r.next_cookie => {
+                            errs.push(format!(
+                                "directory {} cookie {cookie} outside next_cookie",
+                                ino.0
+                            ));
+                        }
+                        None => errs.push(format!(
+                            "directory {} entries before its inode record",
+                            ino.0
+                        )),
+                        _ => {}
+                    }
+                    let e = infos.entry(c.0).or_default();
+                    e.names += 1;
+                    let code = kind_code(t);
+                    if e.declared != 0 && e.declared != code {
+                        e.mismatch = true;
+                    }
+                    e.declared = code;
+                    if t == FileType::Dir {
+                        e.dirent_parent = ino.0;
+                        infos.entry(ino.0).or_default().subdirs += 1;
+                    }
+                }
+                Err(e) => errs.push(format!("inode {}: dirent: {e}", ino.0)),
             },
             K_COOKIE => match (decode_cookie_val(&v), <[u8; 8]>::try_from(suffix)) {
                 (Ok((c, t, n)), Ok(ck)) => {
-                    g.cookies.insert(u64::from_be_bytes(ck), (c, t, n.to_vec()));
+                    g.cookie_rows += 1;
+                    g.cookie_sum =
+                        g.cookie_sum
+                            .wrapping_add(entry_hash(u64::from_be_bytes(ck), c.0, t, n));
                 }
                 _ => errs.push(format!("inode {}: bad cookie row", ino.0)),
             },
             K_XATTR => {}
-            K_CHUNK => match (decode_chunks(&v), <[u8; 4]>::try_from(suffix)) {
-                (Ok(c), Ok(idx)) => g.segs.push((
-                    u32::from_be_bytes(idx),
-                    c.len(),
-                    c.iter().map(|c| u64::from(c.len)).sum(),
-                )),
-                _ => errs.push(format!("inode {}: bad chunk segment", ino.0)),
+            K_CHUNK => match (decode_chunks(&v), <[u8; 8]>::try_from(suffix)) {
+                (Ok(c), Ok(off)) if c.len() == 1 => {
+                    if u64::from_be_bytes(off) != g.next_off {
+                        errs.push(format!(
+                            "inode {}: extent at {} but expected {}",
+                            ino.0,
+                            u64::from_be_bytes(off),
+                            g.next_off
+                        ));
+                    }
+                    g.extents += 1;
+                    g.next_off = g.next_off.saturating_add(u64::from(c[0].len));
+                }
+                _ => errs.push(format!("inode {}: bad extent", ino.0)),
             },
             K_LINK => g.link = Some(v.len()),
             other => errs.push(format!("inode {}: unknown record kind {other}", ino.0)),
@@ -305,79 +402,84 @@ fn check_snapshot(nodes: &Nodes, root: &NodeId, next_ino: u64, errs: &mut Errs) 
         prev = Some(k);
     }
     if let Some(g) = group.take() {
-        finish(g, next_ino, &mut s, errs);
+        finish(g, reserved, &mut infos, errs);
     }
-    check_graph(&s, errs);
+    check_graph(&infos, errs);
     Ok(())
 }
 
-fn check_graph(s: &Snap, errs: &mut Errs) {
-    match s.inodes.get(&ROOT_INO.0) {
-        Some(r) if r.kind == FileType::Dir && r.parent == ROOT_INO.0 => {}
+fn check_graph(infos: &HashMap<u64, Info>, errs: &mut Errs) {
+    match infos.get(&ROOT_INO.0) {
+        Some(r) if r.seen && r.kind == 2 && r.parent == ROOT_INO.0 => {}
         _ => errs.push("root directory missing or malformed".into()),
     }
-    let mut named: HashMap<u64, u32> = HashMap::new();
-    let mut parents: HashMap<u64, u64> = HashMap::new();
-    let mut subdirs: HashMap<u64, u32> = HashMap::new();
-    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
-    for (dir, child, kind) in &s.dirents {
-        match s.inodes.get(&child.0) {
-            None => errs.push(format!("directory {dir} names missing inode {child}")),
-            Some(r) if r.kind != *kind => errs.push(format!(
-                "directory {dir} entry for {child} has the wrong type"
-            )),
-            Some(_) => {}
+    for (&ino, e) in infos {
+        if !e.seen {
+            errs.push(format!("directory entry names missing inode {ino}"));
+            continue;
         }
-        *named.entry(child.0).or_default() += 1;
-        if *kind == FileType::Dir {
-            *subdirs.entry(*dir).or_default() += 1;
-            parents.insert(child.0, *dir);
-            children.entry(*dir).or_default().push(child.0);
+        if e.declared != 0 && (e.declared != e.kind || e.mismatch) {
+            errs.push(format!(
+                "directory entry for inode {ino} has the wrong type"
+            ));
         }
-    }
-    for (&ino, r) in &s.inodes {
-        let n = named.get(&ino).copied().unwrap_or(0);
         if ino == ROOT_INO.0 {
-            if n != 0 {
+            if e.names != 0 {
                 errs.push("root directory is named by an entry".into());
             }
-        } else if n == 0 {
+        } else if e.names == 0 {
             errs.push(format!("orphaned inode {ino}"));
             continue;
         }
-        if r.kind == FileType::Dir {
-            let want = 2 + subdirs.get(&ino).copied().unwrap_or(0);
-            if r.nlink != want {
+        if e.kind == 2 {
+            let want = 2 + e.subdirs;
+            if e.nlink != want {
                 errs.push(format!(
                     "directory {ino} nlink {} but expected {want}",
-                    r.nlink
+                    e.nlink
                 ));
             }
             if ino != ROOT_INO.0 {
-                if n != 1 {
-                    errs.push(format!("directory {ino} has {n} names"));
+                if e.names != 1 {
+                    errs.push(format!("directory {ino} has {} names", e.names));
                 }
-                if parents.get(&ino) != Some(&r.parent) {
+                if e.dirent_parent != e.parent {
                     errs.push(format!(
                         "directory {ino} parent field disagrees with its entry"
                     ));
                 }
             }
-        } else if r.nlink != n {
-            errs.push(format!("inode {ino} nlink {} but {n} names", r.nlink));
+        } else if e.nlink != e.names {
+            errs.push(format!(
+                "inode {ino} nlink {} but {} names",
+                e.nlink, e.names
+            ));
         }
     }
-    let mut seen: HashSet<u64> = HashSet::from([ROOT_INO.0]);
-    let mut work = vec![ROOT_INO.0];
-    while let Some(d) = work.pop() {
-        for &c in children.get(&d).into_iter().flatten() {
-            if seen.insert(c) {
-                work.push(c);
+    let mut good: HashMap<u64, bool> = HashMap::from([(ROOT_INO.0, true)]);
+    for (&ino, e) in infos {
+        if e.kind != 2 || good.contains_key(&ino) {
+            continue;
+        }
+        let mut chain = vec![ino];
+        let mut cur = e.parent;
+        let ok = loop {
+            if let Some(&g) = good.get(&cur) {
+                break g;
             }
+            if chain.contains(&cur) {
+                break false;
+            }
+            chain.push(cur);
+            match infos.get(&cur) {
+                Some(p) if p.kind == 2 => cur = p.parent,
+                _ => break false,
+            }
+        };
+        for c in chain {
+            good.insert(c, ok);
         }
-    }
-    for (&ino, r) in &s.inodes {
-        if r.kind == FileType::Dir && !seen.contains(&ino) {
+        if !ok {
             errs.push(format!("directory {ino} is not reachable from the root"));
         }
     }

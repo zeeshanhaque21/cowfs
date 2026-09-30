@@ -21,8 +21,11 @@ pub const NAME_MAX: usize = 255;
 pub const XATTR_MAX: usize = 64 * 1024;
 /// Longest symlink target, in bytes.
 pub const SYMLINK_MAX: usize = 4096;
-/// Chunk refs per stored chunk-list segment.
-pub const CHUNKS_PER_SEGMENT: usize = 128;
+
+/// Inode numbers are below this bound (40 bits) so a snapshot id and an inode fit in one `u64`.
+pub const INO_LIMIT: u64 = 1 << 40;
+/// Snapshot ids are below this bound (24 bits).
+pub const SNAPSHOT_LIMIT: u64 = 1 << 24;
 
 /// Kind of an inode.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -145,6 +148,19 @@ pub struct Removed {
     pub chunks: Vec<ChunkRef>,
 }
 
+/// A run of a file's chunk list with the content version it was read at.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ChunkRange {
+    /// Content version of the file when read. Pass it to `splice_content` as `expected_version`.
+    pub version: u64,
+    /// Logical file size.
+    pub size: u64,
+    /// Bytes of the file covered by chunks (the rest up to `size` is a trailing hole).
+    pub covered: u64,
+    /// `(byte offset, chunk)` pairs in offset order.
+    pub chunks: Vec<(u64, ChunkRef)>,
+}
+
 /// One snapshot as listed by `Meta::snapshots`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SnapshotInfo {
@@ -209,15 +225,19 @@ pub(crate) struct InodeRec {
     pub ctime: Timestamp,
     pub parent: u64,
     pub next_cookie: u64,
+    /// Bytes covered by chunk extents (files); always at most `size`.
+    pub covered: u64,
+    /// Bumped by every content change; the compare-and-swap token of `splice_content`.
+    pub cversion: u64,
 }
 
-const INODE_V1: u8 = 1;
-const INODE_LEN: usize = 2 + 4 + 4 + 8 + 3 * 12 + 8 + 8;
+const INODE_V: u8 = 2;
+const INODE_LEN: usize = 2 + 4 + 4 + 8 + 3 * 12 + 8 + 8 + 8 + 8;
 
 impl InodeRec {
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(INODE_LEN);
-        b.push(INODE_V1);
+        b.push(INODE_V);
         b.push(self.kind.code());
         b.extend(self.mode.to_le_bytes());
         b.extend(self.nlink.to_le_bytes());
@@ -228,11 +248,13 @@ impl InodeRec {
         }
         b.extend(self.parent.to_le_bytes());
         b.extend(self.next_cookie.to_le_bytes());
+        b.extend(self.covered.to_le_bytes());
+        b.extend(self.cversion.to_le_bytes());
         b
     }
 
     pub(crate) fn decode(b: &[u8]) -> Result<Self> {
-        if b.len() != INODE_LEN || b[0] != INODE_V1 {
+        if b.len() != INODE_LEN || b[0] != INODE_V {
             return Err(Error::Corrupt("bad inode record".into()));
         }
         let ts = |pos| -> Result<Timestamp> {
@@ -251,6 +273,8 @@ impl InodeRec {
             ctime: ts(42)?,
             parent: u64::from_le_bytes(rd(b, 54)?),
             next_cookie: u64::from_le_bytes(rd(b, 62)?),
+            covered: u64::from_le_bytes(rd(b, 70)?),
+            cversion: u64::from_le_bytes(rd(b, 78)?),
         })
     }
 
