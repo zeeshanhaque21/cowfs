@@ -135,20 +135,32 @@
         {
           "id": "11",
           "title": "#11 Linux FUSE mount",
-          "state": "blocked",
-          "issue": 11
+          "state": "building",
+          "issue": 11,
+          "owner": "subagent",
+          "pr": "#31",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/31",
+          "detail": "Thin FUSE adapter over Vfs with the spike 3 defaults (long TTLs, negative cache, keep_cache). Mount tests run in the OrbStack VM. Worktree slot 5, branch v1/11-fuse."
         },
         {
           "id": "12",
           "title": "#12 macOS NFS loopback mount",
-          "state": "blocked",
-          "issue": 12
+          "state": "building",
+          "issue": 12,
+          "owner": "subagent",
+          "pr": "#32",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/32",
+          "detail": "Vendored and fixed nfsserve plus a Vfs adapter, mount management with locallocks, the spike batteries as ignored mount tests. Worktree slot 6, branch v1/12-nfs."
         },
         {
           "id": "13",
           "title": "#13 CLI and Unix-socket control API",
-          "state": "blocked",
-          "issue": 13
+          "state": "building",
+          "issue": 13,
+          "owner": "subagent",
+          "pr": "#33",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/33",
+          "detail": "docs/v1-control-api.md first, then cowfs-ctl (protocol, client, server) and the cowfs CLI against a stub backend with a Backend seam for the real core. Worktree slot 7, branch v1/13-cli."
         },
         {
           "id": "14",
@@ -173,6 +185,23 @@
           "title": "#17 Linux mount namespaces for canonical paths",
           "state": "blocked",
           "issue": 17
+        },
+        {
+          "id": "29",
+          "title": "#29 cowfs-vfs trait, MemVfs and conformance suite",
+          "state": "building",
+          "owner": "subagent",
+          "issue": 29,
+          "pr": "#30",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/30",
+          "detail": "Trait and types done (PR #27). MemVfs plus a generic conformance suite with mutation checks are being built. Every backend must pass the suite. Worktree slot 4, branch v1/vfs-test."
+        },
+        {
+          "id": "26",
+          "title": "#26 cowfs-core: Vfs over store and meta",
+          "state": "blocked",
+          "issue": 26,
+          "detail": "The layer the original plan lacked: file IO, write-back cache, re-chunking, open-handle tracking, snapshot namespace. Starts when the store, meta and conformance suite land."
         }
       ]
     },
