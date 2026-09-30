@@ -1,7 +1,7 @@
 //! Security, resource-bound, retransmission and inode-reuse tests at the protocol level.
 mod common;
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -29,8 +29,8 @@ fn connect_raw(port: u16) -> TcpStream {
 /// True if the server closes `s` within `secs`.
 fn closed_within(s: &mut TcpStream, secs: u64) -> bool {
     let t = Instant::now();
-    s.set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
+    // A socket that was reset refuses a new timeout, which is itself proof that it is gone.
+    let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
     let mut b = [0u8; 16];
     while t.elapsed() < Duration::from_secs(secs) {
         match s.read(&mut b) {
@@ -498,4 +498,113 @@ fn the_reply_cache_stays_small_under_a_long_run() {
     println!("20000 cached calls: RSS grew {} MiB", grown >> 20);
     assert!(grown < 40 << 20);
     let _ = nfsstat3::NFS3_OK;
+}
+
+// ---- connection budget and record deadlines (round 2) ----------------------------------------
+
+/// A NULL call: well formed, needs no handle, and gets an answer.
+fn null_frame() -> Vec<u8> {
+    let mut m = Vec::new();
+    for w in [1u32, 0, 2, 100_003, 3, 0, 0, 0, 0, 0] {
+        m.extend_from_slice(&w.to_be_bytes());
+    }
+    let mut f = (m.len() as u32 | 1 << 31).to_be_bytes().to_vec();
+    f.extend_from_slice(&m);
+    f
+}
+
+fn answered(s: &mut TcpStream) -> bool {
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut h = [0u8; 4];
+    s.read_exact(&mut h).is_ok()
+}
+
+#[test]
+fn served_but_silent_connections_do_not_lock_the_client_out() {
+    let limits = Limits {
+        max_connections: 4,
+        ..Limits::default()
+    };
+    let (s, c) = serve(memfs(), opts(limits));
+    let root = c.root.clone();
+    let mut hold = vec![];
+    for _ in 0..3 {
+        let mut x = connect_raw(s.port());
+        x.write_all(&null_frame()).unwrap();
+        assert!(answered(&mut x), "the silent connection is served");
+        hold.push(x);
+    }
+    let mut late = connect_raw(s.port());
+    late.write_all(&null_frame()).unwrap();
+    assert!(
+        answered(&mut late),
+        "a silent local process locked the client out of a reconnect"
+    );
+    drop(hold);
+    let mut after = Nfs::attach(s.port(), root.clone());
+    assert_eq!(
+        after.getattr(&root).0,
+        OK,
+        "and the server still serves new clients"
+    );
+}
+
+#[test]
+fn empty_fragments_do_not_extend_the_record_deadline() {
+    let limits = Limits {
+        frame_timeout: Duration::from_secs(2),
+        ..Limits::default()
+    };
+    let (s, _c) = serve(memfs(), opts(limits));
+    let mut x = connect_raw(s.port());
+    let start = Instant::now();
+    for _ in 0..8 {
+        // A closed connection answers with a reset, which is the answer being tested for.
+        if x.write_all(&0u32.to_be_bytes()).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(900));
+    }
+    // Nothing to read and no error means the connection is still open and waiting.
+    let _ = x.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut b = [0u8; 8];
+    let alive = matches!(
+        x.read(&mut b),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+    );
+    eprintln!(
+        "empty fragments: alive after {:?}: {alive}",
+        start.elapsed()
+    );
+    assert!(
+        !alive,
+        "frame_timeout is 2 s but empty fragments kept it open"
+    );
+}
+
+#[test]
+fn a_record_may_not_exceed_the_cap_across_fragments() {
+    let limits = Limits {
+        max_frame: 512 * 1024,
+        ..Limits::default()
+    };
+    let (s, mut c) = serve(memfs(), opts(limits));
+    let root = c.root.clone();
+    let mut x = connect_raw(s.port());
+    // 400 KiB fragments, none of them over the cap on its own. A reset mid-write is the answer
+    // being tested for, so it is not an error here.
+    let chunk = vec![0u8; 400 * 1024];
+    for _ in 0..8 {
+        if x.write_all(&(400u32 * 1024).to_be_bytes()).is_err() {
+            break;
+        }
+        if x.write_all(&chunk).is_err() {
+            break;
+        }
+    }
+    assert!(
+        closed_within(&mut x, 10),
+        "the cap is for the whole record, not for one fragment"
+    );
+    assert_eq!(c.getattr(&root).0, OK, "the server is unharmed");
 }

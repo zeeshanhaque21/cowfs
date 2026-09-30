@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, error, trace, warn};
 
@@ -34,6 +34,9 @@ async fn handle_rpc(
     mut context: RPCContext,
     fingerprint: u64,
 ) -> Result<bool, anyhow::Error> {
+    context
+        .active
+        .store(crate::tcp::now_ms(), std::sync::atomic::Ordering::Relaxed);
     let mut recv = rpc_msg::default();
     recv.deserialize(input)?;
     let xid = recv.xid;
@@ -123,12 +126,15 @@ async fn read_record(
     const CHUNK: usize = 64 * 1024;
     let mut record: Vec<u8> = Vec::new();
     let mut first = true;
+    let mut deadline = tokio::time::Instant::now();
     loop {
         let mut header = [0_u8; 4];
+        // One deadline for the whole record: a peer must not extend it by sending another
+        // fragment header, empty or not.
         let wait = if first {
             first_wait
         } else {
-            limits.frame_timeout
+            deadline.saturating_duration_since(tokio::time::Instant::now())
         };
         match timeout(wait, rd.read(&mut header[..1])).await {
             Err(_) => return Err(anyhow!("timed out waiting for a request")),
@@ -137,8 +143,10 @@ async fn read_record(
             Ok(Ok(0)) => return Err(anyhow!("closed inside a record")),
             Ok(Ok(_)) => {}
         }
+        if first {
+            deadline = tokio::time::Instant::now() + limits.frame_timeout;
+        }
         first = false;
-        let deadline = tokio::time::Instant::now() + limits.frame_timeout;
         timeout(
             deadline - tokio::time::Instant::now(),
             rd.read_exact(&mut header[1..]),
@@ -191,13 +199,14 @@ pub async fn write_fragment(
     Ok(())
 }
 
-/// Serves one connection until the peer closes it, misbehaves or times out. Requests run
-/// concurrently, at most `limits.max_in_flight` at a time.
+/// Serves one connection until the peer closes it, misbehaves, is kicked to make room for a
+/// newer one, or times out. Requests run concurrently, at most `limits.max_in_flight` at a time.
 pub async fn serve_connection(
     mut rd: OwnedReadHalf,
     mut wr: OwnedWriteHalf,
     context: RPCContext,
     limits: Limits,
+    mut kicked: watch::Receiver<bool>,
 ) {
     let (tx, mut rx) = mpsc::channel::<Option<Vec<u8>>>(limits.max_in_flight.max(1));
     let mut writer = tokio::spawn(async move {
@@ -226,6 +235,10 @@ pub async fn serve_connection(
                 }
             },
             _ = &mut writer => break,
+            _ = kicked.changed() => {
+                debug!("connection kicked to make room for a newer one");
+                break;
+            }
         };
         served = true;
         let Ok(permit) = in_flight.clone().acquire_owned().await else {

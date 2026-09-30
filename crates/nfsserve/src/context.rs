@@ -13,6 +13,8 @@ pub struct RPCContext {
     pub local_port: u16,
     /// Identity of the connection this request arrived on, see `ReplyCache`.
     pub conn: u64,
+    /// When this connection last had a request, so the accept loop can kick the quiet one.
+    pub active: Arc<std::sync::atomic::AtomicU64>,
     pub client_addr: String,
     pub client_ip: IpAddr,
     pub peer: SocketAddr,

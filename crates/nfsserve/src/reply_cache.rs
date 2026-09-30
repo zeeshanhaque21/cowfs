@@ -10,7 +10,6 @@
 //! nothing since, it never saw a reply, which is the only shape a post-reconnect resend can take.
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -71,7 +70,6 @@ pub struct ReplyCache {
     max_bytes: usize,
     max_age: Duration,
     inner: Mutex<Inner>,
-    next_conn: AtomicU64,
 }
 
 impl ReplyCache {
@@ -81,13 +79,7 @@ impl ReplyCache {
             max_bytes,
             max_age,
             inner: Mutex::new(Inner::default()),
-            next_conn: AtomicU64::new(1),
         }
-    }
-
-    /// A connection identity, unique for the life of the server.
-    pub fn open_conn(&self) -> u64 {
-        self.next_conn.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Notes the xid a connection just sent, and answers whether that connection has sent

@@ -1,12 +1,12 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use crate::context::RPCContext;
@@ -106,7 +106,25 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     export_name: Arc<String>,
     limits: Limits,
     reply_cache: Arc<ReplyCache>,
-    connections: Arc<Semaphore>,
+    live: Arc<Mutex<Vec<Live>>>,
+    next_conn: AtomicU64,
+}
+
+/// One served connection, so the accept loop can make room by dropping the one that has been
+/// quiet longest instead of refusing whoever arrives next.
+#[derive(Debug)]
+struct Live {
+    id: u64,
+    /// When this connection last had a request, shared with its context so every request
+    /// refreshes it.
+    active: Arc<AtomicU64>,
+    kick: tokio::sync::watch::Sender<bool>,
+}
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 impl<T: NFSFileSystem + Send + Sync + 'static> std::fmt::Debug for NFSTcpListener<T> {
@@ -150,7 +168,8 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             peer_check: None,
             export_name: Arc::from("/".to_string()),
             reply_cache: reply_cache(&limits),
-            connections: Arc::new(Semaphore::new(limits.max_connections)),
+            live: Arc::new(Mutex::new(Vec::new())),
+            next_conn: AtomicU64::new(1),
             limits,
         })
     }
@@ -158,7 +177,6 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
     /// Replaces the resource bounds. Call before `handle_forever`.
     pub fn set_limits(&mut self, limits: Limits) {
         self.reply_cache = reply_cache(&limits);
-        self.connections = Arc::new(Semaphore::new(limits.max_connections));
         self.limits = limits;
     }
 
@@ -228,15 +246,14 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 }
                 Err(e) => return Err(e),
             };
-            let Ok(permit) = self.connections.clone().try_acquire_owned() else {
-                debug!("connection limit reached, closing {peer}");
-                continue;
-            };
             let _ = socket.set_nodelay(true);
             let Ok(local) = socket.local_addr() else {
                 continue;
             };
-            let conn = self.reply_cache.open_conn();
+            let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
+            let active = Arc::new(AtomicU64::new(now_ms()));
+            let (kick, kicked) = tokio::sync::watch::channel(false);
+            self.enter(conn, active.clone(), kick.clone());
             let context = RPCContext {
                 local_port: self.port,
                 conn,
@@ -251,15 +268,46 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 local,
                 export_name: self.export_name.clone(),
                 reply_cache: self.reply_cache.clone(),
+                active,
             };
             let limits = self.limits.clone();
+            let live = self.live.clone();
             info!("Accepting connection from {}", context.client_addr);
             tokio::spawn(async move {
                 let (rd, wr) = socket.into_split();
-                serve_connection(rd, wr, context, limits).await;
-                drop(permit);
+                serve_connection(rd, wr, context, limits, kicked).await;
+                live.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|l| l.id != conn);
             });
         }
+    }
+}
+
+impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
+    /// Records a new connection, and if the cap is full kicks the one that has been quiet
+    /// longest. A local process cannot be told apart from the real client by address, so
+    /// refusing the newcomer is what lets it lock the client out.
+    fn enter(&self, conn: u64, active: Arc<AtomicU64>, kick: tokio::sync::watch::Sender<bool>) {
+        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        live.retain(|l| l.active.load(Ordering::Relaxed) + 3_600_000 > now_ms());
+        if live.len() >= self.limits.max_connections {
+            if let Some(oldest) = live
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, l)| l.active.load(Ordering::Relaxed))
+                .map(|(i, _)| i)
+            {
+                let victim = live.remove(oldest);
+                let _ = victim.kick.send(true);
+                debug!("connection limit reached, kicked connection {}", victim.id);
+            }
+        }
+        live.push(Live {
+            id: conn,
+            active,
+            kick,
+        });
     }
 }
 
