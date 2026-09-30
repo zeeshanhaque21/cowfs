@@ -8,7 +8,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cowfs_vfs::{
     validate_name, Attr, FileHandle, FileKind, Ino, SetAttr, SetTime, Vfs, MODE_MASK, ROOT_INO,
@@ -22,6 +22,7 @@ use fuser::{
 use libc::c_int;
 
 use crate::convert::{self, XattrReply};
+use crate::cost::{Class, Cost};
 use crate::dir::{self, DirSink};
 use crate::options::MountOptions;
 use crate::table::Table;
@@ -82,6 +83,7 @@ struct Core {
     uid: u32,
     gid: u32,
     sh: Arc<Shared>,
+    cost: Cost,
 }
 
 fn name(n: &OsStr) -> R<&[u8]> {
@@ -342,6 +344,7 @@ impl Fs {
             .collect();
         Self {
             core: Arc::new(Core {
+                cost: Cost::new(opts.inline_below),
                 vfs,
                 opts,
                 uid,
@@ -352,15 +355,32 @@ impl Fs {
         }
     }
 
-    /// Runs `f` on the lane that owns `key`, a FIFO, so requests for one inode keep their order
-    /// while unrelated inodes proceed in parallel. With no workers it runs right here.
-    fn lane(&self, key: Ino, f: impl FnOnce(&Core) + Send + 'static) {
+    /// Runs `f` for a request of `class` on `key`'s inode. A class that has been cheap runs right
+    /// here on the loop thread, skipping the hand-off. Otherwise `f` goes to the lane that owns
+    /// `key`, a FIFO, so requests for one inode keep their order while unrelated inodes run in
+    /// parallel and a slow request no longer delays unrelated ones. `pinned` forces the lane.
+    fn dispatch(
+        &self,
+        class: Class,
+        key: Ino,
+        pinned: bool,
+        f: impl FnOnce(&Core) + Send + 'static,
+    ) {
         let c = self.core.clone();
-        if self.lanes.is_empty() {
-            return f(&c);
+        let job = move || {
+            let start = Instant::now();
+            f(&c);
+            c.cost.record(class, start.elapsed());
+        };
+        if self.lanes.is_empty() || (!pinned && self.core.cost.cheap(class)) {
+            return job();
         }
         let i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % self.lanes.len();
-        let _ = self.lanes[i].send(Box::new(move || f(&c)));
+        let _ = self.lanes[i].send(Box::new(job));
+    }
+
+    fn lane(&self, class: Class, key: Ino, f: impl FnOnce(&Core) + Send + 'static) {
+        self.dispatch(class, key, false, f);
     }
 }
 
@@ -424,7 +444,7 @@ impl Filesystem for Fs {
             Err(e) => reply.error(e),
         };
         if size.is_some() {
-            self.lane(ino, f);
+            self.lane(Class::Meta, ino, f);
         } else {
             f(&self.core);
         }
@@ -451,7 +471,7 @@ impl Filesystem for Fs {
             return reply.error(libc::ENOTSUP);
         }
         let n = n.to_owned();
-        self.lane(parent, move |c| {
+        self.lane(Class::Meta, parent, move |c| {
             let r = name(&n).and_then(|nm| {
                 let a = c.call(|v| v.create(parent, nm, mode & MODE_MASK))?;
                 c.referenced(parent, nm, &a, true)
@@ -473,7 +493,7 @@ impl Filesystem for Fs {
         reply: ReplyEntry,
     ) {
         let n = n.to_owned();
-        self.lane(parent, move |c| {
+        self.lane(Class::Meta, parent, move |c| {
             let r = name(&n).and_then(|nm| {
                 let a = c.call(|v| v.mkdir(parent, nm, mode & MODE_MASK))?;
                 c.referenced(parent, nm, &a, true)
@@ -487,7 +507,7 @@ impl Filesystem for Fs {
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, n: &OsStr, reply: ReplyEmpty) {
         let n = n.to_owned();
-        self.lane(parent, move |c| {
+        self.lane(Class::Meta, parent, move |c| {
             let r = name(&n).and_then(|nm| {
                 c.call(|v| v.unlink(parent, nm))?;
                 c.sh.table().unname(parent, nm);
@@ -499,7 +519,7 @@ impl Filesystem for Fs {
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, n: &OsStr, reply: ReplyEmpty) {
         let n = n.to_owned();
-        self.lane(parent, move |c| {
+        self.lane(Class::Meta, parent, move |c| {
             let r = name(&n).and_then(|nm| {
                 c.call(|v| v.rmdir(parent, nm))?;
                 c.sh.table().unname(parent, nm);
@@ -519,7 +539,7 @@ impl Filesystem for Fs {
     ) {
         let n = link_name.to_owned();
         let target = target.as_os_str().as_bytes().to_vec();
-        self.lane(parent, move |c| {
+        self.lane(Class::Meta, parent, move |c| {
             let r = name(&n).and_then(|nm| {
                 let a = c.call(|v| v.symlink(parent, nm, &target))?;
                 c.referenced(parent, nm, &a, true)
@@ -546,7 +566,7 @@ impl Filesystem for Fs {
             Err(errno) => return reply.error(errno),
         };
         let (n, nn) = (n.to_owned(), newname.to_owned());
-        self.lane(parent, move |c| {
+        self.lane(Class::Meta, parent, move |c| {
             let r = name(&n)
                 .and_then(|n| Ok((n, name(&nn)?)))
                 .and_then(|(n, nn)| {
@@ -567,7 +587,7 @@ impl Filesystem for Fs {
         reply: ReplyEntry,
     ) {
         let n = newname.to_owned();
-        self.lane(newparent, move |c| {
+        self.lane(Class::Meta, newparent, move |c| {
             let r = name(&n).and_then(|nm| {
                 let a = c.call(|v| v.link(ino, newparent, nm))?;
                 c.referenced(newparent, nm, &a, false)
@@ -580,7 +600,7 @@ impl Filesystem for Fs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        self.lane(ino, move |c| match c.call(|v| v.open(ino)) {
+        self.lane(Class::Open, ino, move |c| match c.call(|v| v.open(ino)) {
             Ok(h) => reply.opened(h.0, c.open_flags()),
             Err(e) => reply.error(e),
         });
@@ -597,9 +617,11 @@ impl Filesystem for Fs {
         reply: ReplyCreate,
     ) {
         let n = n.to_owned();
-        self.lane(parent, move |c| match c.create(parent, &n, mode) {
-            Ok((a, fh)) => reply.created(&c.opts.entry_lifetime(), &a, 0, fh, c.open_flags()),
-            Err(e) => reply.error(e),
+        self.lane(Class::Meta, parent, move |c| {
+            match c.create(parent, &n, mode) {
+                Ok((a, fh)) => reply.created(&c.opts.entry_lifetime(), &a, 0, fh, c.open_flags()),
+                Err(e) => reply.error(e),
+            }
         });
     }
 
@@ -614,7 +636,7 @@ impl Filesystem for Fs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        self.lane(ino, move |c| {
+        self.lane(Class::Read, ino, move |c| {
             match offset(off).and_then(|o| c.call(|v| v.read(ino, o, size))) {
                 Ok(d) => reply.data(&d[..d.len().min(size as usize)]),
                 Err(e) => reply.error(e),
@@ -635,15 +657,20 @@ impl Filesystem for Fs {
         reply: ReplyWrite,
     ) {
         let data = data.to_vec();
-        self.lane(ino, move |c| match c.write(ino, off, &data, flags) {
-            Ok((n, stale)) => {
-                reply.written(n);
-                if stale {
-                    c.invalidate_attr(ino);
+        self.dispatch(
+            Class::Write,
+            ino,
+            flags & libc::O_APPEND != 0,
+            move |c| match c.write(ino, off, &data, flags) {
+                Ok((n, stale)) => {
+                    reply.written(n);
+                    if stale {
+                        c.invalidate_attr(ino);
+                    }
                 }
-            }
-            Err(e) => reply.error(e),
-        });
+                Err(e) => reply.error(e),
+            },
+        );
     }
 
     fn flush(
@@ -654,7 +681,9 @@ impl Filesystem for Fs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        self.lane(ino, move |c| empty(c.call(|v| v.flush(ino)), reply));
+        self.lane(Class::Close, ino, move |c| {
+            empty(c.call(|v| v.flush(ino)), reply)
+        });
     }
 
     fn release(
@@ -667,13 +696,13 @@ impl Filesystem for Fs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.lane(ino, move |c| {
+        self.lane(Class::Close, ino, move |c| {
             empty(c.call(|v| v.release(FileHandle(fh))), reply);
         });
     }
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
-        self.lane(ino, move |c| {
+        self.lane(Class::Fsync, ino, move |c| {
             empty(c.call(|v| v.fsync(ino, datasync)), reply)
         });
     }
@@ -686,13 +715,13 @@ impl Filesystem for Fs {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.lane(ino, move |c| {
+        self.lane(Class::Fsync, ino, move |c| {
             empty(c.call(|v| v.fsync(ino, datasync)), reply)
         });
     }
 
     fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, off: i64, reply: ReplyDirectory) {
-        self.lane(ino, move |c| {
+        self.lane(Class::Dir, ino, move |c| {
             let parent = c.sh.table().parent_of(ino);
             let mut sink = Sink(reply);
             match c.call(|v| dir::fill(v, ino, parent, off, &mut sink)) {
@@ -739,7 +768,7 @@ impl Filesystem for Fs {
             Err(errno) => return reply.error(errno),
         };
         let (n, value) = (n.to_owned(), value.to_vec());
-        self.lane(ino, move |c| {
+        self.lane(Class::Meta, ino, move |c| {
             empty(
                 c.call(|v| v.setxattr(ino, n.as_bytes(), &value, flags)),
                 reply,
@@ -769,7 +798,7 @@ impl Filesystem for Fs {
             return reply.error(e);
         }
         let n = n.to_owned();
-        self.lane(ino, move |c| {
+        self.lane(Class::Meta, ino, move |c| {
             empty(c.call(|v| v.removexattr(ino, n.as_bytes())), reply);
         });
     }

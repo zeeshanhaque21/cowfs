@@ -24,17 +24,23 @@
 //!
 //! # Threading
 //!
-//! Cheap metadata (lookup, getattr, access, statfs, forget, xattr reads, lseek) runs on the
-//! `fuser` request loop thread, with no hand-off, so it costs what a single threaded server
-//! costs (spike 3: a naive worker pool made lookups 15 to 34 microseconds instead of 6).
-//! Everything that can block (read, write, readdir, open, flush, fsync, release, and every
-//! operation that changes the tree) goes to one of `workers` lanes, each a FIFO thread. A
-//! request is routed by its inode (the directory for namespace changes), so requests for one
-//! inode keep their order while unrelated inodes run in parallel, and a slow read no longer
-//! delays a `stat`. The `Vfs` must be thread safe, as its trait says, and must tolerate
-//! the loop thread and up to `workers` lanes calling it at once. `workers=0` restores the
-//! single threaded loop. Concurrent `O_APPEND` writers to one file are serialised by their
-//! lane; writers that bypass the mount are not.
+//! Cheap metadata (lookup, getattr, access, statfs, forget, xattr reads, lseek) always runs on
+//! the `fuser` request loop thread. Everything that can block (read, write, readdir, open,
+//! flush, fsync, release, and every operation that changes the tree) is routed by inode
+//! (the directory for namespace changes) to one of `workers` lane threads, each a FIFO, so
+//! requests for one inode keep their order while unrelated inodes run in parallel and a slow
+//! read no longer delays a `stat`.
+//!
+//! A hand-off costs 50 to 100 microseconds in a virtual machine (measured: small writes and
+//! creates became 10 to 25 times slower), so a class of request (read, write, namespace
+//! change, close, fsync, readdir, open) whose recent average `Vfs` time is under
+//! `inline_below` (100 us) runs on the loop thread instead. A class counts as slow until it has
+//! been seen to be fast, and one slow request sends it back to the lanes, so a backend that is
+//! usually fast and sometimes slow can still block the loop for that one slow request.
+//! `O_APPEND` writes always use the lane, which makes concurrent appenders to one file
+//! atomic. The `Vfs` must be thread safe, as its trait says, and must tolerate the loop thread
+//! and up to `workers` lanes calling it at once. `workers=0` restores the single threaded loop,
+//! `inline_below_us=0` sends everything to the lanes.
 //!
 //! # Failure containment
 //!
@@ -93,6 +99,9 @@ pub mod convert;
 pub mod dir;
 mod error;
 pub mod options;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod cost;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod mounts;

@@ -939,10 +939,8 @@ fn rename_link_unlink_race_keeps_the_tree_consistent() {
     }
 }
 
-#[test]
-#[ignore = "needs FUSE and cc: cargo test -p cowfs-fuse -- --ignored --test-threads=1 --nocapture"]
-fn fsx_random_operations_match_a_shadow_copy() {
-    let Some(fx) = Fixture::new("") else { return };
+fn run_fsx(opts: &str, seeds: &[&str], ops: &str) {
+    let Some(fx) = Fixture::new(opts) else { return };
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/battery/fsx.c");
     let bin = fx.tmp.path().join("fsx");
     match Command::new("cc")
@@ -957,18 +955,44 @@ fn fsx_random_operations_match_a_shadow_copy() {
             return;
         }
     }
-    for seed in ["1", "2"] {
+    for seed in seeds {
         let out = Command::new("timeout")
             .args(["900"])
             .arg(&bin)
             .arg(fx.p(&format!("fsx{seed}")))
-            .args(["100000", seed])
+            .args([ops, seed])
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        println!("fsx seed {seed}: {text}");
+        println!("fsx [{opts}] seed {seed}: {text}");
         assert!(out.status.success(), "fsx seed {seed} failed: {text}");
     }
+}
+
+#[test]
+#[ignore = "needs FUSE and cc: cargo test -p cowfs-fuse -- --ignored --test-threads=1 --nocapture"]
+fn fsx_random_operations_match_a_shadow_copy() {
+    run_fsx("", &["1", "2"], "100000");
+}
+
+#[test]
+#[ignore = "needs FUSE and cc: cargo test -p cowfs-fuse -- --ignored --test-threads=1 --nocapture"]
+fn fsx_with_every_request_on_a_lane() {
+    run_fsx("inline_below_us=0,workers=3", &["3"], "60000");
+}
+
+#[test]
+#[ignore = "needs FUSE and python3: cargo test -p cowfs-fuse -- --ignored --test-threads=1 --nocapture"]
+fn batteries_with_every_request_on_a_lane() {
+    let Some(fx) = Fixture::new("inline_below_us=0,workers=3") else {
+        return;
+    };
+    let text = battery(&fx, "test_mount.py", &[]);
+    assert!(text.contains("Not passing: []"), "some checks did not pass");
+    let text = battery(&fx, "test_hardlink_readdir.py", &["2000"]);
+    assert!(text.contains("PASS hardlink readdir: listed 4000/4000 unique 4000"));
+    let text = battery(&fx, "mmap_race.py", &["50", "fsync"]);
+    assert!(text.contains("size_mismatch=0") && text.contains("content_mismatch=0"));
 }
 
 fn percentile(v: &mut [f64], p: f64) -> f64 {
@@ -1066,18 +1090,31 @@ fn bench_head_of_line() {
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse --release -- --ignored --test-threads=1 --nocapture bench_latency"]
 fn bench_latency_floor() {
-    for (label, opts) in [
+    let mut variants: Vec<(String, String)> = vec![
         (
-            "workers=0, ttl=0,noneg (every op reaches the adapter)",
-            "workers=0,ttl=0,noneg",
+            "workers=0 (single threaded loop), ttl=0,noneg".into(),
+            "workers=0,ttl=0,noneg".into(),
         ),
         (
-            "default workers, ttl=0,noneg (every op reaches the adapter)",
-            "ttl=0,noneg",
+            "everything on the lanes (inline_below_us=0), ttl=0,noneg".into(),
+            "inline_below_us=0,ttl=0,noneg".into(),
         ),
-        ("default options", ""),
-    ] {
-        let Some(fx) = Fixture::new(opts) else { return };
+        (
+            "default (adaptive), ttl=0,noneg".into(),
+            "ttl=0,noneg".into(),
+        ),
+        ("default options".into(), String::new()),
+    ];
+    if let Some(v) = std::env::var("COWFS_BENCH_OPTS")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        variants = v.split(';').map(|o| (o.to_owned(), o.to_owned())).collect();
+    }
+    for (label, opts) in variants {
+        let Some(fx) = Fixture::new(&opts) else {
+            return;
+        };
         let report = bench::measure(&fx.dir, &bench::Config::default()).unwrap();
         println!("== bench, MemVfs, {label}\n{report}");
     }

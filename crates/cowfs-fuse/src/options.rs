@@ -57,6 +57,13 @@ pub struct MountOptions {
     /// use one lane, so they stay ordered. 0 runs everything on the request loop thread.
     /// Default `min(8, cpus)`.
     pub workers: usize,
+    /// Requests of a kind whose recent average `Vfs` time is under this run on the request
+    /// loop thread; slower kinds go to the worker lanes. Waking a lane and having it reply from
+    /// another CPU costs 50 to 100 microseconds on a virtual machine, which would make every
+    /// small write and create ten times slower, so cheap requests skip it. A kind counts as
+    /// slow until seen to be fast, and one slow request sends it back to the lanes. Zero
+    /// sends everything to the lanes. Default 100 us.
+    pub inline_below: Duration,
     /// `Vfs` panics tolerated before the mount is marked failed and answers `ENOTCONN`.
     /// Default 3.
     pub max_panics: u32,
@@ -81,6 +88,7 @@ impl Default for MountOptions {
             allow_other: false,
             auto_unmount: false,
             workers: std::thread::available_parallelism().map_or(4, |n| n.get().min(8)),
+            inline_below: Duration::from_micros(100),
             max_panics: 3,
             unmount_timeout: Duration::from_secs(5),
             paranoid_ino: false,
@@ -159,6 +167,9 @@ impl MountOptions {
             "allow_other" => flag(value).map(|_| self.allow_other = true)?,
             "auto_unmount" => flag(value).map(|_| self.auto_unmount = true)?,
             "workers" => self.workers = usize::try_from(count(value)?).map_err(|_| bad())?,
+            "inline_below_us" => {
+                self.inline_below = Duration::from_micros(u64::from(count(value)?));
+            }
             "max_panics" => self.max_panics = count(value)?.max(1),
             "unmount_timeout" => self.unmount_timeout = secs(value)?,
             "paranoid_ino" => flag(value).map(|_| self.paranoid_ino = true)?,
@@ -172,7 +183,7 @@ impl MountOptions {
 /// Keys: `fsname=<name>`, `ttl=<secs>` (both `Shared` lifetimes), `entry_ttl=<secs>`,
 /// `attr_ttl=<secs>`, `neg_ttl=<secs>`, `noneg`, `shared`, `sole_writer[=<secs>]` (default
 /// 3600), `ro`/`rw`, `default_permissions`/`nodefault_permissions`, `allow_other`,
-/// `auto_unmount`, `workers=<n>`, `max_panics=<n>`, `unmount_timeout=<secs>`, `paranoid_ino`.
+/// `auto_unmount`, `workers=<n>`, `inline_below_us=<n>`, `max_panics=<n>`, `unmount_timeout=<secs>`, `paranoid_ino`.
 /// Later tokens win.
 impl FromStr for MountOptions {
     type Err = MountError;
@@ -250,10 +261,14 @@ mod tests {
             parse("noneg,ro,nodefault_permissions,allow_other,auto_unmount,paranoid_ino").unwrap();
         assert!(o.negative_ttl.is_zero() && o.read_only && !o.default_permissions);
         assert!(o.allow_other && o.auto_unmount && o.paranoid_ino);
-        let o = parse("ro,rw,noneg,neg_ttl=5,workers=0,max_panics=0,unmount_timeout=0.5").unwrap();
+        let o = parse(
+            "ro,rw,noneg,neg_ttl=5,workers=0,max_panics=0,unmount_timeout=0.5,inline_below_us=7",
+        )
+        .unwrap();
         assert!(!o.read_only && o.negative_ttl == Duration::from_secs(5));
         assert_eq!((o.workers, o.max_panics), (0, 1));
         assert_eq!(o.unmount_timeout, Duration::from_millis(500));
+        assert_eq!(o.inline_below, Duration::from_micros(7));
     }
 
     #[test]
