@@ -650,3 +650,37 @@ fn the_sandbox_shim_refuses_a_call_that_would_leave() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A slot that exists but carries no lease must be refused, not released without a pin.
+#[test]
+fn f1_an_unleased_slot_is_refused_rather_than_released_unpinned() {
+    let _w = Watchdog::start(180);
+    let bin = crate::require_treehouse!();
+    let s = Sandbox::new();
+    let (slot, _) = lease_at(&s, &s.pool());
+    // Hand it back with real treehouse, so the slot exists in the pool and is not leased.
+    let out = s.treehouse(&["return", &slot.display().to_string(), "--force"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(entry(&s, &s.pool(), "1")["lease_id"], "");
+
+    // The wrapper must refuse it rather than send an unpinned return.
+    let out = run(&[
+        "--treehouse-bin",
+        &bin.display().to_string(),
+        "--treehouse-home",
+        &s.home().display().to_string(),
+        "return",
+        "--slot",
+        &slot.display().to_string(),
+        "--root",
+        &s.pool().display().to_string(),
+        "--force",
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unleased slot is a usage error, not a release\nstderr: {err}"
+    );
+    assert!(err.contains("unpinned"), "and it must say why: {err}");
+}
