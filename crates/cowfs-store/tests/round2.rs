@@ -772,6 +772,7 @@ fn a_flood_of_forged_headers_with_valid_checksums_opens_fast() {
     }
     bytes.extend_from_slice(&vec![0u8; 300_000]);
     fs::write(&p, &bytes).unwrap();
+    let t = std::time::Instant::now();
     let s = Store::open(dir.path(), opts()).unwrap();
     assert!(
         t.elapsed().as_millis() < 3000,
@@ -810,6 +811,7 @@ fn many_damaged_records_do_not_hide_the_valid_ones() {
     }
     drop(f);
     let _ = fs::remove_file(dir.path().join("index.cix"));
+    let t = std::time::Instant::now();
     let s = Store::open_unsynced(dir.path(), opts()).unwrap();
     assert!(
         t.elapsed().as_millis() < 3000,
