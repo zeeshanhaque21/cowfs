@@ -1,7 +1,7 @@
 //! Read paths shared by read transactions and by writers inside a batch.
 
 use crate::node::NodeId;
-use crate::ptree::{self, Cursor};
+use crate::ptree::{self, Cached, Cursor};
 use crate::types::*;
 use crate::{Error, Result};
 use cowfs_store::ChunkRef;
@@ -37,7 +37,7 @@ pub(crate) trait Reader {
 
 /// A tree read through a redb read transaction.
 pub(crate) struct RoView {
-    pub(crate) nodes: ReadOnlyTable<[u8; 32], &'static [u8]>,
+    pub(crate) nodes: Cached<ReadOnlyTable<[u8; 32], &'static [u8]>>,
     pub(crate) root: NodeId,
 }
 

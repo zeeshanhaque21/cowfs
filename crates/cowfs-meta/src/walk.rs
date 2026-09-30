@@ -33,7 +33,7 @@ impl Marker {
 
 struct Frame {
     id: NodeId,
-    node: Node,
+    node: std::sync::Arc<Node>,
     idx: usize,
 }
 

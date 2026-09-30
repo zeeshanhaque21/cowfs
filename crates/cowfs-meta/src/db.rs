@@ -2,7 +2,7 @@
 
 use crate::error::guard;
 use crate::node::NodeId;
-use crate::ptree::{MemTree, NodeWriter};
+use crate::ptree::{Cached, MemTree, NodeCache, NodeWriter};
 use crate::read::{self, RoView};
 use crate::tx::Tx;
 use crate::types::*;
@@ -43,6 +43,8 @@ pub struct Options {
     pub before_sync: Option<SyncHook>,
     /// redb page cache size in bytes.
     pub cache_size: usize,
+    /// Verified tree nodes kept in memory (about `node_size` bytes each).
+    pub node_cache: usize,
 }
 
 impl Default for Options {
@@ -53,6 +55,7 @@ impl Default for Options {
             sync_interval: Duration::from_secs(1),
             before_sync: None,
             cache_size: 64 << 20,
+            node_cache: 16384,
         }
     }
 }
@@ -65,6 +68,7 @@ impl std::fmt::Debug for Options {
             .field("sync_interval", &self.sync_interval)
             .field("before_sync", &self.before_sync.is_some())
             .field("cache_size", &self.cache_size)
+            .field("node_cache", &self.node_cache)
             .finish()
     }
 }
@@ -101,6 +105,7 @@ pub(crate) struct Inner {
     pub(crate) db: Db,
     opts: Options,
     node_max: usize,
+    pub(crate) cache: Arc<NodeCache>,
     state: Mutex<SyncState>,
 }
 
@@ -302,6 +307,7 @@ impl Meta {
             inner: Arc::new(Inner {
                 db: Db(Some(db)),
                 node_max,
+                cache: Arc::new(NodeCache::new(opts.node_cache)),
                 state: Mutex::new(SyncState {
                     pending: 0,
                     last_sync: Instant::now(),
@@ -325,7 +331,11 @@ impl Meta {
             let mut names = wtx.open_table(SNAP_NAMES)?;
             let mut snaps = wtx.open_table(SNAPSHOTS)?;
             let mut meta = wtx.open_table(META)?;
-            let mut w = NodeWriter::new(wtx.open_table(NODES)?, wtx.open_table(REFS)?);
+            let mut w = NodeWriter::new(
+                wtx.open_table(NODES)?,
+                wtx.open_table(REFS)?,
+                self.inner.cache.clone(),
+            );
             if names.get(name)?.is_some() {
                 return Err(Error::SnapshotExists);
             }
@@ -417,7 +427,11 @@ impl Meta {
         self.inner.write(true, |wtx| {
             let mut names = wtx.open_table(SNAP_NAMES)?;
             let mut snaps = wtx.open_table(SNAPSHOTS)?;
-            let mut w = NodeWriter::new(wtx.open_table(NODES)?, wtx.open_table(REFS)?);
+            let mut w = NodeWriter::new(
+                wtx.open_table(NODES)?,
+                wtx.open_table(REFS)?,
+                self.inner.cache.clone(),
+            );
             let info = read_snap(&snaps, id)?;
             w.drop_ref(info.root);
             w.settle()?;
@@ -522,7 +536,10 @@ impl Snapshot {
             let rtx = self.inner.db.begin_read()?;
             let root = read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)?.root;
             f(&RoView {
-                nodes: rtx.open_table(NODES)?,
+                nodes: Cached {
+                    table: rtx.open_table(NODES)?,
+                    cache: self.inner.cache.clone(),
+                },
                 root,
             })
         })
@@ -590,7 +607,11 @@ impl Snapshot {
             let info = read_snap(&snaps, id)?;
             let next_ino = meta_get(&meta, "next_ino")?;
             let mut tx = Tx {
-                w: NodeWriter::new(wtx.open_table(NODES)?, wtx.open_table(REFS)?),
+                w: NodeWriter::new(
+                    wtx.open_table(NODES)?,
+                    wtx.open_table(REFS)?,
+                    self.inner.cache.clone(),
+                ),
                 tree: MemTree::new(info.root, node_max),
                 next_ino,
                 now: Timestamp::now(),

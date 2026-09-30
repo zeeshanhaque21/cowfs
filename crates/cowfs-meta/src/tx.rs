@@ -25,21 +25,21 @@ impl std::fmt::Debug for Tx<'_> {
 
 impl Reader for Tx<'_> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.tree.get(&self.w.nodes, key)
+        self.tree.get(&self.w, key)
     }
 
     fn seek_ge(&self, key: &[u8]) -> Result<Option<Entry>> {
-        self.tree.seek_ge(&self.w.nodes, key)
+        self.tree.seek_ge(&self.w, key)
     }
 }
 
 impl Tx<'_> {
     fn put(&mut self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
-        self.tree.insert(&self.w.nodes, &key, val)
+        self.tree.insert(&self.w, &key, val)
     }
 
     fn del(&mut self, key: &[u8]) -> Result<()> {
-        self.tree.remove(&self.w.nodes, key).map(|_| ())
+        self.tree.remove(&self.w, key).map(|_| ())
     }
 
     fn put_inode(&mut self, ino: Ino, rec: &InodeRec) -> Result<()> {

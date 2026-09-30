@@ -6,14 +6,100 @@
 use crate::node::{self, encode, encoded_size, entry_cost, Node, NodeId};
 use crate::{Error, Result};
 use redb::{ReadableTable, Table};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 pub(crate) type NodesTable<'t> = Table<'t, [u8; 32], &'static [u8]>;
 pub(crate) type RefsTable<'t> = Table<'t, [u8; 32], u64>;
 
-/// Read access to stored node bytes by id.
+/// Read access to stored nodes by id.
 pub(crate) trait NodeSource {
     fn read(&self, id: &NodeId) -> Result<Option<Vec<u8>>>;
+
+    /// Loads, hash-verifies and parses a node.
+    fn node(&self, id: &NodeId) -> Result<Arc<Node>> {
+        let bytes = self
+            .read(id)?
+            .ok_or_else(|| Error::Corrupt(format!("missing tree node {id}")))?;
+        if node::hash(&bytes) != *id {
+            return Err(Error::Corrupt(format!("tree node {id} fails its hash")));
+        }
+        Ok(Arc::new(Node::parse(bytes)?))
+    }
+}
+
+const SHARDS: usize = 16;
+
+/// Cache of verified nodes. Nodes are immutable and named by their hash, so an entry never goes stale.
+pub(crate) struct NodeCache {
+    shards: Vec<Mutex<HashMap<NodeId, Arc<Node>>>>,
+    per_shard: usize,
+}
+
+impl NodeCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            per_shard: capacity.div_ceil(SHARDS),
+        }
+    }
+
+    fn shard(&self, id: &NodeId) -> std::sync::MutexGuard<'_, HashMap<NodeId, Arc<Node>>> {
+        let i = usize::from(id.as_bytes()[0]) % SHARDS;
+        self.shards[i].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get(&self, id: &NodeId) -> Option<Arc<Node>> {
+        self.shard(id).get(id).cloned()
+    }
+
+    fn put(&self, id: NodeId, n: Arc<Node>) {
+        if self.per_shard == 0 {
+            return;
+        }
+        let mut s = self.shard(&id);
+        if s.len() >= self.per_shard {
+            s.clear();
+        }
+        s.insert(id, n);
+    }
+}
+
+impl std::fmt::Debug for NodeCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCache").finish_non_exhaustive()
+    }
+}
+
+/// A node source that consults the shared cache before the database.
+pub(crate) struct Cached<T> {
+    pub(crate) table: T,
+    pub(crate) cache: Arc<NodeCache>,
+}
+
+impl<T: ReadableTable<[u8; 32], &'static [u8]>> NodeSource for Cached<T> {
+    fn read(&self, id: &NodeId) -> Result<Option<Vec<u8>>> {
+        self.table.read(id)
+    }
+
+    fn node(&self, id: &NodeId) -> Result<Arc<Node>> {
+        cached_node(self, &self.cache, id)
+    }
+}
+
+fn cached_node<S: NodeSource>(src: &S, cache: &NodeCache, id: &NodeId) -> Result<Arc<Node>> {
+    if let Some(n) = cache.get(id) {
+        return Ok(n);
+    }
+    let bytes = src
+        .read(id)?
+        .ok_or_else(|| Error::Corrupt(format!("missing tree node {id}")))?;
+    if node::hash(&bytes) != *id {
+        return Err(Error::Corrupt(format!("tree node {id} fails its hash")));
+    }
+    let n = Arc::new(Node::parse(bytes)?);
+    cache.put(*id, n.clone());
+    Ok(n)
 }
 
 impl<T: ReadableTable<[u8; 32], &'static [u8]>> NodeSource for T {
@@ -23,14 +109,8 @@ impl<T: ReadableTable<[u8; 32], &'static [u8]>> NodeSource for T {
 }
 
 /// Loads a node and verifies its hash against the id it was looked up by.
-pub(crate) fn load<S: NodeSource>(src: &S, id: &NodeId) -> Result<Node> {
-    let bytes = src
-        .read(id)?
-        .ok_or_else(|| Error::Corrupt(format!("missing tree node {id}")))?;
-    if node::hash(&bytes) != *id {
-        return Err(Error::Corrupt(format!("tree node {id} fails its hash")));
-    }
-    Node::parse(bytes)
+pub(crate) fn load<S: NodeSource>(src: &S, id: &NodeId) -> Result<Arc<Node>> {
+    src.node(id)
 }
 
 /// Point lookup in a stored tree.
@@ -48,7 +128,7 @@ pub(crate) fn get<S: NodeSource>(src: &S, root: &NodeId, key: &[u8]) -> Result<O
 /// In-order cursor over a stored tree.
 #[derive(Debug)]
 pub(crate) struct Cursor {
-    stack: Vec<(Node, usize)>,
+    stack: Vec<(Arc<Node>, usize)>,
 }
 
 impl Cursor {
@@ -451,14 +531,26 @@ pub(crate) struct NodeWriter<'t> {
     pub(crate) nodes: NodesTable<'t>,
     pub(crate) refs: RefsTable<'t>,
     delta: HashMap<NodeId, i64>,
+    cache: Arc<NodeCache>,
+}
+
+impl NodeSource for NodeWriter<'_> {
+    fn read(&self, id: &NodeId) -> Result<Option<Vec<u8>>> {
+        self.nodes.read(id)
+    }
+
+    fn node(&self, id: &NodeId) -> Result<Arc<Node>> {
+        cached_node(self, &self.cache, id)
+    }
 }
 
 impl<'t> NodeWriter<'t> {
-    pub(crate) fn new(nodes: NodesTable<'t>, refs: RefsTable<'t>) -> Self {
+    pub(crate) fn new(nodes: NodesTable<'t>, refs: RefsTable<'t>, cache: Arc<NodeCache>) -> Self {
         Self {
             nodes,
             refs,
             delta: HashMap::new(),
+            cache,
         }
     }
 
@@ -483,11 +575,20 @@ impl<'t> NodeWriter<'t> {
     }
 
     /// Applies the accumulated count changes and frees nodes whose count reaches zero.
+    ///
+    /// Frees are resolved in memory first, so an untouched child that gains a reference from a new
+    /// parent and loses one from the freed old parent nets to zero and is never written.
     pub(crate) fn settle(&mut self) -> Result<()> {
-        let mut work: Vec<NodeId> = self.delta.keys().copied().collect();
+        let mut freed: HashSet<NodeId> = HashSet::new();
+        let mut work: Vec<NodeId> = self
+            .delta
+            .iter()
+            .filter(|(_, d)| **d < 0)
+            .map(|(id, _)| *id)
+            .collect();
         while let Some(id) = work.pop() {
-            let d = self.delta.remove(&id).unwrap_or(0);
-            if d == 0 {
+            let d = self.delta.get(&id).copied().unwrap_or(0);
+            if d >= 0 || freed.contains(&id) {
                 continue;
             }
             let cur = self.refs.get(*id.as_bytes())?.map_or(0, |g| g.value());
@@ -498,7 +599,6 @@ impl<'t> NodeWriter<'t> {
                 )));
             }
             if new > 0 {
-                self.refs.insert(*id.as_bytes(), new as u64)?;
                 continue;
             }
             let bytes = self
@@ -507,6 +607,8 @@ impl<'t> NodeWriter<'t> {
                 .map(|g| g.value().to_vec())
                 .ok_or_else(|| Error::Corrupt(format!("freeing missing node {id}")))?;
             self.refs.remove(*id.as_bytes())?;
+            self.delta.remove(&id);
+            freed.insert(id);
             let n = Node::parse(bytes)?;
             if !n.is_leaf() {
                 for i in 0..n.len() {
@@ -515,6 +617,18 @@ impl<'t> NodeWriter<'t> {
                     work.push(c);
                 }
             }
+        }
+        for (id, d) in std::mem::take(&mut self.delta) {
+            if d == 0 {
+                continue;
+            }
+            let cur = self.refs.get(*id.as_bytes())?.map_or(0, |g| g.value());
+            let new = i64::try_from(cur).unwrap_or(i64::MAX) + d;
+            let new = u64::try_from(new)
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| Error::Corrupt(format!("reference count of {id} left invalid")))?;
+            self.refs.insert(*id.as_bytes(), new)?;
         }
         Ok(())
     }
