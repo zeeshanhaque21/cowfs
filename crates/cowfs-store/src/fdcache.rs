@@ -4,21 +4,23 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, PoisonError, RwLock, RwLockWriteGuard};
 
 use crate::pack;
+
+#[derive(Debug)]
+struct Slot {
+    file: Arc<File>,
+    used: AtomicU64,
+}
 
 #[derive(Debug)]
 pub(crate) struct FdCache {
     dir: PathBuf,
     cap: usize,
-    inner: Mutex<Inner>,
-}
-
-#[derive(Debug, Default)]
-struct Inner {
-    tick: u64,
-    map: HashMap<u32, (Arc<File>, u64)>,
+    tick: AtomicU64,
+    map: RwLock<HashMap<u32, Slot>>,
 }
 
 impl FdCache {
@@ -26,23 +28,22 @@ impl FdCache {
         Self {
             dir,
             cap: cap.max(1),
-            inner: Mutex::new(Inner::default()),
+            tick: AtomicU64::new(0),
+            map: RwLock::new(HashMap::new()),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<u32, Slot>> {
+        self.map.write().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A shared read handle for pack `id`, opening it if it is not cached.
+    /// A shared read handle for pack `id`, opening it if it is not cached. A hit takes only a read lock.
     pub(crate) fn get(&self, id: u32) -> io::Result<Arc<File>> {
         {
-            let mut g = self.lock();
-            g.tick += 1;
-            let tick = g.tick;
-            if let Some((f, t)) = g.map.get_mut(&id) {
-                *t = tick;
-                return Ok(Arc::clone(f));
+            let g = self.map.read().unwrap_or_else(PoisonError::into_inner);
+            if let Some(slot) = g.get(&id) {
+                slot.used.store(self.tick.fetch_add(1, Relaxed), Relaxed);
+                return Ok(Arc::clone(&slot.file));
             }
         }
         let path = pack::pack_path(&self.dir, id);
@@ -50,23 +51,30 @@ impl FdCache {
             Ok(f) => f,
             // ENFILE and EMFILE are 23 and 24 on Linux and macOS: drop cached handles and retry once.
             Err(e) if matches!(e.raw_os_error(), Some(23 | 24)) => {
-                self.lock().map.clear();
+                self.write().clear();
                 File::open(&path)?
             }
             Err(e) => return Err(e),
         };
-        let file = Arc::new(file);
-        let mut g = self.lock();
-        g.tick += 1;
-        let tick = g.tick;
-        let entry = g.map.entry(id).or_insert((file, tick));
-        entry.1 = tick;
-        let out = Arc::clone(&entry.0);
-        while g.map.len() > self.cap {
-            let oldest = g.map.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k);
+        let mut g = self.write();
+        let used = self.tick.fetch_add(1, Relaxed);
+        let out = Arc::clone(
+            &g.entry(id)
+                .or_insert_with(|| Slot {
+                    file: Arc::new(file),
+                    used: AtomicU64::new(used),
+                })
+                .file,
+        );
+        while g.len() > self.cap {
+            let oldest = g
+                .iter()
+                .filter(|(k, _)| **k != id)
+                .min_by_key(|(_, s)| s.used.load(Relaxed))
+                .map(|(k, _)| *k);
             match oldest {
-                Some(k) if k != id => g.map.remove(&k),
-                _ => break,
+                Some(k) => g.remove(&k),
+                None => break,
             };
         }
         Ok(out)
@@ -74,7 +82,10 @@ impl FdCache {
 
     #[cfg(test)]
     pub(crate) fn cached(&self) -> usize {
-        self.lock().map.len()
+        self.map
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 }
 

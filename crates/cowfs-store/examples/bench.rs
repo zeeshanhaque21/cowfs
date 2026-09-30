@@ -205,6 +205,22 @@ fn main() {
         }
         report(&format!("ingest + sync, {threads} thread(s)"), "MiB/s", &v);
     }
+
+    let refs_files: Vec<&Vec<u8>> = data.iter().collect();
+    let mut v = Vec::new();
+    for _ in 0..runs {
+        drop(store.take());
+        let s2 = Store::open(&store_dir, Options::default()).unwrap();
+        let (_, t) = timed(|| {
+            refs_files.iter().for_each(|d| {
+                s2.ingest_bytes(d).unwrap();
+            })
+        });
+        v.push(mb / t);
+        drop(s2);
+        store = Some(Store::open(&store_dir, opts).unwrap());
+    }
+    report("re-ingest dupes after reopen, 1 thr", "MiB/s", &v);
     let s = store.unwrap();
     let st = s.stats();
     println!(
