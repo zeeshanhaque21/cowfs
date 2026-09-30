@@ -1,93 +1,96 @@
-//! The `fuser::Filesystem` implementation: one `Vfs` call per kernel request.
+//! The `fuser::Filesystem` implementation: one `Vfs` call per kernel request, cheap metadata on
+//! the request loop thread, slow operations on keyed worker lanes.
 
+use std::any::Any;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowfs_vfs::{
-    validate_name, Attr, Error, FileHandle, FileKind, Ino, Result, SetAttr, SetTime, Vfs,
-    MODE_MASK, ROOT_INO,
+    validate_name, Attr, FileHandle, FileKind, Ino, SetAttr, SetTime, Vfs, MODE_MASK, ROOT_INO,
 };
-use fuser::consts::FOPEN_KEEP_CACHE;
+use fuser::consts::{FOPEN_KEEP_CACHE, FUSE_PARALLEL_DIROPS};
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, KernelConfig, Notifier, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite,
+    ReplyXattr, Request, TimeOrNow,
 };
+use libc::c_int;
 
 use crate::convert::{self, XattrReply};
 use crate::dir::{self, DirSink};
 use crate::options::MountOptions;
+use crate::table::Table;
+
+type R<T> = Result<T, c_int>;
+type Job = Box<dyn FnOnce() + Send>;
 
 const BLKSIZE: u32 = 4096;
 
-pub(crate) struct Fs {
-    vfs: Arc<dyn Vfs>,
-    opts: MountOptions,
-    uid: u32,
-    gid: u32,
+/// State shared between the request loop, the worker lanes, the `Mount` and its `Invalidator`s.
+pub(crate) struct Shared {
+    table: Mutex<Table>,
+    pub(crate) notifier: OnceLock<Notifier>,
+    pub(crate) epoch: AtomicU64,
+    panics: AtomicU32,
+    failed: AtomicBool,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("failed", &self.failed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Shared {
+    pub(crate) fn new() -> Self {
+        Self {
+            table: Mutex::new(Table::default()),
+            notifier: OnceLock::new(),
+            epoch: AtomicU64::new(0),
+            panics: AtomicU32::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn table(&self) -> MutexGuard<'_, Table> {
+        self.table.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// True once `Vfs` panics reached `max_panics`: every request then fails with `ENOTCONN`.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
 }
 
 /// The effective uid and gid of this process, which own every file on the mount.
 #[allow(unsafe_code)]
-fn mounter() -> (u32, u32) {
+pub(crate) fn mounter() -> (u32, u32) {
     // SAFETY: geteuid and getegid take no arguments, touch no memory and cannot fail.
     unsafe { (libc::geteuid(), libc::getegid()) }
 }
 
-impl Fs {
-    pub(crate) fn new(vfs: Arc<dyn Vfs>, opts: MountOptions) -> Self {
-        let (uid, gid) = mounter();
-        Self {
-            vfs,
-            opts,
-            uid,
-            gid,
-        }
-    }
-
-    fn file_attr(&self, a: &Attr) -> FileAttr {
-        file_attr(a, self.uid, self.gid)
-    }
-
-    fn entry(&self, r: Result<Attr>, reply: ReplyEntry) {
-        match r {
-            Ok(a) => reply.entry(&self.opts.entry_ttl, &self.file_attr(&a), 0),
-            Err(e) => reply.error(e.errno()),
-        }
-    }
-
-    fn attr(&self, r: Result<Attr>, reply: ReplyAttr) {
-        match r {
-            Ok(a) => reply.attr(&self.opts.attr_ttl, &self.file_attr(&a)),
-            Err(e) => reply.error(e.errno()),
-        }
-    }
-
-    fn keep_cache(&self) -> u32 {
-        if self.opts.keep_cache {
-            FOPEN_KEEP_CACHE
-        } else {
-            0
-        }
-    }
+struct Core {
+    vfs: Arc<dyn Vfs>,
+    opts: MountOptions,
+    uid: u32,
+    gid: u32,
+    sh: Arc<Shared>,
 }
 
-fn empty(r: Result<()>, reply: ReplyEmpty) {
-    match r {
-        Ok(()) => reply.ok(),
-        Err(e) => reply.error(e.errno()),
-    }
-}
-
-fn name(n: &OsStr) -> Result<&[u8]> {
-    validate_name(n.as_bytes())?;
+fn name(n: &OsStr) -> R<&[u8]> {
+    validate_name(n.as_bytes()).map_err(|e| e.errno())?;
     Ok(n.as_bytes())
 }
 
-fn offset(o: i64) -> Result<u64> {
-    u64::try_from(o).map_err(|_| Error::InvalidArgument)
+fn offset(o: i64) -> R<u64> {
+    u64::try_from(o).map_err(|_| libc::EINVAL)
 }
 
 fn file_type(kind: FileKind) -> FileType {
@@ -145,6 +148,21 @@ fn set_time(t: TimeOrNow) -> SetTime {
     }
 }
 
+fn empty(r: R<()>, reply: ReplyEmpty) {
+    match r {
+        Ok(()) => reply.ok(),
+        Err(e) => reply.error(e),
+    }
+}
+
+fn xattr_reply(size: u32, value: &[u8], reply: ReplyXattr) {
+    match convert::xattr_reply(size, value.len()) {
+        XattrReply::Size(n) => reply.size(n),
+        XattrReply::Data => reply.data(value),
+        XattrReply::TooSmall => reply.error(libc::ERANGE),
+    }
+}
+
 struct Sink(ReplyDirectory);
 
 impl DirSink for Sink {
@@ -154,24 +172,227 @@ impl DirSink for Sink {
     }
 }
 
-impl Filesystem for Fs {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, n: &OsStr, reply: ReplyEntry) {
-        match name(n).and_then(|n| self.vfs.lookup(parent, n)) {
-            Err(Error::NotFound) if !self.opts.negative_ttl.is_zero() => {
-                reply.entry(&self.opts.negative_ttl, &negative_attr(), 0);
+impl Core {
+    /// Runs one `Vfs` call. A panic in it becomes `EIO` for this request and is counted; after
+    /// `max_panics` the mount is failed and everything answers `ENOTCONN`, so the mountpoint
+    /// never turns into an empty directory that looks valid.
+    fn call<T>(&self, f: impl FnOnce(&dyn Vfs) -> cowfs_vfs::Result<T>) -> R<T> {
+        if self.sh.failed() {
+            return Err(libc::ENOTCONN);
+        }
+        match catch_unwind(AssertUnwindSafe(|| f(&*self.vfs))) {
+            Ok(r) => r.map_err(|e| e.errno()),
+            Err(p) => {
+                self.panicked(&p);
+                Err(libc::EIO)
             }
-            r => self.entry(r, reply),
+        }
+    }
+
+    fn panicked(&self, p: &(dyn Any + Send)) {
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let n = self.sh.panics.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= self.opts.max_panics {
+            self.sh.failed.store(true, Ordering::Release);
+            log::error!(
+                "Vfs panicked ({n} of {}): {msg}; mount failed, answering ENOTCONN",
+                self.opts.max_panics
+            );
+        } else {
+            log::error!(
+                "Vfs panicked ({n} of {}): {msg}; request answered EIO",
+                self.opts.max_panics
+            );
+        }
+    }
+
+    fn fattr(&self, a: &Attr, unlinked_ok: bool) -> FileAttr {
+        let (s, changed) = convert::sanitize(a, unlinked_ok);
+        if changed {
+            log::warn!(
+                "Vfs returned impossible attributes for inode {}: {a:?}; clamped",
+                a.ino
+            );
+        }
+        file_attr(&s, self.uid, self.gid)
+    }
+
+    /// Records the reference the kernel gets with a reply that hands out `a`, and converts it.
+    fn referenced(&self, parent: Ino, n: &[u8], a: &Attr, fresh: bool) -> R<FileAttr> {
+        let r = self
+            .sh
+            .table()
+            .reference(parent, n, a.ino, a.kind, fresh, self.opts.paranoid_ino);
+        if r.is_err() {
+            log::error!(
+                "Vfs reused inode {} while the kernel still references it",
+                a.ino
+            );
+            let _ = self.call(|v| {
+                v.forget(a.ino, 1);
+                Ok(())
+            });
+            return Err(libc::EIO);
+        }
+        Ok(self.fattr(a, false))
+    }
+
+    fn lookup(&self, parent: Ino, n: &OsStr) -> R<FileAttr> {
+        let n = name(n)?;
+        let a = self.call(|v| v.lookup(parent, n))?;
+        self.referenced(parent, n, &a, false)
+    }
+
+    fn getattr(&self, ino: Ino, open: bool) -> R<FileAttr> {
+        let a = self.call(|v| v.getattr(ino))?;
+        let unlinked = open || self.sh.table().is_unnamed(ino);
+        Ok(self.fattr(&a, unlinked))
+    }
+
+    fn setattr(&self, ino: Ino, changes: SetAttr) -> R<FileAttr> {
+        let a = self.call(|v| v.setattr(ino, changes))?;
+        let unlinked = self.sh.table().is_unnamed(ino);
+        Ok(self.fattr(&a, unlinked))
+    }
+
+    fn forget(&self, ino: Ino, count: u64) {
+        if ino == ROOT_INO {
+            return;
+        }
+        self.sh.table().forget(ino, count);
+        let _ = self.call(|v| {
+            v.forget(ino, count);
+            Ok(())
+        });
+    }
+
+    fn open_flags(&self) -> u32 {
+        if self.opts.keep_cache() {
+            FOPEN_KEEP_CACHE
+        } else {
+            0
+        }
+    }
+
+    fn create(&self, parent: Ino, n: &OsStr, mode: u32) -> R<(FileAttr, u64)> {
+        let n = name(n)?;
+        let a = self.call(|v| v.create(parent, n, mode & MODE_MASK))?;
+        let attr = self.referenced(parent, n, &a, true)?;
+        match self.call(|v| v.open(a.ino)) {
+            Ok(h) => Ok((attr, h.0)),
+            Err(e) => {
+                self.forget(a.ino, 1);
+                Err(e)
+            }
+        }
+    }
+
+    /// Writes at `off`, or at the current end for an append. The kernel computes append offsets
+    /// from its cached size, which is stale when the tree changed behind the mount, so the size
+    /// comes from the `Vfs`. The second result is true when the kernel's size was wrong and its
+    /// attributes must be refreshed.
+    fn write(&self, ino: Ino, off: i64, data: &[u8], flags: i32) -> R<(u32, bool)> {
+        let mut pos = offset(off)?;
+        let mut stale = false;
+        if flags & libc::O_APPEND != 0 {
+            let size = self.call(|v| v.getattr(ino))?.size;
+            stale = size != pos;
+            pos = size;
+        }
+        let n = self.call(|v| v.write(ino, pos, data))?;
+        let max = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        Ok((n.min(max), stale))
+    }
+
+    fn invalidate_attr(&self, ino: Ino) {
+        if let Some(n) = self.sh.notifier.get() {
+            if let Err(e) = n.inval_inode(ino, -1, 0) {
+                log::warn!("attribute invalidation of inode {ino} failed: {e}");
+            }
+        }
+    }
+}
+
+pub(crate) struct Fs {
+    core: Arc<Core>,
+    lanes: Vec<mpsc::Sender<Job>>,
+}
+
+impl Fs {
+    pub(crate) fn new(vfs: Arc<dyn Vfs>, opts: MountOptions, sh: Arc<Shared>) -> Self {
+        let (uid, gid) = mounter();
+        let lanes = (0..opts.workers)
+            .filter_map(|i| {
+                let (tx, rx) = mpsc::channel::<Job>();
+                std::thread::Builder::new()
+                    .name(format!("cowfs-fuse-w{i}"))
+                    .spawn(move || {
+                        for job in rx {
+                            let _ = catch_unwind(AssertUnwindSafe(job));
+                        }
+                    })
+                    .map_err(|e| log::error!("cannot start worker {i}: {e}"))
+                    .ok()
+                    .map(|_| tx)
+            })
+            .collect();
+        Self {
+            core: Arc::new(Core {
+                vfs,
+                opts,
+                uid,
+                gid,
+                sh,
+            }),
+            lanes,
+        }
+    }
+
+    /// Runs `f` on the lane that owns `key`, a FIFO, so requests for one inode keep their order
+    /// while unrelated inodes proceed in parallel. With no workers it runs right here.
+    fn lane(&self, key: Ino, f: impl FnOnce(&Core) + Send + 'static) {
+        let c = self.core.clone();
+        if self.lanes.is_empty() {
+            return f(&c);
+        }
+        let i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % self.lanes.len();
+        let _ = self.lanes[i].send(Box::new(move || f(&c)));
+    }
+}
+
+impl Filesystem for Fs {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
+        if !self.lanes.is_empty() {
+            let _ = config.add_capabilities(FUSE_PARALLEL_DIROPS);
+        }
+        Ok(())
+    }
+
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, n: &OsStr, reply: ReplyEntry) {
+        let c = &self.core;
+        match c.lookup(parent, n) {
+            Ok(a) => reply.entry(&c.opts.entry_lifetime(), &a, 0),
+            Err(libc::ENOENT) if !c.opts.negative_ttl.is_zero() => {
+                reply.entry(&c.opts.negative_ttl, &negative_attr(), 0);
+            }
+            Err(e) => reply.error(e),
         }
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        if ino != ROOT_INO {
-            self.vfs.forget(ino, nlookup);
-        }
+        self.core.forget(ino, nlookup);
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        self.attr(self.vfs.getattr(ino), reply);
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+        let c = &self.core;
+        match c.getattr(ino, fh.is_some()) {
+            Ok(a) => reply.attr(&c.opts.attr_lifetime(), &a),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn setattr(
@@ -184,11 +405,11 @@ impl Filesystem for Fs {
         size: Option<u64>,
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
-        _ctime: Option<std::time::SystemTime>,
+        _ctime: Option<SystemTime>,
         _fh: Option<u64>,
-        _crtime: Option<std::time::SystemTime>,
-        _chgtime: Option<std::time::SystemTime>,
-        _bkuptime: Option<std::time::SystemTime>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
@@ -198,13 +419,21 @@ impl Filesystem for Fs {
             atime: atime.map(set_time),
             mtime: mtime.map(set_time),
         };
-        self.attr(self.vfs.setattr(ino, changes), reply);
+        let f = move |c: &Core| match c.setattr(ino, changes) {
+            Ok(a) => reply.attr(&c.opts.attr_lifetime(), &a),
+            Err(e) => reply.error(e),
+        };
+        if size.is_some() {
+            self.lane(ino, f);
+        } else {
+            f(&self.core);
+        }
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        match self.vfs.readlink(ino) {
+        match self.core.call(|v| v.readlink(ino)) {
             Ok(t) => reply.data(&t),
-            Err(e) => reply.error(e.errno()),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -221,10 +450,17 @@ impl Filesystem for Fs {
         if !convert::mknod_is_regular(mode) {
             return reply.error(libc::ENOTSUP);
         }
-        self.entry(
-            name(n).and_then(|n| self.vfs.create(parent, n, mode & MODE_MASK)),
-            reply,
-        );
+        let n = n.to_owned();
+        self.lane(parent, move |c| {
+            let r = name(&n).and_then(|nm| {
+                let a = c.call(|v| v.create(parent, nm, mode & MODE_MASK))?;
+                c.referenced(parent, nm, &a, true)
+            });
+            match r {
+                Ok(a) => reply.entry(&c.opts.entry_lifetime(), &a, 0),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 
     fn mkdir(
@@ -236,18 +472,41 @@ impl Filesystem for Fs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        self.entry(
-            name(n).and_then(|n| self.vfs.mkdir(parent, n, mode & MODE_MASK)),
-            reply,
-        );
+        let n = n.to_owned();
+        self.lane(parent, move |c| {
+            let r = name(&n).and_then(|nm| {
+                let a = c.call(|v| v.mkdir(parent, nm, mode & MODE_MASK))?;
+                c.referenced(parent, nm, &a, true)
+            });
+            match r {
+                Ok(a) => reply.entry(&c.opts.entry_lifetime(), &a, 0),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, n: &OsStr, reply: ReplyEmpty) {
-        empty(name(n).and_then(|n| self.vfs.unlink(parent, n)), reply);
+        let n = n.to_owned();
+        self.lane(parent, move |c| {
+            let r = name(&n).and_then(|nm| {
+                c.call(|v| v.unlink(parent, nm))?;
+                c.sh.table().unname(parent, nm);
+                Ok(())
+            });
+            empty(r, reply);
+        });
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, n: &OsStr, reply: ReplyEmpty) {
-        empty(name(n).and_then(|n| self.vfs.rmdir(parent, n)), reply);
+        let n = n.to_owned();
+        self.lane(parent, move |c| {
+            let r = name(&n).and_then(|nm| {
+                c.call(|v| v.rmdir(parent, nm))?;
+                c.sh.table().unname(parent, nm);
+                Ok(())
+            });
+            empty(r, reply);
+        });
     }
 
     fn symlink(
@@ -258,11 +517,18 @@ impl Filesystem for Fs {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        self.entry(
-            name(link_name)
-                .and_then(|n| self.vfs.symlink(parent, n, target.as_os_str().as_bytes())),
-            reply,
-        );
+        let n = link_name.to_owned();
+        let target = target.as_os_str().as_bytes().to_vec();
+        self.lane(parent, move |c| {
+            let r = name(&n).and_then(|nm| {
+                let a = c.call(|v| v.symlink(parent, nm, &target))?;
+                c.referenced(parent, nm, &a, true)
+            });
+            match r {
+                Ok(a) => reply.entry(&c.opts.entry_lifetime(), &a, 0),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 
     fn rename(
@@ -279,12 +545,17 @@ impl Filesystem for Fs {
             Ok(f) => f,
             Err(errno) => return reply.error(errno),
         };
-        empty(
-            name(n)
-                .and_then(|n| Ok((n, name(newname)?)))
-                .and_then(|(n, nn)| self.vfs.rename(parent, n, newparent, nn, flags)),
-            reply,
-        );
+        let (n, nn) = (n.to_owned(), newname.to_owned());
+        self.lane(parent, move |c| {
+            let r = name(&n)
+                .and_then(|n| Ok((n, name(&nn)?)))
+                .and_then(|(n, nn)| {
+                    c.call(|v| v.rename(parent, n, newparent, nn, flags))?;
+                    c.sh.table().rename(parent, n, newparent, nn);
+                    Ok(())
+                });
+            empty(r, reply);
+        });
     }
 
     fn link(
@@ -295,17 +566,24 @@ impl Filesystem for Fs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        self.entry(
-            name(newname).and_then(|n| self.vfs.link(ino, newparent, n)),
-            reply,
-        );
+        let n = newname.to_owned();
+        self.lane(newparent, move |c| {
+            let r = name(&n).and_then(|nm| {
+                let a = c.call(|v| v.link(ino, newparent, nm))?;
+                c.referenced(newparent, nm, &a, false)
+            });
+            match r {
+                Ok(a) => reply.entry(&c.opts.entry_lifetime(), &a, 0),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        match self.vfs.open(ino) {
-            Ok(h) => reply.opened(h.0, self.keep_cache()),
-            Err(e) => reply.error(e.errno()),
-        }
+        self.lane(ino, move |c| match c.call(|v| v.open(ino)) {
+            Ok(h) => reply.opened(h.0, c.open_flags()),
+            Err(e) => reply.error(e),
+        });
     }
 
     fn create(
@@ -318,17 +596,11 @@ impl Filesystem for Fs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let attr = match name(n).and_then(|n| self.vfs.create(parent, n, mode & MODE_MASK)) {
-            Ok(a) => a,
-            Err(e) => return reply.error(e.errno()),
-        };
-        match self.vfs.open(attr.ino) {
-            Ok(h) => reply.created(&self.opts.entry_ttl, &self.file_attr(&attr), 0, h.0, 0),
-            Err(e) => {
-                self.vfs.forget(attr.ino, 1);
-                reply.error(e.errno());
-            }
-        }
+        let n = n.to_owned();
+        self.lane(parent, move |c| match c.create(parent, &n, mode) {
+            Ok((a, fh)) => reply.created(&c.opts.entry_lifetime(), &a, 0, fh, c.open_flags()),
+            Err(e) => reply.error(e),
+        });
     }
 
     fn read(
@@ -342,10 +614,12 @@ impl Filesystem for Fs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        match offset(off).and_then(|o| self.vfs.read(ino, o, size)) {
-            Ok(d) => reply.data(&d),
-            Err(e) => reply.error(e.errno()),
-        }
+        self.lane(ino, move |c| {
+            match offset(off).and_then(|o| c.call(|v| v.read(ino, o, size))) {
+                Ok(d) => reply.data(&d[..d.len().min(size as usize)]),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 
     fn write(
@@ -356,14 +630,20 @@ impl Filesystem for Fs {
         off: i64,
         data: &[u8],
         _write_flags: u32,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        match offset(off).and_then(|o| self.vfs.write(ino, o, data)) {
-            Ok(n) => reply.written(n),
-            Err(e) => reply.error(e.errno()),
-        }
+        let data = data.to_vec();
+        self.lane(ino, move |c| match c.write(ino, off, &data, flags) {
+            Ok((n, stale)) => {
+                reply.written(n);
+                if stale {
+                    c.invalidate_attr(ino);
+                }
+            }
+            Err(e) => reply.error(e),
+        });
     }
 
     fn flush(
@@ -374,24 +654,28 @@ impl Filesystem for Fs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        empty(self.vfs.flush(ino), reply);
+        self.lane(ino, move |c| empty(c.call(|v| v.flush(ino)), reply));
     }
 
     fn release(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        empty(self.vfs.release(FileHandle(fh)), reply);
+        self.lane(ino, move |c| {
+            empty(c.call(|v| v.release(FileHandle(fh))), reply);
+        });
     }
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
-        empty(self.vfs.fsync(ino, datasync), reply);
+        self.lane(ino, move |c| {
+            empty(c.call(|v| v.fsync(ino, datasync)), reply)
+        });
     }
 
     fn fsyncdir(
@@ -402,19 +686,24 @@ impl Filesystem for Fs {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        empty(self.vfs.fsync(ino, datasync), reply);
+        self.lane(ino, move |c| {
+            empty(c.call(|v| v.fsync(ino, datasync)), reply)
+        });
     }
 
     fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, off: i64, reply: ReplyDirectory) {
-        let mut sink = Sink(reply);
-        match dir::fill(&*self.vfs, ino, off, &mut sink) {
-            Ok(()) => sink.0.ok(),
-            Err(e) => sink.0.error(e.errno()),
-        }
+        self.lane(ino, move |c| {
+            let parent = c.sh.table().parent_of(ino);
+            let mut sink = Sink(reply);
+            match c.call(|v| dir::fill(v, ino, parent, off, &mut sink)) {
+                Ok(()) => sink.0.ok(),
+                Err(e) => sink.0.error(e),
+            }
+        });
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        match self.vfs.statfs() {
+        match self.core.call(|v| v.statfs()) {
             Ok(s) => reply.statfs(
                 s.blocks,
                 s.blocks_free,
@@ -425,13 +714,13 @@ impl Filesystem for Fs {
                 s.name_max,
                 s.block_size,
             ),
-            Err(e) => reply.error(e.errno()),
+            Err(e) => reply.error(e),
         }
     }
 
     fn setxattr(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         n: &OsStr,
         value: &[u8],
@@ -442,46 +731,76 @@ impl Filesystem for Fs {
         if position != 0 {
             return reply.error(libc::EINVAL);
         }
-        match convert::xattr_flags(flags) {
-            Ok(f) => empty(self.vfs.setxattr(ino, n.as_bytes(), value, f), reply),
-            Err(errno) => reply.error(errno),
+        if let Err(e) = convert::xattr_name_ok(n.as_bytes(), req.uid() == 0) {
+            return reply.error(e);
         }
+        let flags = match convert::xattr_flags(flags) {
+            Ok(f) => f,
+            Err(errno) => return reply.error(errno),
+        };
+        let (n, value) = (n.to_owned(), value.to_vec());
+        self.lane(ino, move |c| {
+            empty(
+                c.call(|v| v.setxattr(ino, n.as_bytes(), &value, flags)),
+                reply,
+            );
+        });
     }
 
-    fn getxattr(&mut self, _req: &Request<'_>, ino: u64, n: &OsStr, size: u32, reply: ReplyXattr) {
-        match self.vfs.getxattr(ino, n.as_bytes()) {
+    fn getxattr(&mut self, req: &Request<'_>, ino: u64, n: &OsStr, size: u32, reply: ReplyXattr) {
+        if let Err(e) = convert::xattr_name_ok(n.as_bytes(), req.uid() == 0) {
+            return reply.error(e);
+        }
+        match self.core.call(|v| v.getxattr(ino, n.as_bytes())) {
             Ok(v) => xattr_reply(size, &v, reply),
-            Err(e) => reply.error(e.errno()),
+            Err(e) => reply.error(e),
         }
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
-        match self.vfs.listxattr(ino) {
+        match self.core.call(|v| v.listxattr(ino)) {
             Ok(names) => xattr_reply(size, &convert::encode_xattr_names(&names), reply),
-            Err(e) => reply.error(e.errno()),
+            Err(e) => reply.error(e),
         }
     }
 
-    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, n: &OsStr, reply: ReplyEmpty) {
-        empty(self.vfs.removexattr(ino, n.as_bytes()), reply);
+    fn removexattr(&mut self, req: &Request<'_>, ino: u64, n: &OsStr, reply: ReplyEmpty) {
+        if let Err(e) = convert::xattr_name_ok(n.as_bytes(), req.uid() == 0) {
+            return reply.error(e);
+        }
+        let n = n.to_owned();
+        self.lane(ino, move |c| {
+            empty(c.call(|v| v.removexattr(ino, n.as_bytes())), reply);
+        });
     }
 
     fn access(&mut self, req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
-        match self.vfs.getattr(ino) {
-            Ok(a)
-                if convert::access_allowed(
-                    a.mode,
-                    self.uid,
-                    self.gid,
-                    req.uid(),
-                    req.gid(),
-                    mask,
-                ) =>
-            {
+        let c = &self.core;
+        match c.call(|v| v.getattr(ino)) {
+            Ok(a) if convert::access_allowed(a.mode, c.uid, c.gid, req.uid(), req.gid(), mask) => {
                 reply.ok();
             }
             Ok(_) => reply.error(libc::EACCES),
-            Err(e) => reply.error(e.errno()),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn lseek(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        off: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        let r = self
+            .core
+            .call(|v| v.getattr(ino))
+            .and_then(|a| convert::seek(whence, off, a.size));
+        match r {
+            Ok(o) => reply.offset(o),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -512,14 +831,6 @@ impl Filesystem for Fs {
         reply: ReplyWrite,
     ) {
         reply.error(libc::ENOTSUP);
-    }
-}
-
-fn xattr_reply(size: u32, value: &[u8], reply: ReplyXattr) {
-    match convert::xattr_reply(size, value.len()) {
-        XattrReply::Size(n) => reply.size(n),
-        XattrReply::Data => reply.data(value),
-        XattrReply::TooSmall => reply.error(libc::ERANGE),
     }
 }
 
@@ -557,9 +868,9 @@ mod tests {
     #[test]
     fn names_are_validated() {
         assert!(name(OsStr::new("ok")).is_ok());
-        assert_eq!(name(OsStr::new("..")), Err(Error::InvalidArgument));
-        assert_eq!(name(OsStr::new(&"x".repeat(256))), Err(Error::NameTooLong));
-        assert_eq!(offset(-1), Err(Error::InvalidArgument));
+        assert_eq!(name(OsStr::new("..")), Err(libc::EINVAL));
+        assert_eq!(name(OsStr::new(&"x".repeat(256))), Err(libc::ENAMETOOLONG));
+        assert_eq!(offset(-1), Err(libc::EINVAL));
     }
 
     #[test]

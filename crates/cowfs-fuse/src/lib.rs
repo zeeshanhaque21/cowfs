@@ -4,24 +4,89 @@
 //!
 //! # Caching and consistency
 //!
-//! The defaults (see [`MountOptions`]) let the kernel cache names, attributes and file pages
-//! for an hour. That is only correct while every change to the tree goes through this mount.
-//! A change made any other way must be announced with `Mount::invalidate_inode` and
-//! `Mount::invalidate_entry`.
+//! By default ([`MountMode::Shared`]) the kernel caches names and attributes for one second
+//! and file pages are dropped on every open, so a change made to the tree behind the mount,
+//! by snapshot, gc or control operations, is visible within a second. Appends are placed at
+//! the size the `Vfs` reports, not at the kernel's cached size, so growth behind the mount
+//! cannot make an append overwrite data.
+//!
+//! [`MountMode::SoleWriter`] opts into long lifetimes and `keep_cache` (the spike 3 numbers).
+//! It is valid only when every mutation goes through this mount or is announced through the
+//! `Invalidator`; anything else is served stale for the whole lifetime. Wiring that is the
+//! job of whoever owns the control plane: after every change made behind the mount, call
+//! `invalidate_inode` for changed inodes and their parents, `invalidate_entry` for removed or
+//! renamed names, `invalidate_children` for a directory whose contents were replaced, or
+//! `invalidate_all` (also after a snapshot swap).
+//!
+//! "No such name" answers are cached for `negative_ttl` (default 1 s) in both modes. The
+//! kernel ignores invalidation of them (verified on Linux 7.0), so a name created behind the
+//! mount, such as a new snapshot directory at the mount root, appears within `negative_ttl`.
 //!
 //! # Threading
 //!
-//! The `fuser` 0.15 request loop is single threaded and this adapter runs every `Vfs` call
-//! on that thread. In the spike 3 measurements, handing requests to a worker pool made
-//! lookups slower (15 to 34 microseconds against 6) and no-op builds twice as slow, so
-//! there is none. The `Vfs` must tolerate calls from this thread while other threads call it
-//! too, and a slow `Vfs` call stalls the whole mount.
+//! Cheap metadata (lookup, getattr, access, statfs, forget, xattr reads, lseek) runs on the
+//! `fuser` request loop thread, with no hand-off, so it costs what a single threaded server
+//! costs (spike 3: a naive worker pool made lookups 15 to 34 microseconds instead of 6).
+//! Everything that can block (read, write, readdir, open, flush, fsync, release, and every
+//! operation that changes the tree) goes to one of `workers` lanes, each a FIFO thread. A
+//! request is routed by its inode (the directory for namespace changes), so requests for one
+//! inode keep their order while unrelated inodes run in parallel, and a slow read no longer
+//! delays a `stat`. The `Vfs` must be thread safe, as its trait says, and must tolerate
+//! the loop thread and up to `workers` lanes calling it at once. `workers=0` restores the
+//! single threaded loop. Concurrent `O_APPEND` writers to one file are serialised by their
+//! lane; writers that bypass the mount are not.
+//!
+//! # Failure containment
+//!
+//! A panic in a `Vfs` call is caught, logged, and answered with `EIO` for that request.
+//! After `max_panics` (default 3) the mount is marked failed: every request answers
+//! `ENOTCONN` (never an empty directory) until it is unmounted, `Mount::failed` is true and
+//! `Mount::is_alive` is false. Attributes from the `Vfs` are clamped to what the kernel
+//! accepts, and logged, so one bad reply cannot make `stat` fail for the whole mount.
+//!
+//! # Lifecycle
+//!
+//! `Mount::unmount` returns how it ended: cleanly, lazily (a process still had a file open
+//! or a working directory inside, after `unmount_timeout`), or an error. It never reports
+//! success silently. `Mount::install_signal_cleanup` unmounts on SIGTERM, SIGINT and
+//! SIGHUP; `sweep_stale_mounts` clears mounts left by `kill -9` at startup. `auto_unmount`
+//! makes `fusermount3` unmount when the process dies, but implies `allow_other`, so a
+//! non-root user needs `user_allow_other` in `/etc/fuse.conf`; without it
+//! `MountError::NeedsAllowOther` is returned instead of a mount that fails obscurely.
+//!
+//! # Inode numbers
+//!
+//! The adapter always sends generation 0, so the `Vfs` must never reuse an inode number
+//! during the lifetime of a mount (see `docs/v1-architecture.md`). `paranoid_ino` makes the
+//! adapter detect a reuse while the kernel still references the old file and fail that
+//! request with `EIO`. `.` and `..` in a listing carry the real parent inode when the adapter
+//! has seen it.
+//!
+//! # Permissions
+//!
+//! Every file is owned by the mounter. With `default_permissions` (the default) the kernel
+//! enforces mode bits, POSIX style: the handle returned by creating a file with mode 0444 can
+//! write, but a later `open` for writing by the owner fails with `EACCES`. With
+//! `nodefault_permissions` the adapter does no mode checks on `open`, only on `access(2)`, so
+//! the owner can write a 0444 file. The NFS adapter is stateless and cannot see the creating
+//! handle, so it behaves like `nodefault_permissions`; which policy every adapter should
+//! share is a decision for the lead.
 //!
 //! # Not supported
 //!
 //! Device nodes, fifos and sockets (`mknod` of anything but a regular file is `ENOTSUP`),
-//! `RENAME_EXCHANGE` (`ENOTSUP`), `fallocate` and `copy_file_range` (`ENOTSUP`), and FUSE
+//! `RENAME_EXCHANGE` (`ENOTSUP`), `fallocate` and `copy_file_range` (`ENOTSUP`, so
+//! `rsync --preallocate` prints a warning per file and `cp --reflink=always` fails),
+//! extended attribute namespaces other than `user.*`, `security.*` and `trusted.*` (POSIX ACLs
+//! are `ENOTSUP`), holes (`SEEK_DATA` and `SEEK_HOLE` treat the whole file as data), and FUSE
 //! locks: the kernel handles `flock` and POSIX locks locally.
+//!
+//! # Running the mount tests
+//!
+//! They need Linux with `/dev/fuse` and `fusermount3`, are `#[ignore]`d, and skip themselves
+//! when FUSE is unusable:
+//! `cargo test -p cowfs-fuse -j4 -- --ignored --test-threads=1 --nocapture`
+//! (add `--release` for the latency floor). A Linux CI job runs exactly that.
 
 pub mod bench;
 pub mod convert;
@@ -29,16 +94,22 @@ pub mod dir;
 mod error;
 pub mod options;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod mounts;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod table;
+
 #[cfg(target_os = "linux")]
 mod fs;
+#[cfg(target_os = "linux")]
+mod lifecycle;
 #[cfg(target_os = "linux")]
 mod mount;
 
 pub use error::MountError;
-pub use options::MountOptions;
+pub use options::{MountMode, MountOptions};
 
 #[cfg(target_os = "linux")]
-pub use mount::{run, Mount};
-
-#[cfg(all(test, target_os = "linux"))]
-mod mount_tests;
+pub use lifecycle::{sweep_stale_mounts, Unmounted};
+#[cfg(target_os = "linux")]
+pub use mount::{run, Invalidator, Mount};

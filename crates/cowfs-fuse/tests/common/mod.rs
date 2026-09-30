@@ -1,0 +1,261 @@
+//! Shared fixtures for the mount tests: a `MemVfs` wrapper with fault injection and counters,
+//! and a mounted fixture with a watchdog. Uses only API that every version of the crate has.
+#![allow(dead_code)]
+
+use std::fs::{self, OpenOptions};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::SeqCst};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+
+use cowfs_fuse::{Mount, MountOptions};
+use cowfs_vfs::*;
+use cowfs_vfs_test::MemVfs;
+use tempfile::TempDir;
+
+/// `MemVfs` plus knobs (delays, panics, bad replies, inode reuse) and call counters.
+#[derive(Default)]
+pub struct Probe {
+    pub inner: MemVfs,
+    pub read_delay_ms: AtomicU64,
+    pub panic_read: AtomicBool,
+    pub bad_attrs: AtomicBool,
+    pub panics: AtomicU64,
+    pub reuse_ino_for_create: Mutex<Option<Ino>>,
+    pub refs: AtomicI64,
+    pub forgotten: AtomicU64,
+    pub opens: AtomicU64,
+    pub releases: AtomicU64,
+    pub flushes: AtomicU64,
+    pub fsyncs: AtomicU64,
+    pub fsyncs_data_only: AtomicU64,
+}
+
+impl Probe {
+    fn hand(&self, r: Result<Attr>) -> Result<Attr> {
+        r.map(|mut a| {
+            self.refs.fetch_add(1, SeqCst);
+            self.tweak(&mut a);
+            a
+        })
+    }
+
+    fn tweak(&self, a: &mut Attr) {
+        if self.bad_attrs.load(SeqCst) {
+            a.size = u64::MAX;
+            a.blocks = u64::MAX;
+            a.mode = 0xFFFF_FFFF;
+            a.nlink = if a.kind == FileKind::Directory {
+                0
+            } else {
+                u32::MAX
+            };
+        }
+    }
+}
+
+impl Vfs for Probe {
+    fn lookup(&self, p: Ino, n: &[u8]) -> Result<Attr> {
+        self.hand(self.inner.lookup(p, n))
+    }
+    fn forget(&self, i: Ino, c: u64) {
+        self.refs.fetch_sub(c as i64, SeqCst);
+        self.forgotten.fetch_add(c, SeqCst);
+        self.inner.forget(i, c)
+    }
+    fn getattr(&self, i: Ino) -> Result<Attr> {
+        self.inner.getattr(i).map(|mut a| {
+            self.tweak(&mut a);
+            a
+        })
+    }
+    fn setattr(&self, i: Ino, c: SetAttr) -> Result<Attr> {
+        self.inner.setattr(i, c)
+    }
+    fn readlink(&self, i: Ino) -> Result<Vec<u8>> {
+        self.inner.readlink(i)
+    }
+    fn create(&self, p: Ino, n: &[u8], m: u32) -> Result<Attr> {
+        let mut r = self.inner.create(p, n, m);
+        if let (Ok(a), Some(ino)) = (&mut r, *self.reuse_ino_for_create.lock().unwrap()) {
+            a.ino = ino;
+        }
+        self.hand(r)
+    }
+    fn mkdir(&self, p: Ino, n: &[u8], m: u32) -> Result<Attr> {
+        self.hand(self.inner.mkdir(p, n, m))
+    }
+    fn symlink(&self, p: Ino, n: &[u8], t: &[u8]) -> Result<Attr> {
+        self.hand(self.inner.symlink(p, n, t))
+    }
+    fn link(&self, i: Ino, p: Ino, n: &[u8]) -> Result<Attr> {
+        self.hand(self.inner.link(i, p, n))
+    }
+    fn unlink(&self, p: Ino, n: &[u8]) -> Result<()> {
+        self.inner.unlink(p, n)
+    }
+    fn rmdir(&self, p: Ino, n: &[u8]) -> Result<()> {
+        self.inner.rmdir(p, n)
+    }
+    fn rename(&self, p: Ino, n: &[u8], p2: Ino, n2: &[u8], f: RenameFlags) -> Result<()> {
+        self.inner.rename(p, n, p2, n2, f)
+    }
+    fn open(&self, i: Ino) -> Result<FileHandle> {
+        let r = self.inner.open(i);
+        if r.is_ok() {
+            self.opens.fetch_add(1, SeqCst);
+        }
+        r
+    }
+    fn release(&self, h: FileHandle) -> Result<()> {
+        let r = self.inner.release(h);
+        if r.is_ok() {
+            self.releases.fetch_add(1, SeqCst);
+        }
+        r
+    }
+    fn read(&self, i: Ino, o: u64, s: u32) -> Result<Vec<u8>> {
+        let d = self.read_delay_ms.load(SeqCst);
+        if d > 0 {
+            std::thread::sleep(Duration::from_millis(d));
+        }
+        if self.panic_read.load(SeqCst) {
+            self.panics.fetch_add(1, SeqCst);
+            panic!("injected Vfs panic");
+        }
+        self.inner.read(i, o, s)
+    }
+    fn write(&self, i: Ino, o: u64, d: &[u8]) -> Result<u32> {
+        self.inner.write(i, o, d)
+    }
+    fn flush(&self, i: Ino) -> Result<()> {
+        self.flushes.fetch_add(1, SeqCst);
+        self.inner.flush(i)
+    }
+    fn fsync(&self, i: Ino, data_only: bool) -> Result<()> {
+        self.fsyncs.fetch_add(1, SeqCst);
+        if data_only {
+            self.fsyncs_data_only.fetch_add(1, SeqCst);
+        }
+        self.inner.fsync(i, data_only)
+    }
+    fn readdir(&self, d: Ino, c: u64, m: usize) -> Result<ReadDir> {
+        self.inner.readdir(d, c, m)
+    }
+    fn statfs(&self) -> Result<StatFs> {
+        self.inner.statfs()
+    }
+    fn getxattr(&self, i: Ino, n: &[u8]) -> Result<Vec<u8>> {
+        self.inner.getxattr(i, n)
+    }
+    fn setxattr(&self, i: Ino, n: &[u8], v: &[u8], f: XattrFlags) -> Result<()> {
+        self.inner.setxattr(i, n, v, f)
+    }
+    fn listxattr(&self, i: Ino) -> Result<Vec<Vec<u8>>> {
+        self.inner.listxattr(i)
+    }
+    fn removexattr(&self, i: Ino, n: &[u8]) -> Result<()> {
+        self.inner.removexattr(i, n)
+    }
+}
+
+pub fn fuse_usable() -> bool {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .is_ok()
+        && ["fusermount3", "fusermount"]
+            .iter()
+            .any(|b| Command::new(b).arg("-V").output().is_ok())
+}
+
+pub fn is_mounted(dir: &std::path::Path) -> bool {
+    let want = dir.to_string_lossy().into_owned();
+    fs::read_to_string("/proc/mounts")
+        .unwrap()
+        .lines()
+        .any(|l| l.split(' ').nth(1) == Some(want.as_str()))
+}
+
+pub fn errno(r: std::io::Result<impl Sized>) -> i32 {
+    r.err().and_then(|e| e.raw_os_error()).unwrap_or(0)
+}
+
+/// A mounted `Probe`. A watchdog lazily unmounts after three minutes, so a hung test fails
+/// with `ENOTCONN` instead of hanging the run.
+pub struct Fixture {
+    pub mount: Option<Mount>,
+    pub vfs: Arc<Probe>,
+    pub dir: PathBuf,
+    pub tmp: TempDir,
+    _watchdog: mpsc::Sender<()>,
+}
+
+impl Fixture {
+    pub fn new(opts: &str) -> Option<Self> {
+        Self::with(opts, |_| {})
+    }
+
+    /// `prepare` runs on the bare `MemVfs` before the mount exists.
+    pub fn with(opts: &str, prepare: impl FnOnce(&MemVfs)) -> Option<Self> {
+        if !fuse_usable() {
+            eprintln!("SKIP: /dev/fuse or fusermount3 not usable");
+            return None;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("mnt");
+        fs::create_dir(&dir).unwrap();
+        let vfs = Arc::new(Probe::default());
+        prepare(&vfs.inner);
+        let opts: MountOptions = opts.parse().unwrap();
+        let mount = Mount::new(vfs.clone(), &dir, opts).unwrap();
+        let (tx, rx) = mpsc::channel::<()>();
+        let d = dir.clone();
+        std::thread::spawn(move || {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(Duration::from_secs(180))
+            {
+                eprintln!("WATCHDOG: test hung, unmounting {}", d.display());
+                let _ = Command::new("fusermount3")
+                    .arg("-u")
+                    .arg("-z")
+                    .arg(&d)
+                    .status();
+            }
+        });
+        Some(Self {
+            mount: Some(mount),
+            vfs,
+            dir,
+            tmp,
+            _watchdog: tx,
+        })
+    }
+
+    pub fn p(&self, n: &str) -> PathBuf {
+        self.dir.join(n)
+    }
+
+    /// The `MemVfs` under the wrapper: changes made through it are "behind the mount" and are
+    /// not counted.
+    pub fn raw(&self) -> &MemVfs {
+        &self.vfs.inner
+    }
+
+    pub fn mount(&self) -> &Mount {
+        self.mount.as_ref().unwrap()
+    }
+}
+
+/// Polls `f` every 20 ms for up to `secs` seconds.
+pub fn eventually(secs: u64, mut f: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + Duration::from_secs(secs);
+    while std::time::Instant::now() < end {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    f()
+}

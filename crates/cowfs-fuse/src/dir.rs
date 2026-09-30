@@ -44,15 +44,22 @@ pub trait DirSink {
     fn add(&mut self, ino: Ino, offset: i64, kind: FileKind, name: &[u8]) -> bool;
 }
 
-/// Lists `dir` from FUSE `offset` into `sink`, synthesizing `.` and `..`.
-/// Both synthesized entries carry the directory's own inode number, because the `Vfs`
-/// has no parent lookup and the kernel does not use the value.
-pub fn fill(vfs: &dyn Vfs, dir: Ino, offset: i64, sink: &mut dyn DirSink) -> Result<()> {
+/// Lists `dir` from FUSE `offset` into `sink`, synthesizing `.` (the directory itself) and
+/// `..` (`parent`, which the caller tracks because the `Vfs` has no parent lookup).
+pub fn fill(
+    vfs: &dyn Vfs,
+    dir: Ino,
+    parent: Ino,
+    offset: i64,
+    sink: &mut dyn DirSink,
+) -> Result<()> {
     let start = start_position(offset)?;
     if start == Start::Dot && sink.add(dir, 1, FileKind::Directory, b".") {
         return Ok(());
     }
-    if matches!(start, Start::Dot | Start::DotDot) && sink.add(dir, 2, FileKind::Directory, b"..") {
+    if matches!(start, Start::Dot | Start::DotDot)
+        && sink.add(parent, 2, FileKind::Directory, b"..")
+    {
         return Ok(());
     }
     let mut cookie = match start {
@@ -105,7 +112,7 @@ mod tests {
                 cap: page,
                 got: vec![],
             };
-            fill(vfs, dir, offset, &mut sink).unwrap();
+            fill(vfs, dir, 1, offset, &mut sink).unwrap();
             let Some(last) = sink.got.last() else { break };
             offset = last.0;
             names.extend(sink.got.into_iter().map(|(_, n)| n));
@@ -154,13 +161,13 @@ mod tests {
             cap: 0,
             got: vec![],
         };
-        fill(&vfs, 1, 0, &mut sink).unwrap();
+        fill(&vfs, 1, 1, 0, &mut sink).unwrap();
         assert!(sink.got.is_empty());
         let mut sink = Collect {
             cap: 1,
             got: vec![],
         };
-        fill(&vfs, 1, 0, &mut sink).unwrap();
+        fill(&vfs, 1, 1, 0, &mut sink).unwrap();
         assert_eq!(sink.got, [(1, b".".to_vec())]);
     }
 
@@ -177,7 +184,7 @@ mod tests {
                 cap: 10,
                 got: vec![],
             };
-            fill(&vfs, 1, offset, &mut sink).unwrap();
+            fill(&vfs, 1, 1, offset, &mut sink).unwrap();
             let Some(last) = sink.got.last() else { break };
             offset = last.0;
             for (_, n) in &sink.got {
@@ -195,6 +202,25 @@ mod tests {
     }
 
     #[test]
+    fn dot_entries_carry_the_directory_and_its_parent() {
+        struct Inos(Vec<(Vec<u8>, Ino)>);
+        impl DirSink for Inos {
+            fn add(&mut self, ino: Ino, _: i64, _: FileKind, n: &[u8]) -> bool {
+                self.0.push((n.to_vec(), ino));
+                false
+            }
+        }
+        let vfs = MemVfs::new();
+        let d = vfs.mkdir(1, b"d", 0o755).unwrap().ino;
+        let mut s = Inos(vec![]);
+        fill(&vfs, d, 99, 0, &mut s).unwrap();
+        assert_eq!(s.0, [(b".".to_vec(), d), (b"..".to_vec(), 99)]);
+        let mut s = Inos(vec![]);
+        fill(&vfs, d, 99, 1, &mut s).unwrap();
+        assert_eq!(s.0, [(b"..".to_vec(), 99)]);
+    }
+
+    #[test]
     fn rejects_bad_offsets_and_unrepresentable_cookies() {
         struct Bad;
         impl DirSink for Bad {
@@ -204,9 +230,9 @@ mod tests {
         }
         let vfs = MemVfs::new();
         vfs.create(1, b"a", 0o644).unwrap();
-        assert!(fill(&vfs, 1, 2, &mut Bad).is_ok());
-        assert_eq!(fill(&vfs, 1, -3, &mut Bad), Err(Error::InvalidArgument));
+        assert!(fill(&vfs, 1, 1, 2, &mut Bad).is_ok());
+        assert_eq!(fill(&vfs, 1, 1, -3, &mut Bad), Err(Error::InvalidArgument));
         let broken = MemVfs::with_fault(Fault::DotEntries);
-        assert_eq!(fill(&broken, 1, 2, &mut Bad), Err(Error::Range));
+        assert_eq!(fill(&broken, 1, 1, 2, &mut Bad), Err(Error::Range));
     }
 }

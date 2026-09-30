@@ -2,7 +2,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cowfs_vfs::{RenameFlags, Timestamp, XattrFlags};
+use cowfs_vfs::{Attr, FileKind, RenameFlags, Timestamp, XattrFlags, MODE_MASK};
 
 const S_IFMT: u32 = 0o170_000;
 const S_IFREG: u32 = 0o100_000;
@@ -10,6 +10,7 @@ const RENAME_NOREPLACE: u32 = 1;
 const RENAME_EXCHANGE: u32 = 2;
 const XATTR_CREATE: i32 = 1;
 const XATTR_REPLACE: i32 = 2;
+const MAX_NLINK: u32 = 1 << 30;
 
 /// Converts a timestamp to `SystemTime`, saturating to the epoch if it is out of range.
 pub fn to_system_time(ts: Timestamp) -> SystemTime {
@@ -108,6 +109,53 @@ pub fn encode_xattr_names(names: &[Vec<u8>]) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+/// Clamps an `Attr` from the `Vfs` to what the kernel accepts, so one bad reply cannot make
+/// `stat` fail for the whole mount. Returns the clamped attributes and whether anything changed.
+/// A live file reports at least one link, a directory at least two; zero links are kept only
+/// when `unlinked_ok` (an unlinked file that is still open).
+pub fn sanitize(a: &Attr, unlinked_ok: bool) -> (Attr, bool) {
+    let mut o = *a;
+    o.mode &= MODE_MASK;
+    o.size = o.size.min(i64::MAX as u64);
+    o.blocks = o.blocks.min(i64::MAX as u64 >> 9);
+    let min_links = match (o.kind, unlinked_ok) {
+        (FileKind::Directory, _) => 2,
+        (_, true) => 0,
+        _ => 1,
+    };
+    o.nlink = o.nlink.clamp(min_links, MAX_NLINK);
+    (o, o != *a)
+}
+
+/// Answers `SEEK_DATA` and `SEEK_HOLE`: the `Vfs` has no hole information, so everything below
+/// `size` is data and the only hole starts at the end of the file.
+pub fn seek(whence: i32, offset: i64, size: u64) -> Result<i64, i32> {
+    let Ok(off) = u64::try_from(offset) else {
+        return Err(libc::EINVAL);
+    };
+    if off >= size {
+        return Err(libc::ENXIO);
+    }
+    match whence {
+        libc::SEEK_DATA => Ok(offset),
+        libc::SEEK_HOLE => i64::try_from(size).map_err(|_| libc::EINVAL),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+/// Only `user.*` and `security.*` (and `trusted.*` for root) are extended attributes cowfs
+/// stores. `system.*` (POSIX ACLs) and unknown namespaces are `ENOTSUP`, as the kernel does.
+pub fn xattr_name_ok(name: &[u8], root: bool) -> Result<(), i32> {
+    let trusted = name.starts_with(b"trusted.");
+    if name.starts_with(b"user.") || name.starts_with(b"security.") || (trusted && root) {
+        Ok(())
+    } else if trusted {
+        Err(libc::EPERM)
+    } else {
+        Err(libc::ENOTSUP)
+    }
 }
 
 /// Mode-bit permission check for `access(2)` as the mounter's uid and gid.
@@ -242,6 +290,65 @@ mod tests {
         ));
         assert!(!access_allowed(0o644, 1000, 100, 0, 0, libc::X_OK));
         assert!(access_allowed(0o744, 1000, 100, 0, 0, libc::X_OK));
+    }
+
+    #[test]
+    fn sanitize_clamps_what_the_kernel_would_reject() {
+        use cowfs_vfs::Timestamp;
+        let t = Timestamp::default();
+        let mut a = Attr {
+            ino: 3,
+            kind: FileKind::Directory,
+            mode: 0xFFFF_FFFF,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            size: u64::MAX,
+            blocks: u64::MAX,
+            atime: t,
+            mtime: t,
+            ctime: t,
+        };
+        let (o, changed) = sanitize(&a, false);
+        assert!(changed);
+        assert_eq!((o.mode, o.size, o.nlink), (MODE_MASK, i64::MAX as u64, 2));
+        assert!(o.blocks <= i64::MAX as u64 >> 9);
+        a.kind = FileKind::Regular;
+        a.mode = 0o644;
+        a.size = 5;
+        a.blocks = 1;
+        a.nlink = 1;
+        assert_eq!(sanitize(&a, false), (a, false));
+        a.nlink = 0;
+        assert_eq!(sanitize(&a, false).0.nlink, 1);
+        assert_eq!(sanitize(&a, true), (a, false));
+        a.nlink = u32::MAX;
+        assert_eq!(sanitize(&a, false).0.nlink, MAX_NLINK);
+    }
+
+    #[test]
+    fn seek_treats_everything_as_data() {
+        assert_eq!(seek(libc::SEEK_DATA, 3, 10), Ok(3));
+        assert_eq!(seek(libc::SEEK_HOLE, 3, 10), Ok(10));
+        assert_eq!(seek(libc::SEEK_DATA, 10, 10), Err(libc::ENXIO));
+        assert_eq!(seek(libc::SEEK_HOLE, 99, 10), Err(libc::ENXIO));
+        assert_eq!(seek(libc::SEEK_DATA, -1, 10), Err(libc::EINVAL));
+        assert_eq!(seek(libc::SEEK_SET, 1, 10), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn xattr_namespaces() {
+        assert_eq!(xattr_name_ok(b"user.a", false), Ok(()));
+        assert_eq!(xattr_name_ok(b"security.selinux", false), Ok(()));
+        assert_eq!(xattr_name_ok(b"trusted.x", true), Ok(()));
+        assert_eq!(xattr_name_ok(b"trusted.x", false), Err(libc::EPERM));
+        assert_eq!(
+            xattr_name_ok(b"system.posix_acl_access", true),
+            Err(libc::ENOTSUP)
+        );
+        assert_eq!(xattr_name_ok(b"system.foo", false), Err(libc::ENOTSUP));
+        assert_eq!(xattr_name_ok(b"nonamespace", false), Err(libc::ENOTSUP));
+        assert_eq!(xattr_name_ok(b"", false), Err(libc::ENOTSUP));
     }
 
     #[test]
