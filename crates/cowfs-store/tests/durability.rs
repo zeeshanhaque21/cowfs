@@ -43,7 +43,7 @@ fn assert_in_order_msg(ops: &[Op], want: &[Op], msg: &str) {
     for w in want {
         assert!(
             it.any(|o| o == w),
-            "{w:?} missing or out of order in {ops:#?}"
+            "{msg}: {w:?} missing or out of order in {ops:#?}"
         );
     }
 }

@@ -589,11 +589,8 @@ fn q2_repair_beats_stale_checkpoint_entry() {
         .write(true)
         .open(pack_path(dir.path(), 0))
         .unwrap();
-    f.write_at(
-        &[0xAB; 8],
-        (PACK_HEADER.len() as u64 + REC_HDR as u64 + 100) as u64,
-    )
-    .unwrap();
+    f.write_at(&[0xAB; 8], PACK_HEADER.len() as u64 + REC_HDR as u64 + 100)
+        .unwrap();
     drop(f);
     {
         let s = open(dir.path());
@@ -632,11 +629,8 @@ fn v1_bit_rot_after_verify_in_the_same_session_is_a_known_window() {
             .write(true)
             .open(pack_path(dir.path(), 0))
             .unwrap();
-        f.write_at(
-            &[0xAB; 8],
-            (PACK_HEADER.len() as u64 + REC_HDR as u64 + 100) as u64,
-        )
-        .unwrap();
+        f.write_at(&[0xAB; 8], PACK_HEADER.len() as u64 + REC_HDR as u64 + 100)
+            .unwrap();
         drop(f);
         assert!(
             s.put(&d).is_ok(),
