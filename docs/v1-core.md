@@ -43,6 +43,8 @@ An alias costs about 40 bytes per file created by this mount session that still 
 Virtual numbers do not survive a restart: after a restart the same file has its meta-derived number.
 No adapter keeps file handles across a restart of the process that owns the mount, so this is documented and accepted.
 Snapshot ids and meta inode numbers are never reused, so a number never names two files.
+The meta-derived number is exactly `Meta::pack_ino(snapshot id, meta inode)`, so the layout is meta's and restart stable by construction.
+A test (`an_inode_number_is_never_reused_for_another_file`) checks that no number names two files across unlink and create, snapshot delete and create, and two restarts.
 
 ## The synthetic root
 
@@ -129,10 +131,14 @@ What survives is always a prefix of the operations of each snapshot, cut at a ba
 Every operation is atomic: a rename, a create, or a write that reached the set-content stage is either fully there or fully absent.
 File content updates are committed when the file's data is flushed, which can be later than namespace operations that followed the write, as with delayed allocation elsewhere.
 
+The queue also has a hard bound: an operation that finds four times `max_pending_ops` queued flushes in its own thread, so the queue is bounded even with `Options::background` off.
+Since the meta rewrite, meta has its own timer and group commit, so `Meta::sync` from the flusher and from `fsync` shares a commit with whatever else is pending.
+`Core` only decides when its queue becomes a meta batch; when that batch becomes durable is meta's policy plus `fsync` and `sync`.
+
 `flush(ino)` does nothing, as the trait allows.
 `fsync(ino)` flushes that file's data, commits the snapshot's whole queue (so the file's name and its parents are durable), then calls `Meta::sync`, which runs the store sync first.
 `data_only` does not change what is done, because a commit is one transaction either way.
-Dropping the last `Core` handle stops the flusher and does the same as `sync`.
+Dropping the last `Core` handle stops the flusher, does the same as `sync`, and then calls `Meta::close` (whose error a drop cannot report; call `Core::sync` first when the result matters).
 
 ### Ordering with the store (no dangling chunk)
 
@@ -224,6 +230,12 @@ Control operations that change a snapshot's content from the outside (remove) pu
 - GC (#10) must treat the chunks of open orphans and of blocks put after its mark started as live: `Core::pinned_blocks()` returns the chunk ids held by open orphans and by files with an uncommitted chunk list.
 - Data of an orphan is only in the store and in memory, so it is lost on a crash, as POSIX allows.
 
+## Opening a damaged store
+
+`Core::from_parts` refuses to open when `Store::recovery().has_corruption()` (durable bytes were lost to damage, or the watermark is missing and there are gaps): the error is `Corrupt`.
+The store quarantines the damaged region and never serves it, so refusing is a policy choice of the mount layer, not a safety requirement.
+Test: `a_store_that_lost_durable_data_is_not_opened`.
+
 ## Errors
 
 One table, `error::from_meta` and `error::from_store`, tested case by case.
@@ -266,7 +278,15 @@ A batch commit is done with no namespace lock held, so namespace operations cont
 
 ## Requests of store and meta
 
+State at the merge of `origin/v1/8-9-meta` (commit 687ff4b) and `origin/v1/7-block-store`.
 None of these blocks the crate, each has a workaround stated here.
+
+Landed and adopted: `before_sync` after the batch closure, `Meta::close`, `Meta::pack_ino`, the durable inode reservation (numbers are never reused), the store's `corrupt_synced` refusal, the new error variants (mapped in the error table).
+Landed and not yet used by `Core`: `Snapshot::chunk_range`, `Tx::splice_content` (with the version check) and `Error::NeedsRechunk`.
+`Core` still reads a file's whole chunk list on first use and commits it with `set_content`, which is O(chunks in the file) per commit.
+Moving to `chunk_range` and `splice_content` is the next step for multi-GiB files and is not needed at the measured sizes.
+
+Not landed:
 
 1. `Meta::rename_snapshot(id, new_name)` (atomic, keeps the id).
    Workaround: fork plus remove, which changes ids and is not atomic.
@@ -274,12 +294,11 @@ None of these blocks the crate, each has a workaround stated here.
 2. `Snapshot::batch_at(now: Timestamp, f)` or `Tx::set_now`, so that ctime (and creation times) of deferred operations are the times the operations happened.
    Workaround: atime and mtime are restored with `setattr`; ctime in meta is the batch time, up to `flush_interval` late.
    Cached ctime is exact while the node is cached.
-3. GC (#10) must skip chunk refs with an all-zero id (holes), must not free blocks named only by an open orphan or by an uncommitted chunk list (`Core::pinned_blocks`), and must not free a block put after its mark started.
-   A first-class hole flag in `ChunkRef` would be cleaner; `ChunkRef` is in the store crate.
-4. `Meta::reserve_inodes(n)` (or `Tx::create_with_ino`), which would remove the virtual inode numbers and the alias table.
-5. `Snapshot::chunks` reads the whole chunk list.
-   A ranged read (`chunks_at(ino, offset)`) would keep the first read of a multi-GiB file from loading every segment.
-   Not needed at the measured sizes.
+3. A first-class hole flag in `ChunkRef` (`ChunkRef` is in the store crate).
+   Workaround: an all-zero block id is a hole.
+   GC (#10) must skip those refs, must not free blocks named only by an open orphan or by an uncommitted chunk list (`Core::pinned_blocks`), and must not free a block put after its mark started.
+4. `Meta::reserve_inodes(n)` or `Tx::create_with_ino`, which would remove the virtual inode numbers and the alias table.
+   Meta now reserves durably inside itself, but a caller still cannot get a number before the transaction that creates the inode.
 
 ## Decisions for the lead to review
 
@@ -291,7 +310,108 @@ None of these blocks the crate, each has a workaround stated here.
 6. No atime update on read.
 7. Data lost on crash is bounded by the write-back limits above; content updates can commit later than later namespace operations.
 8. Snapshot removal is refused while a handle is open in it, and makes its inode numbers `Stale` even when references remain.
+9. `statfs` free space counts pack bytes, so blocks of a file that was flushed to the store and then deleted are only returned by GC (#10).
+   The conformance check `statfs_free_after_unlink` passes only while the deleted file's data is unflushed, so the suite runs with the background flusher off (`tests/conformance.rs`).
+   The lead should decide whether that check should stay at the `Cowfs` level before GC exists.
+10. The `Core` open path refuses a store that lost durable data (see "Opening a damaged store").
+11. Two conformance-relevant readings that changed with the revised suite: `readdir` with `max` 0 is `InvalidArgument`, and an xattr name with a NUL is `InvalidArgument`.
 
 ## Tests
 
-Listed with results in the "Measurements and results" section once they have run.
+All in `crates/cowfs-core/tests` unless noted.
+Counts are from the runs recorded below (`cargo test -p cowfs-core` after merging the meta fixes).
+
+| Category | File | Tests | What it proves |
+|---|---|---|---|
+| Unit | `src/` | 11 | inode shapes, alias table, error tables (meta and store, case by case), file extents, holes, truncate, append chunking |
+| Conformance | `conformance.rs` | 127 pass, 2 heavy | the whole `cowfs-vfs-test` suite through a `Core` snapshot view (levels Posix, Portable, Cowfs), plus the 2 heavy checks run separately |
+| Core behaviour | `core.rs` | 18 | mount root, snapshot rules, fork isolation both ways, persistence, dedup by byte counts, 1 TiB sparse file with RSS bound, forget accounting over 100,000 create and unlink cycles, batching, corrupt block is EIO, damaged store refused, Merkle root iff content, control plane, unlink while open, elision, background flusher, inode numbers never reused |
+| Model | `model.rs` | 2 proptests | `Core` against `MemVfs` on random sequences including forks, handles, restarts and cache drops, with tiny and default cache sizes |
+| Partial chunks | `chunks.rs` | 2 proptests and 1 boundary test | random write, truncate and extend against a `Vec<u8>`, offsets and lengths on and around 16 KiB, 64 KiB and 256 KiB, with eager flushing and with cache drops; sequential appends dedup with a one-shot write |
+| Crash images | `crash.rs` | 2 | power-loss simulation, see below, plus a negative control that must fail |
+| kill -9 | `kill9.rs` | 1 (plus the child) | SIGKILL of a writing process with the background flusher on |
+| Stress | `stress.rs` | 3 | overlapping writers to one file, many files with snapshot forks and renames, directory churn, all under a deadlock watchdog |
+
+The 8,000 hardlink pairs, delete-while-listing and the read-only-mode 0444 and 0400 checks (20 rounds of 8 MiB with fsync) are conformance checks and run through `Core`.
+
+### Crash injection (`crash.rs`)
+
+The metadata database sits on a recording redb backend and the store is a real directory.
+A seeded workload of creates, overlapping writes, truncates, renames, unlinks, hardlinks, snapshot forks, `fsync` and flushes runs on a `Core`.
+At random operation boundaries the test records the length of the backend log, a copy of the store files and what the model says is durable.
+Each point becomes four crash images: metadata rebuilt from the log with everything, with only synced writes, and twice with synced writes plus a random subset of later writes each possibly torn; the store's last pack is cut at a random byte beyond the durable watermark, and the index checkpoint is kept or dropped at random.
+Every image is reopened and must: open without corruption, pass `Meta::check`, have a clean `Store::fsck`, contain every snapshot that had an `fsync`, read back every file untouched since its `fsync` byte for byte (a dangling chunk is a read error and fails the test), read every other file without error, accept a new fsynced write, and survive a second reopen.
+A file changed after its last `fsync` is only required to read without error, because either version is allowed.
+The negative control runs the same workload with the store sync removed from the meta hook and must find a dangling chunk; it does (`Corrupt("block ... named by a file is missing")`), so the test can see the bug it guards against.
+
+### Kill -9 (`kill9.rs`)
+
+A child process runs a workload (truncate and rewrite of 40 files with sizes up to 600 KB, a create and unlink churn) with the background flusher at 30 ms and `fsync` every fifth step, printing progress.
+The parent kills it at a random moment between 0.4 and 2.6 s, reopens, and checks: no corruption reported, `check()`, clean `fsck`, and every file whose last fsynced step is known holds one of the contents written at or after that step (or is empty from a truncate).
+
+## Results
+
+Machine: Apple M3 Max, APFS, shared with about 20 other sessions, load1 between 21 and 205 during the runs below, so every timing is a noisy lower bound.
+
+| Run | Result |
+|---|---|
+| `cargo test -p cowfs-core --test conformance` | 127 passed, 0 failed, 2 ignored (heavy) |
+| `COWFS_CONFORMANCE_HEAVY=1 cargo test -p cowfs-core --test conformance -- --ignored` | 2 passed (`roundtrip_8_mib`, `readdir_50000_entries`) |
+| `COWFS_CRASH_SEEDS=3 COWFS_CRASH_OPS=120 cargo test -p cowfs-core --test crash` | 280 crash images over 3 workloads, 0 failures; negative control fails as required |
+| `COWFS_KILL_ROUNDS=120 cargo test -p cowfs-core --test kill9` | 120 rounds, 7,849 steps completed, 7,400 fsynced steps, 0 failures, 0 rounds killed before the first step |
+| `PROPTEST_CASES=300 cargo test -p cowfs-core --test model` | 2 tests, 300 cases each, 0 failures |
+| default `cargo test -p cowfs-core` | see the verification run in the PR |
+
+Defaults are smaller than these runs to keep `cargo test --workspace` short: 1 crash workload of 60 operations, 8 kill rounds, 32 and 24 proptest cases.
+`COWFS_CRASH_SEEDS`, `COWFS_CRASH_OPS`, `COWFS_KILL_ROUNDS` and `PROPTEST_CASES` raise them.
+
+## Measurements
+
+Source: `cargo run --release -p cowfs-core --example bench` (`COWFS_BENCH_QUICK=1` for a smoke run), after the merge of the meta fixes.
+Every timed batch ran under the shared CPU lock, n=5, median shown, ranges in the raw output.
+Load1 was 54 at the start and 47 at the end and between 66 and 111 during the rows, so every row is flagged high load.
+The baseline is the same operation with `std::fs` on the same APFS volume.
+"time ratio" is the median time of cowfs-core divided by the median time of the baseline, so below 1 means faster than the baseline.
+
+| Metric | cowfs-core | std::fs | time ratio |
+|---|---|---|---|
+| create 20,000 files (334 MiB, mixed sizes) then durable | 8,905 files/s | 4,002 files/s (no fsync) | 0.45 |
+| lookup hit, cold caches, 10,000 names | 498,411 /s | 349,885 /s | 0.70 |
+| lookup hit, warm | 667,000 /s | 365,445 /s | 0.55 |
+| lookup miss, cold | 788,895 /s | 638,203 /s | 0.81 |
+| lookup miss, warm (negative entries) | 2,718,869 /s | 460,138 /s | 0.17 |
+| getattr of 10,000 held inodes, warm | 8,624,095 /s | 410,042 /s | 0.05 |
+| cargo no-op lookup replay, cold (16,000 lookups: 2,000 hit, 14,000 miss, synthetic) | 697,884 /s | 545,933 /s | 0.78 |
+| same replay, warm | 3,287,587 /s | 543,500 /s | 0.17 |
+| sequential write 1 GiB with fsync | 239 MiB/s | 1,396 MiB/s | 5.84 |
+| sequential read 1 GiB, caches dropped | 637 MiB/s | 11,326 MiB/s | 17.79 |
+| random 4 KiB read, 256 MiB file, caches dropped | 16,003 /s | 914,042 /s | 57.12 |
+| random 4 KiB write plus fsync, 5,000 ops | 2,554 /s | 35,638 /s | 13.95 |
+| snapshot create (durable), 1,000 files | 95 /s (10 to 11 ms) | - | - |
+| snapshot create (durable), 100,000 files | 71 /s (12 to 21 ms) | `cp -cR` 0.02 /s | 0.00 |
+| floor: `Store::ingest_bytes` plus sync of 1 GiB, no Core | 347 MiB/s | - | - |
+| floor: FastCDC plus BLAKE3 only | 658 MiB/s | - | - |
+
+What they show and do not show:
+
+- The lookup numbers are the ones the issue #18 workload depends on.
+  Warm negative lookups are 0.33 us each and the synthetic replay of a cargo no-op build's lookup mix runs about 6 times faster than raw `std::fs` when warm and in the same range when cold.
+  The replay is synthetic (a random mix of 2,000 hits and 14,000 misses over 200 directories), not a recording, so it is a rate, not a build time.
+- The native baseline for data is the macOS page cache, which cowfs cannot match: sequential read is 17.8 times slower than a warm page-cache read and random 4 KiB reads 57 times, because each read of a cold block fetches, decompresses and hashes a whole block of up to 256 KiB.
+  These rows are not within the 1.5x target of `docs/design.md` and the target is not claimed here.
+  The target is about a `cargo build` and `git status`, which are dominated by the lookup rows and by writes of build output, neither of which this benchmark runs end to end.
+- Sequential write is 239 MiB/s against a store-only floor of 347 MiB/s, at load up to 111 (range 3.7 to 8.2 s), so the gap to the floor is inside the noise and is not attributed to `Core`.
+  In an earlier run at load 65 the two were 397 and 369 MiB/s.
+- Snapshot create is flat between 1,000 and 100,000 files within the noise and is dominated by the durable commit.
+  The 100,000-file tree took 3.1 s to build durably (32,657 files/s).
+- One profile-guided fix was made: a cold lookup used to read meta twice (the lookup, then the inode for the node table).
+  It now seeds the node table from the lookup's attributes.
+  Its effect was not isolated at n=5 under this load, so no speedup is claimed; by construction it removes one meta read per cold hit.
+
+## Known gaps
+
+- Chunk lists are loaded whole and committed whole (see "Requests of store and meta").
+- Blocks of deleted data are only reclaimed by GC (#10), so `statfs` free space does not grow after a flushed file is deleted.
+- Only `fsync` and the timers make data durable; `flush` does nothing.
+- The virtual inode numbers and the alias table remain until meta can hand out inode numbers ahead of a transaction.
+- No mount adapter has been run against `Core` yet; the suite runs through the `Vfs` trait only.
