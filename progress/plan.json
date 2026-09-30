@@ -193,12 +193,13 @@
         {
           "id": "29",
           "title": "#29 cowfs-vfs trait, MemVfs and conformance suite",
-          "state": "building",
-          "owner": "subagent",
+          "state": "reviewing",
+          "owner": "critic (subagent)",
           "issue": 29,
           "pr": "#30",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/30",
-          "detail": "Trait and types done (PR #27). MemVfs plus a generic conformance suite with mutation checks are being built. Every backend must pass the suite. Worktree slot 4, branch v1/vfs-test."
+          "detail": "Builder done: MemVfs, 116 checks (2 heavy), oracle proptest and 15 mutation faults all caught; I re-ran: 114 pass + 2 ignored, oracle test passes (the earlier oracle failure is fixed), fmt/clippy clean, trait crate untouched. Critic is validating the oracle against real APFS, btrfs and ext4, auditing assertions for wrong POSIX claims, and running 15+ new mutations.",
+          "ci": "CI: linux pass, macos pending"
         },
         {
           "id": "26",
@@ -206,6 +207,16 @@
           "state": "blocked",
           "issue": 26,
           "detail": "The layer the original plan lacked: file IO, write-back cache, re-chunking, open-handle tracking, snapshot namespace. Starts when the store, meta and conformance suite land."
+        },
+        {
+          "id": "34",
+          "title": "#34 cowfs-vfs-path: run the suite on native filesystems and through mounts",
+          "state": "building",
+          "owner": "subagent",
+          "issue": 34,
+          "pr": "#35",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/35",
+          "detail": "Path-based Vfs over a directory. Native APFS and Linux runs are the control; the same suite through the FUSE and NFS mounts finds adapter bugs. Worktree slot 8, branch v1/pathvfs."
         }
       ]
     },
