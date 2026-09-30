@@ -103,6 +103,11 @@ impl Mirror {
     fn open_for_write(p: &Path) -> io::Result<File> {
         match OpenOptions::new().write(true).open(p) {
             Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
+                static PERM_FLIP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                let _g = PERM_FLIP.lock().unwrap_or_else(|e| e.into_inner());
+                if let Ok(f) = OpenOptions::new().write(true).open(p) {
+                    return Ok(f);
+                }
                 let orig = fs::metadata(p)?.permissions();
                 fs::set_permissions(p, fs::Permissions::from_mode(orig.mode() | 0o200))?;
                 let r = OpenOptions::new().write(true).open(p);

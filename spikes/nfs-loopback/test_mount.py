@@ -278,5 +278,24 @@ def _():
     assert r.returncode == 0 and r.stdout.strip() == "ok", (r.stdout + r.stderr)[-400:]
 
 
+@check("read-only-mode files: 8 MiB write+fsync x20 each (0444, 0400)")
+def _():
+    data = os.urandom(8 << 20)
+    fails = []
+    for mode in (0o444, 0o400):
+        for i in range(20):
+            path = P(f"ro_{oct(mode)[2:]}_{i}")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            try:
+                os.write(fd, data)
+                os.fsync(fd)
+            except OSError as e:
+                fails.append(f"{oct(mode)}#{i}:{e.errno}")
+            finally:
+                os.close(fd)
+            assert os.stat(path).st_mode & 0o777 == mode, f"mode drifted to {oct(os.stat(path).st_mode)}"
+    assert not fails, f"{len(fails)}/40 failed: {fails[:4]}"
+
+
 bad = [n for n, s in results if s != "PASS"]
 print(f"\n{len(results) - len(bad)}/{len(results)} passed. Not passing: {bad}")

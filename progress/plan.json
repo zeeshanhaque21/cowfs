@@ -33,10 +33,10 @@
         {
           "id": "4",
           "title": "#4 .git inside the filesystem",
-          "state": "running",
+          "state": "done",
           "issue": 4,
-          "owner": "subagent",
-          "detail": "Git workloads with .git on the mount vs native vs a native .git overlay, plus the worktree pattern. Running."
+          "owner": "lead",
+          "detail": "Reads fine with .git on the mount (status 1.3x, log 1.1x). Writes: add -A 3.9x, commit 3.9x; native .git overlay gives 1.1x and 1.7x. Checkout 9-11x, worktree add 11x, cold status 6.6x in both layouts (working-tree file ops). Found and fixed a write race on read-only-mode files; one unexplained corrupt idx (#21). Large-repo n=3-5, load 15-62. docs/spikes/4-git-inside-the-filesystem.md"
         },
         {
           "id": "5",
@@ -75,6 +75,13 @@
           "state": "ready",
           "issue": 20,
           "detail": "Propose upstream fd detection to treehouse, add a cowfs control-API process list, decide how .nfs entries are handled."
+        },
+        {
+          "id": "21",
+          "title": "#21 v1: data integrity - corrupt idx unexplained, readdir cookie",
+          "state": "ready",
+          "issue": 21,
+          "detail": "Write race fixed and regression-checked. Corrupt idx not reproduced, needs a soak on the fixed server. Readdir cookie still position-based."
         }
       ]
     },
