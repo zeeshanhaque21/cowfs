@@ -58,7 +58,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use cowfs_vfs::{
     validate_name, Attr, DirEntry, Error, FileHandle, FileKind, Ino, ReadDir, RenameFlags, Result,
-    SetAttr, SetTime, StatFs, Vfs, XattrFlags, MODE_MASK, ROOT_INO,
+    SetAttr, SetTime, StatFs, Vfs, XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
 };
 
 mod cookies;
@@ -461,6 +461,9 @@ impl Vfs for PathVfs {
     }
 
     fn readdir(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDir> {
+        if max == 0 {
+            return Err(Error::InvalidArgument);
+        }
         let mut s = self.lock();
         let open = s.dir_fd(dir)?;
         if cookie == 0 || s.node(dir)?.listing.is_none() {
@@ -517,6 +520,12 @@ impl Vfs for PathVfs {
     }
 
     fn setxattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: XattrFlags) -> Result<()> {
+        if name.is_empty() || name.contains(&0) {
+            return Err(Error::InvalidArgument);
+        }
+        if name.len() > NAME_MAX {
+            return Err(Error::NameTooLong);
+        }
         self.with_xattr(ino, |t| {
             sys::setxattr(t, name, value, flags.create, flags.replace)
         })

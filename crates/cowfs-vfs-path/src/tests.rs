@@ -181,3 +181,23 @@ fn statfs_reports_the_backing_filesystem() {
     assert!(s.block_size > 0 && s.blocks > 0 && s.blocks_free <= s.blocks);
     assert!(s.name_max >= 255);
 }
+
+#[test]
+fn readdir_with_max_zero_is_invalid() {
+    let (_s, v) = fs();
+    assert_eq!(v.readdir(ROOT_INO, 0, 0), Err(Error::InvalidArgument));
+}
+
+#[test]
+fn xattr_names_are_validated_before_the_filesystem_sees_them() {
+    let (_s, v) = fs();
+    let f = v.create(ROOT_INO, b"f", 0o644).expect("create").ino;
+    let none = XattrFlags::default();
+    assert_eq!(v.setxattr(f, b"", b"v", none), Err(Error::InvalidArgument));
+    assert_eq!(
+        v.setxattr(f, b"a\0b", b"v", none),
+        Err(Error::InvalidArgument)
+    );
+    let long = vec![b'x'; 256];
+    assert_eq!(v.setxattr(f, &long, b"v", none), Err(Error::NameTooLong));
+}
