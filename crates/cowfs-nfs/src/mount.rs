@@ -393,11 +393,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_translate_appledouble_and_lock_down_the_mount() {
+    fn defaults_hide_appledouble_and_lock_down_the_mount() {
         let o = MountOptions::default();
-        assert!(o.appledouble == AppleDoubleMode::Translate && !o.stats_on_sigusr1);
+        assert!(o.appledouble == AppleDoubleMode::Hide && !o.stats_on_sigusr1);
         assert!(o.one_shot_mount && o.check_peer_uid && !o.inline_metadata);
-        assert_eq!(o.adapter(None).appledouble, AppleDoubleMode::Translate);
+        assert_eq!(o.adapter(None).appledouble, AppleDoubleMode::Hide);
     }
 
     #[test]

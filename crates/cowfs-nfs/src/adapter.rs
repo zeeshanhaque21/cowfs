@@ -27,13 +27,12 @@ const SYMLINK_TARGET_MAX: usize = 1024;
 const READDIR_PAGE: usize = 512;
 
 /// What to do with the `._name` AppleDouble files the macOS client writes for extended attributes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppleDoubleMode {
     /// Serve `._name` as a view of the extended attributes of `name` and store nothing: the
     /// attributes live in the `Vfs` as xattrs of the real file, so no sidecar inodes exist and
     /// other mounts of the same data see no `._` files. Real files whose names start with `._`
     /// are invisible on the mount.
-    #[default]
     Translate,
     /// Store the sidecars as ordinary files but hide them from listings. Removing a file
     /// removes its sidecar, renaming moves it, removing a directory that holds only sidecars
@@ -41,6 +40,14 @@ pub enum AppleDoubleMode {
     Hide,
     /// Treat `._` names like any other name.
     Store,
+}
+
+impl Default for AppleDoubleMode {
+    /// `Hide` is the default: it is what the mount did before `Translate` existed and it is
+    /// known to be correct for every tool. `Translate` is opt-in until its own tests pass.
+    fn default() -> Self {
+        AppleDoubleMode::Hide
+    }
 }
 
 /// Adapter behaviour switches.
