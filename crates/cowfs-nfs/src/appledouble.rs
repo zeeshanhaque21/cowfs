@@ -29,7 +29,6 @@ const VERSION: u32 = 0x0002_0000;
 const FILLER: &[u8; 16] = b"Mac OS X        ";
 const ATTR_MAGIC: u32 = 0x4154_5452;
 const AD_RESOURCE: u32 = 2;
-const AD_REALNAME: u32 = 3;
 const AD_FINDERINFO: u32 = 9;
 const ENTRIES_AT: usize = 26;
 const FINFO_AT: usize = 50;
@@ -615,7 +614,7 @@ mod tests {
         put32(&mut many, ENTRIES_AT + 20, EMPTY_FORK_LEN as u32);
         for i in 2..16usize {
             let at = ENTRIES_AT + 12 * i;
-            put32(&mut many, at, AD_REALNAME);
+            put32(&mut many, at, 3);
             put32(&mut many, at + 4, 400 + 10 * (i - 2) as u32);
             put32(&mut many, at + 8, 4);
         }
