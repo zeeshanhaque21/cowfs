@@ -296,9 +296,12 @@ pub fn lookup_nlink_is_fresh(c: &Ctx) -> Outcome {
 
 const LINK_TRY: u32 = 70_000;
 
-/// A backend may have no link limit. If it has one, running into it must be reported as
-/// `TooManyLinks`, `nlink` must count exactly the names that were made, and the file must stay
-/// fully usable. `MemVfs` has a limit of `LINK_MAX` names.
+/// cowfs contract: a backend may cap the number of names of one file, and running into the cap
+/// must be reported as `TooManyLinks` with `nlink` counting exactly the names that were made.
+/// Native filesystems allow 65,000 or more and creating that many links is far slower than any
+/// test timeout, so the check only runs when the backend declares a small limit through
+/// `Options::link_limit` (for example `MemVfs::with_link_max(200)`). Without it the runner
+/// reports the check as skipped instead of hanging. The report counts the skip.
 pub fn hardlink_limit_reports_too_many_links(c: &Ctx) -> Outcome {
     let f = c.file(ROOT_INO, "f")?;
     c.write_all(f, 0, b"data")?;
@@ -314,21 +317,31 @@ pub fn hardlink_limit_reports_too_many_links(c: &Ctx) -> Outcome {
             Err(e) => return Err(e.into()),
         }
     }
+    c.fs.forget(f, u64::from(names));
     ensure_eq!(c.fs.getattr(f)?.nlink, names, "nlink after the last link");
     ensure_eq!(
         c.content(f)?,
         b"data".to_vec(),
         "content of a file with many names"
     );
-    if names < LINK_TRY {
+    if let Some(limit) = c.link_limit {
+        ensure!(
+            names <= limit,
+            "{names} names were accepted past the declared limit of {limit}"
+        );
         ensure_err!(
             c.fs.link(f, d, b"one-more"),
             Error::TooManyLinks,
-            "link after the limit was reported"
+            "link after the declared limit of {limit} was accepted"
         );
         ensure_eq!(c.fs.getattr(f)?.nlink, names, "nlink after a rejected link");
         c.fs.unlink(d, b"l1")?;
         c.fs.link(f, d, b"again")?;
+        ensure_eq!(
+            c.fs.getattr(f)?.nlink,
+            names,
+            "nlink after a name was freed and taken again"
+        );
     }
     Ok(())
 }

@@ -1,5 +1,8 @@
 //! Creation, lookup, attributes, statfs and the `Stale` rule.
 //!
+//! The directory `nlink` rule below is a cowfs decision: ext4 uses it, btrfs reports 1 and APFS
+//! reports 2 + all children.
+//!
 //! Decisions pinned here: the root is `ROOT_INO`; a directory reports `nlink` = 2 + its
 //! subdirectories; a regular file reports the number of names; a new file has size 0 and
 //! `blocks` 0; `uid` and `gid` are the same for every file; `create` and `mkdir` keep only
@@ -205,6 +208,9 @@ pub fn dir_nlink_counts_subdirs(c: &Ctx) -> Outcome {
     Ok(())
 }
 
+/// btrfs reports `files` 0, so the inode count is only checked when the backend reports it.
+/// The macOS NFS client caches statfs for about 0.2 s, so a check that measures free space
+/// right after a write sees old numbers; only inequalities are asserted, never a delta.
 pub fn statfs_sane(c: &Ctx) -> Outcome {
     let s = c.fs.statfs()?;
     ensure!(s.block_size > 0, "block_size is 0");
@@ -219,7 +225,12 @@ pub fn statfs_sane(c: &Ctx) -> Outcome {
         s.blocks_available <= s.blocks_free,
         "blocks_available > blocks_free"
     );
-    ensure!(s.files_free <= s.files, "files_free > files");
+    ensure!(
+        s.files == 0 || s.files_free <= s.files,
+        "files_free {} > files {}",
+        s.files_free,
+        s.files
+    );
     ensure_eq!(s.name_max as usize, NAME_MAX, "name_max");
     let f = c.file(ROOT_INO, "f")?;
     c.write_all(f, 0, &super::pattern(1 << 20, 3))?;
@@ -228,10 +239,12 @@ pub fn statfs_sane(c: &Ctx) -> Outcome {
         after.blocks_free <= s.blocks_free,
         "writing 1 MiB grew free space"
     );
-    ensure!(
-        after.files_free < s.files_free,
-        "creating a file did not reduce files_free"
-    );
+    if s.files > 0 {
+        ensure!(
+            after.files_free < s.files_free,
+            "creating a file did not reduce files_free"
+        );
+    }
     Ok(())
 }
 

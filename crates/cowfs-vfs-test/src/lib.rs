@@ -47,7 +47,8 @@
 //! use cowfs_vfs_test::conformance::{run_all, Level, Options};
 //! let opts = Options {
 //!     level: Some(Level::Posix),
-//!     skip: vec![("non_utf8_names".into(), "APFS refuses invalid UTF-8".into())],
+//!     xattr_names: true, // Linux needs a namespace prefix on xattr names
+//!     skip: vec![("appledouble_names_are_ordinary".into(), "NFS Translate mode hides ._x".into())],
 //!     ..Options::from_env()
 //! };
 //! let report = run_all(&factory, &opts);
@@ -56,18 +57,7 @@
 //! assert_eq!(report.skipped_count(), 1); // a backend can pin its expected skips
 //! ```
 //!
-//! [`conformance::Options`] fields: `heavy`, `filter` (keep checks whose `category::name`
-//! contains the text), `level` (see below), `skip` (name and reason; an unknown name is a
-//! `Report::config_errors` entry and makes `passed()` false), `timeout` (hang timeout per
-//! check, default 60 s and 600 s for heavy checks). A check that panics is a failure. A check
-//! that hangs is a failure too, its thread is leaked and marked `[LEAKED THREAD]` in the table
-//! and counted by `Report::leaked_count`. Every check gets a fresh filesystem from the factory,
-//! so neither can affect a later check.
-//!
-//! Environment variables read by `Options::from_env` and `conformance_tests!`:
-//! `COWFS_CONFORMANCE_HEAVY=1`, `COWFS_CONFORMANCE_FILTER=text`,
-//! `COWFS_CONFORMANCE_LEVEL=posix|portable|cowfs`, `COWFS_CONFORMANCE_TIMEOUT_SECS=n`.
-//! A check returns a [`conformance::Failure`] with a description and never panics.
+//! See "Options" below for every field and environment variable.
 //!
 //! # Levels: what a check's expectation rests on
 //!
@@ -75,50 +65,93 @@
 //! `Options::level` (default: everything). Levels are cumulative: `Portable` runs `Posix` and
 //! `Portable`.
 //!
-//! - `Posix`: believed to hold on ext4, btrfs and APFS. Use it for a native-filesystem control
-//!   run. A check is only `Posix` when its assertions were probed or follow directly from the
-//!   POSIX text; when in doubt it is not `Posix`.
+//! - `Posix`: holds on ext4, btrfs and APFS, so it is safe for a native-filesystem control run.
+//!   A check is `Posix` only when it was run on those three or follows directly from the POSIX
+//!   text; when in doubt it is not `Posix`.
 //! - `Portable`: holds on the common local filesystems but depends on something that varies
 //!   (timestamp granularity, sparse files, xattr support, symlink target length) or was not
 //!   verified on all three.
 //! - `Cowfs`: a cowfs contract decision, or a `Vfs` concept with no native equivalent
-//!   (`forget`, `Stale`, handles pinning inodes, `max` of 0, file-type bits in `mode`). These
-//!   are not claims about POSIX.
+//!   (`forget`, `Stale`, handles pinning inodes, `max` of 0, file-type bits in `mode`).
 //!
-//! Evidence (probes run on APFS, btrfs and ext4 during the review of PR #30; "OK" means the
-//! assertion held natively on all three):
+//! ## Evidence
 //!
-//! - Directory `nlink`: ext4 2 + subdirectories, btrfs always 1, APFS 2 + all entries. So
-//!   every check that asserts it is `Cowfs`: `root_is_directory`, `new_file_attrs`,
-//!   `dir_nlink_counts_subdirs`, `rmdir_updates_parent`, `deeply_nested_directories`,
-//!   `rename_dir_over_empty_dir`, `rename_dir_cross_directory_fixes_nlink`,
-//!   `rename_dir_across_parents_keeps_parent_links`, `concurrent_rename_unlink_lookup`.
-//! - `create` with mode 04755 keeps setuid on btrfs and ext4 but drops it on APFS:
-//!   `create_masks_mode` is `Cowfs`.
-//! - xattr values: 60,000 bytes fail on btrfs (ENOSPC), 4,096 bytes fail on ext4, both work on
-//!   APFS. `user.*` xattrs on a symlink fail on Linux (EPERM) and work on APFS. Both checks are
-//!   `Cowfs`.
-//! - Names: APFS rejects invalid UTF-8 (EILSEQ) and is case-insensitive and normalising by
-//!   default, so `non_utf8_names` and `names_are_exact_bytes` are `Cowfs`. NAME_MAX 255 is
-//!   enforced identically on all three (ENAMETOOLONG at 256): `name_max_ok_and_one_more_fails`
-//!   is `Posix`.
-//! - Timestamps: nanosecond granularity on all three (1000 of 1000 directory mtimes strictly
-//!   increased after 1 ms), so time checks are `Portable`. They need a clock that advances
-//!   between two operations made a few milliseconds apart: a 1 to 2 second granularity
-//!   filesystem (ext3, HFS+, FAT) fails them.
-//! - `blocks`: 1 byte is 8 blocks and 1 MiB is 2048 blocks on all three, so
-//!   `blocks_accounting` is `Posix`.
+//! Every row is from `cowfs-vfs-path` running this suite through `PathVfs` (findings in
+//! `crates/cowfs-vfs-path/FINDINGS.md`, branch `v1/pathvfs`) on APFS, case-sensitive APFS,
+//! btrfs, ext4, a FUSE mount and an NFS mount and raw NFSv3, plus the probes cited below.
+//! One run per environment unless a count is given.
+//!
+//! - **No `Posix` check fails on APFS, btrfs or ext4** (56 of 56 on each, and 56 of 56 over
+//!   raw NFSv3 with `AppleDoubleMode::Store`).
+//! - Directory `nlink` 2 + subdirectories: ext4 yes, btrfs always 1, APFS 2 + all entries. All
+//!   nine `nlink` checks are `Cowfs` and were seen failing natively for exactly this reason.
+//! - `user.*` xattrs on a symlink: EPERM on Linux, works on APFS and through FUSE.
+//!   `xattr_on_directory_and_symlink` is `Cowfs`.
+//! - xattr value sizes: 60,000 bytes is ENOSPC on ext4 and btrfs, works on APFS; 4,096 bytes
+//!   fails on ext4. `xattr_empty_and_large_values` is `Cowfs`.
+//! - xattr names: a 255 byte name with no namespace is ENOTSUP on Linux; `user.` plus 250 bytes
+//!   works; `user.` plus 251 bytes is ERANGE. `xattr_name_validation` is `Cowfs` and takes
+//!   `Options::xattr_names` for the valid-name case.
+//! - macOS adds `com.apple.provenance` to new files, so the two xattr listing checks ignore
+//!   `com.apple.*`.
+//! - APFS rejects invalid UTF-8 (EILSEQ) and is case-insensitive and normalising by default:
+//!   `non_utf8_names` and `names_are_exact_bytes` are `Cowfs`, `name_max_ok_and_one_more_fails`
+//!   is `Posix` (ENAMETOOLONG at 256 on all three).
+//! - Symlink targets: a 4095 byte target fails on APFS (PATH_MAX 1024). Targets up to 1000 bytes
+//!   work everywhere, so `symlink_size_is_target_length` and `symlink_size_multibyte` are
+//!   `Portable`.
+//! - Timestamps: nanosecond granularity on all three, so time checks are `Portable`. They need a
+//!   clock that advances between two operations made a few milliseconds apart, so a 1 to 2
+//!   second granularity filesystem (ext3, HFS+, FAT) fails them.
+//! - APFS does not bump ctime for an atime-only `utimensat`, so `setattr_bumps_ctime` only
+//!   requires a bump for mode, mtime and size changes (`Portable`) and the atime-only rule is
+//!   the `Cowfs` check `attrs_atime_only_bumps_ctime`.
+//! - btrfs reports statfs `files` 0, so `statfs_sane` only checks the inode count when the
+//!   backend reports it. The macOS NFS client caches statfs for about 0.2 s, so only
+//!   inequalities are ever asserted.
+//! - `blocks`: 1 byte is 8 blocks and 1 MiB is 2048 on all three, so `blocks_accounting` is
+//!   `Posix`.
 //! - Same-size truncate: btrfs does not bump mtime, ext4 and APFS do. `truncate_to_same_size`
-//!   asserts size and content only; the ctime rule is the `Cowfs` check
+//!   asserts size and content only (`Posix`); the ctime rule is the `Cowfs` check
 //!   `truncate_to_same_size_bumps_ctime`.
+//! - Read atomicity: 8 byte reads and writes never tore in about 1M reads on ext4, btrfs, tmpfs
+//!   and APFS (`small_reads_are_never_torn`, `Portable`); 512 and 4096 byte reads tore on
+//!   ext4, btrfs and tmpfs (8 to 297 in about 300k reads) and never on APFS, so
+//!   `concurrent_readers_and_writers_of_one_file` is `Cowfs`. POSIX says a read is atomic
+//!   against a concurrent write; Linux buffered I/O does not provide that.
 //! - `unlink` of a directory: EISDIR on Linux, EPERM on APFS. `mkdir_rmdir_errors` accepts both.
-//! - `rename` with `no_replace` onto the very same path succeeds on APFS (Exists elsewhere).
-//!   `rename_no_replace` does not test that case and is `Portable`.
-//! - Sparse files and `symlink` target length: 4,095-byte targets fail on APFS (PATH_MAX 1024),
-//!   so `symlink_size_is_target_length` is `Portable`.
-//! - Not verified on a native filesystem by running the suite (that is the job of
-//!   `cowfs-vfs-path`): everything `Posix` beyond the rows above rests on reading the POSIX
-//!   text. If a `Posix` check fails natively, reclassify it and record the evidence here.
+//! - APFS reports `nlink` 2 for a removed directory, so `rmdir_reclaimed_after_forget` is
+//!   `Cowfs` and was seen failing on APFS.
+//! - APFS (and the macOS NFS client) keep an unlinked open file as `.nfs.<id>`, so 9 `Posix`
+//!   checks fail through an NFS mount. They pass over raw NFSv3, where the adapter is
+//!   correct: an adapter test run must drive the protocol, not the macOS client.
+//! - NFSv3 is stateless: a handle of a removed file is STALE (RFC 1813) and there are no xattr
+//!   procedures, so the `lifecycle` checks that need a pinning handle and the `xattrs` checks
+//!   cannot be judged over raw NFSv3 at all.
+//! - `appledouble_names_are_ordinary` is `Cowfs`: the NFS adapter's default
+//!   `AppleDoubleMode::Translate` makes `._x` names invisible on purpose, and it passes in
+//!   `Store` mode. An adapter in `Translate` mode must skip it with a reason.
+//! - Hardlink limits: ext4 allows 65,000 links, and creating that many over a mount took 540 s,
+//!   so `hardlink_limit_reports_too_many_links` is `Cowfs` and only runs when the backend
+//!   declares a small limit with `Options::link_limit`. Without it the runner reports the check
+//!   as skipped instead of hanging.
+//!
+//! If a `Posix` check ever fails natively, reclassify it and add the evidence here.
+//!
+//! ## Options
+//!
+//! [`conformance::Options`] fields: `heavy`, `filter` (keep checks whose `category::name`
+//! contains the text), `level`, `skip` (name and reason; an unknown name is a
+//! `Report::config_errors` entry and makes `passed()` false), `timeout` (hang timeout per
+//! check, default 60 s and 600 s for heavy checks), `xattr_names` (prefixed xattr names) and
+//! `link_limit` (a small hardlink limit the backend can reach inside the timeout).
+//! Environment variables: `COWFS_CONFORMANCE_HEAVY=1`, `COWFS_CONFORMANCE_FILTER=text`,
+//! `COWFS_CONFORMANCE_LEVEL=posix|portable|cowfs`, `COWFS_CONFORMANCE_TIMEOUT_SECS=n`,
+//! `COWFS_CONFORMANCE_XATTR_NAMES=prefixed`, `COWFS_CONFORMANCE_LINK_LIMIT=n`.
+//! A check returns a [`conformance::Failure`] with a description and never panics. A check that
+//! panics is a failure; a check that hangs is a failure too, its thread is leaked and marked
+//! `[LEAKED THREAD]` in the table and counted by `Report::leaked_count`. Every check gets a
+//! fresh filesystem from the factory, so neither can affect a later check.
 //!
 //! # Error precedence: accepted alternatives
 //!

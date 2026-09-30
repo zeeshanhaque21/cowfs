@@ -1,5 +1,8 @@
 //! Extended attributes.
 //!
+//! Every listing assertion here ignores `com.apple.*` names: macOS adds
+//! `com.apple.provenance` to new files.
+//!
 //! Decisions pinned here: attributes belong to the inode (all hardlinked names share them);
 //! an empty value is a real value; `create` fails with `Exists`, `replace` with `NoAttr`;
 //! values up to 60,000 bytes work (larger ones are backend defined: `Range` or success);
@@ -8,6 +11,15 @@
 use cowfs_vfs::{Error, XattrFlags, NAME_MAX, ROOT_INO};
 
 use super::{pattern, Ctx, Outcome};
+
+/// macOS adds `com.apple.*` attributes (for example `com.apple.provenance`) to new files, so
+/// every listing assertion ignores them.
+fn without_apple(names: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    names
+        .into_iter()
+        .filter(|n| !n.starts_with(b"com.apple."))
+        .collect()
+}
 
 const NONE: XattrFlags = XattrFlags {
     create: false,
@@ -24,12 +36,15 @@ const REPLACE: XattrFlags = XattrFlags {
 
 pub fn xattr_set_get_list_remove(c: &Ctx) -> Outcome {
     let f = c.file(ROOT_INO, "f")?;
-    ensure!(c.fs.listxattr(f)?.is_empty(), "a new file has attributes");
+    ensure!(
+        without_apple(c.fs.listxattr(f)?).is_empty(),
+        "a new file has attributes"
+    );
     c.fs.setxattr(f, b"user.one", b"1", NONE)?;
     c.fs.setxattr(f, b"user.two", b"22", NONE)?;
     ensure_eq!(c.fs.getxattr(f, b"user.one")?, b"1".to_vec(), "get one");
     ensure_eq!(c.fs.getxattr(f, b"user.two")?, b"22".to_vec(), "get two");
-    let mut names = c.fs.listxattr(f)?;
+    let mut names = without_apple(c.fs.listxattr(f)?);
     names.sort();
     ensure_eq!(
         names,
@@ -38,7 +53,11 @@ pub fn xattr_set_get_list_remove(c: &Ctx) -> Outcome {
     );
     c.fs.setxattr(f, b"user.one", b"uno", NONE)?;
     ensure_eq!(c.fs.getxattr(f, b"user.one")?, b"uno".to_vec(), "overwrite");
-    ensure_eq!(c.fs.listxattr(f)?.len(), 2, "overwrite must not add a name");
+    ensure_eq!(
+        without_apple(c.fs.listxattr(f)?).len(),
+        2,
+        "overwrite must not add a name"
+    );
     c.fs.removexattr(f, b"user.one")?;
     ensure_err!(
         c.fs.getxattr(f, b"user.one"),
@@ -46,7 +65,7 @@ pub fn xattr_set_get_list_remove(c: &Ctx) -> Outcome {
         "get after remove"
     );
     ensure_eq!(
-        c.fs.listxattr(f)?,
+        without_apple(c.fs.listxattr(f)?),
         vec![b"user.two".to_vec()],
         "list after remove"
     );
@@ -116,7 +135,7 @@ pub fn xattr_empty_and_large_values(c: &Ctx) -> Outcome {
         "empty value"
     );
     ensure_eq!(
-        c.fs.listxattr(f)?,
+        without_apple(c.fs.listxattr(f)?),
         vec![b"user.empty".to_vec()],
         "an empty value still lists"
     );
@@ -143,18 +162,18 @@ pub fn xattr_list_order_is_stable(c: &Ctx) -> Outcome {
     for i in [5, 3, 9, 1, 7, 2, 8, 4, 6, 0] {
         c.fs.setxattr(f, format!("user.n{i}").as_bytes(), b"v", NONE)?;
     }
-    let first = c.fs.listxattr(f)?;
+    let first = without_apple(c.fs.listxattr(f)?);
     ensure_eq!(first.len(), 10, "attributes listed");
     for _ in 0..5 {
         ensure_eq!(
-            c.fs.listxattr(f)?,
+            without_apple(c.fs.listxattr(f)?),
             first,
             "list order changed between calls"
         );
     }
     c.fs.setxattr(f, b"user.n3", b"changed", NONE)?;
     ensure_eq!(
-        c.fs.listxattr(f)?,
+        without_apple(c.fs.listxattr(f)?),
         first,
         "list order changed after an overwrite"
     );
@@ -205,8 +224,11 @@ pub fn xattr_shared_by_hardlinks(c: &Ctx) -> Outcome {
 }
 
 /// cowfs contract: an attribute name is 1 to `NAME_MAX` bytes without NUL. Linux and APFS
-/// disagree on the errno for the rest (ERANGE, EINVAL), so `InvalidArgument` and `Range` are
-/// both accepted, and `NameTooLong` for an over-long name.
+/// disagree on the errno for the rest (ERANGE, EINVAL), so `InvalidArgument`, `Range` and
+/// `NameTooLong` are all accepted. Linux additionally requires a namespace prefix (`user.`,
+/// `system.posix_acl_*`): a 255 byte name with no prefix is ENOTSUP there, and a `user.` plus
+/// 250 byte name works. A backend that wants the name-prefixed cases set
+/// `Options::xattr_names` (see the crate docs); the rejection cases are always checked.
 pub fn xattr_name_validation(c: &Ctx) -> Outcome {
     let f = c.file(ROOT_INO, "f")?;
     ensure_err_any!(
@@ -227,15 +249,23 @@ pub fn xattr_name_validation(c: &Ctx) -> Outcome {
         long.len()
     );
     ensure!(
-        c.fs.listxattr(f)?.is_empty(),
+        without_apple(c.fs.listxattr(f)?).is_empty(),
         "a rejected setxattr left an attribute behind"
     );
-    let max = vec![b'y'; NAME_MAX];
-    c.fs.setxattr(f, &max, b"v", NONE)?;
+    let name: Vec<u8> = if c.xattr_names_prefixed {
+        let mut n = b"user.".to_vec();
+        n.extend(std::iter::repeat_n(b'y', NAME_MAX - 5));
+        n
+    } else {
+        vec![b'y'; NAME_MAX]
+    };
+    ensure_eq!(name.len(), NAME_MAX, "test attribute name length");
+    c.fs.setxattr(f, &name, b"v", NONE)?;
     ensure_eq!(
-        c.fs.getxattr(f, &max)?,
+        c.fs.getxattr(f, &name)?,
         b"v".to_vec(),
-        "attribute with a {NAME_MAX} byte name"
+        "attribute named {:?} ({NAME_MAX} bytes)",
+        String::from_utf8_lossy(&name[..name.len().min(16)])
     );
     Ok(())
 }
