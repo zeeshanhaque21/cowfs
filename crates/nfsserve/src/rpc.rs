@@ -1,7 +1,5 @@
 // this is just a complete enumeration of everything in the RFC
-#![allow(dead_code)]
 // And its nice to keep the original RFC names and case
-#![allow(non_camel_case_types)]
 
 use std::io::{Read, Write};
 
@@ -10,8 +8,6 @@ use num_derive::{FromPrimitive, ToPrimitive};
 use crate::xdr::*;
 // Transcribed from RFC 1057
 
-#[allow(non_camel_case_types)]
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 /// This is only defined as the discriminant for rpc_body and should not
@@ -22,7 +18,6 @@ pub enum _msg_type {
 }
 xdr_enum_serde!(_msg_type);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 /// This is only defined as the discriminant for reply_body and should not
@@ -33,8 +28,6 @@ pub enum _reply_stat {
 }
 xdr_enum_serde!(_reply_stat);
 
-#[allow(non_camel_case_types)]
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 /// This is only defined as the discriminant for accept_body and should not
@@ -53,7 +46,6 @@ pub enum _accept_stat {
 }
 xdr_enum_serde!(_accept_stat);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 /// This is only defined as the discriminant for reject_body and should not
@@ -66,7 +58,6 @@ pub enum _reject_stat {
 }
 xdr_enum_serde!(_reject_stat);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 ///   Why authentication failed
@@ -85,7 +76,6 @@ pub enum auth_stat {
 }
 xdr_enum_serde!(auth_stat);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 #[non_exhaustive]
@@ -97,7 +87,6 @@ pub enum auth_flavor {
 }
 xdr_enum_serde!(auth_flavor);
 
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Default)]
 pub struct auth_unix {
     stamp: u32,
@@ -126,7 +115,6 @@ xdr_struct!(auth_unix, stamp, machinename, uid, gid, gids);
 ///
 ///If authentication parameters were rejected, the reply message
 ///contains information stating why they were rejected.
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug)]
 pub struct opaque_auth {
     pub flavor: auth_flavor,
@@ -142,7 +130,6 @@ impl Default for opaque_auth {
     }
 }
 
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Default)]
 ///All messages start with a transaction identifier, xid, followed by a
 ///two-armed discriminated union.  The union's discriminant is a
@@ -157,8 +144,6 @@ pub struct rpc_msg {
 }
 xdr_struct!(rpc_msg, xid, body);
 
-#[allow(non_camel_case_types)]
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Debug)]
 #[repr(u32)]
 /// Discriminant is msg_type
@@ -251,7 +236,6 @@ impl XDR for rpc_body {
 ///two authentication parameters are followed by the parameters to the
 ///remote procedure, which are specified by the specific program
 ///protocol.
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Default)]
 pub struct call_body {
     /// Must be = 2
@@ -266,7 +250,6 @@ pub struct call_body {
 
 xdr_struct!(call_body, rpcvers, prog, vers, proc, cred, verf);
 
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug)]
 #[repr(u32)]
 pub enum reply_body {
@@ -310,7 +293,6 @@ impl XDR for reply_body {
     }
 }
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
 pub struct mismatch_info {
@@ -329,7 +311,6 @@ xdr_struct!(mismatch_info, low, high);
 ///specifies the lowest and highest version numbers of the remote
 ///program supported by the server.
 /// Discriminant is reply_stat
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Default)]
 pub struct accepted_reply {
     pub verf: opaque_auth,
@@ -337,8 +318,6 @@ pub struct accepted_reply {
 }
 xdr_struct!(accepted_reply, verf, reply_data);
 
-#[allow(non_camel_case_types)]
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(u32)]
 /// Discriminant is accept_stat
@@ -394,7 +373,6 @@ impl XDR for accept_body {
     }
 }
 
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug)]
 #[repr(u32)]
 ///Reply to an RPC call that was rejected by the server:

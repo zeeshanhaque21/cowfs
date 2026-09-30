@@ -1,7 +1,5 @@
 // this is just a complete enumeration of everything in the RFC
-#![allow(dead_code)]
 // And its nice to keep the original RFC names and case
-#![allow(non_camel_case_types)]
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -36,7 +34,6 @@ pub const NFS3_CREATEVERFSIZE: u32 = 8;
 pub const NFS3_WRITEVERFSIZE: u32 = 8;
 
 // Section 2.5 Basic Data Types
-#[allow(non_camel_case_types)]
 #[derive(Default, Clone)]
 pub struct nfsstring(pub Vec<u8>);
 impl nfsstring {
@@ -95,7 +92,6 @@ pub type offset3 = u64;
 pub type mode3 = u32;
 pub type count3 = u32;
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum nfsstat3 {
@@ -197,7 +193,6 @@ pub enum nfsstat3 {
 xdr_enum_serde!(nfsstat3);
 
 /// File Type
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum ftype3 {
@@ -219,7 +214,6 @@ pub enum ftype3 {
 }
 xdr_enum_serde!(ftype3);
 /// Device Number information. Ex: Major / Minor device
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct specdata3 {
@@ -229,20 +223,11 @@ pub struct specdata3 {
 xdr_struct!(specdata3, specdata1, specdata2);
 
 /// File Handle information
-#[allow(non_camel_case_types)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct nfs_fh3 {
     pub data: Vec<u8>,
 }
 xdr_struct!(nfs_fh3, data);
-#[allow(clippy::derivable_impls)]
-impl Default for nfs_fh3 {
-    fn default() -> nfs_fh3 {
-        nfs_fh3 { data: Vec::new() }
-    }
-}
-
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct nfstime3 {
@@ -251,7 +236,6 @@ pub struct nfstime3 {
 }
 xdr_struct!(nfstime3, seconds, nseconds);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct fattr3 {
     pub ftype: ftype3,
@@ -295,7 +279,6 @@ pub const FSF_HOMOGENEOUS: u32 = 0x0008;
 /// (FALSE), the server cannot set times as requested.
 pub const FSF_CANSETTIME: u32 = 0x0010;
 
-#[allow(non_camel_case_types)]
 #[derive(Debug, Default)]
 pub struct fsinfo3 {
     pub obj_attributes: post_op_attr,
@@ -325,7 +308,6 @@ xdr_struct!(
     properties
 );
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct wcc_attr {
     pub size: size3,
@@ -334,7 +316,6 @@ pub struct wcc_attr {
 }
 xdr_struct!(wcc_attr, size, mtime, ctime);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(u32)]
 pub enum pre_op_attr {
@@ -344,7 +325,6 @@ pub enum pre_op_attr {
 }
 xdr_bool_union!(pre_op_attr, attributes, wcc_attr);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(u32)]
 pub enum post_op_attr {
@@ -354,7 +334,6 @@ pub enum post_op_attr {
 }
 xdr_bool_union!(post_op_attr, attributes, fattr3);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct wcc_data {
     pub before: pre_op_attr,
@@ -362,7 +341,6 @@ pub struct wcc_data {
 }
 xdr_struct!(wcc_data, before, after);
 
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Default)]
 #[repr(u32)]
 pub enum post_op_fh3 {
@@ -372,7 +350,6 @@ pub enum post_op_fh3 {
 }
 xdr_bool_union!(post_op_fh3, handle, nfs_fh3);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 /// This enum is only used as a discriminant for set_atime / set_mtime
@@ -384,7 +361,6 @@ pub enum _time_how {
 }
 xdr_enum_serde!(_time_how);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 #[repr(u32)]
 pub enum set_mode3 {
@@ -393,7 +369,6 @@ pub enum set_mode3 {
 }
 xdr_bool_union!(set_mode3, mode, mode3);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 #[repr(u32)]
 pub enum set_uid3 {
@@ -402,7 +377,6 @@ pub enum set_uid3 {
 }
 xdr_bool_union!(set_uid3, uid, uid3);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 #[repr(u32)]
 pub enum set_gid3 {
@@ -411,7 +385,6 @@ pub enum set_gid3 {
 }
 xdr_bool_union!(set_gid3, gid, gid3);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 #[repr(u32)]
 pub enum set_size3 {
@@ -420,7 +393,6 @@ pub enum set_size3 {
 }
 xdr_bool_union!(set_size3, size, size3);
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 #[repr(u32)]
 /// discriminant is time_how
@@ -466,7 +438,6 @@ impl XDR for set_atime {
     }
 }
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 #[repr(u32)]
 /// discriminant is time_how
@@ -513,7 +484,6 @@ impl XDR for set_mtime {
     }
 }
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct sattr3 {
     pub mode: set_mode3,
@@ -537,7 +507,6 @@ impl Default for sattr3 {
     }
 }
 
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Default)]
 pub struct diropargs3 {
     pub dir: nfs_fh3,
@@ -545,7 +514,6 @@ pub struct diropargs3 {
 }
 xdr_struct!(diropargs3, dir, name);
 
-#[allow(non_camel_case_types)]
 #[derive(Debug, Default)]
 pub struct symlinkdata3 {
     pub symlink_attributes: sattr3,

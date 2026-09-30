@@ -24,8 +24,6 @@ use crate::xdr::*;
  } = 100000;
 */
 
-#[allow(non_camel_case_types)]
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
 enum PortmapProgram {
     PMAPPROC_NULL = 0,

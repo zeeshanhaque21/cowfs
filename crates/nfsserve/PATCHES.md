@@ -6,8 +6,7 @@ Everything below is ours.
 ## From spike 2 (`docs/spikes/2-nfs-loopback.md`)
 
 - NFSPROC3_LINK implemented (rustc incremental compilation hardlinks its object files).
-- `TransactionTracker`: the retransmission table was scanned in full on every request under a global lock, 94% of server time.
-  The scan now runs at most once a second.
+- `TransactionTracker`: the retransmission table was scanned in full on every request under a global lock, 94% of server time. It is gone, replaced by `reply_cache.rs` (below).
 - READDIR and READDIRPLUS cookies are positions supplied by the file system, not file ids.
   Hardlinks in one directory share a file id, so id cookies restarted listings in the wrong place.
 - Per-procedure operation count and latency table, `take_stats()`.
@@ -29,5 +28,13 @@ Everything below is ours.
   MKNOD answers NFS3ERR_NOTSUPP.
 - Replies leave in one write (header and body together) so TCP_NODELAY does not split them.
 - No panics on network data: bounded XDR lengths and RPC message size, `unwrap` and `assert` removed, `accept` errors do not end the server loop.
-- Removed: `fs_util` (Windows and path helpers), the `demo` feature, the auto IP binding, `filetime`, `intaglio`.
-- Lints: the workspace lint bar (fmt, clippy `-D warnings`), `#![allow]` only for RFC style names.
+- Security and bounds (`tcp.rs`, `rpcwire.rs`, `reply_cache.rs`):
+  - `MountGate`: the first connection to send MNT gets the root handle, other connections are refused until `rearm`.
+  - `PeerCheck` hook for MNT callers.
+  - `Limits`: connection cap, idle timeout, per-frame slowloris deadline, in-flight requests per connection, frame size cap.
+  - Records are read incrementally, so a declared but unsent frame costs nothing.
+  - READDIR, READDIRPLUS and READ replies are capped whatever count the client asks for.
+  - Reply cache keyed by client address, xid and a hash of the whole call: a retransmitted SETATTR, CREATE, MKDIR, SYMLINK, REMOVE, RMDIR, RENAME or LINK gets the original reply. Bounded in entries, bytes and age, and it shrinks.
+- Removed: `fs_util` (Windows and path helpers), `write_counter`, `transaction_tracker`, the `demo` feature, the auto IP binding, `filetime`, `intaglio`.
+- Lints: the workspace lint bar (fmt, clippy `-D warnings`).
+  Allows that remain: `lib.rs` has `#![allow(non_camel_case_types, clippy::upper_case_acronyms)]` because the RFC type and procedure names are kept as written; `mount.rs` and `portmap.rs` have `#![allow(dead_code)]` because they transcribe RFC constants this server does not all use.

@@ -1,7 +1,7 @@
-// this is just a complete enumeration of everything in the RFC
+// RFC constants and types kept whole even where this server does not use them
 #![allow(dead_code)]
+// this is just a complete enumeration of everything in the RFC
 // And its nice to keep the original RFC names and case
-#![allow(non_camel_case_types)]
 
 use std::io::{Read, Write};
 
@@ -21,7 +21,6 @@ pub type fhandle3 = Vec<u8>;
 pub type dirpath = Vec<u8>;
 pub type name = Vec<u8>;
 
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum mountstat3 {

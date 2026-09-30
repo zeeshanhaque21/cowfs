@@ -23,8 +23,6 @@ program MOUNT_PROGRAM {
 } = 100005;
 */
 
-#[allow(non_camel_case_types)]
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug, FromPrimitive, ToPrimitive)]
 enum MountProgram {
     MOUNTPROC3_NULL = 0,
@@ -73,7 +71,6 @@ pub fn mountproc3_null(
     Ok(())
 }
 
-#[allow(non_camel_case_types)]
 #[derive(Clone, Debug)]
 struct mountres3_ok {
     fhandle: fhandle3, // really same thing as nfs::nfs_fh3

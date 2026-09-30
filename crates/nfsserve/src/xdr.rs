@@ -5,7 +5,6 @@ pub type XDREndian = BigEndian;
 use crate::nfs::nfsstring;
 
 /// See <https://datatracker.ietf.org/doc/html/rfc1014>
-#[allow(clippy::upper_case_acronyms)]
 pub trait XDR {
     fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()>;
     fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()>;
@@ -13,7 +12,6 @@ pub trait XDR {
 
 /// Serializes a basic enumeration.
 /// Casts everything as u32 BigEndian
-#[allow(non_camel_case_types)]
 #[macro_export]
 macro_rules! xdr_enum_serde {
     ($t:ident) => {
@@ -191,7 +189,6 @@ impl XDR for Vec<u32> {
     }
 }
 
-#[allow(non_camel_case_types)]
 #[macro_export]
 macro_rules! xdr_struct {
     (
@@ -225,7 +222,6 @@ macro_rules! xdr_struct {
 ///       }
 /// The serde methods can be generated with XDRBoolUnion(pre_op_attr, attributes, wcc_attr)
 /// The "true" type must have the Default trait
-#[allow(non_camel_case_types)]
 #[macro_export]
 macro_rules! xdr_bool_union {
     (

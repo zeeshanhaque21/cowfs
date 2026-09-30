@@ -1,7 +1,7 @@
-// this is just a complete enumeration of everything in the RFC
+// RFC constants and types kept whole even where this server does not use them
 #![allow(dead_code)]
+// this is just a complete enumeration of everything in the RFC
 // And its nice to keep the original RFC names and case
-#![allow(non_camel_case_types)]
 
 use std::io::{Read, Write};
 
@@ -9,7 +9,6 @@ use crate::xdr::*;
 // Transcribed from RFC 1057 Appendix A
 
 /// Device Number information. Ex: Major / Minor device
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
 pub struct mapping {
