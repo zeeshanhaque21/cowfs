@@ -462,6 +462,7 @@ impl Inner {
             barriers: self.ctr.barriers.load(Ordering::Relaxed),
             forget_underflows: self.ctr.underflows.load(Ordering::Relaxed),
             flush_errors: self.ctr.flush_errors.load(Ordering::Relaxed),
+            poisoned: self.ctr.poisoned.load(Ordering::Relaxed),
             dentry_hits: self.ctr.dhit.load(Ordering::Relaxed),
             dentry_misses: self.ctr.dmiss.load(Ordering::Relaxed),
             nodes: self.nodes.len(),

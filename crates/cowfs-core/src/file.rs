@@ -335,6 +335,25 @@ fn flush_extent(list: &mut Chunks, blocks: &Blocks, a: u64, data: &[u8]) -> Resu
     Ok(())
 }
 
+/// Verifies every stored chunk that a write of `[a, b)` only partially covers, so a
+/// read-modify-write of a damaged chunk fails at the write instead of later at the flush.
+/// A fully covered chunk is never read, because its old bytes are not needed.
+pub(crate) fn verify_partial(blocks: &Blocks, list: &Chunks, a: u64, b: u64) -> Result<()> {
+    let mut i = list.find(a);
+    while i < list.refs.len() {
+        let s = list.start(i);
+        if s >= b {
+            break;
+        }
+        let c = list.refs[i];
+        if (s < a || list.ends[i] > b) && c.id != HOLE {
+            check_len(&blocks.get(c.id)?, c)?;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Reads `[off, end)` of a file: chunk data, zeros for holes, then the dirty `overlay` on top.
 pub(crate) fn read_range(
     blocks: &Blocks,

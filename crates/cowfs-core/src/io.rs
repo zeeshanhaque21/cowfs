@@ -9,7 +9,7 @@ use cowfs_vfs::{
 };
 
 use crate::error::{from_meta, stale};
-use crate::file::{read_range, MAX_FILE};
+use crate::file::{read_range, verify_partial, MAX_FILE};
 use crate::inner::{mino, Inner};
 use crate::node::{Node, NodeState};
 use crate::queue::SnapCtx;
@@ -37,6 +37,9 @@ impl Inner {
 
     pub(crate) fn op_read(&self, ino: Ino, off: u64, size: u32) -> Result<Vec<u8>> {
         let (sc, node) = self.file_node(ino)?;
+        if let Some(e) = node.poisoned() {
+            return Err(e);
+        }
         self.ensure_file(&sc, &node)?;
         let (chunks, overlay, end) = {
             let st = node.st.rd();
@@ -63,9 +66,29 @@ impl Inner {
             return Ok(0);
         }
         self.ensure_file(&sc, &node)?;
+        // A write that only partly covers a chunk needs that chunk's old bytes, so verify it now:
+        // a damaged block is EIO at the write, not a latent failure at the next flush.
+        for _ in 0..8 {
+            let chunks = node.st.rd().file.as_ref().map(|f| f.chunks.clone());
+            let Some(chunks) = chunks else {
+                return Err(Error::Stale);
+            };
+            let view = node.st.rd();
+            let Some(f) = view.file.as_ref() else {
+                return Err(Error::Stale);
+            };
+            if Arc::ptr_eq(&f.chunks, &chunks) {
+                drop(view);
+                verify_partial(&self.blocks, &chunks, off, off + u64::from(len))?;
+                break;
+            }
+        }
         let now = Timestamp::now();
         {
             let mut st = node.st.wr();
+            if let Some(e) = node.poisoned() {
+                return Err(e);
+            }
             let NodeState { attr, file, .. } = &mut *st;
             let Some(f) = file.as_mut() else {
                 return Err(Error::Stale);
@@ -92,7 +115,10 @@ impl Inner {
             }
             if after >= self.opts.file_flush_bytes {
                 if let Err(e) = self.flush_locked(&sc, &node, &mut st) {
-                    *self.last_error.lk() = Some(e.to_string());
+                    let err = node.poison(format!("{e} (file {ino:#x})"));
+                    *self.last_error.lk() = Some(err.to_string());
+                    self.ctr.poisoned.fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
                 }
             }
         }
@@ -120,6 +146,9 @@ impl Inner {
         }
         if ch.size.is_some() {
             self.ensure_file(&sc, &node)?;
+        }
+        if let Some(e) = node.poisoned() {
+            return Err(e);
         }
         let now = Timestamp::now();
         let pick = |t: SetTime| match t {
@@ -235,14 +264,23 @@ impl Inner {
         if ino == ROOT_INO {
             return Ok(());
         }
-        self.live(ino)?;
+        let n = self.live(ino)?;
+        if let Some(e) = n.poisoned() {
+            return Err(e);
+        }
         let sc = self.snapctx(ino)?;
-        self.fsync_snapshot(&sc)
+        self.fsync_snapshot(&sc)?;
+        if let Some(e) = n.poisoned() {
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub(crate) fn op_flush(&self, ino: Ino) -> Result<()> {
         if ino != ROOT_INO {
-            self.live(ino)?;
+            if let Some(e) = self.live(ino)?.poisoned() {
+                return Err(e);
+            }
         }
         Ok(())
     }

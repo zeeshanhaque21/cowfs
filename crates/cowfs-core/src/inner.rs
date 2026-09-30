@@ -78,6 +78,8 @@ pub struct Stats {
     pub forget_underflows: u64,
     /// Flushes that failed.
     pub flush_errors: u64,
+    /// Files whose flush failed and are poisoned.
+    pub poisoned: u64,
     /// Dentry cache hits and misses.
     pub dentry_hits: u64,
     /// See `dentry_hits`.
@@ -102,6 +104,8 @@ pub(crate) struct Counters {
     pub(crate) barriers: AtomicU64,
     pub(crate) underflows: AtomicU64,
     pub(crate) flush_errors: AtomicU64,
+    /// Files whose flush failed and are therefore poisoned.
+    pub(crate) poisoned: AtomicU64,
     pub(crate) dhit: AtomicU64,
     pub(crate) dmiss: AtomicU64,
     pub(crate) inodes_net: AtomicI64,
@@ -498,18 +502,30 @@ impl Inner {
     }
 
     /// Chunks and stores every file with unflushed bytes in `sc`.
+    ///
+    /// A file whose flush fails is poisoned and dropped from the dirty set, so the rest of the
+    /// snapshot still commits and the queue cannot be wedged by one damaged block.
+    /// The file's bytes stay in memory and stay counted; `fsync` of that file reports the error.
     pub(crate) fn flush_data(&self, sc: &SnapCtx) -> Result<()> {
         let files = sc.q.lk().take_dirty_files();
-        let mut first = None;
+        let mut first: Option<Error> = None;
         for ino in files {
-            if let Some(node) = self.nodes.get(&ino) {
-                if let Err(e) = self.flush_node(sc, &node) {
-                    first.get_or_insert(e);
-                    sc.q.lk().add_dirty_file(ino);
-                }
+            let Some(node) = self.nodes.get(&ino) else {
+                continue;
+            };
+            if let Err(e) = self.flush_node(sc, &node) {
+                let err = node.poison(format!("{e} (file {ino:#x})"));
+                first.get_or_insert(err);
+                self.ctr.poisoned.fetch_add(1, Ordering::Relaxed);
             }
         }
-        first.map_or(Ok(()), Err)
+        match first {
+            Some(e) => {
+                *self.last_error.lk() = Some(format!("poisoned file: {e}"));
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     /// Commits everything queued for `sc`: data to the store, then one meta batch.

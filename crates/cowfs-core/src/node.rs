@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
-use cowfs_vfs::{Attr, FileKind, Ino};
+use cowfs_vfs::{Attr, Error, FileKind, Ino};
 
 use crate::file::FileData;
 
@@ -72,6 +72,9 @@ pub(crate) struct Node {
     created_gen: AtomicU64,
     /// The create was cancelled before it reached meta, so nothing of this node is ever committed.
     pub(crate) elided: AtomicBool,
+    /// Set when a flush of this file failed: its data cannot be chunked into the store, so every
+    /// operation on it reports the error instead of writing back around the damage.
+    pub(crate) poison: Mutex<Option<String>>,
     pub(crate) st: RwLock<NodeState>,
 }
 
@@ -86,6 +89,7 @@ impl Node {
             struct_ops: AtomicU32::new(0),
             created_gen: AtomicU64::new(NO_GEN),
             elided: AtomicBool::new(false),
+            poison: Mutex::new(None),
             st: RwLock::new(st),
         }
     }
@@ -96,6 +100,20 @@ impl Node {
 
     pub(crate) fn pinned(&self) -> bool {
         self.refs.load(Ordering::Acquire) > 0 || self.handles.load(Ordering::Acquire) > 0
+    }
+
+    /// Records why this file cannot be written, and returns the error to report to callers.
+    pub(crate) fn poison(&self, why: String) -> Error {
+        *self.poison.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.clone());
+        Error::Corrupt(why)
+    }
+
+    pub(crate) fn poisoned(&self) -> Option<Error> {
+        self.poison
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .map(Error::Corrupt)
     }
 
     pub(crate) fn set_created_gen(&self, gen: u64) {

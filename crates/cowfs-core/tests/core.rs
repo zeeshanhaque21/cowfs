@@ -510,7 +510,7 @@ fn control_plane_operations() {
     assert_eq!(
         c.promote_base("base", "base"),
         Err(ControlError::InvalidName(
-            "source and base are the same snapshot"
+            "source and target are the same snapshot"
         ))
     );
     c.check().unwrap();
