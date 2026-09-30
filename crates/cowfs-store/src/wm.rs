@@ -185,6 +185,28 @@ mod tests {
     }
 
     #[test]
+    fn the_first_mark_is_written_twice_so_tearing_the_newest_slot_leaves_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Io::new(None, true);
+        let mut wm = Wm::open(&io, dir.path()).unwrap();
+        wm.init(&io, Mark { pack: 0, len: 16 }).unwrap();
+        drop(wm);
+        let path = dir.path().join(FILE_NAME);
+        let mut b = std::fs::read(&path).unwrap();
+        let newest = slots(&path)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|s| (s.0, i)))
+            .max()
+            .unwrap()
+            .1;
+        b[newest * SLOT + 16] ^= 0xff;
+        std::fs::write(&path, &b).unwrap();
+        let wm = Wm::open(&io, dir.path()).unwrap();
+        assert_eq!(wm.mark(), Some(Mark { pack: 0, len: 16 }));
+    }
+
+    #[test]
     fn advance_never_regresses_but_reset_does() {
         let dir = tempfile::tempdir().unwrap();
         let io = Io::new(None, true);

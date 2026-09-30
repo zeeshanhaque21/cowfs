@@ -365,3 +365,27 @@ fn copy_of_live_store_files_opens_read_only_view() {
     let t = open(copy.path());
     assert_eq!(t.get(id).unwrap(), random(1, 5000));
 }
+
+#[test]
+fn pack_bytes_in_stats_matches_the_files_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open_unsynced(
+        dir.path(),
+        cowfs_store::Options {
+            max_pack_size: 30_000,
+            checkpoint_on_drop: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for i in 0..20u64 {
+        s.put(&random(i, 5000 + i as usize)).unwrap();
+        let on_disk: u64 = pack_ids(dir.path())
+            .iter()
+            .map(|id| fs::metadata(pack_path(dir.path(), *id)).unwrap().len())
+            .sum();
+        assert_eq!(s.stats().pack_bytes, on_disk, "after put {i}");
+    }
+    assert!(s.stats().packs > 1);
+    assert_eq!(s.stats().packs, pack_ids(dir.path()).len() as u64);
+}
