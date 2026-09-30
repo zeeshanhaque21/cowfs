@@ -99,12 +99,12 @@
         {
           "id": "7",
           "title": "#7 chunking, hashing and block store",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 7,
-          "owner": "critic (subagent)",
+          "owner": "builder (subagent)",
           "pr": "#24",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/24",
-          "detail": "Builder done: 45 tests pass (I re-ran), CI green. Chunk+hash 573 MiB/s (target 800) and verified read 394 MiB/s (target 1024) missed, measured at load 35-140. Open design points: in-memory index plus checkpoint instead of redb, synced last record with bit flip is truncated as torn tail. Independent critic is attacking durability, recovery, resync forgery, concurrency and mutation-tests the suite. docs/v1-store.md",
+          "detail": "Critic verdict: NOT mergeable. Reproduced: F1 put reports Ok for an unreadable block, F2 forged/embedded record poisons an id, F4 a single bit flip in the last SYNCED record makes recovery truncate (delete) it, plus fd-per-pack exhaustion, missing dir fsyncs, O(n) checkpoint under the writer lock, unvalidated alloc, no rust-version, and fsync/BLAKE3 mutants surviving. Builder is fixing with regression tests (durable watermark distinguishes torn tail from corruption). Perf misses stand: chunk+hash ~590 vs 800 MiB/s, verified read ~430 vs 1024 (BLAKE3-bound single thread; 3413 MiB/s at 8 threads).",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -160,12 +160,12 @@
         {
           "id": "13",
           "title": "#13 CLI and Unix-socket control API",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 13,
-          "owner": "critic (subagent)",
+          "owner": "builder (subagent)",
           "pr": "#33",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/33",
-          "detail": "Builder done: 61 tests (I re-ran: pass), CI green on Linux and macOS. JSON-lines protocol over a Unix socket, peer uid check, stub backend, Backend seam for the real core. Design points for #15/#16: slot reset is snapshot_rm then snapshot_create (not atomic), ps returns cwd/fd/lock holds for #20. Independent critic attacking sockets, protocol robustness, cancellation and treehouse fit. docs/v1-control-api.md",
+          "detail": "Critic verdict: NOT mergeable. No cross-user hole, but: no client timeout (status hung 25 s), shutdown waits 6 s for handlers ignoring cancel while the socket stays and new clients hang, unbounded connections (3000 idle -> 3003 threads), slowloris; half-close cancels; unsafe snapshot names accepted (.nfs, ._, case/NFC collisions); no atomic snapshot_reset for treehouse mode (b); import verified is a bare bool. Builder is fixing with regression tests and killing surviving mutants.",
           "ci": "CI: pass (linux, macos)"
         },
         {
