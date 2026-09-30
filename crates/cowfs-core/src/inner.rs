@@ -318,6 +318,28 @@ impl Inner {
         });
     }
 
+    /// Caches a node from attributes meta just returned, so the caller's next `node()` needs no read.
+    fn seed_node(&self, ino: Ino, a: &cowfs_meta::Attr) {
+        if self.nodes.get(&ino).is_some() {
+            return;
+        }
+        let epoch = self.nodes.epoch(&ino);
+        let st = NodeState {
+            attr: self.attr_from_meta(ino, a),
+            target: None,
+            file: None,
+            xattrs: None,
+            kids: None,
+        };
+        if self
+            .nodes
+            .insert_if(ino, Arc::new(Node::new(ino, st)), epoch)
+            .is_ok()
+        {
+            self.shrink_nodes(ino);
+        }
+    }
+
     /// Resolves `name` in `parent` through the dentry cache, then meta.
     pub(crate) fn dent_lookup(&self, sc: &SnapCtx, parent: &Node, name: &[u8]) -> Result<Target> {
         if let Some(d) = self.dents.get(parent.ino, name) {
@@ -332,6 +354,7 @@ impl Inner {
         match sc.snap.lookup(mino(pm), name) {
             Ok(a) => {
                 let child = self.canon(sc.id, a.ino.0)?;
+                self.seed_node(child, &a);
                 let t = Some((child, kind_of(a.kind)));
                 self.dents.fill(parent.ino, name, t, epoch);
                 self.shrink_dents(parent.ino);

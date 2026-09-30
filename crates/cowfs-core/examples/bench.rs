@@ -469,6 +469,31 @@ fn seq_and_random(cfg: &Cfg, rows: &mut Vec<Row>) {
     }
     rows.push(w);
     rows.push(rd);
+    let mut floor = Row::new(
+        &format!("floor: Store::ingest_bytes + sync of {mib:.0} MiB, no Core"),
+        "MiB/s",
+        mib,
+    );
+    let mut chunk_only = Row::new("floor: FastCDC + BLAKE3 only (no store)", "MiB/s", mib);
+    for rep in 0..cfg.n {
+        let data = gen(cfg.seq, rep as u64 + 100);
+        let d = scratch();
+        let st =
+            cowfs_store::Store::open(d.path(), cowfs_store::Options::default()).expect("store");
+        floor.core(timed(|| {
+            st.ingest_bytes(&data).expect("ingest");
+            st.sync().expect("sync");
+        }));
+        chunk_only.core(timed(|| {
+            let mut n = 0usize;
+            for c in cowfs_store::chunks(&data) {
+                n += cowfs_store::BlockId::of(c).as_bytes()[0] as usize;
+            }
+            std::hint::black_box(n);
+        }));
+    }
+    rows.push(floor);
+    rows.push(chunk_only);
 
     let blocks = (cfg.rnd_file / 4096) as u64;
     let mib = cfg.rnd_file as f64 / 1048576.0;
@@ -511,7 +536,13 @@ fn seq_and_random(cfg: &Cfg, rows: &mut Vec<Row>) {
         }));
         drop(c);
         let nd = scratch();
-        let f = fs::File::create(nd.path().join("f")).expect("create");
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(nd.path().join("f"))
+            .expect("create");
         f.write_all_at(&data, 0).expect("write");
         f.sync_all().expect("sync");
         let mut buf = vec![0u8; 4096];
