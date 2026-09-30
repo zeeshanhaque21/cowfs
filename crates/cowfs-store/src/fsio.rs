@@ -155,18 +155,6 @@ impl Io {
         file.write_all_at(buf, off)
     }
 
-    /// Read exactly `buf.len()` bytes, logging nothing (reads never change the image).
-    pub(crate) fn read_exact_at(
-        &self,
-        file: &File,
-        path: &Path,
-        off: u64,
-        buf: &mut [u8],
-    ) -> io::Result<()> {
-        let _ = path;
-        file.read_exact_at(buf, off)
-    }
-
     pub(crate) fn sync_file(&self, file: &File, path: &Path) -> io::Result<()> {
         self.log(|| Op::Sync(name(path)));
         log_data(LogOp::Sync { file: name(path) });
