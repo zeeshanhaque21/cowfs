@@ -81,6 +81,72 @@ pub fn is_plain_attr(name: &[u8]) -> bool {
         && name != RESOURCE_FORK
 }
 
+/// True if `buf` can still become a valid sidecar, even though it is not one yet: the
+/// AppleDouble header, the attribute header, the entry table and every attribute name are
+/// complete, only the data and the resource fork are still missing. This is what the client
+/// writes first, in pieces. A file whose bytes cannot be a sidecar at all (a real file someone
+/// created under a reserved name) fails here, which is how the adapter can refuse it instead of
+/// accepting bytes it would only drop.
+pub fn is_plausible_prefix(buf: &[u8]) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    if be32(buf, 0) != Some(MAGIC) || be32(buf, 4) != Some(VERSION) {
+        return false;
+    }
+    let count = match be16(buf, 24) {
+        Some(c) if (1..=15).contains(&c) => usize::from(c),
+        _ => return false,
+    };
+    let header_end = ENTRIES_AT + 12 * count;
+    if buf.len() < header_end {
+        return false;
+    }
+    let mut finder = None;
+    for i in 0..count {
+        let at = ENTRIES_AT + 12 * i;
+        let (kind, off) = match (
+            be32(buf, at),
+            be32(buf, at + 4).and_then(|o| usize::try_from(o).ok()),
+        ) {
+            (Some(k), Some(o)) => (k, o),
+            _ => return false,
+        };
+        // A prefix can name data it has not received yet, so only the lower bound is checked.
+        if off < header_end {
+            return false;
+        }
+        if kind == AD_FINDERINFO {
+            finder = Some((at, off));
+        }
+    }
+    let Some((_, off)) = finder else {
+        return false;
+    };
+    if off != FINFO_AT || buf.len() < ATTR_HDR_AT + ATTR_HDR_LEN {
+        return false;
+    }
+    if be32(buf, ATTR_HDR_AT) != Some(ATTR_MAGIC) {
+        return false;
+    }
+    let count = match be16(buf, ATTR_HDR_AT + 34) {
+        Some(c) if usize::from(c) <= MAX_ATTRS => usize::from(c),
+        _ => return false,
+    };
+    let mut at = FIRST_ENTRY;
+    for _ in 0..count {
+        let namelen = match buf.get(at + 10) {
+            Some(n) => usize::from(*n),
+            None => return false,
+        };
+        if namelen == 0 || at + 11 + namelen > buf.len() || buf.get(at + 10 + namelen) != Some(&0) {
+            return false;
+        }
+        at += entry_len(namelen);
+    }
+    at <= buf.len()
+}
+
 fn is_empty_fork(fork: &[u8]) -> bool {
     fork.len() == EMPTY_FORK_LEN && fork.get(16..16 + EMPTY_FORK_TAG.len()) == Some(EMPTY_FORK_TAG)
 }
@@ -127,7 +193,7 @@ impl Sidecar {
     }
 
     #[cfg(test)]
-    fn encode_all(s: &Sidecar) -> Vec<u8> {
+    pub(crate) fn encode_all(s: &Sidecar) -> Vec<u8> {
         Sidecar::encode_capped(s, usize::MAX)
     }
 
@@ -443,11 +509,48 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_file_write_that_is_not_a_sidecar_is_refused() {
-        // What the adapter has to be able to tell: a real file named ._x must not be accepted.
-        assert_eq!(Sidecar::decode(b"my real file content"), None);
-        assert_eq!(Sidecar::decode(&[0u8; 20]), None);
-        assert!(Sidecar::decode(&Sidecar::default().encode()).is_some());
+    fn a_prefix_of_a_sidecar_is_recognised_and_other_bytes_are_not() {
+        let full = sidecar_of_30();
+        for cut in [0, 840, 900, 1024, 2000, 4095, 4096] {
+            assert!(is_plausible_prefix(&full[..cut]), "{cut} bytes");
+        }
+        // Too short to tell anything: below the end of the entry table (840 bytes here) a buffer
+        // could still be anything, and refusing is the safe answer when it cannot be ruled out.
+        for cut in [1, 25, 120, 839] {
+            assert!(!is_plausible_prefix(&full[..cut]), "{cut} bytes");
+        }
+        assert!(is_plausible_prefix(&full), "the whole file");
+        for bad in [&b"my real file content"[..], &[0u8; 20], &[0xffu8; 4096]] {
+            assert!(!is_plausible_prefix(bad), "{bad:?}");
+        }
+        let mut magic = full.clone();
+        magic[1] ^= 1;
+        assert!(!is_plausible_prefix(&magic));
+        let mut count = full.clone();
+        count[24..26].copy_from_slice(&0u16.to_be_bytes());
+        assert!(!is_plausible_prefix(&count));
+        let mut name = full[..1024].to_vec();
+        name[130] = 200;
+        assert!(
+            !is_plausible_prefix(&name),
+            "a name length past what was written"
+        );
+        let mut nul = full[..1024].to_vec();
+        nul[140] = b'x';
+        assert!(
+            !is_plausible_prefix(&nul),
+            "a name not terminated inside what was written"
+        );
+    }
+
+    /// A sidecar with 30 attributes, which is larger than one buffer.
+    fn sidecar_of_30() -> Vec<u8> {
+        let mut s = Sidecar::default();
+        for i in 0..30usize {
+            s.attrs
+                .insert(format!("user.k{i:03}").into_bytes(), vec![i as u8; 100]);
+        }
+        s.encode()
     }
 
     #[test]

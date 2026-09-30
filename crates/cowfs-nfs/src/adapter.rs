@@ -18,7 +18,7 @@ use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult};
 use crate::convert::{fattr, set_attr};
 use crate::errors::nfsstat;
 use crate::handle::HandleCodec;
-use crate::sidecar::{is_side, SidecarBuffers};
+use crate::sidecar::{is_side, PerIno, SidecarBuffers};
 
 pub(crate) type NfsResult<T> = Result<T, nfsstat3>;
 
@@ -112,6 +112,7 @@ pub struct Adapter {
     handles: HandleCodec,
     parents: Mutex<HashMap<Ino, Ino>>,
     pub(crate) sidecars: Mutex<SidecarBuffers>,
+    pub(crate) sidecar_locks: Mutex<PerIno>,
 }
 
 impl std::fmt::Debug for Adapter {
@@ -132,6 +133,7 @@ impl Adapter {
             handles: HandleCodec::new()?,
             parents: Mutex::new(HashMap::new()),
             sidecars: Mutex::new(SidecarBuffers::default()),
+            sidecar_locks: Mutex::new(PerIno::default()),
         })
     }
 
@@ -182,6 +184,15 @@ impl Adapter {
         self.handles.bury(ino);
     }
 
+    /// Buries an inode that has no name left. Asked after the removal, never before: two
+    /// unlinks of the last two names of one file would otherwise both see a link left and bury
+    /// nothing.
+    fn reap_if_last(&self, ino: Ino) {
+        if !matches!(self.vfs.getattr(ino), Ok(a) if a.nlink > 0) {
+            self.reap(ino);
+        }
+    }
+
     fn parent_of(&self, dir: Ino) -> NfsResult<Ino> {
         if dir == ROOT_INO {
             return Ok(ROOT_INO);
@@ -201,7 +212,7 @@ impl Adapter {
 
     pub fn lookup(&self, dir: fileid3, name: &[u8]) -> NfsResult<(fileid3, fattr3)> {
         not_side(dir)?;
-        if self.translating(name) {
+        if self.translating(dir, name) {
             return self.side_lookup(dir, name);
         }
         match name {
@@ -286,7 +297,7 @@ impl Adapter {
         guarded: bool,
     ) -> NfsResult<(fileid3, fattr3)> {
         not_side(dir)?;
-        if self.translating(name) {
+        if self.side_of(dir, name) {
             return self.side_create(dir, name, attr, guarded);
         }
         new_name(name)?;
@@ -326,7 +337,7 @@ impl Adapter {
         verf: createverf3,
     ) -> NfsResult<(fileid3, fattr3)> {
         not_side(dir)?;
-        if self.translating(name) {
+        if self.side_of(dir, name) {
             return self.side_create_exclusive(dir, name);
         }
         new_name(name)?;
@@ -358,7 +369,6 @@ impl Adapter {
 
     pub fn mkdir(&self, dir: fileid3, name: &[u8], attr: &sattr3) -> NfsResult<(fileid3, fattr3)> {
         not_side(dir)?;
-        self.no_sidecar_name(name)?;
         new_name(name)?;
         let mode = match attr.mode {
             set_mode3::mode(m) => m,
@@ -376,7 +386,6 @@ impl Adapter {
         target: &[u8],
     ) -> NfsResult<(fileid3, fattr3)> {
         not_side(dir)?;
-        self.no_sidecar_name(name)?;
         new_name(name)?;
         if target.is_empty() || target.contains(&0) {
             return Err(nfsstat3::NFS3ERR_INVAL);
@@ -394,29 +403,17 @@ impl Adapter {
         if is_side(file) {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
-        self.no_sidecar_name(name)?;
         new_name(name)?;
         let a = self.vfs.link(file, dir, name).map_err(stat)?;
         self.handed_out(None, &a);
         Ok(self.fa(&a))
     }
 
-    /// Sidecars are created by CREATE only.
-    fn no_sidecar_name(&self, name: &[u8]) -> NfsResult<()> {
-        if self.translating(name) {
-            Err(nfsstat3::NFS3ERR_ACCES)
-        } else {
-            Ok(())
-        }
-    }
-
     /// Removes one name and releases the inode if that was its last link.
     fn remove_one(&self, dir: Ino, name: &[u8]) -> NfsResult<()> {
         let target = self.peek(dir, name).map_err(stat)?;
         self.vfs.unlink(dir, name).map_err(stat)?;
-        if target.nlink <= 1 {
-            self.reap(target.ino);
-        }
+        self.reap_if_last(target.ino);
         Ok(())
     }
 
@@ -430,7 +427,7 @@ impl Adapter {
     pub fn remove(&self, dir: fileid3, name: &[u8]) -> NfsResult<()> {
         not_side(dir)?;
         check_name(name)?;
-        if self.translating(name) {
+        if self.translating(dir, name) {
             return self.side_remove(dir, name);
         }
         self.remove_one(dir, name)?;
@@ -469,7 +466,7 @@ impl Adapter {
     pub fn rmdir(&self, dir: fileid3, name: &[u8]) -> NfsResult<()> {
         not_side(dir)?;
         check_name(name)?;
-        if self.translating(name) {
+        if self.translating(dir, name) {
             return Err(nfsstat3::NFS3ERR_NOTDIR);
         }
         let target = self.peek(dir, name).map_err(stat)?;
@@ -480,7 +477,7 @@ impl Adapter {
             }
             r => r.map_err(stat)?,
         }
-        self.reap(target.ino);
+        self.reap_if_last(target.ino);
         Ok(())
     }
 
@@ -495,7 +492,10 @@ impl Adapter {
         not_side(to_dir)?;
         check_name(from)?;
         check_name(to)?;
-        match (self.translating(from), self.translating(to)) {
+        match (
+            self.translating(from_dir, from),
+            self.translating(to_dir, to),
+        ) {
             // The attributes live on the inode and moved with it: nothing left to do.
             (true, true) => return Ok(()),
             (false, false) => {}
@@ -510,8 +510,8 @@ impl Adapter {
             lock(&self.parents).insert(src.ino, to_dir);
         }
         if let Some(d) = replaced {
-            if d.ino != src.ino && (d.kind == FileKind::Directory || d.nlink <= 1) {
-                self.reap(d.ino);
+            if d.ino != src.ino {
+                self.reap_if_last(d.ino);
             }
         }
         if self.opts.appledouble == AppleDoubleMode::Hide {
@@ -561,7 +561,7 @@ impl Adapter {
                     break;
                 }
                 cookie = e.cookie;
-                if self.opts.appledouble != AppleDoubleMode::Store && is_appledouble(&e.name) {
+                if self.opts.appledouble == AppleDoubleMode::Hide && is_appledouble(&e.name) {
                     continue;
                 }
                 if let Some(entry) = self.list_entry(dir, e, with_attrs) {

@@ -11,13 +11,13 @@
 //!   partial write lands on the layout it wrote itself.
 //! - The buffers are bounded in count and bytes; the oldest are dropped first.
 use std::collections::{BTreeMap, HashMap};
-use std::sync::MutexGuard;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use cowfs_vfs::{Attr, Error, FileKind, Ino, SetAttr, Timestamp, XattrFlags};
 use nfsserve::nfs::{fattr3, fileid3, nfsstat3, sattr3};
 
 use crate::adapter::{is_appledouble, lock, stat, Adapter, NfsResult};
-use crate::appledouble::{is_plain_attr, Sidecar, FINDER_INFO, RESOURCE_FORK};
+use crate::appledouble::{is_plain_attr, is_plausible_prefix, Sidecar, FINDER_INFO, RESOURCE_FORK};
 use crate::convert::set_attr;
 
 /// Set on the file id of a sidecar.
@@ -103,14 +103,53 @@ impl SidecarBuffers {
     }
 }
 
+/// One lock per inode, so two writers of the same sidecar cannot lose each other's chunks while
+/// writers of different files do not wait for each other. The map holds weak references, so an
+/// entry disappears with its last user.
+#[derive(Debug, Default)]
+pub(crate) struct PerIno {
+    map: HashMap<Ino, Weak<Mutex<()>>>,
+}
+
+impl PerIno {
+    fn of(&mut self, ino: Ino) -> Arc<Mutex<()>> {
+        if let Some(l) = self.map.get(&ino).and_then(Weak::upgrade) {
+            return l;
+        }
+        let l = Arc::new(Mutex::new(()));
+        self.map.insert(ino, Arc::downgrade(&l));
+        if self.map.len() > 4096 {
+            self.map.retain(|_, w| w.strong_count() > 0);
+        }
+        l
+    }
+}
+
 fn side_of(name: &[u8]) -> Option<&[u8]> {
     is_appledouble(name).then(|| &name[2..])
 }
 
 impl Adapter {
-    /// True if `name` is a sidecar name that this adapter translates.
-    pub(crate) fn translating(&self, name: &[u8]) -> bool {
-        self.opts.appledouble == crate::AppleDoubleMode::Translate && is_appledouble(name)
+    /// True if `._name` is a name this adapter might translate: the mode says so, and no real
+    /// file of that name exists. A real file wins, so a `._x` that arrived before `x` (every zip,
+    /// tar and git checkout that tracks one) stays a real file.
+    pub(crate) fn translating(&self, dir: Ino, name: &[u8]) -> bool {
+        self.opts.appledouble == crate::AppleDoubleMode::Translate
+            && is_appledouble(name)
+            && self.peek(dir, name).is_err()
+    }
+
+    /// True if `._name` is the sidecar of an existing `name` rather than a real file of that
+    /// name. Both halves matter: with no `name` to hold the attributes there is nothing to
+    /// translate, so CREATE stores a real file instead of refusing, which is what an archive
+    /// extraction and a checkout of a tree that tracks `._*` need.
+    pub(crate) fn side_of(&self, dir: Ino, name: &[u8]) -> bool {
+        self.translating(dir, name) && self.main_of(dir, name).is_ok()
+    }
+
+    /// The main file a sidecar name belongs to.
+    fn main_of(&self, dir: Ino, name: &[u8]) -> Result<Attr, Error> {
+        self.peek(dir, name.get(2..).unwrap_or_default())
     }
 
     fn buffers(&self) -> MutexGuard<'_, SidecarBuffers> {
@@ -250,6 +289,11 @@ impl Adapter {
         offset: u64,
         data: &[u8],
     ) -> NfsResult<(u32, fattr3)> {
+        let one = {
+            let mut locks = lock(&self.sidecar_locks);
+            locks.of(id & !SIDE_BIT)
+        };
+        let _held = one.lock().unwrap_or_else(PoisonError::into_inner);
         let (t, mut buf) = self.side_file(id & !SIDE_BIT)?;
         let start = usize::try_from(offset).map_err(|_| nfsstat3::NFS3ERR_FBIG)?;
         let end = start
@@ -260,6 +304,11 @@ impl Adapter {
             buf.resize(end, 0);
         }
         buf[start..end].copy_from_slice(data);
+        if offset == 0 && !is_plausible_prefix(&buf) {
+            // Bytes that can never be a sidecar are a real file under a reserved name. Refuse
+            // them instead of accepting data the adapter would only drop.
+            return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        }
         let cur = self.side_store(&t, buf)?;
         let n = u32::try_from(data.len()).unwrap_or(u32::MAX);
         Ok((n, self.side_attr(&cur, cur.size as usize)))
@@ -267,6 +316,11 @@ impl Adapter {
 
     /// SETATTR on a sidecar: only the size matters, mode and times are accepted and ignored.
     pub(crate) fn side_setattr(&self, id: fileid3, s: &sattr3) -> NfsResult<fattr3> {
+        let one = {
+            let mut locks = lock(&self.sidecar_locks);
+            locks.of(id & !SIDE_BIT)
+        };
+        let _held = one.lock().unwrap_or_else(PoisonError::into_inner);
         let (t, mut buf) = self.side_file(id & !SIDE_BIT)?;
         let changes: SetAttr = set_attr(s);
         let Some(size) = changes.size else {
@@ -321,5 +375,49 @@ impl Adapter {
         self.sync_xattrs(t.ino, &Sidecar::default())?;
         self.buffers().remove(t.ino);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::AdapterOptions;
+    use cowfs_vfs::ROOT_INO;
+    use cowfs_vfs_test::MemVfs;
+
+    fn adapter() -> Adapter {
+        Adapter::new(
+            Arc::new(MemVfs::new()),
+            AdapterOptions {
+                appledouble: crate::AppleDoubleMode::Translate,
+                ..AdapterOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn more_attributes_than_the_format_holds_are_refused() {
+        let a = adapter();
+        a.create(ROOT_INO, b"f", &sattr3::default(), true).unwrap();
+        let (id, _) = a
+            .create(ROOT_INO, b"._f", &sattr3::default(), true)
+            .unwrap();
+        let mut over = Sidecar::default();
+        for i in 0..300 {
+            over.attrs
+                .insert(format!("user.a{i:03}").into_bytes(), vec![1; 100]);
+        }
+        let st = a.write(id, 0, &Sidecar::encode_all(&over));
+        assert_eq!(
+            st.map(|_| ()).unwrap_err(),
+            nfsstat3::NFS3ERR_NOTSUPP,
+            "past the cap the write is refused, not accepted and dropped"
+        );
+        let ino = a.main_of(ROOT_INO, b"._f").unwrap().ino;
+        assert!(
+            a.vfs.listxattr(ino).unwrap().is_empty(),
+            "and nothing was stored as attributes"
+        );
     }
 }

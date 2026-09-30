@@ -6,6 +6,8 @@
 //! - The inode generation detects inode reuse: the adapter counts the removals of each inode,
 //!   the count is in the handle, and a handle minted before the last removal of its inode is
 //!   stale even if the `Vfs` reuses the number. The handle of a live inode never changes.
+//! - A file and its AppleDouble sidecar share one generation, because they are one inode, so a
+//!   sidecar handle goes stale exactly when the file's does.
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::{Mutex, PoisonError};
@@ -13,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowfs_vfs::Ino;
 use nfsserve::nfs::nfsstat3;
+
+use crate::sidecar::SIDE_BIT;
 
 /// Length of every handle.
 pub const HANDLE_LEN: usize = 40;
@@ -92,9 +96,11 @@ impl HandleCodec {
         }
     }
 
-    fn inode_generation(&self, ino: Ino) -> u64 {
+    /// The generation of the inode `id` names, ignoring the sidecar bit, which only tells a
+    /// sidecar apart from the file it belongs to.
+    fn inode_generation(&self, id: Ino) -> u64 {
         let b = self.buried.lock().unwrap_or_else(PoisonError::into_inner);
-        b.generation.get(&ino).copied().unwrap_or(0)
+        b.generation.get(&(id & !SIDE_BIT)).copied().unwrap_or(0)
     }
 
     /// The handle for `ino` as of now.
@@ -225,6 +231,21 @@ mod tests {
         let b = c.buried.lock().unwrap();
         assert_eq!(b.generation.len(), MAX_REMEMBERED);
         assert_eq!(b.order.len(), MAX_REMEMBERED);
+    }
+
+    #[test]
+    fn a_sidecar_handle_stales_with_its_file() {
+        let c = codec();
+        let file = c.encode(5);
+        let side = c.encode(5 | SIDE_BIT);
+        assert_eq!(
+            c.decode(&side),
+            Ok(5 | SIDE_BIT),
+            "a sidecar handle decodes to its own id"
+        );
+        c.bury(5);
+        assert_eq!(c.decode(&side), Err(nfsstat3::NFS3ERR_STALE));
+        assert_eq!(c.decode(&file), Err(nfsstat3::NFS3ERR_STALE));
     }
 
     #[test]
