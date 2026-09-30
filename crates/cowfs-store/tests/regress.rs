@@ -183,7 +183,7 @@ fn fd_child() {
     };
     let mut ids = Vec::new();
     {
-        let s = Store::open(&dir, o).unwrap();
+        let s = Store::open_unsynced(&dir, o).unwrap();
         for i in 0..1500u64 {
             let d = random(i, 100);
             ids.push((s.put(&d).unwrap(), d));
@@ -193,7 +193,7 @@ fn fd_child() {
             assert_eq!(&s.get(*id).unwrap(), d);
         }
     }
-    let s = Store::open(&dir, o).unwrap();
+    let s = Store::open_unsynced(&dir, o).unwrap();
     assert_eq!(s.stats().packs, 1501);
     for (id, d) in &ids {
         assert_eq!(&s.get(*id).unwrap(), d);

@@ -132,3 +132,11 @@ pub(crate) fn decode(header: &Header, payload: &[u8]) -> Result<Vec<u8>, &'stati
         }
     }
 }
+
+/// True when the payload decodes and its bytes hash to the record's id.
+pub(crate) fn verify(header: &Header, payload: &[u8]) -> bool {
+    match decode(header, payload) {
+        Ok(data) => BlockId::of(&data) == header.id,
+        Err(_) => false,
+    }
+}

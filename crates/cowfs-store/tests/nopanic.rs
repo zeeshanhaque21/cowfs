@@ -17,7 +17,7 @@ fn base() -> &'static Fixture {
 
 /// Open whatever is in `dir`. It may fail, but it must not panic, serve wrong data, or refuse writes once open.
 fn exercise(dir: &Path) {
-    let Ok(s) = Store::open(dir, opts()) else {
+    let Ok(s) = Store::open_unsynced(dir, opts()) else {
         return;
     };
     let ids: Vec<_> = s.iter_ids().collect();
@@ -169,7 +169,7 @@ fn index_pointing_at_a_missing_pack_or_a_directory_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
     install(dir.path(), &[(0, &fx.packs[0])], None);
     fs::create_dir(index_path(dir.path())).unwrap();
-    let s = Store::open(dir.path(), opts()).unwrap();
+    let s = Store::open_unsynced(dir.path(), opts()).unwrap();
     assert!(!s.recovery().index_loaded);
     for (id, d) in &fx.blocks {
         assert_eq!(&s.get(*id).unwrap(), d);
@@ -179,7 +179,7 @@ fn index_pointing_at_a_missing_pack_or_a_directory_is_ignored() {
 
     let ix = index_bytes(&[(7, 100)], &[]);
     install(dir.path(), &[(0, &fx.packs[0])], Some(&ix));
-    let s = Store::open(dir.path(), opts()).unwrap();
+    let s = Store::open_unsynced(dir.path(), opts()).unwrap();
     assert!(!s.recovery().index_loaded);
     assert_eq!(s.iter_ids().count(), fx.blocks.len());
 }
@@ -191,6 +191,6 @@ fn stray_files_in_the_store_are_ignored() {
     install(dir.path(), &[(0, &fx.packs[0])], None);
     fs::write(dir.path().join("packs").join("notes.txt"), b"hi").unwrap();
     fs::write(pack_path(dir.path(), 0).with_extension("tmp"), b"x").unwrap();
-    let s = Store::open(dir.path(), opts()).unwrap();
+    let s = Store::open_unsynced(dir.path(), opts()).unwrap();
     assert_eq!(s.iter_ids().count(), fx.blocks.len());
 }

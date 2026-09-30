@@ -42,6 +42,7 @@ fn opts() -> Options {
     Options {
         max_pack_size: 2500,
         checkpoint_on_drop: false,
+        ..Default::default()
     }
 }
 
@@ -59,7 +60,7 @@ proptest! {
     fn store_matches_model_across_crashes(ops in prop::collection::vec(op(), 1..40)) {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
-        let mut store = Some(Store::open(d, opts()).unwrap());
+        let mut store = Some(Store::open_unsynced(d, opts()).unwrap());
         let mut present: HashSet<usize> = HashSet::new();
         let mut durable: HashSet<usize> = HashSet::new();
         let mut synced = pack_lens(d);
@@ -99,7 +100,7 @@ proptest! {
                     let keep = (synced.get(&last).copied().unwrap_or(16) + extra).min(actual);
                     fs::OpenOptions::new().write(true).open(&p).unwrap().set_len(keep).unwrap();
 
-                    let s = Store::open(d, opts()).unwrap();
+                    let s = Store::open_unsynced(d, opts()).unwrap();
                     let mut survivors = HashSet::new();
                     for i in 0..POOL {
                         let id = BlockId::of(&data(i));
@@ -125,7 +126,7 @@ proptest! {
         }
 
         drop(store.take());
-        let s = Store::open(d, opts()).unwrap();
+        let s = Store::open_unsynced(d, opts()).unwrap();
         for i in &present {
             prop_assert_eq!(s.get(BlockId::of(&data(*i))).unwrap(), data(*i));
         }

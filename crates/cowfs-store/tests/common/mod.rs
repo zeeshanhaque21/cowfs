@@ -100,6 +100,7 @@ pub fn fixture(specs: &[(usize, bool)], max_pack_size: u64) -> Fixture {
             Options {
                 max_pack_size,
                 checkpoint_on_drop: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -141,8 +142,33 @@ pub fn install(dir: &Path, packs: &[(u32, &[u8])], index: Option<&[u8]>) {
         fs::write(pack_path(dir, *id), bytes).unwrap();
     }
     let _ = fs::remove_file(index_path(dir));
+    let _ = fs::remove_file(dir.join("SYNCED"));
     if let Some(bytes) = index {
         fs::write(index_path(dir), bytes).unwrap();
+    }
+}
+
+/// Bytes of a `SYNCED` watermark file saying pack `pack` is durable up to `len`.
+pub fn wm_bytes(pack: u32, len: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 64];
+    b[..8].copy_from_slice(&2u64.to_le_bytes());
+    b[8..12].copy_from_slice(&pack.to_le_bytes());
+    b[16..24].copy_from_slice(&len.to_le_bytes());
+    let crc = crc32c::crc32c(&b[..24]);
+    b[24..28].copy_from_slice(&crc.to_le_bytes());
+    b
+}
+
+/// Like [`install`], and also write a watermark when `mark` is given.
+pub fn install_wm(
+    dir: &Path,
+    packs: &[(u32, &[u8])],
+    index: Option<&[u8]>,
+    mark: Option<(u32, u64)>,
+) {
+    install(dir, packs, index);
+    if let Some((pack, len)) = mark {
+        fs::write(dir.join("SYNCED"), wm_bytes(pack, len)).unwrap();
     }
 }
 
