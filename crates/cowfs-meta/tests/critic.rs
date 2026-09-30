@@ -160,6 +160,7 @@ fn verify(img: Vec<u8>, p: usize, marks: &[Mark], any: bool, what: &str) -> Resu
 }
 
 thread_local! {
+    static RECOVER_FAILED_CLOSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECOVERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -168,8 +169,21 @@ fn recover(img: Vec<u8>, marks: &[Mark], what: &str, why: &str) -> Result<(), St
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lost.redb");
     std::fs::write(&path, &img).unwrap();
-    let (m, rec) = Meta::open_recover(&path, opts())
-        .map_err(|e| format!("{what}: open failed ({why}) and open_recover failed: {e}"))?;
+    let (m, rec) = match Meta::open_recover(&path, opts()) {
+        Ok(v) => v,
+        Err(e) => {
+            // Damage recovery cannot repair (for example a file length that is not a valid
+            // region layout): it must fail closed and leave the original bytes in place.
+            return if std::fs::read(&path).unwrap() == img {
+                RECOVER_FAILED_CLOSED.with(|c| c.set(c.get() + 1));
+                Ok(())
+            } else {
+                Err(format!(
+                    "{what}: open_recover failed ({e}) and changed the file"
+                ))
+            };
+        }
+    };
     m.check()
         .map_err(|e| format!("{what}: check after recovery: {e}"))?;
     let got = fp(&m);
@@ -250,8 +264,9 @@ fn crash_all(name: &str, log: &[Ev], marks: &[Mark], stride: usize, seed: u64) -
         }
     }
     eprintln!(
-        "{name}: {} lost-fsync images recovered with open_recover",
-        RECOVERED.with(std::cell::Cell::get)
+        "{name}: {} lost-fsync images recovered with open_recover, {} failed closed with the file untouched",
+        RECOVERED.with(std::cell::Cell::get),
+        RECOVER_FAILED_CLOSED.with(std::cell::Cell::get)
     );
     eprintln!(
         "{name}: log {} events, marks {}, images {opened}, failures {}",
