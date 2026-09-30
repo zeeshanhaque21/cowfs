@@ -287,9 +287,46 @@ chunks(&[u8]) -> impl Iterator<Item = &[u8]>           // FastCDC 16/64/256 KiB
 `ingest` and `ingest_bytes` leave blocks stored before an error in the store as unreferenced blocks, for garbage collection.
 An empty input to `ingest` gives an empty chunk list.
 
+## Compaction (#10)
+
+`crates/cowfs-store/src/compact.rs` adds the rewriting a collector drives.
+The collector itself is `cowfs-gc` (`docs/v1-gc.md`); this crate only moves bytes and keeps its
+own invariants.
+
+There is still no `delete`.
+A block leaves the store only when the pack holding it is rewritten without it, and that is five
+explicit steps, so a caller can drive them and a crash can land between any two:
+
+| Step | Method | Durability |
+|---|---|---|
+| 1 | `plan_pack(id, live)` | none, a read-only scan |
+| 2 | `begin_compaction(&plan, live)` | new pack created, header fsynced, `packs/` fsynced |
+| 3 | `copy_batch(&mut c, budget)` | none, records copied byte for byte into the page cache |
+| 4 | `finish_compaction(&c)` | new pack fsynced, `packs/` fsynced, index repointed, `index.cix` rewritten |
+| 5 | `discard_pack(id, condemned)` | `ACKED` appended and fsynced, pack unlinked, `packs/` fsynced, `SYNCED` base lowered |
+
+Invariants this crate keeps:
+
+- Records are copied verbatim: no decode, no rehash, no recompress.
+  The copy costs the read and write path and nothing else.
+- A pack with nothing live in it gets no new pack, so a fully dead pack costs 16 bytes, not a
+  fresh file.
+- A record is only copied when the index points into the pack being rewritten.
+  A duplicate record never steals an index entry from a good copy.
+- A pack with `corrupt_synced` damage, or one the watermark says is missing, is refused by
+  `begin_compaction`.
+  Rewriting it would copy only valid records and silently discard the damaged region, which is
+  what `ACKED` and `Store::acknowledge_corruption` exist to make explicit.
+- `discard_pack` records the pack in `ACKED` before unlinking it and lowers `SYNCED`'s base, so a
+  crash between those steps is never reported as a missing synced pack.
+- Crash between any two steps leaves a consistent store.
+  The copy is a real pack of real records, so `open` finds and indexes it; the source stays until
+  step 5, so the index never names a file that is gone.
+- `Store::epoch()` is the durable watermark, and a collector uses it as the epoch of its cycle.
+
 ## Not in this crate
 
-Garbage collection and compaction (#10), last-access times, tiering and any remote backend.
+Garbage collection itself (#10), last-access times, tiering and any remote backend.
 Only `put`, no `delete`: blocks leave the store only through compaction.
 
 ## Measured performance

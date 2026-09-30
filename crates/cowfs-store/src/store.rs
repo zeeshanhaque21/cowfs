@@ -1052,3 +1052,91 @@ impl Drop for Store {
         }
     }
 }
+
+/// Store internals `crate::compact` needs, bundled so that module never names a private field.
+#[derive(Debug)]
+pub(crate) struct Guts<'a> {
+    pub(crate) dir: &'a Path,
+    pub(crate) io: &'a Io,
+    pub(crate) index: &'a Index,
+    pub(crate) wm: &'a Mutex<Wm>,
+}
+
+impl Store {
+    pub(crate) fn guts(&self) -> Guts<'_> {
+        Guts {
+            dir: &self.dir,
+            io: &self.io,
+            index: &self.index,
+            wm: &self.wm,
+        }
+    }
+
+    /// Id of the pack `put` appends to.
+    pub(crate) fn active_pack(&self) -> u32 {
+        self.writer().id
+    }
+
+    /// The durable watermark: everything below it was fsynced by a completed `sync`.
+    ///
+    /// A collector takes it as the epoch of its cycle: a record at or above it was written after
+    /// the collector froze, so no reference to it can have been seen by the mark yet.
+    /// `None` before anything is synced.
+    pub fn epoch(&self) -> Option<(u32, u64)> {
+        let w = self.writer();
+        (w.synced.1 > 0).then_some(w.synced)
+    }
+
+    /// Create a pack that `put` will not append to, for compaction to write into.
+    ///
+    /// The id is above every pack that exists, and is remembered as sealed, so the writer's next
+    /// rollover never hands it out twice.
+    pub fn new_pack(&self) -> Result<(u32, Arc<File>)> {
+        let mut w = self.writer();
+        let id = w
+            .pack_lens()
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("pack ids exhausted"))?;
+        let file = Arc::new(create_pack(&self.io, &self.dir, id)?);
+        w.sealed.insert(id, PACK_HEADER_LEN);
+        self.counters.packs.fetch_add(1, Relaxed);
+        self.counters.pack_bytes.fetch_add(PACK_HEADER_LEN, Relaxed);
+        Ok((id, file))
+    }
+
+    /// Record the real length of a pack compaction just finished writing.
+    pub fn finish_pack(&self, id: u32, len: u64) -> Result<()> {
+        let mut w = self.writer();
+        let old = w.sealed.insert(id, len).unwrap_or(0);
+        self.counters
+            .pack_bytes
+            .fetch_add(len.saturating_sub(old), Relaxed);
+        Ok(())
+    }
+
+    /// Forget a pack that no longer exists: drop it from the writer's map and recount the sizes.
+    pub(crate) fn forget_pack(&self, id: u32) {
+        self.writer().sealed.remove(&id);
+        let mut packs = 0u64;
+        let mut bytes = 0u64;
+        if let Ok(entries) = fs::read_dir(pack::pack_dir(&self.dir)) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .and_then(pack::parse_pack_name)
+                    .is_some()
+                {
+                    packs += 1;
+                    bytes += entry.metadata().map_or(0, |m| m.len());
+                }
+            }
+        }
+        self.counters.packs.store(packs, Relaxed);
+        self.counters.pack_bytes.store(bytes, Relaxed);
+    }
+}

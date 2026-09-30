@@ -2,6 +2,7 @@
 
 mod ack;
 mod chunk;
+mod compact;
 mod error;
 mod fdcache;
 mod fsio;
@@ -15,6 +16,7 @@ mod wm;
 use std::fmt;
 
 pub use chunk::{chunks, Chunks, AVG_CHUNK_LEN, MAX_CHUNK_LEN, MIN_CHUNK_LEN};
+pub use compact::{Compaction, PackInfo, PackPlan, Rewrite};
 pub use error::{Error, Result};
 #[doc(hidden)]
 pub use fsio::{Op, Trace};
