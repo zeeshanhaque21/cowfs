@@ -125,6 +125,7 @@ impl Drop for Guard {
             let _ = t.join();
         }
         let _ = self.inner.sync_all();
+        let _ = self.inner.meta.close();
     }
 }
 

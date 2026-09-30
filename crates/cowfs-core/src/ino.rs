@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use cowfs_meta::SnapshotId;
 use cowfs_vfs::{Error, Ino, Result, ROOT_INO};
 
 /// Set on inode numbers handed out before meta assigned a real one.
@@ -42,10 +43,10 @@ pub(crate) fn snap_of(ino: Ino) -> Option<u64> {
 
 /// The meta-derived inode number of meta inode `m` in snapshot `snap`.
 pub(crate) fn pack(snap: u64, m: u64) -> Result<Ino> {
-    if snap == 0 || snap >= MAX_SNAP || m > LOW {
+    if snap >= MAX_SNAP {
         return Err(Error::NoSpace);
     }
-    Ok(snap << SHIFT | m)
+    cowfs_meta::Meta::pack_ino(SnapshotId(snap), cowfs_meta::Ino(m)).ok_or(Error::NoSpace)
 }
 
 pub(crate) fn virt(snap: u64, n: u64) -> Result<Ino> {

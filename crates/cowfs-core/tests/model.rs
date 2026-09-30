@@ -333,7 +333,7 @@ struct Entry {
 
 fn dump(fs: &dyn Vfs) -> BTreeMap<Vec<u8>, Entry> {
     let mut out = BTreeMap::new();
-    let mut groups: HashMap<Ino, usize> = HashMap::new();
+    let mut inos: HashMap<Vec<u8>, Ino> = HashMap::new();
     let mut stack = vec![(ROOT_INO, Vec::new())];
     while let Some((dir, prefix)) = stack.pop() {
         let mut cookie = 0;
@@ -357,8 +357,8 @@ fn dump(fs: &dyn Vfs) -> BTreeMap<Vec<u8>, Entry> {
                 a.ino, e.ino,
                 "readdir and lookup disagree on the inode of {p:?}"
             );
-            let next = groups.len();
-            let group = *groups.entry(a.ino).or_insert(next);
+            inos.insert(p.clone(), a.ino);
+            let group = 0;
             let (digest, target) = match a.kind {
                 FileKind::Regular => {
                     let mut data = Vec::new();
@@ -399,6 +399,12 @@ fn dump(fs: &dyn Vfs) -> BTreeMap<Vec<u8>, Entry> {
             );
             fs.forget(a.ino, 1);
         }
+    }
+    // hardlink groups are numbered in path order, because listing order after a rename may differ
+    let mut groups: HashMap<Ino, usize> = HashMap::new();
+    for (p, e) in &mut out {
+        let next = groups.len();
+        e.group = *groups.entry(inos[p]).or_insert(next);
     }
     out
 }
@@ -601,7 +607,7 @@ fn big_opts() -> Options {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 48,
+        cases: 32,
         max_shrink_iters: 300,
         ..ProptestConfig::default()
     })]

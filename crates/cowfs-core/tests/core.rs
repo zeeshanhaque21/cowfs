@@ -578,7 +578,7 @@ fn background_flusher_commits_without_being_asked() {
     let r = root_entry(c, "s").ino;
     mkfile(c, r, "f", &pattern(100_000, 5));
     let t = std::time::Instant::now();
-    while c.stats().pending_ops > 0 || c.stats().dirty_bytes > 0 {
+    while c.stats().batches == 0 || c.stats().pending_ops > 0 || c.stats().dirty_bytes > 0 {
         assert!(
             t.elapsed().as_secs() < 10,
             "background flusher did not run: {:?}",

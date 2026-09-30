@@ -8,6 +8,7 @@ use cowfs_vfs::Error;
 /// the subject turn it into `Stale` with [`stale`].
 pub(crate) fn from_meta(e: cowfs_meta::Error) -> Error {
     use cowfs_meta::Error as M;
+    let e_text = |e: &M| e.to_string();
     match e {
         M::NotFound => Error::NotFound,
         M::Exists => Error::Exists,
@@ -24,6 +25,10 @@ pub(crate) fn from_meta(e: cowfs_meta::Error) -> Error {
         M::Inconsistent(v) => Error::Corrupt(v.join("; ")),
         M::Storage(m) => Error::Io(m),
         M::Hook(e) => from_io(&e),
+        M::LimitExceeded(_) => Error::NoSpace,
+        M::Format(m) => Error::Corrupt(m),
+        M::Conflict | M::NeedsRechunk | M::Reentrant => Error::Io(e_text(&e)),
+        M::Closed => Error::Io(e_text(&e)),
     }
 }
 
@@ -87,6 +92,10 @@ mod tests {
                 M::Hook(io::Error::from(ErrorKind::StorageFull)),
                 Error::NoSpace,
             ),
+            (M::LimitExceeded("x"), Error::NoSpace),
+            (M::Format("f".into()), Error::Corrupt("f".into())),
+            (M::Conflict, Error::Io("content version conflict".into())),
+            (M::Closed, Error::Io("metadata store is closed".into())),
         ];
         for (m, want) in cases {
             let label = format!("{m:?}");

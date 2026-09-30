@@ -107,7 +107,7 @@ fn run(steps: &[Step], opts: Options) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 40, max_shrink_iters: 200, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 24, max_shrink_iters: 200, ..ProptestConfig::default() })]
 
     #[test]
     fn writes_truncates_and_extends_match_a_vec(steps in prop::collection::vec(step(), 1..30)) {

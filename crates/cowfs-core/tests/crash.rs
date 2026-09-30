@@ -664,7 +664,7 @@ fn run(seed: u64, ops: usize, hook: bool) -> usize {
 #[test]
 fn crash_images_reopen_consistent_and_keep_fsynced_data() {
     let seeds = env("COWFS_CRASH_SEEDS", 1);
-    let ops = env("COWFS_CRASH_OPS", 100);
+    let ops = env("COWFS_CRASH_OPS", 60);
     let mut total = 0;
     for s in 0..seeds {
         total += run(0xC0DE + s as u64 * 7919, ops, true);

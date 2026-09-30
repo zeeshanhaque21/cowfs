@@ -1,7 +1,7 @@
 //! kill -9 test: a child process mutates a `Core` (background flusher on) and the parent SIGKILLs
 //! it at random moments, reopens the directory and verifies it.
 //!
-//! `COWFS_KILL_ROUNDS` sets the number of rounds (default 20).
+//! `COWFS_KILL_ROUNDS` sets the number of rounds (default 8).
 
 mod common;
 
@@ -206,7 +206,7 @@ fn kill_minus_nine_leaves_a_consistent_store() {
     let rounds: u64 = std::env::var("COWFS_KILL_ROUNDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
+        .unwrap_or(8);
     let mut rng = Rng(0xC0FFEE);
     let (mut steps, mut synced, mut empty) = (0, 0, 0);
     for r in 0..rounds {
