@@ -195,12 +195,12 @@
         {
           "id": "29",
           "title": "#29 cowfs-vfs trait, MemVfs and conformance suite",
-          "state": "reviewing",
-          "owner": "critic (subagent)",
+          "state": "fixing",
+          "owner": "builder (subagent)",
           "issue": 29,
           "pr": "#30",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/30",
-          "detail": "Builder done: MemVfs, 116 checks (2 heavy), oracle proptest and 15 mutation faults all caught; I re-ran: 114 pass + 2 ignored, oracle test passes (the earlier oracle failure is fixed), fmt/clippy clean, trait crate untouched. Critic is validating the oracle against real APFS, btrfs and ext4, auditing assertions for wrong POSIX claims, and running 15+ new mutations.",
+          "detail": "Critic verdict: mergeable as the cowfs contract after fixes, NOT a POSIX suite. Oracle vs real APFS/btrfs/ext4 (100k ops each): directory nlink=2+subdirs only holds on ext4 (btrfs reports 1, APFS 2+entries); setuid, xattr size, non-UTF-8 and NFC assumptions over-specify; oracle bug on rename onto own non-empty ancestor (ENOTEMPTY on Linux); 0.5% of ops have multiple allowed errors and MemVfs errno differs from the real one. 34 new faults: 6 slipped through. No per-check skip. Builder is adding check levels (Posix/Portable/Cowfs), Options::skip with reasons, the 6 checks, faster default tests, MemVfs edge fixes. Public API stays source-compatible for core/fuse/nfs/pathvfs.",
           "ci": "CI: linux pass, macos pending"
         },
         {
