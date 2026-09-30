@@ -139,8 +139,12 @@
         {
           "id": "10",
           "title": "#10 garbage collection",
-          "state": "blocked",
-          "issue": 10
+          "state": "building",
+          "issue": 10,
+          "owner": "subagent (space bunny)",
+          "pr": "#39",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/39",
+          "detail": "Builder writes docs/v1-gc.md first, then mark (subtree skipping, hole refs skipped, core pinned blocks via an ExtraRoots trait, epoch/grace protocol so blocks created during a mark are never swept), access-time hints (hint only), compaction (copy live records, fsync, manifest/watermark/index ordering, atomic swap), dry run, progress and cancellation. Crash injection at every compaction step, kill -9 loop, concurrent stress, negative control. Worktree slot 11, branch v1/10-gc."
         },
         {
           "id": "11",
@@ -184,14 +188,22 @@
         {
           "id": "15",
           "title": "#15 treehouse mode (a) transparent",
-          "state": "blocked",
-          "issue": 15
+          "state": "building",
+          "issue": 15,
+          "owner": "subagent (space bunny)",
+          "pr": "#38",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
+          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse."
         },
         {
           "id": "16",
           "title": "#16 treehouse mode (b) snapshot-native slots and warm base",
-          "state": "blocked",
-          "issue": 16
+          "state": "building",
+          "issue": 16,
+          "owner": "subagent (space bunny)",
+          "pr": "#38",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
+          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse."
         },
         {
           "id": "17",
