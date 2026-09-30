@@ -214,7 +214,7 @@ A `batch` runs several operations in one redb write transaction and one material
 
 ### Inode numbers
 
-Inode numbers come from a counter that is reserved durably in blocks (`Options::ino_block`, default 1024).
+Inode numbers come from a counter that is reserved durably in blocks (`Options::ino_block`, default 16384; each reservation is a durable commit of its own, so a larger block means fewer latency spikes and a larger number gap after a crash).
 The durable record `ino_reserved` is always above every number ever handed to a caller: before handing out the first number of a new block, the store commits the new high-water mark in its own redb transaction (durable, no chunk references, so no hook).
 After a crash the counter restarts at `ino_reserved`, so the first number handed out is above every number a caller could have seen.
 A clean `close()` or drop writes the exact counter, so a normal restart wastes nothing.
