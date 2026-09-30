@@ -149,12 +149,12 @@
         {
           "id": "12",
           "title": "#12 macOS NFS loopback mount",
-          "state": "fixing",
+          "state": "reviewing",
           "issue": 12,
-          "owner": "builder (subagent)",
+          "owner": "critic round 2 (subagent)",
           "pr": "#32",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/32",
-          "detail": "Critic verdict: NOT mergeable. Leak: rename over a file never reaps the replaced sidecar inode (200 write-tmp-rename cycles left 202 inodes; 65k-op workload RSS 4 to 899 MB). Biggest gap: AppleDouble sidecars are ~47% of all RPCs and double the inodes (fix: translate sidecars to Vfs xattrs). Latency is RPC count not server speed (server ~99% idle, 8-55 us/RPC; the builder's 3.4/4.1 ms were load noise, minimums 1.0/1.46 ms). Security: any local uid can MNT and use the port (fix: one-shot MNT plus keyed-MAC handles). DoS: 200 half-sent 8 MiB frames took 1.6 GB. Retransmits dropped not replayed; stale handle read another file's bytes after inode reuse; kill -TERM leaves a hung mount. Builder is fixing.",
+          "detail": "Round-1 findings fixed with regression tests (I re-ran: 38 nfsserve/adapter + protocol tests pass, fmt/clippy clean, CI green): reference-balance leak, AppleDouble Translate (sidecar to xattrs, no sidecar inodes; 200 files = 200 inodes vs 400), one-shot MNT + keyed MAC handles + generations, DoS bounds, retransmission reply cache, inode-reuse STALE, signal cleanup + stale-mount sweep. Mutants 21/22 killed. Caveats: latency at load 42-65 (inline_metadata helps writes and reads, noisy), no before/after RPC baseline, lsof peer-uid check adds almost nothing, RSS soak 3 to 40 MiB unexplained, real files named ._x invisible under Translate. Translate is new stateful code, so a round-2 critic is attacking it.",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -206,12 +206,13 @@
         {
           "id": "26",
           "title": "#26 cowfs-core: Vfs over store and meta",
-          "state": "building",
+          "state": "reviewing",
           "issue": 26,
-          "detail": "Builder stopped early: Vfs over store+meta implemented; conformance suite 112 pass / 0 fail (2 heavy not run); 16 core tests and model proptest pass. Resumed to finish crash injection, kill -9, stress, benchmarks, and to adopt the store/meta critic fixes and the 'Ino never reused' contract. Requests to meta: atomic rename_snapshot, batch timestamps, hole flag on ChunkRef, reserve_inodes.",
-          "owner": "subagent",
+          "detail": "Builder done, re-verified by me: 127 conformance checks pass through Core (2 heavy separately), 18 core tests, model proptests, crash images 280 and kill -9 120 rounds with 0 failures, negative control finds a dangling chunk. Benchmarks at load 54-111: lookups at or above native (miss 2.7M/s vs 460k/s), data 6-57x slower than APFS page cache (seq read 637 MiB/s, write 239), snapshot create 12-21 ms at 100k files. Core refuses to open a store with corrupt_synced. Open: virtual-inode alias table, chunk lists loaded whole (splice_content unused), flush() does nothing, snapshot rename/promote not atomic (needs Meta::rename_snapshot), batch timestamps, ChunkRef hole flag, early ino reservation. Critic attacking durability ordering, write-back semantics, partial chunks, ino reuse, caches, concurrency and mutants.",
+          "owner": "critic (subagent)",
           "pr": "#36",
-          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/36"
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/36",
+          "ci": "CI: ubuntu pass, macos FAIL (a cowfs-meta test from the merged in-flight meta branch, not core)"
         },
         {
           "id": "34",
