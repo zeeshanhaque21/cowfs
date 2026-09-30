@@ -32,12 +32,16 @@ pub struct AdapterOptions {
     /// are just not listed. Removing a file removes its sidecar, renaming moves it, and removing
     /// a directory that holds only sidecars removes them.
     pub hide_appledouble: bool,
+    /// The (uid, gid) reported for every file. `Mount` sets it to the owner of the mount point,
+    /// so tools that check ownership (git) accept the tree. `None` reports what the `Vfs` says.
+    pub owner: Option<(u32, u32)>,
 }
 
 impl Default for AdapterOptions {
     fn default() -> Self {
         Self {
             hide_appledouble: true,
+            owner: None,
         }
     }
 }
@@ -112,6 +116,15 @@ impl Adapter {
         self.generation
     }
 
+    fn fa(&self, a: &Attr) -> fattr3 {
+        let mut f = fattr(a);
+        if let Some((uid, gid)) = self.opts.owner {
+            f.uid = uid;
+            f.gid = gid;
+        }
+        f
+    }
+
     /// Records a reference handed to the client, and the parent of a directory.
     fn handed_out(&self, parent: Option<Ino>, a: &Attr) {
         *lock(&self.refs).entry(a.ino).or_insert(0) += 1;
@@ -147,7 +160,7 @@ impl Adapter {
     }
 
     pub fn getattr(&self, id: fileid3) -> NfsResult<fattr3> {
-        self.vfs.getattr(id).map(|a| fattr(&a)).map_err(stat)
+        self.vfs.getattr(id).map(|a| self.fa(&a)).map_err(stat)
     }
 
     pub fn lookup(&self, dir: fileid3, name: &[u8]) -> NfsResult<(fileid3, fattr3)> {
@@ -157,7 +170,7 @@ impl Adapter {
                 if a.kind != FileKind::Directory {
                     return Err(nfsstat3::NFS3ERR_NOTDIR);
                 }
-                Ok((dir, fattr(&a)))
+                Ok((dir, self.fa(&a)))
             }
             b".." => {
                 let p = self.parent_of(dir)?;
@@ -167,7 +180,7 @@ impl Adapter {
                 check_name(name)?;
                 let a = self.vfs.lookup(dir, name).map_err(stat)?;
                 self.handed_out(Some(dir), &a);
-                Ok((a.ino, fattr(&a)))
+                Ok((a.ino, self.fa(&a)))
             }
         }
     }
@@ -182,7 +195,7 @@ impl Adapter {
     }
 
     pub fn setattr(&self, id: fileid3, s: &sattr3) -> NfsResult<fattr3> {
-        self.apply(id, set_attr(s)).map(|a| fattr(&a))
+        self.apply(id, set_attr(s)).map(|a| self.fa(&a))
     }
 
     pub fn readlink(&self, id: fileid3) -> NfsResult<Vec<u8>> {
@@ -231,7 +244,7 @@ impl Adapter {
                     changes.size = None;
                 }
                 let a = self.apply(a.ino, changes)?;
-                Ok((a.ino, fattr(&a)))
+                Ok((a.ino, self.fa(&a)))
             }
             Err(Error::Exists) if !guarded => {
                 let existing = self.vfs.lookup(dir, name).map_err(stat)?;
@@ -241,7 +254,7 @@ impl Adapter {
                 }
                 self.handed_out(Some(dir), &existing);
                 let a = self.apply(existing.ino, changes)?;
-                Ok((a.ino, fattr(&a)))
+                Ok((a.ino, self.fa(&a)))
             }
             Err(e) => Err(stat(e)),
         }
@@ -264,13 +277,13 @@ impl Adapter {
                     ..SetAttr::default()
                 };
                 let a = self.vfs.setattr(a.ino, changes).map_err(stat)?;
-                Ok((a.ino, fattr(&a)))
+                Ok((a.ino, self.fa(&a)))
             }
             Err(Error::Exists) => {
                 let a = self.vfs.lookup(dir, name).map_err(stat)?;
                 if a.kind == FileKind::Regular && a.atime == atime && a.mtime == mtime {
                     self.handed_out(Some(dir), &a);
-                    Ok((a.ino, fattr(&a)))
+                    Ok((a.ino, self.fa(&a)))
                 } else {
                     self.vfs.forget(a.ino, 1);
                     Err(nfsstat3::NFS3ERR_EXIST)
@@ -288,7 +301,7 @@ impl Adapter {
         };
         let a = self.vfs.mkdir(dir, name, mode).map_err(stat)?;
         self.handed_out(Some(dir), &a);
-        Ok((a.ino, fattr(&a)))
+        Ok((a.ino, self.fa(&a)))
     }
 
     pub fn symlink(
@@ -306,14 +319,14 @@ impl Adapter {
         }
         let a = self.vfs.symlink(dir, name, target).map_err(stat)?;
         self.handed_out(Some(dir), &a);
-        Ok((a.ino, fattr(&a)))
+        Ok((a.ino, self.fa(&a)))
     }
 
     pub fn link(&self, file: fileid3, dir: fileid3, name: &[u8]) -> NfsResult<fattr3> {
         new_name(name)?;
         let a = self.vfs.link(file, dir, name).map_err(stat)?;
         self.handed_out(None, &a);
-        Ok(fattr(&a))
+        Ok(self.fa(&a))
     }
 
     /// Removes one name and releases the inode if that was its last link.
@@ -466,7 +479,7 @@ impl Adapter {
             if a.kind == FileKind::Directory {
                 lock(&self.parents).insert(a.ino, dir);
             }
-            Some(fattr(&a))
+            Some(self.fa(&a))
         } else {
             None
         };

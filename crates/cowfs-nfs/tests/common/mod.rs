@@ -113,7 +113,7 @@ pub struct Nfs {
 
 /// A running server over `vfs` and a connected, mounted client.
 pub fn serve(vfs: Arc<dyn Vfs>, opts: MountOptions) -> (Server, Nfs) {
-    let server = Server::start(vfs, &opts).unwrap();
+    let server = Server::start(vfs, &opts, None).unwrap();
     let nfs = Nfs::connect(server.port());
     (server, nfs)
 }

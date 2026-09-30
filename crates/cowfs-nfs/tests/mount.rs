@@ -43,7 +43,7 @@ fn mounted(opts: MountOptions) -> Option<Mounted> {
     }
     let dir = tempfile::Builder::new()
         .prefix("cowfs-nfs-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .tempdir()
         .unwrap();
     match Mount::new(Arc::new(MemVfs::new()), &dir.path().join("mnt"), opts) {
         Ok(m) => Some(Mounted {

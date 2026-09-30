@@ -589,3 +589,18 @@ fn oversized_and_bad_frames_do_not_kill_the_server() {
     );
     assert_eq!(acc, 0);
 }
+
+#[test]
+fn owner_override_applies_to_every_reply() {
+    let server =
+        cowfs_nfs::Server::start(memfs(), &MountOptions::default(), Some((501, 20))).unwrap();
+    let mut c = Nfs::connect(server.port());
+    let root = c.root.clone();
+    assert_eq!((c.attrs(&root).uid, c.attrs(&root).gid), (501, 20));
+    let f = c.create_file(&root, "f");
+    assert_eq!(c.attrs(&f).uid, 501);
+    let listed = c.list(&root, true, 4096);
+    assert_eq!(listed[0].attr.unwrap().uid, 501);
+    let (_, _, obj, dir) = c.lookup(&root, "f");
+    assert_eq!((obj.unwrap().gid, dir.unwrap().uid), (20, 501));
+}

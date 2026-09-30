@@ -1,5 +1,6 @@
 //! The loopback server and the `mount_nfs` / `umount` lifecycle.
 use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -77,9 +78,10 @@ impl MountOptions {
         )
     }
 
-    fn adapter(&self) -> AdapterOptions {
+    fn adapter(&self, owner: Option<(u32, u32)>) -> AdapterOptions {
         AdapterOptions {
             hide_appledouble: self.hide_appledouble,
+            owner,
         }
     }
 }
@@ -93,13 +95,17 @@ pub struct Server {
 
 impl Server {
     /// Binds an ephemeral port on 127.0.0.1 and starts serving.
-    pub fn start(vfs: Arc<dyn Vfs>, opts: &MountOptions) -> io::Result<Server> {
+    pub fn start(
+        vfs: Arc<dyn Vfs>,
+        opts: &MountOptions,
+        owner: Option<(u32, u32)>,
+    ) -> io::Result<Server> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .thread_name("cowfs-nfs")
             .enable_all()
             .build()?;
-        let fs = CowNfs::new(vfs, opts.adapter());
+        let fs = CowNfs::new(vfs, opts.adapter(owner));
         let listener = runtime.block_on(NFSTcpListener::bind("127.0.0.1:0", fs))?;
         let port = listener.get_listen_port();
         runtime.spawn(async move {
@@ -254,7 +260,8 @@ impl Mount {
         if listed(&mountpoint, timeout)? {
             return Err(MountError::AlreadyMounted(mountpoint));
         }
-        let server = Server::start(vfs, &opts)?;
+        let md = std::fs::metadata(&mountpoint)?;
+        let server = Server::start(vfs, &opts, Some((md.uid(), md.gid())))?;
         let mounted = checked(
             Command::new(MOUNT_NFS)
                 .arg("-o")
@@ -347,7 +354,7 @@ mod tests {
     fn defaults_hide_appledouble() {
         let o = MountOptions::default();
         assert!(o.hide_appledouble && !o.stats_on_sigusr1);
-        assert!(o.adapter().hide_appledouble);
+        assert!(o.adapter(None).hide_appledouble);
     }
 
     #[test]
