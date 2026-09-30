@@ -39,6 +39,7 @@ pub(crate) const REAP: TableDefinition<u64, [u8; 32]> = TableDefinition::new("re
 pub(crate) const MAGIC: u64 = 0x434f_5746_534d_4554;
 pub(crate) const FORMAT_VERSION: u64 = 2;
 const REAP_BUDGET: usize = 256;
+const REAP_DURABLE_EVERY: u64 = 16;
 const REAP_TIME: Duration = Duration::from_millis(4);
 const GROUP_WAIT: Duration = Duration::from_millis(2);
 
@@ -112,7 +113,7 @@ impl Default for Options {
             ack: Ack::Applied,
             background: true,
             max_pending_bytes: 32 << 20,
-            ino_block: 1024,
+            ino_block: 16384,
         }
     }
 }
@@ -226,6 +227,7 @@ pub(crate) struct Inner {
     poisoned: AtomicBool,
     inflight: AtomicUsize,
     reap_len: AtomicU64,
+    reap_steps: AtomicU64,
 }
 
 impl std::fmt::Debug for Inner {
@@ -780,6 +782,12 @@ impl Inner {
                 }
                 meta.insert("next_reap", next)?;
             }
+            // A durable commit flushes every earlier non-durable one, so bound the backlog: it
+            // carries no chunk references, hence no hook.
+            if self.reap_steps.fetch_add(1, SeqCst) % REAP_DURABLE_EVERY == REAP_DURABLE_EVERY - 1 {
+                wtx.set_durability(Durability::Immediate)?;
+                wtx.set_two_phase_commit(true);
+            }
             wtx.commit()?;
             Ok((taken, added))
         });
@@ -1117,6 +1125,7 @@ impl Meta {
             poisoned: AtomicBool::new(false),
             inflight: AtomicUsize::new(0),
             reap_len: AtomicU64::new(reap_len),
+            reap_steps: AtomicU64::new(0),
             opts,
         });
         let thread = if background {
