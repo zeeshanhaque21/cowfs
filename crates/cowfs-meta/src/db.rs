@@ -39,6 +39,7 @@ pub(crate) const REAP: TableDefinition<u64, [u8; 32]> = TableDefinition::new("re
 pub(crate) const MAGIC: u64 = 0x434f_5746_534d_4554;
 pub(crate) const FORMAT_VERSION: u64 = 2;
 const REAP_BUDGET: usize = 256;
+const REAP_TIME: Duration = Duration::from_millis(4);
 const GROUP_WAIT: Duration = Duration::from_millis(2);
 
 /// Counts callers that are inside `mutate`, so a commit leader can wait for them.
@@ -192,8 +193,6 @@ pub(crate) struct Session {
     pub(crate) names: HashMap<String, SnapshotId>,
     pub(crate) ino: InoAlloc,
     pub(crate) next_snapshot: u64,
-    pub(crate) next_reap: u64,
-    pub(crate) reap_len: u64,
     applied: u64,
     durable: u64,
     pending_ops: u32,
@@ -226,6 +225,7 @@ pub(crate) struct Inner {
     bg: Bg,
     poisoned: AtomicBool,
     inflight: AtomicUsize,
+    reap_len: AtomicU64,
 }
 
 impl std::fmt::Debug for Inner {
@@ -480,8 +480,9 @@ impl Inner {
                         let e = s.snaps.get(id).ok_or(Error::NoSuchSnapshot)?;
                         snaps.remove(id.0)?;
                         names.remove(e.info.name.as_str())?;
-                        reap.insert(s.next_reap, *e.info.root.as_bytes())?;
-                        meta.insert("next_reap", s.next_reap + 1)?;
+                        let next = meta_get(&meta, "next_reap")?;
+                        reap.insert(next, *e.info.root.as_bytes())?;
+                        meta.insert("next_reap", next + 1)?;
                     }
                 }
                 w.settle()?;
@@ -529,8 +530,7 @@ impl Inner {
                 if let Some(e) = s.snaps.remove(&id) {
                     s.names.remove(&e.info.name);
                 }
-                s.next_reap += 1;
-                s.reap_len += 1;
+                self.reap_len.fetch_add(1, SeqCst);
                 self.wake_reaper();
             }
             Extra::None => {}
@@ -717,15 +717,18 @@ impl Inner {
 
     /// Frees a bounded number of nodes of removed snapshots in one small transaction. Returns
     /// whether more work remains.
+    ///
+    /// Runs without the session lock: redb serializes it with commits, and in-memory changes never
+    /// wait for it.
     pub(crate) fn reap_step(&self) -> Result<bool> {
-        let mut s = self.wlock()?;
-        if s.reap_len == 0 {
+        if self.reap_len.load(SeqCst) == 0 {
             return Ok(false);
         }
-        self.check_writable(&s)?;
+        self.check_writable(&*self.rlock()?)?;
         let r = guard(|| -> Result<(u64, u64)> {
             let mut wtx = self.db.begin_write()?;
             wtx.set_durability(Durability::None)?;
+            let started = Instant::now();
             let (taken, added);
             {
                 let mut reap = wtx.open_table(REAP)?;
@@ -744,7 +747,7 @@ impl Inner {
                 let mut work: Vec<[u8; 32]> = rows.into_iter().map(|(_, v)| v).collect();
                 let (mut freed, mut left) = (0usize, Vec::new());
                 while let Some(id) = work.pop() {
-                    if freed >= REAP_BUDGET {
+                    if freed >= REAP_BUDGET || (freed > 0 && started.elapsed() >= REAP_TIME) {
                         left.push(id);
                         continue;
                     }
@@ -782,9 +785,10 @@ impl Inner {
         });
         match r {
             Ok((taken, added)) => {
-                s.reap_len = s.reap_len.saturating_sub(taken) + added;
-                s.next_reap += added;
-                Ok(s.reap_len > 0)
+                let _ = self
+                    .reap_len
+                    .fetch_update(SeqCst, SeqCst, |n| Some(n.saturating_sub(taken) + added));
+                Ok(self.reap_len.load(SeqCst) > 0)
             }
             Err(e) => {
                 self.note(&e);
@@ -1073,6 +1077,7 @@ impl Meta {
             let tree = MemTree::new(info.root, node_max);
             snaps.insert(info.id, SnapEntry { info, tree });
         }
+        let reap_len = rtx.open_table(REAP)?.len()?;
         let session = Session {
             snaps,
             names,
@@ -1082,8 +1087,6 @@ impl Meta {
                 block: opts.ino_block,
             },
             next_snapshot: meta_get(&meta, "next_snapshot")?,
-            next_reap: meta_get(&meta, "next_reap")?,
-            reap_len: rtx.open_table(REAP)?.len()?,
             applied: 0,
             durable: 0,
             pending_ops: 0,
@@ -1113,6 +1116,7 @@ impl Meta {
             },
             poisoned: AtomicBool::new(false),
             inflight: AtomicUsize::new(0),
+            reap_len: AtomicU64::new(reap_len),
             opts,
         });
         let thread = if background {
@@ -1121,7 +1125,7 @@ impl Meta {
                 .name("cowfs-meta-bg".into())
                 .spawn(move || bg_main(i2))
                 .map_err(|e| Error::Storage(format!("cannot start the background thread: {e}")))?;
-            if inner.session.read().is_ok_and(|s| s.reap_len > 0) {
+            if inner.reap_len.load(SeqCst) > 0 {
                 inner.wake_reaper();
             }
             Some(t)
@@ -1208,7 +1212,7 @@ impl Meta {
 
     /// Number of removed-snapshot roots still waiting to be freed.
     pub fn pending_reap(&self) -> Result<u64> {
-        Ok(self.h.inner.rlock()?.reap_len)
+        Ok(self.h.inner.reap_len.load(SeqCst))
     }
 
     /// Runs `before_sync`, then makes every applied change durable. The hook runs on every call,
