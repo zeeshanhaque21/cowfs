@@ -660,7 +660,11 @@ fn f1_an_unleased_slot_is_refused_rather_than_released_unpinned() {
     let (slot, _) = lease_at(&s, &s.pool());
     // Hand it back with real treehouse, so the slot exists in the pool and is not leased.
     let out = s.treehouse(&["return", &slot.display().to_string(), "--force"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(entry(&s, &s.pool(), "1")["lease_id"], "");
 
     // The wrapper must refuse it rather than send an unpinned return.
