@@ -518,6 +518,18 @@ fn xattrs_round_trip_without_sidecar_inodes() {
         test "$(xattr -p user.k h2)" = v
         ls -A | grep -v '^\._' > /dev/null
         test -z "$(ls -A | grep '^\._' || true)"
+        echo many > many
+        val=$(printf 'v%.0s' $(seq 1 100))
+        i=0
+        while [ $i -lt 200 ]; do
+            xattr -w "user.a$i" "$val" many
+            i=$((i + 1))
+        done
+        # 200 of ours, plus the com.apple.provenance the client adds to a new file.
+        test "$(xattr many | grep -c '^user\.a[0-9]')" = 200
+        test "$(xattr many | wc -l | tr -d ' ')" = 201
+        xattr -p user.a199 many | wc -c | grep -q 101
+        test "$(xattr -l many | grep -c 'user\.a[0-9]')" = 200
         "#,
     );
     println!("{out}");
