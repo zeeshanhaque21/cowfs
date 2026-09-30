@@ -51,6 +51,6 @@ Everything below is ours.
     never sent anything after it. No client does that, and preferring a duplicate effect over a
     silently wrong success is the safer of the two. The per-connection high-water marks are
     bounded, and the cross-connection index never outlives the entries it points at.
-- Removed: `fs_util` (Windows and path helpers), `write_counter`, `transaction_tracker`, the `demo` feature, the auto IP binding, `filetime`, `intaglio`.
+- Removed: `fs_util` (Windows and path helpers), `config.rs` (a builder for a whole server configuration that this server does not use), `write_counter`, `transaction_tracker`, the `demo` feature, the auto IP binding, `filetime`, `intaglio`.
 - Lints: the workspace lint bar (fmt, clippy `-D warnings`).
   Allows that remain: `lib.rs` has `#![allow(non_camel_case_types, clippy::upper_case_acronyms)]` because the RFC type and procedure names are kept as written; `mount.rs` and `portmap.rs` have `#![allow(dead_code)]` because they transcribe RFC constants this server does not all use.

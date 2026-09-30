@@ -60,6 +60,17 @@
 //! because the kernel NFS client's socket is invisible to it, so it cannot tell an attacker from
 //! the client.
 //!
+//! # What Translate is worth, measured
+//!
+//! On this machine, 100 files each created, written and closed, and 100 existing files opened,
+//! written and closed, counted with [`nfsserve::take_stats`]: `Translate` 13.0 and 4.0 RPCs per
+//! operation, `Hide` 14.1 and 4.0, `Store` 14.1 and 4.0. So about 8% fewer RPCs on create and none
+//! on an overwrite: the kernel still sends CREATE, WRITE, SETATTR and COMMIT for the sidecar, and
+//! `Translate` only makes them cheap and inode-free. The real difference is the store: 200 inodes
+//! for 200 files instead of 400, and no `._` file for a Linux FUSE mount of the same snapshot to
+//! trip over. An earlier claim that this cut create+write from 19 RPCs to 13 was wrong; 13.4 was
+//! measured for the whole change against 14.3 before it.
+//!
 //! Tests: `cargo test -p cowfs-nfs` runs the unit and in-process protocol tests. The mount tests
 //! and the benchmark are `#[ignore]`d, see `tests/mount.rs` and `tests/bench.rs`.
 
