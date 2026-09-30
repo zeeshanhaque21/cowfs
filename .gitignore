@@ -1,2 +1,7 @@
 target/
 .DS_Store
+/spikes/*/out/
+/progress/*.pid
+__pycache__/
+*.pyc
+/progress/serve.log

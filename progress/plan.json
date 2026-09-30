@@ -1,0 +1,287 @@
+{
+  "loop": "gauntlet: a builder and a separate critic with fresh context per piece. The critic runs ours next to native, names the biggest gap, and the piece loops until the critic picks ours.",
+  "bar": "native APFS (this Mac) and ext4 (moonscape): cargo build and git status within 1.5x, pjdfstest + fsx + xfstests-generic no worse than native, zero data loss in crash-injection.",
+  "phases": [
+    {
+      "name": "Spikes (gate v1)",
+      "items": [
+        {
+          "id": "1",
+          "title": "#1 dedup ratio on the real worktree corpus",
+          "state": "done",
+          "owner": "lead",
+          "live": "spike1",
+          "issue": 1,
+          "detail": "Full run on 45 slots, 843,889 files, 273.43 GiB raw, 0 errors. Raw 1.00x, per-file zstd 3.60x, whole-file dedup 3.12x, CDC only 5.08x, CDC + zstd 14.04x. A median extra lumen slot costs 0.47 GiB compressed (4.9% of raw). Caveat: 97.5% of raw is cargo target/ and 91.7% is one repo, so 14x is a Rust build-output result. Write-up: docs/spikes/1-dedup-corpus.md. Gate met."
+        },
+        {
+          "id": "2",
+          "title": "#2 mmap and file locking over the macOS NFS loopback",
+          "state": "done",
+          "owner": "lead",
+          "issue": 2,
+          "detail": "Viable without sudo (-o locallocks). 24/24 checks. Tuned server: clean builds 0.9x-1.2x native, git status 1.3x-1.4x, warm and incremental builds 2.5x-3.5x (misses 1.5x, see #18). Old server was 3-5x clean and 9-55x warm because of nfsserve bugs (LINK, tracker lock, readdir cookie), fixed in the vendored copy (#19). One 60-dep crate, passthrough server, n=3-5. Write-up: docs/spikes/2-nfs-loopback.md."
+        },
+        {
+          "id": "3",
+          "title": "#3 build and git status overhead versus native",
+          "state": "done",
+          "issue": 3,
+          "owner": "lead",
+          "detail": "macOS NFS: clean builds 0.9x-1.2x, warm 2.5x-3.5x. Linux FUSE passthrough in an OrbStack VM (btrfs native): clean 1.03x-1.14x, edit rebuild 1.16x-1.19x, no-op 1.07x-1.48x, seeded first build 1.1x, all within 1.5x. Bulk metadata (git status, find, rm, cp) 2x-3x. Gap looks macOS-NFS-specific (#18). Passthrough only, no ext4 numbers, 7.8k-file tree. docs/spikes/2-nfs-loopback.md and 3-linux-fuse.md"
+        },
+        {
+          "id": "4",
+          "title": "#4 .git inside the filesystem",
+          "state": "done",
+          "issue": 4,
+          "owner": "lead",
+          "detail": "Reads fine with .git on the mount (status 1.3x, log 1.1x). Writes: add -A 3.9x, commit 3.9x; native .git overlay gives 1.1x and 1.7x. Checkout 9-11x, worktree add 11x, cold status 6.6x in both layouts (working-tree file ops). Found and fixed a write race on read-only-mode files; one unexplained corrupt idx (#21). Large-repo n=3-5, load 15-62. docs/spikes/4-git-inside-the-filesystem.md"
+        },
+        {
+          "id": "5",
+          "title": "#5 treehouse process detection on the mount",
+          "state": "done",
+          "issue": 5,
+          "owner": "lead",
+          "detail": "cwd-only detection works on the mount for every detectable case. Gap: a process holding an open fd or flock after chdir out is not detected, and on the mount the reset leaves a .nfs silly-rename file and a dirty slot while return exits 0 (#20). lsof and cwd lookup fine. Real pools untouched. docs/spikes/5-treehouse-process-detection.md"
+        },
+        {
+          "id": "6",
+          "title": "#6 artifact byte-identity across slots at different paths",
+          "state": "done",
+          "issue": 6,
+          "owner": "lead",
+          "detail": "Independent debug slots cost 12.8%-28% of slot 1 after dedup, 1.8% release. Remapping or CARGO_INCREMENTAL=0 brings it under 3%. Clone-seeded plus one edit: 8.8%-10.3%. Slot-specific remap makes a copied target dirty. Mount namespaces (#17) not needed for dedup on these crates. Two small crates, one run per cell. docs/spikes/6-artifact-byte-identity.md"
+        },
+        {
+          "id": "18",
+          "title": "#18 decision: warm and incremental builds 2.5x-3.5x over NFS loopback",
+          "state": "done",
+          "issue": 18,
+          "owner": "zee",
+          "detail": "Decided: reframe criterion 2 for macOS warm builds (option 1 of the follow-up plan). 1.5x stays for Linux and for macOS clean builds and git status; macOS warm/incremental builds get a provisional absolute budget (edit-and-rebuild adds under 1 s), amended in docs/design.md. v1 adopts AppleDouble translation, a readdir cache with a cookie verifier and the SETATTR guard fix. Option 3 (FUSE-T, macFUSE) is deferred to #37, after the full solution is built."
+        },
+        {
+          "id": "19",
+          "title": "#19 v1 server requirements and nfsserve fixes",
+          "state": "ready",
+          "issue": 19,
+          "detail": "LINK, tracker lock, readdir cookie (fixed in vendored copy); open: symlink SETATTR, AppleDouble policy, stale nlink in readdir, memory growth, readdir sort, path map."
+        },
+        {
+          "id": "20",
+          "title": "#20 v1: open-fd holders not detected, .nfs dirt on the mount",
+          "state": "ready",
+          "issue": 20,
+          "detail": "Propose upstream fd detection to treehouse, add a cowfs control-API process list, decide how .nfs entries are handled."
+        },
+        {
+          "id": "21",
+          "title": "#21 v1: data integrity - corrupt idx unexplained, readdir cookie",
+          "state": "ready",
+          "issue": 21,
+          "detail": "Write race fixed and regression-checked. Corrupt idx not reproduced, needs a soak on the fixed server. Readdir cookie still position-based."
+        },
+        {
+          "id": "pr22",
+          "title": "PR #22 spikes 1-6 (draft)",
+          "state": "waiting",
+          "pr": "#22",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/22",
+          "detail": "Draft PR with all spike write-ups. Base of the v1 stack: #23 skeleton, then #24 store and #25 meta."
+        },
+        {
+          "id": "37",
+          "title": "#37 post-v1: evaluate another macOS mount route",
+          "state": "pending",
+          "issue": 37,
+          "detail": "Deferred from #18. After v1 is complete: measure FUSE-T and macFUSE against the real core on the seeded-build and git status workloads, and against the amended macOS warm-build budget."
+        }
+      ]
+    },
+    {
+      "name": "v1 build",
+      "items": [
+        {
+          "id": "7",
+          "title": "#7 chunking, hashing and block store",
+          "state": "reviewing",
+          "issue": 7,
+          "owner": "critic round 3 (subagent)",
+          "pr": "#24",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/24",
+          "detail": "Round-2 findings N1-N8 fixed, re-verified by me: 89 crate tests pass, fmt/clippy clean, scope clean, BlockId/ChunkRef untouched, CI green. Builder's evidence: 1800 simulated power-loss cases, 0 acked blocks lost, 0 wrong bytes, corrupt_synced reported after benign torn tail 271/1800 before, 0 after; 256 MiB pack opens in 1 ms with index, 227 ms full verified rebuild; header CRC added (format v2, 56-byte header, v1 refused); salvage(), verify_all(), acknowledge_corruption(), torn-tail sidecar, transactional roll, SYNCED base; 50 mutants 48 killed (2 equivalent); builds on Rust 1.89. Open: possible 25-35% single-thread slowdown (ingest 287 to 191 MiB/s, verified read 771 to 521) on the one clean pass, inconclusive on noisy passes; N9 cold-cache verify-on-dedup cost not measurable; sealed-pack cut at a record boundary only noticed via index checkpoint; default test time 2:17. Round-3 critic running a proper A/B of the old and new code, crash-during-recovery harness, and mutants on the new logic.",
+          "ci": "CI: pass (linux, macos) at 3e78b5d"
+        },
+        {
+          "id": "8",
+          "title": "#8 Merkle tree and O(1) writable snapshots",
+          "state": "reviewing",
+          "issue": 8,
+          "owner": "critic round 2 (subagent)",
+          "pr": "#25",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/25",
+          "detail": "Round-1 findings fixed, re-verified by me: 71 crate tests pass, fmt/clippy clean, scope clean, CI green. Hook now runs after the closure (1000 commits, 0 dangling), drop with a failing hook discards instead of committing, inode numbers durable and never reused after a crash, real flush timer, group commit, splice_content with CAS, open_recover (rolls back one commit, never automatic), incremental remove_snapshot (19.7 ms call, 4.9 ms writer stall, 28 ms whole window vs 20 ms target), magic/format v2. Lookup hot 1.9 us, random 18.6 us at 1M (target single digit NOT met for random), unbatched create 0.21 ms is applied-not-durable, durable create 19.3/5.5/1.2 ms at 1/8/32 threads. Not fixed: check() bounded memory (4.2 s, 230 MB at 1M), hammer worst write 1.85 s unattributed, recovery 4.8 s at 1M, default test time 2:40. BREAKING API changes for core (Options fields, Error variants, format v2) in docs/v1-meta.md. Round-2 critic attacking the new ordering, reservation, reaper, group commit and open_recover.",
+          "ci": "CI: pass (linux, macos) at 9abe96e"
+        },
+        {
+          "id": "9",
+          "title": "#9 redb metadata store with crash consistency",
+          "state": "reviewing",
+          "issue": 9,
+          "owner": "critic round 2 (subagent)",
+          "pr": "#25",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/25",
+          "detail": "Round-1 findings fixed, re-verified by me: 71 crate tests pass, fmt/clippy clean, scope clean, CI green. Hook now runs after the closure (1000 commits, 0 dangling), drop with a failing hook discards instead of committing, inode numbers durable and never reused after a crash, real flush timer, group commit, splice_content with CAS, open_recover (rolls back one commit, never automatic), incremental remove_snapshot (19.7 ms call, 4.9 ms writer stall, 28 ms whole window vs 20 ms target), magic/format v2. Lookup hot 1.9 us, random 18.6 us at 1M (target single digit NOT met for random), unbatched create 0.21 ms is applied-not-durable, durable create 19.3/5.5/1.2 ms at 1/8/32 threads. Not fixed: check() bounded memory (4.2 s, 230 MB at 1M), hammer worst write 1.85 s unattributed, recovery 4.8 s at 1M, default test time 2:40. BREAKING API changes for core (Options fields, Error variants, format v2) in docs/v1-meta.md. Round-2 critic attacking the new ordering, reservation, reaper, group commit and open_recover.",
+          "ci": "CI: pass (linux, macos) at 9abe96e"
+        },
+        {
+          "id": "10",
+          "title": "#10 garbage collection",
+          "state": "building",
+          "issue": 10,
+          "owner": "subagent (space bunny)",
+          "pr": "#39",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/39",
+          "detail": "Builder writes docs/v1-gc.md first, then mark (subtree skipping, hole refs skipped, core pinned blocks via an ExtraRoots trait, epoch/grace protocol so blocks created during a mark are never swept), access-time hints (hint only), compaction (copy live records, fsync, manifest/watermark/index ordering, atomic swap), dry run, progress and cancellation. Crash injection at every compaction step, kill -9 loop, concurrent stress, negative control. Worktree slot 11, branch v1/10-gc."
+        },
+        {
+          "id": "11",
+          "title": "#11 Linux FUSE mount",
+          "state": "ready",
+          "issue": 11,
+          "owner": "lead",
+          "pr": "#31",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/31",
+          "detail": "Critic findings fixed, re-verified by me at 98c0f24: 43 unit tests on Mac, and in the Linux VM 46 unit + 39 mount + 5 regress tests pass, no mounts left. Defaults now safe: ttl 1 s, keep_cache off, opt-in SoleWriter with an Invalidator; Vfs panics become EIO then a clean unmount; keyed-lane worker pool (slow read no longer delays stat: 856 ms to 0.2 ms, builder's n=1); signal cleanup and stale-mount sweep; inode-reuse paranoid mode. Decisions for lead: cross-adapter permission policy (FUSE denies later O_WRONLY on a 0444 file, NFS allows), SoleWriter wiring by core/control plane (invalidate from outside Vfs calls), add 'Ino never reused' text to architecture doc (done on v1/vfs-trait), add a Linux mount CI job (command in report). 2 survivors: one equivalent, one control.",
+          "ci": "CI: pass (linux, macos)"
+        },
+        {
+          "id": "12",
+          "title": "#12 macOS NFS loopback mount",
+          "state": "fixing",
+          "issue": 12,
+          "owner": "builder (subagent)",
+          "pr": "#32",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/32",
+          "detail": "Reply-cache connection bug FIXED and re-verified by me at 5122ff1 (110 crate tests, 5 new dupcache tests, ignored mount suite 17/17, no mounts left, CI green). Round-2 critic verdict: NOT mergeable with Translate as default. F1 ._x created before x exists (unzip exits 50, tarfile and ditto fail, git clone with tracked ._ files leaves a broken index; Hide and Store succeed); F2 a write to a real ._x file is accepted then lost after restart; F3 more than ~150 xattrs on a file make all its xattrs invisible (fix patch provided). Also: sidecar handles do not go stale on inode reuse, concurrent sidecar writes lose chunks, silent connections fill the cap, one-shot MNT can be raced by a polling attacker, SIGKILL of the host hangs ls/touch, inline_metadata stalls the server with a blocking Vfs, RPC claim not reproduced (14.3 to 13.4, not 19 to 13), 14 of 24 new-code mutants killed. Held up: SETATTR guard correct, reference balance 0 leaks in all 3 modes, handle MAC sound, RSS bounded (3-24 MiB), SIGTERM cleanup 66/66. Builder switching default to Hide first, then fixing Translate.",
+          "ci": "CI: pass (linux, macos)"
+        },
+        {
+          "id": "13",
+          "title": "#13 CLI and Unix-socket control API",
+          "state": "ready",
+          "issue": 13,
+          "owner": "lead",
+          "pr": "#33",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/33",
+          "detail": "Critic findings fixed, re-verified. Linux CI failure fixed: connecting to a regular file gives ECONNREFUSED on Linux and ENOTSOCK on macOS; exit 3 now means missing path or a socket that refuses, exit 1 for a path that is not a socket. Full suite passes in the Linux VM, first Linux run of SO_PEERCRED. Decisions for lead: snapshot_reset/busy semantics, name rules vs core, import hash scope. Not built: real backend (seam only), no TTY test.",
+          "ci": "CI: pass (linux, macos)"
+        },
+        {
+          "id": "14",
+          "title": "#14 cowfs import (non-destructive migration)",
+          "state": "blocked",
+          "issue": 14
+        },
+        {
+          "id": "15",
+          "title": "#15 treehouse mode (a) transparent",
+          "state": "building",
+          "issue": 15,
+          "owner": "subagent (space bunny)",
+          "pr": "#38",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
+          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse."
+        },
+        {
+          "id": "16",
+          "title": "#16 treehouse mode (b) snapshot-native slots and warm base",
+          "state": "building",
+          "issue": 16,
+          "owner": "subagent (space bunny)",
+          "pr": "#38",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
+          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse."
+        },
+        {
+          "id": "17",
+          "title": "#17 Linux mount namespaces for canonical paths",
+          "state": "blocked",
+          "issue": 17
+        },
+        {
+          "id": "29",
+          "title": "#29 cowfs-vfs trait, MemVfs and conformance suite",
+          "state": "ready",
+          "owner": "lead",
+          "issue": 29,
+          "pr": "#30",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/30",
+          "detail": "Critic findings fixed and native-evidence level corrections applied; re-verified by me at f584c00: default tests pass (130 in the main suite), fmt/clippy clean, full mutation run passes in release (61 s), scope clean (architecture doc only differs because the branch lags v1/vfs-trait). 129 checks: 55 Posix, 24 Portable, 50 Cowfs (2 heavy). Options added: xattr_names, link_limit (LINK_MAX check skips with a reason unless declared), com.apple.* xattrs ignored, atime-only ctime moved to Cowfs, honest tearing guarantee. Caveat from builder: small_reads_are_never_torn is a write-then-read on an aligned 8-byte word, not a concurrent-reader check. Not done: oracle still does not check timestamps, blocks, xattr flags or short reads (direct checks cover them). Needs a CI job for the feature-gated mutation run.",
+          "ci": "CI: linux pass, macos pending at f584c00"
+        },
+        {
+          "id": "26",
+          "title": "#26 cowfs-core: Vfs over store and meta",
+          "state": "fixing",
+          "issue": 26,
+          "detail": "Critic verdict: NOT mergeable. F1 deadlock: ensure_file holds the node write lock then takes the meta read lock while commit holds meta write then node read (repro hangs; builder's stress/kill9 never hit it). F2 promote_base removes base then forks: a failed fork loses base. F3 one corrupt block wedges the whole snapshot (fsync, readdir, fork, merkle_root all return Corrupt; other files' acked data lost at reopen) and a partial overwrite inside a corrupt chunk succeeds. Also: virtual inos reused across restart (wrong bytes), snapshot names accept .git/newline/ESC and case/NFC duplicates unlike the CLI, readdir flushes unrelated dirty data (48 MiB, 179 ms), alias table unbounded (469 MB after 500k creates), zero-id hole refs look dangling to GC. Held up: durability ordering, fsx 20k ops vs model, 60 s of overlapping writers (0 torn), hook failure recovery, EIO on corrupt reads. Bench (load 11-15): seq read 1351 MiB/s (13.6x slower than APFS page cache), 4K read 21.6k/s, seq write+fsync 390 MiB/s, lookups faster than std::fs. Builder fixing and re-merging fixed store and meta.",
+          "owner": "builder (subagent)",
+          "pr": "#36",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/36",
+          "ci": "CI: ubuntu pass, macos FAIL (a cowfs-meta test from the merged in-flight meta branch, not core)"
+        },
+        {
+          "id": "34",
+          "title": "#34 cowfs-vfs-path: run the suite on native filesystems and through mounts",
+          "state": "fixing",
+          "owner": "builder (subagent)",
+          "issue": 34,
+          "pr": "#35",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/35",
+          "detail": "Suite run on APFS, btrfs, ext4, FUSE and NFS. Posix level (56 checks): 0 failures natively and through FUSE; NFS mount 10 (9 silly rename, 1 AppleDouble Translate hides ._ names). FUSE adapter: no bug. NFS adapter bug found: the reply cache ignores the connection, so a second connection's identical xid replays the first connection's reply and the call never runs (sent to the #12 builder). Suite level corrections sent to the #29 builder (torn reads on ext4/btrfs/tmpfs at 512/4096 B, statfs files=0 on btrfs, com.apple.* xattrs, atime-only ctime, xattr name prefix, LINK_MAX hang). Client-side, not adapter: sparse blocks, statfs caching, silly rename. 2 unexplained flakes.",
+          "ci": "CI: pass (linux, macos) at 88e5834"
+        }
+      ]
+    },
+    {
+      "name": "Gauntlet gates vs native",
+      "items": [
+        {
+          "id": "g1",
+          "title": "cargo build within 1.5x of native (APFS and ext4)",
+          "state": "waiting",
+          "detail": "Linux FUSE passthrough: builds within 1.5x (1.03x-1.48x). macOS NFS: clean builds within, warm/incremental 2.5x-3.5x (#18). Real backend not measured."
+        },
+        {
+          "id": "g2",
+          "title": "git status on a large tree within 1.5x of native",
+          "state": "waiting",
+          "detail": "macOS NFS git status 1.3x-1.4x (--ignored 1.7x-1.8x). Linux FUSE git status 2.75x on 7.8k files (22ms vs 48ms). Large tracked repo not measured."
+        },
+        {
+          "id": "g3",
+          "title": "pjdfstest no worse than native",
+          "state": "pending"
+        },
+        {
+          "id": "g4",
+          "title": "fsx no worse than native",
+          "state": "pending"
+        },
+        {
+          "id": "g5",
+          "title": "xfstests-generic no worse than native",
+          "state": "pending"
+        },
+        {
+          "id": "g6",
+          "title": "crash-injection: zero data loss, no torn tree",
+          "state": "pending"
+        }
+      ]
+    }
+  ]
+}

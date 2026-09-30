@@ -1,0 +1,12 @@
+[package]
+name = "fusepass"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fuser = { version = "=0.15.1", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3

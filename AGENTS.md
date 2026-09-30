@@ -112,6 +112,14 @@ Track all work as GitHub issues: `gh-axi issue list --repo zeeshanhaque21/cowfs`
   `context7` for library documentation.
 - Downloads use `aria2c` with `-o <name>`.
 
+## Subagents
+
+- Spawn on Sonnet.
+- Every subagent prompt must require: context-mode for large or unpredictable output, codebase-memory-mcp for code exploration, rtk for shell commands, caveman ultra mode for prose, ponytail full mode for code.
+- Subagents inherit none of these rules, so restate them in each prompt.
+- Give each subagent exact project-relative paths it owns, and forbid touching other files.
+- Give the exact operational recipe (server restart, mount, PID verification), not "read the skill".
+
 ## Environment
 
 - Dev machine is an Apple M3 Max Mac.
