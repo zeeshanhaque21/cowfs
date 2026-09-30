@@ -6,8 +6,46 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+/// Aborts the test binary when a test outlives `secs`, so a hang fails CI instead of stalling it.
+struct Watchdog(mpsc::Sender<()>);
+
+fn watchdog() -> Watchdog {
+    let (tx, rx) = mpsc::channel::<()>();
+    let name = std::thread::current().name().unwrap_or("?").to_owned();
+    std::thread::spawn(move || {
+        if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(Duration::from_secs(90)) {
+            eprintln!("WATCHDOG: test {name} exceeded 90s");
+            std::process::abort();
+        }
+    });
+    Watchdog(tx)
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// A spawned process that is killed and reaped when dropped.
+struct Kid(Child);
+
+impl Drop for Kid {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn private_dir() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
 
 const BIN: &str = env!("CARGO_BIN_EXE_cowfs");
 
@@ -15,12 +53,13 @@ struct Daemon {
     _dir: TempDir,
     socket: PathBuf,
     child: Child,
+    _watchdog: Watchdog,
 }
 
 impl Daemon {
     fn start(extra: &[&str]) -> Daemon {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let watchdog = watchdog();
+        let dir = private_dir();
         let socket = dir.path().join("c.sock");
         let mut child = Command::new(BIN)
             .args([
@@ -48,6 +87,7 @@ impl Daemon {
             _dir: dir,
             socket,
             child,
+            _watchdog: watchdog,
         }
     }
 
@@ -164,7 +204,21 @@ fn every_subcommand_works_with_json_output() {
     let src = tempfile::tempdir().unwrap();
     std::fs::write(src.path().join("a"), b"hello").unwrap();
     let import = d.json(&["import", src.path().to_str().unwrap(), "--name", "imported"]);
-    assert_eq!(keys(&import), ["bytes", "files", "name", "verified"]);
+    assert_eq!(
+        keys(&import),
+        [
+            "bytes",
+            "files",
+            "hash_algorithm",
+            "imported_root_hash",
+            "mismatches",
+            "mismatches_truncated",
+            "name",
+            "source_root_hash",
+            "verified"
+        ]
+    );
+    assert_eq!(import["source_root_hash"], import["imported_root_hash"]);
     assert_eq!(
         (&import["files"], &import["bytes"], &import["verified"]),
         (&Value::from(1), &Value::from(5), &Value::Bool(true))
@@ -240,8 +294,11 @@ fn exit_code_1_and_a_json_error_for_daemon_errors() {
     let d = Daemon::start(&[]);
     let out = d.run(&["--json", "snapshot", "rm", "ghost"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(out.stdout.is_empty());
-    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert!(
+        out.stderr.is_empty(),
+        "no progress and no error text on stderr"
+    );
+    let err: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(err["error"]["code"], "not_found");
     assert!(err["error"]["message"].as_str().unwrap().contains("ghost"));
 
@@ -254,7 +311,7 @@ fn exit_code_1_and_a_json_error_for_daemon_errors() {
     let out = d.run(&["--json", "snapshot", "create", "a/b"]);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
-        serde_json::from_slice::<Value>(&out.stderr).unwrap()["error"]["code"],
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"],
         "invalid_params"
     );
 }
@@ -318,7 +375,7 @@ fn exit_code_3_when_no_daemon_is_running() {
         .unwrap();
     assert_eq!(out.status.code(), Some(3));
     assert_eq!(
-        serde_json::from_slice::<Value>(&out.stderr).unwrap()["error"]["code"],
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"],
         "not_running"
     );
 
@@ -340,13 +397,13 @@ fn exit_code_3_when_no_daemon_is_running() {
 #[test]
 fn ctrl_c_cancels_the_operation_and_exits_130() {
     let d = Daemon::start(&["--stub-delay-ms", "400"]);
-    let mut child = d
+    let mut child = Kid(d
         .cmd(&["gc"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
-    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        .unwrap());
+    let mut stderr = BufReader::new(child.0.stderr.take().unwrap());
     let mut first = String::new();
     stderr.read_line(&mut first).unwrap();
     assert!(
@@ -355,11 +412,11 @@ fn ctrl_c_cancels_the_operation_and_exits_130() {
     );
     let started = Instant::now();
     let kill = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
+        .args(["-INT", &child.0.id().to_string()])
         .status()
         .unwrap();
     assert!(kill.success());
-    let status = child.wait().unwrap();
+    let status = child.0.wait().unwrap();
     assert_eq!(status.code(), Some(130));
     assert!(
         started.elapsed() < Duration::from_secs(3),
@@ -378,13 +435,27 @@ fn ctrl_c_cancels_the_operation_and_exits_130() {
 }
 
 #[test]
-fn progress_goes_to_stderr_one_line_per_phase() {
+fn progress_goes_to_stderr_one_line_per_phase_and_as_json_lines_with_json() {
     let d = Daemon::start(&[]);
-    let out = d.run(&["--json", "gc"]);
+    let out = d.run(&["gc", "--dry-run"]);
     let err = String::from_utf8(out.stderr).unwrap();
     let lines: Vec<&str> = err.lines().collect();
     assert_eq!(lines.len(), 2, "{err:?}");
     assert!(lines[0].starts_with("mark") && lines[1].starts_with("sweep"));
+
+    let out = d.run(&["--json", "gc", "--dry-run"]);
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(!err.is_empty());
+    for l in err.lines() {
+        assert!(
+            serde_json::from_str::<Value>(l).unwrap()["progress"].is_object(),
+            "{l}"
+        );
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).matches('\n').count(),
+        1
+    );
     assert!(serde_json::from_slice::<Value>(&out.stdout).is_ok());
 }
 
@@ -478,4 +549,320 @@ fn completions_for_every_shell() {
             .code(),
         Some(2)
     );
+}
+
+fn silent_listener() -> (TempDir, PathBuf) {
+    let dir = private_dir();
+    let path = dir.path().join("silent.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in listener.incoming().flatten() {
+            held.push(s);
+        }
+    });
+    (dir, path)
+}
+
+#[test]
+fn h1_a_silent_daemon_times_out_with_exit_4() {
+    let _w = watchdog();
+    let (_dir, socket) = silent_listener();
+    let started = Instant::now();
+    let out = Command::new(BIN)
+        .args(["--timeout", "1", "--json", "--socket"])
+        .arg(&socket)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(8));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "timeout");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("did not send"));
+}
+
+#[test]
+fn timeout_option_and_environment_are_validated() {
+    let _w = watchdog();
+    let (_dir, socket) = silent_listener();
+    for bad in ["0", "x", "-1"] {
+        let out = Command::new(BIN)
+            .args(["--timeout", bad, "status"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "--timeout {bad}");
+    }
+    let out = Command::new(BIN)
+        .env("COWFS_TIMEOUT", "1")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4), "COWFS_TIMEOUT applies");
+    let out = Command::new(BIN)
+        .env("COWFS_TIMEOUT", "soon")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn an_empty_cowfs_socket_means_unset() {
+    let _w = watchdog();
+    let dir = private_dir();
+    let out = Command::new(BIN)
+        .env("COWFS_SOCKET", "")
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains(dir.path().to_str().unwrap()));
+}
+
+#[test]
+fn errors_name_the_socket_path() {
+    let _w = watchdog();
+    let dir = private_dir();
+    let file = dir.path().join("regular");
+    std::fs::write(&file, b"x").unwrap();
+    let out = Command::new(BIN)
+        .arg("--socket")
+        .arg(&file)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(file.to_str().unwrap()));
+
+    let long = dir.path().join("x".repeat(200)).join("c.sock");
+    let out = Command::new(BIN)
+        .arg("--socket")
+        .arg(&long)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a path too long for a socket is a usage error"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("xxxxxxxx"));
+}
+
+#[test]
+fn snapshot_reset_and_forced_rm_work_from_the_cli() {
+    let d = Daemon::start(&[]);
+    d.json(&["snapshot", "create", "base"]);
+    d.json(&["snapshot", "create", "slot"]);
+    let reset = d.json(&["snapshot", "reset", "slot", "--from", "base"]);
+    assert_eq!(
+        (&reset["name"], &reset["parent"]),
+        (&Value::from("slot"), &Value::from("base"))
+    );
+    assert_eq!(
+        d.json(&["snapshot", "list"])["snapshots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let out = d.run(&["--json", "snapshot", "reset", "ghost", "--from", "base"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"],
+        "not_found"
+    );
+    assert_eq!(
+        d.json(&["snapshot", "rm", "slot", "--force"]),
+        serde_json::json!({})
+    );
+    let out = d.run(&["--json", "snapshot", "create", "Base"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"],
+        "already_exists"
+    );
+}
+
+#[test]
+fn unsafe_names_never_print_raw_control_characters() {
+    let d = Daemon::start(&[]);
+    let out = d.run(&["--json", "snapshot", "create", "a\u{1b}]0;PWNED\u{7}"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains('\u{1b}'));
+    let out = d.run(&["snapshot", "create", "bad\nname"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("bad\nname"));
+}
+
+#[test]
+fn a_path_that_is_not_utf8_is_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    let d = Daemon::start(&[]);
+    let bad = std::ffi::OsStr::from_bytes(b"/tmp/not-utf8-\xff");
+    let out = d
+        .cmd(&["import"])
+        .arg(bad)
+        .args(["--name", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("UTF-8"));
+}
+
+#[test]
+fn a_failing_stdout_fails_the_command() {
+    let d = Daemon::start(&[]);
+    let full = std::path::Path::new("/dev/full");
+    if !full.exists() {
+        return;
+    }
+    let out = d
+        .cmd(&["status"])
+        .stdout(std::fs::OpenOptions::new().write(true).open(full).unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot write"));
+}
+
+#[test]
+fn a_closed_pipe_reader_is_not_an_error() {
+    let d = Daemon::start(&[]);
+    let mut child = Kid(d
+        .cmd(&["snapshot", "list"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap());
+    drop(child.0.stdout.take());
+    assert_eq!(child.0.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn sigint_waits_a_bounded_time_for_a_daemon_that_ignores_cancel() {
+    let d = Daemon::start(&["--stub-delay-ms", "400", "--stub-ignore-cancel"]);
+    let mut child = Kid(d
+        .cmd(&["gc"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap());
+    let mut stderr = BufReader::new(child.0.stderr.take().unwrap());
+    let mut first = String::new();
+    stderr.read_line(&mut first).unwrap();
+    let started = Instant::now();
+    assert!(Command::new("kill")
+        .args(["-INT", &child.0.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(child.0.wait().unwrap().code(), Some(130));
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(3500),
+        "{took:?}: gc itself runs 4 s"
+    );
+    assert!(
+        took >= Duration::from_millis(1500),
+        "{took:?}: waited for the final frame first"
+    );
+}
+
+#[test]
+fn a_second_sigint_exits_the_client_at_once() {
+    let d = Daemon::start(&["--stub-delay-ms", "400", "--stub-ignore-cancel"]);
+    let mut child = Kid(d
+        .cmd(&["gc"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap());
+    let mut stderr = BufReader::new(child.0.stderr.take().unwrap());
+    let mut first = String::new();
+    stderr.read_line(&mut first).unwrap();
+    let pid = child.0.id().to_string();
+    Command::new("kill").args(["-INT", &pid]).status().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    Command::new("kill").args(["-INT", &pid]).status().unwrap();
+    assert_eq!(child.0.wait().unwrap().code(), Some(130));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn shutdown_during_a_streaming_gc_gives_the_client_a_terminal_error() {
+    let d = Daemon::start(&["--stub-delay-ms", "300"]);
+    let mut gc = Kid(d
+        .cmd(&["--json", "gc"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap());
+    let mut stderr = BufReader::new(gc.0.stderr.take().unwrap());
+    let mut first = String::new();
+    stderr.read_line(&mut first).unwrap();
+    assert_eq!(d.run(&["shutdown"]).status.code(), Some(0));
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(gc.0.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    assert_eq!(gc.0.wait().unwrap().code(), Some(1));
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    let code = v["error"]["code"].as_str().unwrap();
+    assert!(code == "shutting_down" || code == "cancelled", "{stdout}");
+}
+
+#[test]
+fn a_second_signal_forces_serve_to_exit_while_a_handler_ignores_cancel() {
+    let mut d = Daemon::start(&["--stub-delay-ms", "1000", "--stub-ignore-cancel"]);
+    let mut gc = Kid(d
+        .cmd(&["gc"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap());
+    let mut stderr = BufReader::new(gc.0.stderr.take().unwrap());
+    let mut first = String::new();
+    stderr.read_line(&mut first).unwrap();
+    let pid = d.child.id().to_string();
+    Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    let t = Instant::now();
+    while d.socket.exists() {
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "socket not removed when shutdown began"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        d.child.try_wait().unwrap().is_none(),
+        "still draining the stubborn handler"
+    );
+    let started = Instant::now();
+    Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    let code = d.child.wait().unwrap().code();
+    assert_eq!(code, Some(130));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
