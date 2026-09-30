@@ -1,5 +1,3 @@
-use crate::BlockId;
-
 /// Settings for [`crate::Store::open`].
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -9,6 +7,10 @@ pub struct Options {
     pub checkpoint_on_drop: bool,
     /// Most read-only pack handles kept open at once. Default 64.
     pub max_open_packs: usize,
+    /// Torn-tail sidecars kept per store. Older ones are deleted at open. Default 8.
+    pub max_torn_sidecars: usize,
+    /// Total bytes kept in torn-tail sidecars. Oldest are deleted first. Default 64 MiB.
+    pub max_torn_sidecar_bytes: u64,
 }
 
 impl Default for Options {
@@ -17,6 +19,8 @@ impl Default for Options {
             max_pack_size: 256 << 20,
             checkpoint_on_drop: true,
             max_open_packs: 64,
+            max_torn_sidecars: 8,
+            max_torn_sidecar_bytes: 64 << 20,
         }
     }
 }
@@ -32,7 +36,7 @@ pub struct Gap {
     pub len: u64,
 }
 
-/// Damage found in bytes that an earlier `sync` had made durable. This is corruption, not a torn write.
+/// Damage found in bytes that an earlier `sync` had made durable, or in a pack that is gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorruptRegion {
     /// Pack id.
@@ -42,17 +46,31 @@ pub struct CorruptRegion {
     /// Number of bad bytes, or missing bytes when the pack is shorter than its durable length.
     pub len: u64,
     /// The id the damaged header claims, when that header still parses. Unverified.
-    pub id: Option<BlockId>,
+    pub id: Option<crate::BlockId>,
+}
+
+/// Bytes of a discarded torn tail, kept next to the pack for forensics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TornSidecar {
+    /// Pack the bytes came from.
+    pub pack: u32,
+    /// Offset in that pack where the discarded region started.
+    pub offset: u64,
+    /// File name, next to the pack.
+    pub name: String,
+    /// Bytes kept in the file.
+    pub bytes: u64,
 }
 
 /// What [`crate::Store::open`] found and repaired.
 ///
-/// Two kinds of damage are kept apart.
+/// Damage is kept in two classes.
 /// A torn tail is bytes after the durable watermark: the store never promised them, so open cuts
-/// them and only reports how much (`torn_tail_discarded`). That is normal after a crash.
-/// `corrupt_synced` and `missing_synced` are damage to data that a completed `sync` had made durable.
-/// That is data loss and callers that must not serve a store with lost data should refuse to mount
-/// when [`RecoveryReport::has_corruption`] is true.
+/// them into sidecars and only reports the size. That is normal after a crash and is reported in
+/// `torn_tail_discarded`.
+/// Corruption is damage to data that a completed `sync` had made durable, or a pack that is gone.
+/// It is listed in `corrupt_synced` and `missing_synced`, and `has_corruption()` is true until
+/// [`crate::Store::acknowledge_corruption`] accepts it.
 #[derive(Clone, Debug, Default)]
 pub struct RecoveryReport {
     /// The index checkpoint was valid and used.
@@ -62,27 +80,30 @@ pub struct RecoveryReport {
     /// Records found by scanning packs (beyond the checkpoint) and hash-verified.
     pub records_scanned: u64,
     /// Bytes cut from the end of the last pack as a torn tail (only beyond the durable watermark).
-    /// The first megabyte of each cut is kept in `<pack>.torn-<n>` next to the pack.
     pub torn_tail_discarded: u64,
     /// Same value as `torn_tail_discarded`, kept for source compatibility.
     pub truncated_bytes: u64,
-    /// Valid records found after a torn region and moved down over it, so nothing verifiable is lost.
+    /// Valid records found after a torn region and copied into a new pack, so nothing verifiable is lost.
     pub recovered_from_tail: u64,
     /// Bad regions that were skipped but not removed. Nothing in them is served or indexed.
     pub gaps: Vec<Gap>,
-    /// The subset of bad regions inside durable bytes, and packs shorter than the watermark says.
-    /// A non-empty list means data was lost to corruption.
+    /// Damage to durable bytes, and packs shorter than the watermark says.
+    /// Non-empty means data was lost to corruption. Includes pending losses from earlier opens.
     pub corrupt_synced: Vec<CorruptRegion>,
     /// Pack ids that the watermark says must exist and do not.
     pub missing_synced: Vec<u32>,
     /// Damaged regions whose block has a verified copy elsewhere, so nothing is lost. Informational.
     pub superseded: Vec<CorruptRegion>,
-    /// Damaged regions that [`crate::Store::acknowledge_corruption`] accepted earlier. Informational.
+    /// Damaged regions that [`crate::Store::acknowledge_corruption`] accepted. Informational.
     pub acknowledged: Vec<CorruptRegion>,
+    /// Sidecars written by this open, newest last.
+    pub torn_sidecars: Vec<TornSidecar>,
+    /// Sidecars that were deleted to stay inside the retention limits.
+    pub sidecars_pruned: u32,
 }
 
 impl RecoveryReport {
-    /// True when open found damage to bytes that had been made durable.
+    /// True when open found, or still remembers, damage to bytes that had been made durable.
     ///
     /// Open does not re-read data covered by the index checkpoint, so bit rot there is not
     /// reported here. Use [`crate::Store::verify_all`] to find it.
@@ -148,7 +169,7 @@ pub enum Damage {
         /// Record offset.
         offset: u64,
         /// The id the record claims.
-        id: BlockId,
+        id: crate::BlockId,
     },
     /// A record with a valid checksum whose payload does not decode.
     BadPayload {
@@ -157,12 +178,12 @@ pub enum Damage {
         /// Record offset.
         offset: u64,
         /// The id the record claims.
-        id: BlockId,
+        id: crate::BlockId,
     },
     /// An index entry that does not point at a verified record for that id.
     IndexEntry {
         /// The indexed id.
-        id: BlockId,
+        id: crate::BlockId,
     },
 }
 

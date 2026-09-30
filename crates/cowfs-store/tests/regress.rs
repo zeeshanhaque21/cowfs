@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::time::{Duration, Instant};
 
-use common::{index_bytes, index_path, opts, pack_path, random, record, REC_HDR};
+use common::{index_bytes, index_path, opts, pack_path, random, record, PACK_HEADER, REC_HDR};
 use cowfs_store::{BlockId, Options, Store};
 
 #[test]
@@ -23,7 +23,8 @@ fn f1_put_never_acks_a_block_that_is_unreadable() {
         .write(true)
         .open(pack_path(dir.path(), 0))
         .unwrap();
-    f.write_all_at(&[0xff], 16 + REC_HDR as u64 + 100).unwrap();
+    f.write_all_at(&[0xff], PACK_HEADER.len() as u64 + REC_HDR as u64 + 100)
+        .unwrap();
     drop(f);
     let s = Store::open(dir.path(), opts()).unwrap();
     if s.put(&d).is_ok() {
@@ -50,7 +51,7 @@ fn f2_forged_inner_record_does_not_poison_an_id() {
     let bytes = fs::read(&p).unwrap();
     let at = bytes
         .windows(4)
-        .skip(16 + REC_HDR)
+        .skip(PACK_HEADER.len() + REC_HDR)
         .position(|w| w == b"CWRB")
         .unwrap()
         + 16
@@ -134,10 +135,13 @@ fn f8_index_claiming_a_huge_record_is_rejected_before_allocation() {
         .unwrap()
         .set_len(big)
         .unwrap();
-    let slen = (big - 16 - REC_HDR as u64) as u32;
+    let slen = (big - PACK_HEADER.len() as u64 - REC_HDR as u64) as u32;
     fs::write(
         index_path(dir.path()),
-        index_bytes(&[(0, big)], &[(ia, [0, 16, slen, slen])]),
+        index_bytes(
+            &[(0, big)],
+            &[(ia, [0, PACK_HEADER.len() as u32, slen, slen])],
+        ),
     )
     .unwrap();
     let s = Store::open(dir.path(), opts()).unwrap();

@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use common::{fixture, install_wm, opts, parse_pack, random, Fixture};
+use common::{fixture, install_wm, opts, parse_pack, random, Fixture, PACK_HEADER};
 use cowfs_store::{BlockId, Error, Store};
 
 const SMALL: &[(usize, bool)] = &[
@@ -40,8 +40,8 @@ fn crash_at_every_offset(fx: &Fixture) {
             .filter(|r| r.2 <= cut)
             .map(|r| r.2)
             .max()
-            .unwrap_or(16);
-        let mark = if cut >= 16 {
+            .unwrap_or(PACK_HEADER.len());
+        let mark = if cut >= PACK_HEADER.len() {
             Some((last as u32, kept_end as u64))
         } else if last > 0 {
             Some((last as u32 - 1, fx.packs[last - 1].len() as u64))
@@ -66,7 +66,7 @@ fn crash_at_every_offset(fx: &Fixture) {
         };
         let s = open(dir.path());
         check(&s);
-        if cut >= 16 {
+        if cut >= PACK_HEADER.len() {
             assert_eq!(
                 s.recovery().truncated_bytes,
                 (cut - kept_end) as u64,
@@ -171,7 +171,19 @@ fn flip_check(fx: &Fixture, positions: impl Iterator<Item = (usize, u8)>, with_i
             }
             Ok(s) => s,
         };
-        assert!(hit.is_some(), "pack header flip accepted, {ctx}");
+        // A flip inside a record makes that record unreadable. A flip in the 16 byte pack header
+        // (magic, version or creation nonce) leaves every record intact, so nothing is lost and the
+        // checkpoint, which names the nonce, is dropped instead.
+        if byte < 16 {
+            assert!(!s.recovery().index_loaded, "stale index kept, {ctx}");
+            for (id, d) in &fx.blocks {
+                assert_eq!(&s.get(*id).unwrap(), d, "{ctx}");
+            }
+            assert_eq!(s.recovery().truncated_bytes, 0, "{ctx}");
+            assert!(s.fsck().unwrap().is_clean(), "{ctx}");
+            continue;
+        }
+        assert!(hit.is_some(), "record flip missed, {ctx}");
         assert_eq!(s.recovery().index_loaded, with_index, "{ctx}");
         for (i, (id, d)) in fx.blocks.iter().enumerate() {
             if Some(i) == hit {
@@ -187,8 +199,8 @@ fn flip_check(fx: &Fixture, positions: impl Iterator<Item = (usize, u8)>, with_i
         assert_eq!(on_disk, b.len() as u64, "synced bytes deleted, {ctx}");
         if !with_index {
             assert!(s.recovery().has_corruption(), "flip not reported, {ctx}");
+            assert!(!s.fsck().unwrap().is_clean(), "flip not detected, {ctx}");
         }
-        assert!(!s.fsck().unwrap().is_clean(), "flip not detected, {ctx}");
     }
 }
 
