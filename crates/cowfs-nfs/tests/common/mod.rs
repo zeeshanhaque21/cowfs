@@ -1,6 +1,7 @@
 //! A tiny NFSv3 client over raw RPC frames, enough to drive the server in-process.
 #![allow(dead_code)]
 pub mod counting;
+pub mod reuse;
 
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
@@ -175,6 +176,11 @@ impl Nfs {
         (acc, r)
     }
 
+    /// The next call uses this xid, to build retransmissions.
+    pub fn set_next_xid(&mut self, xid: u32) {
+        self.xid = xid.wrapping_sub(1);
+    }
+
     pub fn send(&mut self, m: &[u8]) {
         self.s
             .write_all(&(m.len() as u32 | 1 << 31).to_be_bytes())
@@ -207,6 +213,28 @@ impl Nfs {
     pub fn getattr(&mut self, fh: &nfs_fh3) -> (u32, Option<fattr3>) {
         let (st, mut r) = self.call(1, Args::new().put(fh));
         (st, (st == OK).then(|| dec(&mut r)))
+    }
+
+    /// GETATTR that reports a closed or silent connection as `None` instead of panicking.
+    pub fn try_getattr(&mut self, fh: &nfs_fh3) -> Option<u32> {
+        self.xid += 1;
+        let mut m = Vec::new();
+        for w in [self.xid, 0, 2, 100_003, 3, 1, 0, 0, 0, 0] {
+            m.extend_from_slice(&w.to_be_bytes());
+        }
+        Args::new().put(fh).0.iter().for_each(|b| m.push(*b));
+        self.s
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .ok()?;
+        self.s
+            .write_all(&(m.len() as u32 | 1 << 31).to_be_bytes())
+            .ok()?;
+        self.s.write_all(&m).ok()?;
+        let mut h = [0u8; 4];
+        self.s.read_exact(&mut h).ok()?;
+        let mut b = vec![0u8; (u32::from_be_bytes(h) & 0x7fff_ffff) as usize];
+        self.s.read_exact(&mut b).ok()?;
+        Some(0)
     }
 
     pub fn attrs(&mut self, fh: &nfs_fh3) -> fattr3 {
@@ -435,4 +463,17 @@ impl Nfs {
         let _a: post_op_attr = dec(&mut r);
         (st, if st == OK { dec(&mut r) } else { 0 })
     }
+}
+
+/// Resident memory of this process in bytes, from `ps`.
+pub fn rss_bytes() -> u64 {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0)
+        * 1024
 }
