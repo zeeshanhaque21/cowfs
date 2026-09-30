@@ -569,3 +569,79 @@ fn background_flusher_commits_without_being_asked() {
     assert!(c.stats().batches >= 1);
     c.check().unwrap();
 }
+
+#[test]
+fn an_inode_number_is_never_reused_for_another_file() {
+    use std::collections::HashMap;
+    let dir = tempfile::tempdir().unwrap();
+    let mut seen: HashMap<u64, String> = HashMap::new();
+    let mut note = |ino: u64, what: String| {
+        if let Some(prev) = seen.insert(ino, what.clone()) {
+            assert_eq!(prev, what, "inode {ino} named two different files");
+        }
+    };
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    c.create_snapshot("s").unwrap();
+    let r = root_entry(&c, "s").ino;
+    for round in 0..300u32 {
+        let name = format!("f{}", round % 5);
+        let a = c.create(r, name.as_bytes(), 0o644).unwrap();
+        note(a.ino, format!("session1 file {round}"));
+        if round % 7 == 0 {
+            c.flush().unwrap();
+        }
+        c.unlink(r, name.as_bytes()).unwrap();
+        c.forget(a.ino, 1);
+        if round % 50 == 49 {
+            c.flush().unwrap();
+        }
+    }
+    let old_root = r;
+    c.remove_snapshot("s").unwrap();
+    c.create_snapshot("s").unwrap();
+    let r2 = root_entry(&c, "s").ino;
+    assert_ne!(old_root, r2, "a removed snapshot's root number was reused");
+    for i in 0..50 {
+        let a = c.create(r2, format!("g{i}").as_bytes(), 0o644).unwrap();
+        note(a.ino, format!("after snapshot recreate {i}"));
+    }
+    let g0 = c.lookup(r2, b"g0").unwrap().ino;
+    let kept: Vec<u64> = (0..50)
+        .map(|i| c.lookup(r2, format!("g{i}").as_bytes()).unwrap().ino)
+        .collect();
+    assert_eq!(kept[0], g0);
+    for i in 0..25 {
+        c.unlink(r2, format!("g{i}").as_bytes()).unwrap();
+    }
+    c.sync().unwrap();
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    let r3 = root_entry(&c, "s").ino;
+    let mut after_restart: HashMap<u64, String> = HashMap::new();
+    for i in 25..50 {
+        let a = c.lookup(r3, format!("g{i}").as_bytes()).unwrap();
+        after_restart.insert(a.ino, format!("g{i}"));
+    }
+    for i in 0..40 {
+        let a = c.create(r3, format!("h{i}").as_bytes(), 0o644).unwrap();
+        assert!(
+            !after_restart.contains_key(&a.ino),
+            "a file created after a restart got the number of a live file"
+        );
+    }
+    c.sync().unwrap();
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    let r4 = root_entry(&c, "s").ino;
+    let mut all: HashSet<u64> = HashSet::new();
+    for i in 25..50 {
+        assert!(all.insert(c.lookup(r4, format!("g{i}").as_bytes()).unwrap().ino));
+    }
+    for i in 0..40 {
+        assert!(
+            all.insert(c.lookup(r4, format!("h{i}").as_bytes()).unwrap().ino),
+            "h{i} shares its number with another file after restart"
+        );
+    }
+    c.check().unwrap();
+}
