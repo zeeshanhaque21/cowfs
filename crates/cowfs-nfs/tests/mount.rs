@@ -557,6 +557,11 @@ impl Drop for Child {
 }
 
 fn spawn_host() -> Option<Child> {
+    spawn_host_with(MountOptions::default())
+}
+
+/// `child_host` with mount options, for the tests that need a particular mount.
+fn spawn_host_with(opts: MountOptions) -> Option<Child> {
     if !mount_nfs_available() {
         eprintln!("SKIP: mount_nfs is not available");
         return None;
@@ -574,6 +579,10 @@ fn spawn_host() -> Option<Child> {
             "--test-threads=1",
         ])
         .env("COWFS_CHILD_MOUNT", dir.path().join("mnt"))
+        .env(
+            "COWFS_CHILD_OPTS",
+            format!("{}|{}", opts.soft, opts.appledouble as u8),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1067,5 +1076,68 @@ fn archives_and_checkouts_of_dot_underscore_files_work_in_every_mode() {
         );
         assert!(ok, "{mode:?}: contents: {out}");
         m.finish();
+    }
+}
+
+/// What a dead server costs the caller, with and without `soft`, and what frees the caller.
+/// Prints a table. Asserts only what holds on this system: no mount option bounds the wait, so
+/// the cure is the signal handler and the sweep, both of which are tested elsewhere.
+#[test]
+#[ignore = "mounts a filesystem and kills it; run with --ignored"]
+fn a_dead_server_costs_the_caller_bounded_time_when_soft() {
+    println!("| options | ls on an uncached path | touch on an uncached path | after the sweep |");
+    println!("|---|---|---|---|");
+    for (name, soft) in [("hard", false), ("soft,timeo=6,retrans=2", true)] {
+        let opts = MountOptions {
+            soft,
+            timeo: 6,
+            retrans: 2,
+            ..MountOptions::default()
+        };
+        let Some(mut h) = spawn_host_with(opts) else {
+            return;
+        };
+        let table = Command::new("/usr/bin/nfsstat")
+            .args(["-m"])
+            .output()
+            .unwrap()
+            .stdout
+            .into_iter()
+            .map(char::from)
+            .collect::<String>();
+        let listed = table.contains("soft") || table.contains("hard");
+        let pid = h.child.id().to_string();
+        assert!(Command::new("/bin/kill")
+            .args(["-KILL", &pid])
+            .status()
+            .unwrap()
+            .success());
+        assert!(wait_exit(&mut h.child, 30).is_some());
+        let dog = Watchdog::start(h.mountpoint.clone(), 300);
+        let (ls_ok, _) = run_limited(Command::new("/bin/ls").arg(h.mountpoint.join("nosuch")), 20);
+        let t = Instant::now();
+        let (touch_ok, _) = run_limited(
+            Command::new("/usr/bin/touch").arg(h.mountpoint.join("new")),
+            20,
+        );
+        let secs = t.elapsed().as_secs_f64();
+        let prefix = h.mountpoint.parent().unwrap().to_path_buf();
+        let swept = cowfs_nfs::sweep_stale_mounts(&prefix).unwrap();
+        let (after_ok, _) =
+            run_limited(Command::new("/bin/ls").arg(h.mountpoint.join("nosuch")), 10);
+        println!(
+            "| {name} (soft shown: {listed}) | {} | {:.0}s {} | ls {} |",
+            if ls_ok { "answered" } else { "hung" },
+            secs,
+            if touch_ok { "ok" } else { "hung" },
+            if after_ok { "answered" } else { "hung" },
+        );
+        drop(dog);
+        assert!(!swept.is_empty(), "the sweep must find the dead mount");
+        assert!(
+            !mount_table_has(&h.mountpoint),
+            "and the mount table must no longer list it"
+        );
+        eprintln!("{name}: after the sweep ls on the old path answered: {after_ok}");
     }
 }

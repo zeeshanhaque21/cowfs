@@ -54,9 +54,6 @@ impl Default for AppleDoubleMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdapterOptions {
     pub appledouble: AppleDoubleMode,
-    /// Run cheap metadata calls (GETATTR, LOOKUP, FSSTAT) on the network thread instead of a
-    /// blocking task. Only correct when the `Vfs` answers them without blocking.
-    pub inline_metadata: bool,
     /// The (uid, gid) reported for every file. `Mount` sets it to the owner of the mount point,
     /// so tools that check ownership (git) accept the tree. `None` reports what the `Vfs` says.
     pub owner: Option<(u32, u32)>,
@@ -624,19 +621,6 @@ impl CowNfs {
         Ok(Self(Arc::new(Adapter::new(vfs, opts)?)))
     }
 
-    /// For calls a `Vfs` answers without blocking: inline if the option says so.
-    async fn run_cheap<T, F>(&self, f: F) -> NfsResult<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&Adapter) -> NfsResult<T> + Send + 'static,
-    {
-        if self.0.opts.inline_metadata {
-            f(&self.0)
-        } else {
-            self.run(f).await
-        }
-    }
-
     async fn run<T, F>(&self, f: F) -> NfsResult<T>
     where
         T: Send + 'static,
@@ -671,11 +655,11 @@ impl NFSFileSystem for CowNfs {
 
     async fn lookup(&self, dirid: fileid3, name: &filename3) -> NfsResult<(fileid3, fattr3)> {
         let name = name.clone();
-        self.run_cheap(move |a| a.lookup(dirid, &name)).await
+        self.run(move |a| a.lookup(dirid, &name)).await
     }
 
     async fn getattr(&self, id: fileid3) -> NfsResult<fattr3> {
-        self.run_cheap(move |a| a.getattr(id)).await
+        self.run(move |a| a.getattr(id)).await
     }
 
     async fn setattr(&self, id: fileid3, s: sattr3) -> NfsResult<fattr3> {
@@ -781,7 +765,7 @@ impl NFSFileSystem for CowNfs {
     }
 
     async fn fsstat(&self, _id: fileid3) -> NfsResult<fsstat3> {
-        self.run_cheap(|a| a.fsstat()).await
+        self.run(|a| a.fsstat()).await
     }
 }
 

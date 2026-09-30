@@ -74,8 +74,6 @@ pub struct MountOptions {
     pub actimeo: u32,
     /// What to do with the `._name` files the macOS client writes for extended attributes.
     pub appledouble: AppleDoubleMode,
-    /// Answer cheap metadata calls on the network thread, see [`AdapterOptions::inline_metadata`].
-    pub inline_metadata: bool,
     /// Give the root file handle to one client only: the first MNT wins and later ones are
     /// refused until [`Server::rearm_mount`].
     pub one_shot_mount: bool,
@@ -83,6 +81,14 @@ pub struct MountOptions {
     /// which cannot see the kernel NFS client's socket, so it is off by default and adds nothing
     /// over the secret export name.
     pub check_peer_uid: bool,
+    /// Mount soft, so a syscall against a dead server fails with EIO instead of blocking. A soft
+    /// mount can also fail a write half way through, which loses that write: the file system is
+    /// not corrupt, but the caller must be prepared for EIO on any call.
+    pub soft: bool,
+    /// `timeo` in tenths of a second, only used when `soft`. How long one retransmission waits.
+    pub timeo: u32,
+    /// `retrans` attempts before a soft call gives up.
+    pub retrans: u32,
     /// Connection and message bounds of the server.
     pub limits: Limits,
     /// Print the per-procedure latency table to stderr on SIGUSR1.
@@ -98,9 +104,11 @@ impl Default for MountOptions {
             wsize: 131_072,
             actimeo: 120,
             appledouble: AppleDoubleMode::default(),
-            inline_metadata: false,
             one_shot_mount: true,
             check_peer_uid: false,
+            soft: false,
+            timeo: 6,
+            retrans: 2,
             limits: Limits::default(),
             stats_on_sigusr1: false,
             command_timeout: Duration::from_secs(20),
@@ -112,16 +120,20 @@ impl MountOptions {
     /// The `-o` string for `mount_nfs`. `locallocks` is required: without it flock and fcntl
     /// fail and rustc incremental compilation aborts.
     pub fn nfs_option_string(&self, port: u16) -> String {
+        let retry = if self.soft {
+            format!("soft,timeo={},retrans={}", self.timeo, self.retrans)
+        } else {
+            "hard".to_string()
+        };
         format!(
-            "locallocks,vers=3,tcp,rsize={},wsize={},actimeo={},port={port},mountport={port}",
-            self.rsize, self.wsize, self.actimeo
+            "locallocks,vers=3,tcp,rsize={},wsize={},actimeo={},{},port={port},mountport={port}",
+            self.rsize, self.wsize, self.actimeo, retry
         )
     }
 
     fn adapter(&self, owner: Option<(u32, u32)>) -> AdapterOptions {
         AdapterOptions {
             appledouble: self.appledouble,
-            inline_metadata: self.inline_metadata,
             owner,
         }
     }
@@ -417,8 +429,16 @@ mod tests {
         let s = MountOptions::default().nfs_option_string(4711);
         assert_eq!(
             s,
-            "locallocks,vers=3,tcp,rsize=131072,wsize=131072,actimeo=120,port=4711,mountport=4711"
+            "locallocks,vers=3,tcp,rsize=131072,wsize=131072,actimeo=120,hard,port=4711,mountport=4711"
         );
+        let soft = MountOptions {
+            soft: true,
+            timeo: 3,
+            retrans: 1,
+            ..MountOptions::default()
+        }
+        .nfs_option_string(4711);
+        assert!(soft.contains("soft,timeo=3,retrans=1"), "{soft}");
         let custom = MountOptions {
             rsize: 1 << 20,
             wsize: 65_536,
@@ -427,14 +447,17 @@ mod tests {
         };
         let s = custom.nfs_option_string(1);
         assert!(s.starts_with("locallocks,vers=3,tcp,"));
-        assert!(s.contains("rsize=1048576,wsize=65536,actimeo=0,port=1,mountport=1"));
+        assert!(
+            s.contains("rsize=1048576,wsize=65536,actimeo=0,hard,port=1,mountport=1"),
+            "{s}"
+        );
     }
 
     #[test]
     fn defaults_hide_appledouble_and_lock_down_the_mount() {
         let o = MountOptions::default();
         assert!(o.appledouble == AppleDoubleMode::Hide && !o.stats_on_sigusr1);
-        assert!(o.one_shot_mount && !o.check_peer_uid && !o.inline_metadata);
+        assert!(o.one_shot_mount && !o.check_peer_uid);
         assert!(
             o.appledouble == AppleDoubleMode::Hide,
             "the safe mode is the default"

@@ -6,7 +6,6 @@
 //! never seen the files it times: every timed call is a cold round trip. Timed batches hold the
 //! shared CPU lock (`COWFS_CPU_LOCK`, default the spike lock directory); the lock is never held
 //! across setup. `COWFS_BENCH_REPS` sets the repetitions (default 5, minimum 5 for a report).
-//! `COWFS_BENCH_INLINE=1` turns `inline_metadata` on.
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -177,12 +176,7 @@ fn timed(d: &Dirs) -> [f64; 6] {
 }
 
 fn bench_options() -> MountOptions {
-    let inline = std::env::var("COWFS_BENCH_INLINE").is_ok_and(|v| v == "1");
-    println!("inline_metadata = {inline}");
-    MountOptions {
-        inline_metadata: inline,
-        ..MountOptions::default()
-    }
+    MountOptions::default()
 }
 
 fn median(v: &mut [f64]) -> f64 {

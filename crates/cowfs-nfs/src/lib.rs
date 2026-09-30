@@ -21,8 +21,10 @@
 //! - `Ino` values stay below 2^63: the top bit marks a translated sidecar.
 //! - `lookup`, `create`, `mkdir`, `symlink` and `link` each take one reference and the adapter
 //!   gives every one back at once with `forget`. NFS handles are stateless, so nothing is pinned.
-//! - `getattr`, `lookup` and `statfs` may be called on the network thread when
-//!   `inline_metadata` is set, so they must not block for long.
+//! - Every call may block, and each one runs on its own blocking task, so a slow `Vfs` costs
+//!   parallelism rather than the whole server. An option to answer cheap metadata calls on the
+//!   network thread was removed: it stalled every request behind one slow `getattr` (measured
+//!   0.8 s for an unrelated NULL call) and showed no reproducible gain in the benchmark.
 //!
 //! # Security model
 //!
