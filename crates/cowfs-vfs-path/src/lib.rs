@@ -57,8 +57,9 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use cowfs_vfs::{
-    validate_name, Attr, DirEntry, Error, FileHandle, FileKind, Ino, ReadDir, RenameFlags, Result,
-    SetAttr, SetTime, StatFs, Vfs, XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
+    validate_name, Attr, DirEntry, DirEntryPlus, Error, FileHandle, FileKind, Ino, ReadDir,
+    ReadDirPlus, RenameFlags, Result, SetAttr, SetTime, StatFs, Vfs, XattrFlags, MODE_MASK,
+    NAME_MAX, ROOT_INO,
 };
 
 mod cookies;
@@ -104,8 +105,71 @@ impl PathVfs {
         self
     }
 
+    /// Live inode table entries and held descriptors, for the leak regression tests.
+    #[cfg(test)]
+    fn live_counts(&self) -> (usize, usize) {
+        self.lock().counts()
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// One page with attributes: the listing carries the `fstatat` results, so a page costs one
+    /// `fstatat` per entry and no extra `getattr`.
+    fn readdir_page(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDirPlus> {
+        if max == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let mut s = self.lock();
+        let open = s.dir_fd(dir)?;
+        let dstamp = sys::fstat(open.file.as_fd()).map_err(io_err)?;
+        let stamp = (
+            dstamp.mtime.0,
+            dstamp.mtime.1,
+            dstamp.ctime.0,
+            dstamp.ctime.1,
+            dstamp.size,
+            dstamp.nlink,
+        );
+        let listing = match s.listing_for(dir, stamp, cookie == 0) {
+            Some(l) => l,
+            None => {
+                let names = sys::list_dir(open.file.as_fd()).map_err(io_err)?;
+                s.node_mut(dir)?.cookies.sync(names)
+            }
+        };
+        let rest = listing[listing.partition_point(|(c, _)| *c <= cookie)..].to_vec();
+        let mut entries = Vec::new();
+        let mut consumed = 0;
+        for (c, name) in &rest {
+            if entries.len() >= max {
+                break;
+            }
+            consumed += 1;
+            let st = match sys::fstatat(open.file.as_fd(), name) {
+                Ok(st) => st,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(e) => return Err(io_err(e)),
+            };
+            let Ok(kind) = kind_of(&st) else {
+                continue;
+            };
+            let ino = s.register(dir, &open.file, name, &st)?;
+            let attr = s.attr_of(ino, &st)?;
+            entries.push(DirEntryPlus {
+                entry: DirEntry {
+                    ino,
+                    kind,
+                    name: name.clone(),
+                    cookie: *c,
+                },
+                attr,
+            });
+        }
+        let eof = consumed == rest.len();
+        s.set_listing(dir, listing, stamp);
+        Ok(ReadDirPlus { entries, eof })
     }
 
     fn with_xattr<R>(&self, ino: Ino, f: impl FnOnce(&XTarget<'_>) -> io::Result<R>) -> Result<R> {
@@ -123,6 +187,16 @@ impl PathVfs {
         let o = s.open_fd(ino)?;
         f(&XTarget::Fd(o.file.as_fd())).map_err(io_err)
     }
+}
+
+fn check_xattr_name(name: &[u8]) -> Result<()> {
+    if name.is_empty() || name.contains(&0) {
+        return Err(Error::InvalidArgument);
+    }
+    if name.len() > NAME_MAX {
+        return Err(Error::NameTooLong);
+    }
+    Ok(())
 }
 
 fn time_spec(t: Option<SetTime>) -> TimeSpec {
@@ -160,6 +234,7 @@ impl Vfs for PathVfs {
                 FileKind::Directory => return Err(Error::IsDir),
                 FileKind::Symlink => return Err(Error::InvalidArgument),
                 FileKind::Regular => {}
+                _ => return Err(Error::NotSupported),
             }
         }
         if let Some(size) = changes.size {
@@ -175,13 +250,15 @@ impl Vfs for PathVfs {
         }
         if let Some(mode) = changes.mode {
             let mode = mode & MODE_MASK;
-            match s.locate(ino)? {
-                Loc::Named(dir, name) => {
-                    sys::fchmodat(dir.as_fd(), &name, mode, kind == FileKind::Symlink)
-                }
-                Loc::Fd(o) => sys::fchmod(o.file.as_fd(), mode),
+            // Through a descriptor opened without following symlinks: a path based chmod could
+            // land on whatever was swapped into that name.
+            let o = s.open_kind(ino)?;
+            sys::fchmod(o.file.as_fd(), mode).map_err(io_err)?;
+            if mode & 0o200 != 0 {
+                s.unpin(ino);
+            } else {
+                s.pin(ino);
             }
-            .map_err(io_err)?;
         }
         s.attr(ino)
     }
@@ -204,6 +281,10 @@ impl Vfs for PathVfs {
         let st = sys::fstat(open.file.as_fd()).map_err(io_err)?;
         let ino = s.register(parent, &dir.file, name, &st)?;
         s.remember(ino, open);
+        if mode & 0o200 == 0 {
+            // Nothing can reopen this for writing later, so keep the descriptor we have.
+            s.pin(ino);
+        }
         s.add_ref(ino);
         s.attr_of(ino, &st)
     }
@@ -293,7 +374,7 @@ impl Vfs for PathVfs {
             return Err(io_err(e));
         }
         if let Some(i) = known {
-            s.name_removed(i, parent, name, st.nlink.saturating_sub(1));
+            s.name_removed(i, parent, name);
         }
         Ok(())
     }
@@ -321,7 +402,7 @@ impl Vfs for PathVfs {
             });
         }
         if let Some(i) = known {
-            s.name_removed(i, parent, name, 0);
+            s.name_removed(i, parent, name);
         }
         Ok(())
     }
@@ -379,13 +460,8 @@ impl Vfs for PathVfs {
         if let Some(i) = moved {
             s.rename_name(i, (parent, name), (new_parent, new_name));
         }
-        if let (Some(i), Some(d)) = (replaced, dst) {
-            let remaining = if d.file_type() == sys::S_IFDIR {
-                0
-            } else {
-                d.nlink.saturating_sub(1)
-            };
-            s.name_removed(i, new_parent, new_name, remaining);
+        if let Some(i) = replaced {
+            s.name_removed(i, new_parent, new_name);
         }
         Ok(())
     }
@@ -405,16 +481,18 @@ impl Vfs for PathVfs {
                 FileKind::Directory => return Err(Error::IsDir),
                 FileKind::Symlink => return Err(Error::InvalidArgument),
                 FileKind::Regular => {}
+                _ => return Err(Error::NotSupported),
             }
             s.open_fd(ino)?.file
         };
-        if offset > i64::MAX as u64 - u64::from(READ_MAX) {
+        if offset > i64::MAX as u64 {
             return Ok(Vec::new());
         }
         let mut buf = vec![0u8; size.min(READ_MAX) as usize];
         let mut got = 0;
         while got < buf.len() {
-            match file.read_at(&mut buf[got..], offset + got as u64) {
+            let chunk = (buf.len() - got).min(READ_MAX as usize);
+            match file.read_at(&mut buf[got..got + chunk], offset + got as u64) {
                 Ok(0) => break,
                 Ok(n) => got += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -432,10 +510,14 @@ impl Vfs for PathVfs {
                 FileKind::Directory => return Err(Error::IsDir),
                 FileKind::Symlink => return Err(Error::InvalidArgument),
                 FileKind::Regular => {}
+                _ => return Err(Error::NotSupported),
             }
             s.open_rw(ino)?.file
         };
         let len = u32::try_from(data.len()).map_err(|_| Error::InvalidArgument)?;
+        if offset > i64::MAX as u64 - u64::from(len) {
+            return Err(Error::InvalidArgument);
+        }
         file.write_all_at(data, offset).map_err(io_err)?;
         Ok(len)
     }
@@ -461,44 +543,15 @@ impl Vfs for PathVfs {
     }
 
     fn readdir(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDir> {
-        if max == 0 {
-            return Err(Error::InvalidArgument);
-        }
-        let mut s = self.lock();
-        let open = s.dir_fd(dir)?;
-        if cookie == 0 || s.node(dir)?.listing.is_none() {
-            let names = sys::list_dir(open.file.as_fd()).map_err(io_err)?;
-            let n = s.node_mut(dir)?;
-            n.listing = Some(n.cookies.sync(names));
-        }
-        let listing = s.node_mut(dir)?.listing.take().unwrap_or_default();
-        let rest = &listing[listing.partition_point(|(c, _)| *c <= cookie)..];
-        let mut entries = Vec::new();
-        let mut consumed = 0;
-        for (c, name) in rest {
-            if entries.len() >= max {
-                break;
-            }
-            consumed += 1;
-            let st = match sys::fstatat(open.file.as_fd(), name) {
-                Ok(st) => st,
-                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
-                Err(e) => return Err(io_err(e)),
-            };
-            let Ok(kind) = kind_of(&st) else {
-                continue;
-            };
-            let ino = s.register(dir, &open.file, name, &st)?;
-            entries.push(DirEntry {
-                ino,
-                kind,
-                name: name.clone(),
-                cookie: *c,
-            });
-        }
-        let eof = consumed == rest.len();
-        s.node_mut(dir)?.listing = Some(listing);
-        Ok(ReadDir { entries, eof })
+        let page = self.readdir_page(dir, cookie, max)?;
+        Ok(ReadDir {
+            entries: page.entries.into_iter().map(|e| e.entry).collect(),
+            eof: page.eof,
+        })
+    }
+
+    fn readdir_attrs(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDirPlus> {
+        self.readdir_page(dir, cookie, max)
     }
 
     fn statfs(&self) -> Result<StatFs> {
@@ -516,16 +569,12 @@ impl Vfs for PathVfs {
     }
 
     fn getxattr(&self, ino: Ino, name: &[u8]) -> Result<Vec<u8>> {
+        check_xattr_name(name)?;
         self.with_xattr(ino, |t| sys::getxattr(t, name))
     }
 
     fn setxattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: XattrFlags) -> Result<()> {
-        if name.is_empty() || name.contains(&0) {
-            return Err(Error::InvalidArgument);
-        }
-        if name.len() > NAME_MAX {
-            return Err(Error::NameTooLong);
-        }
+        check_xattr_name(name)?;
         self.with_xattr(ino, |t| {
             sys::setxattr(t, name, value, flags.create, flags.replace)
         })
@@ -536,6 +585,7 @@ impl Vfs for PathVfs {
     }
 
     fn removexattr(&self, ino: Ino, name: &[u8]) -> Result<()> {
+        check_xattr_name(name)?;
         self.with_xattr(ino, |t| sys::removexattr(t, name))
     }
 }

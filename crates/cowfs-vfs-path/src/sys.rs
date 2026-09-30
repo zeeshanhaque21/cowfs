@@ -245,19 +245,6 @@ pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// `fchmodat`; with `nofollow` the platform decides whether a symlink's own mode can change.
-pub fn fchmodat(dir: BorrowedFd<'_>, name: &[u8], mode: u32, nofollow: bool) -> io::Result<()> {
-    let name = cstr(name)?;
-    let flags = if nofollow {
-        libc::AT_SYMLINK_NOFOLLOW
-    } else {
-        0
-    };
-    // SAFETY: see module docs.
-    cvt(unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, flags) })?;
-    Ok(())
-}
-
 /// A time to set: leave alone, the current time, or an exact instant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeSpec {
@@ -583,7 +570,7 @@ pub fn listxattr(t: &XTarget<'_>) -> io::Result<Vec<Vec<u8>>> {
                     .map(<[u8]>::to_vec)
                     .collect());
             }
-            Err(e) if e.raw_os_error() == Some(libc::ERANGE) => continue,
+            Err(e) if e.raw_os_error() == Some(libc::ERANGE) && size < XATTR_BUF_MAX => continue,
             Err(e) => return Err(e),
         }
     }

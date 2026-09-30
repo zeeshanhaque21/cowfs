@@ -36,7 +36,9 @@ pub(crate) fn io_err(e: io::Error) -> Error {
         libc::ERANGE | libc::E2BIG => Error::Range,
         libc::EROFS => Error::ReadOnly,
         libc::EXDEV => Error::CrossDevice,
-        _ => Error::Io(e.to_string()),
+        libc::ENOSYS => Error::NotSupported,
+        // A non-exhaustive enum: an error the crate does not know must not pass silently.
+        other => Error::Io(format!("errno {other}")),
     }
 }
 
@@ -70,6 +72,9 @@ pub(crate) enum Loc {
 /// references and handles that keep it alive.
 #[derive(Debug)]
 pub(crate) struct Node {
+    /// The file's identity on the backing filesystem. A number may be reused once the file is
+    /// gone, which is safe here because `by_id` only holds an entry while the node still has a
+    /// name the Vfs knows, and a number is only reusable after every name is gone.
     pub id: (u64, u64),
     pub kind: FileKind,
     /// `(parent, name)` pairs known to lead here. Enough to reopen the file, never a full list.
@@ -85,12 +90,16 @@ pub(crate) struct Node {
     pub cookies: Cookies,
     /// The directory's names by cookie as of the last read, dropped by every change to it.
     pub listing: Option<Vec<(u64, Vec<u8>)>>,
+    /// The directory's (mtime, ctime, size, links) when the listing was read: a change made by
+    /// anyone else, including an adapter under a mountpoint, moves at least one of them.
+    pub listing_stamp: Option<(i64, u32, i64, u32, u64, u64)>,
 }
 
 /// The inode table. Every method runs under the single lock in `PathVfs`.
 #[derive(Debug)]
 pub(crate) struct State {
     nodes: HashMap<Ino, Node>,
+    /// Backing identities to inode numbers. Entries are dropped with the node they name.
     by_id: HashMap<(u64, u64), Ino>,
     cache: HashMap<Ino, Open>,
     open_handles: HashMap<u64, Ino>,
@@ -118,6 +127,7 @@ impl State {
             target: None,
             cookies: Cookies::default(),
             listing: None,
+            listing_stamp: None,
         };
         let mut nodes = HashMap::new();
         nodes.insert(ROOT_INO, node);
@@ -145,11 +155,46 @@ impl State {
     pub(crate) fn invalidate(&mut self, dir: Ino) {
         if let Some(n) = self.nodes.get_mut(&dir) {
             n.listing = None;
+            n.listing_stamp = None;
         }
     }
 
+    /// The cached listing of `dir`, or `None` when it must be read again: either nobody has read
+    /// it, or the directory itself changed since, which is the only signal that a name appeared
+    /// or vanished without `PathVfs` doing it.
+    pub(crate) fn listing_for(
+        &mut self,
+        dir: Ino,
+        stamp: (i64, u32, i64, u32, u64, u64),
+        restart: bool,
+    ) -> Option<Vec<(u64, Vec<u8>)>> {
+        let n = self.nodes.get(&dir)?;
+        if restart || n.listing.is_none() || n.listing_stamp != Some(stamp) {
+            return None;
+        }
+        n.listing.clone()
+    }
+
+    /// Keeps a listing that a resumed call just used.
+    pub(crate) fn set_listing(
+        &mut self,
+        dir: Ino,
+        listing: Vec<(u64, Vec<u8>)>,
+        stamp: (i64, u32, i64, u32, u64, u64),
+    ) {
+        if let Some(n) = self.nodes.get_mut(&dir) {
+            n.listing = Some(listing);
+            n.listing_stamp = Some(stamp);
+        }
+    }
+
+    /// The inode for a backing identity, when the node behind it is still live.
     pub(crate) fn node_by_id(&self, id: (u64, u64)) -> Option<Ino> {
-        self.by_id.get(&id).copied()
+        let ino = *self.by_id.get(&id)?;
+        match self.nodes.get(&ino) {
+            Some(n) if n.id == id => Some(ino),
+            _ => None,
+        }
     }
 
     fn cached(&self, ino: Ino) -> Option<Open> {
@@ -175,24 +220,22 @@ impl State {
         if let Some(o) = self.cached(ino) {
             return Ok(o);
         }
-        let o = self.reopen(ino)?;
+        let o = self.reopen(ino, false)?;
         self.cache_put(ino, o.clone());
         Ok(o)
     }
 
-    /// Like `open_fd`, but for writing: a stale read-only descriptor is retried read-write.
+    /// A descriptor that can write, reopened read-write: a cached read-only one is not enough.
     pub(crate) fn open_rw(&mut self, ino: Ino) -> Result<Open> {
-        let o = self.open_fd(ino)?;
-        if o.rw {
-            return Ok(o);
-        }
-        if let Ok(fresh) = self.reopen(ino) {
-            if fresh.rw {
-                self.replace(ino, fresh.clone());
-                return Ok(fresh);
+        self.node(ino)?;
+        if let Some(o) = self.cached(ino) {
+            if o.rw {
+                return Ok(o);
             }
         }
-        Err(Error::PermissionDenied)
+        let o = self.reopen(ino, true)?;
+        self.replace(ino, o.clone());
+        Ok(o)
     }
 
     fn replace(&mut self, ino: Ino, open: Open) {
@@ -202,12 +245,13 @@ impl State {
         }
     }
 
-    fn reopen(&mut self, ino: Ino) -> Result<Open> {
+    fn reopen(&mut self, ino: Ino, write: bool) -> Result<Open> {
         let (id, kind, names) = {
             let n = self.node(ino)?;
             (n.id, n.kind, n.names.clone())
         };
         let mut last = Error::Stale;
+        let mut parents: Vec<Ino> = Vec::new();
         for (parent, name) in names {
             let dir = match self.dir_fd(parent) {
                 Ok(d) => d,
@@ -216,13 +260,47 @@ impl State {
                     continue;
                 }
             };
-            match open_named(&dir.file, &name, kind) {
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+            match open_named(&dir.file, &name, kind, write) {
                 Ok((o, st)) if (st.dev, st.ino) == id => return Ok(o),
                 Ok(_) => last = Error::Stale,
                 Err(e) => last = io_err(e),
             }
         }
+        // Another writer may have renamed or replaced the file under a name the Vfs knows
+        // (an adapter under a mountpoint does), so look for it by identity in those parents.
+        for parent in parents {
+            if let Some(o) = self.scan_for(parent, id, kind, write) {
+                return Ok(o);
+            }
+        }
         Err(last)
+    }
+
+    /// Finds a file by backing identity inside one directory and opens it.
+    fn scan_for(
+        &mut self,
+        parent: Ino,
+        id: (u64, u64),
+        kind: FileKind,
+        write: bool,
+    ) -> Option<Open> {
+        let dir = self.dir_fd(parent).ok()?;
+        let names = sys::list_dir(dir.file.as_fd()).ok()?;
+        for name in names {
+            let Ok(st) = sys::fstatat(dir.file.as_fd(), &name) else {
+                continue;
+            };
+            if (st.dev, st.ino) != id {
+                continue;
+            }
+            if let Ok((o, _)) = open_named(&dir.file, &name, kind, write) {
+                return Some(o);
+            }
+        }
+        None
     }
 
     pub(crate) fn dir_fd(&mut self, ino: Ino) -> Result<Open> {
@@ -291,7 +369,7 @@ impl State {
     ) -> Result<Ino> {
         let id = (st.dev, st.ino);
         let kind = kind_of(st)?;
-        if let Some(&ino) = self.by_id.get(&id) {
+        if let Some(ino) = self.node_by_id(id) {
             if let Some(n) = self.nodes.get_mut(&ino) {
                 if !n.names.iter().any(|(p, nm)| *p == parent && nm == name) {
                     n.names.push((parent, name.to_vec()));
@@ -299,8 +377,7 @@ impl State {
                 return Ok(ino);
             }
         }
-        let ino = self.next_ino;
-        self.next_ino += 1;
+        let ino = self.alloc_ino();
         let target = if kind == FileKind::Symlink {
             Some(sys::readlinkat(dir.as_fd(), name).map_err(io_err)?)
         } else {
@@ -319,10 +396,21 @@ impl State {
                 target,
                 cookies: Cookies::default(),
                 listing: None,
+                listing_stamp: None,
             },
         );
         self.by_id.insert(id, ino);
         Ok(ino)
+    }
+
+    /// A number no other file has ever been given.
+    fn alloc_ino(&mut self) -> Ino {
+        let ino = self.next_ino;
+        self.next_ino = self
+            .next_ino
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("inode numbers exhausted: {} live nodes", self.nodes.len()));
+        ino
     }
 
     /// Holds a descriptor for `ino` so it survives losing its last name. Best effort.
@@ -330,10 +418,32 @@ impl State {
         if self.nodes.get(&ino).is_none_or(|n| n.pinned.is_some()) {
             return;
         }
-        if let Ok(o) = self.open_fd(ino) {
+        if let Ok(o) = self.open_rw(ino).or_else(|_| self.open_fd(ino)) {
             self.cache.remove(&ino);
             if let Some(n) = self.nodes.get_mut(&ino) {
                 n.pinned = Some(o);
+            }
+        }
+    }
+
+    /// Opens `ino` the way the operation needs it: read-write for a regular file, as it is for
+    /// a directory or a symlink, so a mode change never goes through a path.
+    pub(crate) fn open_kind(&mut self, ino: Ino) -> Result<Open> {
+        if self.node(ino)?.kind == FileKind::Regular {
+            self.open_rw(ino)
+        } else {
+            self.open_fd(ino)
+        }
+    }
+
+    /// Drops a pinned descriptor: the file can be reopened for writing, so it need not be held.
+    pub(crate) fn unpin(&mut self, ino: Ino) {
+        let Some(n) = self.nodes.get_mut(&ino) else {
+            return;
+        };
+        if let Some(o) = n.pinned.take() {
+            if o.rw {
+                self.cache_put(ino, o);
             }
         }
     }
@@ -350,14 +460,17 @@ impl State {
         }
     }
 
-    /// Notes that the name `parent`/`name` no longer leads to `ino`, and that `remaining`
-    /// links are left on the backing filesystem.
-    pub(crate) fn name_removed(&mut self, ino: Ino, parent: Ino, name: &[u8], remaining: u64) {
+    /// Notes that the name `parent`/`name` no longer leads to `ino`.
+    ///
+    /// The names PathVfs knows are the whole truth here: a hardlink made outside the Vfs, or by
+    /// an adapter underneath a mount, keeps the file alive on the backing filesystem but is not
+    /// a name the Vfs can reach, and the `Vfs` contract counts names the Vfs handed out.
+    pub(crate) fn name_removed(&mut self, ino: Ino, parent: Ino, name: &[u8]) {
         let Some(n) = self.nodes.get_mut(&ino) else {
             return;
         };
         n.names.retain(|(p, nm)| !(*p == parent && nm == name));
-        if n.names.is_empty() && remaining == 0 {
+        if n.names.is_empty() {
             n.unlinked = true;
             let id = n.id;
             self.by_id.remove(&id);
@@ -384,6 +497,15 @@ impl State {
             self.nodes.remove(&ino);
             self.cache.remove(&ino);
         }
+    }
+
+    /// Live nodes and cached descriptors, for the leak regression tests.
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        (
+            self.nodes.len(),
+            self.cache.len() + self.nodes.values().filter(|n| n.pinned.is_some()).count(),
+        )
     }
 
     pub(crate) fn add_ref(&mut self, ino: Ino) {
@@ -429,16 +551,18 @@ impl State {
 }
 
 /// Opens `name` inside `dir` for its kind, never following a final symlink.
-fn open_named(dir: &File, name: &[u8], kind: FileKind) -> io::Result<(Open, Stat)> {
+fn open_named(dir: &File, name: &[u8], kind: FileKind, write: bool) -> io::Result<(Open, Stat)> {
     let d = dir.as_fd();
     let (fd, rw) = match kind {
         FileKind::Regular => match sys::openat(d, name, libc::O_RDWR | libc::O_NOFOLLOW, 0) {
             Ok(fd) => (fd, true),
+            // A write that must succeed needs the read-write descriptor, so no fallback here.
+            Err(e) if write => return Err(e),
+            // A file whose mode has no write bit is still readable, and `Vfs` does no
+            // permission enforcement, so reads go on.
             Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::EACCES | libc::EPERM | libc::EROFS)
-                ) =>
+                if [libc::EACCES, libc::EPERM, libc::EROFS]
+                    .contains(&e.raw_os_error().unwrap_or(0)) =>
             {
                 (
                     sys::openat(d, name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)?,
@@ -457,6 +581,8 @@ fn open_named(dir: &File, name: &[u8], kind: FileKind) -> io::Result<(Open, Stat
             false,
         ),
         FileKind::Symlink => (sys::openat(d, name, sys::OPEN_SYMLINK, 0)?, false),
+        // A non-exhaustive enum: refusing a kind we do not know is the only safe answer.
+        _ => return Err(io::Error::from_raw_os_error(libc::ENOTSUP)),
     };
     let st = sys::fstat(fd.as_fd())?;
     Ok((
