@@ -42,9 +42,9 @@ pub(crate) fn io_err(e: io::Error) -> Error {
 
 pub(crate) fn kind_of(st: &Stat) -> Result<FileKind> {
     match st.file_type() {
-        t if t == u32::from(libc::S_IFREG) => Ok(FileKind::Regular),
-        t if t == u32::from(libc::S_IFDIR) => Ok(FileKind::Directory),
-        t if t == u32::from(libc::S_IFLNK) => Ok(FileKind::Symlink),
+        t if t == sys::S_IFREG => Ok(FileKind::Regular),
+        t if t == sys::S_IFDIR => Ok(FileKind::Directory),
+        t if t == sys::S_IFLNK => Ok(FileKind::Symlink),
         _ => Err(Error::NotSupported),
     }
 }
@@ -101,7 +101,7 @@ pub(crate) struct State {
 impl State {
     pub(crate) fn new(root: OwnedFd) -> io::Result<Self> {
         let st = sys::fstat(root.as_fd())?;
-        if st.file_type() != u32::from(libc::S_IFDIR) {
+        if st.file_type() != sys::S_IFDIR {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
         let node = Node {

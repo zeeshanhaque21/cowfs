@@ -44,9 +44,19 @@ pub struct Stat {
     pub ctime: (i64, u32),
 }
 
+// `mode_t` is `u16` on macOS and `u32` on Linux: the casts are needed on one and useless on the other.
+#[allow(clippy::unnecessary_cast)]
+mod modes {
+    pub const S_IFMT: u32 = libc::S_IFMT as u32;
+    pub const S_IFREG: u32 = libc::S_IFREG as u32;
+    pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
+    pub const S_IFLNK: u32 = libc::S_IFLNK as u32;
+}
+pub use modes::{S_IFDIR, S_IFLNK, S_IFREG};
+
 impl Stat {
     pub fn file_type(&self) -> u32 {
-        self.mode & u32::from(libc::S_IFMT)
+        self.mode & modes::S_IFMT
     }
 }
 
@@ -56,8 +66,8 @@ fn widen(st: &libc::stat) -> Stat {
     Stat {
         dev: st.st_dev as u64,
         ino: st.st_ino as u64,
-        mode: u32::from(st.st_mode),
-        nlink: u64::from(st.st_nlink),
+        mode: st.st_mode as u32,
+        nlink: st.st_nlink as u64,
         uid: st.st_uid,
         gid: st.st_gid,
         size: st.st_size as u64,

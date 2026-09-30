@@ -277,7 +277,7 @@ impl Vfs for PathVfs {
         let dir = s.dir_fd(parent)?;
         s.invalidate(parent);
         let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
-        if st.file_type() == u32::from(libc::S_IFDIR) {
+        if st.file_type() == sys::S_IFDIR {
             return Err(Error::IsDir);
         }
         let known = s.node_by_id((st.dev, st.ino));
@@ -304,7 +304,7 @@ impl Vfs for PathVfs {
         let dir = s.dir_fd(parent)?;
         s.invalidate(parent);
         let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
-        if st.file_type() != u32::from(libc::S_IFDIR) {
+        if st.file_type() != sys::S_IFDIR {
             return Err(Error::NotDir);
         }
         let known = s.node_by_id((st.dev, st.ino));
@@ -380,7 +380,7 @@ impl Vfs for PathVfs {
             s.rename_name(i, (parent, name), (new_parent, new_name));
         }
         if let (Some(i), Some(d)) = (replaced, dst) {
-            let remaining = if d.file_type() == u32::from(libc::S_IFDIR) {
+            let remaining = if d.file_type() == sys::S_IFDIR {
                 0
             } else {
                 d.nlink.saturating_sub(1)
