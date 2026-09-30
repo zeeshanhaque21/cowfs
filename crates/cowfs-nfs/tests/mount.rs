@@ -452,6 +452,16 @@ fn references_drain_after_a_workload_on_a_real_mount() {
     m.finish();
 }
 
+/// `sh` with extra environment for the script.
+fn sh_env(dir: &Path, env: &[(&str, String)], script: &str) -> (bool, String) {
+    let mut c = Command::new("/bin/sh");
+    c.arg("-c").arg(script).current_dir(dir);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    run_limited(&mut c, 120)
+}
+
 fn sh(dir: &Path, script: &str) -> (bool, String) {
     run_limited(
         Command::new("/bin/sh")
@@ -906,4 +916,156 @@ fn rss_soak() {
         "RSS kept growing: {samples:?}"
     );
     m.finish();
+}
+
+/// Builds a zip and a tar on the local file system that hold `__MACOSX/._name` entries, and a git
+/// repository that tracks `._name` files, so the extraction and checkout cases of the round 2
+/// review can be run against a real mount in any AppleDouble mode.
+fn make_archives(dir: &Path) {
+    let src = dir.join("src");
+    fs::create_dir_all(src.join("__MACOSX/pkg")).unwrap();
+    fs::create_dir_all(src.join("pkg")).unwrap();
+    fs::write(src.join("pkg/x.txt"), "hello\n").unwrap();
+    fs::write(src.join("__MACOSX/pkg/._x.txt"), "sidecar bytes\n").unwrap();
+    fs::write(src.join("__MACOSX/._lonely"), "no main file\n").unwrap();
+    let mut z = Command::new("/usr/bin/zip");
+    z.arg("-q")
+        .arg("-r")
+        .arg(dir.join("a.zip"))
+        .arg("__MACOSX")
+        .arg("pkg")
+        .current_dir(&src);
+    assert!(z.status().unwrap().success(), "zip");
+    let mut t = Command::new("/usr/bin/tar");
+    t.arg("cf")
+        .arg(dir.join("a.tar"))
+        .arg("__MACOSX")
+        .arg("pkg")
+        .current_dir(&src);
+    assert!(t.status().unwrap().success(), "tar");
+}
+
+fn make_repo(dir: &Path) {
+    let repo = dir.join("repo");
+    fs::create_dir_all(repo.join("sub")).unwrap();
+    fs::write(repo.join("._x"), "tracked sidecar\n").unwrap();
+    fs::write(repo.join("._lone"), "tracked, no main file\n").unwrap();
+    fs::write(repo.join("sub/._a"), "tracked in a subdirectory\n").unwrap();
+    fs::write(repo.join("normal"), "ordinary file\n").unwrap();
+    let git = |args: &[&str]| {
+        let ok = Command::new("/opt/homebrew/bin/git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q", "."]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "m"]);
+}
+
+/// The extraction and checkout cases of the round 2 review, in every mode. `._` files that arrive
+/// before the file they belong to must not make the tool fail.
+#[test]
+#[ignore = "mounts a filesystem; run with --ignored"]
+fn archives_and_checkouts_of_dot_underscore_files_work_in_every_mode() {
+    for mode in [
+        AppleDoubleMode::Translate,
+        AppleDoubleMode::Hide,
+        AppleDoubleMode::Store,
+    ] {
+        let vfs = common::counting::CountingVfs::new();
+        let opts = MountOptions {
+            appledouble: mode,
+            ..MountOptions::default()
+        };
+        let Some(m) = mounted_vfs(vfs.clone(), opts) else {
+            return;
+        };
+        let root = m.path().to_path_buf();
+        let native = tempfile::Builder::new()
+            .prefix("cowfs-archives-")
+            .tempdir()
+            .unwrap();
+        make_archives(native.path());
+        make_repo(native.path());
+        fs::copy(native.path().join("a.zip"), root.join("a.zip")).unwrap();
+        fs::copy(native.path().join("a.tar"), root.join("a.tar")).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("/opt/homebrew/bin/git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+
+        let (ok, out) = sh_env(
+            &root,
+            &[("MODE", format!("{mode:?}"))],
+            r#"set -e
+            mkdir zt tt
+            cd zt && unzip -q ../a.zip && cd ..
+            test -f zt/pkg/x.txt
+            cd tt && tar xf ../a.tar && cd ..
+            test -f tt/pkg/x.txt
+            mkdir dt
+            (cd dt && ditto -xk ../a.zip .)
+            test -f dt/pkg/x.txt
+            "#,
+        );
+        assert!(ok, "{mode:?}: {out}");
+
+        let (ok, err) = git(&[
+            "clone",
+            "-q",
+            &native.path().join("repo").to_string_lossy(),
+            "clone",
+        ]);
+        assert!(ok, "{mode:?}: git clone failed: {err}");
+        let (ok, out) = sh_env(
+            &root,
+            &[("MODE", format!("{mode:?}"))],
+            r#"set -e
+            test -f clone/._x
+            test -f clone/._lone
+            test -f clone/sub/._a
+            test -f clone/normal
+            cd clone
+            if [ "$MODE" != Store ]; then
+                # Store shows whatever the client wrote as a sidecar, so a checkout can leave
+                # untracked ._ files behind. That is what Store is for, so nothing is asserted
+                # about the status there.
+                test -z "$(git status --porcelain)"
+            fi
+            "#,
+        );
+        assert!(ok, "{mode:?}: checkout: {out}");
+        // Whatever the mode, every file the archives and the repository held is readable back.
+        let (ok, out) = sh(
+            &root,
+            r#"set -e
+            test -f zt/__MACOSX/._lonely
+            test -f zt/__MACOSX/pkg/._x.txt
+            test -f clone/._x
+            test -f clone/._lone
+            test -f clone/sub/._a
+            test "$(cat zt/pkg/x.txt)" = hello
+            test "$(cat clone/._x)" = "tracked sidecar"
+            "#,
+        );
+        assert!(ok, "{mode:?}: contents: {out}");
+        m.finish();
+    }
 }
