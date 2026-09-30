@@ -484,3 +484,199 @@ fn check_graph(infos: &HashMap<u64, Info>, errs: &mut Errs) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{encode_snap, Meta, Options};
+    use crate::ptree::{Lazy, MemTree, NodeWriter};
+    use redb::ReadableDatabase;
+
+    fn open() -> (tempfile::TempDir, Meta) {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            background: false,
+            ..Options::default()
+        };
+        let m = Meta::open(dir.path().join("m.redb"), opts).unwrap();
+        let s = m.new_snapshot("s").unwrap();
+        let f1 = s.create(ROOT_INO, b"f1", 0o644).unwrap();
+        s.create(ROOT_INO, b"f2", 0o644).unwrap();
+        s.unlink(ROOT_INO, b"f1").unwrap();
+        let _ = f1;
+        s.mkdir(ROOT_INO, b"d", 0o755).unwrap();
+        m.check().unwrap();
+        (dir, m)
+    }
+
+    /// Edits raw keys of snapshot "s" on disk, bypassing every invariant of the public API.
+    fn tamper(m: &Meta, edit: impl FnOnce(&mut MemTree, &Lazy<'_>)) {
+        m.sync().unwrap();
+        let inner = &m.h.inner;
+        let info = m.snapshots().unwrap().remove(0);
+        let wtx = inner.db.begin_write().unwrap();
+        {
+            let mut w = NodeWriter::new(
+                wtx.open_table(NODES).unwrap(),
+                wtx.open_table(REFS).unwrap(),
+                inner.cache.clone(),
+            );
+            let lazy = Lazy::new(&inner.db, &inner.cache);
+            let mut tree = MemTree::new(info.root, inner.node_max);
+            edit(&mut tree, &lazy);
+            let root = tree.write(&mut w).unwrap();
+            w.add_ref(root);
+            w.drop_ref(info.root);
+            w.settle().unwrap();
+            let new = crate::types::SnapshotInfo { root, ..info };
+            wtx.open_table(SNAPSHOTS)
+                .unwrap()
+                .insert(new.id.0, encode_snap(&new).as_slice())
+                .unwrap();
+        }
+        wtx.commit().unwrap();
+    }
+
+    fn expect(m: &Meta, needle: &str) {
+        match m.check() {
+            Err(Error::Inconsistent(v)) => {
+                assert!(
+                    v.iter().any(|s| s.contains(needle)),
+                    "no {needle:?} in {v:?}"
+                )
+            }
+            other => panic!("expected Inconsistent({needle}), got {other:?}"),
+        }
+    }
+
+    fn inode_of(t: &MemTree, src: &Lazy<'_>, ino: u64) -> InodeRec {
+        InodeRec::decode(&t.get(src, &key(Ino(ino), K_INODE, &[])).unwrap().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn wrong_nlink_is_reported() {
+        let (_d, m) = open();
+        tamper(&m, |t, src| {
+            let mut r = inode_of(t, src, 3);
+            r.nlink += 1;
+            t.insert(src, &key(Ino(3), K_INODE, &[]), r.encode())
+                .unwrap();
+        });
+        expect(&m, "nlink");
+    }
+
+    #[test]
+    fn wrong_directory_nlink_is_reported() {
+        let (_d, m) = open();
+        tamper(&m, |t, src| {
+            let mut r = inode_of(t, src, 1);
+            r.nlink += 1;
+            t.insert(src, &key(ROOT_INO, K_INODE, &[]), r.encode())
+                .unwrap();
+        });
+        expect(&m, "nlink");
+    }
+
+    #[test]
+    fn dangling_directory_entry_is_reported() {
+        let (_d, m) = open();
+        tamper(&m, |t, src| {
+            t.insert(
+                src,
+                &key(ROOT_INO, K_NAME, b"ghost"),
+                name_val(Ino(99), FileType::File, 1),
+            )
+            .unwrap();
+            t.insert(
+                src,
+                &key(ROOT_INO, K_COOKIE, &1u64.to_be_bytes()),
+                cookie_val(Ino(99), FileType::File, b"ghost"),
+            )
+            .unwrap();
+        });
+        expect(&m, "missing inode");
+    }
+
+    #[test]
+    fn orphan_inode_is_reported() {
+        let (_d, m) = open();
+        tamper(&m, |t, src| {
+            let mut r = inode_of(t, src, 3);
+            r.nlink = 1;
+            t.insert(src, &key(Ino(50), K_INODE, &[]), r.encode())
+                .unwrap();
+        });
+        expect(&m, "orphaned");
+    }
+
+    #[test]
+    fn name_row_without_cookie_row_is_reported() {
+        let (_d, m) = open();
+        tamper(&m, |t, src| {
+            t.insert(
+                src,
+                &key(ROOT_INO, K_NAME, b"half"),
+                name_val(Ino(3), FileType::File, 1),
+            )
+            .unwrap();
+        });
+        expect(&m, "disagree");
+    }
+
+    #[test]
+    fn wrong_reference_count_is_reported() {
+        let (_d, m) = open();
+        let root = *m.snapshots().unwrap()[0].root.as_bytes();
+        let wtx = m.h.inner.db.begin_write().unwrap();
+        wtx.open_table(REFS).unwrap().insert(root, 7).unwrap();
+        wtx.commit().unwrap();
+        expect(&m, "count");
+    }
+
+    #[test]
+    fn extent_gap_is_reported() {
+        let (_d, m) = open();
+        let c = cowfs_store::ChunkRef {
+            id: cowfs_store::BlockId::of(b"x"),
+            len: 4,
+        };
+        m.snapshot("s")
+            .unwrap()
+            .set_content(Ino(3), &[c], 4)
+            .unwrap();
+        tamper(&m, |t, src| {
+            t.insert(
+                src,
+                &key(Ino(3), K_CHUNK, &99u64.to_be_bytes()),
+                encode_chunks(&[c]),
+            )
+            .unwrap();
+        });
+        expect(&m, "extent");
+    }
+
+    #[test]
+    fn tampered_node_bytes_fail_the_hash() {
+        let (_d, m) = open();
+        let root = *m.snapshots().unwrap()[0].root.as_bytes();
+        let wtx = m.h.inner.db.begin_write().unwrap();
+        wtx.open_table(NODES)
+            .unwrap()
+            .insert(root, [1u8, 0, 0, 0, 0, 0, 0, 0, 0].as_slice())
+            .unwrap();
+        wtx.commit().unwrap();
+        assert!(matches!(m.check(), Err(Error::Corrupt(_))));
+        m.h.inner.cache.clear_for_test();
+        assert!(matches!(
+            m.snapshot("s").unwrap().lookup(ROOT_INO, b"f2"),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn a_clean_tree_passes() {
+        let (_d, m) = open();
+        m.check().unwrap();
+        let _ = m.h.inner.db.begin_read().unwrap();
+    }
+}

@@ -1314,7 +1314,7 @@ impl Snapshot {
 
     fn read<T>(&self, f: impl FnOnce(&View<'_>) -> Result<T>) -> Result<T> {
         let inner = &self.h.inner;
-        guard(|| {
+        let r = guard(|| {
             let s = inner.rlock()?;
             let e = s.snaps.get(&self.id).ok_or(Error::NoSuchSnapshot)?;
             let lazy = Lazy::new(&inner.db, &inner.cache);
@@ -1322,7 +1322,11 @@ impl Snapshot {
                 tree: &e.tree,
                 src: &lazy,
             })
-        })
+        });
+        if let Err(e) = &r {
+            inner.note(e);
+        }
+        r
     }
 
     /// Looks up a name in a directory. `.` and `..` resolve.

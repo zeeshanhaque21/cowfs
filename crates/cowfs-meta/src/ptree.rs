@@ -101,6 +101,13 @@ impl NodeCache {
         self.shards[i].lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[cfg(test)]
+    pub(crate) fn clear_for_test(&self) {
+        for s in &self.shards {
+            *s.lock().unwrap_or_else(|e| e.into_inner()) = Shard::default();
+        }
+    }
+
     pub(crate) fn get(&self, id: &NodeId) -> Option<Arc<Node>> {
         if self.per_shard == 0 {
             return None;
@@ -820,5 +827,38 @@ impl std::fmt::Debug for NodeWriter<'_> {
 impl std::fmt::Debug for MemTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemTree").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u8) -> NodeId {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        NodeId::from_bytes(b)
+    }
+
+    fn node() -> Arc<Node> {
+        Arc::new(Node::parse(encode(true, &[])).unwrap())
+    }
+
+    #[test]
+    fn clock_evicts_cold_entries_and_keeps_hot_ones() {
+        let cache = NodeCache::new(SHARDS * 4);
+        for n in 0..4 {
+            cache.put(id(n), node());
+        }
+        assert!(cache.get(&id(0)).is_some());
+        cache.put(id(9), node());
+        assert!(cache.get(&id(0)).is_some(), "the hot entry was evicted");
+        assert!(cache.get(&id(1)).is_none(), "the first cold entry stays");
+        for n in 10..100 {
+            cache.put(id(n), node());
+        }
+        let held = (0..100u8).filter(|n| cache.get(&id(*n)).is_some()).count();
+        assert!(held <= 4, "cache grew past its bound: {held}");
+        assert!(held >= 3, "cache emptied itself: {held}");
     }
 }
