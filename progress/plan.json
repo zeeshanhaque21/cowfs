@@ -216,12 +216,13 @@
         {
           "id": "34",
           "title": "#34 cowfs-vfs-path: run the suite on native filesystems and through mounts",
-          "state": "building",
-          "owner": "subagent",
+          "state": "fixing",
+          "owner": "builder (subagent)",
           "issue": 34,
           "pr": "#35",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/35",
-          "detail": "Path-based Vfs over a directory. Native APFS and Linux runs are the control; the same suite through the FUSE and NFS mounts finds adapter bugs. Worktree slot 8, branch v1/pathvfs."
+          "detail": "PathVfs built; suite ran on APFS (99/114), case-sensitive APFS (99), btrfs (100), ext4 (112), FUSE (112, same 2 failures as native ext4, so no FUSE adapter bug), NFS (88, 26 fail). No adapter bug confirmed; 12 NFS failures are the client's silly rename (.nfs.* files), 1 is RENAME_EXCL ENOTSUP. Suite bugs found: dir nlink formula, symlink xattrs, 60 kB xattr, 4095-byte symlink targets, and concurrent read/write shows torn reads natively on ext4 and btrfs (6 of 10 runs). Silly rename makes unlink-while-open, forget and rmdir-while-referenced unjudgeable through NFS: now being run at protocol level. Builder is fixing Linux clippy, merging the revised suite and rerunning the matrix at Posix level.",
+          "ci": "CI: ubuntu FAIL (clippy, Linux-only lints), macos pass"
         }
       ]
     },
