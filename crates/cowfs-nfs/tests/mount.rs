@@ -462,6 +462,15 @@ fn sh_env(dir: &Path, env: &[(&str, String)], script: &str) -> (bool, String) {
     run_limited(&mut c, 120)
 }
 
+/// The mode under test: `Translate` keeps `._` files out of the store, which is what these tests
+/// are about. The crate default is `Hide`.
+fn translated() -> MountOptions {
+    MountOptions {
+        appledouble: AppleDoubleMode::Translate,
+        ..MountOptions::default()
+    }
+}
+
 fn sh(dir: &Path, script: &str) -> (bool, String) {
     run_limited(
         Command::new("/bin/sh")
@@ -476,7 +485,7 @@ fn sh(dir: &Path, script: &str) -> (bool, String) {
 #[ignore = "mounts a filesystem; run with --ignored"]
 fn xattrs_round_trip_without_sidecar_inodes() {
     let vfs = common::counting::CountingVfs::new();
-    let Some(m) = mounted_vfs(vfs.clone(), MountOptions::default()) else {
+    let Some(m) = mounted_vfs(vfs.clone(), translated()) else {
         return;
     };
     let root = m.path().to_path_buf();
@@ -715,7 +724,7 @@ fn a_killed_host_leaves_a_mount_that_sweep_removes() {
 #[ignore = "mounts a filesystem; run with --ignored"]
 fn copy_tools_carry_xattrs_and_leave_no_sidecar_inodes() {
     let vfs = common::counting::CountingVfs::new();
-    let Some(m) = mounted_vfs(vfs.clone(), MountOptions::default()) else {
+    let Some(m) = mounted_vfs(vfs.clone(), translated()) else {
         return;
     };
     let root = m.path().to_path_buf();
