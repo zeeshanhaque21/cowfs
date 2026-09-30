@@ -136,22 +136,24 @@
         {
           "id": "11",
           "title": "#11 Linux FUSE mount",
-          "state": "building",
+          "state": "reviewing",
           "issue": 11,
-          "owner": "subagent",
+          "owner": "critic (subagent)",
           "pr": "#31",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/31",
-          "detail": "Thin FUSE adapter over Vfs with the spike 3 defaults (long TTLs, negative cache, keep_cache). Mount tests run in the OrbStack VM. Worktree slot 5, branch v1/11-fuse."
+          "detail": "Builder done: 22 unit tests (Mac) and 14 mount tests in the Linux VM pass on my re-run, CI green. Defaults: ttl 3600 s, keep_cache, negative ttl 1 s (kernel ignored inval_entry for negative entries per builder), single-threaded request loop. Open: conformance suite through the mount not run, head-of-line blocking risk with a slow core. Critic attacking staleness, POSIX correctness (fsx), lifecycle, forget/inode reuse.",
+          "ci": "CI: pass (linux, macos)"
         },
         {
           "id": "12",
           "title": "#12 macOS NFS loopback mount",
-          "state": "building",
+          "state": "reviewing",
           "issue": 12,
-          "owner": "subagent",
+          "owner": "critic (subagent)",
           "pr": "#32",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/32",
-          "detail": "Vendored and fixed nfsserve plus a Vfs adapter, mount management with locallocks, the spike batteries as ignored mount tests. Worktree slot 6, branch v1/12-nfs."
+          "detail": "Builder done: 18 unit, 22 protocol, 11 nfsserve and 8 mount tests (25/25 battery) pass on my re-run, CI green. Latency floor over MemVfs looks bad (write 3.4 ms, create 4.1 ms, missing lookup 167 us) but was measured at load 50-75 and is unexplained. AppleDouble hidden by default (flag for review). Critic will profile the latency, and check the unauthenticated localhost port, stale handles and mount cleanup.",
+          "ci": "CI: pass (linux, macos)"
         },
         {
           "id": "13",
