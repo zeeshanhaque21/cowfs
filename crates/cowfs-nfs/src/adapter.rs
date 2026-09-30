@@ -652,3 +652,140 @@ impl NFSFileSystem for CowNfs {
         self.run(|a| a.fsstat()).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cowfs_vfs_test::MemVfs;
+
+    fn adapter(hide: bool) -> Adapter {
+        Adapter::new(
+            Arc::new(MemVfs::new()),
+            AdapterOptions {
+                hide_appledouble: hide,
+                owner: None,
+            },
+        )
+    }
+
+    #[test]
+    fn new_names_are_validated() {
+        assert_eq!(new_name(b"ok"), Ok(()));
+        assert_eq!(new_name(b"."), Err(nfsstat3::NFS3ERR_EXIST));
+        assert_eq!(new_name(b".."), Err(nfsstat3::NFS3ERR_EXIST));
+        assert_eq!(new_name(b""), Err(nfsstat3::NFS3ERR_INVAL));
+        assert_eq!(new_name(b"a/b"), Err(nfsstat3::NFS3ERR_INVAL));
+        assert_eq!(new_name(b"a\0b"), Err(nfsstat3::NFS3ERR_INVAL));
+        assert_eq!(new_name(&[b'x'; NAME_MAX]), Ok(()));
+        assert_eq!(
+            new_name(&[b'x'; NAME_MAX + 1]),
+            Err(nfsstat3::NFS3ERR_NAMETOOLONG)
+        );
+    }
+
+    #[test]
+    fn appledouble_names() {
+        assert!(is_appledouble(b"._x"));
+        assert!(is_appledouble(b"._"));
+        assert!(!is_appledouble(b".x"));
+        assert!(!is_appledouble(b"x._"));
+        assert_eq!(Adapter::sidecar(b"x"), Some(b"._x".to_vec()));
+        assert_eq!(Adapter::sidecar(b"._x"), None);
+        assert_eq!(
+            Adapter::sidecar(&[b'x'; NAME_MAX]),
+            None,
+            "the sidecar name would be too long"
+        );
+    }
+
+    #[test]
+    fn exclusive_verifier_survives_a_round_trip() {
+        let (a, m) = verifier_times([0, 0, 1, 2, 0xff, 0, 0, 3]);
+        assert_eq!((a.secs, m.secs), (0x102, 0xff00_0003));
+    }
+
+    #[test]
+    fn read_eof_flag() {
+        let a = adapter(true);
+        let (f, _) = a.create(ROOT_INO, b"f", &sattr3::default(), true).unwrap();
+        a.write(f, 0, b"abcdef").unwrap();
+        assert_eq!(a.read(f, 0, 3).unwrap(), (b"abc".to_vec(), false));
+        assert_eq!(
+            a.read(f, 3, 3).unwrap(),
+            (b"def".to_vec(), true),
+            "a read ending exactly at the end"
+        );
+        assert_eq!(a.read(f, 3, 10).unwrap(), (b"def".to_vec(), true));
+        assert_eq!(a.read(f, 6, 3).unwrap(), (Vec::new(), true));
+    }
+
+    #[test]
+    fn hidden_entries_advance_the_cookie_without_ending_the_listing() {
+        let a = adapter(true);
+        for n in ["a", "._1", "._2", "._3", "b", "._4", "c"] {
+            a.create(ROOT_INO, n.as_bytes(), &sattr3::default(), true)
+                .unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut cookie = 0;
+        loop {
+            let page = a.readdir(ROOT_INO, cookie, 1, false).unwrap();
+            for e in &page.entries {
+                seen.push(String::from_utf8(e.name.0.clone()).unwrap());
+                cookie = e.cookie;
+            }
+            if page.end {
+                break;
+            }
+            assert!(!page.entries.is_empty(), "an empty page must be the last");
+        }
+        assert_eq!(seen, ["a", "b", "c"]);
+        let all = adapter(false);
+        all.create(ROOT_INO, b"._1", &sattr3::default(), true)
+            .unwrap();
+        assert_eq!(
+            all.readdir(ROOT_INO, 0, 10, false).unwrap().entries.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn readdir_of_a_missing_or_plain_file_fails() {
+        let a = adapter(true);
+        assert_eq!(
+            a.readdir(999, 0, 10, false).err(),
+            Some(nfsstat3::NFS3ERR_STALE)
+        );
+        let (f, _) = a.create(ROOT_INO, b"f", &sattr3::default(), true).unwrap();
+        assert_eq!(
+            a.readdir(f, 0, 10, false).err(),
+            Some(nfsstat3::NFS3ERR_NOTDIR)
+        );
+    }
+
+    #[test]
+    fn symlink_targets_are_bounded() {
+        let a = adapter(true);
+        assert!(a.symlink(ROOT_INO, b"l", b"t").is_ok());
+        assert_eq!(
+            a.symlink(ROOT_INO, b"l2", b"").err(),
+            Some(nfsstat3::NFS3ERR_INVAL)
+        );
+        assert_eq!(
+            a.symlink(ROOT_INO, b"l3", b"a\0b").err(),
+            Some(nfsstat3::NFS3ERR_INVAL)
+        );
+        let long = vec![b'x'; SYMLINK_TARGET_MAX + 1];
+        assert_eq!(
+            a.symlink(ROOT_INO, b"l4", &long).err(),
+            Some(nfsstat3::NFS3ERR_NAMETOOLONG)
+        );
+    }
+
+    #[test]
+    fn fsstat_uses_block_units() {
+        let f = adapter(true).fsstat().unwrap();
+        assert!(f.tbytes >= f.fbytes && f.fbytes >= f.abytes.min(f.fbytes));
+        assert!(f.tfiles > 0);
+    }
+}

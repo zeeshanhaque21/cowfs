@@ -897,3 +897,53 @@ pub async fn nfsproc3_pathconf(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attr(mode: u32, ftype: ftype3) -> fattr3 {
+        fattr3 {
+            ftype,
+            mode,
+            ..fattr3::default()
+        }
+    }
+
+    #[test]
+    fn access_follows_the_owner_bits() {
+        let all = 0x3f;
+        let file = attr(0o644, ftype3::NF3REG);
+        assert_eq!(
+            access_granted(&file, all, true),
+            ACCESS3_READ | ACCESS3_MODIFY | ACCESS3_EXTEND
+        );
+        assert_eq!(access_granted(&file, all, false), ACCESS3_READ);
+        let exe = attr(0o755, ftype3::NF3REG);
+        assert_ne!(access_granted(&exe, all, true) & ACCESS3_EXECUTE, 0);
+        let dir = attr(0o755, ftype3::NF3DIR);
+        let g = access_granted(&dir, all, true);
+        assert_ne!(g & ACCESS3_LOOKUP, 0);
+        assert_ne!(g & ACCESS3_DELETE, 0);
+        assert_eq!(g & ACCESS3_EXECUTE, 0);
+        assert_eq!(
+            access_granted(&attr(0o444, ftype3::NF3DIR), all, true) & ACCESS3_DELETE,
+            0
+        );
+        assert_eq!(
+            access_granted(&file, ACCESS3_READ, true),
+            ACCESS3_READ,
+            "only what was asked"
+        );
+    }
+
+    #[test]
+    fn stats_table_counts_and_resets() {
+        STAT_COUNT[1].fetch_add(2, Ordering::Relaxed);
+        STAT_NS[1].fetch_add(4000, Ordering::Relaxed);
+        let s = take_stats();
+        assert!(s.starts_with("proc count total_ms avg_us\n"));
+        assert!(s.contains("NFSPROC3_GETATTR"), "{s}");
+        assert!(s.contains("TOTAL"));
+    }
+}

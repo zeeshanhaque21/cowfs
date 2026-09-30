@@ -219,3 +219,139 @@ pub trait NFSFileSystem: Send + Sync {
         self.generation().to_le_bytes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Gen(u64);
+
+    #[async_trait]
+    impl NFSFileSystem for Gen {
+        fn root_dir(&self) -> fileid3 {
+            1
+        }
+        fn generation(&self) -> u64 {
+            self.0
+        }
+        async fn lookup(&self, _: fileid3, _: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_NOENT)
+        }
+        async fn getattr(&self, _: fileid3) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_STALE)
+        }
+        async fn setattr(&self, _: fileid3, _: sattr3) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_STALE)
+        }
+        async fn readlink(&self, _: fileid3) -> Result<nfspath3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_STALE)
+        }
+        async fn read(&self, _: fileid3, _: u64, _: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_STALE)
+        }
+        async fn write(&self, _: fileid3, _: u64, _: Vec<u8>) -> Result<(u32, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_STALE)
+        }
+        async fn commit(&self, _: fileid3) -> Result<(), nfsstat3> {
+            Ok(())
+        }
+        async fn create(
+            &self,
+            _: fileid3,
+            _: &filename3,
+            _: sattr3,
+            _: bool,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        async fn create_exclusive(
+            &self,
+            _: fileid3,
+            _: &filename3,
+            _: createverf3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        async fn mkdir(
+            &self,
+            _: fileid3,
+            _: &filename3,
+            _: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        async fn symlink(
+            &self,
+            _: fileid3,
+            _: &filename3,
+            _: &nfspath3,
+            _: &sattr3,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        async fn link(&self, _: fileid3, _: fileid3, _: &filename3) -> Result<fattr3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        async fn remove(&self, _: fileid3, _: &filename3) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        async fn rmdir(&self, _: fileid3, _: &filename3) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        async fn rename(
+            &self,
+            _: fileid3,
+            _: &filename3,
+            _: fileid3,
+            _: &filename3,
+        ) -> Result<(), nfsstat3> {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        async fn readdir(
+            &self,
+            _: fileid3,
+            _: cookie3,
+            _: usize,
+            _: bool,
+        ) -> Result<ReadDirResult, nfsstat3> {
+            Ok(ReadDirResult::default())
+        }
+        async fn fsstat(&self, _: fileid3) -> Result<fsstat3, nfsstat3> {
+            Err(nfsstat3::NFS3ERR_STALE)
+        }
+    }
+
+    #[test]
+    fn handle_round_trip_and_generation_checks() {
+        let fs = Gen(10);
+        let fh = fs.id_to_fh(42);
+        assert_eq!(fs.fh_to_id(&fh), Ok(42));
+        assert_eq!(Gen(11).fh_to_id(&fh), Err(nfsstat3::NFS3ERR_STALE));
+        assert_eq!(Gen(9).fh_to_id(&fh), Err(nfsstat3::NFS3ERR_BADHANDLE));
+        assert_eq!(
+            fs.fh_to_id(&nfs_fh3 { data: vec![1; 15] }),
+            Err(nfsstat3::NFS3ERR_BADHANDLE)
+        );
+        assert_eq!(fs.serverid(), 10u64.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn path_walk_reports_the_first_missing_component() {
+        let fs = Gen(1);
+        assert_eq!(fs.path_to_id(b"/").await, Ok(1));
+        assert_eq!(fs.path_to_id(b"//").await, Ok(1));
+        assert_eq!(fs.path_to_id(b"/a/b").await, Err(nfsstat3::NFS3ERR_NOENT));
+    }
+
+    #[test]
+    fn default_fsinfo_and_pathconf_advertise_link_support() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let fs = Gen(1);
+        let info = rt.block_on(fs.fsinfo(1)).unwrap();
+        assert_ne!(info.properties & FSF_LINK, 0);
+        let conf = rt.block_on(fs.pathconf(1)).unwrap();
+        assert_eq!(conf.name_max, 255);
+    }
+}

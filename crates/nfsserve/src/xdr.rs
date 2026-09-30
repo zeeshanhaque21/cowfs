@@ -4,7 +4,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 pub type XDREndian = BigEndian;
 use crate::nfs::nfsstring;
 
-/// See https://datatracker.ietf.org/doc/html/rfc1014
+/// See <https://datatracker.ietf.org/doc/html/rfc1014>
 #[allow(clippy::upper_case_acronyms)]
 pub trait XDR {
     fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()>;
@@ -263,3 +263,57 @@ macro_rules! xdr_bool_union {
 pub(crate) use xdr_bool_union;
 pub(crate) use xdr_enum_serde;
 pub(crate) use xdr_struct;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn opaque_round_trips_with_padding() {
+        for len in 0..9usize {
+            let v: Vec<u8> = (0..len as u8).collect();
+            let mut buf = Vec::new();
+            v.serialize(&mut buf).unwrap();
+            assert_eq!(buf.len(), 4 + len.div_ceil(4) * 4);
+            let mut back: Vec<u8> = Vec::new();
+            back.deserialize(&mut Cursor::new(buf)).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn oversized_lengths_are_rejected_without_allocating() {
+        let mut huge = Vec::new();
+        u32::MAX.serialize(&mut huge).unwrap();
+        assert!(Vec::<u8>::new()
+            .deserialize(&mut Cursor::new(huge.clone()))
+            .is_err());
+        assert!(Vec::<u32>::new()
+            .deserialize(&mut Cursor::new(huge))
+            .is_err());
+    }
+
+    #[test]
+    fn truncated_input_is_an_error() {
+        let mut n = 0u64;
+        assert!(n.deserialize(&mut Cursor::new(vec![0u8; 3])).is_err());
+        let mut v = Vec::<u8>::new();
+        assert!(v
+            .deserialize(&mut Cursor::new(vec![0, 0, 0, 9, 1]))
+            .is_err());
+    }
+
+    #[test]
+    fn bool_union_round_trips() {
+        let a = crate::nfs::post_op_attr::attributes(crate::nfs::fattr3::default());
+        let mut buf = Vec::new();
+        a.serialize(&mut buf).unwrap();
+        let mut back = crate::nfs::post_op_attr::Void;
+        back.deserialize(&mut Cursor::new(buf)).unwrap();
+        assert!(matches!(back, crate::nfs::post_op_attr::attributes(_)));
+        let mut buf = Vec::new();
+        crate::nfs::post_op_attr::Void.serialize(&mut buf).unwrap();
+        assert_eq!(buf, [0, 0, 0, 0]);
+    }
+}

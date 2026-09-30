@@ -73,3 +73,33 @@ pub enum TransactionState {
     InProgress,
     Completed(SystemTime),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_xid_from_one_client_is_a_retransmission() {
+        let t = TransactionTracker::new(Duration::from_secs(60));
+        assert!(!t.is_retransmission(7, "a"));
+        assert!(t.is_retransmission(7, "a"));
+        assert!(!t.is_retransmission(7, "b"), "another client");
+        assert!(!t.is_retransmission(8, "a"));
+        t.mark_processed(7, "a");
+        assert!(
+            t.is_retransmission(7, "a"),
+            "still remembered once completed"
+        );
+    }
+
+    #[test]
+    fn old_completed_transactions_are_forgotten() {
+        let t = TransactionTracker::new(Duration::ZERO);
+        assert!(!t.is_retransmission(1, "a"));
+        t.mark_processed(1, "a");
+        *t.last_housekeeping.lock().unwrap() = SystemTime::now() - Duration::from_secs(5);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!t.is_retransmission(2, "a"));
+        assert!(!t.is_retransmission(1, "a"), "expired entry was swept");
+    }
+}
