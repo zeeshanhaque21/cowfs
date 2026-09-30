@@ -636,13 +636,13 @@ fn dotdot_lists_the_parent_inode() {
     fs::create_dir_all(fx.p("a/b")).unwrap();
     fs::create_dir(fx.p("c")).unwrap();
     let dots = |p: &Path| -> (u64, u64) {
-        let out = Command::new("ls").arg("-fi").arg(p).output().unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/battery/getdents.py");
+        let out = Command::new("python3").arg(script).arg(p).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let find = |name: &str| {
             text.lines()
                 .find_map(|l| {
-                    let mut f = l.split_whitespace();
-                    let (ino, n) = (f.next()?, f.next()?);
+                    let (n, ino) = l.split_once(' ')?;
                     (n == name).then(|| ino.parse::<u64>().unwrap())
                 })
                 .unwrap_or_else(|| panic!("no {name} in {text}"))
