@@ -67,7 +67,11 @@ fn serve(backend: &dyn Backend, config: &ServeConfig, socket: &Path) -> Result<(
             handle.shutdown();
         }
     });
-    eprintln!("cowfs: serving {} on {}", config.mount.display(), socket.display());
+    eprintln!(
+        "cowfs: serving {} on {}",
+        config.mount.display(),
+        socket.display()
+    );
     server.wait();
     Ok(())
 }
@@ -105,7 +109,9 @@ fn request_for(command: &Command) -> Option<Request> {
                 name: name.clone(),
                 from: from.clone(),
             }),
-            SnapshotCommand::Rm { name } => Request::SnapshotRm(SnapshotName { name: name.clone() }),
+            SnapshotCommand::Rm { name } => {
+                Request::SnapshotRm(SnapshotName { name: name.clone() })
+            }
             SnapshotCommand::Rename { from, to } => Request::SnapshotRename(SnapshotRename {
                 from: from.clone(),
                 to: to.clone(),
@@ -189,7 +195,12 @@ fn client_command(json: bool, socket: &Path, request: Request) -> i32 {
     let interrupt = match Interrupt::install() {
         Ok(i) => i,
         Err(e) => {
-            report(json, "internal", &format!("cannot install signal handler: {e}"), None);
+            report(
+                json,
+                "internal",
+                &format!("cannot install signal handler: {e}"),
+                None,
+            );
             return EXIT_ERROR;
         }
     };
