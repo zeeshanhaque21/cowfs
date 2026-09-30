@@ -112,6 +112,32 @@ fn create_pack(io: &Io, store: &Path, id: u32) -> io::Result<File> {
     Ok(file)
 }
 
+/// Read the record `loc` names and check that it decodes to data hashing to `id`.
+fn verify_at(dir: &Path, id: BlockId, loc: Loc) -> bool {
+    if !locate_ok(&loc) {
+        return false;
+    }
+    let Ok(file) = File::open(pack::pack_path(dir, loc.pack)) else {
+        return false;
+    };
+    let mut buf = vec![0u8; HEADER_LEN + loc.slen as usize];
+    if file.read_exact_at(&mut buf, u64::from(loc.offset)).is_err() {
+        return false;
+    }
+    let (head, payload) = buf.split_at(HEADER_LEN);
+    let Ok(raw) = <&[u8; HEADER_LEN]>::try_from(head) else {
+        return false;
+    };
+    let Ok(header) = Header::parse(raw) else {
+        return false;
+    };
+    header.id == id
+        && header.slen == loc.slen
+        && header.ulen == loc.ulen
+        && Header::expected_crc(raw, payload) == header.crc
+        && record::verify(&header, payload)
+}
+
 /// Keep the first megabyte of a discarded tail for forensics. Best effort.
 fn save_torn(dir: &Path, pack: u32, file: &File, from: u64, len: u64) {
     let n = (0u32..)
@@ -435,7 +461,15 @@ impl Store {
             let elsewhere = |x: BlockId| {
                 index.get(&x).is_some_and(|l| {
                     let at = u64::from(l.offset);
-                    l.verified && !(l.pack == r.pack && at >= r.offset && at < r.offset + r.len)
+                    let inside = l.pack == r.pack && at >= r.offset && at < r.offset + r.len;
+                    if inside {
+                        return false;
+                    }
+                    if !l.verified && !verify_at(&dir, x, l) {
+                        return false;
+                    }
+                    index.mark_verified(&x, l);
+                    true
                 })
             };
             if r.id.is_some_and(elsewhere) {
