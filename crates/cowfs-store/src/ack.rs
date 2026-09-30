@@ -5,7 +5,6 @@
 
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::fsio::Io;
@@ -67,8 +66,8 @@ pub(crate) fn append(io: &Io, dir: &Path, entries: &[Entry]) -> io::Result<()> {
         .open(&path)?;
     let intact = load(dir).len() as u64 * ENTRY as u64;
     let buf: Vec<u8> = entries.iter().flat_map(encode).collect();
-    file.write_all_at(&buf, intact)?;
-    file.set_len(intact + buf.len() as u64)?;
+    io.write_at(&file, &path, intact, &buf)?;
+    io.truncate(&file, &path, intact + buf.len() as u64)?;
     io.sync_file(&file, &path)?;
     if !existed {
         io.created(&path);
