@@ -120,6 +120,13 @@ impl Adapter {
         }
     }
 
+    /// Looks a name up for the adapter's own use and gives the reference straight back.
+    fn peek(&self, dir: Ino, name: &[u8]) -> Result<Attr, Error> {
+        let a = self.vfs.lookup(dir, name)?;
+        self.vfs.forget(a.ino, 1);
+        Ok(a)
+    }
+
     /// Drops the references held for an inode whose last name was just removed.
     fn reap(&self, ino: Ino) {
         let n = lock(&self.refs).remove(&ino).unwrap_or(0);
@@ -229,6 +236,7 @@ impl Adapter {
             Err(Error::Exists) if !guarded => {
                 let existing = self.vfs.lookup(dir, name).map_err(stat)?;
                 if existing.kind == FileKind::Directory {
+                    self.vfs.forget(existing.ino, 1);
                     return Err(nfsstat3::NFS3ERR_ISDIR);
                 }
                 self.handed_out(Some(dir), &existing);
@@ -264,6 +272,7 @@ impl Adapter {
                     self.handed_out(Some(dir), &a);
                     Ok((a.ino, fattr(&a)))
                 } else {
+                    self.vfs.forget(a.ino, 1);
                     Err(nfsstat3::NFS3ERR_EXIST)
                 }
             }
@@ -309,7 +318,7 @@ impl Adapter {
 
     /// Removes one name and releases the inode if that was its last link.
     fn remove_one(&self, dir: Ino, name: &[u8]) -> NfsResult<()> {
-        let target = self.vfs.lookup(dir, name).map_err(stat)?;
+        let target = self.peek(dir, name).map_err(stat)?;
         self.vfs.unlink(dir, name).map_err(stat)?;
         if target.nlink <= 1 {
             self.reap(target.ino);
@@ -358,7 +367,7 @@ impl Adapter {
 
     pub fn rmdir(&self, dir: fileid3, name: &[u8]) -> NfsResult<()> {
         check_name(name)?;
-        let target = self.vfs.lookup(dir, name).map_err(stat)?;
+        let target = self.peek(dir, name).map_err(stat)?;
         match self.vfs.rmdir(dir, name) {
             Err(Error::NotEmpty) if self.opts.hide_appledouble => {
                 self.purge_sidecars(target.ino)?;
@@ -379,8 +388,8 @@ impl Adapter {
     ) -> NfsResult<()> {
         check_name(from)?;
         check_name(to)?;
-        let src = self.vfs.lookup(from_dir, from).map_err(stat)?;
-        let replaced = self.vfs.lookup(to_dir, to).ok();
+        let src = self.peek(from_dir, from).map_err(stat)?;
+        let replaced = self.peek(to_dir, to).ok();
         self.vfs
             .rename(from_dir, from, to_dir, to, RenameFlags::default())
             .map_err(stat)?;
