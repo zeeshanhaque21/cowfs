@@ -138,12 +138,12 @@
         {
           "id": "11",
           "title": "#11 Linux FUSE mount",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 11,
-          "owner": "critic (subagent)",
+          "owner": "builder (subagent)",
           "pr": "#31",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/31",
-          "detail": "Builder done: 22 unit tests (Mac) and 14 mount tests in the Linux VM pass on my re-run, CI green. Defaults: ttl 3600 s, keep_cache, negative ttl 1 s (kernel ignored inval_entry for negative entries per builder), single-threaded request loop. Open: conformance suite through the mount not run, head-of-line blocking risk with a slow core. Critic attacking staleness, POSIX correctness (fsx), lifecycle, forget/inode reuse.",
+          "detail": "Critic verdict: NOT mergeable. Blockers: (1) 3600 s ttl + keep_cache leaves changes behind the mount invisible for up to an hour and caused silent data corruption (O_APPEND at a stale size overwrote data); nothing wires the invalidate API and the kernel ignores negative-entry invalidation (verified on 7.0). (2) A Vfs panic hangs the read and the mount vanishes with no error. (3) Single-threaded loop: one 1 s read delayed a stat 852 ms; 4 readers at 100 ms gave lookup p50 835 ms. Also SIGTERM leaves the mount, 8 of 21 mutants survive, inode reuse untested. Passed: 15/15 mount tests, fsx 1e5 ops x2, git/tar/cp/mmap, race test, forget accounting, latency floor reproduces. Builder fixing: short default ttl, opt-in SoleWriter with an Invalidator, catch_unwind, keyed-lane worker pool.",
           "ci": "CI: pass (linux, macos)"
         },
         {
