@@ -5,22 +5,24 @@ use crate::MountError;
 
 /// How a cowfs `Vfs` is mounted through FUSE.
 ///
-/// The defaults are the spike 3 findings: long kernel cache lifetimes, negative lookup
-/// caching and `keep_cache`. They are only correct while every change to the tree goes
-/// through this mount. A change made any other way (the control API, a snapshot
-/// operation) must be announced with `Mount::invalidate_inode` and
-/// `Mount::invalidate_entry`, or the kernel keeps serving the old answer until the
-/// timeout expires.
+/// The defaults are the spike 3 findings: long kernel cache lifetimes for names and
+/// attributes, negative lookup caching and `keep_cache`. The long lifetimes are only correct
+/// while every change to the tree goes through this mount. A change made any other way (the
+/// control API, a snapshot operation) must be announced with `Mount::invalidate_inode` and
+/// `Mount::invalidate_entry`, or the kernel keeps serving the old answer until the timeout
+/// expires. Measured on the Linux 7.0 kernel of the test VM, the kernel cannot be told to drop
+/// a cached "no such name" answer, so those expire only by `negative_ttl`, which is short.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountOptions {
     /// Name shown in `/proc/mounts` and `mount(8)`. Default `cowfs`.
     pub fs_name: String,
-    /// How long the kernel may cache a name lookup, including a negative one. Default 3600 s.
+    /// How long the kernel may cache a successful name lookup. Default 3600 s.
     pub entry_ttl: Duration,
     /// How long the kernel may cache attributes. Default 3600 s.
     pub attr_ttl: Duration,
-    /// Cache "no such name" answers for `entry_ttl`. Default true.
-    pub negative_cache: bool,
+    /// How long the kernel may cache a "no such name" answer, zero to disable. Default 1 s.
+    /// A name created behind the mount stays invisible for up to this long.
+    pub negative_ttl: Duration,
     /// Keep cached file pages across `open` calls instead of dropping them on every open.
     /// Default true.
     pub keep_cache: bool,
@@ -45,7 +47,7 @@ impl Default for MountOptions {
             fs_name: "cowfs".into(),
             entry_ttl: hour,
             attr_ttl: hour,
-            negative_cache: true,
+            negative_ttl: Duration::from_secs(1),
             keep_cache: true,
             read_only: false,
             default_permissions: true,
@@ -77,8 +79,8 @@ impl MountOptions {
             }
             "entry_ttl" => self.entry_ttl = secs(value)?,
             "attr_ttl" => self.attr_ttl = secs(value)?,
-            "neg" | "negative_cache" => flag(value).map(|_| self.negative_cache = true)?,
-            "noneg" | "nonegative_cache" => flag(value).map(|_| self.negative_cache = false)?,
+            "neg_ttl" => self.negative_ttl = secs(value)?,
+            "noneg" => flag(value).map(|_| self.negative_ttl = Duration::ZERO)?,
             "keep_cache" => flag(value).map(|_| self.keep_cache = true)?,
             "nokeep_cache" => flag(value).map(|_| self.keep_cache = false)?,
             "ro" => flag(value).map(|_| self.read_only = true)?,
@@ -95,7 +97,7 @@ impl MountOptions {
 
 /// Parses a comma separated option string such as `ttl=60,noneg,ro` on top of the defaults.
 /// Keys: `fsname=<name>`, `ttl=<secs>` (both timeouts), `entry_ttl=<secs>`, `attr_ttl=<secs>`,
-/// `neg`/`noneg`, `keep_cache`/`nokeep_cache`, `ro`/`rw`, `default_permissions`/
+/// `neg_ttl=<secs>`, `noneg`, `keep_cache`/`nokeep_cache`, `ro`/`rw`, `default_permissions`/
 /// `nodefault_permissions`, `allow_other`, `auto_unmount`. Later tokens win.
 impl FromStr for MountOptions {
     type Err = MountError;
@@ -122,7 +124,8 @@ mod tests {
         let o = MountOptions::default();
         assert_eq!(o.entry_ttl, Duration::from_secs(3600));
         assert_eq!(o.attr_ttl, Duration::from_secs(3600));
-        assert!(o.negative_cache && o.keep_cache && o.default_permissions);
+        assert_eq!(o.negative_ttl, Duration::from_secs(1));
+        assert!(o.keep_cache && o.default_permissions);
         assert!(!o.read_only && !o.allow_other && !o.auto_unmount);
         assert_eq!(parse("").unwrap(), o);
     }
@@ -143,10 +146,10 @@ mod tests {
     fn flags_toggle() {
         let o =
             parse("noneg,nokeep_cache,ro,nodefault_permissions,allow_other,auto_unmount").unwrap();
-        assert!(!o.negative_cache && !o.keep_cache && o.read_only);
+        assert!(o.negative_ttl.is_zero() && !o.keep_cache && o.read_only);
         assert!(!o.default_permissions && o.allow_other && o.auto_unmount);
-        let o = parse("ro,rw,noneg,neg").unwrap();
-        assert!(!o.read_only && o.negative_cache);
+        let o = parse("ro,rw,noneg,neg_ttl=5").unwrap();
+        assert!(!o.read_only && o.negative_ttl == Duration::from_secs(5));
     }
 
     #[test]
@@ -165,6 +168,8 @@ mod tests {
             "ttl=nan",
             "ro=1",
             "neg=yes",
+            "neg_ttl",
+            "noneg=1",
             "allow_other=1",
         ] {
             assert!(

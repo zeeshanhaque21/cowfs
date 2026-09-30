@@ -138,8 +138,8 @@ impl DirSink for Sink {
 impl Filesystem for Fs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, n: &OsStr, reply: ReplyEntry) {
         match name(n).and_then(|n| self.vfs.lookup(parent, n)) {
-            Err(Error::NotFound) if self.opts.negative_cache && !self.opts.entry_ttl.is_zero() => {
-                reply.entry(&self.opts.entry_ttl, &negative_attr(), 0);
+            Err(Error::NotFound) if !self.opts.negative_ttl.is_zero() => {
+                reply.entry(&self.opts.negative_ttl, &negative_attr(), 0);
             }
             r => self.entry(r, reply),
         }

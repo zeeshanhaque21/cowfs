@@ -207,26 +207,16 @@ fn read_only_mount_refuses_writes() {
 
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
-fn kernel_caches_until_invalidated() {
+fn invalidation_drops_cached_names_and_attributes() {
     let Some(fx) = Fixture::with("", |v| {
-        let a = v.create(ROOT_INO, b"f", 0o644).unwrap();
-        v.write(a.ino, 0, b"one").unwrap();
+        for (n, data) in [(&b"f"[..], &b"one"[..]), (b"p", b"p")] {
+            let a = v.create(ROOT_INO, n, 0o644).unwrap();
+            v.write(a.ino, 0, data).unwrap();
+        }
     }) else {
         return;
     };
     assert_eq!(fs::metadata(fx.p("f")).unwrap().len(), 3);
-    assert_eq!(errno(fs::metadata(fx.p("late"))), libc::ENOENT);
-    let a = fx.vfs.create(ROOT_INO, b"late", 0o644).unwrap();
-    assert_eq!(
-        errno(fs::metadata(fx.p("late"))),
-        libc::ENOENT,
-        "negative entry is cached"
-    );
-    fx.mount()
-        .invalidate_entry(ROOT_INO, "late".as_ref())
-        .unwrap();
-    assert_eq!(fs::metadata(fx.p("late")).unwrap().ino(), a.ino);
-
     let f = fx.vfs.lookup(ROOT_INO, b"f").unwrap();
     fx.vfs.write(f.ino, 0, b"three").unwrap();
     assert_eq!(
@@ -237,6 +227,32 @@ fn kernel_caches_until_invalidated() {
     fx.mount().invalidate_inode(f.ino).unwrap();
     assert_eq!(fs::metadata(fx.p("f")).unwrap().len(), 5);
     assert_eq!(fs::read(fx.p("f")).unwrap(), b"three");
+
+    fs::metadata(fx.p("p")).unwrap();
+    fx.vfs
+        .rename(ROOT_INO, b"p", ROOT_INO, b"q", Default::default())
+        .unwrap();
+    assert!(fs::metadata(fx.p("p")).is_ok(), "names are cached");
+    fx.mount().invalidate_entry(ROOT_INO, "p".as_ref()).unwrap();
+    assert_eq!(errno(fs::metadata(fx.p("p"))), libc::ENOENT);
+    assert!(fs::metadata(fx.p("q")).is_ok());
+}
+
+#[test]
+#[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
+fn negative_answers_expire_by_negative_ttl() {
+    let Some(fx) = Fixture::new("neg_ttl=2") else {
+        return;
+    };
+    assert_eq!(errno(fs::metadata(fx.p("late"))), libc::ENOENT);
+    let a = fx.vfs.create(ROOT_INO, b"late", 0o644).unwrap();
+    assert_eq!(
+        errno(fs::metadata(fx.p("late"))),
+        libc::ENOENT,
+        "negative answer is cached"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    assert_eq!(fs::metadata(fx.p("late")).unwrap().ino(), a.ino);
 }
 
 #[test]
@@ -302,7 +318,8 @@ fn run_blocks_until_unmounted_from_outside() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("mnt");
     fs::create_dir(&dir).unwrap();
-    let vfs: Arc<dyn Vfs> = Arc::new(TestVfs::default());
+    let owner = fs::metadata(tmp.path()).unwrap();
+    let vfs: Arc<dyn Vfs> = Arc::new(TestVfs::new(owner.uid(), owner.gid()));
     let d = dir.clone();
     let t = std::thread::spawn(move || crate::run(vfs, d, MountOptions::default()));
     for _ in 0..100 {
