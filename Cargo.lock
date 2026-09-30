@@ -140,6 +140,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cowfs-vfs-test"
+version = "0.0.0"
+dependencies = [
+ "cowfs-vfs",
+ "proptest",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
