@@ -115,6 +115,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "cowfs-vfs",
+ "cowfs-vfs-test",
  "nfsserve",
  "tempfile",
  "thiserror",
