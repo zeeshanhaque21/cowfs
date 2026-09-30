@@ -176,6 +176,7 @@ impl Queue {
     pub(crate) fn try_elide(&mut self, n: &Node) -> bool {
         if n.created_gen() == Some(self.gen) && n.struct_ops.load(Ordering::Acquire) == 1 {
             self.elided.insert(n.ino);
+            n.elided.store(true, Ordering::Release);
             self.content_idx.remove(&n.ino);
             true
         } else {

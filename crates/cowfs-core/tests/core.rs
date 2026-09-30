@@ -367,34 +367,32 @@ fn creates_are_batched() {
     assert_eq!(c.readdir(r, 0, 10_000).unwrap().entries.len(), 5000);
 }
 
-#[test]
-fn corrupt_block_is_eio_never_wrong_data() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = pattern(600_000, 7);
-    {
-        let c = Core::open(dir.path(), test_opts()).unwrap();
-        c.create_snapshot("s").unwrap();
-        let r = root_entry(&c, "s").ino;
-        mkfile(&c, r, "f", &data);
-        c.sync().unwrap();
-    }
-    let pack = std::fs::read_dir(dir.path().join("store/packs"))
+fn one_pack(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(dir.join("store/packs"))
         .unwrap()
         .next()
         .unwrap()
         .unwrap()
-        .path();
-    let mut bytes = std::fs::read(&pack).unwrap();
-    let at = 16 + 52 + 70_000;
-    bytes[at] ^= 0x55;
-    std::fs::write(&pack, &bytes).unwrap();
-    let _ = std::fs::remove_file(dir.path().join("store/index.cix"));
+        .path()
+}
+
+#[test]
+fn corrupt_block_under_an_open_core_is_eio_never_wrong_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = pattern(600_000, 7);
     let c = Core::open(dir.path(), test_opts()).unwrap();
+    c.create_snapshot("s").unwrap();
     let r = root_entry(&c, "s").ino;
-    let a = c.lookup(r, b"f").unwrap();
+    let a = mkfile(&c, r, "f", &data);
+    c.sync().unwrap();
+    c.drop_caches();
+    let pack = one_pack(dir.path());
+    let mut bytes = std::fs::read(&pack).unwrap();
+    bytes[16 + 52 + 70_000] ^= 0x55;
+    std::fs::write(&pack, &bytes).unwrap();
     let mut saw_error = false;
     let mut off = 0u64;
-    while off < a.size {
+    while off < 600_000 {
         match c.read(a.ino, off, 65536) {
             Ok(got) => assert_eq!(
                 got,
@@ -410,6 +408,28 @@ fn corrupt_block_is_eio_never_wrong_data() {
     }
     assert!(saw_error, "the damaged chunk was read without an error");
     assert!(!c.fsck().unwrap().is_clean());
+}
+
+#[test]
+fn a_store_that_lost_durable_data_is_not_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        c.create_snapshot("s").unwrap();
+        let r = root_entry(&c, "s").ino;
+        mkfile(&c, r, "f", &pattern(600_000, 7));
+        c.sync().unwrap();
+    }
+    let pack = one_pack(dir.path());
+    let mut bytes = std::fs::read(&pack).unwrap();
+    bytes[16 + 52 + 70_000] ^= 0x55;
+    std::fs::write(&pack, &bytes).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("store/index.cix"));
+    match Core::open(dir.path(), test_opts()) {
+        Err(Error::Corrupt(m)) => assert!(m.contains("corruption"), "{m}"),
+        Err(e) => panic!("wrong error {e:?}"),
+        Ok(_) => panic!("a store with damaged durable data was opened"),
+    }
 }
 
 fn libc_eio() -> i32 {

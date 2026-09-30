@@ -109,6 +109,12 @@ impl FileData {
         self.dirty_bytes
     }
 
+    /// Forgets every unflushed byte and returns how many there were.
+    pub(crate) fn discard(&mut self) -> usize {
+        self.dirty.clear();
+        std::mem::take(&mut self.dirty_bytes)
+    }
+
     pub(crate) fn is_clean(&self) -> bool {
         self.dirty.is_empty()
     }

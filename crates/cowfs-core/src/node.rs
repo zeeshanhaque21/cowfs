@@ -1,7 +1,7 @@
 //! In-memory inodes.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use cowfs_vfs::{Attr, FileKind, Ino};
@@ -70,6 +70,8 @@ pub(crate) struct Node {
     pub(crate) struct_ops: AtomicU32,
     /// Queue generation of the still queued create, if any.
     created_gen: AtomicU64,
+    /// The create was cancelled before it reached meta, so nothing of this node is ever committed.
+    pub(crate) elided: AtomicBool,
     pub(crate) st: RwLock<NodeState>,
 }
 
@@ -83,6 +85,7 @@ impl Node {
             ns_seq: AtomicU64::new(0),
             struct_ops: AtomicU32::new(0),
             created_gen: AtomicU64::new(NO_GEN),
+            elided: AtomicBool::new(false),
             st: RwLock::new(st),
         }
     }

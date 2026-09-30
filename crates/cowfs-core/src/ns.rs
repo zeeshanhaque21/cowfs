@@ -35,9 +35,15 @@ impl Inner {
         }
     }
 
+    /// Wakes the flusher at `max_pending_ops` queued operations and flushes in the caller at four
+    /// times that, so the queue is bounded even without the background thread.
     fn maybe_wake(&self, sc: &SnapCtx) {
-        if sc.q.lk().op_count() >= self.opts.max_pending_ops {
+        let n = sc.q.lk().op_count();
+        if n >= self.opts.max_pending_ops {
             self.wake();
+        }
+        if n >= self.opts.max_pending_ops.saturating_mul(4) {
+            let _ = self.flush_snapshot(sc);
         }
     }
 
@@ -80,9 +86,15 @@ impl Inner {
 
     pub(crate) fn op_readdir(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDir> {
         if dir == ROOT_INO {
+            if max == 0 {
+                return Err(Error::InvalidArgument);
+            }
             return self.root_readdir(cookie, max);
         }
         let (sc, dn) = self.dir(dir)?;
+        if max == 0 {
+            return Err(Error::InvalidArgument);
+        }
         if dn.st.rd().attr.nlink == 0 {
             return Ok(ReadDir {
                 entries: Vec::new(),
@@ -101,7 +113,7 @@ impl Inner {
         let epoch = self.dents.epoch(dir);
         let r = sc
             .snap
-            .readdir(mino(m), cookie, max.max(1))
+            .readdir(mino(m), cookie, max)
             .map_err(from_meta)
             .map_err(stale)?;
         let mut entries = Vec::with_capacity(r.entries.len());
@@ -119,12 +131,6 @@ impl Inner {
             .collect();
         self.dents.fill_many(dir, &fill, epoch);
         self.shrink_dents(dir);
-        if max == 0 {
-            return Ok(ReadDir {
-                eof: entries.is_empty(),
-                entries: Vec::new(),
-            });
-        }
         Ok(ReadDir {
             entries,
             eof: r.end,

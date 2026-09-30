@@ -12,8 +12,13 @@ fn opts() -> Options {
 }
 
 fn factory() -> Arc<dyn Vfs> {
+    // statfs_free_after_unlink needs unflushed data: freed space of stored blocks waits for GC (#10)
+    let opts = Options {
+        background: false,
+        ..opts()
+    };
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = Core::open(dir.path(), opts()).expect("open");
+    let core = Core::open(dir.path(), opts).expect("open");
     core.create_snapshot("main").expect("snapshot");
     let view = core.snapshot_view("main").expect("view");
     Arc::new(Keep {

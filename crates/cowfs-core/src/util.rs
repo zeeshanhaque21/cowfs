@@ -36,6 +36,8 @@ pub(crate) struct Shard<K, V> {
     pub map: HashMap<K, V>,
     /// Bumped by every mutation, commit and eviction: a fill that started before it is stale.
     pub epoch: u64,
+    /// Skip shrinking until the shard holds this many entries.
+    pub next_shrink: usize,
 }
 
 /// A hash map split into shards, each behind its own mutex.
@@ -53,6 +55,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardMap<K, V> {
                     Mutex::new(Shard {
                         map: HashMap::new(),
                         epoch: 0,
+                        next_shrink: 0,
                     })
                 })
                 .collect(),
@@ -134,11 +137,12 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardMap<K, V> {
     pub(crate) fn shrink_shard_of(
         &self,
         k: &K,
+        cap: usize,
         target: usize,
         mut evictable: impl FnMut(&K, &V) -> bool,
     ) {
         let mut s = self.shard(k);
-        if s.map.len() <= target {
+        if s.map.len() <= cap.max(s.next_shrink) {
             return;
         }
         let mut over = s.map.len() - target;
@@ -154,5 +158,10 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardMap<K, V> {
         if over != before {
             s.epoch += 1;
         }
+        s.next_shrink = if s.map.len() > cap {
+            s.map.len() + cap / 4
+        } else {
+            0
+        };
     }
 }

@@ -307,7 +307,7 @@ impl Inner {
         }
         let n = self.live(ino)?;
         let sc = self.snapctx(ino)?;
-        if name.is_empty() || (flags.create && flags.replace) {
+        if name.is_empty() || name.contains(&0) || (flags.create && flags.replace) {
             return Err(Error::InvalidArgument);
         }
         if value.len() > XATTR_VALUE_MAX || name.len() > NAME_MAX {

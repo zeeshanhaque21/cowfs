@@ -294,15 +294,16 @@ impl Inner {
             return;
         }
         let flushed = self.flushed_of();
-        self.nodes.shrink_shard_of(&near, cap * 3 / 4, |ino, n| {
-            let fl = snap_of(*ino).and_then(|s| flushed.get(&s)).copied();
-            let Some(fl) = fl else { return true };
-            Arc::strong_count(n) == 1
-                && !n.pinned()
-                && n.seq.load(Ordering::Acquire) <= fl
-                && n.ns_seq.load(Ordering::Acquire) <= fl
-                && n.st.try_read().is_ok_and(|s| s.dirty_bytes() == 0)
-        });
+        self.nodes
+            .shrink_shard_of(&near, cap, cap * 3 / 4, |ino, n| {
+                let fl = snap_of(*ino).and_then(|s| flushed.get(&s)).copied();
+                let Some(fl) = fl else { return true };
+                Arc::strong_count(n) == 1
+                    && !n.pinned()
+                    && n.seq.load(Ordering::Acquire) <= fl
+                    && n.ns_seq.load(Ordering::Acquire) <= fl
+                    && n.st.try_read().is_ok_and(|s| s.dirty_bytes() == 0)
+            });
     }
 
     pub(crate) fn shrink_dents(&self, near: Ino) {
@@ -441,7 +442,10 @@ impl Inner {
             return;
         };
         let fl = sc.flushed();
-        if node.seq.load(Ordering::Acquire) > fl || node.ns_seq.load(Ordering::Acquire) > fl {
+        let never_committed = node.elided.load(Ordering::Acquire);
+        if !never_committed
+            && (node.seq.load(Ordering::Acquire) > fl || node.ns_seq.load(Ordering::Acquire) > fl)
+        {
             return;
         }
         if node.st.rd().attr.nlink != 0 {
@@ -452,6 +456,8 @@ impl Inner {
             .remove_if(&node.ino, |n| Arc::ptr_eq(n, node) && !n.pinned());
         if removed {
             self.aliases.wr().remove(node.ino);
+            let n = node.st.wr().file.as_mut().map_or(0, FileData::discard);
+            self.dirty_bytes.fetch_sub(n, Ordering::AcqRel);
         }
     }
 

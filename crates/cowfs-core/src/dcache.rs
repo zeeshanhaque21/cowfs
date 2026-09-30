@@ -24,6 +24,9 @@ struct DShard {
     dirs: HashMap<Ino, HashMap<Box<[u8]>, Dent>>,
     count: usize,
     epoch: u64,
+    /// Skip shrinking until the shard holds this many entries: a shard full of dirty entries
+    /// would otherwise be rescanned on every insert.
+    next_shrink: usize,
 }
 
 #[derive(Debug)]
@@ -147,7 +150,7 @@ impl DCache {
     /// it is over its bound.
     pub(crate) fn shrink(&self, dir: Ino, flushed: &dyn Fn(Ino) -> u64) {
         let mut s = self.shard(dir);
-        if s.count <= self.cap_per_shard {
+        if s.count <= self.cap_per_shard.max(s.next_shrink) {
             return;
         }
         let target = self.cap_per_shard * 3 / 4;
@@ -171,5 +174,10 @@ impl DCache {
         s.dirs.retain(|_, n| !n.is_empty());
         s.count -= removed;
         s.epoch += 1;
+        s.next_shrink = if s.count > self.cap_per_shard {
+            s.count + self.cap_per_shard / 4
+        } else {
+            0
+        };
     }
 }
