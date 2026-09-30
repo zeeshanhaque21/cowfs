@@ -446,7 +446,7 @@ mod tests {
     fn a_whole_file_write_that_is_not_a_sidecar_is_refused() {
         // What the adapter has to be able to tell: a real file named ._x must not be accepted.
         assert_eq!(Sidecar::decode(b"my real file content"), None);
-        assert_eq!(Sidecar::decode(&vec![0u8; 20]), None);
+        assert_eq!(Sidecar::decode(&[0u8; 20]), None);
         assert!(Sidecar::decode(&Sidecar::default().encode()).is_some());
     }
 
