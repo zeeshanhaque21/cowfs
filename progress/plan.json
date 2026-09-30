@@ -235,13 +235,13 @@
         },
         {
           "id": "34",
-          "title": "#34 cowfs-vfs-path: run the suite on native filesystems and through mounts",
-          "state": "fixing",
-          "owner": "builder (subagent)",
+          "title": "#34 cowfs-vfs-path: native-filesystem control (merged)",
+          "state": "done",
+          "owner": "lead",
           "issue": 34,
           "pr": "#35",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/35",
-          "detail": "Suite run on APFS, btrfs, ext4, FUSE and NFS. Posix level (56 checks): 0 failures natively and through FUSE; NFS mount 10 (9 silly rename, 1 AppleDouble Translate hides ._ names). FUSE adapter: no bug. NFS adapter bug found: the reply cache ignores the connection, so a second connection's identical xid replays the first connection's reply and the call never runs (sent to the #12 builder). Suite level corrections sent to the #29 builder (torn reads on ext4/btrfs/tmpfs at 512/4096 B, statfs files=0 on btrfs, com.apple.* xattrs, atime-only ctime, xattr name prefix, LINK_MAX hang). Client-side, not adapter: sparse blocks, statfs caching, silly rename. 2 unexplained flakes. | Critic verdict NOT mergeable; builder fixing F1 (hardlink reclaim / Ino reuse), F8 (bitwise-OR errno bug), F9 (stale dir cache), F4 (8000-pair timeout), 8 surviving mutants. Live CI: ubuntu FAILS at `cargo test --workspace` on the in-progress head 3f779a8, macOS passes.",
+          "detail": "Merged to main. Critic (no root escape; 28 adversarial tests) found 4 blockers, all fixed with regression tests and re-verified by me, including the exact merge result with main (fmt, clippy, 36 tests): F1 hardlink reclaim and Ino reuse (301 nodes leaked before, 1 after), F8 bitwise-OR errno bug, F9 stale directory cache, F4 hardlink-pairs timing. Mutants: 15 of 18 killed (round 2: 5 of 13); 3 survivors explained (two independent defences, unobservable, compiled out on macOS). Posix level on the merged suite: APFS 56/0, btrfs 56/0, ext4 56/0 failures. Caveat I should correct: the builder's list of suite change requests was already done in the merged suite (#30); only the additive per-check timeout/lifecycle check request is new. Known limit: one table lock.",
           "ci": "CI: pass (linux, macos) at 88e5834"
         },
         {
@@ -292,5 +292,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41. Waiting: #24 #31 #33 #35 #32 #36 (fixing), #38 (verified, stacked on #33), #39 (building). Each must merge main and adopt the frozen trait first."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35. Waiting: #24 #31 #33 #32 #36 (fixing), #38 (verified, stacked on #33), #39 (building). Each must merge main and adopt the frozen trait first."
 }
