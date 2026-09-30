@@ -5,6 +5,60 @@ Contract: `docs/v1-architecture.md`, section "cowfs-meta contract".
 This note is the design.
 Numbers in the "Measurements" section come from `crates/cowfs-meta/examples/bench.rs` and are the only performance claims made here.
 
+## Changes since first review
+
+An independent review of the first version (PR 25) found ordering, inode reuse, scaling and test-quality problems.
+This list is for `cowfs-core`, which builds on the first version's API.
+Everything not listed here keeps its signature and meaning.
+
+Signature changes and additions:
+
+- `Options` gained `ack: Ack`, `background: bool`, `max_pending_bytes: usize`, `ino_block: u64`.
+  Code that builds it with `..Options::default()` still compiles; a full struct literal does not.
+  `node_cache` now defaults to 32768 nodes.
+- `Error` gained `Conflict`, `NeedsRechunk`, `LimitExceeded`, `Reentrant`, `Closed`, `Format`.
+  A `match` on it needs new arms.
+  A file that is not a cowfs-meta database, or has another format version, is now `Format` (it was `Corrupt` for a version mismatch and was silently initialised for a foreign redb file).
+  `Corrupt` is now also returned for redb's own corruption errors (it was `Storage`).
+- The chunk-list rows changed from segments to per-chunk extents, and the inode record grew.
+  The format version is 2: a database from the first version is refused with `Error::Format`.
+  `CHUNKS_PER_SEGMENT` is gone; `INO_LIMIT` and `SNAPSHOT_LIMIT` are new.
+- New: `Meta::close() -> Result<()>`, `Meta::open_recover`, `Meta::durable_snapshots`, `Meta::reap_step`, `Meta::reap_all`, `Meta::pending_reap`, `Meta::pack_ino`, `Meta::unpack_ino`, `Snapshot::chunk_range`, `Snapshot::content_version`, `Snapshot::splice_content`, and the matching `Tx` methods (`Tx::readlink` too), `Ack`, `Recovery`, `ChunkRange`.
+
+Semantic changes:
+
+- Hook ordering (F1): the hook now runs after the batch closure and before the durable commit, once per commit, and also on every `sync()`, even with nothing pending.
+  It may now run on the background thread, so it must be thread-safe (it already had to be `Send + Sync`).
+  A hook that calls this crate gets `Error::Reentrant`.
+- Applied versus durable: a mutating call is visible to every reader when it returns and becomes durable by the policy in "Applied and durable".
+  `Snapshot::info`, `Snapshot::root` and `Meta::snapshots` report the applied root.
+  `Meta::durable_snapshots` reports the file's state.
+  `Snapshot::root()` on a snapshot with pending changes hashes the changed nodes, so its cost grows with the pending change, not the tree.
+- `close()` and drop (F2): both run the hook and commit.
+  If the hook or the commit fails, pending changes are discarded and never written.
+  After `close()` every mutation returns `Error::Closed`.
+  A `Snapshot` handle keeps the file open, so the file closes when the last `Meta` and `Snapshot` clone is gone.
+- Inode numbers (F3): never reused, also across crashes; after a crash the first new number may be up to `ino_block` above the last handed out, so numbers are not contiguous.
+  `pack_ino`/`unpack_ino` give a restart-stable `u64`.
+  A `Tx` that fails still consumes the numbers it allocated.
+- Timer (F4): the background thread flushes idle changes after `sync_interval`.
+  With `background: false` the caller must call `sync()`.
+- `Ack::Durable` (F11): each call returns after a durable commit; concurrent callers share one hook run and one fsync.
+- `check()` and `live_blocks()` call `sync()` first, so they run the hook.
+  `live_blocks` walks the durable state.
+- `remove_snapshot` (F13) is durable on return and returns quickly; the nodes are freed afterwards in steps of at most 256 nodes.
+  `Meta::pending_reap` reports the queue.
+- Same-directory `rename` keeps the entry's cookie (F12); a cross-directory rename assigns a new cookie.
+- `setattr(size)` inside a chunk returns `Error::NeedsRechunk` (F12).
+- Chunk lists (F7): one extent row per chunk keyed by byte offset.
+  `set_content` still replaces the whole list; use `chunk_range` and `splice_content(ino, expected_version, start, end, new_chunks, new_size)` for large files.
+  `start` and `end` are byte offsets on chunk boundaries; a splice before the end of the covered range must keep its byte length.
+- A detected corrupt read makes the handle refuse writes with `Corrupt` until it is reopened (F8).
+- `Snapshot` lookups take one descent for the directory entry and one for the child inode (F10).
+  Invalidation `cowfs-core` needs for a dentry cache above this API: a cached `(snapshot id, dir, name) -> Attr` is valid until a mutating call on that snapshot returns (any `batch`, `create`, `rename`, and so on) or the snapshot is removed.
+  `Snapshot::root()` changes on every applied change and can serve as a cheap version stamp, at the hashing cost above; a per-snapshot counter is not provided.
+  A forked snapshot starts with the same tree, so entries are valid in the fork until the fork mutates.
+
 ## Problem
 
 `cowfs-meta` stores the directory tree, inode attributes, xattrs, symlink targets, and each file's chunk list.
@@ -95,19 +149,24 @@ Clustering by inode number keeps all records of one inode adjacent, and keeps al
 
 | Kind | Byte | Suffix | Value |
 |---|---|---|---|
-| inode | 0x01 | none | version, file type, mode, nlink, size, atime, mtime, ctime, parent inode (directories), next cookie (directories) |
+| inode | 0x01 | none | version, file type, mode, nlink, size, atime, mtime, ctime, parent inode (directories), next cookie (directories), covered bytes and content version (files) |
 | dirent by name | 0x02 | name bytes | child inode, file type, cookie |
 | dirent by cookie | 0x03 | cookie, 8 bytes big-endian | child inode, file type, name |
 | xattr | 0x04 | xattr name bytes | value bytes |
-| chunk segment | 0x05 | segment index, 4 bytes big-endian | up to 128 chunk refs, each 32-byte block id and 4-byte length |
+| chunk extent | 0x05 | byte offset of the chunk, 8 bytes big-endian | one chunk ref: 32-byte block id and 4-byte length |
 | symlink target | 0x06 | none | target bytes |
 
 The root directory is inode 1.
 There is no inode 0.
 
 Limits: names are 1 to 255 bytes, not containing `/` or NUL; xattr names are at most 255 bytes; xattr values at most 64 KiB; a symlink target at most 4096 bytes.
-A file's chunk list is split into segments of 128 chunks so that a file of tens of thousands of chunks never puts a huge value into one tree node, and a change to one region rewrites only the affected segments.
-Setting the content of a file compares the old and new segments and writes only the ones that differ.
+A file's chunk list is one row per chunk, keyed by the chunk's byte offset.
+A chunk is an extent: `[offset, offset + len)`.
+Extents are contiguous from offset 0, and their total length is the inode's `covered`, which is at most `size` (the rest is a trailing hole).
+Because the rows are keyed by offset inside the same B+tree, appending a chunk, replacing a run of chunks, or truncating at a chunk boundary touches only the leaves on those keys and the path to the root.
+Cost is proportional to the chunks changed plus the tree depth, not to the file.
+`set_content` (whole list, last writer wins) compares old and new extents and writes only the rows that differ.
+The `content version` in the inode record is bumped by every content change and is the compare-and-swap token of `splice_content`.
 
 ### Tree nodes
 
@@ -155,17 +214,23 @@ A `batch` runs several operations in one redb write transaction and one material
 
 ### Inode numbers
 
-A global counter in the `meta` table hands out inode numbers.
-The counter and the inode records it numbers commit in the same redb transaction, so a crash never leaves a used number unrecorded, and a number is never reused.
-Inode numbers are never reused after unlink either, so a stale NFS handle to a deleted file fails cleanly.
+Inode numbers come from a counter that is reserved durably in blocks (`Options::ino_block`, default 1024).
+The durable record `ino_reserved` is always above every number ever handed to a caller: before handing out the first number of a new block, the store commits the new high-water mark in its own redb transaction (durable, no chunk references, so no hook).
+After a crash the counter restarts at `ino_reserved`, so the first number handed out is above every number a caller could have seen.
+A clean `close()` or drop writes the exact counter, so a normal restart wastes nothing.
+A failed batch consumes the numbers it allocated; they are not returned.
+Numbers are never reused after unlink either, so a stale NFS handle to a deleted file fails cleanly.
+The limit is 2^40 inode numbers (`INO_LIMIT`); reaching it returns `Error::LimitExceeded` on the operation that needs a new number.
+
+Snapshot ids are also never reused (the counter is part of every snapshot commit) and are below 2^24 (`SNAPSHOT_LIMIT`); creating the 2^24th snapshot returns `Error::LimitExceeded`.
 
 Snapshots share inode numbers at the moment of cloning.
 The same inode number in two snapshots means "the same file as of the clone", which can diverge later.
 The identity of a live file is therefore the pair (snapshot id, inode number).
-Snapshot ids are also never reused.
-A mount adapter must put both in NFS file handles and must derive `st_ino` from both, otherwise tools that compare `(dev, ino)` would see files in two clones as hardlinks of each other.
-This is the reading of "unique across snapshots' live files" that an O(1) snapshot allows.
-The lead should confirm it.
+`Meta::pack_ino(snapshot, ino) -> Option<u64>` packs the pair as `snapshot << 40 | ino` and `Meta::unpack_ino` reverses it.
+The mapping is a pure function: it needs no table and is the same after a restart.
+`pack_ino` returns `None` only for values the store never hands out (snapshot 0, or a value at or above its limit).
+A mount adapter should use the packed value for `st_ino` and NFS file handles, otherwise tools that compare `(dev, ino)` would see files in two clones as hardlinks of each other.
 
 ### Hardlinks and `nlink`
 
@@ -217,67 +282,95 @@ Cookies never change while an entry exists and are never reused within a directo
 `readdir(dir, cookie, max)` scans by-cookie records with a cookie greater than the given one, so resuming after any cookie returns the entries added later and skips nothing that remained.
 Removing entries while a listing is in progress cannot duplicate or drop the survivors, because each survivor has one fixed cookie.
 Two hardlinked names in the same directory have different cookies, so the spike 2 bug (an inode-based cookie shared by names of one inode) cannot occur.
-A rename gives the moved entry a new cookie in its destination directory.
-POSIX leaves it unspecified whether a listing in progress shows a renamed entry.
+A rename inside one directory keeps the entry's cookie (the entry keeps its place in listings, so a listing that renames every entry it sees still terminates).
+A rename into another directory gives the entry a new cookie there, at the end of that directory's order.
+POSIX leaves it unspecified whether a listing in progress shows a moved entry.
 Cookie 0 means "start".
 `.` and `..` are not returned by `readdir`.
 `lookup` resolves `.` and `..`, and directory inodes record their parent, so an adapter can synthesize them.
 
 ### Reading and the API surface
 
-- `Meta`: opens or creates a database, lists and removes snapshots, checks consistency, syncs.
+- `Meta`: opens or creates a database (`open`, `open_recover`), lists and removes snapshots, `sync`, `close`, `check`, `reap_step`.
 - `Snapshot`: a cheap, cloneable, `Send + Sync` handle to one snapshot with `&self` methods.
-  Read methods open a redb read transaction.
-  Write methods run one redb write transaction and update that snapshot's root.
-- `Snapshot::batch`: runs a closure over a `Tx` that has the same write methods, in one transaction that is aborted if the closure returns an error.
+- `Snapshot::batch`: runs a closure over a `Tx` that has the same operations, applied atomically.
+  If the closure returns `Err` or panics, none of its changes are kept.
+- Content: `chunks`, `chunk_range(ino, start, end)`, `content_version`, `set_content`, and `splice_content(ino, expected_version, start, end, new_chunks, new_size)`, a compare-and-swap that returns `Error::Conflict` when the version moved on.
+- `setattr(size)` shrinks a file only to a chunk boundary; any other shrink returns the distinct `Error::NeedsRechunk` and the caller re-chunks the tail, `put`s the new tail block, and splices.
 
-redb allows one writer and many concurrent readers, and cowfs-meta inherits that.
-Writers to any snapshot are serialized.
-Readers never block and never see a partial transaction.
+### Applied and durable
 
-### Durability policy
+A mutating call is applied to an in-memory copy of the snapshot's tree (only the nodes on touched paths are copied).
+Every reader sees it at once and never sees part of a batch.
+It reaches redb only in a durable commit, which writes all pending snapshot trees, their reference counts, the snapshot rows and the inode reservation in one redb transaction with two-phase commit.
+`Snapshot::info` and `Snapshot::root` report the applied root.
+`Meta::durable_snapshots` reports what the file holds, which is what a crash right now would leave.
 
-Every mutating call, and every `batch`, is one redb write transaction and is atomic.
-The transaction commits with `Durability::None` unless one of these holds, in which case it commits with `Durability::Immediate` (fsync, two-phase commit):
+A durable commit starts when any of these is true:
 
-1. The call is a snapshot operation (create root snapshot, create snapshot, remove snapshot).
-2. The number of mutating transactions since the last durable commit has reached `Options::sync_every_ops` (default 256).
-3. The time since the last durable commit has reached `Options::sync_interval` (default 1 second).
-4. The caller called `sync()`.
+1. A snapshot is created, forked or removed (these are durable on return).
+2. `sync_every_ops` applied calls are pending (default 256; a batch counts as one call).
+3. `max_pending_bytes` of changes are pending (default 32 MiB), which also bounds memory.
+4. The oldest pending change is `sync_interval` old (default 1 s).
+   A background thread owned by `Meta` enforces this even when no further call arrives.
+   It holds no strong reference to the handle and stops when the last handle is dropped.
+   `Options::background = false` disables it, and then the caller drives `sync()`.
+5. The caller calls `sync()` or `close()`, or `Options::ack = Ack::Durable` makes each call wait for a commit.
 
-A durable commit makes every earlier non-durable commit durable too.
-The exact bound on lost recent writes after a crash is: at most `sync_every_ops - 1` mutating transactions, and, while mutations keep arriving, at most `sync_interval` of wall time plus one transaction.
-If mutations stop, the last fewer than `sync_every_ops` transactions stay unsynced until `sync()`, dropping the handle, or the next mutation.
-There is no background thread.
-The mount layer is expected to call `sync()` on fsync, on unmount, and on a timer.
-Dropping the last handle performs a final `sync()`, because a non-durable commit is otherwise lost on a clean exit.
+`Ack::Durable` uses group commit: a caller whose change is applied waits for the next commit; the first waiter becomes the leader, waits up to 2 ms for callers that are already inside `batch` to apply, and then runs one hook and one fsync for all of them.
+Every caller returns only after its change is durable.
 
-A crash discards a suffix of the transaction history.
-It never exposes part of a transaction.
-That is the crash-consistency argument below.
+The bound on lost recent writes after a crash is the changes applied since the last durable commit: fewer than `sync_every_ops` calls and less than `max_pending_bytes` of changes, and, with the background thread on, no older than `sync_interval` plus one commit time.
+With the thread off, the age is unbounded until the next call, `sync()` or `close()`.
 
-Ordering with the block store: a chunk list committed durably must not reference blocks that are not durable.
-`Options::before_sync` is a hook called immediately before every durable commit, and the mount layer sets it to `Store::sync`.
-An explicit `sync()` calls it too.
-If the hook fails, the durable commit does not happen and the error is returned.
+### Ordering with the block store (the hook)
+
+A chunk list committed durably must not reference blocks that are not durable.
+`Options::before_sync` is the hook, and the mount layer sets it to `Store::sync`.
+The precise guarantee:
+
+- Every durable commit is preceded by exactly one run of the hook, and the hook returns before the redb transaction begins.
+- The hook runs after every batch closure whose changes the commit carries has returned, because a commit takes the same writer lock a closure holds while it runs.
+  So a closure that `put`s a block and then references it can never become durable before the block is: the block was `put` before the closure returned, and the hook (which syncs the store) runs after that.
+- A hook error aborts the commit: nothing changes on disk, the changes stay applied in memory, and the error is returned to the caller of `sync`, `close`, or a durable-ack call.
+  The timer retries every `sync_interval`.
+- `sync()` runs the hook even when nothing is pending, so `Meta::sync` can be used as "sync the store, then the metadata".
+- The hook must not call this crate; a call from inside it returns `Error::Reentrant` (checked per thread) instead of deadlocking.
+- Dropping the last handle runs the same path as `close()`.
+  If the hook fails, or the commit fails, the pending changes are discarded, never written: the store closes without redb's own close-time commit making them durable.
+  `close()` reports the error; drop cannot.
+- Inode reservations (F3) are committed without the hook.
+  They carry no chunk references.
 
 ### Crash-consistency argument
 
 All persistent state lives in one redb database file.
-Tree nodes, reference counts, snapshot rows, the inode counter and the format version are all rows in tables of that database, and every mutating call changes all the rows it needs in one redb write transaction.
-So the rows that a crash exposes are the rows of some committed prefix of the transaction history, because redb makes each transaction atomic and orders commits.
-redb's commit protocol publishes a new root by flipping a single byte after the pages it names are written and synced, and verifies page checksums on repair.
-We enable two-phase commit on durable commits so that the primary commit slot is valid without relying on checksums.
-A reopened database is therefore a snapshot of the history at some transaction boundary that is at least as recent as the last durable commit that completed before the crash.
-Within that state, the node tree is a set of immutable content-addressed nodes.
-Every node in `nodes` was written with all its children in the same transaction or earlier, and reference counts change in the same transaction as the nodes they count, so counts and nodes cannot disagree.
+Tree nodes, reference counts, snapshot rows, the inode reservation, the removal queue and the format header are rows of that database, and each durable commit changes all the rows it needs in one redb write transaction.
+So the rows that a crash exposes are the rows of some committed prefix of the commit history, because redb makes each transaction atomic and orders commits.
+redb publishes a new root by flipping a single byte after the pages it names are written and synced.
+We enable two-phase commit so that the primary commit slot is valid without relying on checksums.
+A reopened database is therefore the state at some commit boundary at least as recent as the last durable commit that completed before the crash.
+Within that state, the node tree is a set of immutable content-addressed nodes written with all their children in the same transaction or earlier, and reference counts change in the same transaction as the nodes they count, so counts and nodes cannot disagree.
 `check()` re-derives all of this from scratch.
 The tests cover this claim (see "Tests").
 They do not prove it.
 
+### A lost fsync (F5)
+
+On macOS, Rust std uses `fcntl(F_FULLFSYNC)` for `File::sync_all` (seen as `fcntl` under `File::sync_all` in a sample profile of a redb commit here) and, from its source as I recall it and not re-checked in this session, for `sync_data` too, so redb's syncs should reach the platform's strongest guarantee (unverified for `sync_data`).
+A disk that acknowledges a flush it did not perform is outside POSIX and outside this crate's model.
+What redb does then: if the newest commit slot does not verify and two-phase commit was used, `open` fails with "Primary is corrupted despite 2-phase commit" (redb's `do_repair`).
+`Meta::open` keeps that behaviour: it fails closed, never guesses.
+`Meta::open_recover(path, opts)` is the explicit, never automatic path.
+It copies the file to `<path>.pre-recover`, clears the two-phase flag and sets the recovery flag in the redb header, which makes redb verify the primary slot and fall back to the previous commit's slot.
+It returns a `Recovery` report (rolled back or not, the backup path, the recovered snapshots).
+If recovery fails, it restores the file from the backup.
+Everything committed after the previous commit is lost, and the caller decides whether to accept that.
+The mitigation for the failure mode itself is the backup copy: take a copy of the file (or use the store's own backups) before running with a disk whose flushes are in doubt.
+
 ### Consistency check
 
-`Meta::check()` runs in one read transaction and verifies:
+`Meta::check()` first calls `sync()`, then runs in one read transaction and verifies:
 
 1. Every snapshot root exists.
    Every reachable node hashes to its id, has sorted keys, has separators consistent with its children, and all leaves have the same depth.
@@ -289,36 +382,55 @@ They do not prove it.
    Every non-root inode is named by at least one entry and is reachable from the root, so there are no orphaned records and no detached directories.
    A directory has exactly one parent entry and its recorded parent matches.
    xattr, chunk, and symlink records belong to an inode of the right type.
-   A file's size is at least the sum of its chunk lengths.
-   All inode numbers are below the global counter.
+   A file's extents are contiguous from offset 0, their total equals `covered`, and `covered` is at most `size`.
+   All inode numbers are below `ino_reserved`.
 4. The snapshot name index and the snapshot table agree.
+5. Roots waiting in the removal queue are counted like snapshot roots, so reference counts stay exact while a removed snapshot is freed in steps.
+
+Memory is about 40 bytes per inode and 50 bytes per tree node (counters only); directory rows are checked with a streaming multiset hash, never held.
 
 ## Tests
 
-- Model-based property test against an in-memory POSIX tree over random sequences of every operation, checking every result and `check()` after each step.
-- Snapshot isolation in both directions, hardlink semantics, rename edge cases, listing under removal.
-- Tree-level property test with a tiny node size to force deep trees, splits, merges, and root collapse.
-- Crash injection through redb's `StorageBackend`: a recording backend logs every write, set_len, and sync.
-  Crash images are built from the log at hundreds of points with three policies: everything up to the crash point with the last write torn, only synced writes, and all synced writes plus a random subset of unsynced writes each possibly torn.
-  Each image is reopened, `check()`ed, and its snapshot roots must equal the state at a committed transaction boundary that is between the last durable commit before the crash point and the last commit begun.
-- A kill -9 test: a child process runs a deterministic mutation loop and reports progress on a pipe.
-  The parent kills it at random moments, reopens, runs `check()`, and requires the state to match a replay of the same workload at a step that is at least the last reported durable step.
-- No-panic test: truncated and bit-flipped copies of a database file either fail to open, fail `check()` or an operation with an error, or pass `check()`.
-  They never panic.
+`cargo test -p cowfs-meta` runs all of these except the ones marked ignored.
+
+- `tests/model.rs`: model-based property test against an in-memory POSIX tree over random sequences of every operation (including `splice_content` with stale versions and misaligned ranges), checking every result and `check()` after each step.
+- `tests/posix.rs`: snapshot isolation in both directions, hardlink semantics, rename edge cases, listing under removal, atomic batches.
+- `tests/crash.rs`, `tests/critic.rs`: crash injection through redb's `StorageBackend`.
+  A recording backend logs every write, set_len and sync.
+  Crash images are built at every N-th log event (`CRIT_STRIDE`, default 4, `1` for every event) under five loss policies: prefix with a torn last write, only fsynced writes, 512-byte sector shredding with random subset and reorder, 4 KiB sector shredding, and lost-last-fsync.
+  Each image is reopened, `check()`ed, and its snapshot roots and a full content digest must equal a committed boundary between the last durable commit before the crash point and the next commit.
+  The lost-last-fsync images that redb refuses must recover through `open_recover` to a committed boundary.
+  Workloads: a random mix, snapshot create/fork/remove, and a removed snapshot freed in several reap steps.
+- `tests/kill9.rs`: a child process mutates in a loop, the parent SIGKILLs it, reopens, checks, and compares with a replay.
+- `tests/corrupt.rs`: truncated and bit-flipped database files give an error or a valid tree, never a panic.
+- `tests/review.rs`: one regression test per review finding:
+  F1 hook ordering with a store whose blocks are durable only after sync (1000 commits, 0 dangling), the same with the real `cowfs-store`, hook count per commit and the `sync_every_ops` boundary, `sync()` with nothing pending runs the hook, the timer flushes idle changes and retries after a hook failure, inode numbers never reused after a crash at every event (two block sizes), snapshot ids and `pack_ino`, hook re-entry, group commit, rename-while-listing terminates, `NeedsRechunk`, `splice_content` compare-and-swap, append cost in bytes written (10 vs 50,000 chunks), incremental snapshot removal, background reaper, foreign redb and non-redb files refused and untouched, fail-closed after a detected corrupt read, transient flips during writes.
+  `hammer_120s` is ignored: `cargo test -p cowfs-meta --release --test review hammer -- --ignored --nocapture`.
+- `src/check.rs` tests: `check()` negative tests that corrupt a refcount, an nlink, a directory nlink, a dangling entry, an orphan inode, a half directory entry, an extent gap and a node's bytes, through a test-only backdoor, and require the specific report.
+- `src/ptree.rs`, `src/node.rs`, `src/error.rs` unit tests: CLOCK eviction bound, node parse of garbage, the panic guard and error mapping.
+
+Heavy runs (release):
+
+- `cargo test -p cowfs-meta --release --test crash -- --ignored --nocapture`
+- `CRIT_STRIDE=1 cargo test -p cowfs-meta --release --test critic -- --nocapture`
+- `COWFS_KILL_ROUNDS=300 cargo test -p cowfs-meta --release --test kill9 -- --nocapture --test-threads 1`
+- `COWFS_CORRUPT_SCALE=5 cargo test -p cowfs-meta --release --test corrupt -- --nocapture`
 
 ## Decisions for the lead to review
 
 1. Non-canonical roots (alternative E).
-2. `(snapshot id, inode)` is the identity of a live file, and adapters must combine them.
-3. Default durability numbers: 256 transactions or 1 second.
-4. The `before_sync` hook as the way to order store syncs before metadata syncs.
+2. `(snapshot id, inode)` is the identity of a live file; `pack_ino` is the restart-stable packing (24 bits snapshot, 40 bits inode).
+3. Mutations are applied in memory and reach redb only in durable commits (count, bytes, timer, sync, close, or durable ack).
+   A crash loses the applied-but-not-durable changes.
+4. The hook runs after the closure and before the redb transaction, once per commit.
 5. No unlink-while-open support in this crate.
 6. Only regular files, directories, and symlinks: no device nodes, FIFOs, or sockets, and no uid or gid.
-7. `setattr(size)` shrinks only to a chunk boundary, and any other shrink is `set_content` after the caller has written the new tail chunk into the store.
-8. Removing a snapshot frees its unique nodes in one write transaction, so removing a large snapshot holds the writer lock for a while.
-9. Every unbatched operation is its own redb transaction (about 1.7 to 2.1 ms at load above 70), so adapters must batch bursts.
-10. BLAKE3 runs the portable code path; enabling its `neon` feature is a workspace dependency change left to the lead.
-11. redb panics on damaged pages are caught and reported as `Corrupt`.
+7. `setattr(size)` shrinks only to a chunk boundary, otherwise `NeedsRechunk`.
+8. Removed snapshots are freed by the reaper in steps of at most 256 nodes per transaction, so the writer stall is one step, not the tree.
+   Until the reaper finishes, the removed snapshot's nodes still occupy file space.
+9. BLAKE3 runs the portable code path; enabling its `neon` feature is a workspace dependency change left to the lead.
+10. redb panics on damaged pages are caught and reported as `Corrupt`; a detected corrupt read makes the handle refuse all writes until it is reopened.
+11. `Meta::open_recover` exists for a lost fsync; it loses the newest commit and never runs by itself.
 
 ## Robustness against a damaged file
 

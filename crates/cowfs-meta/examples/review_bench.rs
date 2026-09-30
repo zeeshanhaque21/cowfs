@@ -358,71 +358,67 @@ fn rm(dir: &Path, files: usize) {
         },
     );
     let other = m.new_snapshot("other").unwrap();
-    let (mut removes, mut worst, mut drains, mut load_max) =
-        (Vec::new(), Vec::new(), Vec::new(), 0.0f64);
+    let (mut removes, mut worst, mut worst_reap, mut drains, mut load_max) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0.0f64);
     for rep in 0..5 {
         let big = m.new_snapshot(&format!("big{rep}")).unwrap();
         fill(&big, 0, files);
         m.sync().unwrap();
-        let ((rm_us, worst_us, drain_us), load) = locked(|| {
+        let ((rm_us, worst_us, reap_us, drain_us), load) = locked(|| {
             let stop = Arc::new(AtomicBool::new(false));
-            let st = stop.clone();
-            let o = other.clone();
+            let reaping = Arc::new(AtomicBool::new(false));
+            let (st, rp, o) = (stop.clone(), reaping.clone(), other.clone());
             let h = std::thread::spawn(move || {
-                let (mut n, mut max) = (0u64, Duration::ZERO);
+                let (mut n, mut max, mut max_reap) = (0u64, Duration::ZERO, Duration::ZERO);
                 while !st.load(SeqCst) {
                     let t = Instant::now();
+                    let in_reap = rp.load(SeqCst);
                     o.create(ROOT_INO, format!("x{rep}-{n}").as_bytes(), 0o644)
                         .unwrap();
                     max = max.max(t.elapsed());
+                    if in_reap {
+                        max_reap = max_reap.max(t.elapsed());
+                    }
                     n += 1;
                     std::thread::sleep(Duration::from_micros(500));
                 }
-                max
+                (max, max_reap)
             });
             std::thread::sleep(Duration::from_millis(100));
             let t = Instant::now();
             m.remove_snapshot(big.id()).unwrap();
             let rm = t.elapsed();
+            reaping.store(true, SeqCst);
             while m.pending_reap().unwrap() > 0 {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let drain = t.elapsed();
             stop.store(true, SeqCst);
-            let worst = h.join().unwrap();
-            (
-                rm.as_secs_f64() * 1e6,
-                worst.as_secs_f64() * 1e6,
-                drain.as_secs_f64() * 1e6,
-            )
+            let (worst, worst_reap) = h.join().unwrap();
+            let us = |d: Duration| d.as_secs_f64() * 1e6;
+            (us(rm), us(worst), us(worst_reap), us(drain))
         });
         load_max = load_max.max(load);
         removes.push(rm_us);
         worst.push(worst_us);
+        worst_reap.push(reap_us);
         drains.push(drain_us);
     }
     let inodes = files + files / PER_DIR;
-    row(
-        "remove_snapshot call returns after (durable)",
-        inodes,
-        "5x1",
-        removes,
-        load_max,
-    );
-    row(
-        "worst latency of a concurrent create during remove and reaping",
-        inodes,
-        "5x1",
-        worst,
-        load_max,
-    );
-    row(
-        "time until every node of the removed snapshot is freed",
-        inodes,
-        "5x1",
-        drains,
-        load_max,
-    );
+    for (label, v) in [
+        ("remove_snapshot call returns after (durable)", removes),
+        ("worst latency of a concurrent create, whole window", worst),
+        (
+            "worst latency of a concurrent create started after remove returned (reaping only)",
+            worst_reap,
+        ),
+        (
+            "time until every node of the removed snapshot is freed",
+            drains,
+        ),
+    ] {
+        row(label, inodes, "5x1", v, load_max);
+    }
     let t = Instant::now();
     m.check().unwrap();
     println!("check() after: {:?}, rss {} MB", t.elapsed(), rss_mb());
