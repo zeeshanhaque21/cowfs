@@ -119,6 +119,11 @@ pub struct Gc {
     marks: Mutex<Marks>,
     progress: Mutex<Option<ProgressFn>>,
     cancelled: AtomicBool,
+    /// One cycle at a time per collector. Two overlapping cycles on one store each hold their own
+    /// picture of what is live, and the second one to unlink a pack can free a block the first
+    /// one has just decided to keep. Serialising the cycle removes that whole class of race, and
+    /// a real deployment runs one collect at a time anyway.
+    cycle: Mutex<()>,
 }
 
 impl Gc {
@@ -149,6 +154,7 @@ impl Gc {
             marks: Mutex::new(marks),
             progress: Mutex::new(None),
             cancelled: AtomicBool::new(false),
+            cycle: Mutex::new(()),
         })
     }
 
@@ -222,7 +228,12 @@ impl Gc {
     }
 
     /// One cycle: freeze, mark, choose candidates, copy, then verify and unlink under a barrier.
+    ///
+    /// One cycle runs at a time per collector: a second call waits. Two overlapping cycles would
+    /// each hold their own picture of what is live, and the second to unlink a pack could free a
+    /// block the first has just decided to keep.
     pub fn collect(&self, roots: Option<&dyn ExtraRoots>) -> Result<GcReport> {
+        let _cycle = self.cycle.lock().unwrap_or_else(PoisonError::into_inner);
         let mut r = GcReport {
             dry_run: self.opts.dry_run,
             ..GcReport::default()
@@ -426,7 +437,11 @@ impl Gc {
                 walked.insert(key);
                 continue;
             }
-            let snap = self.meta.snapshot_by_id(info.id)?;
+            // A snapshot removed between the listing and the lookup is gone, so its blocks are
+            // not live. That is not an error: a collect runs while snapshots come and go.
+            let Ok(snap) = self.meta.snapshot_by_id(info.id) else {
+                continue;
+            };
             for b in snap.live_blocks(marker)? {
                 let b = b?;
                 if b == HOLE {

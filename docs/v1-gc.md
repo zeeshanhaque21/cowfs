@@ -167,10 +167,16 @@ A read never writes: the map is only touched, and flushed in batches.
   under a write load reclaims cold packs first.
 - `Options::io_budget_bytes` bounds the bytes copied per cycle (default 2 GiB, 0 means no bound),
   which bounds a cycle's duration and its I/O rate.
-- Progress is reported through `Options::progress` after each pack, and
-  `Options::cancelled` is polled before each pack and inside the copy loop, so a client can cancel
-  and the store is left consistent: a half-copied new pack is a pack with no index entries, and
-  open ignores it and the next cycle reuses or removes it.
+- Progress is reported through `Gc::set_progress` after each pack copied and after each pack
+  unlinked, and `Gc::cancel` is polled before each pack, inside the copy loop, and before each
+  unlink, so a client can cancel from its own progress handler and the store is left consistent: a
+  half-copied new pack is a pack with no index entries, and open indexes it as ordinary data.
+- A cancel is **sticky** until `Gc::resume`. A client that cancels once and then polls `collect`
+  must not get a second full cycle by accident.
+- A cycle that cannot free, because the caller offered no barrier, does not copy either. A copy
+  nobody unlinks only costs space.
+- The I/O budget is spent on **copied bytes**, not on packs looked at. A pack of pure garbage is a
+  candidate and copies nothing, which is correct: it is unlinked without a new pack.
 
 ## What the collector does not do
 
@@ -226,33 +232,98 @@ They are added in `crates/cowfs-store/src/compact.rs`, with one `pub(crate) fn g
 ## Decisions for the lead to review
 
 1. The barrier is required for any free, and `cowfs-core` has to provide it.
-   The alternative (proceed without it) risks silent data loss and is not implemented.
-2. The live set and the already-marked roots are persisted in `<state>/mark.bin`, rewritten
-   atomically at the end of a cycle, and dropped when they exceed `Options::max_persisted_blocks`.
-   Within a cycle, skipping is `cowfs-meta`'s `Marker`.
+   The alternative, proceed without it, risks silent data loss and is not implemented.
+   A collector with no barrier marks, reports its candidates and touches nothing.
+2. Cross-cycle incrementality is at **root** granularity: a snapshot whose root an earlier cycle
+   walked is skipped whole. Within a cycle it is at **node** granularity through `cowfs-meta`'s
+   `Marker`, which is where the measured 4.8x comes from.
+   A persistent set of *node* ids would make a single changed file cheap too, but `Marker` does not
+   expose its contents, so that needs a change in `cowfs-meta`.
+   Until then a change to one snapshot costs one full walk of that snapshot.
 3. Condemning a block never makes it unreadable early.
    It stays readable until its pack is unlinked in step 5, and a pack that cannot be unlinked is
    left fully in place.
-4. A cancelled cycle leaves copied packs behind with no index entries.
-   Open ignores them and the next cycle reuses them, so cancellation costs disk, never data.
-5. Records are copied byte for byte.
+4. Records are copied byte for byte.
    Compaction is bounded by the read and write path, never by compression.
+5. Reclaimable space is bounded by how **lumpy** the dead data is, not by how much of it there is.
+   A pack is only rewritten when it is mostly dead, so live data spread evenly through every pack
+   leaves most of the garbage in place. That is the correct trade: rewriting a pack that is mostly
+   live costs a copy and frees almost nothing.
+6. `Store::finish_compaction` checkpoints `index.cix` per pack, which is O(entries) per pack and
+   therefore quadratic over a sweep. Dropping it to one checkpoint per cycle, or making the
+   checkpoint incremental, is the first thing to fix if a sweep over many packs is slow.
+7. One cycle runs at a time per collector: a second `collect` waits.
+   Two overlapping cycles each hold their own picture of what is live, and the second to unlink a
+   pack can free a block the first has just decided to keep.
+   The concurrency suite found exactly that, twice in eight runs, before the cycle was serialised.
+   A shared `Gc` is `Sync` and safe to call from any number of threads; it just runs them one at a
+   time. Two `Gc` handles over one store are still not a supported configuration.
+
+## Measurements
+
+Tool: `cargo run --release -p cowfs-gc --example gc_bench -- <mark|compact|garbage> <blocks> <n>`.
+Run under the shared CPU lock. Corpus is generated: 16 directories of `blocks/16` files of 64 KiB,
+half compressible, so a pack holds a realistic mix.
+
+Machine: Apple M3 Max, APFS, shared with other agents.
+Load1 during the runs below was 44 to 122, so every figure is a noisy lower bound and differences
+under about 20% are not meaningful. n is 5 for every row and the median is shown.
+
+| Metric | Median | Range | Baseline | n |
+|---|---|---|---|---|
+| Mark, 33,525 live blocks, 6 snapshots, one shared `Marker` | 0.463 s | 0.294 to 0.985 | 2.215 s with a fresh `Marker` per snapshot, 4.8x more yields (215,157 against 1,290,752) | 5 |
+| Compaction throughput, records copied | 6.1 MiB/s | 4.0 to 9.3 | 5,773,552 bytes copied per run, 8 MiB packs | 5 |
+| Collect a store that is 90% garbage, `dead_ratio` 0.5 | 1.761 s | 1.256 to 2.504 | 438.2 MiB of packs down to 134.8 MiB, 1,590,325,840 bytes freed | 5 |
+| The same at `dead_ratio` 0.1, on a smaller corpus | 0.447 s | 0.305 to 0.672 | 164.3 MiB down to 130.2 MiB | 5 |
+
+The mark row is the one that matters for the design: the incremental marking of `docs/design.md`
+is real, and 4.8x is what six snapshots sharing a tree buy at 33,525 live blocks.
+The 1,000,000-block mark of the contract was not run: creating a million 64 KiB files takes longer
+than a session, and the trend from 16,000 to 33,525 blocks is linear with no knee.
+
+The compaction row is low, and the reason is in the decision above: a per-pack checkpoint of
+`index.cix` and a per-pack scan of the candidate set.
+Both are O(entries) per pack, so a sweep over many packs is quadratic.
+At three packs per cycle, as here, that is noise; at a hundred it will not be.
 
 ## Tests
 
-- `tests/mark.rs`: shared subtrees are walked once, unchanged roots are skipped, holes are not
-  demanded, pinned blocks are marked.
-- `tests/model.rs`: model-based property test over random put, reference, unreference, snapshot
-  create and remove, and collect.
-  After every collect, every block the model says is live reads back.
-- `tests/race.rs`: writers, snapshot creation and removal, and collect all at once, with a barrier
-  that behaves like `cowfs-core`'s flusher lock.
-  Afterwards every block any snapshot references reads back.
-- `tests/crash.rs`: crash injection at every durability event of a compaction, then reopen.
-  A negative control shows the test fails when the unlink is moved before the new index is durable.
-- `tests/kill9.rs`: a child runs writes and collect, the parent SIGKILLs it at a random moment,
-  120 rounds.
-- `tests/control.rs`: a dry run leaves the store directory byte-identical, a cancelled collect
-  leaves it consistent, removing a snapshot and collecting frees exactly the expected bytes.
-- `tests/corrupt.rs`: a corrupt pack is reported and never compacted, quarantined bytes are
-  reported and kept.
+Run everything with `cargo test -p cowfs-gc`. The heavy ones are listed after.
+
+- `src/lib.rs`, `src/state.rs`: 12 unit tests. A hole is the zero id and not the hash of nothing,
+  a barrier is `None` when a caller offers none, hints survive a reload and a torn last record is
+  dropped, the cap drops hints and counts them, a corrupt or truncated state file is an empty set
+  and never an error, a full set is dropped rather than written huge, and a real `NodeId` round
+  trips through the file.
+- `tests/mark.rs`: 11 tests. Shared subtrees walked once across six forks, an unchanged root
+  skipped whole with its blocks still live, a changed root walked in full, holes never demanded of
+  the store, pinned blocks never swept and reclaimable once unpinned, the active pack never a
+  candidate, state kept out of the store directory.
+- `tests/model.rs`: one property test, 40 cases of up to 60 random steps over write, fork, unlink,
+  snapshot remove, collect and reopen, against an in-memory model of the live set.
+  The invariant is checked after every step, not just at the end: every block the model says is
+  live reads back with exactly the bytes that were put.
+- `tests/crash.rs`: 4 tests. A crash image at each of six steps of a compaction, each reopened,
+  `fsck`ed and re-collected. A negative control builds the ordering bug the protocol exists to
+  prevent, the pack holding the live blocks unlinked with no copy, and the same assertions catch
+  it: 1 of 2 live blocks gone. A cancelled collect leaves the store consistent and the next cycle
+  does the work.
+- `tests/race.rs`: 5 tests. Writers, snapshot creates, snapshot removes and collects at once for
+  1.5 s, with a barrier that behaves like `cowfs-core`'s flusher lock, checking after every collect
+  that every referenced block reads. A collector with no barrier frees and copies nothing. Two
+  collectors on one store. The stall a barrier costs a writer.
+- `tests/control.rs`: 9 tests. A dry run leaves the store directory byte-identical and still
+  reports, progress is streamed and monotonic, a cancel stops the cycle and is reported, removing
+  a snapshot reclaims exactly the bytes the report said, a read never writes and hints flush in
+  append-only batches, the I/O budget bounds a cycle, a store with known data loss is refused.
+- `tests/corrupt.rs`: 4 tests. A pack with damage to durable bytes is reported, refused by
+  `begin_compaction`, never unlinked, and makes the collector refuse the store. A gap is counted
+  and never copied away silently. A torn sidecar is reported and kept. An acknowledged store is
+  collectable again after a restart.
+- `tests/kill9.rs`: 1 test, ignored. A child writes, syncs and collects in a loop while the
+  parent SIGKILLs it at a random moment. Run:
+  `COWFS_KILL_ROUNDS=120 cargo test -p cowfs-gc --release --test kill9 -- --ignored --nocapture --test-threads 1`.
+  The measured run: 120 rounds, 309 live block reads verified, no corruption and `fsck` clean every
+  time.
+
+The benchmarks are an example, not a test: `crates/cowfs-gc/examples/gc_bench.rs`.
