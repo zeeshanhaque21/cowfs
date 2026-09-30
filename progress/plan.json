@@ -99,12 +99,12 @@
         {
           "id": "7",
           "title": "#7 chunking, hashing and block store",
-          "state": "reviewing",
+          "state": "fixing",
           "issue": 7,
-          "owner": "critic round 2 (subagent)",
+          "owner": "builder (subagent)",
           "pr": "#24",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/24",
-          "detail": "Round 1 findings F1-F10 fixed (I re-ran: 65 crate tests pass, fmt/clippy clean, CI green, BlockId/ChunkRef unchanged): put verifies before dedup, records hash-verified on rebuild, durable SYNCED watermark so a bit flip in a synced record is quarantined and reported instead of truncated, fd LRU, directory fsyncs, O(1) stats, non-blocking checkpoint, rust-version 1.89. Benchmarks (load 50-120): chunk+hash 636, ingest 8 threads 1000, verified read 525 MiB/s single thread. Perf targets still missed (800 / 1024 single thread, BLAKE3-bound); builder recommends restating per 8 threads (4170 measured). Recovery was rewritten, so a round-2 critic is attacking the watermark protocol, quarantine, resync budget, fd cache and mutants. Store never built on Rust 1.89.",
+          "detail": "Round 1 F1-F10 fixed and held (1800 simulated power-loss cases: 0 acked blocks lost, 0 wrong bytes; 3 min 8-thread stress 27.7M ops, 0 errors; builds on Rust 1.89). Round 2 verdict: NOT mergeable. N1: a benign torn write becomes permanent 'corruption' after the next sync moves the watermark over the gap (about 7% of simulated crashes), and cowfs-core refuses to mount on it. N2: watermark ahead of the packs makes sync() silently stop fsyncing. N3: a deleted middle pack is not reported. N4: a failed pack roll wedges puts forever (AlreadyExists). N5: the 64 MiB resync budget can drop a whole damaged pack from the index (1100 damaged records lost all 4095 blocks, ~3000 valid). Also 8 real mutant gaps. Builder fixing (header CRC format change, torn-tail sidecar, transactional roll, pack manifest, salvage API).",
           "ci": "CI: pass (linux, macos)"
         },
         {
