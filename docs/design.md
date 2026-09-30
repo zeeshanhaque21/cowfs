@@ -109,6 +109,11 @@ A slot is an ordinary worktree at `{pool}/{slot}/{repo}`.
 1. Dedup ratio against a real corpus: the worktree pools plus one Node project.
    Measured before any filesystem code is written.
 2. Build overhead within 1.5x of native on a representative `cargo build`, and on `git status` for a large tree.
+   Amended after spikes 2, 3 and 18 (decision recorded in issue #18):
+   - The 1.5x bar stays for Linux and for macOS clean builds and `git status`.
+   - On macOS, warm and incremental builds are measured against an absolute budget instead of a ratio, because the macOS NFS client costs about 50 microseconds per lookup against about 6 on Linux FUSE, and about 1,100 to 1,400 missing-name lookups per rebuild are structural.
+   - The provisional macOS budget is that an edit-and-rebuild of the reference crate adds under one second over native, to be confirmed against the real backend.
+   - Revisit after v1 is complete: evaluate another macOS mount route (FUSE-T, macFUSE) against this budget (issue tracked as a post-v1 follow-up).
 3. Zero data loss in crash-injection tests.
 
 ## Spikes
