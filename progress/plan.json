@@ -188,22 +188,22 @@
         {
           "id": "15",
           "title": "#15 treehouse mode (a) transparent",
-          "state": "building",
+          "state": "fixing",
           "issue": 15,
-          "owner": "subagent (space bunny)",
+          "owner": "builder (subagent)",
           "pr": "#38",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
-          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse."
+          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse. | CRITIC VERDICT: NOT mergeable. F1 `treehouse return <path>` picks the pool from the PATH and ignores --root (proved with two sandbox pools: released poolA's slot while --root named poolB) and the pin lookup then finds no lease id, so the release is unpinned: same shape as the earlier incident. F2 a failing build after get --lease never returns the slot (leak, max_trees 12). F3 15 real-treehouse tests do not skip off the author's Mac (hardcoded path; 3 pass, 12 fail in the Linux VM, the real-pool guard test panics). Surviving mutants: drop --root, terminate without --force, always unpinned. Held up: pid validation (kill(0)/kill(-1) unreachable), 5x87 tests no flakes, real pools untouched by the critic (shim), all treehouse 3.1.0 claims verified from a fresh clone. Biggest gap: the daemon-side rules for a client-chosen mount path. Builder fixing behind a sandbox shim."
         },
         {
           "id": "16",
           "title": "#16 treehouse mode (b) snapshot-native slots and warm base",
-          "state": "building",
+          "state": "fixing",
           "issue": 16,
-          "owner": "subagent (space bunny)",
+          "owner": "builder (subagent)",
           "pr": "#38",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
-          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse."
+          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse. | CRITIC VERDICT: NOT mergeable. F1 `treehouse return <path>` picks the pool from the PATH and ignores --root (proved with two sandbox pools: released poolA's slot while --root named poolB) and the pin lookup then finds no lease id, so the release is unpinned: same shape as the earlier incident. F2 a failing build after get --lease never returns the slot (leak, max_trees 12). F3 15 real-treehouse tests do not skip off the author's Mac (hardcoded path; 3 pass, 12 fail in the Linux VM, the real-pool guard test panics). Surviving mutants: drop --root, terminate without --force, always unpinned. Held up: pid validation (kill(0)/kill(-1) unreachable), 5x87 tests no flakes, real pools untouched by the critic (shim), all treehouse 3.1.0 claims verified from a fresh clone. Biggest gap: the daemon-side rules for a client-chosen mount path. Builder fixing behind a sandbox shim."
         },
         {
           "id": "17",
