@@ -237,3 +237,25 @@ fn rebuild_quarantines_a_checksum_valid_record_with_the_wrong_hash() {
     assert_eq!(s.put(&real).unwrap(), id);
     assert_eq!(s.get(id).unwrap(), real);
 }
+
+#[test]
+fn a_record_with_nonzero_padding_and_a_valid_checksum_is_quarantined() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = random(9, 300);
+    let id = BlockId::of(&d);
+    let mut rec = record(0, 300, *id.as_bytes(), &d);
+    rec[5] = 1;
+    let crc = crc32c::crc32c_append(crc32c::crc32c(&rec[..48]), &d);
+    rec[48..52].copy_from_slice(&crc.to_le_bytes());
+    let mut pack = PACK_HEADER.to_vec();
+    pack.extend_from_slice(&rec);
+    install_wm(
+        dir.path(),
+        &[(0, &pack)],
+        None,
+        Some((0, pack.len() as u64)),
+    );
+    let s = Store::open_unsynced(dir.path(), opts()).unwrap();
+    assert!(!s.contains(id));
+    assert!(s.recovery().has_corruption());
+}
