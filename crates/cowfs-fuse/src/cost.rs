@@ -54,6 +54,17 @@ impl Cost {
     }
 }
 
+/// The lane that owns inode `key`. Stable, so requests for one inode always meet the same FIFO.
+pub(crate) fn lane_index(key: u64, lanes: usize) -> usize {
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % lanes.max(1)
+}
+
+/// Appends must run on their lane even when their class is cheap: the append offset is read
+/// and used in two `Vfs` calls, and concurrent appenders on different threads would interleave.
+pub(crate) fn append_needs_lane(flags: i32) -> bool {
+    flags & libc::O_APPEND != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +95,24 @@ mod tests {
             c.record(Class::Meta, 5 * US);
         }
         assert!(c.cheap(Class::Meta));
+    }
+
+    #[test]
+    fn one_inode_always_maps_to_one_lane_and_inodes_spread() {
+        for key in [1u64, 2, 77, u64::MAX] {
+            let first = lane_index(key, 8);
+            assert!((0..100).all(|_| lane_index(key, 8) == first));
+        }
+        let used: std::collections::HashSet<_> = (1..200).map(|k| lane_index(k, 8)).collect();
+        assert_eq!(used.len(), 8);
+        assert_eq!(lane_index(5, 1), 0);
+    }
+
+    #[test]
+    fn only_appends_are_pinned() {
+        assert!(append_needs_lane(libc::O_WRONLY | libc::O_APPEND));
+        assert!(!append_needs_lane(libc::O_WRONLY));
+        assert!(!append_needs_lane(libc::O_RDWR | libc::O_CREAT));
     }
 
     #[test]

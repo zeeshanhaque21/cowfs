@@ -202,6 +202,29 @@ mod tests {
     }
 
     #[test]
+    fn offsets_are_the_vfs_cookies_plus_two_even_when_names_share_an_inode() {
+        let vfs = MemVfs::new();
+        let a = vfs.create(1, b"a", 0o644).unwrap();
+        vfs.link(a.ino, 1, b"b").unwrap();
+        vfs.link(a.ino, 1, b"c").unwrap();
+        let cookies: Vec<_> = vfs
+            .readdir(1, 0, 10)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.cookie)
+            .collect();
+        let mut sink = Collect {
+            cap: 100,
+            got: vec![],
+        };
+        fill(&vfs, 1, 1, 0, &mut sink).unwrap();
+        let offsets: Vec<_> = sink.got.iter().skip(2).map(|(o, _)| *o).collect();
+        let want: Vec<_> = cookies.iter().map(|c| *c as i64 + 2).collect();
+        assert_eq!(offsets, want);
+    }
+
+    #[test]
     fn dot_entries_carry_the_directory_and_its_parent() {
         struct Inos(Vec<(Vec<u8>, Ino)>);
         impl DirSink for Inos {

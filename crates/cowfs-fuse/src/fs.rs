@@ -22,7 +22,7 @@ use fuser::{
 use libc::c_int;
 
 use crate::convert::{self, XattrReply};
-use crate::cost::{Class, Cost};
+use crate::cost::{append_needs_lane, lane_index, Class, Cost};
 use crate::dir::{self, DirSink};
 use crate::options::MountOptions;
 use crate::table::Table;
@@ -375,7 +375,7 @@ impl Fs {
         if self.lanes.is_empty() || (!pinned && self.core.cost.cheap(class)) {
             return job();
         }
-        let i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % self.lanes.len();
+        let i = lane_index(key, self.lanes.len());
         let _ = self.lanes[i].send(Box::new(job));
     }
 
@@ -660,7 +660,7 @@ impl Filesystem for Fs {
         self.dispatch(
             Class::Write,
             ino,
-            flags & libc::O_APPEND != 0,
+            append_needs_lane(flags),
             move |c| match c.write(ino, off, &data, flags) {
                 Ok((n, stale)) => {
                     reply.written(n);

@@ -106,6 +106,12 @@ fn unlinked_open_file_is_pinned_until_release() {
     f.write_all(b"data").unwrap();
     fs::remove_file(fx.p("u")).unwrap();
     assert_eq!(f.metadata().unwrap().nlink(), 0);
+    let by_path = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&f));
+    assert_eq!(
+        fs::metadata(by_path).unwrap().nlink(),
+        0,
+        "an unlinked file that is still open keeps zero links when statted without its handle"
+    );
     let mut buf = [0u8; 4];
     f.read_exact_at(&mut buf, 0).unwrap();
     assert_eq!(&buf, b"data");
@@ -385,8 +391,8 @@ fn concurrent_appenders_do_not_overwrite_each_other() {
 
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
-fn negative_answers_expire_by_negative_ttl() {
-    let Some(fx) = Fixture::new("neg_ttl=2") else {
+fn negative_answers_expire_by_negative_ttl_not_the_entry_ttl() {
+    let Some(fx) = Fixture::new("neg_ttl=2,entry_ttl=60") else {
         return;
     };
     assert_eq!(errno(fs::metadata(fx.p("late"))), libc::ENOENT);
@@ -628,7 +634,7 @@ fn dotdot_lists_the_parent_inode() {
     fs::create_dir_all(fx.p("a/b")).unwrap();
     fs::create_dir(fx.p("c")).unwrap();
     let dots = |p: &Path| -> (u64, u64) {
-        let out = Command::new("ls").arg("-ia").arg(p).output().unwrap();
+        let out = Command::new("ls").arg("-fi").arg(p).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let find = |name: &str| {
             text.lines()

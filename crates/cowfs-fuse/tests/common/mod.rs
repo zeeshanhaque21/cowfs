@@ -183,7 +183,24 @@ pub fn errno(r: std::io::Result<impl Sized>) -> i32 {
     r.err().and_then(|e| e.raw_os_error()).unwrap_or(0)
 }
 
-/// A mounted `Probe`. A watchdog lazily unmounts after three minutes, so a hung test fails
+/// Aborts the FUSE connection of the mount at `dir` through fusectl, which fails every waiting
+/// and future request, including those of processes that hold files open on a lazily unmounted
+/// mount. Silent when fusectl is not usable.
+pub fn abort_connection(dir: &std::path::Path) {
+    let want = dir.to_string_lossy().into_owned();
+    let Ok(info) = fs::read_to_string("/proc/self/mountinfo") else {
+        return;
+    };
+    let dev = info.lines().find_map(|l| {
+        let f: Vec<_> = l.split(' ').collect();
+        (f.get(4) == Some(&want.as_str())).then(|| f[2].split(':').nth(1).map(str::to_owned))?
+    });
+    if let Some(minor) = dev {
+        let _ = fs::write(format!("/sys/fs/fuse/connections/{minor}/abort"), "1");
+    }
+}
+
+/// A mounted `Probe`. A watchdog lazily unmounts after two minutes, so a hung test fails
 /// with `ENOTCONN` instead of hanging the run.
 pub struct Fixture {
     pub mount: Option<Mount>,
@@ -214,7 +231,7 @@ impl Fixture {
         let (tx, rx) = mpsc::channel::<()>();
         let d = dir.clone();
         std::thread::spawn(move || {
-            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(Duration::from_secs(180))
+            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(Duration::from_secs(120))
             {
                 eprintln!("WATCHDOG: test hung, unmounting {}", d.display());
                 let _ = Command::new("fusermount3")
