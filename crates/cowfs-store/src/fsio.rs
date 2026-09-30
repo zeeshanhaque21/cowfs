@@ -27,6 +27,7 @@ pub enum Op {
 /// A data write, a truncation or a whole-file write, for the crash model.
 #[derive(Clone, Debug)]
 #[doc(hidden)]
+#[allow(dead_code)]
 pub enum LogOp {
     /// A positional write that is not yet durable.
     Write {
