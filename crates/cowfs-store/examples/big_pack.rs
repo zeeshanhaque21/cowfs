@@ -50,6 +50,9 @@ fn copy(from: &Path, to: &Path, index: bool) {
     }
 }
 
+/// Damages a pack file and returns the indices of the records it destroyed.
+type Damage = Box<dyn Fn(&std::fs::File) -> Vec<usize>>;
+
 fn record_range(i: usize) -> (u64, u64) {
     let start = 16 + i as u64 * REC;
     (start, start + REC)
@@ -86,7 +89,7 @@ fn main() {
         assert_eq!(ok, N);
     }
 
-    let scenarios: [(&str, Box<dyn Fn(&std::fs::File) -> Vec<usize>>); 4] = [
+    let scenarios: [(&str, Damage); 4] = [
         (
             "A zero 1MiB at offset 1MiB",
             Box::new(|f| {
