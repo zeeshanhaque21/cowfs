@@ -99,12 +99,13 @@
         {
           "id": "7",
           "title": "#7 chunking, hashing and block store",
-          "state": "building",
+          "state": "reviewing",
           "issue": 7,
-          "owner": "subagent",
+          "owner": "critic (subagent)",
           "pr": "#24",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/24",
-          "detail": "Builder is writing docs/v1-store.md, then the block store with crash-injection, corruption and model-based tests and a benchmark on real data. A separate critic reviews after. Worktree ~/.treehouse/cowfs-7c1bf8/1, branch v1/7-block-store."
+          "detail": "Builder done: 45 tests pass (I re-ran), CI green. Chunk+hash 573 MiB/s (target 800) and verified read 394 MiB/s (target 1024) missed, measured at load 35-140. Open design points: in-memory index plus checkpoint instead of redb, synced last record with bit flip is truncated as torn tail. Independent critic is attacking durability, recovery, resync forgery, concurrency and mutation-tests the suite. docs/v1-store.md",
+          "ci": "CI: pass (linux, macos)"
         },
         {
           "id": "8",
