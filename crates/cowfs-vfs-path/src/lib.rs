@@ -31,6 +31,9 @@
 //!   cargo test -p cowfs-vfs-path --test mount -j4 -- --ignored --nocapture
 //! ```
 //!
+//! `FINDINGS.md` has the FUSE and NFS driver recipes, the case-sensitive APFS and loop-mounted
+//! ext4 setups, and the full matrix.
+//!
 //! Each check gets a fresh empty subdirectory of the chosen directory and removes it afterwards.
 //! `COWFS_CONFORMANCE_FILTER=text` runs only the checks whose `category::name` contains `text`.
 //!
