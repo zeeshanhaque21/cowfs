@@ -54,6 +54,17 @@ pub(crate) enum Op {
     },
 }
 
+impl Op {
+    /// The inode a create or content operation is for.
+    fn subject(&self) -> Option<Ino> {
+        match self {
+            Op::Create { child, .. } => Some(*child),
+            Op::Content { ino, .. } => Some(*ino),
+            _ => None,
+        }
+    }
+}
+
 /// What a flush takes out of the queue.
 #[derive(Debug, Default)]
 pub(crate) struct Batch {
@@ -61,6 +72,16 @@ pub(crate) struct Batch {
     pub(crate) touched: Vec<Ino>,
     pub(crate) elided: HashSet<Ino>,
     pub(crate) seq: u64,
+}
+
+impl Batch {
+    /// Operations that reach meta: everything except those cancelled by elision.
+    pub(crate) fn applied(&self) -> usize {
+        self.ops
+            .iter()
+            .filter(|o| o.subject().is_none_or(|i| !self.elided.contains(&i)))
+            .count()
+    }
 }
 
 #[derive(Debug, Default)]

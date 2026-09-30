@@ -516,7 +516,7 @@ impl Inner {
                 self.ctr.batches.fetch_add(1, Ordering::Relaxed);
                 self.ctr
                     .ops
-                    .fetch_add(batch.ops.len() as u64, Ordering::Relaxed);
+                    .fetch_add(batch.applied() as u64, Ordering::Relaxed);
                 self.unsynced.lk().get_or_insert_with(Instant::now);
                 for ino in &batch.touched {
                     if let Some(n) = self.nodes.get(ino) {
