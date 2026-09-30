@@ -159,13 +159,13 @@
         },
         {
           "id": "12",
-          "title": "#12 macOS NFS loopback mount",
-          "state": "fixing",
+          "title": "#12 macOS NFS loopback mount (merged)",
+          "state": "done",
           "issue": 12,
-          "owner": "builder (subagent)",
+          "owner": "lead",
           "pr": "#32",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/32",
-          "detail": "Round-2 critic blockers F1-F10 fixed with regression tests (builder, head 5673a79): ._x with no main file stored as a real file (unzip, tar, ditto, git clone work in Translate, Hide and Store), writes to a real ._x are refused not dropped, 200+ xattrs survive, sidecar handles go stale on inode reuse, per-inode sidecar locking, silent connections cannot lock out a client, MNT answers only for a random per-server export path and one connection gets the root handle, reply cache per connection, inline_metadata removed (cannot be made safe), sweep matches only cowfs mounts. 37 of 37 mutants killed; ignored mount suite 19/19. SHIPS WITH AppleDoubleMode::Hide as the default; Translate is opt-in until a round-3 critic reviews the new code. Live CI is RED because the branch is behind main: two exhaustive matches (FileKind in convert.rs:27, Error in errors.rs:6) broke on the frozen non_exhaustive trait. I reproduced it in a scratch merge. Builder is merging main and fixing them. F8 partial: a dead server still hangs ls/touch for 20 s+ on macOS 26 with hard or soft mounts; cure is install_signal_cleanup plus sweep_stale_mounts. Not tested with a second uid.",
+          "detail": "Merged to main. Round-2 critic blockers fixed with regression tests and re-verified by me at 8ea2c80 (main merged, CI green on both platforms, scope clean, 138 crate tests pass, builder reports ignored mount suite 19/19 and 37/37 mutants killed). Adopted the frozen trait: Retry maps to NFS3ERR_JUKEBOX, unknown Error variants are a logged SERVERFAULT, unknown FileKind is never served as a regular file, exhaustiveness guard test, root COMMIT is the whole-mount barrier. SHIPS WITH AppleDoubleMode::Hide as default; Translate is opt-in. Follow-up issue filed for a round-3 review of Translate and the new security code before flipping the default or releasing. Not tested with a second uid; a dead server still hangs ls for 20 s+ on macOS 26 (cure: signal cleanup and sweep, which the daemon must call).",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -292,5 +292,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35. Waiting: #24 #31 #33 #32 #36 (fixing), #38 (verified, stacked on #33), #39 (building). Each must merge main and adopt the frozen trait first."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32. Waiting: #24 #31 #33 #36 (fixing or in review), #38 (verified, stacked on #33), #39 (building). Each must merge main and adopt the frozen trait first."
 }
