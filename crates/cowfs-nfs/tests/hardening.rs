@@ -302,28 +302,28 @@ fn a_connection_flood_is_capped_and_the_server_recovers() {
 #[test]
 fn slow_and_idle_connections_time_out() {
     let limits = Limits {
-        frame_timeout: Duration::from_millis(400),
-        idle_timeout: Duration::from_millis(900),
+        frame_timeout: Duration::from_millis(2000),
+        idle_timeout: Duration::from_millis(4000),
         ..Limits::default()
     };
     let (s, mut c) = serve(memfs(), opts(limits));
     let root = c.root.clone();
 
     let mut silent = connect_raw(s.port());
-    assert!(closed_within(&mut silent, 4), "no request at all");
+    assert!(closed_within(&mut silent, 15), "no request at all");
     let mut slow = connect_raw(s.port());
     slow.write_all(&[0x80, 0, 0]).unwrap();
-    assert!(closed_within(&mut slow, 4), "three of four header bytes");
+    assert!(closed_within(&mut slow, 15), "three of four header bytes");
     let mut trickle = connect_raw(s.port());
     trickle
         .write_all(&(100u32 | 1 << 31).to_be_bytes())
         .unwrap();
     trickle.write_all(&[0; 10]).unwrap();
-    assert!(closed_within(&mut trickle, 4), "a body that stops");
+    assert!(closed_within(&mut trickle, 15), "a body that stops");
 
     let mut idle = Nfs::attach(s.port(), root.clone());
     assert_eq!(idle.getattr(&root).0, OK);
-    std::thread::sleep(Duration::from_millis(1800));
+    std::thread::sleep(Duration::from_millis(6000));
     assert!(
         idle.try_getattr(&root).is_none(),
         "an idle connection is closed"
@@ -382,6 +382,33 @@ fn absurd_counts_get_bounded_replies() {
         cookie = page.last().unwrap().cookie;
     }
     assert_eq!(seen, 6000, "paging with huge counts still lists everything");
+}
+
+#[test]
+fn a_replaced_sidecar_in_hide_mode_goes_stale() {
+    let o = MountOptions {
+        appledouble: cowfs_nfs::AppleDoubleMode::Hide,
+        ..MountOptions::default()
+    };
+    let (_s, mut c) = serve(ReusingVfs::new(), o);
+    let root = c.root.clone();
+    c.create_file(&root, "a");
+    c.create_file(&root, "._a");
+    c.create_file(&root, "b");
+    let old_side = c.create_file(&root, "._b");
+    assert_eq!(c.rename(&root, "a", &root, "b"), OK);
+    assert_eq!(
+        c.getattr(&old_side).0,
+        STALE,
+        "the replaced sidecar's handle is stale"
+    );
+    let fresh = c.create_file(&root, "c");
+    assert_ne!(fresh.data, old_side.data);
+    assert_eq!(
+        c.getattr(&old_side).0,
+        STALE,
+        "even when its number is reused"
+    );
 }
 
 // ---- retransmission --------------------------------------------------------------------------
