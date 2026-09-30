@@ -188,22 +188,22 @@
         {
           "id": "15",
           "title": "#15 treehouse mode (a) transparent",
-          "state": "fixing",
+          "state": "waiting",
           "issue": 15,
-          "owner": "builder (subagent)",
+          "owner": "lead",
           "pr": "#38",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
-          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse. | Critic verdict NOT mergeable: F1 `treehouse return <path>` ignores --root (pool picked from the path) and releases unpinned; F2 failed build leaks the lease; F3 real-treehouse tests do not skip off the author's Mac. Builder fixing behind a sandbox shim."
+          "detail": "Critic blockers F1-F3 fixed, re-verified by me at 3dae005: 110 crate tests pass, fmt/clippy clean, scope clean, CI green, real pool state files byte-identical across my run (11 leased slots untouched). F1: `return`/`destroy` now refuse a slot outside the named root (three layers), release without a readable lease id is a hard error, TREEHOUSE_ROOT removed from the child env. F2/F6: LeaseGuard returns the lease on every error path. F3: binary lookup and skip reasons; in the Linux VM 108 passed, 0 failed, 25 skipped (was 3 pass, 12 fail, 1 panic). Survivors 3 of 13 mutants, all judged equivalent (one, disarm-lease-guard, not fully killed). mount_snapshot daemon rules (13 rows) documented. NOT MERGING YET: the PR is stacked on #33 (v1/13-cli), which is being redesigned (framework-enforced atomic snapshot_reset) and will change the API this crate drives; needs a re-check and a short round-2 critic after #33 lands. Also depends on cowfs-ctl mount_snapshot/unmount_snapshot and a Treehouse arm in cowfs-cli."
         },
         {
           "id": "16",
           "title": "#16 treehouse mode (b) snapshot-native slots and warm base",
-          "state": "fixing",
+          "state": "waiting",
           "issue": 16,
-          "owner": "builder (subagent)",
+          "owner": "lead",
           "pr": "#38",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
-          "detail": "Builder researches treehouse 3.1.0 hooks first (docs/v1-treehouse.md, upstream proposal if hooks are insufficient), then mode (a) setup/doctor/return wrapper (open-fd holders via ps, .nfs dirt) and mode (b) slot create/reset from the warm base, base refresh, staleness, promote, all through the control API against the stub. Sandbox-only use of the real treehouse binary with explicit --root; a test asserts ~/.treehouse state files are unchanged. Worktree slot 10, branch v1/15-16-treehouse. | Critic verdict NOT mergeable: F1 `treehouse return <path>` ignores --root (pool picked from the path) and releases unpinned; F2 failed build leaks the lease; F3 real-treehouse tests do not skip off the author's Mac. Builder fixing behind a sandbox shim."
+          "detail": "Critic blockers F1-F3 fixed, re-verified by me at 3dae005: 110 crate tests pass, fmt/clippy clean, scope clean, CI green, real pool state files byte-identical across my run (11 leased slots untouched). F1: `return`/`destroy` now refuse a slot outside the named root (three layers), release without a readable lease id is a hard error, TREEHOUSE_ROOT removed from the child env. F2/F6: LeaseGuard returns the lease on every error path. F3: binary lookup and skip reasons; in the Linux VM 108 passed, 0 failed, 25 skipped (was 3 pass, 12 fail, 1 panic). Survivors 3 of 13 mutants, all judged equivalent (one, disarm-lease-guard, not fully killed). mount_snapshot daemon rules (13 rows) documented. NOT MERGING YET: the PR is stacked on #33 (v1/13-cli), which is being redesigned (framework-enforced atomic snapshot_reset) and will change the API this crate drives; needs a re-check and a short round-2 critic after #33 lands. Also depends on cowfs-ctl mount_snapshot/unmount_snapshot and a Treehouse arm in cowfs-cli."
         },
         {
           "id": "17",
@@ -284,5 +284,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25. Waiting: #24 (fixing), #31 (critic running), #33 (fixing), #35 (fixing), #32 #36 (fixing), #38 (fixing), #39 (building). Each must merge main and adopt the frozen trait first."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25. Waiting on a critic or fixer: #24 #31 #32 #33 #35 #36 #39. #38 is verified but stacked on #33 (API changing): merges after #33 plus a short round-2 critic. Each must merge main and adopt the frozen trait first."
 }
