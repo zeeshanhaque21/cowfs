@@ -360,14 +360,14 @@ Machine: Apple M3 Max, APFS, shared with about 20 other sessions, load1 between 
 | `COWFS_CRASH_SEEDS=3 COWFS_CRASH_OPS=120 cargo test -p cowfs-core --test crash` | 280 crash images over 3 workloads, 0 failures; negative control fails as required |
 | `COWFS_KILL_ROUNDS=120 cargo test -p cowfs-core --test kill9` | 120 rounds, 7,849 steps completed, 7,400 fsynced steps, 0 failures, 0 rounds killed before the first step |
 | `PROPTEST_CASES=300 cargo test -p cowfs-core --test model` | 2 tests, 300 cases each, 0 failures |
-| default `cargo test -p cowfs-core` | see the verification run in the PR |
+| full verification command (fmt, clippy -D warnings, `cargo test --workspace`, `cargo doc`) after the last meta merge | exit 0; 386 s wall including a build, at load1 46 to 85 |
 
 Defaults are smaller than these runs to keep `cargo test --workspace` short: 1 crash workload of 60 operations, 8 kill rounds, 32 and 24 proptest cases.
 `COWFS_CRASH_SEEDS`, `COWFS_CRASH_OPS`, `COWFS_KILL_ROUNDS` and `PROPTEST_CASES` raise them.
 
 ## Measurements
 
-Source: `cargo run --release -p cowfs-core --example bench` (`COWFS_BENCH_QUICK=1` for a smoke run), after the merge of the meta fixes.
+Source: `cargo run --release -p cowfs-core --example core_bench` (`COWFS_BENCH_QUICK=1` for a smoke run), after the merge of the meta fixes.
 Every timed batch ran under the shared CPU lock, n=5, median shown, ranges in the raw output.
 Load1 was 54 at the start and 47 at the end and between 66 and 111 during the rows, so every row is flagged high load.
 The baseline is the same operation with `std::fs` on the same APFS volume.

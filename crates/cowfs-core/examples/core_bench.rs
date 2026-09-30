@@ -1,6 +1,6 @@
 //! Benchmark of `Core` against raw `std::fs` on the same file system.
 //!
-//! `cargo run --release -p cowfs-core --example bench` prints a Markdown table. `COWFS_BENCH_QUICK=1`
+//! `cargo run --release -p cowfs-core --example core_bench` prints a Markdown table. `COWFS_BENCH_QUICK=1`
 //! shrinks every size for a smoke run. Each timed batch runs under the shared CPU lock directory
 //! (`COWFS_CPU_LOCK`, default the spikes lock) and records `uptime` load before and after.
 //! Scratch data goes under `COWFS_BENCH_DIR` (default `target/bench-tmp`).
