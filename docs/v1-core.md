@@ -27,21 +27,28 @@ Core::open(dir, Options)  ->  <dir>/store/  (cowfs-store)
 |---|---|---|
 | mount root | `1` | synthetic directory that lists snapshots |
 | meta-derived | `(snapshot id << 40) \| meta inode`, snapshot id in `1..2^23`, meta inode below `2^40` | a file that exists in meta |
-| virtual | `1 << 63 \| n` | a file created through this `Core` that was not yet committed when its number was handed out |
+| virtual | `1 << 63 \| (snapshot id << 40) \| n` | a file created through this `Core` that was not yet committed when its number was handed out |
 
 The meta-derived form is computed, not stored, so it needs no table, is stable across restarts, and is unique across snapshots because the snapshot id is part of it.
 Two snapshots that share content report different numbers for the same file, so `find -samefile` and `rsync -H` do not see them as hardlinks.
 Snapshot roots are `(id << 40) | 1`.
 An inode whose snapshot id is not a live snapshot is `Stale`.
 
+The virtual form is `1 << 63 | (snapshot id << 40) | n`, where `n` comes from a counter.
 The virtual form exists because `create`, `mkdir` and `symlink` must return an `Ino` at once, while the write-back layer commits them later, and meta only assigns inode numbers inside a transaction.
-A virtual number is allocated from a counter.
 When the batch that creates the file commits, meta reports its real inode number and `Core` records the pair in an alias table (virtual to meta, and meta to virtual).
-From then on `lookup`, `readdir` and every other path canonicalise the meta number to the virtual one, so a file has exactly one `Ino` for as long as the mount lives.
-The alias entry is dropped when the file is deleted and unreferenced.
-An alias costs about 40 bytes per file created by this mount session that still exists.
-Virtual numbers do not survive a restart: after a restart the same file has its meta-derived number.
-No adapter keeps file handles across a restart of the process that owns the mount, so this is documented and accepted.
+From then on `lookup`, `readdir` and every other path canonicalise the meta number to the virtual one, so a file has exactly one `Ino` while anything can still hold it.
+
+**The counter is durable.** `<root>/virt.ino` holds the highest number handed out, written and synced in blocks of 2^20 before any number of the block is used (`Options::alias_batch` is unrelated; the block size is `VIRT_BLOCK`).
+A crash can therefore waste numbers but never reuse one, and a number from an earlier session is `Stale` rather than another file's data.
+The mark is written twice (value, then the same value again), so a torn write is refused at open instead of believed.
+Tests: `virtual_inode_numbers_are_never_reused_across_a_restart` (a clean reopen) and `the_virtual_number_reservation_survives_a_crash` (a child process that aborts without syncing, three times in a row).
+
+**Aliases are released.** Once a file is committed, has no unflushed bytes, is not unlinked, and no caller holds a reference or a handle, its alias is dropped and its number reverts to the meta-derived one.
+The dentry cache stores meta-derived numbers only and canonicalises every hit, so releasing an alias cannot leave a cached name pointing at a number nothing knows (`DCache::retarget` re-points a committed create's entry, and only if it still names that inode, so a rename or unlink in between is not undone).
+A released number used again as a directory gives `Stale`, not a silent `NotFound` (`Inner::is_released_virt`).
+Tests: `aliases_drain_for_committed_files_with_no_references` (20,000 creates leave 1 alias and 2 nodes; 500,000 leave 130), `a_referenced_file_keeps_its_number_across_a_flush`, `live_blocks_filters_holes_and_yields_only_stored_blocks`.
+
 Snapshot ids and meta inode numbers are never reused, so a number never names two files.
 The meta-derived number is exactly `Meta::pack_ino(snapshot id, meta inode)`, so the layout is meta's and restart stable by construction.
 A test (`an_inode_number_is_never_reused_for_another_file`) checks that no number names two files across unlink and create, snapshot delete and create, and two restarts.
@@ -55,8 +62,40 @@ Its `nlink` is 2 plus the number of snapshots.
 `create`, `mkdir`, `symlink`, `link`, `unlink`, `rmdir`, `rename`, `setattr` with a size, `write`, and `setxattr` on the root return `ReadOnly`; `rename` between two snapshots is `CrossDevice`; `link` across snapshots is `CrossDevice`.
 `setattr` of mode or times on the root is accepted and ignored.
 
-Snapshot names: 1 to 255 bytes, valid UTF-8, no `/`, no NUL, not `.` or `..`, not starting with `._` (AppleDouble) or `.nfs` (NFS silly rename).
-The adapters and the OS create names such as these, so allowing them would make a snapshot that a mount cannot see.
+Snapshot names follow exactly the rule `cowfs-ctl` enforces (`crates/cowfs-ctl/src/validate.rs` on branch `v1/13-cli`), which is what the CLI's tests pin: non-empty, at most 255 bytes, no `/`, no control character (NUL, newline, ESC and tab included), no leading `.` (which also rules out `.`, `..`, `._*` and `.nfs*`).
+The collision key of a name is NFC, lowercased, NFC again (`cowfs_core::name_key`), so `Café`, `cafe` + combining acute and `CAFÉ` are one name and a backend must refuse to hold two.
+The rules and the test table are copied into one small module, `src/snapname.rs`, so the two can be reconciled into a shared crate when the branches land (see "Requests of store and meta").
+The API takes `&str`, so a name is UTF-8 by construction; `validate_snapshot_name_bytes` is what an adapter or the control API calls on bytes that came off a wire, and it refuses non-UTF-8.
+Test: `snapshot_names_follow_the_cli_rules`.
+
+## Snapshot replacement is crash-safe
+
+`cowfs-meta` has no atomic rename of a snapshot, so `Core` cannot replace a name in one transaction.
+Every replacement (`rename_snapshot`, and `promote_base` which may overwrite) goes through `src/swap.rs`:
+
+1. fork the source into a staging name (a failure here changes nothing),
+2. write and sync the intent file `<root>/swap-<target>`, naming the staging and target snapshots,
+3. remove the old target,
+4. fork the staging snapshot into the target name,
+5. remove the staging snapshot,
+6. remove the intent file.
+
+Any failure before step 3 leaves the old target untouched.
+Any failure or crash from step 3 on leaves the intent file, and the next `Core::open` finishes steps 4 to 6 before it serves anything.
+So a snapshot name never disappears without a record that explains it, and a failed swap never costs the old base.
+The two forks change the snapshot id, so every inode number in the new snapshot differs from the old one's.
+
+Test: `promote_base_survives_a_failure_at_every_step` injects a failure at each of the five steps (`Core::set_swap_fault`, a doc-hidden test seam), checks the content before the reopen, reopens, and checks that recovery completed the swap or left the old base, with no staging snapshot and no intent file left.
+
+## One damaged block poisons one file, not the snapshot
+
+A read-modify-write of a damaged chunk fails at the write, not later.
+`Inner::verify_partial` checks every stored chunk that a write only partially covers before the write is recorded, so `write` returns `EIO` (`Error::Corrupt`) instead of silently writing new bytes around garbage; a fully covered chunk is never read, because its old bytes are not needed.
+When a file's flush fails anyway (for example a store cut by an external tool), the file is poisoned: its node records the reason and every later operation on that file (`read`, `write`, `setattr` with a size, `fsync`, `flush`) returns it.
+The rest of the snapshot's queue still commits, other files' `fsync` still makes their data durable, and `fork`, `readdir` barrier and `sync` on that snapshot keep working, because a poisoned file's data is simply not queued (its bytes stay in memory and stay counted in `Stats::dirty_bytes`).
+The file's dirty bytes are dropped when the inode is reclaimed, that is when it is unlinked and the unlink commits; `Stats::poisoned` counts the events.
+
+Tests: `a_damaged_chunk_fails_its_own_file_and_nothing_else`, `a_damaged_chunk_found_by_a_truncate_poisons_only_that_file`, `a_healthy_file_is_durable_after_its_fsync_while_another_is_poisoned`, `a_damaged_block_does_not_stop_a_promote`.
 
 ## Control plane
 
@@ -65,8 +104,8 @@ The adapters and the OS create names such as these, so allowing them would make 
 | `create_snapshot(name)` | one durable meta commit | empty tree |
 | `fork_snapshot(src, name)` | O(1): flush of `src`'s pending operations, then one meta row | writable clone |
 | `remove_snapshot(name)` | proportional to nodes unique to it | refused with `Busy` while any handle is open in it |
-| `rename_snapshot(old, new)` | fork plus remove | changes the snapshot id and so every inode number in it, refused while handles are open. Request 1 below removes this. |
-| `promote_base(src, base)` | fork plus remove of the old `base` | not atomic across a crash: between the two steps there is no `base`. Request 1. |
+| `rename_snapshot(old, new)` | the staged swap in `src/swap.rs` | crash-safe and error-safe (see "Snapshot replacement is crash-safe"); changes the snapshot id and so every inode number in it, refused while handles are open |
+| `promote_base(src, base)` | the staged swap, replacing an existing `base` | crash-safe and error-safe; two O(1) forks |
 | `list_snapshots()` | one read | |
 | `merkle_root(name)` | flush of that snapshot, then one read | root only covers committed state, so it flushes first |
 | `sync()` | flush of everything, then `Meta::sync` | |
@@ -205,6 +244,7 @@ Blocks that were just put are cached.
 ## Caches and invalidation
 
 - Dentry cache: per directory, name to `Some(child, kind)` or `None` (a negative entry), bounded to `Options::dentry_cache` entries, evicting clean entries only.
+  A cached `child` is always a meta-derived number; a create that has not committed yet is the one exception and is re-pointed at its meta number when the batch commits (`DCache::retarget`), so a released virtual alias can never leave a cached name pointing at a number nothing knows.
   This is where the cargo warm-build lookups land (about 14,000 missing and 2,000 existing per rebuild, issue #18).
 - Node table: inode to `Arc<Node>` (attributes, symlink target, file data), evicting nodes that are clean, unreferenced, have no handle and are not in use by a running operation.
 - Block cache as above.
@@ -255,10 +295,47 @@ One table, `error::from_meta` and `error::from_store`, tested case by case.
 
 ## Concurrency and locks
 
-Order: namespace lock, then flush lock, then node locks, then the queue mutex, then a cache shard mutex.
-No lock is held across a store `get` for a read, or across a meta commit, except the flush lock (which only other committers wait on) and the write lock of the one file being flushed to the store.
-Lookup, getattr, read and readdir of a clean directory take no namespace or flush lock, so they are never queued behind a commit.
-A batch commit is done with no namespace lock held, so namespace operations continue while it runs.
+There is ONE global order, and it is enforced by construction rather than by inspection:
+
+1. `SnapCtx::ns` (namespace), then `SnapCtx::flush`, then `SnapCtx::q`.
+2. The node write lock of the file being written (`Node::st`), then the queue mutex, then a cache shard mutex (`nodes`, `dents`, `blocks`).
+3. **The meta lock is a leaf.** No lock of ours is taken while a meta read or write transaction is open, and no lock of ours is held while a meta transaction is opened.
+4. `snaps`, `aliases`, `handles`, `root_time`, `pressure`, `unsynced` and `last_error` are leaves: taken alone, or with the SnapCtx locks above them and never below them.
+
+Rule 3 is the one that matters and the one that was broken twice:
+
+- `ensure_file` and `ensure_target` used to hold the node write lock while reading a file's chunk list, while `commit` read every touched node's state inside the meta writer lock (`restore_state`).
+  That is a cycle: a reader waits for the meta writer, the committer waits for the node.
+  The critic reproduced it as a hang (`d1_deadlock_ensure_file_vs_commit`, "no progress for 10 s, progress=7211"), and the stack showed both sides: readers in `op_read -> ensure_file -> Snapshot::chunks` and the committer in `Core::flush -> commit -> Snapshot::batch -> mutate`.
+  Now `ensure_file` reads meta first and publishes under the node lock, and `commit` takes a snapshot of every touched node's `(mode, atime, mtime)` (`Inner::restore_states`) before it opens the batch.
+- `ShardMap::retain` used to take a blocking node read lock while holding a shard lock, and `try_reclaim` takes a node lock and then the shard lock.
+  Every closure that runs under a shard lock now uses `try_read` and keeps the entry it cannot read, so a shard lock is never held across a node lock.
+
+Full audit of every multi-lock site, by file and function:
+
+| Site | Locks held together | Order |
+|---|---|---|
+| `Inner::flush_snapshot`, `Inner::barrier` | `sc.flush`, then `sc.q`, then node locks, then `aliases`, then meta | 1, 2, 3 |
+| `Inner::commit_batch` | `sc.flush` (from the caller), node read locks (before meta), `aliases` (before meta), meta, then node locks again | 1, 2, 3 |
+| `Inner::flush_data` | `sc.flush`, `sc.q` (released), then one node write lock at a time | 1, 2 |
+| `Inner::maybe_drop_alias`, `Inner::try_reclaim` | node read lock, then `nodes` shard, then `aliases` | 2 |
+| `Inner::drop_stale_aliases` | `aliases`, then a `nodes` shard lookup with `try_read` | 2 |
+| `Inner::alloc_virt`, `Inner::reserve_virt` | `virt_lock`, then the file system | leaf |
+| `Inner::ensure_file`, `ensure_target` | meta (no lock), then the node write lock | 3 then 2 |
+| `Inner::dent_lookup` | `aliases` (released per call), then meta, then a dentry shard | 3 then 2 |
+| `Inner::pinned_blocks`, `drop_caches`, `Inner::unregister` | `nodes` shard with `try_read`, `dents` shards, then `aliases` | 2 |
+| `ns::op_rename`, `ns::op_link`, `ns::op_unlink`, `ns::op_rmdir` | `sc.ns`, then `barrier` (`sc.flush`), then node locks, then `sc.q` | 1 |
+| `ns::rename_dir` | `sc.ns` (held by the caller), `sc.flush` inside the barrier, meta | 1, 3 |
+| `ns::make`, `ns::require_empty`, `ns::adjust_kids` | `sc.ns`, node write locks, `sc.q`, a `nodes` shard, a `dents` shard, `snaps` read | 1, 2 |
+| `io::op_write`, `io::op_setattr`, `io::op_setxattr` | node write lock, then `sc.q`; store reads and writes under the node lock; `sc.ns` and `sc.flush` only before it | 1, 2 |
+| `io::op_fsync` | node read lock, `sc.flush`, meta, `snaps` read | 1, 3 |
+| `io::op_forget`, `io::op_release` | `handles` (released), then node, then `nodes` shard, then `aliases` | 2 |
+| `lib::Core::Guard::drop`, background flusher | `bg` mutex, `sc.flush` per snapshot, meta, store | 1, 3 |
+| `lib::unregister`, `lib::add_snap` | `sc.ns`, `sc.flush`, `sc.q`, `snaps` write, shards, `aliases` | 1, 2 |
+| `blocks::get`, `blocks::put` | `gens` lock (released around store IO) | leaf |
+| `dcache` shard functions | one shard; the eviction closure reads a precomputed map | leaf |
+
+Tests that hold the order in place: `locks.rs` runs a cold read of a not-yet-loaded file against a thread that drops caches, chmods every file and commits, with a watchdog that dumps thread stacks and fails the test on no progress (`cold_read_of_a_file_concurrent_with_a_commit_never_deadlocks`, the critic's repro), and `mixed_lock_stress_for_a_minute_never_deadlocks` runs eight readers, writers, creators, unlinkers, a directory-renaming thread, a fork/remove/rename/merkle thread and a sync thread for 60 s (the same watchdog), then checks `check()` and a clean `fsck`.
 
 ## Cost
 
@@ -278,10 +355,10 @@ A batch commit is done with no namespace lock held, so namespace operations cont
 
 ## Requests of store and meta
 
-State at the merge of `origin/v1/8-9-meta` (commit 687ff4b) and `origin/v1/7-block-store`.
+State at the merge of `origin/v1/8-9-meta` (commit 9abe96e) and `origin/v1/7-block-store` (commit 1c00c1e), plus `origin/v1/vfs-test` (5cc6008) and `origin/v1/vfs-trait` (1825081).
 None of these blocks the crate, each has a workaround stated here.
 
-Landed and adopted: `before_sync` after the batch closure, `Meta::close`, `Meta::pack_ino`, the durable inode reservation (numbers are never reused), the store's `corrupt_synced` refusal, the new error variants (mapped in the error table).
+Landed and adopted: `before_sync` after the batch closure, `Meta::close`, `Meta::pack_ino`, the durable inode reservation (numbers are never reused), the store's `corrupt_synced` refusal, the store's v2 pack format and recovery classification, the new error variants (mapped in the error table), the store op log.
 Landed and not yet used by `Core`: `Snapshot::chunk_range`, `Tx::splice_content` (with the version check) and `Error::NeedsRechunk`.
 `Core` still reads a file's whole chunk list on first use and commits it with `set_content`, which is O(chunks in the file) per commit.
 Moving to `chunk_range` and `splice_content` is the next step for multi-GiB files and is not needed at the measured sizes.
@@ -289,24 +366,28 @@ Moving to `chunk_range` and `splice_content` is the next step for multi-GiB file
 Not landed:
 
 1. `Meta::rename_snapshot(id, new_name)` (atomic, keeps the id).
-   Workaround: fork plus remove, which changes ids and is not atomic.
-   Also a way to replace snapshot `base` by another in one transaction for `promote_base`.
+   Workaround: the staged swap with an intent record in `src/swap.rs` (see "Snapshot replacement is crash-safe"), which needs no meta change and survives a crash or an error at every step.
+   It still changes the id (two forks), which the lead may or may not care about.
 2. `Snapshot::batch_at(now: Timestamp, f)` or `Tx::set_now`, so that ctime (and creation times) of deferred operations are the times the operations happened.
    Workaround: atime and mtime are restored with `setattr`; ctime in meta is the batch time, up to `flush_interval` late.
    Cached ctime is exact while the node is cached.
 3. A first-class hole flag in `ChunkRef` (`ChunkRef` is in the store crate).
    Workaround: an all-zero block id is a hole.
-   GC (#10) must skip those refs, must not free blocks named only by an open orphan or by an uncommitted chunk list (`Core::pinned_blocks`), and must not free a block put after its mark started.
+   GC (#10) must use `Core::live_blocks`, which filters hole refs, and must not free blocks named only by an open orphan or by an uncommitted chunk list (`Core::pinned_blocks`), and must not free a block put after its mark started.
 4. `Meta::reserve_inodes(n)` or `Tx::create_with_ino`, which would remove the virtual inode numbers and the alias table.
    Meta now reserves durably inside itself, but a caller still cannot get a number before the transaction that creates the inode.
+5. A crate for the snapshot-name rule shared by the backend and the control API.
+   `cowfs_core::validate_snapshot_name`, `validate_snapshot_name_bytes` and `name_key` are copied from `cowfs-ctl`'s `validate.rs` with its test table (`src/snapname.rs`) because the two are on different branches; they should become one crate, and `validate.rs` should then depend on it instead of duplicating it.
 
 ## Decisions for the lead to review
 
 1. Virtual inode numbers with an alias table, in place of asking meta for a reservation.
-2. Directory rename, replacing a directory, and readdir of a directory with pending changes are barriers.
+   The counter is durable in `<root>/virt.ino` and aliases are released once nothing can hold their number, so the table is bounded (130 aliases after 500,000 creates).
+2. Directory rename, replacing a directory, and readdir of a directory with pending changes are barriers, but a barrier commits only the namespace.
+   Unrelated files' dirty data is not flushed: a `readdir` of one directory with 48 MiB of dirty data in another file costs 0.14 ms at the median and never chunks the unrelated data (test `a_directory_barrier_does_not_flush_unrelated_file_data`; before the fix the same call flushed all 48 MiB and took 5.9 s on this loaded box).
 3. Timestamps: atime and mtime exact, ctime in meta is batch time (request 2).
-4. `rename_snapshot` and `promote_base` change ids and are not atomic (request 1).
-5. Holes are zero-id chunk refs (request 3).
+4. `rename_snapshot` and `promote_base` go through a staged swap with a crash-safe intent record; they change ids and are atomic only in the sense that a name is never lost (request 1).
+5. Holes are zero-id chunk refs; `Core::live_blocks` filters them for GC (request 3).
 6. No atime update on read.
 7. Data lost on crash is bounded by the write-back limits above; content updates can commit later than later namespace operations.
 8. Snapshot removal is refused while a handle is open in it, and makes its inode numbers `Stale` even when references remain.
@@ -315,6 +396,9 @@ Not landed:
    The lead should decide whether that check should stay at the `Cowfs` level before GC exists.
 10. The `Core` open path refuses a store that lost durable data (see "Opening a damaged store").
 11. Two conformance-relevant readings that changed with the revised suite: `readdir` with `max` 0 is `InvalidArgument`, and an xattr name with a NUL is `InvalidArgument`.
+12. Snapshot names follow `cowfs-ctl`'s rule and collision key, copied into `src/snapname.rs` rather than depended on, until one shared crate exists (request 5).
+13. A file whose flush fails is poisoned for the life of the mount: every operation on it reports the store error and the rest of the queue keeps committing.
+14. Virtual inode numbers come from a durable mark in `<root>/virt.ino`, and an alias is released as soon as nothing can hold its number, so a number never names two files and the table stays bounded.
 
 ## Tests
 
@@ -323,13 +407,20 @@ Counts are from the runs recorded below (`cargo test -p cowfs-core` after mergin
 
 | Category | File | Tests | What it proves |
 |---|---|---|---|
-| Unit | `src/` | 11 | inode shapes, alias table, error tables (meta and store, case by case), file extents, holes, truncate, append chunking |
-| Conformance | `conformance.rs` | 127 pass, 2 heavy | the whole `cowfs-vfs-test` suite through a `Core` snapshot view (levels Posix, Portable, Cowfs), plus the 2 heavy checks run separately |
+| Unit | `src/` | 14 | inode shapes, alias table, virtual-number mark (including a torn one), error tables (meta and store, case by case), file extents, holes, truncate, append chunking, snapshot-name rules and collision keys |
+| Conformance | `conformance.rs` | 132 pass, 2 heavy | the whole `cowfs-vfs-test` suite through a `Core` snapshot view (levels Posix, Portable, Cowfs), plus the 2 heavy checks run separately |
 | Core behaviour | `core.rs` | 18 | mount root, snapshot rules, fork isolation both ways, persistence, dedup by byte counts, 1 TiB sparse file with RSS bound, forget accounting over 100,000 create and unlink cycles, batching, corrupt block is EIO, damaged store refused, Merkle root iff content, control plane, unlink while open, elision, background flusher, inode numbers never reused |
+| Locks | `locks.rs` | 2 | the critic's deadlock repro as a test with a stack-dumping watchdog, plus a 60 s mixed stress of every multi-lock operation |
+| Swap | `swap.rs` | 3 | failure injected at every step of a snapshot replacement, the intent record's recovery on reopen, a damaged store inside a swap, rename failure safety |
+| Poison | `poison.rs` | 3 | a damaged chunk is EIO at the write, poisons only its own file, leaves other files' `fsync` durable, and does not stop a promote |
+| Names and inode numbers | `names_ino.rs` | 4 | the CLI's name rules and collision keys, virtual numbers never reused across a clean reopen or a process that aborts |
+| Aliases | `alias.rs` | 2 | the alias table stays bounded over 20,000 (and 500,000) creates, a referenced or open file keeps its number |
+| Caches and blocks | `caches.rs` | 2 | a directory barrier does not flush unrelated data, `live_blocks` filters holes and yields only stored blocks |
+| Ported from the critic | `critic.rs` | 3 pass, 4 heavy | truncate leaves no stale bytes, a store that lost durable data is refused by name, reader stall during a slow write; heavy: fsx, 180 s hammer, barrier storm, 500,000 files |
 | Model | `model.rs` | 2 proptests | `Core` against `MemVfs` on random sequences including forks, handles, restarts and cache drops, with tiny and default cache sizes |
-| Partial chunks | `chunks.rs` | 2 proptests and 1 boundary test | random write, truncate and extend against a `Vec<u8>`, offsets and lengths on and around 16 KiB, 64 KiB and 256 KiB, with eager flushing and with cache drops; sequential appends dedup with a one-shot write |
-| Crash images | `crash.rs` | 2 | power-loss simulation, see below, plus a negative control that must fail |
-| kill -9 | `kill9.rs` | 1 (plus the child) | SIGKILL of a writing process with the background flusher on |
+| Partial chunks | `chunks.rs` | 2 proptests, 2 boundary tests | random write, truncate and extend against a `Vec<u8>`, offsets and lengths on and around 16 KiB, 64 KiB and 256 KiB, with eager flushing and with cache drops; sequential appends dedup with a one-shot write; writes ending one byte before, at and one byte after real chunk boundaries read back byte for byte |
+| Crash images | `crash.rs` | 2 | power-loss simulation, see below, plus a negative control that must fail; built through `Core::open_with_meta` so the store sync hook is wired by the production path |
+| kill -9 | `kill9.rs` | 1 (plus the child) | SIGKILL of a writing process with the background flusher on, through `Core::open` |
 | Stress | `stress.rs` | 3 | overlapping writers to one file, many files with snapshot forks and renames, directory churn, all under a deadlock watchdog |
 
 The 8,000 hardlink pairs, delete-while-listing and the read-only-mode 0444 and 0400 checks (20 rounds of 8 MiB with fsync) are conformance checks and run through `Core`.
@@ -355,19 +446,31 @@ Machine: Apple M3 Max, APFS, shared with about 20 other sessions, load1 between 
 
 | Run | Result |
 |---|---|
-| `cargo test -p cowfs-core --test conformance` | 127 passed, 0 failed, 2 ignored (heavy) |
+| `cargo test -p cowfs-core --test conformance` | 132 passed, 0 failed, 2 ignored (heavy) |
 | `COWFS_CONFORMANCE_HEAVY=1 cargo test -p cowfs-core --test conformance -- --ignored` | 2 passed (`roundtrip_8_mib`, `readdir_50000_entries`) |
+| `cargo test -p cowfs-core` (whole crate, after the meta, store, vfs-test and vfs merges) | 0 failed, 413 s |
 | `COWFS_CRASH_SEEDS=3 COWFS_CRASH_OPS=120 cargo test -p cowfs-core --test crash` | 280 crash images over 3 workloads, 0 failures; negative control fails as required |
 | `COWFS_KILL_ROUNDS=120 cargo test -p cowfs-core --test kill9` | 120 rounds, 7,849 steps completed, 7,400 fsynced steps, 0 failures, 0 rounds killed before the first step |
 | `PROPTEST_CASES=300 cargo test -p cowfs-core --test model` | 2 tests, 300 cases each, 0 failures |
+| `FSX_OPS=100000 FSX_SEED=1 cargo test -p cowfs-core --release --test critic -- --ignored fsx` | 100,000 ops, 0 mismatches, 406 s |
+| `FSX_OPS=100000 FSX_SEED=2 cargo test -p cowfs-core --release --test critic -- --ignored fsx` | 100,000 ops, 0 mismatches, 439 s |
+| `HAMMER_SECS=180 cargo test -p cowfs-core --release --test critic -- --ignored hammer` | 180 s, 98,360 overlapping writes, 0 torn blocks, same content after a reopen |
+| `cargo test -p cowfs-core --release --test critic -- --ignored barrier_storm` | 2,000 create-then-list cycles in 2.39 s (1.2 ms per barrier), 2,000 batches |
+| `N_FILES=500000 cargo test -p cowfs-core --release --test critic -- --ignored many_files` | 500,000 files in 38.9 s, 131 nodes, 130 aliases, 192,600 dentries (bounded by the cache), 0 pending |
+| `LOCK_STRESS_SECS=60 cargo test -p cowfs-core --test locks -- mixed` | 60 s of 12 concurrent threads, no deadlock, `check()` clean, `fsck` clean |
+| `python3 scripts/mutants.py` (14 mutants, per-mutant `CARGO_TARGET_DIR`) | 14 killed, 0 survivors (`target/benchout/mutants-after-critic-fixes.out`) |
 | full verification command (fmt, clippy -D warnings, `cargo test --workspace`, `cargo doc`) after the last meta merge | exit 0; 386 s wall including a build, at load1 46 to 85 |
 
+The two mutants the first round of this review survived are now killed: `m01` (the store sync hook not wired in the production path) by `crash.rs`, which now goes through `Core::open_with_meta` so the wiring is in production code, and `m05` (a read-modify-write that drops the last byte) by the new real-chunk-boundary test in `chunks.rs`.
+
 Defaults are smaller than these runs to keep `cargo test --workspace` short: 1 crash workload of 60 operations, 8 kill rounds, 32 and 24 proptest cases.
-`COWFS_CRASH_SEEDS`, `COWFS_CRASH_OPS`, `COWFS_KILL_ROUNDS` and `PROPTEST_CASES` raise them.
+`COWFS_CRASH_SEEDS`, `COWFS_CRASH_OPS`, `COWFS_KILL_ROUNDS`, `PROPTEST_CASES`, `LOCK_STRESS_SECS`, `HAMMER_SECS`, `FSX_OPS`, `FSX_SEED`, `N_FILES` and `ALIAS_FILES` raise them.
 
 ## Measurements
 
-Source: `cargo run --release -p cowfs-core --example core_bench` (`COWFS_BENCH_QUICK=1` for a smoke run), after the merge of the meta fixes.
+### Benchmark
+
+Source: `cargo run --release -p cowfs-core --example core_bench` (`COWFS_BENCH_QUICK=1` for a smoke run, `COWFS_BENCH_ONLY=seq` and `COWFS_BENCH_REPEAT=n` to run one section repeatedly).
 Every timed batch ran under the shared CPU lock, n=5, median shown, ranges in the raw output.
 Load1 was 54 at the start and 47 at the end and between 66 and 111 during the rows, so every row is flagged high load.
 The baseline is the same operation with `std::fs` on the same APFS volume.
@@ -408,10 +511,27 @@ What they show and do not show:
   It now seeds the node table from the lookup's attributes.
   Its effect was not isolated at n=5 under this load, so no speedup is claimed; by construction it removes one meta read per cold hit.
 
+### Lock discipline and stall measurements
+
+| Measurement | Result |
+|---|---|
+| `a_directory_barrier_does_not_flush_unrelated_file_data`: `readdir` of a directory with 48 MiB of dirty data in another file, n=5 | p50 0.14 ms, max 0.039 s (the first call pays the meta commit), dirty bytes unchanged; a full `sync` of the same 48 MiB took 12.0 s |
+| before the fix (same call, pre-`034db42` build) | flushed all 48 MiB (dirty 50,331,648 to 0) and took 5.95 s |
+| `aliases_drain_for_committed_files_with_no_references`, 20,000 creates | 1 alias, 2 nodes, 3,617 dentries; RSS growth from 5,000 to 20,000 files 1.4 KiB per file |
+| same, 500,000 creates (`ALIAS_FILES=500000`) | 130 aliases, 131 nodes, RSS growth from 5,000 to 500,000 files 122 bytes per file; the residue is redb mapping a growing database file (967 bytes per file measured on `cowfs-meta` alone), not a per-file map |
+| `reader_stall_during_a_slow_write`: a 1 GiB write in flight (52.3 s of storing) while another file is stat'd, looked up and read, release | getattr p50 2.4 us, max 8.0 ms; lookup p50 4.0 us, max 8.9 ms; read p50 6.4 us, max 14.9 ms |
+| `barrier_storm`: 2,000 create-then-list cycles | 2.39 s total, 1.2 ms per barrier |
+
+The cold-read profile (`sample`, 26 windows of 2 s over a `core_bench --only seq` run at load1 86 to 98, 116,023 samples) splits the busy time as roughly 51 percent kernel write and read syscalls, 31 percent the benchmark's own data generator, 11 percent BLAKE3 over all samples and 6 percent `memcpy`; the windows that land entirely in the read are 84 to 87 percent `memcpy`.
+So the read path's cost here is copying, not hashing, and the obvious cheap win is one copy too many (store decompression into the block cache, then the cache into the caller's buffer) rather than anything about the hash.
+This was not pursued further, per the instruction not to spend long on it.
+
 ## Known gaps
 
 - Chunk lists are loaded whole and committed whole (see "Requests of store and meta").
 - Blocks of deleted data are only reclaimed by GC (#10), so `statfs` free space does not grow after a flushed file is deleted.
 - Only `fsync` and the timers make data durable; `flush` does nothing.
-- The virtual inode numbers and the alias table remain until meta can hand out inode numbers ahead of a transaction.
+- The virtual inode numbers need the `<root>/virt.ino` mark and the alias table still exists (both bounded now) until meta can hand out inode numbers ahead of a transaction.
+- A poisoned file stays poisoned for the life of the mount; there is no repair operation, only removing it.
+- The cold read path copies twice per chunk and the profile says that is where its time goes (see above).
 - No mount adapter has been run against `Core` yet; the suite runs through the `Vfs` trait only.
