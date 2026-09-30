@@ -80,7 +80,7 @@ pub fn fill(vfs: &dyn Vfs, dir: Ino, offset: i64, sink: &mut dyn DirSink) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stub::TestVfs;
+    use cowfs_vfs_test::{Fault, MemVfs};
 
     struct Collect {
         cap: usize,
@@ -97,7 +97,7 @@ mod tests {
         }
     }
 
-    fn list_all(vfs: &TestVfs, dir: Ino, page: usize) -> Vec<Vec<u8>> {
+    fn list_all(vfs: &MemVfs, dir: Ino, page: usize) -> Vec<Vec<u8>> {
         let mut names = Vec::new();
         let mut offset = 0;
         loop {
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn lists_dots_then_entries_in_pages_without_repeats() {
-        let vfs = TestVfs::default();
+        let vfs = MemVfs::new();
         for i in 0..1000 {
             vfs.create(1, format!("f{i}").as_bytes(), 0o644).unwrap();
         }
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn stops_when_the_buffer_is_full_on_a_dot_entry() {
-        let vfs = TestVfs::default();
+        let vfs = MemVfs::new();
         let mut sink = Collect {
             cap: 0,
             got: vec![],
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn deleting_while_listing_neither_repeats_nor_skips() {
-        let vfs = TestVfs::default();
+        let vfs = MemVfs::new();
         for i in 0..600 {
             vfs.create(1, format!("f{i:04}").as_bytes(), 0o644).unwrap();
         }
@@ -195,18 +195,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_offsets_and_cookies_that_do_not_advance() {
+    fn rejects_bad_offsets_and_unrepresentable_cookies() {
         struct Bad;
         impl DirSink for Bad {
             fn add(&mut self, _: Ino, _: i64, _: FileKind, _: &[u8]) -> bool {
                 false
             }
         }
-        let vfs = TestVfs::default();
+        let vfs = MemVfs::new();
         vfs.create(1, b"a", 0o644).unwrap();
         assert!(fill(&vfs, 1, 2, &mut Bad).is_ok());
         assert_eq!(fill(&vfs, 1, -3, &mut Bad), Err(Error::InvalidArgument));
-        vfs.break_cookies();
-        assert!(matches!(fill(&vfs, 1, 2, &mut Bad), Err(Error::Io(_))));
+        let broken = MemVfs::with_fault(Fault::DotEntries);
+        assert_eq!(fill(&broken, 1, 2, &mut Bad), Err(Error::Range));
     }
 }

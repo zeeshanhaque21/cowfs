@@ -11,9 +11,9 @@ use std::process::Command;
 use std::sync::Arc;
 
 use cowfs_vfs::{Vfs, ROOT_INO};
+use cowfs_vfs_test::MemVfs;
 use tempfile::TempDir;
 
-use crate::stub::TestVfs;
 use crate::{Mount, MountOptions};
 
 fn fuse_usable() -> bool {
@@ -29,7 +29,7 @@ fn fuse_usable() -> bool {
 
 struct Fixture {
     mount: Option<Mount>,
-    vfs: Arc<TestVfs>,
+    vfs: Arc<MemVfs>,
     dir: PathBuf,
     _tmp: TempDir,
 }
@@ -39,7 +39,7 @@ impl Fixture {
         Self::with(opts, |_| {})
     }
 
-    fn with(opts: &str, prepare: impl FnOnce(&TestVfs)) -> Option<Self> {
+    fn with(opts: &str, prepare: impl FnOnce(&MemVfs)) -> Option<Self> {
         if !fuse_usable() {
             eprintln!("SKIP: /dev/fuse or fusermount3 not usable");
             return None;
@@ -47,8 +47,7 @@ impl Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("mnt");
         fs::create_dir(&dir).unwrap();
-        let owner = fs::metadata(tmp.path()).unwrap();
-        let vfs = Arc::new(TestVfs::new(owner.uid(), owner.gid()));
+        let vfs = Arc::new(MemVfs::new());
         prepare(&vfs);
         let opts: MountOptions = opts.parse().unwrap();
         let mount = Mount::new(vfs.clone(), &dir, opts).unwrap();
@@ -318,8 +317,7 @@ fn run_blocks_until_unmounted_from_outside() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("mnt");
     fs::create_dir(&dir).unwrap();
-    let owner = fs::metadata(tmp.path()).unwrap();
-    let vfs: Arc<dyn Vfs> = Arc::new(TestVfs::new(owner.uid(), owner.gid()));
+    let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
     let d = dir.clone();
     let t = std::thread::spawn(move || crate::run(vfs, d, MountOptions::default()));
     for _ in 0..100 {
@@ -347,7 +345,7 @@ fn mounting_a_missing_directory_fails_cleanly() {
     if !fuse_usable() {
         return;
     }
-    let vfs: Arc<dyn Vfs> = Arc::new(TestVfs::default());
+    let vfs: Arc<dyn Vfs> = Arc::new(MemVfs::new());
     let r = Mount::new(
         vfs,
         "/nonexistent/cowfs-mountpoint",
@@ -420,6 +418,6 @@ fn bench_latency_floor() {
     ] {
         let Some(fx) = Fixture::new(opts) else { return };
         let report = crate::bench::measure(&fx.dir, &crate::bench::Config::default()).unwrap();
-        println!("== bench, TestVfs, {label}\n{report}");
+        println!("== bench, MemVfs, {label}\n{report}");
     }
 }

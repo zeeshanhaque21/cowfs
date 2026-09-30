@@ -6,8 +6,8 @@
 //!
 //! The defaults (see [`MountOptions`]) let the kernel cache names, attributes and file pages
 //! for an hour. That is only correct while every change to the tree goes through this mount.
-//! A change made any other way must be announced with [`Mount::invalidate_inode`] and
-//! [`Mount::invalidate_entry`].
+//! A change made any other way must be announced with `Mount::invalidate_inode` and
+//! `Mount::invalidate_entry`.
 //!
 //! # Threading
 //!
@@ -42,5 +42,3 @@ pub use mount::{run, Mount};
 
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests;
-#[cfg(test)]
-mod stub;

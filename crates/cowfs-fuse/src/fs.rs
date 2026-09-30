@@ -25,23 +25,42 @@ const BLKSIZE: u32 = 4096;
 pub(crate) struct Fs {
     vfs: Arc<dyn Vfs>,
     opts: MountOptions,
+    uid: u32,
+    gid: u32,
+}
+
+/// The effective uid and gid of this process, which own every file on the mount.
+#[allow(unsafe_code)]
+fn mounter() -> (u32, u32) {
+    // SAFETY: geteuid and getegid take no arguments, touch no memory and cannot fail.
+    unsafe { (libc::geteuid(), libc::getegid()) }
 }
 
 impl Fs {
     pub(crate) fn new(vfs: Arc<dyn Vfs>, opts: MountOptions) -> Self {
-        Self { vfs, opts }
+        let (uid, gid) = mounter();
+        Self {
+            vfs,
+            opts,
+            uid,
+            gid,
+        }
+    }
+
+    fn file_attr(&self, a: &Attr) -> FileAttr {
+        file_attr(a, self.uid, self.gid)
     }
 
     fn entry(&self, r: Result<Attr>, reply: ReplyEntry) {
         match r {
-            Ok(a) => reply.entry(&self.opts.entry_ttl, &file_attr(&a), 0),
+            Ok(a) => reply.entry(&self.opts.entry_ttl, &self.file_attr(&a), 0),
             Err(e) => reply.error(e.errno()),
         }
     }
 
     fn attr(&self, r: Result<Attr>, reply: ReplyAttr) {
         match r {
-            Ok(a) => reply.attr(&self.opts.attr_ttl, &file_attr(&a)),
+            Ok(a) => reply.attr(&self.opts.attr_ttl, &self.file_attr(&a)),
             Err(e) => reply.error(e.errno()),
         }
     }
@@ -79,7 +98,7 @@ fn file_type(kind: FileKind) -> FileType {
     }
 }
 
-fn file_attr(a: &Attr) -> FileAttr {
+fn file_attr(a: &Attr, uid: u32, gid: u32) -> FileAttr {
     FileAttr {
         ino: a.ino,
         size: a.size,
@@ -91,8 +110,8 @@ fn file_attr(a: &Attr) -> FileAttr {
         kind: file_type(a.kind),
         perm: u16::try_from(a.mode & MODE_MASK).unwrap_or(0),
         nlink: a.nlink,
-        uid: a.uid,
-        gid: a.gid,
+        uid,
+        gid,
         rdev: 0,
         blksize: BLKSIZE,
         flags: 0,
@@ -304,7 +323,7 @@ impl Filesystem for Fs {
             Err(e) => return reply.error(e.errno()),
         };
         match self.vfs.open(attr.ino) {
-            Ok(h) => reply.created(&self.opts.entry_ttl, &file_attr(&attr), 0, h.0, 0),
+            Ok(h) => reply.created(&self.opts.entry_ttl, &self.file_attr(&attr), 0, h.0, 0),
             Err(e) => {
                 self.vfs.forget(attr.ino, 1);
                 reply.error(e.errno());
@@ -449,7 +468,16 @@ impl Filesystem for Fs {
 
     fn access(&mut self, req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
         match self.vfs.getattr(ino) {
-            Ok(a) if convert::access_allowed(a.mode, a.uid, a.gid, req.uid(), req.gid(), mask) => {
+            Ok(a)
+                if convert::access_allowed(
+                    a.mode,
+                    self.uid,
+                    self.gid,
+                    req.uid(),
+                    req.gid(),
+                    mask,
+                ) =>
+            {
                 reply.ok();
             }
             Ok(_) => reply.error(libc::EACCES),
@@ -509,15 +537,15 @@ mod tests {
             kind: FileKind::Symlink,
             mode: 0o7777,
             nlink: 3,
-            uid: 11,
-            gid: 12,
+            uid: 0,
+            gid: 0,
             size: 9,
             blocks: 1,
             atime: t,
             mtime: t,
             ctime: t,
         };
-        let f = file_attr(&a);
+        let f = file_attr(&a, 11, 12);
         assert_eq!(
             (f.ino, f.size, f.blocks, f.nlink, f.uid, f.gid),
             (7, 9, 1, 3, 11, 12)

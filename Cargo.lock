@@ -81,6 +81,7 @@ name = "cowfs-fuse"
 version = "0.0.0"
 dependencies = [
  "cowfs-vfs",
+ "cowfs-vfs-test",
  "fuser",
  "libc",
  "log",

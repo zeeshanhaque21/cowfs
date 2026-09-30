@@ -17,6 +17,7 @@ thiserror.workspace = true
 fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
 
 [dev-dependencies]
+cowfs-vfs-test = { path = "../cowfs-vfs-test" }
 tempfile.workspace = true
 
 [lints]
