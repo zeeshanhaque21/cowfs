@@ -327,3 +327,23 @@ pub fn timestamps_track_wall_clock(c: &Ctx) -> Outcome {
     }
     Ok(())
 }
+
+/// cowfs contract: freeing the last name of a file (and dropping every reference) returns its
+/// space. A native filesystem shares its free space with other users, so this is not portable.
+pub fn statfs_free_after_unlink(c: &Ctx) -> Outcome {
+    let before = c.fs.statfs()?.blocks_free;
+    let f = c.file(ROOT_INO, "f")?;
+    c.write_all(f, 0, &super::pattern(1 << 20, 1))?;
+    ensure!(
+        c.fs.statfs()?.blocks_free < before,
+        "writing 1 MiB did not consume space"
+    );
+    c.fs.unlink(ROOT_INO, b"f")?;
+    c.forget_all(f);
+    ensure_eq!(
+        c.fs.statfs()?.blocks_free,
+        before,
+        "blocks_free after unlinking the only name"
+    );
+    Ok(())
+}

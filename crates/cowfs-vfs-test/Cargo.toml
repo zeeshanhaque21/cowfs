@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 cowfs-vfs = { path = "../cowfs-vfs" }
+libc = "0.2"
 
 [dev-dependencies]
 proptest.workspace = true

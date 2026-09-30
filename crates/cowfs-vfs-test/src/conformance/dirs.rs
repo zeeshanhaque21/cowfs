@@ -38,10 +38,10 @@ pub fn mkdir_rmdir_errors(c: &Ctx) -> Outcome {
         Error::NotDir,
         "rmdir of a symlink to a directory"
     );
-    ensure_err!(
+    ensure_err_any!(
         c.fs.unlink(ROOT_INO, b"d"),
-        Error::IsDir,
-        "unlink of a directory"
+        [Error::IsDir, Error::PermissionDenied],
+        "unlink of a directory (POSIX allows EISDIR or EPERM)"
     );
     ensure_err!(
         c.fs.rmdir(ROOT_INO, b"missing"),

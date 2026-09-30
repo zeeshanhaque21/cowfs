@@ -5,7 +5,7 @@
 //! values up to 60,000 bytes work (larger ones are backend defined: `Range` or success);
 //! `listxattr` returns each name once and the order is stable while the set is unchanged.
 
-use cowfs_vfs::{Error, XattrFlags, ROOT_INO};
+use cowfs_vfs::{Error, XattrFlags, NAME_MAX, ROOT_INO};
 
 use super::{pattern, Ctx, Outcome};
 
@@ -200,6 +200,42 @@ pub fn xattr_shared_by_hardlinks(c: &Ctx) -> Outcome {
         c.fs.getxattr(h, b"user.a"),
         Error::NoAttr,
         "a new file starts without attributes"
+    );
+    Ok(())
+}
+
+/// cowfs contract: an attribute name is 1 to `NAME_MAX` bytes without NUL. Linux and APFS
+/// disagree on the errno for the rest (ERANGE, EINVAL), so `InvalidArgument` and `Range` are
+/// both accepted, and `NameTooLong` for an over-long name.
+pub fn xattr_name_validation(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    ensure_err_any!(
+        c.fs.setxattr(f, b"", b"v", NONE),
+        [Error::InvalidArgument, Error::Range],
+        "empty attribute name"
+    );
+    ensure_err_any!(
+        c.fs.setxattr(f, b"user.a\0b", b"v", NONE),
+        [Error::InvalidArgument, Error::Range],
+        "attribute name with a NUL"
+    );
+    let long = vec![b'x'; NAME_MAX + 1];
+    ensure_err_any!(
+        c.fs.setxattr(f, &long, b"v", NONE),
+        [Error::Range, Error::NameTooLong, Error::InvalidArgument],
+        "attribute name of {} bytes",
+        long.len()
+    );
+    ensure!(
+        c.fs.listxattr(f)?.is_empty(),
+        "a rejected setxattr left an attribute behind"
+    );
+    let max = vec![b'y'; NAME_MAX];
+    c.fs.setxattr(f, &max, b"v", NONE)?;
+    ensure_eq!(
+        c.fs.getxattr(f, &max)?,
+        b"v".to_vec(),
+        "attribute with a {NAME_MAX} byte name"
     );
     Ok(())
 }
