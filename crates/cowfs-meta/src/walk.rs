@@ -117,7 +117,7 @@ impl Iterator for LiveBlocks<'_> {
         if self.failed {
             return None;
         }
-        match self.step() {
+        match crate::error::guard(|| self.step()) {
             Ok(b) => b.map(Ok),
             Err(e) => {
                 self.failed = true;

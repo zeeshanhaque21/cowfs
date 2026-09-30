@@ -1,5 +1,6 @@
 //! Database handle, snapshots, and the transaction plumbing.
 
+use crate::error::guard;
 use crate::node::NodeId;
 use crate::ptree::{MemTree, NodeWriter};
 use crate::read::{self, RoView};
@@ -13,6 +14,7 @@ use redb::{
     WriteTransaction,
 };
 use std::io;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -73,8 +75,30 @@ struct SyncState {
     last_sync: Instant,
 }
 
+/// Owns the redb handle so a panic in redb's close-time commit on a damaged file cannot escape `drop`.
+pub(crate) struct Db(Option<Database>);
+
+impl std::ops::Deref for Db {
+    type Target = Database;
+
+    fn deref(&self) -> &Database {
+        match &self.0 {
+            Some(db) => db,
+            None => unreachable!("database used after drop"),
+        }
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let Some(db) = self.0.take() {
+            let _ = catch_unwind(AssertUnwindSafe(move || drop(db)));
+        }
+    }
+}
+
 pub(crate) struct Inner {
-    pub(crate) db: Database,
+    pub(crate) db: Db,
     opts: Options,
     node_max: usize,
     state: Mutex<SyncState>,
@@ -121,19 +145,21 @@ impl Inner {
         if durable {
             self.run_hook()?;
         }
-        let wtx = self.begin(durable)?;
-        let (out, changed) = f(&wtx)?;
-        if !changed {
-            return Ok(out);
-        }
-        wtx.commit()?;
-        if durable {
-            st.pending = 0;
-            st.last_sync = Instant::now();
-        } else {
-            st.pending += 1;
-        }
-        Ok(out)
+        guard(|| {
+            let wtx = self.begin(durable)?;
+            let (out, changed) = f(&wtx)?;
+            if !changed {
+                return Ok(out);
+            }
+            wtx.commit()?;
+            if durable {
+                st.pending = 0;
+                st.last_sync = Instant::now();
+            } else {
+                st.pending += 1;
+            }
+            Ok(out)
+        })
     }
 
     pub(crate) fn sync(&self) -> Result<()> {
@@ -142,10 +168,12 @@ impl Inner {
             return Ok(());
         }
         self.run_hook()?;
-        self.begin(true)?.commit()?;
-        st.pending = 0;
-        st.last_sync = Instant::now();
-        Ok(())
+        guard(|| {
+            self.begin(true)?.commit()?;
+            st.pending = 0;
+            st.last_sync = Instant::now();
+            Ok(())
+        })
     }
 }
 
@@ -222,14 +250,12 @@ pub struct Meta {
 impl Meta {
     /// Opens the database at `path`, creating it if the file is missing or empty.
     pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Meta> {
-        let db = builder(&opts).create(path)?;
-        Self::init(db, opts)
+        guard(|| Self::init(builder(&opts).create(path)?, opts.clone()))
     }
 
     /// Like [`Meta::open`] on a caller-supplied redb backend (used by crash-injection tests).
     pub fn open_with_backend(backend: impl StorageBackend, opts: Options) -> Result<Meta> {
-        let db = builder(&opts).create_with_backend(backend)?;
-        Self::init(db, opts)
+        guard(|| Self::init(builder(&opts).create_with_backend(backend)?, opts.clone()))
     }
 
     fn init(db: Database, opts: Options) -> Result<Meta> {
@@ -274,7 +300,7 @@ impl Meta {
         };
         Ok(Meta {
             inner: Arc::new(Inner {
-                db,
+                db: Db(Some(db)),
                 node_max,
                 state: Mutex::new(SyncState {
                     pending: 0,
@@ -346,38 +372,44 @@ impl Meta {
 
     /// Opens a snapshot by name.
     pub fn snapshot(&self, name: &str) -> Result<Snapshot> {
-        let rtx = self.inner.db.begin_read()?;
-        let id = rtx
-            .open_table(SNAP_NAMES)?
-            .get(name)?
-            .map(|g| g.value())
-            .ok_or(Error::NoSuchSnapshot)?;
-        Ok(Snapshot {
-            inner: self.inner.clone(),
-            id: SnapshotId(id),
+        guard(|| {
+            let rtx = self.inner.db.begin_read()?;
+            let id = rtx
+                .open_table(SNAP_NAMES)?
+                .get(name)?
+                .map(|g| g.value())
+                .ok_or(Error::NoSuchSnapshot)?;
+            Ok(Snapshot {
+                inner: self.inner.clone(),
+                id: SnapshotId(id),
+            })
         })
     }
 
     /// Opens a snapshot by id.
     pub fn snapshot_by_id(&self, id: SnapshotId) -> Result<Snapshot> {
-        let rtx = self.inner.db.begin_read()?;
-        read_snap(&rtx.open_table(SNAPSHOTS)?, id)?;
-        Ok(Snapshot {
-            inner: self.inner.clone(),
-            id,
+        guard(|| {
+            let rtx = self.inner.db.begin_read()?;
+            read_snap(&rtx.open_table(SNAPSHOTS)?, id)?;
+            Ok(Snapshot {
+                inner: self.inner.clone(),
+                id,
+            })
         })
     }
 
     /// Lists all snapshots in id order.
     pub fn snapshots(&self) -> Result<Vec<SnapshotInfo>> {
-        let rtx = self.inner.db.begin_read()?;
-        rtx.open_table(SNAPSHOTS)?
-            .iter()?
-            .map(|r| {
-                let (k, v) = r?;
-                decode_snap(k.value(), v.value())
-            })
-            .collect()
+        guard(|| {
+            let rtx = self.inner.db.begin_read()?;
+            rtx.open_table(SNAPSHOTS)?
+                .iter()?
+                .map(|r| {
+                    let (k, v) = r?;
+                    decode_snap(k.value(), v.value())
+                })
+                .collect()
+        })
     }
 
     /// Removes a snapshot and frees every tree node no other snapshot shares.
@@ -402,7 +434,7 @@ impl Meta {
 
     /// Verifies every structural and semantic invariant. See `docs/v1-meta.md`.
     pub fn check(&self) -> Result<()> {
-        crate::check::check(&self.inner)
+        guard(|| crate::check::check(&self.inner))
     }
 }
 
@@ -466,8 +498,10 @@ impl Snapshot {
 
     /// Name, root, creation time and parent of this snapshot.
     pub fn info(&self) -> Result<SnapshotInfo> {
-        let rtx = self.inner.db.begin_read()?;
-        read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)
+        guard(|| {
+            let rtx = self.inner.db.begin_read()?;
+            read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)
+        })
     }
 
     /// The Merkle root of this snapshot's tree.
@@ -484,11 +518,13 @@ impl Snapshot {
     }
 
     fn read<T>(&self, f: impl FnOnce(&RoView) -> Result<T>) -> Result<T> {
-        let rtx = self.inner.db.begin_read()?;
-        let root = read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)?.root;
-        f(&RoView {
-            nodes: rtx.open_table(NODES)?,
-            root,
+        guard(|| {
+            let rtx = self.inner.db.begin_read()?;
+            let root = read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)?.root;
+            f(&RoView {
+                nodes: rtx.open_table(NODES)?,
+                root,
+            })
         })
     }
 
@@ -536,16 +572,19 @@ impl Snapshot {
     /// `marker` once fully walked. Sharing one `marker` across snapshots therefore costs only the
     /// nodes that differ. A block may be yielded more than once.
     pub fn live_blocks<'m>(&self, marker: &'m mut Marker) -> Result<LiveBlocks<'m>> {
-        let rtx = self.inner.db.begin_read()?;
-        let root = read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)?.root;
-        LiveBlocks::new(rtx.open_table(NODES)?, root, marker)
+        guard(|| {
+            let rtx = self.inner.db.begin_read()?;
+            let root = read_snap(&rtx.open_table(SNAPSHOTS)?, self.id)?.root;
+            LiveBlocks::new(rtx.open_table(NODES)?, root, marker)
+        })
     }
 
     /// Runs several operations in one transaction: all commit together or none do.
     pub fn batch<T>(&self, f: impl FnOnce(&mut Tx<'_>) -> Result<T>) -> Result<T> {
         let id = self.id;
         let node_max = self.inner.node_max;
-        self.inner.write(false, |wtx| {
+        let mut user_panic = None;
+        let res = self.inner.write(false, |wtx| {
             let mut snaps = wtx.open_table(SNAPSHOTS)?;
             let mut meta = wtx.open_table(META)?;
             let info = read_snap(&snaps, id)?;
@@ -556,7 +595,13 @@ impl Snapshot {
                 next_ino,
                 now: Timestamp::now(),
             };
-            let out = f(&mut tx)?;
+            let out = match catch_unwind(AssertUnwindSafe(|| f(&mut tx))) {
+                Ok(r) => r?,
+                Err(p) => {
+                    user_panic = Some(p);
+                    return Err(Error::Invalid("batch closure panicked"));
+                }
+            };
             if tx.tree.unchanged() {
                 return Ok((out, false));
             }
@@ -575,6 +620,10 @@ impl Snapshot {
             }
             meta.insert("next_ino", tx.next_ino)?;
             Ok((out, true))
-        })
+        });
+        if let Some(p) = user_panic {
+            resume_unwind(p);
+        }
+        res
     }
 }

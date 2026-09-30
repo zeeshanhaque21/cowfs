@@ -487,3 +487,23 @@ fn many_files_split_the_tree_and_check_passes() {
     m.check().unwrap();
     assert_eq!(s.readdir(ROOT_INO, 0, 5000).unwrap().entries.len(), 1000);
 }
+
+#[test]
+fn panic_in_a_batch_closure_propagates_and_aborts_the_batch() {
+    let (_d, m) = open();
+    let s = m.new_snapshot("main").unwrap();
+    let before = s.root().unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = s.batch(|tx| {
+            tx.create(ROOT_INO, b"a", 0o644)?;
+            if tx.lookup(ROOT_INO, b"a").is_ok() {
+                panic!("boom");
+            }
+            Ok(())
+        });
+    }));
+    assert!(r.is_err());
+    assert_eq!(s.root().unwrap(), before);
+    s.create(ROOT_INO, b"a", 0o644).unwrap();
+    m.check().unwrap();
+}

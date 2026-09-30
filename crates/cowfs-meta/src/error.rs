@@ -77,3 +77,16 @@ from_redb!(
     redb::CommitError,
     redb::SetDurabilityError
 );
+
+/// Runs `f`, turning a panic inside the storage layer into [`Error::Corrupt`].
+///
+/// redb 4.3 can panic on some damaged pages instead of returning an error; a corrupt file must
+/// never take the process down. Panics from caller code (batch closures, the sync hook) are
+/// re-raised by their call sites and never pass through here.
+pub(crate) fn guard<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        Err(Error::Corrupt(
+            "storage layer panicked on damaged data".into(),
+        ))
+    })
+}
