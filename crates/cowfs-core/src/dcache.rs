@@ -105,6 +105,22 @@ impl DCache {
         }
     }
 
+    /// Re-points an entry from one inode number to another, and only if it still names `from`
+    /// (a rename or unlink since the create must not be undone).
+    pub(crate) fn retarget(&self, dir: Ino, name: &[u8], from: Ino, to: (Ino, FileKind)) {
+        let mut s = self.shard(dir);
+        let Some(d) = s.dirs.get_mut(&dir).and_then(|m| m.get_mut(name)) else {
+            return;
+        };
+        if d.target.is_some_and(|(i, _)| i == from) {
+            *d = Dent {
+                target: Some(to),
+                seq: d.seq,
+            };
+            s.epoch += 1;
+        }
+    }
+
     pub(crate) fn bump_all(&self) {
         for s in &*self.shards {
             s.lk().epoch += 1;

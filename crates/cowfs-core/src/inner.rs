@@ -43,6 +43,8 @@ pub struct Options {
     pub block_cache_bytes: usize,
     /// Run the background flusher thread. Without it only explicit flushes and thresholds commit.
     pub background: bool,
+    /// The alias table is swept when it holds this many entries.
+    pub alias_batch: usize,
 }
 
 impl Default for Options {
@@ -59,6 +61,7 @@ impl Default for Options {
             node_cache: 131_072,
             block_cache_bytes: 128 << 20,
             background: true,
+            alias_batch: 4096,
         }
     }
 }
@@ -80,6 +83,8 @@ pub struct Stats {
     pub flush_errors: u64,
     /// Files whose flush failed and are poisoned.
     pub poisoned: u64,
+    /// Virtual aliases released because nothing held their number.
+    pub aliases_dropped: u64,
     /// Dentry cache hits and misses.
     pub dentry_hits: u64,
     /// See `dentry_hits`.
@@ -106,6 +111,7 @@ pub(crate) struct Counters {
     pub(crate) flush_errors: AtomicU64,
     /// Files whose flush failed and are therefore poisoned.
     pub(crate) poisoned: AtomicU64,
+    pub(crate) aliases_dropped: AtomicU64,
     pub(crate) dhit: AtomicU64,
     pub(crate) dmiss: AtomicU64,
     pub(crate) inodes_net: AtomicI64,
@@ -218,6 +224,28 @@ impl Inner {
         Ok(())
     }
 
+    /// Releases aliases whose node has left the node table or is no longer eligible.
+    fn drop_stale_aliases(&self) {
+        if self.aliases.rd().len() < self.opts.alias_batch {
+            return;
+        }
+        let mut al = self.aliases.wr();
+        // keep every alias that is NOT eligible for release: a pinned node (a caller may hold the
+        // number), one with unflushed data, an unlinked one, or one with no node at all
+        let keep: Vec<Ino> = al
+            .live()
+            .filter(|ino| {
+                self.nodes.get(ino).is_none_or(|n| {
+                    n.pinned()
+                        || n.st
+                            .try_read()
+                            .map_or(true, |st| st.dirty_bytes() > 0 || st.attr.nlink == 0)
+                })
+            })
+            .collect();
+        al.retain_only(&keep);
+    }
+
     pub(crate) fn meta_of(&self, ino: Ino) -> Option<u64> {
         match classify(ino) {
             Id::Meta { m, .. } => Some(m),
@@ -304,6 +332,27 @@ impl Inner {
         Err(Error::Stale)
     }
 
+    /// True for a virtual number whose file is committed to meta but whose alias is gone, so the
+    /// number itself is no longer known. A create that is still queued has no alias yet and is
+    /// perfectly good.
+    fn virt_committed_without_alias(&self, ino: Ino) -> bool {
+        if !matches!(classify(ino), Id::Virt { .. }) || self.aliases.rd().meta_of(ino).is_some() {
+            return false;
+        }
+        let Ok(sc) = self.snapctx(ino) else {
+            return true;
+        };
+        let fl = sc.flushed();
+        self.nodes.get(&ino).is_none_or(|n| {
+            n.seq.load(Ordering::Acquire) <= fl && n.ns_seq.load(Ordering::Acquire) <= fl
+        })
+    }
+
+    /// True for a virtual inode number that is committed but whose alias was released.
+    fn is_released_virt(&self, ino: Ino) -> bool {
+        self.virt_committed_without_alias(ino)
+    }
+
     /// The node for `ino`, unless it is an unlinked file nobody holds any more.
     pub(crate) fn live(&self, ino: Ino) -> Result<Arc<Node>> {
         let n = self.node(ino)?;
@@ -314,7 +363,13 @@ impl Inner {
     }
 
     /// A live directory node together with its snapshot.
+    ///
+    /// A virtual number whose alias was released (nothing held it, so its number was free to
+    /// change) is `Stale`, not a silent "no such name".
     pub(crate) fn dir(&self, ino: Ino) -> Result<(Arc<SnapCtx>, Arc<Node>)> {
+        if self.is_released_virt(ino) {
+            return Err(Error::Stale);
+        }
         let sc = self.snapctx(ino)?;
         let n = self.live(ino)?;
         if n.st.rd().attr.kind != FileKind::Directory {
@@ -377,10 +432,32 @@ impl Inner {
     }
 
     /// Resolves `name` in `parent` through the dentry cache, then meta.
+    /// Resolves `name` in `parent` through the dentry cache, then meta.
+    ///
+    /// The cache stores META-derived inode numbers only, and every hit is canonicalised through
+    /// [`Inner::canon`], so releasing a virtual alias (nothing holds its number any more) cannot
+    /// leave a cached entry pointing at a number the mount no longer knows.
     pub(crate) fn dent_lookup(&self, sc: &SnapCtx, parent: &Node, name: &[u8]) -> Result<Target> {
+        let canon = |t: Target| -> Result<Target> {
+            t.map(|(i, k)| match classify(i) {
+                // a pending create still has its virtual number; it is re-pointed at the meta
+                // number when the batch commits, and an unlink replaces it
+                Id::Meta { snap, m } => Ok((self.canon(snap, m)?, k)),
+                _ => Ok((i, k)),
+            })
+            .transpose()
+        };
         if let Some(d) = self.dents.get(parent.ino, name) {
-            self.ctr.dhit.fetch_add(1, Ordering::Relaxed);
-            return Ok(d.target);
+            // A cached pending create whose alias was released (a rename before the batch
+            // committed leaves the entry naming the old name's number) must not be believed:
+            // fall through to meta, which has the committed number.
+            let stale_virt = d
+                .target
+                .is_some_and(|(i, _)| self.virt_committed_without_alias(i));
+            if !stale_virt {
+                self.ctr.dhit.fetch_add(1, Ordering::Relaxed);
+                return canon(d.target);
+            }
         }
         self.ctr.dmiss.fetch_add(1, Ordering::Relaxed);
         let Some(pm) = self.meta_of(parent.ino) else {
@@ -389,12 +466,15 @@ impl Inner {
         let epoch = self.dents.epoch(parent.ino);
         match sc.snap.lookup(mino(pm), name) {
             Ok(a) => {
-                let child = self.canon(sc.id, a.ino.0)?;
-                self.seed_node(child, &a);
-                let t = Some((child, kind_of(a.kind)));
+                let meta_ino = pack(sc.id, a.ino.0)?;
+                let t = Some((meta_ino, kind_of(a.kind)));
                 self.dents.fill(parent.ino, name, t, epoch);
                 self.shrink_dents(parent.ino);
-                Ok(t)
+                let out = canon(t);
+                if let Ok(Some((c, _))) = out {
+                    self.seed_node(c, &a);
+                }
+                out
             }
             Err(cowfs_meta::Error::NotFound) => {
                 self.dents.fill(parent.ino, name, None, epoch);
@@ -469,6 +549,42 @@ impl Inner {
             node.st.wr().xattrs = Some(map);
         }
         Ok(())
+    }
+
+    /// Drops a virtual alias once nothing can still be holding its number: the file is committed,
+    /// nobody holds a reference or a handle, and it has no unflushed data.
+    /// Its number reverts to the meta-derived one, which is what a caller sees after a restart
+    /// anyway. A dentry entry keeps working because the dentry cache holds meta numbers and every
+    /// hit is canonicalised through `canon`.
+    fn maybe_drop_alias(&self, node: &Arc<Node>) {
+        if self.aliases.rd().meta_of(node.ino).is_none() {
+            return;
+        }
+        if node.pinned()
+            || node
+                .st
+                .try_read()
+                .map_or(true, |st| st.dirty_bytes() > 0 || st.attr.nlink == 0)
+        {
+            return;
+        }
+        let Ok(sc) = self.snapctx(node.ino) else {
+            return;
+        };
+        if node.seq.load(Ordering::Acquire) > sc.flushed()
+            || node.ns_seq.load(Ordering::Acquire) > sc.flushed()
+        {
+            return;
+        }
+        let ino = node.ino;
+        // the node and the alias go together, so the file is loaded once more from meta if needed
+        let removed = self.nodes.remove_if(&ino, |n| {
+            Arc::ptr_eq(n, node) && !n.pinned() && n.seq.load(Ordering::Acquire) <= sc.flushed()
+        });
+        if removed {
+            self.aliases.wr().remove(ino);
+            self.ctr.aliases_dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Drops an orphan nobody holds once its removal is committed.
@@ -581,13 +697,17 @@ impl Inner {
         if batch.ops.is_empty() && batch.touched.is_empty() {
             return Ok(());
         }
+        self.commit_batch(sc, batch)
+    }
+
+    fn commit_batch(&self, sc: &SnapCtx, batch: Batch) -> Result<()> {
         let states = self.restore_states(&batch);
         match self.commit(sc, &batch, &states) {
             Ok(created) => {
                 {
                     let mut al = self.aliases.wr();
-                    for (v, m) in created {
-                        al.insert(v, sc.id, m);
+                    for (v, m) in &created {
+                        al.insert(*v, sc.id, *m);
                     }
                 }
                 sc.flushed.store(batch.seq, Ordering::Release);
@@ -603,6 +723,35 @@ impl Inner {
                         self.try_reclaim(&n);
                     }
                 }
+                // the dentry entry of a committed create now names a meta inode
+                for op in &batch.ops {
+                    if let Op::Create {
+                        parent,
+                        name,
+                        child,
+                        what,
+                        ..
+                    } = op
+                    {
+                        if let Some((_, m)) = created.iter().find(|(v, _)| v == child) {
+                            if let Ok(meta_ino) = pack(sc.id, *m) {
+                                let kind = match what {
+                                    Create::File => FileKind::Regular,
+                                    Create::Dir => FileKind::Directory,
+                                    Create::Symlink(_) => FileKind::Symlink,
+                                };
+                                self.dents.retarget(*parent, name, *child, (meta_ino, kind));
+                            }
+                        }
+                    }
+                }
+                // aliases of files that are committed, clean and unreferenced are released
+                for (v, _) in created.iter() {
+                    if let Some(n) = self.nodes.get(v) {
+                        self.maybe_drop_alias(&n);
+                    }
+                }
+                self.drop_stale_aliases();
                 Ok(())
             }
             Err(e) => {
@@ -747,9 +896,35 @@ impl Inner {
         Ok(())
     }
 
+    /// Commits the snapshot's namespace so an operation that needs meta to be current can go on.
+    ///
+    /// Unrelated files' dirty data is left alone: their chunk lists are simply not queued yet, so
+    /// a `readdir` of one directory does not have to chunk 48 MiB written to another file.
+    /// `fsync` and `sync` are the operations that must flush data, and they call
+    /// [`Inner::flush_snapshot`].
     pub(crate) fn barrier(&self, sc: &SnapCtx) -> Result<()> {
         self.ctr.barriers.fetch_add(1, Ordering::Relaxed);
-        self.flush_snapshot(sc)
+        let _g = sc.flush.lk();
+        if sc.removed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let r = self.flush_namespace_locked(sc);
+        if let Err(e) = &r {
+            self.ctr.flush_errors.fetch_add(1, Ordering::Relaxed);
+            *self.last_error.lk() = Some(e.to_string());
+        }
+        r
+    }
+
+    fn flush_namespace_locked(&self, sc: &SnapCtx) -> Result<()> {
+        let batch = {
+            let mut q = sc.q.lk();
+            if !q.pending() {
+                return Ok(());
+            }
+            q.drain(sc)
+        };
+        self.commit_batch(sc, batch)
     }
 
     /// Wakes the background flusher.

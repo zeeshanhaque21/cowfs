@@ -101,6 +101,21 @@ impl Aliases {
     pub(crate) fn len(&self) -> usize {
         self.fwd.len()
     }
+
+    /// Every virtual number that still has a meta number.
+    pub(crate) fn live(&self) -> impl Iterator<Item = Ino> + '_ {
+        self.fwd.keys().copied()
+    }
+
+    /// Drops every alias except those in `keep`, so `canon` can never return a released number.
+    pub(crate) fn retain_only(&mut self, keep: &[Ino]) {
+        self.fwd.retain(|v, _| keep.contains(v));
+        self.rev = self
+            .fwd
+            .iter()
+            .filter_map(|(v, m)| snap_of(*v).map(|s| ((s, *m), *v)))
+            .collect();
+    }
 }
 
 /// Reads the durable virtual-number high-water mark, 0 when there is none.

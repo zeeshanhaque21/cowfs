@@ -335,6 +335,30 @@ impl Core {
         self.inner.pinned_blocks()
     }
 
+    /// Every block a snapshot's committed tree references, with holes removed.
+    ///
+    /// `cowfs-meta` yields the all-zero hole ref of a sparse file, which is not a block; this
+    /// filters it, so every id here is in the store. GC (#10) should use this, not the walker
+    /// directly, until `ChunkRef` has a hole flag (see `docs/v1-core.md`).
+    /// Subtrees are skipped if the caller reuses one `Marker` across snapshots.
+    pub fn live_blocks(
+        &self,
+        name: &str,
+        marker: &mut cowfs_meta::Marker,
+    ) -> Result<Vec<BlockId>, ControlError> {
+        let sc = self.inner.snap_by_name(name)?;
+        self.inner.flush_snapshot(&sc)?;
+        let mut out = Vec::new();
+        let walk = sc.snap.live_blocks(marker).map_err(control_meta)?;
+        for r in walk {
+            let id = r.map_err(control_meta)?;
+            if id != file::HOLE {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// The block store.
     pub fn store(&self) -> &Arc<Store> {
         &self.inner.blocks.store
@@ -456,6 +480,7 @@ impl Inner {
             forget_underflows: self.ctr.underflows.load(Ordering::Relaxed),
             flush_errors: self.ctr.flush_errors.load(Ordering::Relaxed),
             poisoned: self.ctr.poisoned.load(Ordering::Relaxed),
+            aliases_dropped: self.ctr.aliases_dropped.load(Ordering::Relaxed),
             dentry_hits: self.ctr.dhit.load(Ordering::Relaxed),
             dentry_misses: self.ctr.dmiss.load(Ordering::Relaxed),
             nodes: self.nodes.len(),

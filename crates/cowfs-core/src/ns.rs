@@ -117,18 +117,19 @@ impl Inner {
             .map_err(from_meta)
             .map_err(stale)?;
         let mut entries = Vec::with_capacity(r.entries.len());
+        let mut fill: Vec<(Vec<u8>, Target)> = Vec::with_capacity(r.entries.len());
         for e in r.entries {
+            let meta_ino = pack(sc.id, e.ino.0)?;
+            let kind = kind_of(e.kind);
+            fill.push((e.name.clone(), Some((meta_ino, kind))));
             entries.push(DirEntry {
                 ino: self.canon(sc.id, e.ino.0)?,
-                kind: kind_of(e.kind),
+                kind,
                 name: e.name,
                 cookie: e.cookie,
             });
         }
-        let fill: Vec<(&[u8], Target)> = entries
-            .iter()
-            .map(|e| (e.name.as_slice(), Some((e.ino, e.kind))))
-            .collect();
+        let fill: Vec<(&[u8], Target)> = fill.iter().map(|(n, t)| (n.as_slice(), *t)).collect();
         self.dents.fill_many(dir, &fill, epoch);
         self.shrink_dents(dir);
         Ok(ReadDir {
