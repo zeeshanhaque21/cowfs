@@ -58,16 +58,22 @@ pub fn pack_ids(dir: &Path) -> Vec<u32> {
     ids
 }
 
+/// Bytes of a record header.
+pub const REC_HDR: usize = 56;
+
+/// A valid pack header.
+pub const PACK_HEADER: [u8; 16] = *b"COWPACK\0\x02\0\0\0\0\0\0\0";
+
 /// Records of a well-formed pack as `(id, start, end)`, parsed independently of the library.
 pub fn parse_pack(bytes: &[u8]) -> Vec<(BlockId, usize, usize)> {
     let mut out = Vec::new();
     let mut pos = 16;
-    while pos + 52 <= bytes.len() {
+    while pos + REC_HDR <= bytes.len() {
         assert_eq!(&bytes[pos..pos + 4], b"CWRB");
         let slen = u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap()) as usize;
         let id = BlockId::from_bytes(bytes[pos + 16..pos + 48].try_into().unwrap());
-        out.push((id, pos, pos + 52 + slen));
-        pos += 52 + slen;
+        out.push((id, pos, pos + REC_HDR + slen));
+        pos += REC_HDR + slen;
     }
     assert_eq!(pos, bytes.len());
     out
@@ -179,8 +185,9 @@ pub fn record(codec: u8, ulen: u32, id: [u8; 32], payload: &[u8]) -> Vec<u8> {
     r.extend_from_slice(&ulen.to_le_bytes());
     r.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     r.extend_from_slice(&id);
-    let crc = crc32c::crc32c_append(crc32c::crc32c(&r), payload);
-    r.extend_from_slice(&crc.to_le_bytes());
+    let hcrc = crc32c::crc32c(&r);
+    r.extend_from_slice(&hcrc.to_le_bytes());
+    r.extend_from_slice(&crc32c::crc32c_append(hcrc, payload).to_le_bytes());
     r.extend_from_slice(payload);
     r
 }

@@ -3,7 +3,9 @@ mod common;
 use std::fs;
 use std::io::Cursor;
 
-use common::{compressible, copy_store, index_path, opts, pack_ids, pack_path, parse_pack, random};
+use common::{
+    compressible, copy_store, index_path, opts, pack_ids, pack_path, parse_pack, random, REC_HDR,
+};
 use cowfs_store::{BlockId, Error, Store, MAX_BLOCK_LEN, MAX_CHUNK_LEN, MIN_CHUNK_LEN};
 
 fn open(dir: &std::path::Path) -> Store {
@@ -149,7 +151,7 @@ fn compressible_blocks_shrink_and_random_blocks_stay_raw() {
     assert!(after_c < (MAX_CHUNK_LEN as u64) / 4, "stored {after_c}");
     s.put(&r).unwrap();
     let raw_cost = s.stats().stored_bytes - after_c;
-    assert_eq!(raw_cost, 52 + MAX_CHUNK_LEN as u64);
+    assert_eq!(raw_cost, REC_HDR as u64 + MAX_CHUNK_LEN as u64);
 }
 
 #[test]

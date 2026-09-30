@@ -131,7 +131,7 @@ fn torn_middle_record_is_skipped_and_neighbours_survive() {
 fn garbage_after_the_last_record_is_cut_off() {
     let fx = fixture(SMALL, BIG_PACK);
     let dir = tempfile::tempdir().unwrap();
-    for glen in [1usize, 2, 3, 7, 51, 52, 53, 200, 1000] {
+    for glen in [1usize, 2, 3, 7, 55, 56, 57, 200, 1000] {
         for garbage in [vec![0u8; glen], random(glen as u64, glen)] {
             let mut b = fx.packs[0].clone();
             b.extend_from_slice(&garbage);
@@ -193,7 +193,7 @@ fn flip_check(fx: &Fixture, positions: impl Iterator<Item = (usize, u8)>, with_i
 }
 
 #[test]
-fn without_a_watermark_nothing_is_ever_truncated() {
+fn without_a_watermark_damage_is_cut_but_kept_in_a_sidecar_and_reported() {
     let fx = fixture(SMALL, BIG_PACK);
     let recs = parse_pack(&fx.packs[0]);
     let last = recs[recs.len() - 1];
@@ -204,15 +204,25 @@ fn without_a_watermark_nothing_is_ever_truncated() {
     common::install(dir.path(), &[(0, &b)], None);
     let s = open(dir.path());
     assert!(s.recovery().watermark_missing);
-    assert!(s.recovery().has_corruption());
-    assert_eq!(s.recovery().truncated_bytes, 0);
-    let on_disk = std::fs::metadata(common::pack_path(dir.path(), 0))
-        .unwrap()
-        .len();
-    assert_eq!(on_disk, b.len() as u64);
-    let extra = random(5, 99);
-    let id = s.put(&extra).unwrap();
-    assert_eq!(s.get(id).unwrap(), extra);
+    assert!(
+        s.recovery().has_corruption(),
+        "unclassifiable damage must be loud"
+    );
+    assert_eq!(s.recovery().torn_tail_discarded, (b.len() - last.1) as u64);
+    let on_disk = std::fs::read(common::pack_path(dir.path(), 0)).unwrap();
+    assert_eq!(on_disk, b[..last.1], "only the damaged tail is cut");
+    let side = std::fs::read(format!(
+        "{}.torn-0",
+        common::pack_path(dir.path(), 0).display()
+    ))
+    .unwrap();
+    assert_eq!(side, b[last.1..], "cut bytes are preserved");
+    for (id, d) in &fx.blocks[..fx.blocks.len() - 1] {
+        assert_eq!(&s.get(*id).unwrap(), d);
+    }
+    drop(s);
+    let s = open(dir.path());
+    assert!(!s.recovery().has_corruption(), "reported once, not forever");
 }
 
 fn every_bit(len: usize) -> impl Iterator<Item = (usize, u8)> {

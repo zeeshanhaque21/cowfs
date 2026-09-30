@@ -289,7 +289,7 @@ fn main() {
         };
         let id = BlockId::of(c);
         let stored = if want_compressible { z.len() } else { c.len() };
-        let rec = vec![7u8; 52 + stored];
+        let rec = vec![7u8; 56 + stored];
         let mib = c.len() as f64 / (1 << 20) as f64;
         let bench = |f: &dyn Fn()| -> Vec<f64> {
             (0..runs)

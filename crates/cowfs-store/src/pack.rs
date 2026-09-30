@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::record::{Header, HEADER_LEN, RECORD_MAGIC};
 
 pub(crate) const PACK_MAGIC: [u8; 8] = *b"COWPACK\0";
-pub(crate) const PACK_VERSION: u32 = 1;
+pub(crate) const PACK_VERSION: u32 = 2;
 pub(crate) const PACK_HEADER_LEN: u64 = 16;
 const SEARCH_WINDOW: usize = 1 << 20;
 
@@ -35,10 +35,17 @@ pub(crate) fn header_bytes() -> [u8; PACK_HEADER_LEN as usize] {
     h
 }
 
-pub(crate) fn header_ok(file: &File) -> io::Result<bool> {
+/// Check the pack header. `Err` names why this is not a pack this version can read.
+pub(crate) fn header_check(file: &File) -> io::Result<std::result::Result<(), &'static str>> {
     let mut buf = [0u8; PACK_HEADER_LEN as usize];
     file.read_exact_at(&mut buf, 0)?;
-    Ok(buf == header_bytes())
+    Ok(if buf == header_bytes() {
+        Ok(())
+    } else if buf[..8] == PACK_MAGIC && buf[8..12] != PACK_VERSION.to_le_bytes() {
+        Err("unsupported pack format version (format 1 packs are not readable)")
+    } else {
+        Err("bad pack header")
+    })
 }
 
 /// What the scanner found.
@@ -49,8 +56,8 @@ pub(crate) enum Event<'a> {
         header: &'a Header,
         payload: &'a [u8],
     },
-    /// Bytes that are not part of any valid record. `exhausted` means the resync budget ran out,
-    /// so the rest of the pack was not searched and nothing is known about it.
+    /// Bytes that are not part of any valid record. `exhausted` means the search gave up because
+    /// it hit its work bound, so the rest of the pack was not searched.
     Gap {
         offset: u64,
         len: u64,
@@ -84,9 +91,6 @@ fn read_record(
     Ok(Some(header))
 }
 
-/// Upper bound on payload bytes that one scan reads while testing resync candidates.
-pub(crate) const RESYNC_BUDGET: u64 = 64 << 20;
-
 fn magic_at(window: &[u8], from: usize) -> Option<usize> {
     let mut at = from;
     while let Some(i) = window[at..].iter().position(|&b| b == RECORD_MAGIC[0]) {
@@ -106,7 +110,12 @@ enum Found {
 }
 
 /// Smallest offset in `from..end` where a valid record begins.
-/// Spends at most `budget` bytes of payload reads on candidates, then gives up.
+///
+/// A candidate is screened by its header checksum alone, so only a header that really was
+/// written by us costs a payload read. Work is linear in the bytes searched plus one payload
+/// read per surviving header. Damage that comes from crashes or bit rot cannot make headers with
+/// valid checksums, so the payload bytes read for candidates stay below twice the bytes scanned.
+/// `budget` enforces that bound against crafted input and is never reached otherwise.
 fn find_record(
     file: &File,
     from: u64,
@@ -122,8 +131,7 @@ fn find_record(
         let mut at = 0;
         while let Some(p) = magic_at(&window[..n], at) {
             let cand = base + p as u64;
-            let raw = window[p..n].first_chunk::<HEADER_LEN>();
-            let head = match raw {
+            let head = match window[p..n].first_chunk::<HEADER_LEN>() {
                 Some(raw) => Header::parse(raw).ok(),
                 None => peek_header(file, cand, end)?,
             };
@@ -171,7 +179,7 @@ pub(crate) fn scan(
     mut visit: impl FnMut(Event<'_>) -> Result<()>,
 ) -> Result<()> {
     let mut payload = Vec::new();
-    let mut budget = RESYNC_BUDGET;
+    let mut budget = 2 * end.saturating_sub(from) + (1 << 20);
     let mut pos = from;
     while pos < end {
         if let Some(header) = read_record(file, pos, end, &mut payload)? {
