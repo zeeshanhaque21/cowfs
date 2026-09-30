@@ -249,7 +249,7 @@ fn accept_loop(
             let stragglers: Vec<Arc<Conn>> = lock(&shared.conns).values().cloned().collect();
             for conn in stragglers {
                 conn.abandon_inflight();
-                conn.kill();
+                conn.kill_after_finish();
             }
             break;
         }
@@ -286,7 +286,7 @@ fn admit(
             if shared2.stopping() {
                 conn.abandon_inflight();
             }
-            conn.kill();
+            conn.kill_after_finish();
             lock(&shared2.conns).remove(&id);
         }
     });
@@ -311,6 +311,7 @@ struct Conn {
     stream: UnixStream,
     write_lock: Mutex<()>,
     dead: AtomicBool,
+    finishing: AtomicUsize,
     inflight: Mutex<HashMap<u64, CancelToken>>,
 }
 
@@ -321,6 +322,7 @@ impl Conn {
             stream: stream.try_clone()?,
             write_lock: Mutex::new(()),
             dead: AtomicBool::new(false),
+            finishing: AtomicUsize::new(0),
             inflight: Mutex::new(HashMap::new()),
         })
     }
@@ -345,9 +347,21 @@ impl Conn {
 
     /// Sends the terminal frame of request `id`, unless another path already did.
     fn finish(&self, id: u64, frame: &ServerFrame) {
+        self.finishing.fetch_add(1, Ordering::SeqCst);
         if lock(&self.inflight).remove(&id).is_some() {
             self.send(frame);
         }
+        self.finishing.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Closes the connection after any terminal frame that is being sent has gone out, so a
+    /// request removed from `inflight` is never cut off before its final frame.
+    fn kill_after_finish(&self) {
+        let until = Instant::now() + Duration::from_secs(1);
+        while self.finishing.load(Ordering::SeqCst) > 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        self.kill();
     }
 
     fn cancel_all(&self) {

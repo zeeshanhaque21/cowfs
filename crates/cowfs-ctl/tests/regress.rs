@@ -302,6 +302,16 @@ fn m3_destructive_params_are_strict() {
     assert_eq!(
         err_code(&req(
             &mut r,
+            20,
+            "gc",
+            json!({"dry_run": true, "dryrun": false})
+        )),
+        "invalid_params",
+        "an unknown field next to a valid dry_run is still rejected"
+    );
+    assert_eq!(
+        err_code(&req(
+            &mut r,
             3,
             "snapshot_rm",
             json!({"name": "a", "force": true})
