@@ -316,6 +316,15 @@ impl Gc {
             }
         }
         candidates.sort_by_key(|(p, cold)| (*cold, std::cmp::Reverse(p.dead_bytes)));
+        if barrier.is_none() {
+            // Without a barrier the copy could not be followed by a safe free, and a copy nobody
+            // unlinks only costs space. So a cycle that cannot free does not copy either.
+            for (plan, _) in &candidates {
+                r.skip(plan.id, SkipReason::NotReached);
+            }
+            self.finish(&mut r, &live, &pinned);
+            return Ok(r);
+        }
 
         // 4. Copy. No barrier. A put during the copy either writes above the epoch or deduplicates
         // onto a record in a pack step 5 will refuse to unlink.
@@ -348,7 +357,9 @@ impl Gc {
             self.emit(&progress);
         }
 
-        // 5. Verify and unlink with the reference side held still.
+        // 5. Verify and unlink with the reference side held still. The guard is alive from before
+        // the copy, so no commit landed during the copy; its `hold` waits for the writers already
+        // inside one.
         if let Some(guard) = barrier {
             guard.hold();
             match self.marked(&mut marker, &mut r, false, &mut walked_roots) {

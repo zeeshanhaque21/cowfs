@@ -140,6 +140,18 @@ impl Fixture {
         let _ = std::fs::remove_dir_all(self.store_dir());
     }
 
+    /// The handles a concurrent test needs, which are `Send + Sync`.
+    ///
+    /// The fixture itself is not, because it owns a `TempDir` and a `Mutex`, so a threaded test
+    /// takes these instead and leaves the fixture to the main thread.
+    pub fn parts(&self) -> Parts<'_> {
+        Parts {
+            store: Arc::clone(&self.store),
+            meta: Arc::clone(&self.meta),
+            gc: &self.gc,
+        }
+    }
+
     /// Store a file's content and set it on a snapshot, the way a mount would.
     ///
     /// `name` is created under the root, or reused when it already exists, so a rewrite of the
@@ -233,6 +245,52 @@ impl Fixture {
 
     pub fn gc_dir(&self) -> PathBuf {
         self.path().join("gcstate")
+    }
+}
+
+/// The shareable handles of a fixture, for a test that runs threads.
+pub struct Parts<'a> {
+    pub store: Arc<Store>,
+    pub meta: Arc<Meta>,
+    pub gc: &'a Gc,
+}
+
+impl Parts<'_> {
+    /// Store content and write it into a file, the way a mount would. `Send + Sync`, so a thread
+    /// can hold a reference to it.
+    pub fn write(&self, snap: &Snapshot, name: &[u8], data: &[u8]) {
+        let chunks = self.store.ingest_bytes(data).expect("ingest");
+        let ino = match snap.lookup(cowfs_meta::ROOT_INO, name) {
+            Ok(a) => a.ino,
+            Err(_) => {
+                snap.batch(|tx| tx.create(cowfs_meta::ROOT_INO, name, 0o644))
+                    .expect("create")
+                    .ino
+            }
+        };
+        snap.batch(|tx| tx.set_content(ino, &chunks, data.len() as u64))
+            .expect("set content");
+    }
+
+    /// Every block any live snapshot references, holes dropped.
+    ///
+    /// A snapshot removed between the listing and the lookup is skipped: it is gone, so its
+    /// blocks are not live, and a test that removes snapshots under a collector must not fail here.
+    pub fn live(&self) -> std::collections::HashSet<BlockId> {
+        let mut marker = cowfs_meta::Marker::new();
+        let mut out = std::collections::HashSet::new();
+        for info in self.meta.durable_snapshots().expect("snaps") {
+            let Ok(snap) = self.meta.snapshot_by_id(info.id) else {
+                continue;
+            };
+            for b in snap.live_blocks(&mut marker).expect("walk") {
+                let b = b.expect("block");
+                if b != cowfs_gc::HOLE {
+                    out.insert(b);
+                }
+            }
+        }
+        out
     }
 }
 

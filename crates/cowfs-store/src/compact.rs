@@ -22,6 +22,7 @@
 //! corruption.
 
 use std::fs::{self, File};
+use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -422,8 +423,17 @@ impl Store {
             }
         }
         let path = pack::pack_path(g.dir, id);
-        let len = fs::metadata(&path)?.len();
-        fs::remove_file(&path)?;
+        // Two collectors on one store is not a supported configuration, but it must not corrupt
+        // anything: if the pack is already gone the second caller has nothing to do.
+        let Ok(meta) = fs::metadata(&path) else {
+            return Ok(0);
+        };
+        let len = meta.len();
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        }
         g.io.sync_dir(&pack::pack_dir(g.dir))?;
         {
             let mut wm =
