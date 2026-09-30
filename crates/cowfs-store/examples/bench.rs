@@ -150,6 +150,42 @@ fn main() {
         checkpoint_on_drop: false,
         ..Options::default()
     };
+
+    let mut comp = Vec::new();
+    let mut raw_write = Vec::new();
+    let mut nosync = Vec::new();
+    for _ in 0..runs {
+        let (_, t) = timed(|| {
+            let mut c = zstd::bulk::Compressor::new(3).unwrap();
+            data.iter().for_each(|d| {
+                chunks(d).for_each(|ch| {
+                    black_box(c.compress(ch).unwrap());
+                })
+            })
+        });
+        comp.push(mb / t);
+        let _ = fs::remove_dir_all(&store_dir);
+        fs::create_dir_all(&store_dir).unwrap();
+        let (_, t) = timed(|| {
+            use std::io::Write;
+            let mut f = fs::File::create(store_dir.join("raw.bin")).unwrap();
+            data.iter().for_each(|d| f.write_all(d).unwrap());
+            f.sync_data().unwrap();
+        });
+        raw_write.push(mb / t);
+        let _ = fs::remove_dir_all(&store_dir);
+        let st = Store::open(&store_dir, opts).unwrap();
+        let (_, t) = timed(|| {
+            data.iter().for_each(|d| {
+                st.ingest_bytes(d).unwrap();
+            })
+        });
+        nosync.push(mb / t);
+        drop(st);
+    }
+    report("zstd-3 compress of chunks, 1 thread", "MiB/s", &comp);
+    report("baseline: raw write + fdatasync", "MiB/s", &raw_write);
+    report("ingest without sync, 1 thread", "MiB/s", &nosync);
     let mut lists: Vec<Vec<ChunkRef>> = Vec::new();
     let mut store = None;
     for threads in [1usize, 8] {

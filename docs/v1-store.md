@@ -184,3 +184,40 @@ An empty input to `ingest` gives an empty chunk list.
 
 Garbage collection and compaction (#10), last-access times, tiering and any remote backend.
 Only `put`, no `delete`: blocks leave the store only through compaction.
+
+## Measured performance
+
+Tool: `cargo run --release -p cowfs-store --example bench -- <data-dir> <store-dir> [MiB] [runs]`.
+Data: every second file of `RuView/v2/target` (a Rust build output), 3,921 files, 1,037 MiB, 15,029 chunks, average chunk 72,405 bytes.
+Machine: Apple M3 Max, shared with about 19 other sessions.
+Load average during the last full run went from 35 to 140, so every figure is a noisy lower bound.
+n is 5 for every row and the median is shown.
+
+| Metric | Median | Range | Target | Verdict |
+|---|---|---|---|---|
+| Baseline: read the files, warm | 2198 MiB/s | 562 to 2290 | - | - |
+| Baseline: raw write plus fdatasync | 2828 MiB/s | 2373 to 3120 | - | - |
+| FastCDC only, 1 thread | 1267 MiB/s | 1163 to 1415 | - | - |
+| BLAKE3 of whole files, 1 thread | 943 MiB/s | 847 to 967 | - | - |
+| Chunk plus hash, 1 thread | 573 MiB/s | 428 to 640 | 800 | missed |
+| zstd-3 of the chunks, 1 thread | 264 MiB/s | 202 to 287 | - | - |
+| Ingest without sync, 1 thread | 198 MiB/s | 169 to 215 | - | - |
+| Ingest plus sync, 1 thread | 212 MiB/s | 196 to 242 | 10 to 48 per core (spike 1) | met |
+| Ingest plus sync, 8 threads | 709 MiB/s | 633 to 833 | - | - |
+| Verified read, 1 thread, real mix of blocks | 394 MiB/s | 285 to 419 | 1024 | missed |
+| Verified read, 8 threads | 2656 MiB/s | 1916 to 3198 | - | - |
+| Re-ingest of all duplicates, 1 thread | 588 MiB/s | 544 to 633 | - | - |
+| Re-ingest of all duplicates, 8 threads | 4293 MiB/s | 4047 to 4468 | - | - |
+| Index lookups, 1 thread | 25.4 M/s | 18.7 to 25.8 | - | - |
+
+Where the time goes:
+
+- Chunk plus hash is the sum of two serial passes, `1/(1/1267 + 1/943)` is about 540 MiB/s, which matches the measurement.
+  BLAKE3 alone tops out near 1 GiB/s per thread here, so 800 MiB/s cannot be reached without overlapping the two passes on separate threads.
+- Ingest is bound by zstd-3 (264 MiB/s) plus chunk and hash.
+  `1/(1/573 + 1/264)` is about 181 MiB/s against a measured 198.
+  The append and the fsync cost almost nothing (212 with sync against 198 without).
+- Verified reads of a 141 KiB incompressible block run at 939 MiB/s against 1129 MiB/s for BLAKE3 alone, so the hash sets the ceiling.
+  A 165 KiB compressible block runs at 474 MiB/s, the sum of zstd decompression (896 MiB/s) and BLAKE3 (1153 MiB/s).
+  The 1 GiB/s per thread target for verified reads is therefore out of reach for compressed blocks on this machine, and only close for raw ones.
+- Data on this corpus compresses 3.24x after dedup (320 MiB stored for 1,037 MiB of input, with 1,676 of 15,029 puts deduplicated).
