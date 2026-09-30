@@ -123,17 +123,28 @@ impl Sidecar {
 
     /// The bytes of the `._` file: what the kernel itself would have written.
     pub fn encode(&self) -> Vec<u8> {
+        Self::encode_capped(self, MAX_ATTRS)
+    }
+
+    fn encode_all(s: &Sidecar) -> Vec<u8> {
+        Sidecar::encode_capped(s, usize::MAX)
+    }
+
+    fn encode_capped(&self, cap: usize) -> Vec<u8> {
         let attrs: Vec<(&Vec<u8>, &Vec<u8>)> = self
             .attrs
             .iter()
             .filter(|(k, _)| is_plain_attr(k))
-            .take(MAX_ATTRS)
+            .take(cap)
             .collect();
         let entries: usize = attrs.iter().map(|(k, _)| entry_len(k.len() + 1)).sum();
         let data_start = FIRST_ENTRY + entries;
         let data: usize = attrs.iter().map(|(_, v)| v.len()).sum();
         let attr_end = data_start + data;
-        let total_size = (BUF_SIZE - EMPTY_FORK_LEN).max(attr_end);
+        // The kernel reads the Finder info entry as ATTR_BUF_SIZE bytes, so total_size
+        // must sit just under a multiple of it.
+        let total_size =
+            (attr_end + EMPTY_FORK_LEN).div_ceil(BUF_SIZE).max(1) * BUF_SIZE - EMPTY_FORK_LEN;
         let fork_len = if self.resource_fork.is_empty() {
             EMPTY_FORK_LEN
         } else {
@@ -392,6 +403,50 @@ mod tests {
         assert_eq!(Sidecar::from_xattrs(back), s);
         let zero = Sidecar::from_xattrs([(FINDER_INFO.to_vec(), vec![0; 32])]);
         assert!(zero.is_empty(), "all-zero Finder info is no attribute");
+    }
+
+    #[test]
+    fn every_count_and_size_of_attributes_survives_a_round_trip() {
+        let mut sizes = vec![0usize, 1, 3, 4, 127, 128, 1000, 4096];
+        // 255 is where the client stops, so that is where the property has to hold.
+        for n in 0..=MAX_ATTRS {
+            let mut s = Sidecar::default();
+            for i in 0..n {
+                let size = sizes[i % sizes.len()];
+                s.attrs
+                    .insert(format!("user.a{i:03}x").into_bytes(), vec![i as u8; size]);
+            }
+            if n % 5 == 0 {
+                s.finder_info = Some([(n % 251 + 1) as u8; 32]);
+            }
+            let b = s.encode();
+            assert_eq!(b.len() % BUF_SIZE, 0, "{n} attributes, {} bytes", b.len());
+            assert_eq!(Sidecar::decode(&b).as_ref(), Some(&s), "{n} attributes");
+        }
+    }
+
+    #[test]
+    fn a_sidecar_past_the_attribute_cap_is_not_a_sidecar() {
+        let mut over = Sidecar::default();
+        for i in 0..MAX_ATTRS + 40 {
+            over.attrs
+                .insert(format!("user.a{i:03}x").into_bytes(), vec![1; 100]);
+        }
+        // What a client writes is not truncated, so the adapter must be able to say no to it.
+        assert!(Sidecar::decode(&encode_all(&over)).is_none());
+        // What the adapter synthesises is truncated, because the client stops there anyway. The
+        // attributes themselves stay in the Vfs.
+        let shown = Sidecar::decode(&over.encode()).unwrap();
+        assert_eq!(shown.attrs.len(), MAX_ATTRS);
+        assert!(over.attrs.len() > shown.attrs.len());
+    }
+
+    #[test]
+    fn a_whole_file_write_that_is_not_a_sidecar_is_refused() {
+        // What the adapter has to be able to tell: a real file named ._x must not be accepted.
+        assert_eq!(Sidecar::decode(b"my real file content"), None);
+        assert_eq!(Sidecar::decode(&vec![0u8; 20]), None);
+        assert!(Sidecar::decode(&Sidecar::default().encode()).is_some());
     }
 
     #[test]
