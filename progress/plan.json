@@ -171,12 +171,12 @@
         {
           "id": "13",
           "title": "#13 CLI and Unix-socket control API",
-          "state": "ready",
+          "state": "fixing",
           "issue": 13,
-          "owner": "lead",
+          "owner": "builder (subagent)",
           "pr": "#33",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/33",
-          "detail": "Critic findings fixed, re-verified. Linux CI failure fixed: connecting to a regular file gives ECONNREFUSED on Linux and ENOTSOCK on macOS; exit 3 now means missing path or a socket that refuses, exit 1 for a path that is not a socket. Full suite passes in the Linux VM, first Linux run of SO_PEERCRED. Decisions for lead: snapshot_reset/busy semantics, name rules vs core, import hash scope. Not built: real backend (seam only), no TTY test.",
+          "detail": "Critic findings fixed, re-verified. Linux CI failure fixed: connecting to a regular file gives ECONNREFUSED on Linux and ENOTSOCK on macOS; exit 3 now means missing path or a socket that refuses, exit 1 for a path that is not a socket. Full suite passes in the Linux VM, first Linux run of SO_PEERCRED. Decisions for lead: snapshot_reset/busy semantics, name rules vs core, import hash scope. Not built: real backend (seam only), no TTY test. | ROUND-2 VERDICT: NOT mergeable. All round-1 findings held (5000 in-flight shutdown cycles 4999 exactly one terminal frame, 100k connect/close fd delta 0, slowloris closed, 1M-line decoder fuzz 0 panics, /dev/full exit 1). New bugs: A1 shutdown abandons the listen backlog (99.7% of clients that sent hello+request got nothing in 1500 cycles, exit 1 not 3); A2 64 idle held connections starve every legitimate client (no eviction); A3 close-without-drain turns FIN into RST, making the merged suite flaky (peer_uid_mismatch_is_refused failed 2/10); A4 12 of 29 mutants survive, all in the new code, including a snapshot_reset test that is not actually atomic; A5 reset atomicity is doc-only and the trait cannot enforce it (treehouse mode (b) depends on it). Also: completions to /dev/full panics, --json no JSON on clap errors, connect timeout exit 1 not 4, unbounded name_key, tests fail under CPU burners. Builder fixing; A5 redesign will change snapshot_reset for PR #38.",
           "ci": "CI: pass (linux, macos)"
         },
         {
