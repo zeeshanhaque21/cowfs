@@ -20,12 +20,27 @@ impl Vfs for MemVfs {
         let mut st = self.lock();
         st.dir(parent)?;
         validate_name(name)?;
+        if st.f(Fault::HidesDotUnderscore) && name.starts_with(b"._") {
+            return Err(Error::NotFound);
+        }
         let ino = st.child(parent, name)?;
-        st.handed_out(ino)
+        if st.f(Fault::LookupNoRef) {
+            return st.attr(ino);
+        }
+        let mut a = st.handed_out(ino)?;
+        if st.f(Fault::StaleNlinkLookup) && a.kind == FileKind::Regular {
+            a.nlink = a.nlink.min(1);
+        }
+        Ok(a)
     }
 
     fn forget(&self, ino: Ino, count: u64) {
         let mut st = self.lock();
+        let count = if st.f(Fault::ForgetOffByOne) {
+            count.saturating_sub(1)
+        } else {
+            count
+        };
         if let Some(n) = st.nodes.get_mut(&ino) {
             n.lookups = n.lookups.saturating_sub(count);
         }
@@ -58,28 +73,54 @@ impl Vfs for MemVfs {
             }
         }
         let zero_tail = !st.f(Fault::TruncateNoZeroFill);
-        let raw_mode = st.f(Fault::ModeNotMasked);
+        let keep = st.f(Fault::TruncateKeepsPages);
+        let raw_mode = st.f(Fault::ModeNotMasked) || st.f(Fault::SetattrModeNotMasked);
+        let no_mtime = st.f(Fault::TruncateNoMtime);
+        let no_ctime = st.f(Fault::SetattrNoCtime);
         let n = st.node_mut(ino)?;
         if let (Some(size), Body::File(p)) = (ch.size, &mut n.body) {
-            p.truncate(size, zero_tail);
-            n.mtime = t;
+            p.truncate(size, zero_tail, keep);
+            if !no_mtime {
+                n.mtime = t;
+            }
         }
         if let Some(mode) = ch.mode {
             n.mode = if raw_mode { mode } else { mode & MODE_MASK };
         }
         apply_times(n, &ch, t);
-        st.bump_ctime(ino, t);
+        if !no_ctime {
+            st.bump_ctime(ino, t);
+        }
         st.attr(ino)
     }
 
     fn readlink(&self, ino: Ino) -> Result<Vec<u8>> {
-        match &self.lock().node(ino)?.body {
+        let st = self.lock();
+        let lax = st.f(Fault::ReadlinkAnyOk);
+        match &st.node(ino)?.body {
             Body::Symlink { target, .. } => Ok(target.clone()),
+            _ if lax => Ok(Vec::new()),
             _ => Err(Error::InvalidArgument),
         }
     }
 
     fn create(&self, parent: Ino, name: &[u8], mode: u32) -> Result<Attr> {
+        if self.lock().f(Fault::ConcurrentCreateRace) {
+            {
+                let st = self.lock();
+                validate_name(name)?;
+                st.live_dir(parent)?;
+                if st.dir(parent)?.entries.contains_key(name) {
+                    return Err(Error::Exists);
+                }
+            }
+            std::thread::yield_now();
+            let mut st = self.lock();
+            let (ino, t) = st.alloc(Body::File(Pages::default()), mode, 1);
+            st.add_entry(parent, name, ino)?;
+            st.touch_dir(parent, t);
+            return st.handed_out(ino);
+        }
         self.lock()
             .new_entry(parent, name, Body::File(Pages::default()), mode)
     }
@@ -106,8 +147,11 @@ impl Vfs for MemVfs {
         if n.kind() == FileKind::Directory {
             return Err(Error::PermissionDenied);
         }
-        if n.nlink == 0 {
+        if n.nlink == 0 && !st.f(Fault::LinkResurrects) {
             return Err(Error::NotFound);
+        }
+        if n.nlink >= st.link_max {
+            return Err(Error::TooManyLinks);
         }
         validate_name(new_name)?;
         st.live_dir(new_parent)?;
@@ -122,7 +166,9 @@ impl Vfs for MemVfs {
         let t = st.now();
         st.add_entry(new_parent, new_name, ino)?;
         st.node_mut(ino)?.nlink += 1;
-        st.bump_ctime(ino, t);
+        if !st.f(Fault::LinkNoCtime) {
+            st.bump_ctime(ino, t);
+        }
         st.touch_dir(new_parent, t);
         st.handed_out(ino)
     }
@@ -152,8 +198,11 @@ impl Vfs for MemVfs {
         }
         st.del_entry(parent, name)?;
         let t = st.now();
+        let skip = st.f(Fault::RmdirNoParentNlink);
         let p = st.node_mut(parent)?;
-        p.nlink = p.nlink.saturating_sub(1);
+        if !skip {
+            p.nlink = p.nlink.saturating_sub(1);
+        }
         st.touch_dir(parent, t);
         st.drop_name(ino, t);
         Ok(())
@@ -193,7 +242,7 @@ impl Vfs for MemVfs {
         match (src_dir, dest_dir) {
             (true, Some(true)) => {
                 if let Some(d) = dest {
-                    if !st.dir(d)?.entries.is_empty() {
+                    if !st.dir(d)?.entries.is_empty() && !st.f(Fault::RenameNonEmptyDirOk) {
                         return Err(Error::NotEmpty);
                     }
                 }
@@ -205,11 +254,13 @@ impl Vfs for MemVfs {
         let t = st.now();
         if let Some(d) = dest {
             st.del_entry(new_parent, new_name)?;
-            if dest_dir == Some(true) {
+            if dest_dir == Some(true) && !st.f(Fault::RenameDirOverDirNlink) {
                 let p = st.node_mut(new_parent)?;
                 p.nlink = p.nlink.saturating_sub(1);
             }
-            st.drop_name(d, t);
+            if !st.f(Fault::RenameDestNoDrop) {
+                st.drop_name(d, t);
+            }
         }
         st.del_entry(parent, name)?;
         st.add_entry(new_parent, new_name, src)?;
@@ -219,7 +270,37 @@ impl Vfs for MemVfs {
                 p.nlink = p.nlink.saturating_sub(1);
                 st.node_mut(new_parent)?.nlink += 1;
             }
-            st.dir_mut(src)?.parent = new_parent;
+            if !st.f(Fault::DirParentStale) {
+                st.dir_mut(src)?.parent = new_parent;
+            }
+        }
+        if st.f(Fault::RenameDirZeroesChildren) && src_dir {
+            let mut stack = vec![src];
+            while let Some(d) = stack.pop() {
+                let kids: Vec<Ino> = st.dir(d)?.entries.values().map(|e| e.1).collect();
+                for k in kids {
+                    match &mut st.node_mut(k)?.body {
+                        Body::File(p) => p.truncate(0, true, false),
+                        Body::Dir(_) => stack.push(k),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if st.f(Fault::RenameNewIno) && !src_dir {
+            let ni = st.next_ino;
+            st.next_ino += 1;
+            if let Some(node) = st.nodes.remove(&src) {
+                st.nodes.insert(ni, node);
+            }
+            let d = st.dir_mut(new_parent)?;
+            if let Some(e) = d.entries.get_mut(new_name) {
+                e.1 = ni;
+                let seq = e.0;
+                if let Some(o) = d.order.get_mut(&seq) {
+                    o.1 = ni;
+                }
+            }
         }
         st.touch_dir(parent, t);
         st.touch_dir(new_parent, t);
@@ -249,7 +330,20 @@ impl Vfs for MemVfs {
     fn read(&self, ino: Ino, offset: u64, size: u32) -> Result<Vec<u8>> {
         let st = self.lock();
         match &st.node(ino)?.body {
-            Body::File(p) => Ok(p.read(offset, u64::from(size), st.f(Fault::ReadPadsEof))),
+            Body::File(p) => {
+                let size = if st.f(Fault::ShortRead32K) {
+                    size.min(32768)
+                } else {
+                    size
+                };
+                let pad =
+                    st.f(Fault::ReadPadsEof) || (st.f(Fault::ReadPadsCrossing) && offset < p.size);
+                let mut data = p.read(offset, u64::from(size), pad);
+                if st.f(Fault::ReadShort1) && data.len() > 4096 {
+                    data.pop();
+                }
+                Ok(data)
+            }
             Body::Dir(_) => Err(Error::IsDir),
             Body::Symlink { .. } => Err(Error::InvalidArgument),
         }
@@ -258,7 +352,12 @@ impl Vfs for MemVfs {
     fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32> {
         let mut st = self.lock();
         let len = u32::try_from(data.len()).map_err(|_| Error::InvalidArgument)?;
+        let garbage = st.f(Fault::HoleGarbage);
+        let enforce = st.f(Fault::WriteEnforcesMode);
         let n = st.node_mut(ino)?;
+        if enforce && n.mode & 0o222 == 0 {
+            return Err(Error::PermissionDenied);
+        }
         let Body::File(p) = &mut n.body else {
             return Err(if n.kind() == FileKind::Directory {
                 Error::IsDir
@@ -272,10 +371,17 @@ impl Vfs for MemVfs {
         if len == 0 {
             return Ok(0);
         }
-        p.write(offset, data);
+        p.write(offset, data, garbage);
         let t = st.now();
         st.touch_data(ino, t);
-        Ok(len)
+        if st.f(Fault::ModeDriftOnWrite) {
+            st.node_mut(ino)?.mode |= 0o200;
+        }
+        Ok(if st.f(Fault::ShortWrite) && len > 65536 {
+            len - 1
+        } else {
+            len
+        })
     }
 
     fn flush(&self, ino: Ino) -> Result<()> {
@@ -289,6 +395,9 @@ impl Vfs for MemVfs {
     fn readdir(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDir> {
         let st = self.lock();
         let d = st.dir(dir)?;
+        if max == 0 && !st.f(Fault::ReaddirMaxZeroOk) {
+            return Err(Error::InvalidArgument);
+        }
         let kind_of = |ino: Ino| st.nodes.get(&ino).map(Node::kind);
         let mk = |name: &Vec<u8>, ino: Ino, cookie: u64| {
             kind_of(ino).map(|kind| DirEntry {
@@ -339,6 +448,9 @@ impl Vfs for MemVfs {
                 .order
                 .range((Bound::Excluded(cookie), Bound::Unbounded))
                 .peekable();
+            if max == 1 && cookie != 0 && st.f(Fault::ReaddirMax1Skips) {
+                it.next();
+            }
             let mut taken = 0;
             while taken < max {
                 let Some((seq, (name, ino))) = it.next() else {
@@ -357,6 +469,7 @@ impl Vfs for MemVfs {
 
     fn statfs(&self) -> Result<StatFs> {
         let st = self.lock();
+        let leak = st.leak;
         let used: u64 = st
             .nodes
             .values()
@@ -364,7 +477,8 @@ impl Vfs for MemVfs {
                 Body::File(p) => p.blocks() / 8,
                 _ => 1,
             })
-            .sum();
+            .sum::<u64>()
+            + leak;
         let blocks = 1 << 30;
         let files = 1 << 32;
         Ok(StatFs {
@@ -385,18 +499,29 @@ impl Vfs for MemVfs {
 
     fn setxattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: XattrFlags) -> Result<()> {
         let mut st = self.lock();
+        let (ig_c, ig_r) = (
+            st.f(Fault::XattrCreateIgnored),
+            st.f(Fault::XattrReplaceIgnored),
+        );
+        let unchecked = st.f(Fault::XattrNameUnchecked);
         let n = st.node_mut(ino)?;
-        if name.is_empty() || (flags.create && flags.replace) {
+        if !unchecked && (name.is_empty() || name.contains(&0)) {
+            return Err(Error::InvalidArgument);
+        }
+        if !unchecked && name.len() > cowfs_vfs::NAME_MAX {
+            return Err(Error::Range);
+        }
+        if flags.create && flags.replace {
             return Err(Error::InvalidArgument);
         }
         if value.len() > XATTR_VALUE_MAX {
             return Err(Error::Range);
         }
         let exists = n.xattrs.contains_key(name);
-        if flags.create && exists {
+        if flags.create && exists && !ig_c {
             return Err(Error::Exists);
         }
-        if flags.replace && !exists {
+        if flags.replace && !exists && !ig_r {
             return Err(Error::NoAttr);
         }
         n.xattrs.insert(name.to_vec(), value.to_vec());
@@ -411,6 +536,9 @@ impl Vfs for MemVfs {
 
     fn removexattr(&self, ino: Ino, name: &[u8]) -> Result<()> {
         let mut st = self.lock();
+        if st.f(Fault::XattrRemoveNoop) && st.node(ino)?.xattrs.contains_key(name) {
+            return Ok(());
+        }
         st.node_mut(ino)?.xattrs.remove(name).ok_or(Error::NoAttr)?;
         let t = st.now();
         st.bump_ctime(ino, t);

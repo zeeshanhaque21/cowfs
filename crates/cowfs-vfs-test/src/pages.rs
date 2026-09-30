@@ -40,7 +40,11 @@ impl Pages {
         out
     }
 
-    pub fn write(&mut self, offset: u64, data: &[u8]) {
+    pub fn write(&mut self, offset: u64, data: &[u8], garbage: bool) {
+        if garbage && offset > self.size && offset.is_multiple_of(PAGE) && offset >= PAGE {
+            self.map
+                .insert(offset / PAGE - 1, Box::new([0xAAu8; PAGE_USIZE]));
+        }
         let mut pos = offset;
         let mut rest = data;
         while !rest.is_empty() {
@@ -58,9 +62,11 @@ impl Pages {
         self.size = self.size.max(offset + data.len() as u64);
     }
 
-    pub fn truncate(&mut self, new_size: u64, zero_tail: bool) {
+    pub fn truncate(&mut self, new_size: u64, zero_tail: bool, keep: bool) {
         if new_size < self.size {
-            self.map.split_off(&new_size.div_ceil(PAGE));
+            if !keep {
+                self.map.split_off(&new_size.div_ceil(PAGE));
+            }
             if zero_tail && !new_size.is_multiple_of(PAGE) {
                 if let Some(page) = self.map.get_mut(&(new_size / PAGE)) {
                     page[(new_size % PAGE) as usize..].fill(0);

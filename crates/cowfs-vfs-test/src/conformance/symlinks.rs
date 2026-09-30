@@ -213,3 +213,21 @@ pub fn symlink_binary_target(c: &Ctx) -> Outcome {
     ensure_eq!(c.fs.readlink(a.ino)?, target, "binary target");
     Ok(())
 }
+
+pub fn symlink_size_multibyte(c: &Ctx) -> Outcome {
+    let target = "\u{e9}\u{65e5}\u{672c}\u{8a9e}".as_bytes();
+    ensure_eq!(target.len(), 11, "test target length");
+    let a = c.symlink(ROOT_INO, b"l", target)?;
+    ensure_eq!(
+        a.size,
+        11,
+        "size returned by symlink for a multibyte target"
+    );
+    ensure_eq!(
+        c.fs.getattr(a.ino)?.size,
+        11,
+        "size from getattr for a multibyte target"
+    );
+    ensure_eq!(c.fs.readlink(a.ino)?, target.to_vec(), "multibyte target");
+    Ok(())
+}

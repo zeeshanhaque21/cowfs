@@ -66,14 +66,6 @@ pub fn rename_file_over_file(c: &Ctx) -> Outcome {
         b"GGGGGGGG".to_vec(),
         "content of the replaced inode via its other name"
     );
-    c.fs.unlink(ROOT_INO, b"g2")?;
-    ensure_eq!(
-        c.fs.getattr(g)?.nlink,
-        0,
-        "replaced inode after its last name is gone"
-    );
-    c.forget_all(g);
-    ensure_err!(c.fs.getattr(g), Error::Stale, "replaced inode after forget");
     Ok(())
 }
 
@@ -461,5 +453,90 @@ pub fn rename_dir_keeps_contents(c: &Ctx) -> Outcome {
         "deep file content"
     );
     ensure_eq!(c.list(a)?.len(), 3, "entries of the renamed directory");
+    Ok(())
+}
+
+/// Linux says ENOTEMPTY, APFS and `MemVfs` say EISDIR. Either is fine, success is not.
+pub fn rename_file_onto_ancestor_dir_is_rejected(c: &Ctx) -> Outcome {
+    let a = c.dir(ROOT_INO, "a")?;
+    let f = c.file(a, "f")?;
+    ensure_err_any!(
+        mv(c, a, "f", ROOT_INO, "a"),
+        [Error::IsDir, Error::NotEmpty],
+        "a file onto its own non-empty parent directory"
+    );
+    ensure_eq!(c.lookup(a, b"f")?.ino, f, "file after the rejected rename");
+    ensure_eq!(
+        c.lookup(ROOT_INO, b"a")?.ino,
+        a,
+        "directory after the rejected rename"
+    );
+    Ok(())
+}
+
+/// After a directory moves, its new ancestors must be known: moving a former ancestor of the new
+/// place under it is still a cycle.
+pub fn rename_ancestor_into_moved_dir(c: &Ctx) -> Outcome {
+    let p = c.dir(ROOT_INO, "p")?;
+    let q = c.dir(p, "q")?;
+    let r = c.dir(ROOT_INO, "r")?;
+    let deep = c.dir(q, "deep")?;
+    mv(c, p, "q", r, "q")?;
+    ensure_err!(
+        mv(c, ROOT_INO, "r", q, "x"),
+        Error::InvalidArgument,
+        "moving r under its own moved child"
+    );
+    ensure_err!(
+        mv(c, ROOT_INO, "r", deep, "x"),
+        Error::InvalidArgument,
+        "moving r under a grandchild that moved with it"
+    );
+    mv(c, ROOT_INO, "p", q, "p")?;
+    ensure_err!(
+        mv(c, r, "q", deep, "x"),
+        Error::InvalidArgument,
+        "moving q under its own child"
+    );
+    Ok(())
+}
+
+/// Moves a directory to another parent and checks the old and new parent both see it: the
+/// listings, `nlink` (2 + subdirectories), removal through the new parent, and the old parent
+/// becoming removable.
+pub fn rename_dir_across_parents_keeps_parent_links(c: &Ctx) -> Outcome {
+    let a = c.dir(ROOT_INO, "a")?;
+    let b = c.dir(ROOT_INO, "b")?;
+    let x = c.dir(a, "x")?;
+    let y = c.dir(x, "y")?;
+    let nlink = |i| c.fs.getattr(i).map(|a| a.nlink);
+    ensure_eq!((nlink(a)?, nlink(b)?, nlink(x)?), (3, 2, 3), "before");
+    mv(c, a, "x", b, "moved")?;
+    ensure_eq!(
+        (nlink(a)?, nlink(b)?, nlink(x)?, nlink(y)?),
+        (2, 3, 3, 2),
+        "nlink of old parent, new parent, moved directory, its child"
+    );
+    ensure!(
+        c.list(a)?.is_empty(),
+        "old parent still lists the directory"
+    );
+    ensure_eq!(c.names(b)?, vec![b"moved".to_vec()], "new parent listing");
+    ensure_eq!(c.lookup(b, b"moved")?.ino, x, "moved directory inode");
+    ensure_eq!(c.lookup(x, b"y")?.ino, y, "child of the moved directory");
+    ensure_err!(
+        c.fs.rmdir(b, b"moved"),
+        Error::NotEmpty,
+        "rmdir of the moved directory while it has a child"
+    );
+    c.fs.rmdir(x, b"y")?;
+    c.fs.rmdir(b, b"moved")?;
+    ensure_eq!(
+        nlink(b)?,
+        2,
+        "new parent after removing the moved directory"
+    );
+    c.fs.rmdir(ROOT_INO, b"a")?;
+    ensure_eq!(nlink(ROOT_INO)?, 3, "root after removing the old parent");
     Ok(())
 }

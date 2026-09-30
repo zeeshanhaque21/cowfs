@@ -235,20 +235,49 @@ pub fn truncate_shrink_then_grow_zero_fills(c: &Ctx) -> Outcome {
 }
 
 pub fn truncate_to_same_size(c: &Ctx) -> Outcome {
+    for (i, len) in [0usize, 1, 4096, 5000, 12_289].into_iter().enumerate() {
+        let f = c.file(ROOT_INO, &format!("f{i}"))?;
+        let data = pattern(len, 30 + i as u64);
+        c.write_all(f, 0, &data)?;
+        let same = SetAttr {
+            size: Some(len as u64),
+            ..Default::default()
+        };
+        let a = c.fs.setattr(f, same)?;
+        ensure_eq!(
+            a.size,
+            len as u64,
+            "size after truncating a {len} byte file to its own size"
+        );
+        ensure!(
+            c.content(f)? == data,
+            "content changed by truncating a {len} byte file to its own size"
+        );
+        c.write_all(f, len as u64, b"+")?;
+        ensure_eq!(
+            c.fs.getattr(f)?.size,
+            len as u64 + 1,
+            "size after appending to a {len} byte file that was truncated to its size"
+        );
+    }
+    Ok(())
+}
+
+/// cowfs contract: a truncate that changes nothing still counts as a change, so ctime moves.
+/// mtime is deliberately not checked: btrfs leaves it alone, ext4 and APFS bump it.
+pub fn truncate_to_same_size_bumps_ctime(c: &Ctx) -> Outcome {
     let f = c.file(ROOT_INO, "f")?;
     c.write_all(f, 0, b"hello")?;
-    let a = c.fs.setattr(
-        f,
-        SetAttr {
-            size: Some(5),
-            ..Default::default()
-        },
-    )?;
-    ensure_eq!(a.size, 5, "size after no-op truncate");
-    ensure_eq!(
-        c.content(f)?,
-        b"hello".to_vec(),
-        "content after no-op truncate"
+    let old = c.fs.getattr(f)?;
+    c.tick();
+    let same = SetAttr {
+        size: Some(5),
+        ..Default::default()
+    };
+    let a = c.fs.setattr(f, same)?;
+    ensure!(
+        a.ctime > old.ctime,
+        "truncate to the same size did not bump ctime"
     );
     Ok(())
 }
@@ -306,7 +335,7 @@ pub fn blocks_accounting(c: &Ctx) -> Outcome {
         "fully written 1 MiB file reports only {b} bytes of blocks"
     );
     ensure!(
-        b <= len as u64 + (1 << 20),
+        b <= len as u64 + (64 << 10),
         "1 MiB file reports {b} bytes of blocks"
     );
     c.fs.setattr(
@@ -375,6 +404,45 @@ pub fn random_overlapping_writes_match_model(c: &Ctx) -> Outcome {
     ensure!(
         c.content(f)? == model,
         "final content differs from the model"
+    );
+    Ok(())
+}
+
+pub fn read_never_short_mid_file(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    c.write_all(f, 0, &pattern(4 << 20, 2))?;
+    for (off, size) in [
+        (0u64, 65_536u32),
+        (0, 1 << 20),
+        (0, 3 << 20),
+        (1 << 20, 3 << 20),
+    ] {
+        let got = c.fs.read(f, off, size)?.len();
+        ensure_eq!(
+            got,
+            size as usize,
+            "length of a read of {size} bytes at {off} in the middle of a file"
+        );
+    }
+    Ok(())
+}
+
+pub fn read_huge_size_on_small_file(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    c.write_all(f, 0, b"tiny")?;
+    ensure_eq!(
+        c.fs.read(f, 0, u32::MAX)?,
+        b"tiny".to_vec(),
+        "read of u32::MAX bytes from a 4 byte file"
+    );
+    ensure_eq!(
+        c.fs.read(f, 2, u32::MAX)?,
+        b"ny".to_vec(),
+        "read of u32::MAX bytes at offset 2"
+    );
+    ensure!(
+        c.fs.read(f, 4, u32::MAX)?.is_empty(),
+        "read of u32::MAX bytes at the end returned data"
     );
     Ok(())
 }
