@@ -192,6 +192,7 @@ impl Vfs for PathVfs {
         validate_name(name)?;
         let mut s = self.lock();
         let dir = s.dir_fd(parent)?;
+        s.invalidate(parent);
         let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
         let fd = sys::openat(dir.file.as_fd(), name, flags, 0o600).map_err(io_err)?;
         // Set the mode explicitly: the creation mode is filtered by the umask.
@@ -208,6 +209,7 @@ impl Vfs for PathVfs {
         validate_name(name)?;
         let mut s = self.lock();
         let dir = s.dir_fd(parent)?;
+        s.invalidate(parent);
         sys::mkdirat(dir.file.as_fd(), name, 0o700).map_err(io_err)?;
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
         let fd = sys::openat(dir.file.as_fd(), name, flags, 0).map_err(io_err)?;
@@ -224,6 +226,7 @@ impl Vfs for PathVfs {
         validate_name(name)?;
         let mut s = self.lock();
         let dir = s.dir_fd(parent)?;
+        s.invalidate(parent);
         sys::symlinkat(target, dir.file.as_fd(), name).map_err(io_err)?;
         let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
         let ino = s.register(parent, &dir.file, name, &st)?;
@@ -239,6 +242,7 @@ impl Vfs for PathVfs {
             (n.kind, n.id, n.names.clone())
         };
         let new_dir = s.dir_fd(new_parent)?;
+        s.invalidate(new_parent);
         if kind == FileKind::Directory {
             return Err(Error::PermissionDenied);
         }
@@ -268,6 +272,7 @@ impl Vfs for PathVfs {
         validate_name(name)?;
         let mut s = self.lock();
         let dir = s.dir_fd(parent)?;
+        s.invalidate(parent);
         let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
         if st.file_type() == u32::from(libc::S_IFDIR) {
             return Err(Error::IsDir);
@@ -294,6 +299,7 @@ impl Vfs for PathVfs {
         validate_name(name)?;
         let mut s = self.lock();
         let dir = s.dir_fd(parent)?;
+        s.invalidate(parent);
         let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
         if st.file_type() != u32::from(libc::S_IFDIR) {
             return Err(Error::NotDir);
@@ -330,6 +336,8 @@ impl Vfs for PathVfs {
         let mut s = self.lock();
         let from_dir = s.dir_fd(parent)?;
         let to_dir = s.dir_fd(new_parent)?;
+        s.invalidate(parent);
+        s.invalidate(new_parent);
         let src = sys::fstatat(from_dir.file.as_fd(), name).map_err(io_err)?;
         let dst = match sys::fstatat(to_dir.file.as_fd(), new_name) {
             Ok(st) => Some(st),
@@ -449,12 +457,16 @@ impl Vfs for PathVfs {
     fn readdir(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDir> {
         let mut s = self.lock();
         let open = s.dir_fd(dir)?;
-        let names = sys::list_dir(open.file.as_fd()).map_err(io_err)?;
-        let listing = s.node_mut(dir)?.cookies.sync(names);
-        let rest: Vec<_> = listing.iter().filter(|(c, _)| *c > cookie).collect();
+        if cookie == 0 || s.node(dir)?.listing.is_none() {
+            let names = sys::list_dir(open.file.as_fd()).map_err(io_err)?;
+            let n = s.node_mut(dir)?;
+            n.listing = Some(n.cookies.sync(names));
+        }
+        let listing = s.node_mut(dir)?.listing.take().unwrap_or_default();
+        let rest = &listing[listing.partition_point(|(c, _)| *c <= cookie)..];
         let mut entries = Vec::new();
         let mut consumed = 0;
-        for (c, name) in &rest {
+        for (c, name) in rest {
             if entries.len() >= max {
                 break;
             }
@@ -475,10 +487,9 @@ impl Vfs for PathVfs {
                 cookie: *c,
             });
         }
-        Ok(ReadDir {
-            entries,
-            eof: consumed == rest.len(),
-        })
+        let eof = consumed == rest.len();
+        s.node_mut(dir)?.listing = Some(listing);
+        Ok(ReadDir { entries, eof })
     }
 
     fn statfs(&self) -> Result<StatFs> {

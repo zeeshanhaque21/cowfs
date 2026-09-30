@@ -83,6 +83,8 @@ pub(crate) struct Node {
     /// A symlink's target, read once: it never changes.
     pub target: Option<Vec<u8>>,
     pub cookies: Cookies,
+    /// The directory's names by cookie as of the last read, dropped by every change to it.
+    pub listing: Option<Vec<(u64, Vec<u8>)>>,
 }
 
 /// The inode table. Every method runs under the single lock in `PathVfs`.
@@ -115,6 +117,7 @@ impl State {
             unlinked: false,
             target: None,
             cookies: Cookies::default(),
+            listing: None,
         };
         let mut nodes = HashMap::new();
         nodes.insert(ROOT_INO, node);
@@ -136,6 +139,13 @@ impl State {
 
     pub(crate) fn node_mut(&mut self, ino: Ino) -> Result<&mut Node> {
         self.nodes.get_mut(&ino).ok_or(Error::Stale)
+    }
+
+    /// Drops the cached listing of `dir`: a name is about to be added or removed in it.
+    pub(crate) fn invalidate(&mut self, dir: Ino) {
+        if let Some(n) = self.nodes.get_mut(&dir) {
+            n.listing = None;
+        }
     }
 
     pub(crate) fn node_by_id(&self, id: (u64, u64)) -> Option<Ino> {
@@ -308,6 +318,7 @@ impl State {
                 unlinked: false,
                 target,
                 cookies: Cookies::default(),
+                listing: None,
             },
         );
         self.by_id.insert(id, ino);
