@@ -298,3 +298,24 @@ Recommendation for the lead, not applied to `docs/v1-architecture.md`: restate b
 The independent critic measured verified reads at 3413 MiB/s on 8 threads, and the builder measured 2656 MiB/s under heavier load.
 Ingest already scales the same way (709 to 1172 MiB/s on 8 threads against about 200 on one).
 Every thread of a mount serving reads or an import runs the chunker, the hasher and the decoder independently, so the 8 thread figure is the one that matters for cowfs.
+
+## Performance before and after the critic fixes
+
+Same tool and data as above, one run of each binary back to back under the shared CPU lock, n=5 per row, median shown.
+Machine load average was 84 to 117 at the start and 49 to 118 at the end, so every figure is a noisy lower bound and differences under about 15% are not meaningful.
+"Before" is commit `3696e42`, "after" is the fixed code.
+
+| Metric | Before | After |
+|---|---|---|
+| Chunk plus hash, 1 thread | 567 MiB/s | 636 MiB/s |
+| Ingest plus sync, 1 thread | 204 MiB/s | 209 MiB/s |
+| Ingest plus sync, 8 threads | 503 MiB/s | 1000 MiB/s |
+| Verified read, 1 thread | 612 MiB/s | 525 MiB/s |
+| Verified read, 8 threads | 3711 MiB/s | 4170 MiB/s |
+| Re-ingest of duplicates, 1 thread, warm session | 774 MiB/s | 901 MiB/s |
+| Re-ingest of duplicates, 1 thread, first pass after reopen | 689 MiB/s | 686 MiB/s |
+| Re-ingest of duplicates, 8 threads | 4943 MiB/s | 5604 MiB/s |
+| Index lookups, 1 thread | 24.9 M/s | 31.4 M/s |
+
+Verify-on-dedup costs nothing measurable: the first duplicate pass after a reopen reads and compares every stored block, and runs at the same speed as the old trust-the-index path, because that pass is bound by chunking and hashing.
+Single-thread verified read moved from 612 to 525 MiB/s, which is inside the load noise of these runs but is not proven to be noise.
