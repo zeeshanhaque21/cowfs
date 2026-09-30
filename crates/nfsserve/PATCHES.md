@@ -43,14 +43,14 @@ Everything below is ours.
     executed. Keying on (address, xid, hash) alone made the server answer such a call with the
     first connection's reply without ever running it, and the client was then told a file existed
     that did not.
-    A call may still be replayed across connections, but only when the connection that ran it has
-    gone away: over TCP a retransmission goes out on the connection it was sent on, so a
-    connection that is gone is the only shape a genuine post-reconnect resend can take. The price
-    is that a mutation is executed twice if a client sends the same (xid, call) on a second
-    connection it is still holding, while the first connection never got its reply. No client
-    does that, and preferring a duplicate effect over a silently wrong success is the safer of
-    the two. The set of closed connections is bounded and the cross-connection index never
-    outlives the entries it points at.
+    A call may still be replayed on another connection, but only when the connection that ran it
+    has not sent anything since: a client that got the reply moved on, and a client that is
+    repeating a call on a fresh connection is one whose reply was lost, which over TCP is the
+    only shape a post-reconnect resend can take. The price is that a mutation is executed twice
+    if a client sends the same (xid, call) on a second connection while the first connection
+    never sent anything after it. No client does that, and preferring a duplicate effect over a
+    silently wrong success is the safer of the two. The per-connection high-water marks are
+    bounded, and the cross-connection index never outlives the entries it points at.
 - Removed: `fs_util` (Windows and path helpers), `write_counter`, `transaction_tracker`, the `demo` feature, the auto IP binding, `filetime`, `intaglio`.
 - Lints: the workspace lint bar (fmt, clippy `-D warnings`).
   Allows that remain: `lib.rs` has `#![allow(non_camel_case_types, clippy::upper_case_acronyms)]` because the RFC type and procedure names are kept as written; `mount.rs` and `portmap.rs` have `#![allow(dead_code)]` because they transcribe RFC constants this server does not all use.

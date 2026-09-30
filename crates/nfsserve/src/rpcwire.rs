@@ -62,6 +62,7 @@ async fn handle_rpc(
         fingerprint,
     });
     if let Some(key) = cache_key {
+        context.reply_cache.note_xid(context.conn, xid);
         match context.reply_cache.begin(key) {
             Begin::Replay(reply) => {
                 debug!("replaying the reply to retransmitted xid {xid}");

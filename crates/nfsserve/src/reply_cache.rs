@@ -5,7 +5,10 @@
 //! of the whole call. The connection matters: one client keeps several connections open and each
 //! counts xids from its own start, so the same (xid, call) on another connection is a different
 //! call, not a retransmission, and must be executed. See `PATCHES.md`.
-use std::collections::{HashMap, HashSet, VecDeque};
+//!
+//! One call may still be replayed on another connection: if the connection that ran it had sent
+//! nothing since, it never saw a reply, which is the only shape a post-reconnect resend can take.
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -56,9 +59,8 @@ struct Inner {
     order: VecDeque<CacheKey>,
     /// The call each remembered one answers to when it arrives on another connection.
     cross: HashMap<(IpAddr, u32, u64), CacheKey>,
-    /// Connections that have gone away, oldest first.
-    closed: VecDeque<u64>,
-    closed_set: HashSet<u64>,
+    /// The highest xid each connection has sent, which says whether it moved on past a call.
+    high: HashMap<u64, u32>,
     bytes: usize,
 }
 
@@ -88,21 +90,24 @@ impl ReplyCache {
         self.next_conn.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Notes that a connection is gone. A call it ran may then be replayed for another
-    /// connection, which is what a client that lost its connection and reconnected does.
-    pub fn close_conn(&self, conn: u64) {
+    /// Notes the xid a connection just sent, and answers whether that connection has sent
+    /// anything since a given xid. A connection that has moved on got the reply for that xid, so
+    /// a later call with it on another connection is not its retransmission.
+    pub fn note_xid(&self, conn: u64, xid: u32) {
         let mut g = self.lock();
-        if g.closed_set.insert(conn) {
-            g.closed.push_back(conn);
-        }
-        while g.closed.len() > self.max_entries.saturating_mul(2).max(64) {
-            match g.closed.pop_front() {
-                Some(old) => {
-                    g.closed_set.remove(&old);
-                }
-                None => break,
+        let high = g.high.entry(conn).or_insert(0);
+        *high = (*high).max(xid);
+        if g.high.len() > self.max_entries.saturating_mul(2).max(64) {
+            let mut idle: Vec<(u64, u32)> = g.high.iter().map(|(c, h)| (*c, *h)).collect();
+            idle.sort_unstable();
+            for (c, _) in idle.into_iter().take(g.high.len() / 2) {
+                g.high.remove(&c);
             }
         }
+    }
+
+    fn moved_on(&self, g: &Inner, conn: u64, xid: u32) -> bool {
+        g.high.get(&conn).is_some_and(|h| *h > xid)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -124,12 +129,11 @@ impl ReplyCache {
                 State::Done(r) => Begin::Replay(r.clone()),
             };
         }
-        // A call that arrived on a connection which is gone may be a retransmission of one the
-        // client sent before it reconnected, and then must not run again. A call from a
-        // connection that is still open is a new call: the client runs several at once and each
-        // counts xids from its own start.
+        // A call from another connection may be a retransmission of one the client sent before
+        // it reconnected, and then must not run again. It can only be that if the connection
+        // that ran it has sent nothing since, because a client that got the reply moved on.
         if let Some(&orig) = g.cross.get(&key.call()) {
-            if orig.conn != key.conn && g.closed_set.contains(&orig.conn) {
+            if orig.conn != key.conn && !self.moved_on(&g, orig.conn, key.xid) {
                 return match &g.map.get(&orig).map(|e| &e.state) {
                     Some(State::InProgress) | None => Begin::InProgress,
                     Some(State::Done(r)) => Begin::Replay(r.clone()),
@@ -247,27 +251,28 @@ mod tests {
     }
 
     #[test]
-    fn the_same_call_on_a_live_connection_is_not_a_retransmission() {
+    fn a_call_from_another_connection_is_a_new_call_once_the_client_moved_on() {
         let c = cache(100, 60_000);
+        c.note_xid(1, 7);
         assert!(matches!(c.begin(on(1, 7)), Begin::New));
         c.finish(on(1, 7), Some(vec![1]));
+        c.note_xid(1, 8);
         assert!(
             matches!(c.begin(on(2, 7)), Begin::New),
-            "another open connection is a new call"
+            "the first connection sent xid 8, so it got the reply to 7"
         );
     }
 
     #[test]
-    fn the_same_call_after_a_reconnect_replays() {
+    fn a_call_the_client_never_got_a_reply_to_replays_on_a_new_connection() {
         let c = cache(100, 60_000);
-        c.close_conn(1);
+        c.note_xid(1, 7);
         assert!(matches!(c.begin(on(1, 7)), Begin::New));
         c.finish(on(1, 7), Some(vec![9]));
         match c.begin(on(2, 7)) {
             Begin::Replay(r) => assert_eq!(*r, vec![9]),
             other => panic!("{other:?}"),
         }
-        c.close_conn(2);
         assert!(
             matches!(c.begin(on(3, 7)), Begin::Replay(_)),
             "and every later connection gets the same answer"
@@ -277,20 +282,19 @@ mod tests {
     #[test]
     fn a_call_still_running_never_gets_a_reply_for_another_connection() {
         let c = cache(100, 60_000);
+        c.note_xid(1, 7);
         assert!(matches!(c.begin(on(1, 7)), Begin::New));
-        c.close_conn(1);
         assert!(matches!(c.begin(on(2, 7)), Begin::InProgress));
     }
 
     #[test]
-    fn closed_connections_are_forgotten_in_bounded_time() {
+    fn the_connection_bookkeeping_is_bounded() {
         let c = cache(4, 60_000);
-        for i in 0..1000 {
-            c.close_conn(i);
+        for i in 0..10_000u64 {
+            c.note_xid(i, i as u32);
         }
         let g = c.lock();
-        assert!(g.closed.len() <= 64, "{}", g.closed.len());
-        assert!(!g.closed_set.contains(&0), "the oldest are dropped");
+        assert!(g.high.len() <= 64, "{}", g.high.len());
     }
 
     #[test]
