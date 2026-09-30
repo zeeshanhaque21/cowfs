@@ -873,3 +873,63 @@ fn damage_in_a_sealed_pack_is_reported_and_never_cut() {
     assert_eq!(fs::metadata(&p0).unwrap().len(), before);
     assert_eq!(s.recovery().torn_tail_discarded, 0);
 }
+
+/// Mutant guard: a swapped (checksum-valid) index must fail on the id check, not just on the hash.
+#[test]
+fn a_swapped_index_is_rejected_as_a_mismatch_between_index_and_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (random(1, 4000), random(2, 4000));
+    let (ia, ib) = (BlockId::of(&a), BlockId::of(&b));
+    let mut pack = PACK_HEADER.to_vec();
+    pack.extend_from_slice(&record(0, 4000, *ia.as_bytes(), &a));
+    pack.extend_from_slice(&record(0, 4000, *ib.as_bytes(), &b));
+    let oa = 16u32;
+    let ob = (16 + REC_HDR + 4000) as u32;
+    let ix = index_bytes(
+        &[(0, pack.len() as u64)],
+        &[(ia, [0, ob, 4000, 4000]), (ib, [0, oa, 4000, 4000])],
+    );
+    install_wm(
+        dir.path(),
+        &[(0, &pack)],
+        Some(&ix),
+        Some((0, pack.len() as u64)),
+    );
+    let s = Store::open_unsynced(dir.path(), opts()).unwrap();
+    assert!(s.recovery().index_loaded);
+    for id in [ia, ib] {
+        assert!(
+            matches!(s.get(id), Err(Error::Corrupt { .. })),
+            "{:?}",
+            s.get(id)
+        );
+    }
+}
+
+/// Mutant guard: a zstd record that decodes to fewer bytes than its header says is corrupt.
+#[test]
+fn a_short_decode_is_corrupt_even_when_the_bytes_hash_to_the_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let short = random(4, 500);
+    let id = BlockId::of(&short);
+    let payload = zstd::bulk::compress(&short, 3).unwrap();
+    assert!(payload.len() < 1000);
+    let mut pack = PACK_HEADER.to_vec();
+    pack.extend_from_slice(&record(1, 1000, *id.as_bytes(), &payload));
+    let ix = index_bytes(
+        &[(0, pack.len() as u64)],
+        &[(id, [0, 16, payload.len() as u32, 1000])],
+    );
+    install_wm(
+        dir.path(),
+        &[(0, &pack)],
+        Some(&ix),
+        Some((0, pack.len() as u64)),
+    );
+    let s = Store::open_unsynced(dir.path(), opts()).unwrap();
+    assert!(
+        matches!(s.get(id), Err(Error::Corrupt { .. })),
+        "{:?}",
+        s.get(id).map(|v| v.len())
+    );
+}
