@@ -13,6 +13,17 @@ use crate::types::{
 /// content changes also update its mtime. Name-changing operations also update the parent
 /// directory's times (see `Attr`).
 ///
+/// # Concurrency
+///
+/// Every method may be called concurrently from many threads, and each call is atomic:
+/// concurrent calls behave as if they ran one at a time in some order (linearizable), and
+/// the effects of a call that returned are visible to every call that starts afterwards.
+/// An implementation must not rely on the caller to order or serialise calls, including
+/// calls on the same inode. Adapters preserve only the order the kernel or protocol
+/// imposes, which is that a dependent request is issued after the reply to the request it
+/// depends on (write, then fsync, then read). Adapters may run cheap calls inline and slow
+/// ones on worker threads, so two independent calls can overlap.
+///
 /// `ROOT_INO` may be a synthetic, read-only directory: mutating it returns `ReadOnly`, and a
 /// rename across two such subtrees returns `CrossDevice`. There are no special files
 /// (devices, fifos, sockets) and no permission enforcement: adapters check mode bits.

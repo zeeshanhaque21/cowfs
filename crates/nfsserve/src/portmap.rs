@@ -1,0 +1,24 @@
+// RFC constants and types kept whole even where this server does not use them
+#![allow(dead_code)]
+// this is just a complete enumeration of everything in the RFC
+// And its nice to keep the original RFC names and case
+
+use std::io::{Read, Write};
+
+use crate::xdr::*;
+// Transcribed from RFC 1057 Appendix A
+
+/// Device Number information. Ex: Major / Minor device
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct mapping {
+    pub prog: u32,
+    pub vers: u32,
+    pub prot: u32,
+    pub port: u32,
+}
+xdr_struct!(mapping, prog, vers, prot, port);
+pub const IPPROTO_TCP: u32 = 6; /* protocol number for TCP/IP */
+pub const IPPROTO_UDP: u32 = 17; /* protocol number for UDP/IP */
+pub const PROGRAM: u32 = 100000;
+pub const VERSION: u32 = 2;
