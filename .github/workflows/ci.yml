@@ -39,4 +39,10 @@ jobs:
       - name: Test FUSE mounts and conformance
         env:
           COWFS_FUSE_STRICT: "1"
+          COWFS_CONFORMANCE_XATTR_NAMES: prefixed
         run: cargo test -p cowfs-fuse -j4 -- --include-ignored --test-threads=1 --nocapture
+      - name: Native xattr control
+        if: failure()
+        env:
+          COWFS_CONFORMANCE_FILTER: xattr_on_directory_and_symlink
+        run: cargo test -p cowfs-vfs-path --test native -j4 -- --ignored --nocapture --test-threads=1
