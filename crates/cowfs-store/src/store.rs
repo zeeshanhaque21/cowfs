@@ -7,6 +7,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::time::Duration;
 
 use crate::ack::{self, Entry};
 use crate::chunk::{chunks, Chunker};
@@ -28,6 +29,10 @@ const MAX_PACK_LIMIT: u64 = 1 << 31;
 const TORN_KEEP: u64 = 1 << 20;
 /// Most missing pack ids listed in a recovery report.
 const MAX_LISTED: usize = 1 << 16;
+/// How long `open` waits for a lock whose owner is closing before it reports the store as busy.
+const LOCK_WAIT: Duration = Duration::from_millis(250);
+/// How often that wait looks again.
+const LOCK_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Default)]
 struct Counters {
@@ -64,7 +69,6 @@ impl Writer {
 pub struct Store {
     dir: PathBuf,
     io: Io,
-    _lock: File,
     index: Index,
     reads: FdCache,
     writer: Mutex<Writer>,
@@ -78,6 +82,10 @@ pub struct Store {
     /// Packs whose records the index cannot be trusted for, so a checkpoint must not record them.
     rescan: Mutex<BTreeSet<u32>>,
     recovery: RecoveryReport,
+    /// The store lock, declared last so it is the last descriptor to go: every other handle the
+    /// store owns is closed before the lock is released, so a reopen never races a half-closed
+    /// store. `None` only between `close` taking it and the field dropping.
+    _lock: Option<File>,
 }
 
 /// Write a fresh pack header and return the resulting length.
@@ -329,10 +337,20 @@ impl Store {
             io.created(&lock_path);
             io.sync_dir(&dir)?;
         }
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(Error::Locked(dir)),
-            Err(TryLockError::Error(e)) => return Err(e.into()),
+        // A handle that is closing right now still shows the lock as held for a moment, so a
+        // reopen that races a release waits for it instead of failing. A live owner keeps it for
+        // as long as it likes: the wait is bounded and then the store reports Locked.
+        let mut waited = Duration::ZERO;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if waited < LOCK_WAIT => {
+                    std::thread::sleep(LOCK_POLL);
+                    waited += LOCK_POLL;
+                }
+                Err(TryLockError::WouldBlock) => return Err(Error::Locked(dir)),
+                Err(TryLockError::Error(e)) => return Err(e.into()),
+            }
         }
         let max_pack_size = options.max_pack_size.clamp(1, MAX_PACK_LIMIT);
 
@@ -817,7 +835,6 @@ impl Store {
             dir: dir.clone(),
             reads: FdCache::new(dir, options.max_open_packs),
             io,
-            _lock: lock,
             index,
             writer: Mutex::new(Writer {
                 id,
@@ -836,6 +853,7 @@ impl Store {
             damaged: RwLock::new(damaged),
             rescan: Mutex::new(rescan),
             recovery,
+            _lock: Some(lock),
         })
     }
 
@@ -1434,10 +1452,36 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Do what a drop would, but report the error.
+    fn shutdown(&self) -> Result<()> {
+        if self.checkpoint_on_drop && self.dirty.load(Relaxed) {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Release the lock now. `close` calls it; a drop leaves it to the field, which drops last.
+    fn release_lock(&mut self) -> io::Result<()> {
+        match self._lock.take() {
+            Some(f) => f.unlock(),
+            None => Ok(()),
+        }
+    }
+
+    /// Flush, release the lock and report anything that went wrong.
+    ///
+    /// A drop does the same work and cannot report it, so a caller that has to know should call
+    /// this. It is the only way to finish a store whose drop would have complained.
+    pub fn close(mut self) -> Result<()> {
+        let flushed = self.shutdown();
+        let released = self.release_lock();
+        flushed.and(released.map_err(Error::from))
+    }
+}
+
 impl Drop for Store {
     fn drop(&mut self) {
-        if self.checkpoint_on_drop && self.dirty.load(Relaxed) {
-            let _ = self.checkpoint();
-        }
+        let _ = self.shutdown();
     }
 }
