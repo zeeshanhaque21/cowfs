@@ -573,6 +573,7 @@ fn crash_at_every_boundary_of_a_torn_watermark_recovery() {
 }
 
 /// Copy a store's files, without the lock, so a recovery can be crashed in a fresh directory.
+#[cfg(feature = "fault-injection")]
 fn cp_store(from: &std::path::Path, to: &std::path::Path) {
     fs::create_dir_all(to.join("packs")).unwrap();
     for id in pack_ids(from) {
@@ -587,6 +588,7 @@ fn cp_store(from: &std::path::Path, to: &std::path::Path) {
 }
 
 #[test]
+#[cfg(feature = "fault-injection")]
 fn torn_watermark_child() {
     let Ok(p) = std::env::var("C7D_TORN_DIR") else {
         return;
@@ -598,12 +600,14 @@ fn torn_watermark_child() {
     }
     let _ = Store::open(&p, opts());
 }
+#[cfg(feature = "fault-injection")]
 #[allow(unsafe_code)]
 extern "C" {
     fn setenv(name: *const std::ffi::c_char, value: *const std::ffi::c_char, overwrite: i32)
         -> i32;
 }
 
+#[cfg(feature = "fault-injection")]
 unsafe fn set_fault(key: &str, n: &str) {
     let (k, v) = (
         std::ffi::CString::new(key).unwrap(),
@@ -612,6 +616,7 @@ unsafe fn set_fault(key: &str, n: &str) {
     unsafe { setenv(k.as_ptr(), v.as_ptr(), 1) };
 }
 
+#[cfg(feature = "fault-injection")]
 fn child_open(dir: &std::path::Path, extra: &[(&str, String)]) -> i32 {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "torn_watermark_child"])
