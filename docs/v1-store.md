@@ -143,6 +143,8 @@ A checkpoint is taken only after the packs it describes are synced, so every ent
 
 `SYNCED` holds `(pack, len)`, `base`, the lowest pack id that must exist, and `next`, the lowest
 pack id this store may create.
+The legacy slot CRC covers bytes 0..24; `next` occupies bytes 28..32 outside that CRC.
+The pre-create fsync barrier does not add integrity protection to that field.
 Missing packs between `base` and the watermark's pack are reported as `missing_synced`.
 Ids reserved but never created are not lost packs.
 Before a later watermark crosses those holes, their whole-pack entries are durably recorded as accepted in `ACKED`.
@@ -297,7 +299,70 @@ Data that a pack holds between the watermark and its true end (sealed, but past 
   after it keeps the salvaged records. It never writes to a pack.
 - `Store::new_pack()` creates a pack for compaction to write into. It comes from the same allocator
   as a rollover, so the two never collide, and the id is recorded as used so a later rollover steps
-  over it. Any code that creates packs must use it.
+over it. Any code that creates packs must use it.
+
+## Round 4: durability QA
+
+F1: fixed.
+Pending-loss evidence is durable before a cut label, destructive recovery, sidecar retention or header reset can remove the original evidence.
+Relocation still fsyncs the destination before truncating the source.
+Acknowledgement durably saves accepted entries before removing the checkpoint or resetting the watermark.
+F2: fixed.
+Open recovery, rollover and `new_pack` reserve and fsync the next id before creating the pack.
+A failed or interrupted reservation remains consumed.
+Unused reservation holes are recorded before a later data watermark crosses them, not mistaken for lost synced packs.
+F3: documentation and refusal tests fixed; the original macOS lock failure's cause remains unknown.
+The wait now uses a wall-clock deadline rather than adding requested sleep durations.
+
+### Failing-before evidence
+
+`tests/qa4.py before` archives `070ee93` and overlays only the regression tests and opt-in fault seam.
+It does not substitute the fixed store or watermark code.
+The final baseline run failed eight tests:
+
+```text
+gc=false highwater write=None sync=None create=1
+no highwater write+fsync before create
+marker fsync missing before cut
+lost=true corruption=false
+synced block lost, evidence forgotten after crash
+rolled-back watermark hid a loss
+false clean: mode=cut C7D_EXIT_SYNC_N=7
+```
+
+The interrupted-reservation and open-time reservation-order tests also failed on that baseline.
+The live-lock timing test failed under load with the old accumulated-sleep implementation.
+These are not reproductions of the original intermittent macOS CI lock failure.
+The acknowledgement sweep passed before and after; it pins an existing guarantee rather than claiming a newly reproduced bug.
+
+### Final verification
+
+`tests/round4.rs` passes ten tests with `--features fault-injection`.
+The real-I/O seam exits a child after completed writes, truncations, renames, file fsyncs and directory fsyncs; it is absent from normal builds.
+Recovery sweeps cover cuts, relocation, short-header reset and zero-header rewrite at every observed boundary, stopping only when a child completes without reaching another boundary.
+159 recovery cases and eight acknowledgement cases pass on macOS and Linux.
+Each damaged-store case reopens twice, checks surviving bytes and continuing loss reports, then verifies acknowledgement survives another reopen.
+This process-exit sweep complements the separate power-loss models; it does not itself emulate loss of the OS page cache.
+
+| Gate | macOS | Linux VM `cowfs-spike3` |
+|---|---|---|
+| 4000-case crash model | 0 lost, wrong, false-corrupt, dirty-fsck or open failures | pass |
+| 1800-case power-loss model | pass | pass |
+| Real recovery and acknowledgement boundaries | pass | pass |
+| fmt, workspace clippy (`-D warnings`, all features/targets), workspace tests, docs | pass | pass |
+
+The Mac crash model records 38351 recovery operations and at most five sidecars.
+The default lock regression now uses 32 iterations; the separately ignored 20000-iteration test remains available unchanged.
+One scale-latency assertion failed during an overloaded Mac run, passed standalone without changing its threshold, and passed the final full workspace run.
+The benchmark example is named `store-bench` to avoid colliding with the metadata crate's `bench` output.
+
+`tests/qa4.py` applies four ordering mutants with a separate source tree and `CARGO_TARGET_DIR` for each.
+All four compile and are killed by the intended regression assertions: marker fsync dropped, marker after truncate, high-water fsync dropped, and high-water after create.
+There are zero survivors or invalid builds.
+Final mutation logs and the baseline output are in `target/qa4/final/`.
+Use a fresh `COWFS_QA4_RUN` label for a new run.
+The VM recipe is `tests/qa4-vm.sh`; it archives a named revision into a VM-local directory and uses a VM-local target directory.
+VM verification of `c4eb089` is recorded under `/home/zeeshanhaque/cowfs-spike3/round4-c4eb089/logs`.
 
 ### Threat model
 
