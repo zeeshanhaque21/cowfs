@@ -924,7 +924,11 @@ fn a6_completions_to_a_full_device_exits_1_without_panicking() {
         .stdout(Stdio::piped())
         .output()
         .unwrap();
-    assert!(out.stdout.starts_with(b"#"), "still a completion script");
+    let script = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        script.contains("cowfs") && script.contains("snapshot"),
+        "still a completion script"
+    );
     drop(dir);
 }
 
