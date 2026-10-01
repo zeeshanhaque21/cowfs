@@ -292,5 +292,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green."
 }
