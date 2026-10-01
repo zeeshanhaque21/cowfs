@@ -33,6 +33,19 @@ pub struct Probe {
     pub empty_no_eof: AtomicBool,
     /// Number cookies from 0, which the trait reserves for "from the start".
     pub zero_cookies: AtomicBool,
+    /// `rename` sleeps this long, so overlapping calls are visible.
+    pub rename_delay_ms: AtomicU64,
+    /// Renames in flight in the Vfs right now.
+    pub renames_now: AtomicI64,
+    /// Highest number of renames seen in flight at once.
+    pub renames_max: AtomicI64,
+    /// Every `rename` the Vfs was asked to do.
+    pub renames: AtomicU64,
+    /// Parent pairs of the renames in flight, so overlap on a shared directory is visible.
+    pub renaming: Mutex<Vec<(Ino, Ino)>>,
+    /// Renames in flight that share a directory with another in-flight rename.
+    pub renames_shared: AtomicI64,
+    pub renames_shared_max: AtomicI64,
     pub refs: AtomicI64,
     pub forgotten: AtomicU64,
     pub opens: AtomicU64,
@@ -109,7 +122,37 @@ impl Vfs for Probe {
         self.inner.rmdir(p, n)
     }
     fn rename(&self, p: Ino, n: &[u8], p2: Ino, n2: &[u8], f: RenameFlags) -> Result<()> {
-        self.inner.rename(p, n, p2, n2, f)
+        self.renames.fetch_add(1, SeqCst);
+        // Renames that touch a common directory must not overlap; disjoint ones may.
+        let shared = {
+            let mut busy = self.renaming.lock().unwrap_or_else(|e| e.into_inner());
+            let shares = busy
+                .iter()
+                .any(|(a, b)| *a == p || *a == p2 || *b == p || *b == p2);
+            if shares {
+                self.renames_shared.fetch_add(1, SeqCst);
+                self.renames_shared_max
+                    .fetch_max(self.renames_shared.load(SeqCst), SeqCst);
+            }
+            busy.push((p, p2));
+            shares
+        };
+        let _ = shared;
+        self.renames_now.fetch_add(1, SeqCst);
+        self.renames_max
+            .fetch_max(self.renames_now.load(SeqCst), SeqCst);
+        let d = self.rename_delay_ms.load(SeqCst);
+        if d > 0 {
+            std::thread::sleep(Duration::from_millis(d));
+        }
+        let r = self.inner.rename(p, n, p2, n2, f);
+        self.renames_now.fetch_sub(1, SeqCst);
+        self.renames_shared.fetch_sub(1, SeqCst);
+        self.renaming
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(a, b)| !(*a == p && *b == p2));
+        r
     }
     fn open(&self, i: Ino) -> Result<FileHandle> {
         if self.open_fails.load(SeqCst) {

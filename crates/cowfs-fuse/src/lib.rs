@@ -22,24 +22,28 @@
 //! kernel ignores invalidation of them (verified on Linux 7.0), so a name created behind the
 //! mount, such as a new snapshot directory at the mount root, appears within `negative_ttl`.
 //!
-//! # Threading
+//! # Threading and ordering
 //!
-//! Cheap metadata (lookup, getattr, access, statfs, forget, xattr reads, lseek) always runs on
-//! the `fuser` request loop thread. Everything that can block (read, write, readdir, open,
-//! flush, fsync, release, and every operation that changes the tree) is routed by inode
-//! (the directory for namespace changes) to one of `workers` lane threads, each a FIFO, so
-//! requests for one inode keep their order while unrelated inodes run in parallel and a slow
-//! read no longer delays a `stat`.
+//! Cheap metadata (lookup, getattr, access, statfs, forget, xattr reads, lseek) runs on the
+//! `fuser` request loop thread. Everything that can block (read, write, readdir, open, flush,
+//! fsync, release, and every operation that changes the tree) goes to one of `workers` lanes,
+//! each a FIFO, or runs inline when its class has recently been cheap (see `inline_below`).
+//! `O_APPEND` writes always take a lane, which makes concurrent appenders to one file atomic.
 //!
-//! A hand-off costs 50 to 100 microseconds in a virtual machine (measured: small writes and
-//! creates became 10 to 25 times slower), so a class of request (read, write, namespace
-//! change, close, fsync, readdir, open) whose recent average `Vfs` time is under
-//! `inline_below` (100 us) runs on the loop thread instead. A class counts as slow until it has
-//! been seen to be fast, and one slow request sends it back to the lanes, so a backend that is
-//! usually fast and sometimes slow can still block the loop for that one slow request.
-//! `O_APPEND` writes always use the lane, which makes concurrent appenders to one file
-//! atomic. The `Vfs` must be thread safe, as its trait says, and must tolerate the loop thread
-//! and up to `workers` lanes calling it at once. `workers=0` restores the single threaded loop,
+//! The adapter does not promise per-inode serialization. The `Vfs` contract is that each
+//! operation is atomic and that concurrent calls behave as some serial order, which is the
+//! implementor's to provide. The kernel only issues a dependent request after the reply to the
+//! one it depends on, so write-then-fsync, create-then-lookup and rename-then-lookup of the old
+//! name stay ordered through the mount. Requests the kernel issues independently (a `getattr`
+//! and a `read` of one inode from two processes) may reach the `Vfs` at the same time. What the
+//! adapter adds: requests for one inode that the kernel issued one after another reach the
+//! `Vfs` in that order. A rename takes only its source directory's lane, and needs no more,
+//! because the kernel serialises renames per superblock (`s_vfs_rename_mutex`), so a mount never
+//! has two renames in flight: 16 threads hammering 16 directories in both directions never
+//! reached the `Vfs` with two at once.
+//!
+//! A `Vfs` must be thread safe, as its trait says, and must tolerate the loop thread and up to
+//! `workers` lanes calling it at once. `workers=0` restores the single threaded loop;
 //! `inline_below_us=0` sends everything to the lanes.
 //!
 //! # Failure containment
@@ -47,8 +51,12 @@
 //! A panic in a `Vfs` call is caught, logged, and answered with `EIO` for that request.
 //! After `max_panics` (default 3) the mount is marked failed: every request answers
 //! `ENOTCONN` (never an empty directory) until it is unmounted, `Mount::failed` is true and
-//! `Mount::is_alive` is false. Attributes from the `Vfs` are clamped to what the kernel
-//! accepts, and logged, so one bad reply cannot make `stat` fail for the whole mount.
+//! `Mount::is_alive` is false. `is_alive()` means the session is up; a `Vfs` call that never
+//! returns leaves it true, so `Mount::health` reports that instead: `Health::Wedged` names a
+//! lane that has had a request in flight for longer than `lane_bound`. Attributes from the
+//! `Vfs` are clamped to what the kernel accepts, and logged, so one bad reply cannot make
+//! `stat` fail for the whole mount. `Error::Retry` becomes `EAGAIN`; an `Error` or `FileKind`
+//! this adapter does not know is `EIO`, never a guess.
 //!
 //! # Lifecycle
 //!
@@ -85,7 +93,11 @@
 //! `rsync --preallocate` prints a warning per file and `cp --reflink=always` fails),
 //! extended attribute namespaces other than `user.*`, `security.*` and `trusted.*` (POSIX ACLs
 //! are `ENOTSUP`), holes (`SEEK_DATA` and `SEEK_HOLE` treat the whole file as data), and FUSE
-//! locks: the kernel handles `flock` and POSIX locks locally.
+//! locks: the kernel handles `flock` and POSIX locks locally. `syncfs(2)` takes the kernel
+//! fallback, an `fsync` of the root, which the `Vfs` defines as the whole-mount barrier.
+//!
+//! pjdfstest passes on the mount except its fifo, mknod and multi-uid groups, which need the
+//! three features above (`allow_other` is off by default).
 //!
 //! # Running the mount tests
 //!

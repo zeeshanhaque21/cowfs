@@ -522,56 +522,6 @@ impl Fs {
         }
     }
 
-    /// Runs `f` for a request that touches two inodes, such as a rename, ordered after all
-    /// earlier requests on both lanes and before all later ones. The work runs on the
-    /// higher-numbered lane; it is entered from the lower one, which then waits for it. Lane
-    /// numbers are taken in a fixed order, so opposite-direction renames cannot deadlock: the
-    /// lower lane only ever waits for a higher one.
-    fn dispatch2(&self, class: Class, keys: [Ino; 2], f: impl FnOnce(&Core) + Send + 'static) {
-        let c = self.core.clone();
-        let job = move || {
-            let start = Instant::now();
-            f(&c);
-            c.cost.record(class, start.elapsed());
-        };
-        if self.lanes.is_empty() || self.core.cost.cheap(class) {
-            return job();
-        }
-        let n = self.lanes.len();
-        let (a, b) = (lane_index(keys[0], n), lane_index(keys[1], n));
-        if a == b {
-            // Both parents share a lane (a same-directory rename): one lane is enough, and
-            // handing it to itself would wait for itself.
-            let sh = self.core.sh.clone();
-            let job: Job = Box::new(move || {
-                sh.set_in_flight(a, Some((keys[0], Instant::now())));
-                job();
-                sh.set_in_flight(a, None);
-            });
-            if let Err(e) = self.lanes[a].send(job) {
-                log::error!("lane {a} is gone: {e}");
-            }
-            return;
-        }
-        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-        let (done_tx, done_rx) = mpsc::channel();
-        let sh = self.core.sh.clone();
-        let hi_job: Job = Box::new(move || {
-            sh.set_in_flight(hi, Some((keys[0], Instant::now())));
-            job();
-            sh.set_in_flight(hi, None);
-            let _ = done_tx.send(());
-        });
-        let tx = self.lanes[hi].clone();
-        let lo_job: Job = Box::new(move || {
-            let _ = tx.send(hi_job);
-            let _ = done_rx.recv();
-        });
-        if let Err(e) = self.lanes[lo].send(lo_job) {
-            log::error!("lane {lo} is gone: {e}; the request is abandoned with the mount");
-        }
-    }
-
     fn lane(&self, class: Class, key: Ino, f: impl FnOnce(&Core) + Send + 'static) {
         self.dispatch(class, key, false, f);
     }
@@ -758,8 +708,10 @@ impl Filesystem for Fs {
             Ok(f) => f,
             Err(errno) => return reply.error(errno),
         };
+        // One lane, the source directory's. The kernel serialises renames per superblock
+        // (`s_vfs_rename_mutex`), so this is the whole ordering there is; see the crate docs.
         let (n, nn) = (n.to_owned(), newname.to_owned());
-        self.dispatch2(Class::Meta, [parent, newparent], move |c| {
+        self.lane(Class::Meta, parent, move |c| {
             let r = name(&n)
                 .and_then(|n| Ok((n, name(&nn)?)))
                 .and_then(|(n, nn)| {
