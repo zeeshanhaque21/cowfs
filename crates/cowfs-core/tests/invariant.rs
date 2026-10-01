@@ -41,13 +41,18 @@ fn crashes() -> u64 {
         .unwrap_or(12)
 }
 
-fn child(which: u64) -> (String, String) {
+fn child(which: u64) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_string_lossy().into_owned();
     // the parent drives the same sequence up to `which`, then this child aborts somewhere inside
     let exe = std::env::current_exe().expect("current_exe");
     let out = Command::new(exe)
-        .args(["inv_child", "--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "invariant_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("INV_DIR", &path)
         .env("INV_WHICH", which.to_string())
         .env("INV_ITERS", iters().to_string())
@@ -56,7 +61,13 @@ fn child(which: u64) -> (String, String) {
         .output()
         .expect("child");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    (path, text)
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(out.status.signal(), Some(6), "child did not abort: {text}");
+    assert!(
+        text.contains("CHECKPOINT"),
+        "child did not finish its checkpoint: {text}"
+    );
+    (dir, text)
 }
 
 /// The child: replay a prefix of the sequence, run a swap with a fault injected at a random step
@@ -78,6 +89,8 @@ fn replay(dir: &std::path::Path, upto: u64) -> Acked {
     }
     c.sync().expect("sync");
     report(&acked);
+    println!("CHECKPOINT");
+    std::io::stdout().flush().unwrap();
     std::process::abort();
 }
 
@@ -288,7 +301,8 @@ fn control_plane_invariants_hold_across_random_sequences() {
     for round in 0..crashes() {
         let (dir, text) = child(round * 3 + 1);
         let acked = parse_acked(&text);
-        let c = Core::open(&dir, opts()).unwrap_or_else(|e| panic!("round {round}: reopen: {e:?}"));
+        let c = Core::open(dir.path(), opts())
+            .unwrap_or_else(|e| panic!("round {round}: reopen: {e:?}"));
         check(&c, &acked, &format!("round {round} after a crash"));
         // a clean run of the same length, then the invariants again
         let dir2 = tempfile::tempdir().expect("tempdir");
@@ -317,4 +331,17 @@ fn control_plane_invariants_hold_across_random_sequences() {
     let c = Core::open(dir.path(), opts()).expect("reopen");
     check(&c, &a, "long sequence after a close and reopen");
     c.check().expect("check");
+}
+
+#[test]
+fn checkpoint_child_really_runs_and_retains_its_store() {
+    let (dir, text) = child(1);
+    assert!(
+        text.contains("running 1 test"),
+        "checkpoint child was not selected: {text}"
+    );
+    assert!(
+        dir.path().join("meta.redb").exists(),
+        "checkpoint fixture was deleted"
+    );
 }

@@ -627,8 +627,9 @@ fn watchdog<F: FnOnce() + Send + 'static>(
     let done = Arc::new(AtomicBool::new(false));
     let d = done.clone();
     let h = std::thread::spawn(move || {
-        f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         d.store(true, Ordering::SeqCst);
+        result
     });
     let start = Instant::now();
     let mut last = progress.load(Ordering::SeqCst);
@@ -637,41 +638,38 @@ fn watchdog<F: FnOnce() + Send + 'static>(
     while !done.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(50));
         let now = progress.load(Ordering::SeqCst);
-        if now == last {
-            worst = worst.max(quiet_since.elapsed());
-        } else {
-            worst = Duration::ZERO;
+        worst = worst.max(quiet_since.elapsed());
+        if now != last {
             quiet_since = Instant::now();
         }
         last = now;
-        // never give up: report every stall with a stack sample and let the run finish, so the
-        // worst gap is a measurement and not an early exit
-        if worst > Duration::from_secs(20)
-            && start.elapsed() > limit
-            && !done.load(Ordering::SeqCst)
-        {
-            let out = std::process::Command::new("sample")
-                .args([
-                    &std::process::id().to_string(),
-                    "1",
-                    "-mayDie",
-                    "-f",
-                    &format!("/tmp/cowfs-hammer-{what}.sample"),
-                ])
-                .output();
-            eprintln!(
-                "STALL: no progress for {:?} in {what}, sample rc {:?}",
-                worst,
-                out.as_ref().map(|o| o.status.code())
-            );
-        }
+        assert!(
+            quiet_since.elapsed() < limit,
+            "{what}: no progress for {limit:?}"
+        );
     }
-    let _ = h.join();
+    if let Err(e) = h.join().unwrap() {
+        std::panic::resume_unwind(e);
+    }
     u64::try_from(worst.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// B7: every multi-lock operation at once, including the ones the fixes added. Reports the worst
 /// gap between progress ticks and fails if it exceeds two seconds.
+#[test]
+fn watchdog_keeps_the_longest_gap_after_progress_resumes() {
+    let ticks = Arc::new(AtomicU64::new(0));
+    let worker_ticks = ticks.clone();
+    let gap = watchdog(Duration::from_secs(2), "gap regression", ticks, move || {
+        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..20 {
+            worker_ticks.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    assert!(gap >= 150, "forgot the initial quiet interval: {gap} ms");
+}
+
 #[test]
 #[ignore = "heavy: C2B_STRESS_SECS=300 cargo test -p cowfs-core --release --test critic2b -- --ignored stress"]
 fn stress() {
@@ -888,6 +886,35 @@ fn a_step_three_refusal_removes_the_intent_and_staging_snapshot() {
     assert_eq!(snap_names(&c), ["old"]);
     assert_eq!(content(&c, "old", "x"), "OLD");
     c.check().unwrap();
+}
+
+#[test]
+fn staging_snapshots_are_hidden_from_mount_root_readdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    c.create_snapshot("src").unwrap();
+    c.set_swap_fault(1);
+    assert!(c.promote_base("src", "new").is_err());
+    assert!(c
+        .meta()
+        .snapshots()
+        .unwrap()
+        .iter()
+        .any(|s| s.name.contains(".cowfs-swap")));
+    let listing = c.readdir(ROOT_INO, 0, 100).unwrap();
+    assert!(listing
+        .entries
+        .iter()
+        .all(|e| !e.name.windows(11).any(|w| w == b".cowfs-swap")));
+}
+
+#[test]
+fn staging_names_are_reserved_for_the_swap_protocol() {
+    assert!(cowfs_core::validate_snapshot_name("evil.cowfs-swap0").is_err());
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert!(c.create_snapshot("evil.cowfs-swap0").is_err());
+    assert!(c.list_snapshots().unwrap().is_empty());
 }
 
 /// B3: a crash after the staging fork and before the intent file leaves nothing the user can see.

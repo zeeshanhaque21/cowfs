@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+ulimit -c 0
 . /Users/zeeshanhaque/Projects/cowfs/spikes/nfs-loopback/spike3/env.sh
 source_dir=/Users/zeeshanhaque/.treehouse/cowfs-7c1bf8/9/cowfs
 work=/home/zeeshanhaque/cowfs-core-work
@@ -9,9 +10,20 @@ cd "$work"
 export CARGO_TARGET_DIR="$work/target"
 export TMPDIR="$work/target/tmp"
 mkdir -p "$TMPDIR"
+phase=${1:-all}
+if [ "$phase" = hammer ]; then
+    timeout 300 env C2B_STRESS_SECS=3 cargo test -j4 -p cowfs-core --release --test critic2b -- --ignored stress --nocapture
+    timeout 420 env C2B_STRESS_SECS=180 cargo test -j4 -p cowfs-core --release --test critic2b -- --ignored stress --nocapture
+    echo 'LINUX HAMMER PASSED'
+    exit
+fi
 timeout 300 cargo test -j4 -p cowfs-core --test flush_boundary -- --nocapture
 timeout 300 env FSX_OPS=100 FSX_SEED=1 cargo test -j4 -p cowfs-core --release --test critic -- --ignored fsx --nocapture
-timeout 1800 cargo test -j4 -p cowfs-core
+timeout 1800 env INVARIANT_ITERS=100 INVARIANT_CRASHES=3 cargo test -j4 -p cowfs-core --release
+if [ "$phase" = crate ]; then
+    echo 'LINUX CRATE VALIDATION PASSED'
+    exit
+fi
 for seed in 1 2; do
     timeout 1800 env FSX_OPS=100000 FSX_SEED="$seed" cargo test -j4 -p cowfs-core --release --test critic -- --ignored fsx --nocapture
 done

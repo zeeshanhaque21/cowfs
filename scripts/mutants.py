@@ -117,6 +117,8 @@ TIMEOUT = int(os.environ.get("COWFS_MUT_TIMEOUT", "1800"))
 FOCUSED = {
     "b03_no_rollback": ["--test", "critic2b", "a_step_three_refusal_removes_the_intent_and_staging_snapshot"],
     "b09_transient_poisons": ["--test", "critic2b", "a_single_transient_failure_is_retried_in_the_same_flush"],
+    "n15_staging_name_visible": ["--test", "critic2b", "staging_snapshots_are_hidden_from_mount_root_readdir"],
+    "n16_name_rule_allows_staging": ["--test", "critic2b", "staging_names_are_reserved_for_the_swap_protocol"],
 }
 RECHECK = {
     "m10_fsync_no_meta_sync": [["--test", "flush_boundary"], ["--test", "critic2b"]],
@@ -169,7 +171,7 @@ def run(name):
     if killed:
         if "TIMEOUT" in killed:
             result = "TIMEOUT " + killed
-        elif "could not compile" in text or "error[E" in text:
+        elif "could not compile" in text or "error[E" in text or "unclosed delimiter" in text:
             result = "COMPILE-FAILED " + killed
         elif "test result: FAILED" in text:
             result = "KILLED by " + killed
