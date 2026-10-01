@@ -170,13 +170,13 @@
         },
         {
           "id": "13",
-          "title": "#13 CLI and Unix-socket control API",
-          "state": "fixing",
+          "title": "#13 cowfs-ctl and cowfs CLI (merged)",
+          "state": "done",
           "issue": 13,
-          "owner": "builder (subagent)",
+          "owner": "lead",
           "pr": "#33",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/33",
-          "detail": "Critic findings fixed, re-verified. Linux CI failure fixed: connecting to a regular file gives ECONNREFUSED on Linux and ENOTSOCK on macOS; exit 3 now means missing path or a socket that refuses, exit 1 for a path that is not a socket. Full suite passes in the Linux VM, first Linux run of SO_PEERCRED. Decisions for lead: snapshot_reset/busy semantics, name rules vs core, import hash scope. Not built: real backend (seam only), no TTY test. | Round-2 critic verdict NOT mergeable; builder fixing A1-A10 (shutdown backlog drain, admission policy, FIN-vs-RST, surviving mutants, framework-enforced atomic snapshot_reset). Last head f2bdb8c, CI green on that old head.",
+          "detail": "Merged to main. Round-2 critic blockers A1-A10 fixed with regression tests and re-verified by me at 4dd9e75: main merged, scope clean (ctl, cli, control-api doc, lockfile), CI green on both platforms, 121 crate tests pass, fmt and clippy clean. Builder reports 67 mutants with 2 survivors judged equivalent, Mac 20x and Linux VM 20x with 0 flakes. Framework-enforced atomic snapshot reset: ControlHandler now has remove(name,&guard) and swap(name,from,&guard), holders replaces ps, and cowfs_ctl::handler_conformance fails a handler that skips the lock discipline. #38 (treehouse) must adapt to that signature. Known: no second-uid peer test (no su or setpriv in the VM).",
           "ci": "CI: pass (linux, macos)"
         },
         {
@@ -193,7 +193,7 @@
           "owner": "lead",
           "pr": "#38",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
-          "detail": "Critic blockers F1-F3 fixed, re-verified by me at 3dae005: 110 crate tests pass, fmt/clippy clean, scope clean, CI green, real pool state files byte-identical across my run (11 leased slots untouched). F1: `return`/`destroy` now refuse a slot outside the named root (three layers), release without a readable lease id is a hard error, TREEHOUSE_ROOT removed from the child env. F2/F6: LeaseGuard returns the lease on every error path. F3: binary lookup and skip reasons; in the Linux VM 108 passed, 0 failed, 25 skipped (was 3 pass, 12 fail, 1 panic). Survivors 3 of 13 mutants, all judged equivalent (one, disarm-lease-guard, not fully killed). mount_snapshot daemon rules (13 rows) documented. NOT MERGING YET: the PR is stacked on #33 (v1/13-cli), which is being redesigned (framework-enforced atomic snapshot_reset) and will change the API this crate drives; needs a re-check and a short round-2 critic after #33 lands. Also depends on cowfs-ctl mount_snapshot/unmount_snapshot and a Treehouse arm in cowfs-cli."
+          "detail": "Critic blockers F1-F3 fixed, re-verified by me at 3dae005: 110 crate tests pass, fmt/clippy clean, scope clean, CI green, real pool state files byte-identical across my run (11 leased slots untouched). F1: `return`/`destroy` now refuse a slot outside the named root (three layers), release without a readable lease id is a hard error, TREEHOUSE_ROOT removed from the child env. F2/F6: LeaseGuard returns the lease on every error path. F3: binary lookup and skip reasons; in the Linux VM 108 passed, 0 failed, 25 skipped (was 3 pass, 12 fail, 1 panic). Survivors 3 of 13 mutants, all judged equivalent (one, disarm-lease-guard, not fully killed). mount_snapshot daemon rules (13 rows) documented. NOT MERGING YET: the PR is stacked on #33 (v1/13-cli), which is being redesigned (framework-enforced atomic snapshot_reset) and will change the API this crate drives; needs a re-check and a short round-2 critic after #33 lands. Also depends on cowfs-ctl mount_snapshot/unmount_snapshot and a Treehouse arm in cowfs-cli. | #33 merged; PR retargeted to main. Needs: merge main, adapt to the new ControlHandler signature, short round-2 critic."
         },
         {
           "id": "16",
@@ -203,7 +203,7 @@
           "owner": "lead",
           "pr": "#38",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
-          "detail": "Critic blockers F1-F3 fixed, re-verified by me at 3dae005: 110 crate tests pass, fmt/clippy clean, scope clean, CI green, real pool state files byte-identical across my run (11 leased slots untouched). F1: `return`/`destroy` now refuse a slot outside the named root (three layers), release without a readable lease id is a hard error, TREEHOUSE_ROOT removed from the child env. F2/F6: LeaseGuard returns the lease on every error path. F3: binary lookup and skip reasons; in the Linux VM 108 passed, 0 failed, 25 skipped (was 3 pass, 12 fail, 1 panic). Survivors 3 of 13 mutants, all judged equivalent (one, disarm-lease-guard, not fully killed). mount_snapshot daemon rules (13 rows) documented. NOT MERGING YET: the PR is stacked on #33 (v1/13-cli), which is being redesigned (framework-enforced atomic snapshot_reset) and will change the API this crate drives; needs a re-check and a short round-2 critic after #33 lands. Also depends on cowfs-ctl mount_snapshot/unmount_snapshot and a Treehouse arm in cowfs-cli."
+          "detail": "Critic blockers F1-F3 fixed, re-verified by me at 3dae005: 110 crate tests pass, fmt/clippy clean, scope clean, CI green, real pool state files byte-identical across my run (11 leased slots untouched). F1: `return`/`destroy` now refuse a slot outside the named root (three layers), release without a readable lease id is a hard error, TREEHOUSE_ROOT removed from the child env. F2/F6: LeaseGuard returns the lease on every error path. F3: binary lookup and skip reasons; in the Linux VM 108 passed, 0 failed, 25 skipped (was 3 pass, 12 fail, 1 panic). Survivors 3 of 13 mutants, all judged equivalent (one, disarm-lease-guard, not fully killed). mount_snapshot daemon rules (13 rows) documented. NOT MERGING YET: the PR is stacked on #33 (v1/13-cli), which is being redesigned (framework-enforced atomic snapshot_reset) and will change the API this crate drives; needs a re-check and a short round-2 critic after #33 lands. Also depends on cowfs-ctl mount_snapshot/unmount_snapshot and a Treehouse arm in cowfs-cli. | #33 merged; PR retargeted to main. Needs: merge main, adapt to the new ControlHandler signature, short round-2 critic."
         },
         {
           "id": "17",
@@ -292,5 +292,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33."
 }
