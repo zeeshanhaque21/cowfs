@@ -537,6 +537,31 @@ stats.pack_bytes=58828455 disk.bytes=58828455
 reopen ok, corruption=false torn=0
 ```
 
+### Throughput on the round-3 code
+
+`examples/bench.rs` on a treehouse pool (9908 files, 618 MiB, stride 3), release build, n=5,
+under the shared benchmark lock, machine load 28 to 50 throughout, so the spread is the machine.
+
+| Metric | median | min | max |
+|---|---|---|---|
+| Chunk plus hash, 1 thread | 430 MiB/s | 350 | 508 |
+| Ingest plus sync, 1 thread | 191 MiB/s | 165 | 220 |
+| Ingest plus sync, 8 threads | 501 MiB/s | 399 | 695 |
+| Verified read, 1 thread | 547 MiB/s | 460 | 602 |
+| Verified read, 8 threads | 3049 MiB/s | 2783 | 3480 |
+| Re-ingest of duplicates after reopen, 1 thread | 785 MiB/s | 773 | 1112 |
+| Re-ingest of duplicates, warm session, 1 thread | 996 MiB/s | 830 | 1077 |
+| Re-ingest of duplicates, warm session, 8 threads | 5973 MiB/s | 5708 | 7099 |
+| Index lookup (`contains`) | 30350 k/s | 19797 | 30518 |
+
+Store after the run: 8019 blocks, 430 MiB uncompressed unique, 151 MiB stored, 4.09x on the input,
+`fsck` clean.
+
+These are single figures on a loaded shared machine, not a comparison.
+The round-2 A/B in the table above stands as the only measured before-and-after, and it was itself
+inconclusive. The new work is in the open path, not in `put` or `get`, so the hot path is unchanged
+by inspection rather than by measurement.
+
 ### Mutation testing, round 3 (`tests/mutate3.py`)
 
 14 mutations of the round-3 code, run against `round3`, `round2`, `store` and `durability`, plus the
