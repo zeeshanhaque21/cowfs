@@ -150,7 +150,7 @@ proptest! {
         let entries: Vec<_> = locs
             .into_iter()
             .map(|(id, a, b, ulen)| {
-                let offset = 16 + a % (plen as u32 - REC_HDR as u32 - 16);
+                let offset = PACK_HEADER.len() as u32 + a % (plen as u32 - REC_HDR as u32 - PACK_HEADER.len() as u32);
                 let slen = b % (plen as u32 - offset - REC_HDR as u32 + 1);
                 (BlockId::from_bytes(id), [0, offset, slen, ulen % 300])
             })

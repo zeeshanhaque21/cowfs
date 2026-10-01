@@ -408,15 +408,16 @@ impl Store {
         self.sync()?;
         let g = self.guts();
         let lowest = self.packs()?.first().map_or(id, |p| p.id);
-        ack::append(
-            g.io,
-            g.dir,
-            &[ack::Entry {
-                pack: id,
-                offset: ack::WHOLE_PACK.0,
-                len: ack::WHOLE_PACK.1,
-            }],
-        )?;
+        let mut entries = ack::load(g.dir);
+        entries.push(ack::Entry {
+            pack: id,
+            nonce: 0,
+            state: ack::State::Acked,
+            offset: ack::WHOLE_PACK.0,
+            len: ack::WHOLE_PACK.1,
+            id: None,
+        });
+        ack::save(g.io, g.dir, entries)?;
         for b in condemned {
             if g.index.get(b).is_some_and(|l| l.pack == id) {
                 g.index.remove(b);
@@ -441,7 +442,8 @@ impl Store {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(m) = wm.mark() {
                 let base = wm.base().max(lowest);
-                wm.reset(m, base)?;
+                let next = wm.next_id();
+                wm.reset(m, base, next)?;
             }
         }
         self.forget_pack(id);

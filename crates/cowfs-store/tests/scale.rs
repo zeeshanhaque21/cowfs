@@ -21,7 +21,10 @@ fn million_id_store(dir: &std::path::Path) {
             let mut id = [0u8; 32];
             id[..8].copy_from_slice(&i.to_le_bytes());
             id[8..16].copy_from_slice(&(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).to_le_bytes());
-            (BlockId::from_bytes(id), [0, 16, 300, 300])
+            (
+                BlockId::from_bytes(id),
+                [0, PACK_HEADER.len() as u32, 300, 300],
+            )
         })
         .collect();
     let ix = index_bytes(&[(0, pack.len() as u64)], &entries);

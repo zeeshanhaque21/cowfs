@@ -1,11 +1,11 @@
 //! Every durability-relevant call goes through [`Io`], so tests can record the order of writes
 //! and fsyncs, and a crash model can rebuild the disk image from them.
 
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// One recorded durability operation. Names are file names relative to the store directory.
@@ -68,45 +68,38 @@ pub enum LogOp {
     Marker(u64),
 }
 
-static LOG: AtomicBool = AtomicBool::new(false);
-static LOG_OPS: Mutex<Vec<LogOp>> = Mutex::new(Vec::new());
+thread_local! {
+    /// Per thread, so tests that run beside each other cannot log into each other's model.
+    static LOG: RefCell<Option<Vec<LogOp>>> = const { RefCell::new(None) };
+}
 
-/// Start recording data writes and fsyncs into a global log. For the crash model.
+/// Start recording data writes and fsyncs into this thread's log. For the crash model.
 #[doc(hidden)]
 pub fn oplog_start() {
-    LOG.store(true, Relaxed);
-    LOG_OPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
+    LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
 }
 
 /// Stop recording and take the log.
 #[doc(hidden)]
 pub fn oplog_take() -> Vec<LogOp> {
-    LOG.store(false, Relaxed);
-    std::mem::take(&mut *LOG_OPS.lock().unwrap_or_else(PoisonError::into_inner))
+    LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
 }
 
 /// Put a marker in the log, so a test can tell where a sync was called.
 #[doc(hidden)]
 pub fn oplog_marker(v: u64) {
-    if LOG.load(Relaxed) {
-        LOG_OPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(LogOp::Marker(v));
-    }
+    log_data(LogOp::Marker(v));
 }
 
 fn log_data(op: LogOp) {
-    if LOG.load(Relaxed) {
-        LOG_OPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(op);
-    }
+    LOG.with(|l| {
+        if let Some(v) = &mut *l.borrow_mut() {
+            v.push(op);
+        }
+    });
 }
+
+// The log itself lives in the thread local above.
 
 /// Shared log of [`Op`]s, filled while a store built with `Store::open_traced` runs.
 #[doc(hidden)]

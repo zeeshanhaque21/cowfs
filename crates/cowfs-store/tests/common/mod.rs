@@ -62,12 +62,15 @@ pub fn pack_ids(dir: &Path) -> Vec<u32> {
 pub const REC_HDR: usize = 56;
 
 /// A valid pack header.
-pub const PACK_HEADER: [u8; 16] = *b"COWPACK\0\x02\0\0\0\0\0\0\0";
+/// `COWPACK\0`, version 2, nonce 0x44332211.
+pub const PACK_HEADER: [u8; 16] = [
+    b'C', b'O', b'W', b'P', b'A', b'C', b'K', 0, 2, 0, 0, 0, 0x11, 0x22, 0x33, 0x44,
+];
 
 /// Records of a well-formed pack as `(id, start, end)`, parsed independently of the library.
 pub fn parse_pack(bytes: &[u8]) -> Vec<(BlockId, usize, usize)> {
     let mut out = Vec::new();
-    let mut pos = 16;
+    let mut pos = PACK_HEADER.len();
     while pos + REC_HDR <= bytes.len() {
         assert_eq!(&bytes[pos..pos + 4], b"CWRB");
         let slen = u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap()) as usize;
@@ -149,17 +152,24 @@ pub fn install(dir: &Path, packs: &[(u32, &[u8])], index: Option<&[u8]>) {
     }
     let _ = fs::remove_file(index_path(dir));
     let _ = fs::remove_file(dir.join("SYNCED"));
+    let _ = fs::remove_file(dir.join("ACKED"));
     if let Some(bytes) = index {
         fs::write(index_path(dir), bytes).unwrap();
     }
 }
 
-/// Bytes of a `SYNCED` watermark file saying pack `pack` is durable up to `len`.
+/// A `SYNCED` watermark file saying pack `pack` is durable up to `len`, and that pack ids
+/// below `next` are never reused.
 pub fn wm_bytes(pack: u32, len: u64) -> Vec<u8> {
+    wm_bytes_full(pack, len, pack.saturating_add(1))
+}
+
+pub fn wm_bytes_full(pack: u32, len: u64, next: u32) -> Vec<u8> {
     let mut b = vec![0u8; 64];
     b[..8].copy_from_slice(&2u64.to_le_bytes());
     b[8..12].copy_from_slice(&pack.to_le_bytes());
     b[16..24].copy_from_slice(&len.to_le_bytes());
+    b[28..32].copy_from_slice(&next.to_le_bytes());
     let crc = crc32c::crc32c(&b[..24]);
     b[24..28].copy_from_slice(&crc.to_le_bytes());
     b
@@ -192,14 +202,28 @@ pub fn record(codec: u8, ulen: u32, id: [u8; 32], payload: &[u8]) -> Vec<u8> {
     r
 }
 
-/// Encode an index checkpoint with a valid CRC.
+/// Encode an index checkpoint with a valid CRC. Each pack is (id, indexed length, nonce).
 pub fn index_bytes(packs: &[(u32, u64)], entries: &[(BlockId, [u32; 4])]) -> Vec<u8> {
-    let mut b = b"COWIDX01".to_vec();
+    let packs: Vec<(u32, u64, u32)> = packs
+        .iter()
+        .map(|&(id, len)| (id, len, nonce_of(&PACK_HEADER)))
+        .collect();
+    index_bytes_full(&packs, entries)
+}
+
+/// The creation nonce in a pack header.
+pub fn nonce_of(header: &[u8]) -> u32 {
+    u32::from_le_bytes(header[12..16].try_into().unwrap_or([0; 4]))
+}
+
+pub fn index_bytes_full(packs: &[(u32, u64, u32)], entries: &[(BlockId, [u32; 4])]) -> Vec<u8> {
+    let mut b = b"COWIDX02".to_vec();
     b.extend_from_slice(&(packs.len() as u32).to_le_bytes());
     b.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-    for (id, len) in packs {
+    for (id, len, nonce) in packs {
         b.extend_from_slice(&id.to_le_bytes());
         b.extend_from_slice(&len.to_le_bytes());
+        b.extend_from_slice(&nonce.to_le_bytes());
     }
     for (id, loc) in entries {
         b.extend_from_slice(id.as_bytes());
