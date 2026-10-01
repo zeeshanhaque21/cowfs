@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -213,13 +213,15 @@ fn save_torn(
         offset: from,
         reason: e.to_string(),
     };
-    let mut f = OpenOptions::new()
+    let f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .map_err(|e| quarantine(&e))?;
     io.created(&path);
-    let written = f.write_all(&buf).and_then(|()| io.sync_file(&f, &path));
+    let written = io
+        .write_at(&f, &path, 0, &buf)
+        .and_then(|()| io.sync_file(&f, &path));
     if let Err(e) = written {
         let _ = fs::remove_file(&path);
         return Err(quarantine(&e));

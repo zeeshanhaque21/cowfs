@@ -8,6 +8,8 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[3]
 OUT = ROOT / "target" / "qa4"
+if os.environ.get("COWFS_QA4_RUN"):
+    OUT /= os.environ["COWFS_QA4_RUN"]
 
 
 def run(args, cwd=ROOT, env=None, timeout=600):

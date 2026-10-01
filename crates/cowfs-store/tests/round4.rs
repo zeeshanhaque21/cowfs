@@ -262,12 +262,27 @@ fn rolled_back_watermark_keeps_loss_reported() {
 #[cfg(feature = "fault-injection")]
 fn crash_at_every_recovery_boundary() {
     let mut cases = 0;
-    for relocate in [false, true] {
+    for mode in ["cut", "relocate", "short-header", "zero-header"] {
+        let relocate = mode == "relocate";
         for key in ["C7D_EXIT_SYNC_N", "C7D_EXIT_BOUNDARY_N"] {
             let mut finished = false;
             for n in 1..=100 {
                 let (dir, a, b, _) = damaged_tail();
                 let c = random(3, 3000);
+                if mode == "short-header" {
+                    let bytes = fs::read(pack_path(dir.path(), 0)).unwrap();
+                    install_wm(
+                        dir.path(),
+                        &[(0, &bytes[..12])],
+                        None,
+                        Some((0, bytes.len() as u64)),
+                    );
+                } else if mode == "zero-header" {
+                    let path = pack_path(dir.path(), 0);
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes[..16].fill(0);
+                    fs::write(path, bytes).unwrap();
+                }
                 if relocate {
                     let path = pack_path(dir.path(), 0);
                     let mut bytes = fs::read(&path).unwrap();
@@ -284,14 +299,16 @@ fn crash_at_every_recovery_boundary() {
                 cases += 1;
                 for _ in 0..2 {
                     let s = Store::open(dir.path(), opts()).unwrap();
-                    assert_eq!(s.get(BlockId::of(&a)).unwrap(), a, "{key}={n}");
+                    if mode != "short-header" {
+                        assert_eq!(s.get(BlockId::of(&a)).unwrap(), a, "{mode} {key}={n}");
+                    }
                     if relocate {
                         assert_eq!(s.get(BlockId::of(&c)).unwrap(), c, "{key}={n}");
                     }
                     assert!(s.get(BlockId::of(&b)).is_err());
                     assert!(
                         s.recovery().has_corruption(),
-                        "false clean: relocate={relocate} {key}={n}"
+                        "false clean: mode={mode} {key}={n}"
                     );
                 }
                 let s = Store::open(dir.path(), opts()).unwrap();

@@ -366,7 +366,7 @@ Only `put`, no `delete`: blocks leave the store only through compaction.
 
 ## Measured performance
 
-Tool: `cargo run --release -p cowfs-store --example bench -- <data-dir> <store-dir> [MiB] [runs]`.
+Tool: `cargo run --release -p cowfs-store --example store-bench -- <data-dir> <store-dir> [MiB] [runs]`.
 Data: every second file of `RuView/v2/target` (a Rust build output), 3,921 files, 1,037 MiB, 15,029 chunks, average chunk 72,405 bytes.
 Machine: Apple M3 Max, shared with about 19 other sessions.
 Load average during the last full run went from 35 to 140, so every figure is a noisy lower bound.

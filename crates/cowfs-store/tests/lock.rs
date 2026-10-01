@@ -66,7 +66,10 @@ fn cycle(dir: &std::path::Path, o: Options, data: &[u8], threads: usize) -> Resu
 fn drop_releases_the_lock_before_it_returns() {
     let dir = tempfile::tempdir().unwrap();
     let o = opts();
-    let n = iters();
+    let n = std::env::var("COWFS_LOCK_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
     let blocks = blocks();
     let data = common::random(1, 9000);
     let start = Instant::now();

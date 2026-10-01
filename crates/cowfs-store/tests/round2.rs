@@ -738,7 +738,7 @@ fn emfile_child() {
     hog.pop();
     assert!(
         s.put(&b).is_err(),
-        "one fd: the pack is created, the directory fsync fails"
+        "one fd: publishing the skipped reservation or the pack must fail"
     );
     assert!(
         !pack_path(dir, 1).exists(),
@@ -747,7 +747,13 @@ fn emfile_child() {
     drop(hog);
     let ib = s.put(&b).unwrap();
     assert_eq!(s.stats().packs, 2);
-    assert_eq!(pack_ids(dir), vec![0, 1]);
+    let ids = pack_ids(dir);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], 0);
+    assert!(
+        ids[1] > 1,
+        "the failed reservation must stay consumed: {ids:?}"
+    );
     assert_eq!(s.get(ia).unwrap(), a);
     assert_eq!(s.get(ib).unwrap(), b);
     s.sync().unwrap();
