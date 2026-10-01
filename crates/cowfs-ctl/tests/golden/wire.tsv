@@ -1,0 +1,55 @@
+client hello	{"client":"cowfs-cli/0.0.0","type":"hello","versions":[1,2]}
+client cancel	{"id":7,"type":"cancel"}
+req ping	{"id":7,"method":"ping","params":{},"type":"request"}
+req version	{"id":7,"method":"version","params":{},"type":"request"}
+req status	{"id":7,"method":"status","params":{},"type":"request"}
+req snapshot_list	{"id":7,"method":"snapshot_list","params":{},"type":"request"}
+req snapshot_create empty	{"id":7,"method":"snapshot_create","params":{"name":"a"},"type":"request"}
+req snapshot_create from	{"id":7,"method":"snapshot_create","params":{"from":"base","name":"a"},"type":"request"}
+req snapshot_rm	{"id":7,"method":"snapshot_rm","params":{"expect_no_holders":true,"name":"a"},"type":"request"}
+req snapshot_rm force	{"id":7,"method":"snapshot_rm","params":{"expect_no_holders":false,"name":"a"},"type":"request"}
+req snapshot_reset	{"id":7,"method":"snapshot_reset","params":{"expect_no_holders":true,"from":"base","name":"slot"},"type":"request"}
+req snapshot_rename	{"id":7,"method":"snapshot_rename","params":{"from":"a","to":"b"},"type":"request"}
+req snapshot_promote	{"id":7,"method":"snapshot_promote","params":{"name":"a"},"type":"request"}
+req gc	{"id":7,"method":"gc","params":{"dry_run":true},"type":"request"}
+req fsck	{"id":7,"method":"fsck","params":{},"type":"request"}
+req import	{"id":7,"method":"import","params":{"name":"slot1","path":"/srv/slot"},"type":"request"}
+req base_refresh	{"id":7,"method":"base_refresh","params":{"git_ref":"main","repo":"/srv/repo"},"type":"request"}
+req ps	{"id":7,"method":"ps","params":{"snapshot":"slot1"},"type":"request"}
+req mount_info	{"id":7,"method":"mount_info","params":{},"type":"request"}
+req shutdown	{"id":7,"method":"shutdown","params":{},"type":"request"}
+server hello	{"methods":["ping","version","status","snapshot_list","snapshot_create","snapshot_rm","snapshot_reset","snapshot_rename","snapshot_promote","gc","fsck","import","base_refresh","ps","mount_info","shutdown"],"server":"cowfs-ctl/0.0.0","type":"hello","version":1}
+server progress	{"event":{"done":120,"message":null,"phase":"mark","total":400,"unit":"items"},"id":7,"type":"progress"}
+res pong	{"id":7,"result":{"data":{},"kind":"pong"},"type":"response"}
+res version	{"id":7,"result":{"data":{"ctl":"0.0.0","protocol":1,"server":"cowfs-ctl/0.0.0"},"kind":"version"},"type":"response"}
+res status	{"id":7,"result":{"data":{"block_count":10,"logical_bytes":1000,"mount_path":"/m","snapshot_count":2,"store_path":"/s","stored_bytes":400,"uptime_secs":5},"kind":"status"},"type":"response"}
+res snapshot_list	{"id":7,"result":{"data":{"snapshots":[{"base":null,"created_unix_ms":1700000000000,"name":"a","parent":"main"}]},"kind":"snapshot_list"},"type":"response"}
+res snapshot base	{"id":7,"result":{"data":{"base":{"commit":"abc123","git_ref":"main","repo":"/srv/repo"},"created_unix_ms":1700000000000,"name":"b","parent":"main"},"kind":"snapshot"},"type":"response"}
+res ok	{"id":7,"result":{"data":{},"kind":"ok"},"type":"response"}
+res gc	{"id":7,"result":{"data":{"candidate_blocks":3,"candidate_bytes":196608,"dry_run":true,"freed_blocks":0,"freed_bytes":0},"kind":"gc"},"type":"response"}
+res fsck	{"id":7,"result":{"data":{"blocks_checked":9,"bytes_checked":900,"ok":false,"problems":[{"detail":"block 00ff","kind":"bad_hash"}],"snapshots_checked":2},"kind":"fsck"},"type":"response"}
+res import	{"id":7,"result":{"data":{"bytes":3456,"files":12,"hash_algorithm":"blake3","imported_root_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","mismatches":[{"path":"src/a.rs","reason":"content"}],"mismatches_truncated":true,"name":"slot1","source_root_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verified":false},"kind":"import"},"type":"response"}
+res base_refresh	{"id":7,"result":{"data":{"previous_commit":"abc123","snapshot":{"base":null,"created_unix_ms":1700000000000,"name":"repo-base","parent":"main"}},"kind":"base_refresh"},"type":"response"}
+res processes	{"id":7,"result":{"data":{"processes":[{"command":"sleep 100","holds":[{"kind":"cwd","path":"/m/slot1"},{"kind":"lock","path":"/m/slot1/.lock"}],"pid":4242}]},"kind":"processes"},"type":"response"}
+res mount_info	{"id":7,"result":{"data":{"adapter":"nfs","mount_path":"/m","mounted":true},"kind":"mount_info"},"type":"response"}
+error with id	{"error":{"code":"not_found","message":"snapshot \"a\" does not exist"},"id":7,"type":"error"}
+error connection level	{"error":{"code":"unsupported_version","details":{"supported":[1]},"message":"no common protocol version"},"id":null,"type":"error"}
+error code malformed_frame	{"error":{"code":"malformed_frame","message":"m"},"id":7,"type":"error"}
+error code line_too_long	{"error":{"code":"line_too_long","message":"m"},"id":7,"type":"error"}
+error code handshake_required	{"error":{"code":"handshake_required","message":"m"},"id":7,"type":"error"}
+error code unsupported_version	{"error":{"code":"unsupported_version","message":"m"},"id":7,"type":"error"}
+error code permission_denied	{"error":{"code":"permission_denied","message":"m"},"id":7,"type":"error"}
+error code unknown_frame	{"error":{"code":"unknown_frame","message":"m"},"id":7,"type":"error"}
+error code unknown_method	{"error":{"code":"unknown_method","message":"m"},"id":7,"type":"error"}
+error code invalid_params	{"error":{"code":"invalid_params","message":"m"},"id":7,"type":"error"}
+error code duplicate_id	{"error":{"code":"duplicate_id","message":"m"},"id":7,"type":"error"}
+error code busy	{"error":{"code":"busy","message":"m"},"id":7,"type":"error"}
+error code not_found	{"error":{"code":"not_found","message":"m"},"id":7,"type":"error"}
+error code already_exists	{"error":{"code":"already_exists","message":"m"},"id":7,"type":"error"}
+error code unsupported	{"error":{"code":"unsupported","message":"m"},"id":7,"type":"error"}
+error code cancelled	{"error":{"code":"cancelled","message":"m"},"id":7,"type":"error"}
+error code shutting_down	{"error":{"code":"shutting_down","message":"m"},"id":7,"type":"error"}
+error code io_error	{"error":{"code":"io_error","message":"m"},"id":7,"type":"error"}
+error code internal	{"error":{"code":"internal","message":"m"},"id":7,"type":"error"}
+error code too_many_connections	{"error":{"code":"too_many_connections","message":"m"},"id":7,"type":"error"}
+error code timeout	{"error":{"code":"timeout","message":"m"},"id":7,"type":"error"}

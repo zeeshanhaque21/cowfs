@@ -1,0 +1,29 @@
+[package]
+name = "cowfs-cli"
+description = "The cowfs command line: serve the control API and drive it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "cowfs_cli"
+
+[[bin]]
+name = "cowfs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+cowfs-ctl = { path = "../cowfs-ctl" }
+serde_json = "1"
+signal-hook = "0.3"
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
