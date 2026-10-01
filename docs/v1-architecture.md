@@ -44,6 +44,9 @@ Shared types live in `cowfs-store`:
 - Snapshot creation, removal, garbage collection and fsck are control-plane operations and are not part of `Vfs`.
 - Reads and writes are by inode.
   `open` and `release` exist to pin an inode so that an unlinked file stays usable, and NFS, which is stateless, never needs them.
+- Every `Vfs` method is atomic and safe under arbitrary concurrent calls (linearizable).
+  No layer promises per-inode ordering beyond what the kernel or protocol already imposes: a dependent request is issued only after the reply to the one it depends on.
+  Adapters may overlap independent requests, so an implementation must never depend on an adapter to serialise calls.
 - `readdir` excludes `.` and `..` and uses cookies that stay valid while entries come and go (the spike 2 bug).
 - Every `Vfs` implementation must pass the conformance suite in `cowfs-vfs-test`, and the suite is where POSIX semantics are pinned down.
 
