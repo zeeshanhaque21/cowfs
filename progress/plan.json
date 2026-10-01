@@ -251,6 +251,27 @@
           "pr": "#41",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/41",
           "detail": "Added the Vfs concurrency contract to the trait docs and the architecture doc (every method atomic and linearizable; no per-inode ordering beyond what the kernel or protocol imposes). Found by the FUSE round-2 critic. Doc-only, CI green on Linux and macOS, merged to main."
+        },
+        {
+          "id": "50",
+          "title": "daemon: wire backend, control API and mount adapters",
+          "state": "building",
+          "owner": "builder (subagent)",
+          "detail": "New. The end-to-end seam: daemon crate taking Arc<dyn Vfs> (MemVfs and PathVfs today, Core after #36), ControlHandler for the new ctl API, mount_snapshot/unmount_snapshot enforcing the 13-row treehouse rule table, NFS signal cleanup and stale-mount sweep on macOS, FUSE Invalidator on Linux, real end-to-end test through a mount with SIGTERM and kill -9 cases. Branch v1/daemon."
+        },
+        {
+          "id": "51",
+          "title": "bench: gates harness for success criterion 2",
+          "state": "building",
+          "owner": "builder (subagent)",
+          "detail": "New. bench/gates.py (clean cargo build, warm edit-rebuild, git status on 100k+ files, tree walk, large file, metadata storm), compare.py that refuses to print a ratio when load is above 30 or the arms' load differ by 2x (prints 'unmeasurable'), native-vs-native noise floor, run-pair.sh under the CPU lock. Small sample only for now; the full run is scheduled by the lead. Branch v1/bench-gates."
+        },
+        {
+          "id": "52",
+          "title": "#45 FUSE torn read: adapter bug or native kernel behaviour",
+          "state": "investigating",
+          "owner": "builder (subagent)",
+          "detail": "New. Reproduce the intermittent concurrent_readers_and_writers torn read 200+ times through FUSE and on native tmpfs/ext4/btrfs under CPU contention; classify; make PR #44's linux-fuse job honest (known native limit gated with a native control in the same job, genuine adapter failures stay red); 5 reruns."
         }
       ]
     },
@@ -292,5 +313,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45)."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45). | In flight in parallel: #50 daemon, #51 bench harness, #52 torn read (PR #44)."
 }
