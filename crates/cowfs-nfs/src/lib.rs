@@ -55,6 +55,12 @@
 //!
 //! # Security model
 //!
+//! v1 is single-user: the server ignores AUTH_UNIX caller identity.
+//! Mountpoint directory permissions are the access boundary, not per-caller NFS mode checks.
+//! Owner CREATE with mode 0444 followed by WRITE on that descriptor succeeds.
+//! ACCESS respects the owner mode bits, so reopening that file for writing fails with EACCES.
+//! These owner behaviours match native APFS in the real-mount regression test.
+//!
 //! The server listens on 127.0.0.1 only, and answers MNT for one export path
 //! (`localhost:/cowfs-<32 random hex digits>`) that only `mount_nfs` is told. A local process that
 //! finds the port cannot guess the path, so it cannot become a client at all; that is what
