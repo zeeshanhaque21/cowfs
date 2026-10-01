@@ -193,12 +193,19 @@ fn a_reopen_that_races_a_release_in_flight_succeeds() {
     assert!(took < Duration::from_millis(400), "{took:?}");
     match e {
         cowfs_store::Error::Locked { holder, .. } => {
-            assert_eq!(holder, Some(std::process::id()), "the refusal must name the holder")
+            assert_eq!(
+                holder,
+                Some(std::process::id()),
+                "the refusal must name the holder"
+            )
         }
         other => panic!("expected Locked, got {other:?}"),
     }
     drop(holder);
-    assert!(Store::open(dir.path(), opts()).is_ok(), "the lock must be free again");
+    assert!(
+        Store::open(dir.path(), opts()).is_ok(),
+        "the lock must be free again"
+    );
 }
 
 /// The lock is held exactly while a store is open, and free the instant it is gone.
