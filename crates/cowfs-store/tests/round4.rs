@@ -12,7 +12,11 @@ fn recovery_child() {
     let Ok(p) = std::env::var("C7D_STORE") else {
         return;
     };
-    let result = Store::open(&p, opts());
+    let mut o = opts();
+    if std::env::var_os("C7D_SMALL").is_some() {
+        o.max_pack_size = 1;
+    }
+    let result = Store::open(&p, o);
     if std::env::var_os("C7D_LOCKED").is_some() {
         assert!(matches!(result, Err(Error::Locked(_))));
     } else {
@@ -99,6 +103,44 @@ fn open_reserves_before_creating_a_pack() {
         .iter()
         .any(|op| matches!(op, LogOp::Sync { file } if file == "SYNCED")));
     drop(s);
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn a_crashed_reservation_is_not_reused_or_reported_as_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = random(91, 3000);
+    {
+        let s = Store::open(dir.path(), opts()).unwrap();
+        s.put(&a).unwrap();
+        s.sync().unwrap();
+    }
+    assert_eq!(
+        child(
+            dir.path(),
+            &[
+                ("C7D_SMALL", "1".into()),
+                ("C7D_EXIT_FILE", "SYNCED".into()),
+                ("C7D_EXIT_LEN", "64".into()),
+            ]
+        ),
+        77
+    );
+    assert!(!pack_path(dir.path(), 1).exists());
+    let mut o = opts();
+    o.max_pack_size = 4000;
+    let s = Store::open(dir.path(), o).unwrap();
+    assert_eq!(s.get(BlockId::of(&a)).unwrap(), a);
+    s.put(&random(92, 3000)).unwrap();
+    assert!(s.active_pack() >= 2);
+    s.sync().unwrap();
+    drop(s);
+    let s = Store::open(dir.path(), o).unwrap();
+    assert!(
+        !s.recovery().has_corruption(),
+        "an unused reservation became a loss: {:?}",
+        s.recovery()
+    );
 }
 
 #[test]
