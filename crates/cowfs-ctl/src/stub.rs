@@ -407,7 +407,7 @@ mod conformance_tests {
         let touched = Arc::new(source_path.clone());
         let changed = Arc::new(AtomicBool::new(false));
         let once = Arc::clone(&changed);
-        let mut ctx = OpContext::new(CancelToken::new(), move |_| {
+        let ctx = OpContext::new(CancelToken::new(), move |_| {
             if !once.swap(true, Ordering::SeqCst) {
                 std::fs::write(touched.as_path(), b"after!").unwrap();
             }
@@ -419,7 +419,7 @@ mod conformance_tests {
                     path: dir.path().to_string_lossy().into_owned(),
                     name: "imp".into(),
                 },
-                &mut ctx,
+                &ctx,
             )
             .unwrap();
         assert!(!report.verified, "{report:?}");

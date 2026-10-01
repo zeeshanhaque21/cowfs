@@ -64,6 +64,7 @@ pub fn handler_conformance(
             "swap checked holders without holding the guard lock, so a holder can slip in",
         ));
     }
+    *under_lock.lock().unwrap_or_else(PoisonError::into_inner) = 0;
     if handler
         .remove(
             names[1],
@@ -72,6 +73,11 @@ pub fn handler_conformance(
         .is_ok()
     {
         return Err(failure("remove succeeded with a holder present"));
+    }
+    if *under_lock.lock().unwrap_or_else(PoisonError::into_inner) == 0 {
+        return Err(failure(
+            "remove checked holders without holding the guard lock, so a holder can slip in",
+        ));
     }
     if handler.holders(names[1])?.is_empty() {
         return Err(failure("the injected holder is not reported"));
