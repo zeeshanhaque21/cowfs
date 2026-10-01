@@ -188,22 +188,22 @@
         {
           "id": "15",
           "title": "#15 treehouse mode (a) transparent",
-          "state": "waiting",
+          "state": "done",
           "issue": 15,
           "owner": "lead",
           "pr": "#38",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
-          "detail": "Critic blockers F1-F3 fixed, re-verified by me at 3dae005: 110 crate tests pass, fmt/clippy clean, scope clean, CI green, real pool state files byte-identical across my run (11 leased slots untouched). F1: `return`/`destroy` now refuse a slot outside the named root (three layers), release without a readable lease id is a hard error, TREEHOUSE_ROOT removed from the child env. F2/F6: LeaseGuard returns the lease on every error path. F3: binary lookup and skip reasons; in the Linux VM 108 passed, 0 failed, 25 skipped (was 3 pass, 12 fail, 1 panic). Survivors 3 of 13 mutants, all judged equivalent (one, disarm-lease-guard, not fully killed). mount_snapshot daemon rules (13 rows) documented. NOT MERGING YET: the PR is stacked on #33 (v1/13-cli), which is being redesigned (framework-enforced atomic snapshot_reset) and will change the API this crate drives; needs a re-check and a short round-2 critic after #33 lands. Also depends on cowfs-ctl mount_snapshot/unmount_snapshot and a Treehouse arm in cowfs-cli. | #33 merged; PR retargeted to main. Needs: merge main, adapt to the new ControlHandler signature, short round-2 critic."
+          "detail": "Merged to main. Critic blockers F1-F3 fixed and re-verified by me at 935835f (main merged, scope clean, CI green on both platforms, 113 crate tests pass, clippy clean; earlier run: real pool state files byte-identical, Linux VM 108 pass 0 fail 25 skipped with reasons). Needs no change for the new control API: it uses the unchanged CLI protocol and already retries on busy with a bounded timeout. Inert until the daemon wires mount_snapshot, so risk is contained. FOLLOW-UP: a short round-2 critic on the sandbox-root refusal layers before the daemon wires it up; real-pool safety was not re-checksummed on this last run."
         },
         {
           "id": "16",
           "title": "#16 treehouse mode (b) snapshot-native slots and warm base",
-          "state": "waiting",
+          "state": "done",
           "issue": 16,
           "owner": "lead",
           "pr": "#38",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/38",
-          "detail": "Critic blockers F1-F3 fixed, re-verified by me at 3dae005: 110 crate tests pass, fmt/clippy clean, scope clean, CI green, real pool state files byte-identical across my run (11 leased slots untouched). F1: `return`/`destroy` now refuse a slot outside the named root (three layers), release without a readable lease id is a hard error, TREEHOUSE_ROOT removed from the child env. F2/F6: LeaseGuard returns the lease on every error path. F3: binary lookup and skip reasons; in the Linux VM 108 passed, 0 failed, 25 skipped (was 3 pass, 12 fail, 1 panic). Survivors 3 of 13 mutants, all judged equivalent (one, disarm-lease-guard, not fully killed). mount_snapshot daemon rules (13 rows) documented. NOT MERGING YET: the PR is stacked on #33 (v1/13-cli), which is being redesigned (framework-enforced atomic snapshot_reset) and will change the API this crate drives; needs a re-check and a short round-2 critic after #33 lands. Also depends on cowfs-ctl mount_snapshot/unmount_snapshot and a Treehouse arm in cowfs-cli. | #33 merged; PR retargeted to main. Needs: merge main, adapt to the new ControlHandler signature, short round-2 critic."
+          "detail": "Merged to main. Critic blockers F1-F3 fixed and re-verified by me at 935835f (main merged, scope clean, CI green on both platforms, 113 crate tests pass, clippy clean; earlier run: real pool state files byte-identical, Linux VM 108 pass 0 fail 25 skipped with reasons). Needs no change for the new control API: it uses the unchanged CLI protocol and already retries on busy with a bounded timeout. Inert until the daemon wires mount_snapshot, so risk is contained. FOLLOW-UP: a short round-2 critic on the sandbox-root refusal layers before the daemon wires it up; real-pool safety was not re-checksummed on this last run."
         },
         {
           "id": "17",
@@ -292,5 +292,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38."
 }
