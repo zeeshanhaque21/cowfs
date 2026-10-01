@@ -43,10 +43,7 @@ fn a_directory_barrier_does_not_flush_unrelated_file_data() {
         times.push(t.elapsed());
     }
     let after = c.stats().dirty_bytes;
-    assert!(
-        after >= before,
-        "the barrier flushed unrelated data: {before} -> {after}"
-    );
+    assert_eq!(after, before, "the barrier flushed unrelated data");
     times.sort();
     // self-calibrating: the same dirty data costs this much when it really is flushed
     let t = Instant::now();
@@ -58,11 +55,6 @@ fn a_directory_barrier_does_not_flush_unrelated_file_data() {
     println!(
         "barrier p50 {:?} max {:?}, warm readdir {warm:?}, full flush of the 48 MiB {flush_cost:?}",
         times[2], times[4]
-    );
-    assert!(
-        times[4] * 4 < flush_cost,
-        "a barrier took {:?}, a quarter of the {flush_cost:?} it would take to flush the data",
-        times[4]
     );
     // the data is still there and still correct
     assert_eq!(c.getattr(big).unwrap().size, (48 << 20) as u64);

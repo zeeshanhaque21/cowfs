@@ -97,6 +97,7 @@ fn replay(dir: &std::path::Path, upto: u64) -> Acked {
 #[allow(dead_code)]
 fn report(acked: &Acked) {
     let mut o = std::io::stdout();
+    writeln!(o).unwrap();
     for (k, (ino, bytes)) in acked {
         writeln!(o, "A {k} {ino}").unwrap();
         for chunk in bytes.chunks(64) {
@@ -129,6 +130,7 @@ fn parse_acked(text: &str) -> Acked {
                     .filter_map(|i| u8::from_str_radix(&rest[2 * i..2 * i + 2], 16).ok()),
             );
         } else if line == "E" {
+            assert!(!name.is_empty(), "checkpoint frame has no name: {text}");
             out.insert(std::mem::take(&mut name), (ino, std::mem::take(&mut bytes)));
         }
     }
@@ -335,7 +337,7 @@ fn control_plane_invariants_hold_across_random_sequences() {
 
 #[test]
 fn checkpoint_child_really_runs_and_retains_its_store() {
-    let (dir, text) = child(1);
+    let (dir, text) = child(10);
     assert!(
         text.contains("running 1 test"),
         "checkpoint child was not selected: {text}"
@@ -344,4 +346,8 @@ fn checkpoint_child_really_runs_and_retains_its_store() {
         dir.path().join("meta.redb").exists(),
         "checkpoint fixture was deleted"
     );
+    let acked = parse_acked(&text);
+    assert!(acked.keys().all(|name| !name.is_empty()));
+    let c = Core::open(dir.path(), opts()).unwrap();
+    check(&c, &acked, "checkpoint regression");
 }
