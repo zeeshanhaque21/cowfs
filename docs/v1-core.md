@@ -595,7 +595,49 @@ This was not pursued further, per the instruction not to spend long on it.
 - Chunk lists are loaded whole and committed whole (see "Requests of store and meta").
 - Blocks of deleted data are only reclaimed by GC (#10), so `statfs` free space does not grow after a flushed file is deleted.
 - Only `fsync` and the timers make data durable; `flush` does nothing.
-- The virtual inode numbers need the `<root>/virt.ino` mark and the alias table still exists (both bounded now) until meta can hand out inode numbers ahead of a transaction.
-- A poisoned file stays poisoned for the life of the mount; there is no repair operation, only removing it.
+- Virtual inode numbers use `<root>/virt.ino.a` and `<root>/virt.ino.b` reservations until meta can allocate durable inode numbers ahead of a transaction.
+- `Core::unpoison` requeues retained bytes after the cause is repaired; it cannot reconstruct bytes lost outside the mount.
 - The cold read path copies twice per chunk and the profile says that is where its time goes (see above).
 - No mount adapter has been run against `Core` yet; the suite runs through the `Vfs` trait only.
+
+## Round-2 revalidation
+
+Main at `48645b9` and block-store at `c4eb089` are merged into the integration branch.
+The store's new quarantine error maps to retryable VFS I/O, not file corruption.
+No store or metadata source was hand-edited for this revalidation.
+
+The original two survivors now fail targeted assertions: `b03_no_rollback` leaves an intent and hidden staging state; `b09_transient_poisons` stops before using the transient retry budget.
+The second mutant changes the retry decision, not the eventual poison classification.
+The original watchdog-only outcomes were rerun rather than counted as assertion kills.
+Of the original 30 mutants, 26 have regression kills, three survive (`n02_swap_intent_no_fsync`, `n04_virt_mark_no_dir_fsync`, `b11_load_node_upserts`), and one is invalid (`b07_unregister_locked_meta` has an unclosed delimiter).
+`n02` still calls file fsync but ignores its error; the existing tests do not inject that error.
+`n04` needs a directory-durability power-loss model; a process kill does not establish that guarantee.
+`b11` still lacks deterministic contention coverage of the final cache-insertion retry.
+Each rerun has its own target directory and a total hard timeout, and restores its source in `finally`.
+
+Polling `Core::health` previously drained dirty-file work; a failing regression now verifies repeated polls and durable readback without repair.
+The checkpoint harness previously selected no child test and deleted its fixture before reopening it.
+It now retains the fixture, requires a real abort and checkpoint marker, frames output away from the test-harness prefix, and models successful promotion without removing the source from the oracle.
+A controlled unchanged-versus-replaced-target spike demonstrates why the old promotion expectations were invalid.
+Earlier green checkpoint runs do not establish crash coverage.
+Pre-removal swap refusals at steps 1, 2 and 3 now roll back; a regression demonstrated step 1 completing on reopen before this fix.
+
+The two post-store macOS fsx runs each completed 100,000 operations, seeds 1 and 2, in 430.13 s and 410.12 s respectively.
+The 180 s macOS mixed hammer completed 725,491,433 global progress ticks with a largest sampled gap of 452 ms.
+This is one run, not a per-worker bound, and includes setup and drain time.
+The Linux 3 s representative hammer failed with a 12,678 ms gap; its 180 s batch was not launched after the failed sample.
+No lock-specific cause or cross-platform liveness pass is claimed from that result.
+The directory-barrier test now asserts unchanged dirty bytes exactly; timing remains diagnostic because an unrelated scheduling delay made its maximum-time ratio fail without flushing data.
+
+`flush_boundary.rs` SIGKILLs its verified child immediately before and immediately after the real store-sync hook inside a pending metadata flush.
+Both boundaries reopen with clean metadata and fsck, preserve the untouched fsynced file, and expose a complete old or new replacement and namespace batch.
+This is process-crash coverage at two boundaries, not a power-loss model.
+Linux PID verification reads the selected `/proc/<pid>/cmdline` directly because `ps -p` hung while scanning an unrelated blocked process's environment.
+The VM recipe uses only `/home/zeeshanhaque/cowfs-core-work`, its local target and temporary directory, and disables core dumps for its own test processes.
+Linux crate validation uses 100 invariant iterations and three checkpoints; macOS's default invariant run uses 400 iterations and twelve checkpoints.
+
+Reproduce with `sh scripts/verify-core.sh` and `orb -m cowfs-spike3 sh /Users/zeeshanhaque/.treehouse/cowfs-7c1bf8/9/cowfs/scripts/validate-core-linux.sh crate`.
+The `hammer` phase requires its representative run to pass before launching 180 s.
+Raw local evidence is in `target/fsx-round2-seed{1,2}.log`, `target/hammer-macos180.log`, `target/hammer-linux180.log`, `target/mutants.out`, and each retained `target/mutants/<name>/run.log`.
+After #24 lands, re-merge any newer store revision and rerun both workspace platforms, fsx, flush boundaries, checkpoint invariants and the unresolved Linux hammer before claiming an integration pass.
+Explicit hole markers, durable inode reservations, shared snapshot-ID bounds, and atomic snapshot replacement remain metadata requests in #42.

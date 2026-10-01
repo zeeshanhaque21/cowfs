@@ -889,23 +889,22 @@ fn a_step_three_refusal_removes_the_intent_and_staging_snapshot() {
 }
 
 #[test]
-fn staging_snapshots_are_hidden_from_mount_root_readdir() {
-    let dir = tempfile::tempdir().unwrap();
-    let c = Core::open(dir.path(), test_opts()).unwrap();
-    c.create_snapshot("src").unwrap();
-    c.set_swap_fault(1);
-    assert!(c.promote_base("src", "new").is_err());
-    assert!(c
-        .meta()
-        .snapshots()
-        .unwrap()
-        .iter()
-        .any(|s| s.name.contains(".cowfs-swap")));
-    let listing = c.readdir(ROOT_INO, 0, 100).unwrap();
-    assert!(listing
-        .entries
-        .iter()
-        .all(|e| !e.name.windows(11).any(|w| w == b".cowfs-swap")));
+fn every_pre_removal_refusal_stays_refused_after_reopen() {
+    for step in 1..=3 {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let c = Core::open(dir.path(), test_opts()).unwrap();
+            c.create_snapshot("old").unwrap();
+            c.set_swap_fault(step);
+            assert!(c.rename_snapshot("old", "new").is_err());
+        }
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        assert_eq!(
+            snap_names(&c),
+            ["old"],
+            "refusal at step {step} completed on reopen"
+        );
+    }
 }
 
 #[test]

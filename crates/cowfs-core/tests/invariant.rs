@@ -84,7 +84,11 @@ fn replay(dir: &std::path::Path, upto: u64) -> Acked {
     c.set_swap_fault((rng.below(5) + 1) as u8);
     if !acked.is_empty() {
         let src = acked.keys().next().cloned().expect("a name");
-        let _ = c.promote_base(&src, &format!("base{}", rng.below(3)));
+        let base = format!("base{}", rng.below(3));
+        let source = acked.get(&src).cloned().unwrap();
+        if c.promote_base(&src, &base).is_ok() {
+            acked.insert(base, source);
+        }
         c.set_swap_fault(0);
     }
     c.sync().expect("sync");
@@ -172,7 +176,12 @@ fn drive(c: &Core, rng: &mut Rng, step: u64, acked: &mut Acked) {
         4 | 5 => {
             if !live.is_empty() {
                 let src = live[rng.below(live.len() as u64) as usize].clone();
-                let _ = c.fork_snapshot(&src, &format!("f{step}"));
+                let target = format!("f{step}");
+                if c.fork_snapshot(&src, &target).is_ok() {
+                    if let Some(v) = acked.get(&src).cloned() {
+                        acked.insert(target, v);
+                    }
+                }
             }
         }
         6 | 7 => {
@@ -204,7 +213,7 @@ fn drive(c: &Core, rng: &mut Rng, step: u64, acked: &mut Acked) {
                     Ok(_) => {
                         // the base is replaced, whatever it held
                         acked.remove(&base);
-                        if let Some(v) = acked.remove(&src) {
+                        if let Some(v) = acked.get(&src).cloned() {
                             acked.insert(base, v);
                         }
                     }
@@ -350,4 +359,34 @@ fn checkpoint_child_really_runs_and_retains_its_store() {
     assert!(acked.keys().all(|name| !name.is_empty()));
     let c = Core::open(dir.path(), opts()).unwrap();
     check(&c, &acked, "checkpoint regression");
+}
+
+#[test]
+fn checkpoint_spike_compares_unchanged_and_replaced_targets() {
+    for replace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Core::open(dir.path(), opts()).unwrap();
+        let mut acked = Acked::new();
+        for (name, bytes) in [("src", b"NEW".as_slice()), ("base", b"OLD".as_slice())] {
+            c.create_snapshot(name).unwrap();
+            let fs = c.snapshot_view(name).unwrap();
+            let a = mkfile(&fs, ROOT_INO, "f", bytes);
+            fs.fsync(a.ino, false).unwrap();
+            acked.insert(name.to_string(), (a.ino, bytes.to_vec()));
+        }
+        if replace {
+            c.promote_base("src", "base").unwrap();
+        }
+        let stale = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check(&c, &acked, "controlled checkpoint spike");
+        }));
+        assert_eq!(
+            stale.is_err(),
+            replace,
+            "replacement must change the oracle"
+        );
+        let fs = c.snapshot_view("base").unwrap();
+        let a = fs.lookup(ROOT_INO, b"f").unwrap();
+        assert_eq!(read_all(&fs, a.ino), if replace { b"NEW" } else { b"OLD" });
+    }
 }

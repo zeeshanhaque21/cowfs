@@ -172,8 +172,10 @@ impl Core {
         }
         self.inner.flush_snapshot(&src_sc)?;
         self.stage_and_intent(&src_sc, &staged, new)?;
-        self.fault(1)?;
-        self.fault(2)?;
+        if let Err(e) = self.fault(1).and_then(|()| self.fault(2)) {
+            self.rollback(&staged, new);
+            return Err(e);
+        }
         if let Err(e) = self.fault(3) {
             self.rollback(&staged, new);
             return Err(e);
@@ -270,5 +272,37 @@ impl Core {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cowfs_vfs::{Vfs, ROOT_INO};
+
+    #[test]
+    fn staging_snapshots_are_hidden_from_mount_root_readdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Core::open(
+            dir.path(),
+            crate::Options {
+                background: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        c.create_snapshot("src").unwrap();
+        let sc = c.inner.snap_by_name("src").unwrap();
+        let staged = staging_name("new");
+        c.stage_and_intent(&sc, &staged, "new").unwrap();
+        assert!(c
+            .meta()
+            .snapshots()
+            .unwrap()
+            .iter()
+            .any(|s| s.name == staged));
+        let listing = c.readdir(ROOT_INO, 0, 100).unwrap();
+        assert!(listing.entries.iter().all(|e| e.name != staged.as_bytes()));
+        c.rollback(&staged, "new");
     }
 }
