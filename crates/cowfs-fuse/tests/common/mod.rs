@@ -10,6 +10,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use cowfs_fuse::{Mount, MountOptions};
+use cowfs_vfs::Error;
 use cowfs_vfs::*;
 use cowfs_vfs_test::MemVfs;
 use tempfile::TempDir;
@@ -23,6 +24,15 @@ pub struct Probe {
     pub bad_attrs: AtomicBool,
     pub panics: AtomicU64,
     pub reuse_ino_for_create: Mutex<Option<Ino>>,
+    /// `open` fails, to prove a failed create leaves no file behind.
+    pub open_fails: AtomicBool,
+    /// While greater than zero, every `read` blocks for this long before giving up, so a lane
+    /// stays wedged until the test sets it back to zero.
+    pub wedge_read_ms: AtomicU64,
+    /// Return a short page, then an empty one, without ever setting eof.
+    pub empty_no_eof: AtomicBool,
+    /// Number cookies from 0, which the trait reserves for "from the start".
+    pub zero_cookies: AtomicBool,
     pub refs: AtomicI64,
     pub forgotten: AtomicU64,
     pub opens: AtomicU64,
@@ -102,6 +112,9 @@ impl Vfs for Probe {
         self.inner.rename(p, n, p2, n2, f)
     }
     fn open(&self, i: Ino) -> Result<FileHandle> {
+        if self.open_fails.load(SeqCst) {
+            return Err(Error::Io("probe: open refused".into()));
+        }
         let r = self.inner.open(i);
         if r.is_ok() {
             self.opens.fetch_add(1, SeqCst);
@@ -117,6 +130,10 @@ impl Vfs for Probe {
     }
     fn read(&self, i: Ino, o: u64, s: u32) -> Result<Vec<u8>> {
         let d = self.read_delay_ms.load(SeqCst);
+        let wedge = self.wedge_read_ms.load(SeqCst);
+        if wedge > 0 {
+            std::thread::sleep(Duration::from_millis(wedge));
+        }
         if d > 0 {
             std::thread::sleep(Duration::from_millis(d));
         }
@@ -141,7 +158,40 @@ impl Vfs for Probe {
         self.inner.fsync(i, data_only)
     }
     fn readdir(&self, d: Ino, c: u64, m: usize) -> Result<ReadDir> {
-        self.inner.readdir(d, c, m)
+        let mut r = if self.zero_cookies.load(SeqCst) {
+            // A conforming 0-based Vfs: "after cookie c" excludes c.
+            self.inner
+                .readdir(d, if c == 0 { 0 } else { c.saturating_add(1) }, m)
+                .map(|mut l| {
+                    for e in l.entries.iter_mut() {
+                        e.cookie = e.cookie.saturating_sub(1);
+                    }
+                    l
+                })
+        } else {
+            self.inner.readdir(d, c, m)
+        };
+        if false {
+            r = r.map(|mut l| {
+                for e in l.entries.iter_mut() {
+                    e.cookie = e.cookie.saturating_sub(1);
+                }
+                l
+            });
+        }
+        if self.empty_no_eof.load(SeqCst) {
+            r = r.map(|mut l| {
+                l.eof = false;
+                if l.entries.len() > 1 {
+                    l.entries.truncate(1);
+                }
+                l
+            });
+            if r.as_ref().is_ok_and(|l| l.entries.is_empty()) {
+                r = Err(Error::Io("probe: empty page, never eof".into()));
+            }
+        }
+        r
     }
     fn statfs(&self) -> Result<StatFs> {
         self.inner.statfs()
