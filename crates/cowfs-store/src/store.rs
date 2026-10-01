@@ -75,7 +75,8 @@ pub struct Store {
     checkpoint_on_drop: bool,
     counters: Counters,
     damaged: RwLock<HashMap<BlockId, (u32, u64)>>,
-    rescan: BTreeSet<u32>,
+    /// Packs whose records the index cannot be trusted for, so a checkpoint must not record them.
+    rescan: Mutex<BTreeSet<u32>>,
     recovery: RecoveryReport,
 }
 
@@ -345,6 +346,7 @@ impl Store {
         let mut lens: BTreeMap<u32, u64> = BTreeMap::new();
         let mut nonces: HashMap<u32, u32> = HashMap::new();
         let mut head_lost: Vec<u32> = Vec::new();
+        let mut cuts: Vec<CorruptRegion> = Vec::new();
         let mut sealed_len: HashMap<u32, u64> = HashMap::new();
         for &id in &ids {
             let path = pack::pack_path(&dir, id);
@@ -485,6 +487,7 @@ impl Store {
                     offset: len,
                     len: dur - len,
                     id: None,
+                    unclassified: false,
                 });
                 rescan.insert(id);
                 last_damaged |= is_active;
@@ -577,6 +580,7 @@ impl Store {
                         b.len
                     },
                     id: b.id,
+                    unclassified: false,
                 });
             }
             if let Some(t) = torn_from {
@@ -597,6 +601,18 @@ impl Store {
                     cut_at = Some((id, t));
                 }
                 recovery.torn_tail_discarded += len - t;
+                if recovery.watermark_missing {
+                    // Without a watermark the bytes past the header cannot be classified, so cutting
+                    // them destroys data that may have been promised. Remember the cut, so a later
+                    // open still reports the loss until somebody accepts it.
+                    cuts.push(CorruptRegion {
+                        pack: id,
+                        offset: t,
+                        len: len - t,
+                        id: None,
+                        unclassified: true,
+                    });
+                }
                 len = t;
             }
             if scanned > 0 || torn_from.is_some() {
@@ -675,7 +691,7 @@ impl Store {
             }
             let nonce = nonces.get(&r.pack).copied().unwrap_or(0);
             if ack::find(&table, r.pack, nonce, r.offset, r.len, r.id)
-                .is_some_and(|e| e.state == ack::State::Acked)
+                .is_some_and(|e| e.state.accepted())
             {
                 recovery.acknowledged.push(r);
                 continue;
@@ -719,9 +735,20 @@ impl Store {
                 id: None,
             });
         }
+        for c in &cuts {
+            fresh.push(Entry {
+                pack: c.pack,
+                nonce: 0,
+                state: ack::State::Unclassified,
+                offset: c.offset,
+                len: c.len,
+                id: None,
+            });
+            still_pending.push(*c);
+        }
         // A pending entry from an earlier open whose region no longer shows up is still a loss.
         for e in &acked {
-            if e.state != ack::State::Pending {
+            if e.state.accepted() {
                 continue;
             }
             let found = still_pending
@@ -733,7 +760,7 @@ impl Store {
                 continue;
             }
             if ack::find(&table, e.pack, e.nonce, e.offset, e.len, e.id)
-                .is_some_and(|a| a.state == ack::State::Acked)
+                .is_some_and(|a| a.state.accepted())
             {
                 // A newer entry accepted this exact region.
                 continue;
@@ -752,6 +779,7 @@ impl Store {
                     offset: e.offset,
                     len: e.len,
                     id: e.id,
+                    unclassified: e.state == ack::State::Unclassified,
                 });
             }
         }
@@ -806,7 +834,7 @@ impl Store {
             checkpoint_on_drop: options.checkpoint_on_drop,
             counters,
             damaged: RwLock::new(damaged),
-            rescan,
+            rescan: Mutex::new(rescan),
             recovery,
         })
     }
@@ -1109,10 +1137,11 @@ impl Store {
     fn checkpoint_locked(&self) -> Result<()> {
         let lens = self.sync_capture()?;
         let nonces = self.nonces();
+        let rescan = self.rescan.lock().unwrap_or_else(PoisonError::into_inner);
         let packs: Vec<(u32, u64, u32)> = lens
             .iter()
             .map(|(&id, &n)| {
-                let n = if self.rescan.contains(&id) {
+                let n = if rescan.contains(&id) {
                     PACK_HEADER_LEN
                 } else {
                     n
@@ -1121,7 +1150,7 @@ impl Store {
             })
             .collect();
         let entries = self.index.snapshot(|loc| {
-            !self.rescan.contains(&loc.pack)
+            !rescan.contains(&loc.pack)
                 && lens.get(&loc.pack).is_some_and(|&n| {
                     u64::from(loc.offset) + HEADER_LEN as u64 + u64::from(loc.slen) <= n
                 })
@@ -1394,6 +1423,12 @@ impl Store {
             self.dirty.store(true, Relaxed);
             let mut d = self.damaged.write().unwrap_or_else(PoisonError::into_inner);
             d.retain(|id, _| self.index.get(id).is_none());
+            // Every pack was read from end to end and every record that verified is now indexed,
+            // so a checkpoint can record them and a later open does not have to rescan.
+            self.rescan
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
         }
         Ok(report)
     }

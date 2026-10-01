@@ -23,6 +23,14 @@ pub(crate) const WHOLE_PACK: (u64, u64) = (0, u64::MAX);
 pub(crate) enum State {
     Pending,
     Acked,
+    /// Damage the store could not classify, because it had no watermark when it cut the bytes.
+    Unclassified,
+}
+
+impl State {
+    pub(crate) fn accepted(self) -> bool {
+        self == Self::Acked
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +47,11 @@ fn encode(e: &Entry) -> [u8; ENTRY] {
     let mut b = [0u8; ENTRY];
     b[..4].copy_from_slice(&e.pack.to_le_bytes());
     b[4..8].copy_from_slice(&e.nonce.to_le_bytes());
-    b[8..9].copy_from_slice(&[u8::from(e.state == State::Acked)]);
+    b[8..9].copy_from_slice(&[match e.state {
+        State::Pending => 0,
+        State::Acked => 1,
+        State::Unclassified => 2,
+    }]);
     b[16..24].copy_from_slice(&e.offset.to_le_bytes());
     b[24..32].copy_from_slice(&e.len.to_le_bytes());
     if let Some(id) = e.id {
@@ -55,10 +67,10 @@ fn decode(b: &[u8]) -> Option<Entry> {
     if crc32c::crc32c(&b[..ENTRY - 4]) != u32::from_le_bytes(b[ENTRY - 4..].try_into().ok()?) {
         return None;
     }
-    let state = if b[8] == 0 {
-        State::Pending
-    } else {
-        State::Acked
+    let state = match b[8] {
+        0 => State::Pending,
+        1 => State::Acked,
+        _ => State::Unclassified,
     };
     let raw: [u8; 32] = b[32..64].try_into().ok()?;
     let id = raw
@@ -149,9 +161,6 @@ pub(crate) fn find(
 /// is still to be reported.
 pub(crate) fn covers_pack(entries: &[Entry], pack: u32) -> bool {
     entries.iter().rev().any(|e| {
-        e.pack == pack
-            && e.state == State::Acked
-            && e.offset == WHOLE_PACK.0
-            && e.len == WHOLE_PACK.1
+        e.pack == pack && e.state.accepted() && e.offset == WHOLE_PACK.0 && e.len == WHOLE_PACK.1
     })
 }

@@ -233,8 +233,21 @@ fn without_a_watermark_damage_is_cut_but_kept_in_a_sidecar_and_reported() {
         assert_eq!(&s.get(*id).unwrap(), d);
     }
     drop(s);
+    // The cut destroyed bytes the store could not classify, so it stays reported until it is
+    // accepted. Reporting it once would hide a real loss.
+    for round in 0..2 {
+        let s = open(dir.path());
+        assert!(
+            s.recovery().has_corruption(),
+            "round {round}: an unclassifiable cut must stay reported: {:?}",
+            s.recovery()
+        );
+    }
     let s = open(dir.path());
-    assert!(!s.recovery().has_corruption(), "reported once, not forever");
+    assert_eq!(s.acknowledge_corruption().unwrap(), 1);
+    drop(s);
+    let s = open(dir.path());
+    assert!(!s.recovery().has_corruption(), "accepted");
 }
 
 fn every_bit(len: usize) -> impl Iterator<Item = (usize, u8)> {

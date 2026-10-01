@@ -192,8 +192,10 @@ fn run_case(seed: u64, mode: WmMode, sector: u64) -> Result<(bool, bool), String
     {
         let s = Store::open_unsynced(img.path(), o).map_err(|e| format!("{tag}: open1 {e:?}"))?;
         let r = s.recovery().clone();
-        first_reported = r.has_corruption();
-        if first_reported && !matches!(mode, WmMode::BothTorn) {
+        // Damage the store could not classify (a cut made with no watermark) is reported until it
+        // is accepted, so it is expected here; anything else is a false report.
+        first_reported = r.has_corruption() && !r.corrupt_synced.iter().all(|c| c.unclassified);
+        if r.has_corruption() && first_reported && !matches!(mode, WmMode::BothTorn) {
             return Err(format!("{tag}: FALSE corruption on open1 {r:?}"));
         }
         check_acked(&s, &model, &acked, &format!("{tag} open1"));
@@ -211,7 +213,7 @@ fn run_case(seed: u64, mode: WmMode, sector: u64) -> Result<(bool, bool), String
     for (id, d) in &second {
         assert_eq!(&s.get(*id).unwrap(), d, "{tag}: second-cycle block lost");
     }
-    if r.has_corruption() {
+    if r.has_corruption() && !r.corrupt_synced.iter().all(|c| c.unclassified) {
         return Err(format!(
             "{tag}: FALSE corruption on open2 (after benign torn write + one sync): {:?}",
             r.corrupt_synced
@@ -346,9 +348,13 @@ fn d2_missing_watermark_torn_tail() {
     }
     let s = open(dir.path());
     assert!(
-        !s.recovery().has_corruption(),
-        "torn tail became corruption"
+        s.recovery().has_corruption(),
+        "a cut made without a watermark destroys unclassifiable bytes, so it is a pending loss"
     );
+    assert_eq!(s.acknowledge_corruption().unwrap(), 1);
+    drop(s);
+    let s = open(dir.path());
+    assert!(!s.recovery().has_corruption(), "accepted");
 }
 
 /// N2: the watermark names packs that are gone. It must be loud and `sync` must keep fsyncing.

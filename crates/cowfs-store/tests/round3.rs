@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, PoisonError};
 
-use common::{opts, pack_ids, pack_path, parse_pack, random, REC_HDR};
+use common::{opts, pack_ids, pack_path, parse_pack, random, PACK_HEADER, REC_HDR};
 use cowfs_store::{oplog_start, oplog_take, BlockId, LogOp, Options, Store};
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -154,6 +154,50 @@ fn p11_a_loss_keeps_being_reported_until_it_is_acknowledged() {
         assert!(!s.recovery().acknowledged.is_empty());
         assert!(!s.recovery().corrupt_synced.is_empty() || !s.recovery().acknowledged.is_empty());
     }
+}
+
+/// F5, the shape the critic hit: the damage is in bytes a cut removes, so the second open finds a
+/// clean pack and a block that is gone. The loss must still be reported.
+#[test]
+fn p11_a_loss_hidden_by_a_cut_is_still_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (random(1, 4000), random(2, 4000));
+    {
+        let s = Store::open(dir.path(), opts()).unwrap();
+        s.put(&a).unwrap();
+        s.put(&b).unwrap();
+        s.sync().unwrap();
+    }
+    // Without a watermark nothing after the pack header was ever promised, so the damaged region
+    // is a torn tail and open cuts it away. Block `a` is inside it and is now gone for good.
+    let _ = fs::remove_file(dir.path().join("SYNCED"));
+    let p = pack_path(dir.path(), 0);
+    OpenOptions::new()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .write_all_at(
+            &[0xEE; 8],
+            common::PACK_HEADER.len() as u64 + REC_HDR as u64 + 10,
+        )
+        .unwrap();
+    for round in 0..3 {
+        let s = Store::open(dir.path(), opts()).unwrap();
+        assert!(
+            s.recovery().has_corruption(),
+            "round {round}: the loss must stay reported after the cut: {:?}",
+            s.recovery()
+        );
+        assert!(s.get(BlockId::of(&a)).is_err());
+        assert_eq!(s.get(BlockId::of(&b)).unwrap(), b);
+        s.checkpoint().unwrap();
+        let _ = fs::remove_file(dir.path().join("index.cix"));
+    }
+    let s = Store::open(dir.path(), opts()).unwrap();
+    s.acknowledge_corruption().unwrap();
+    drop(s);
+    let s = Store::open(dir.path(), opts()).unwrap();
+    assert!(!s.recovery().has_corruption(), "{:?}", s.recovery());
 }
 
 /// F5, second half: a repairing `put` clears the block from the list a caller works through.
@@ -662,23 +706,28 @@ fn p4_salvage_recovers_records_behind_forged_headers() {
         }
         s.sync().unwrap();
     }
-    // Forge 300 headers with valid checksums, each claiming a 200 KB payload, in front of the
-    // records. A scanner that trusts headers spends its work bound here.
     let p = pack_path(dir.path(), 0);
     let bytes = fs::read(&p).unwrap();
-    let mut forged = common::PACK_HEADER.to_vec();
-    for i in 0..300u32 {
+
+    // 300 forged headers in front of the real records, each with a valid header checksum and a
+    // payload that reaches the end of the file, so each one costs a read of everything behind it. A
+    // scanner with a work bound spends the bound here and never reaches the records.
+    let len = bytes.len() + 300 * REC_HDR;
+    let mut forged = PACK_HEADER.to_vec();
+    for i in 0..300usize {
+        let at = PACK_HEADER.len() + i * REC_HDR;
+        let slen = (len - at - REC_HDR) as u32;
         let mut head = [0u8; REC_HDR];
         head[..4].copy_from_slice(b"CWRB");
-        head[4..8].copy_from_slice(&[1, 0, 0, 0]);
-        head[12..16].copy_from_slice(&200_000u32.to_le_bytes());
-        let mut id = [0u8; 32];
-        id[..4].copy_from_slice(&i.to_le_bytes());
-        head[16..48].copy_from_slice(&id);
+        head[8..12].copy_from_slice(&slen.to_le_bytes());
+        head[12..16].copy_from_slice(&slen.to_le_bytes());
+        head[16..20].copy_from_slice(&(i as u32 ^ 7).to_le_bytes());
+        let hcrc = crc32c::crc32c(&head[..48]);
+        head[48..52].copy_from_slice(&hcrc.to_le_bytes());
         forged.extend_from_slice(&head);
-        forged.extend_from_slice(&vec![0xABu8; 200_000]);
     }
-    forged.extend_from_slice(&bytes[common::PACK_HEADER.len()..]);
+    forged.extend_from_slice(&bytes[PACK_HEADER.len()..]);
+    assert_eq!(forged.len(), len);
     fs::write(&p, &forged).unwrap();
     let _ = fs::remove_file(common::index_path(dir.path()));
 
@@ -701,9 +750,13 @@ fn p4_salvage_recovers_records_behind_forged_headers() {
     for (i, b) in blocks.iter().enumerate() {
         assert_eq!(s.get(ids[i]).unwrap(), *b, "block {i} not recovered");
     }
-    s.sync().unwrap();
+    s.checkpoint().unwrap();
     drop(s);
     let s = Store::open(dir.path(), opts()).unwrap();
+    assert!(
+        s.recovery().index_loaded,
+        "the salvaged index must be reused"
+    );
     for (i, b) in blocks.iter().enumerate() {
         assert_eq!(s.get(ids[i]).unwrap(), *b, "block {i} lost after reopen");
     }

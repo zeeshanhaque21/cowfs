@@ -47,6 +47,9 @@ pub struct CorruptRegion {
     pub len: u64,
     /// The id the damaged header claims, when that header still parses. Unverified.
     pub id: Option<crate::BlockId>,
+    /// The store had no watermark when these bytes were cut, so it cannot say whether they were
+    /// ever durable. It is a loss of unknown size, not a promise broken.
+    pub unclassified: bool,
 }
 
 /// Bytes of a discarded torn tail, kept next to the pack for forensics.

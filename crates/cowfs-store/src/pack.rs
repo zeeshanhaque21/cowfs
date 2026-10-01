@@ -209,11 +209,29 @@ fn find_record(
         let mut at = 0;
         while let Some(p) = magic_at(&window[..n], at) {
             let cand = base + p as u64;
+            if std::env::var_os("COWFS_PACK_DEBUG").is_some() {
+                eprintln!("MAGIC {cand} magic={:?}", &window[p..p + 4]);
+            }
             let head = match window[p..n].first_chunk::<HEADER_LEN>() {
-                Some(raw) => Header::parse(raw).ok(),
+                Some(raw) => {
+                    let h = Header::parse(raw);
+                    if h.is_err() && std::env::var_os("COWFS_PACK_DEBUG").is_some() {
+                        eprintln!("REJECT {cand}: {:?}", h.err());
+                    }
+                    h.ok()
+                }
                 None => peek_header(file, cand, end)?,
             };
+            if std::env::var_os("COWFS_PACK_DEBUG").is_some() {
+                eprintln!(
+                    "CHECK {cand} head={:?}",
+                    head.map(|h| (h.slen, h.total_len(), cand + h.total_len() <= end))
+                );
+            }
             if let Some(h) = head.filter(|h| cand + h.total_len() <= end) {
+                if std::env::var_os("COWFS_PACK_DEBUG").is_some() {
+                    eprintln!("CAND {cand} slen={}", h.slen);
+                }
                 if !budget.charge(h.slen) {
                     return Ok(Found::Exhausted);
                 }
@@ -276,6 +294,12 @@ pub(crate) fn scan_deep(
                 let Some(header) = read_record(file, off, end, &mut payload)? else {
                     break;
                 };
+                if off > pos {
+                    visit(Deep::Gap {
+                        offset: pos,
+                        len: off - pos,
+                    })?;
+                }
                 let total = header.total_len();
                 // The checksums in the header are only as good as the bytes that carry them, so the
                 // payload hash decides. This is what a forged header with valid checksums fails.
