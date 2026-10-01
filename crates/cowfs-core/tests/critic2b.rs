@@ -618,14 +618,16 @@ fn a_read_call_never_allocates_more_than_the_file_and_one_cap() {
 
 // ---------------------------------------------------------------- B7: liveness
 
-fn watchdog<F: FnOnce() + Send + 'static>(limit: Duration, what: &str, f: F) -> u64 {
+fn watchdog<F: FnOnce() + Send + 'static>(
+    limit: Duration,
+    what: &str,
+    progress: Arc<AtomicU64>,
+    f: F,
+) -> u64 {
     let done = Arc::new(AtomicBool::new(false));
-    let progress = Arc::new(AtomicU64::new(0));
     let d = done.clone();
-    let t = progress.clone();
     let h = std::thread::spawn(move || {
         f();
-        t.fetch_add(1, Ordering::SeqCst);
         d.store(true, Ordering::SeqCst);
     });
     let start = Instant::now();
@@ -642,15 +644,26 @@ fn watchdog<F: FnOnce() + Send + 'static>(limit: Duration, what: &str, f: F) -> 
             quiet_since = Instant::now();
         }
         last = now;
-        if start.elapsed() > limit && !done.load(Ordering::SeqCst) {
-            let out = std::process::Command::new("sh")
-                .args(["-c", "sample $PPID 2 -mayDie 2>/dev/null || true"])
+        // never give up: report every stall with a stack sample and let the run finish, so the
+        // worst gap is a measurement and not an early exit
+        if worst > Duration::from_secs(20)
+            && start.elapsed() > limit
+            && !done.load(Ordering::SeqCst)
+        {
+            let out = std::process::Command::new("sample")
+                .args([
+                    &std::process::id().to_string(),
+                    "1",
+                    "-mayDie",
+                    "-f",
+                    &format!("/tmp/cowfs-hammer-{what}.sample"),
+                ])
                 .output();
             eprintln!(
-                "NO PROGRESS for {limit:?} in {what}\n{}",
-                String::from_utf8_lossy(&out.map(|o| o.stdout).unwrap_or_default())
+                "STALL: no progress for {:?} in {what}, sample rc {:?}",
+                worst,
+                out.as_ref().map(|o| o.status.code())
             );
-            std::process::exit(3);
         }
     }
     let _ = h.join();
@@ -668,129 +681,135 @@ fn stress() {
         .unwrap_or(300);
     let dir = tempfile::tempdir().unwrap();
     let ticks_out = Arc::new(AtomicU64::new(0));
-    let ticks_out2 = ticks_out.clone();
-    let gap = watchdog(Duration::from_secs(90), "mixed lock stress", move || {
-        let c = Core::open(
-            dir.path(),
-            Options {
-                background: true,
-                flush_interval: Duration::from_millis(20),
-                max_pending_ops: 64,
-                node_cache: 512,
-                dentry_cache: 4096,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        c.create_snapshot("s").unwrap();
-        c.create_snapshot("other").unwrap();
-        let fs = c.snapshot_view("s").unwrap();
-        let root = ROOT_INO;
-        for i in 0..200 {
-            let d = fs.mkdir(root, format!("d{i}").as_bytes(), 0o755).unwrap();
-            let a = fs.create(d.ino, b"f", 0o644).unwrap();
-            fs.write(a.ino, 0, &pattern(3000, i as u64)).unwrap();
-            fs.forget(a.ino, 1);
-            fs.forget(d.ino, 1);
-        }
-        c.sync().unwrap();
-        let ticks = ticks_out2.clone();
-        let stop = Instant::now() + Duration::from_secs(secs);
-        let mut hs = Vec::new();
-        for t in 0..14u64 {
-            let (c, fs, progress) = (c.clone(), fs.clone(), ticks.clone());
-            hs.push(std::thread::spawn(move || {
-                let mut rng = Rng(t * 7 + 1);
-                while Instant::now() < stop {
-                    let i = rng.below(200);
-                    let name = format!("d{i}");
-                    match t % 14 {
-                        0 | 1 => {
-                            c.drop_caches();
-                            let _ = fs.lookup(root, name.as_bytes());
-                            if let Ok(a) = fs.lookup(root, name.as_bytes()) {
-                                let _ = fs.getattr(a.ino);
-                                let _ = fs.read(a.ino, 0, 4096);
-                                c.forget(a.ino, 1);
+    let threads_ticks = ticks_out.clone();
+    let report_ticks = ticks_out.clone();
+    let gap = watchdog(
+        Duration::from_secs(90),
+        "mixed lock stress",
+        ticks_out.clone(),
+        move || {
+            let c = Core::open(
+                dir.path(),
+                Options {
+                    background: true,
+                    flush_interval: Duration::from_millis(20),
+                    max_pending_ops: 64,
+                    node_cache: 512,
+                    dentry_cache: 4096,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            c.create_snapshot("s").unwrap();
+            c.create_snapshot("other").unwrap();
+            let fs = c.snapshot_view("s").unwrap();
+            let root = ROOT_INO;
+            for i in 0..200 {
+                let d = fs.mkdir(root, format!("d{i}").as_bytes(), 0o755).unwrap();
+                let a = fs.create(d.ino, b"f", 0o644).unwrap();
+                fs.write(a.ino, 0, &pattern(3000, i as u64)).unwrap();
+                fs.forget(a.ino, 1);
+                fs.forget(d.ino, 1);
+            }
+            c.sync().unwrap();
+            let ticks = threads_ticks.clone();
+            let stop = Instant::now() + Duration::from_secs(secs);
+            let mut hs = Vec::new();
+            for t in 0..14u64 {
+                let (c, fs, progress) = (c.clone(), fs.clone(), ticks.clone());
+                hs.push(std::thread::spawn(move || {
+                    let mut rng = Rng(t * 7 + 1);
+                    while Instant::now() < stop {
+                        let i = rng.below(200);
+                        let name = format!("d{i}");
+                        match t % 14 {
+                            0 | 1 => {
+                                c.drop_caches();
+                                let _ = fs.lookup(root, name.as_bytes());
+                                if let Ok(a) = fs.lookup(root, name.as_bytes()) {
+                                    let _ = fs.getattr(a.ino);
+                                    let _ = fs.read(a.ino, 0, 4096);
+                                    c.forget(a.ino, 1);
+                                }
+                            }
+                            2 | 3 => {
+                                if let Ok(a) =
+                                    fs.create(root, format!("t{}", rng.below(64)).as_bytes(), 0o644)
+                                {
+                                    let _ = fs.write(a.ino, 0, &pattern(5000, t));
+                                    c.forget(a.ino, 1);
+                                }
+                            }
+                            4 => {
+                                let _ = fs.readdir(root, 0, 100);
+                            }
+                            5 => {
+                                let _ = fs.setattr(root, SetAttr::default());
+                            }
+                            6 => {
+                                let _ = c.fork_snapshot("s", &format!("f{}", rng.below(4)));
+                                let _ = c.remove_snapshot(&format!("f{}", rng.below(4)));
+                                let _ = c.merkle_root("s");
+                            }
+                            7 => {
+                                let _ = c.rename_snapshot("s", "moving");
+                                let _ = c.rename_snapshot("moving", "s");
+                            }
+                            8 => {
+                                let _ = c.promote_base("other", "base");
+                                let _ = c.rename_snapshot("base", "base2");
+                            }
+                            9 => {
+                                let _ = fs.unlink(root, format!("t{}", rng.below(64)).as_bytes());
+                            }
+                            10 => {
+                                let _ = fs.rename(
+                                    root,
+                                    name.as_bytes(),
+                                    root,
+                                    b"moved",
+                                    Default::default(),
+                                );
+                                let _ = fs.rename(
+                                    root,
+                                    b"moved",
+                                    root,
+                                    name.as_bytes(),
+                                    Default::default(),
+                                );
+                            }
+                            11 => {
+                                let _ = fs.setxattr(
+                                    root,
+                                    b"u",
+                                    &pattern(64, t),
+                                    cowfs_vfs::XattrFlags {
+                                        create: true,
+                                        replace: false,
+                                    },
+                                );
+                            }
+                            12 => {
+                                c.sync().unwrap();
+                            }
+                            _ => {
+                                let _ = c.fsync(ROOT_INO, false);
                             }
                         }
-                        2 | 3 => {
-                            if let Ok(a) =
-                                fs.create(root, format!("t{}", rng.below(64)).as_bytes(), 0o644)
-                            {
-                                let _ = fs.write(a.ino, 0, &pattern(5000, t));
-                                c.forget(a.ino, 1);
-                            }
-                        }
-                        4 => {
-                            let _ = fs.readdir(root, 0, 100);
-                        }
-                        5 => {
-                            let _ = fs.setattr(root, SetAttr::default());
-                        }
-                        6 => {
-                            let _ = c.fork_snapshot("s", &format!("f{}", rng.below(4)));
-                            let _ = c.remove_snapshot(&format!("f{}", rng.below(4)));
-                            let _ = c.merkle_root("s");
-                        }
-                        7 => {
-                            let _ = c.rename_snapshot("s", "moving");
-                            let _ = c.rename_snapshot("moving", "s");
-                        }
-                        8 => {
-                            let _ = c.promote_base("other", "base");
-                            let _ = c.rename_snapshot("base", "base2");
-                        }
-                        9 => {
-                            let _ = fs.unlink(root, format!("t{}", rng.below(64)).as_bytes());
-                        }
-                        10 => {
-                            let _ = fs.rename(
-                                root,
-                                name.as_bytes(),
-                                root,
-                                b"moved",
-                                Default::default(),
-                            );
-                            let _ = fs.rename(
-                                root,
-                                b"moved",
-                                root,
-                                name.as_bytes(),
-                                Default::default(),
-                            );
-                        }
-                        11 => {
-                            let _ = fs.setxattr(
-                                root,
-                                b"u",
-                                &pattern(64, t),
-                                cowfs_vfs::XattrFlags {
-                                    create: true,
-                                    replace: false,
-                                },
-                            );
-                        }
-                        12 => {
-                            c.sync().unwrap();
-                        }
-                        _ => {
-                            let _ = c.fsync(ROOT_INO, false);
-                        }
+                        progress.fetch_add(1, Ordering::Relaxed);
                     }
-                    progress.fetch_add(1, Ordering::Relaxed);
-                }
-            }));
-        }
-        for h in hs {
-            h.join().unwrap();
-        }
-        c.sync().unwrap();
-        c.check().unwrap();
-    });
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+            c.sync().unwrap();
+            c.check().unwrap();
+        },
+    );
     println!(
         "stress ticks: {}, worst gap between progress ticks: {gap} ms",
-        ticks_out.load(Ordering::Relaxed)
+        report_ticks.load(Ordering::Relaxed)
     );
     assert!(gap < 2000, "the worst progress gap was {gap} ms");
 }
