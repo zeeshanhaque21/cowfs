@@ -474,7 +474,9 @@ fn a5_the_framework_rejects_a_reset_whose_holders_appeared() {
     assert!(racer.seen.load(Ordering::SeqCst) > 0);
 }
 
-struct NeverCheck;
+struct NeverCheck {
+    holders: Vec<String>,
+}
 
 impl ControlHandler for NeverCheck {
     fn swap(&self, name: &str, from: &str, _: &HolderGuard<'_>) -> CtlResult<SnapshotInfo> {
@@ -489,47 +491,57 @@ impl ControlHandler for NeverCheck {
     fn remove(&self, _: &str, _: &HolderGuard<'_>) -> CtlResult<()> {
         Ok(())
     }
+
+    fn holders(&self, name: &str) -> CtlResult<Vec<ProcessInfo>> {
+        Ok(self
+            .holders
+            .iter()
+            .filter(|h| *h == name)
+            .map(|h| ProcessInfo {
+                pid: 3,
+                command: h.clone(),
+                holds: vec![],
+            })
+            .collect())
+    }
 }
 
 #[test]
 fn a5_the_framework_alone_refuses_a_handler_that_never_checks() {
     let _w = Watchdog::start(60);
-    let fx = start_arc(Arc::new(NeverCheck), ServerOptions::default());
     // A handler that ignores the guard is non-conformant, but the framework still refuses a
     // snapshot that has a holder before the handler ever runs.
-    let fx2 = start_with(
-        stub().with_process(
-            "held",
-            ProcessInfo {
-                pid: 3,
-                command: "x".into(),
-                holds: vec![],
-            },
-        ),
+    let fx = start_arc(
+        Arc::new(NeverCheck {
+            holders: vec!["held".into()],
+        }),
         ServerOptions::default(),
     );
-    let mut c = Client::connect(&fx2.path).unwrap();
-    c.call(Request::SnapshotCreate(SnapshotCreate {
-        name: "held".into(),
-        from: None,
-    }))
-    .unwrap();
+    let mut c = Client::connect(&fx.path).unwrap();
     let err = c
         .call(Request::SnapshotReset(SnapshotReset {
             name: "held".into(),
-            from: "held2".into(),
+            from: "other".into(),
             expect_no_holders: true,
         }))
         .unwrap_err();
-    assert_eq!(code(err), ErrorCode::Busy);
+    assert_eq!(code(err), ErrorCode::Busy, "reset");
     let err = c
         .call(Request::SnapshotRm(SnapshotRm {
             name: "held".into(),
             expect_no_holders: true,
         }))
         .unwrap_err();
-    assert_eq!(code(err), ErrorCode::Busy);
-    drop(fx);
+    assert_eq!(code(err), ErrorCode::Busy, "rm");
+    assert!(
+        c.call(Request::SnapshotReset(SnapshotReset {
+            name: "free".into(),
+            from: "other".into(),
+            expect_no_holders: true,
+        }))
+        .is_ok(),
+        "a snapshot with no holder still reaches the handler"
+    );
 }
 
 #[test]
