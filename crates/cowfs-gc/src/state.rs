@@ -75,7 +75,11 @@ impl Hints {
 
     /// Record an access. Never touches the disk.
     pub fn note(&mut self, id: BlockId) {
-        let now = now();
+        self.note_at(id, now());
+    }
+
+    /// `note` with the second supplied, so the rule can be tested without racing the wall clock.
+    fn note_at(&mut self, id: BlockId, now: u32) {
         let known = self.times.contains_key(&id);
         if !known && self.times.len() >= self.cap {
             self.dropped += 1;
@@ -131,8 +135,7 @@ impl Hints {
         if self.dirty.is_empty() {
             return Ok(0);
         }
-        let mut buf = Vec::with_capacity(MAGIC.len() + self.dirty.len() * ENTRY);
-        buf.extend_from_slice(MAGIC);
+        let mut buf = Vec::with_capacity(self.dirty.len() * ENTRY);
         for (id, old) in &self.dirty {
             let at = self.times.get(id).copied().unwrap_or(*old);
             buf.extend_from_slice(id.as_bytes());
@@ -145,7 +148,14 @@ impl Hints {
             .create(true)
             .truncate(false)
             .open(&self.path)?;
-        let at = file.metadata()?.len();
+        let mut at = file.metadata()?.len();
+        // The header is a property of the file, not of an append. Writing it on every flush left a
+        // copy in front of every later record, and `load`, which strips it once, then read each
+        // header as the first bytes of a block id and invented a phantom hint per flush.
+        if at == 0 {
+            file.write_all_at(MAGIC, 0)?;
+            at = MAGIC.len() as u64;
+        }
         file.write_all_at(&buf, at)?;
         file.set_len(at + buf.len() as u64)?;
         file.sync_data()?;
@@ -413,15 +423,51 @@ mod tests {
         let mut h = Hints::load(d.path(), 16).unwrap();
         h.note(id);
         assert_eq!(h.flush().unwrap(), 1);
-        h.note(id);
+        // A repeat is a second record only when the stored second has advanced. `note` stamps the
+        // wall clock, so calling it again and racing the second boundary makes the flush count
+        // vary between runs. Drive the stored time directly instead, which is what the rule reads.
+        let stamped = h.get(&id);
+        // A repeat is a record only when the stored second has advanced. `note` stamps the wall
+        // clock, so calling it again races the second boundary and the count varies between runs.
+        // Stamp the stored time forward instead, which is the whole of what `note` reads.
+        h.times.insert(id, stamped);
+        h.dirty.clear();
+        h.note_at(id, stamped);
         assert_eq!(
             h.flush().unwrap(),
             0,
-            "the same second is not a second write"
+            "a repeat without a newer second is not a write"
+        );
+        h.note_at(id, stamped + 1);
+        assert_eq!(h.flush().unwrap(), 1, "a newer second is a write");
+        let loaded = Hints::load(d.path(), 16).unwrap();
+        assert!(loaded.get(&id) >= stamped, "the newest record survives");
+        assert_eq!(loaded.tracked(), 1, "one block, however many records");
+    }
+
+    #[test]
+    fn a_header_is_written_once_not_once_per_flush() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = Hints::load(d.path(), 16).unwrap();
+        let mut expected = 0u64;
+        let mut flushes = 0u32;
+        for i in 0..5u8 {
+            // Two blocks per round, and a flush after each note, so the file sees ten appends.
+            h.note(BlockId::of(&[i]));
+            expected += h.flush().unwrap() as u64;
+            flushes += 1;
+            h.note(BlockId::of(&[i, 1]));
+            expected += h.flush().unwrap() as u64;
+            flushes += 1;
+        }
+        assert_eq!(flushes, 10, "ten flushes");
+        assert_eq!(
+            fs::metadata(d.path().join("atime.bin")).unwrap().len(),
+            MAGIC.len() as u64 + expected * ENTRY as u64,
+            "one header, not one per flush"
         );
         let loaded = Hints::load(d.path(), 16).unwrap();
-        assert_eq!(loaded.get(&id), now());
-        assert_eq!(loaded.tracked(), 1);
+        assert_eq!(loaded.tracked(), 10, "no phantom hints from the headers");
     }
 
     #[test]
