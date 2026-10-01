@@ -118,6 +118,14 @@ FOCUSED = {
     "b03_no_rollback": ["--test", "critic2b", "a_step_three_refusal_removes_the_intent_and_staging_snapshot"],
     "b09_transient_poisons": ["--test", "critic2b", "a_single_transient_failure_is_retried_in_the_same_flush"],
 }
+RECHECK = {
+    "m10_fsync_no_meta_sync": [["--test", "flush_boundary"], ["--test", "critic2b"]],
+    "n02_swap_intent_no_fsync": [["--test", "swap"], ["--test", "critic2b"]],
+    "n04_virt_mark_no_dir_fsync": [["--test", "names_ino"], ["--test", "critic2b"]],
+    "n15_staging_name_visible": [["--test", "swap"], ["--test", "critic2b"], ["--test", "names_ino"]],
+    "n16_name_rule_allows_staging": [["--test", "names_ino"], ["--test", "critic2b"], ["--test", "swap"]],
+    "b11_load_node_upserts": [["--test", "caches"], ["--test", "stress"], ["--test", "critic2b"]],
+}
 
 
 def seed_target(name):
@@ -140,7 +148,7 @@ def run(name):
         p.write_text(orig.replace(old, new))
         env = dict(os.environ, CARGO_TARGET_DIR=str(tgt))
         with open(log_path, "w") as log:
-            for t in [FOCUSED[name]] if name in FOCUSED else ORDER:
+            for t in [FOCUSED[name]] if name in FOCUSED else RECHECK.get(name, ORDER):
                 pr = subprocess.Popen(
                     ["rtk", "cargo", "test", "-j4", "-p", "cowfs-core"] + t,
                     cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,

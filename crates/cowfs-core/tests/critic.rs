@@ -60,7 +60,14 @@ fn fsx() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
     let bounds: [u64; 3] = [16 << 10, 64 << 10, 256 << 10];
     let mut counts = [0usize; 6];
+    let started = Instant::now();
     for i in 0..ops {
+        if i % 1000 == 0 {
+            eprintln!(
+                "fsx seed {seed}: progress {i}/{ops}, elapsed {:?}",
+                started.elapsed()
+            );
+        }
         let k = rng.below(100);
         let base = bounds[rng.below(3) as usize];
         let jitter = |rng: &mut Rng| -> i64 {
