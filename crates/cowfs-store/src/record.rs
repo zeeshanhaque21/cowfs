@@ -1,7 +1,9 @@
 //! Record format and per-block compression. See `docs/v1-store.md`.
 
 use std::cell::RefCell;
+use std::fs::File;
 use std::io;
+use std::os::unix::fs::FileExt;
 
 use zstd::bulk::{Compressor, Decompressor};
 
@@ -29,9 +31,40 @@ pub(crate) struct Header {
     pub crc: u32,
 }
 
+/// The length a record at `pos` claims, if its header still says one.
+pub(crate) fn claimed_total_at(file: &File, pos: u64, end: u64) -> io::Result<Option<u64>> {
+    if pos + HEADER_LEN as u64 > end {
+        return Ok(None);
+    }
+    let mut raw = [0u8; HEADER_LEN];
+    file.read_exact_at(&mut raw, pos)?;
+    Ok(Header::claimed_total(&raw))
+}
+
 impl Header {
     pub(crate) fn total_len(&self) -> u64 {
         HEADER_LEN as u64 + u64::from(self.slen)
+    }
+
+    /// The length a header claims, ignoring its checksums, when the magic and the codec rule hold.
+    ///
+    /// A damaged header can still say how long its record was, and those bytes belong to that
+    /// record, so a scanner must not index anything it finds inside them.
+    pub(crate) fn claimed_total(buf: &[u8; HEADER_LEN]) -> Option<u64> {
+        if buf[..4] != RECORD_MAGIC || buf[5..8] != [0, 0, 0] {
+            return None;
+        }
+        let ulen = u32_at(buf, 8);
+        let slen = u32_at(buf, 12);
+        if ulen as usize > MAX_BLOCK_LEN {
+            return None;
+        }
+        let fits = match buf[4] {
+            0 => slen == ulen,
+            1 => slen < ulen,
+            _ => return None,
+        };
+        fits.then(|| HEADER_LEN as u64 + u64::from(slen))
     }
 
     /// Header-only checks: magic, header checksum, padding, codec and length rules.

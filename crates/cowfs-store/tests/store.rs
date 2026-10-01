@@ -334,7 +334,7 @@ fn second_open_of_same_dir_is_refused() {
     let _a = open(dir.path());
     assert!(matches!(
         Store::open(dir.path(), opts()),
-        Err(Error::Locked(_))
+        Err(Error::Locked { .. })
     ));
 }
 
