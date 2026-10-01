@@ -157,10 +157,14 @@ pub(crate) fn find(
     best
 }
 
-/// True when an accepted entry covers the whole of a pack. A pending one does not count: the loss
-/// is still to be reported.
+/// True when an accepted entry covers the whole of a pack that is no longer there. A pending entry
+/// does not count: the loss is still to be reported.
 pub(crate) fn covers_pack(entries: &[Entry], pack: u32) -> bool {
     entries.iter().rev().any(|e| {
-        e.pack == pack && e.state.accepted() && e.offset == WHOLE_PACK.0 && e.len == WHOLE_PACK.1
+        e.pack == pack
+            && e.state.accepted()
+            && e.offset == WHOLE_PACK.0
+            && e.len == WHOLE_PACK.1
+            && e.nonce == 0
     })
 }

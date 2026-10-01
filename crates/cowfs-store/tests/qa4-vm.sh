@@ -4,11 +4,12 @@ SOURCE=$1
 REV=$2
 WORK=/home/zeeshanhaque/cowfs-spike3/round4-$REV
 if test -e "$WORK"; then
-    echo "Refusing existing VM QA directory: $WORK"
-    exit 1
+    test "${COWFS_QA4_RESUME:-0}" = 1
+    git -C "$SOURCE" show "$REV:crates/cowfs-store/src/store.rs" | cmp - "$WORK/source/crates/cowfs-store/src/store.rs"
+else
+    mkdir -p "$WORK/source" "$WORK/build" "$WORK/logs"
+    git -C "$SOURCE" archive "$REV" | tar -x -C "$WORK/source"
 fi
-mkdir -p "$WORK/source" "$WORK/build" "$WORK/logs"
-git -C "$SOURCE" archive "$REV" | tar -x -C "$WORK/source"
 cd "$WORK/source"
 export CARGO_TARGET_DIR="$WORK/build"
 check() {
@@ -25,6 +26,7 @@ check() {
     fi
 }
 check sample cargo test -j4 -p cowfs-store --features fault-injection --test round4 cut_crash_must_keep_pending_loss
+check components flock -w 120 "$RUSTUP_HOME/cowfs-components.lock" rustup component add rustfmt clippy
 check fmt cargo fmt --all --check
 check clippy cargo clippy -j4 --workspace --all-targets --all-features -- -D warnings
 check workspace cargo test -j4 --workspace

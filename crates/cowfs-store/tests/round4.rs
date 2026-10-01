@@ -18,7 +18,7 @@ fn recovery_child() {
     }
     let result = Store::open(&p, o);
     if std::env::var_os("C7D_LOCKED").is_some() {
-        assert!(matches!(result, Err(Error::Locked(_))));
+        assert!(matches!(result, Err(Error::Locked { .. })));
     } else {
         let s = result.unwrap();
         if std::env::var_os("C7D_ACK").is_some() {
@@ -211,7 +211,7 @@ fn a_second_live_store_and_process_are_refused() {
     let start = Instant::now();
     assert!(matches!(
         Store::open(dir.path(), opts()),
-        Err(Error::Locked(_))
+        Err(Error::Locked { .. })
     ));
     assert!(
         start.elapsed() < Duration::from_millis(350),
