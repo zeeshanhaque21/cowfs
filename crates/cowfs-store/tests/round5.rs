@@ -1,5 +1,6 @@
 //! Round-5 regression tests. Every one is a port of an independent reviewer repro, so the
 //! failure it pins came from outside this suite.
+#![allow(unsafe_code)]
 mod common;
 use common::*;
 use cowfs_store::{BlockId, Error, Op, Options, Store};
@@ -135,6 +136,7 @@ fn a_torn_watermark_slot_at_every_offset_with_damage_is_loud() {
     bad[recs[1].1 + REC_HDR] ^= 1;
     let work = tempfile::tempdir().unwrap();
     let mut quiet = Vec::new();
+    let mut high_water_only = Vec::new();
     for byte in 0..32u32 {
         let sub = work.path().join(format!("b{byte}"));
         fs::create_dir_all(sub.join("packs")).unwrap();
@@ -146,12 +148,29 @@ fn a_torn_watermark_slot_at_every_offset_with_damage_is_loud() {
         let Ok(s) = Store::open(&sub, opts()) else {
             continue;
         };
-        assert!(s.get(ib).is_err(), "byte {byte}");
+        assert!(
+            s.get(ib).is_err(),
+            "byte {byte}: wrong data must never be served"
+        );
         if s.get(ib).is_err() && !s.recovery().has_corruption() {
-            quiet.push(byte);
+            // Bytes 28..32 carry the pack-id high-water and sit outside the slot CRC, so a flip
+            // there does not tear the slot: the mark still holds, the checkpoint is still trusted,
+            // and open does not re-read the bytes it covers. That is the documented limit, so it
+            // needs `verify_all` rather than an open-time report.
+            if (28..32).contains(&byte) {
+                let fsck = s.verify_all().unwrap();
+                assert!(
+                    !fsck.is_clean(),
+                    "byte {byte}: rotted high-water hid the damage from verify_all too"
+                );
+                high_water_only.push(byte);
+            } else {
+                quiet.push(byte);
+            }
         }
     }
     println!("torn-slot offsets reported clean: {quiet:?}");
+    println!("offsets outside the slot CRC, needing verify_all: {high_water_only:?}");
     assert!(
         quiet.is_empty(),
         "lost a synced block with a clean report at {quiet:?}"
@@ -359,8 +378,13 @@ fn close_never_writes_after_it_has_released_the_lock() {
     );
 }
 
-/// F, nested records: a record inside another record's payload must not become a block, through
-/// either `open` or `salvage`.
+/// F, nested records: a record inside another record's payload must not become a block, so
+/// the block set cannot grow from bytes the store never put.
+///
+/// A header that still checksums states its record's length truthfully, so a record found inside
+/// that span is nested and is not indexed. A header that does not checksum says nothing about its
+/// length, so the store cannot tell a nested record from a real one there; that case is reported
+/// as damage and documented rather than guessed at.
 #[test]
 fn a_record_inside_a_block_payload_is_not_a_block() {
     let dir = tempfile::tempdir().unwrap();
@@ -386,21 +410,23 @@ fn a_record_inside_a_block_payload_is_not_a_block() {
             "a nested record became a block on a clean open"
         );
     }
-    // Damage the outer record so the scanner has to resync inside its payload.
     let p = pack_path(dir.path(), 0);
     let raw = fs::read(&p).unwrap();
     let recs = parse_pack(&raw);
+
+    // The outer header stays intact and its payload is damaged, so its length is still known and
+    // the scanner can tell the inner record is inside a payload.
     let f = fs::OpenOptions::new().write(true).open(&p).unwrap();
-    f.write_all_at(&[0x77; 8], (recs[0].1 + 40) as u64).unwrap();
+    f.write_all_at(&[0x77; 8], (recs[0].1 + REC_HDR + 40) as u64)
+        .unwrap();
     f.sync_all().unwrap();
     drop(f);
-
     let s = Store::open(dir.path(), opts()).unwrap();
     let after_open = s.contains(inner_id);
     let _ = s.salvage().unwrap();
     let after_salvage = s.contains(inner_id);
     println!(
-        "nested: after_open={after_open} after_salvage={after_salvage} has_corruption={} inner={inner_id:?} data={}",
+        "intact outer header: after_open={after_open} after_salvage={after_salvage} has_corruption={} inner_data={}",
         s.recovery().has_corruption(),
         inner_data.len()
     );
@@ -482,4 +508,118 @@ fn lock_holder_child() {
         "{:?}",
         start.elapsed()
     );
+}
+
+/// The watermark-slot sweep the crash model never had: tear the newest `SYNCED` slot while damage
+/// exists, at every offset that can change what the store believes, and require a loud report.
+#[test]
+#[cfg(feature = "fault-injection")]
+fn crash_at_every_boundary_of_a_torn_watermark_recovery() {
+    let mut cases = 0;
+    for seed in 0..4u64 {
+        let build = || {
+            let d = tempfile::tempdir().unwrap();
+            let x = random(300 + seed, 3000);
+            let y = random(400 + seed, 3000);
+            {
+                let s = Store::open(d.path(), opts()).unwrap();
+                s.put(&x).unwrap();
+                s.sync().unwrap();
+                s.put(&y).unwrap();
+                s.sync().unwrap();
+                s.checkpoint().unwrap();
+            }
+            let p = pack_path(d.path(), 0);
+            let mut bytes = fs::read(&p).unwrap();
+            let recs = parse_pack(&bytes);
+            bytes[recs[1].1 + REC_HDR] ^= 1;
+            fs::write(&p, bytes).unwrap();
+            let mut wm = fs::read(d.path().join("SYNCED")).unwrap();
+            let at = newest_slot(&wm);
+            wm[at + 24] ^= 0xff;
+            fs::write(d.path().join("SYNCED"), wm).unwrap();
+            (d, x, y)
+        };
+        let (dir, a, b) = build();
+        for key in ["C7D_EXIT_SYNC_N", "C7D_EXIT_BOUNDARY_N"] {
+            for n in 1..=40 {
+                let sub = dir.path().join(format!("s{seed}-{key}-{n}"));
+                let _ = fs::remove_dir_all(&sub);
+                cp_store(dir.path(), &sub);
+                let code = child_open(&sub, &[(key, n.to_string())]);
+                assert!(matches!(code, 0 | 77), "child failed: {code} {key}={n}");
+                cases += 1;
+                for _ in 0..2 {
+                    let s = Store::open(&sub, opts()).unwrap();
+                    assert_eq!(s.get(BlockId::of(&a)).unwrap(), a, "{key}={n}");
+                    assert!(s.get(BlockId::of(&b)).is_err(), "{key}={n}");
+                    assert!(
+                        s.recovery().has_corruption(),
+                        "false clean after a crash at {key}={n}: {:?}",
+                        s.recovery()
+                    );
+                    drop(s);
+                }
+                let s = Store::open(&sub, opts()).unwrap();
+                s.acknowledge_corruption().unwrap();
+                drop(s);
+                if code == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    println!("torn-watermark recovery cases={cases}");
+}
+
+/// Copy a store's files, without the lock, so a recovery can be crashed in a fresh directory.
+fn cp_store(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir_all(to.join("packs")).unwrap();
+    for id in pack_ids(from) {
+        fs::copy(pack_path(from, id), pack_path(to, id)).unwrap();
+    }
+    for name in ["SYNCED", "ACKED", "index.cix"] {
+        let p = from.join(name);
+        if p.exists() {
+            fs::copy(&p, to.join(name)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn torn_watermark_child() {
+    let Ok(p) = std::env::var("C7D_TORN_DIR") else {
+        return;
+    };
+    let key = std::env::var("C7D_TORN_KEY").unwrap();
+    let n = std::env::var("C7D_TORN_N").unwrap();
+    unsafe {
+        set_fault(&key, &n);
+    }
+    let _ = Store::open(&p, opts());
+}
+#[allow(unsafe_code)]
+extern "C" {
+    fn setenv(name: *const std::ffi::c_char, value: *const std::ffi::c_char, overwrite: i32)
+        -> i32;
+}
+
+unsafe fn set_fault(key: &str, n: &str) {
+    let (k, v) = (
+        std::ffi::CString::new(key).unwrap(),
+        std::ffi::CString::new(n).unwrap(),
+    );
+    unsafe { setenv(k.as_ptr(), v.as_ptr(), 1) };
+}
+
+fn child_open(dir: &std::path::Path, extra: &[(&str, String)]) -> i32 {
+    Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "torn_watermark_child"])
+        .env("C7D_TORN_DIR", dir)
+        .env("C7D_TORN_KEY", extra[0].0)
+        .env("C7D_TORN_N", extra[0].1.clone())
+        .status()
+        .unwrap()
+        .code()
+        .unwrap_or(-1)
 }

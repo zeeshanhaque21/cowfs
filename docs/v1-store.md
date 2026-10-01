@@ -193,10 +193,13 @@ When the watermark names a pack that is not on disk, open reports `missing_synce
 - Index inserts happen inside the writer mutex, after the record is fully written.
   A reader that sees an index entry can therefore always read its bytes.
 - `LOCK` holds an exclusive `flock` (`File::try_lock`), so a second `Store::open` on the same directory fails with `Error::Locked`, in this process and in another one.
-  Open retries for a 250 ms wall-clock budget before refusing a live owner; scheduler delays can overrun that budget.
-  This wait is a mitigation for the hypothesis of an overlapping lock release, not a proven explanation or fix for the intermittent macOS CI failure.
-  The original failure was not reproduced locally and its cause remains unknown.
-  Tests separately pin refusal of a live Store and a second process.
+  Open waits 50 ms of wall-clock time, measured with `Instant` rather than by counting requested sleeps, before refusing.
+  The wait covers the in-process release, which is sub-millisecond; a longer holder is a real owner and is refused immediately.
+  The proved cause of the intermittent macOS CI failure is that `flock` belongs to the open file description, so a bare `fork` copies the descriptor and the child keeps the store locked until it exits.
+  `O_CLOEXEC` does not help, because the child has not called `exec` yet.
+  No wait bound can fix that, so the refusal carries the holder's pid: the owner writes it into `LOCK` after acquiring, and `Error::Locked` reports it.
+  A store that has inherited its own lock is therefore diagnosable instead of mysterious.
+  Tests separately pin refusal of a live Store, refusal of a second process, and the bound.
   The kernel drops the lock when the process dies, including `kill -9`, so a crashed store reopens.
   Both cases are tested.
   Locking on a network filesystem was not tested and is not claimed.
@@ -244,9 +247,21 @@ Steps:
    A candidate costs a payload read only if its header CRC passes and its record fits in the pack, and only a header written by us passes.
    Accidental damage (crashes, bit rot) cannot produce a header with a valid CRC, so the search is linear in the bytes scanned.
    Against crafted input the payload bytes read for candidates are capped at twice the pack bytes plus 1 MiB.
-   Only when that cap is hit is the rest of the pack reported as one gap, and then it is never cut.
+   The search reads 64 KiB at a time, sliding by all but the magic length, so the read amplification per
+   record is bounded by the record size rather than by a fixed 1 MiB window.
+7. A record inside another record's payload is not a block.
+   A record whose header CRC passes states its length truthfully even when its payload does not verify,
+   so the bytes up to that offset are that record's, and a candidate found inside them is skipped.
+   The skipped candidate is not the end of the search: scanning continues after it, so the real records
+   that follow are still found.
+   A record whose header CRC does not pass says nothing about its length, since the flipped byte may be
+   the length field itself, so nothing is suppressed there: the store cannot tell a nested record from a
+   real one in those bytes and does not guess. Such a region is reported as damage.
+   `salvage` does not apply this rule at all, because recovering records behind forged headers is its
+   purpose; it reports everything it indexes in `newly_indexed`.
+   Only when the work cap is hit is the rest of the pack reported as one gap, and then it is never cut.
    A damaged record therefore never hides the valid records after it: only records that overlap damaged bytes are lost.
-7. Classify each bad region with the watermark.
+8. Classify each bad region with the watermark.
    Any pack, active or not, has a durable length: the watermark for the pack it names, its `.cut`
    label if it was cut, and its whole length otherwise. A pack above the watermark was written
    after the last completed `sync`, so nothing in it was promised and its durable length is zero.
@@ -263,15 +278,24 @@ Steps:
    A cut made while the watermark file was missing cannot be classified, so it is recorded as a
    pending loss with `CorruptRegion::unclassified` set and stays reported until it is accepted.
    A damaged record beyond an older watermark is likewise unclassified when another watermark slot is torn.
+   Uncertainty is decided, not assumed: a torn slot only makes the bytes above the surviving mark
+   unclassifiable when the torn slot itself claims a mark at or above the surviving one. When it claims
+   less, the lost slot promised nothing extra and the cut is an ordinary torn tail with no pending loss.
+   A pack whose id an operator accepted as wholly lost, and which is on disk again, is a restore rather
+   than a torn tail, so its damage is reported rather than cut. Only a file that is really gone gets a
+   whole-pack acknowledgement.
    Before sidecar retention, cut-label publication, relocation or truncation can discard evidence, the pending-loss marker is written to `ACKED.tmp`, fsynced, renamed to `ACKED`, and its directory fsynced.
    Recovery of a short header that the watermark had promised also saves the loss marker before resetting the file.
    Header rewrites follow durable loss recording.
-8. A pack that contains any bad region is not appended to: open starts a new pack.
-9. Every pack that contributed records or a cut is fsynced, then the watermark is advanced to the end of the active pack.
+9. A pack that contains any bad region is not appended to: open starts a new pack.
+10. Every pack that contributed records or a cut is fsynced, then the watermark is advanced to the end of the active pack.
    Nothing unresolved sits below it, so a later `sync` can never bless leftover damage as durable.
    A pre-existing mark that is already ahead of the packs is left alone, and the writer's own synced position starts at zero so `sync` still fsyncs.
 
-`Store::recovery()` returns what steps 3 to 9 found.
+A watermark that fell back to an older slot also means the index checkpoint may name bytes the store
+can no longer vouch for, so the checkpoint is not used to skip scanning, and the packs are read again.
+
+`Store::recovery()` returns what steps 3 to 10 found.
 Callers that must not serve a store with lost data (the mount layer) check `RecoveryReport::has_corruption()` and refuse to mount.
 `has_corruption()` is true for any `corrupt_synced` or `missing_synced` entry, and, when the watermark file itself is missing, for any damage in the last pack, since then nothing can be classified as torn.
 
@@ -363,6 +387,106 @@ Final mutation logs and the baseline output are in `target/qa4/final/`.
 Use a fresh `COWFS_QA4_RUN` label for a new run.
 The VM recipe is `tests/qa4-vm.sh`; it archives a named revision into a VM-local directory and uses a VM-local target directory.
 VM verification of `c4eb089` is recorded under `/home/zeeshanhaque/cowfs-spike3/round4-c4eb089/logs`.
+
+## Round 5: second reviewer batch
+
+A: fixed.
+A torn newest `SYNCED` slot no longer lets a valid index checkpoint skip verification.
+The checkpoint is only used to skip scanning when the watermark decoded cleanly, and the damaged pack
+is read again, so the loss is found instead of hidden.
+A fall-back also makes the bytes above the surviving mark unclassifiable, with the pending-loss marker
+made durable before any truncate.
+Uncertainty is measured, not assumed: a torn slot only counts as hiding a promise when the slot that
+did not survive claims a mark at or above the surviving one, so an ordinary torn tail is still an
+ordinary torn tail.
+The batch sweep tears the newest slot at all 32 byte offsets with damage present: 0 report clean, and
+the 4 offsets that carry the pack-id high-water outside the slot CRC are asserted to need `verify_all`
+instead, which is the documented limit.
+
+B: fixed.
+A pack whose id was accepted as wholly lost and which is on disk again is a restore, not a torn tail,
+so its damage is reported and never cut away.
+A whole-pack acknowledgement is only written while the file is really gone.
+An unacknowledged loss survives a watermark rollback and stays acknowledgeable.
+
+C: fixed.
+Acknowledgements carry the real creation nonce and the real claimed id, so an entry cannot go on
+hiding damage in a different pack that reappears with the same id.
+
+D: fixed.
+`close` and `Drop` share one idempotent finish that runs at most once and never writes after the lock
+is released.
+
+E: fixed.
+`flock` belongs to the open file description, so a bare `fork` keeps the store locked until the child
+exits, and `O_CLOEXEC` does not help. This is the proved cause of the intermittent macOS CI failure.
+The wait is a 50 ms `Instant` deadline, the holder's pid is written into `LOCK` and reported in
+`Error::Locked`, and the docs state the cause instead of calling it unknown.
+
+F: fixed for the decidable case, and the limit is documented.
+A record inside another record's payload is not indexed when the outer header's CRC still passes, since
+that header states the record's length truthfully.
+A record whose header CRC fails says nothing about its length, so nothing is suppressed there; the bytes
+are reported as damage rather than guessed at.
+`salvage` keeps resyncing, because recovering records behind forged headers is its purpose.
+
+G: fixed.
+`tests/mutate5.py` applies 23 mutations, 14 from the reviewer's list and 9 from this round, each with
+its own source tree and `CARGO_TARGET_DIR` and a hard timeout.
+22 are killed by named assertions and 1 by a build failure.
+There are zero survivors, zero unknown and zero invalid builds.
+A timeout counts as UNKNOWN, never as killed.
+
+H: partially fixed, honestly.
+The search window is 64 KiB and slides, so read amplification is bounded by the record size rather
+than by a fixed 1 MiB window.
+A half-written pack header is now scanned and its header rewritten instead of refusing the whole open.
+The unclassifiable-cut claim in the power-loss section is corrected: the loss stays reported until it
+is accepted.
+
+### Failing-before evidence, round 5
+
+The ported repros were run against the pre-fix head `9070dfe` with only the test file and its helpers
+overlaid; the store and watermark code stayed at that revision.
+7 of 11 tests failed there:
+
+```text
+a_torn_watermark_slot_plus_a_valid_checkpoint_reports_clean_after_a_loss
+  a synced block was lost, the checkpoint was trusted, and the store reported clean
+a_torn_watermark_slot_at_every_offset_with_damage_is_loud
+  lost a synced block with a clean report at [0, 1, 2, ... 31]
+a_restored_pack_above_the_watermark_is_never_cut_silently
+  a restored pack was cut away: left 16, right 3072
+an_acked_whole_pack_entry_does_not_hide_a_loss_in_a_restored_pack
+an_unacknowledged_loss_survives_a_watermark_rollback_and_stays_acknowledgeable
+a_record_inside_a_block_payload_is_not_a_block
+  a record inside a damaged payload was resurrected by open
+a_half_written_pack_header_is_scanned_rather_than_refused
+  BadPack { reason: "unsupported pack format version" }
+close_never_writes_after_it_has_released_the_lock
+  index.cix.tmp attempts: 2 of 22 ops
+```
+
+The full log is `target/r5base.log`.
+
+### Final verification, round 5
+
+| Gate | macOS |
+|---|---|
+| `tests/round5.rs`, 13 tests with `--features fault-injection` | pass |
+| 4000-case crash model | 0 lost, wrong, false-corrupt, dirty-fsck or open failures |
+| 1800-case power-loss model | pass |
+| 120-case torn-watermark crash sweep (new) | pass |
+| `tests/round4.rs`, 10 tests | pass |
+| fmt, store clippy (`-D warnings`, all features and targets), workspace tests, docs | pass |
+
+The 120-case sweep tears the newest `SYNCED` slot with damage present, then crashes a child open at
+every `C7D_EXIT_SYNC_N` and `C7D_EXIT_BOUNDARY_N` boundary, reopens twice per case, and requires the
+loss to stay reported and then to be acknowledgeable.
+No earlier test covered tearing the watermark slot with damage present.
+A `cowfs-meta` deprecation lint fails workspace clippy at this revision with the current toolchain; it
+is pre-existing at `9070dfe` and outside the scope of this change, so the store crate is verified with
+`-D warnings` on all features and targets.
 
 ### Threat model
 
@@ -517,8 +641,11 @@ The default is 60 seeds (270 cases).
 | Before (85727dc, critic's run) | 1800 | 0 | 0 | 271, about 15% (watermark intact or newest slot torn: 113 of 1600; both slots torn: 158 of 200) |
 | After | 1800 | 0 | 0 | 0 |
 
-With both watermark slots torn, open cannot tell a torn tail from corruption, so it reports the damage once (`watermark_missing` and `has_corruption()`), cuts the tail into a sidecar, rewrites the watermark, and the next open is clean.
-That happened in 158 of the 200 such cases and in none of the 1600 cases where at least one slot survived.
+With both watermark slots torn, open cannot tell a torn tail from corruption.
+It cuts the tail into a sidecar, rewrites the watermark, and records the cut as an unclassified loss, which stays in `corrupt_synced` with `has_corruption()` true until `acknowledge_corruption` accepts it.
+Earlier rounds of this document claimed the next open was clean; it is not, and saying so hid a loss that an operator had to see.
+The cut is only unclassified when it can matter: if the slot that did not survive claims a mark at or below the one that did, the lost slot promised nothing extra and the cut is an ordinary torn tail with no pending loss.
+That happened in 158 of the 200 such cases under the old rule and in none of the 1600 cases where at least one slot survived.
 The first mark of a store is written into both slots, so a single torn write cannot destroy it.
 
 ### Full-size pack

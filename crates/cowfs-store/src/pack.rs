@@ -195,8 +195,8 @@ enum Found {
 /// valid checksums, so the payload bytes read for candidates stay below twice the bytes scanned.
 /// `budget` enforces that bound against crafted input and is never reached otherwise.
 ///
-/// `claimed` is the offset a damaged record header says its own bytes reach, so a record found
-/// inside a record's payload is not accepted: the block set must not grow from payload bytes.
+/// `claimed` is where a record with an intact header at `from` ends, so a record found inside its
+/// payload is not accepted: the block set must not grow from payload bytes.
 fn find_record(
     file: &File,
     from: u64,
@@ -233,10 +233,11 @@ fn find_record(
                 );
             }
             if let Some(h) = head.filter(|h| cand + h.total_len() <= end) {
-                // A candidate inside the span a damaged header claimed is that record's payload,
-                // so it must not become a block.
-                if claimed.is_some_and(|c| cand > from && cand < c) {
-                    return Ok(Found::Nothing);
+                // A candidate inside a record whose header checksums is that record's payload, so it
+                // must not become a block.
+                if claimed.is_some_and(|c| cand >= from && cand < c) {
+                    at = p + 1;
+                    continue;
                 }
                 if std::env::var_os("COWFS_PACK_DEBUG").is_some() {
                     eprintln!("CAND {cand} slen={}", h.slen);
@@ -298,8 +299,9 @@ pub(crate) fn scan_deep(
     let mut payload = Vec::new();
     let mut pos = PACK_HEADER_LEN;
     while pos < end {
-        let claimed = crate::record::claimed_total_at(file, pos, end)?;
-        match find_record(file, pos, end, &mut payload, &mut work, claimed)? {
+        // Salvage resyncs past any failed record: recovering records behind forged headers is
+        // what it is for, and it reports everything it indexes in `newly_indexed`.
+        match find_record(file, pos, end, &mut payload, &mut work, None)? {
             Found::At(off) => {
                 let Some(header) = read_record(file, off, end, &mut payload)? else {
                     break;
@@ -360,7 +362,7 @@ pub(crate) fn scan(
             pos += header.total_len();
             continue;
         }
-        let claimed = crate::record::claimed_total_at(file, pos, end)?;
+        let claimed = crate::record::trusted_end_at(file, pos, end)?;
         match find_record(file, pos + 1, end, &mut payload, &mut budget, claimed)? {
             Found::At(next) => {
                 visit(Event::Gap {

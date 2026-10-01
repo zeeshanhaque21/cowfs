@@ -467,18 +467,17 @@ impl Store {
         let mark = wm.mark();
         let mut acked = ack::load(&dir);
         let table = ack::Table::new(&acked);
-        // Packs the store has already told an operator about, so a file that reappears at one of
-        // those ids is a restore and not a torn tail.
-        let known: HashSet<u32> = acked.iter().map(|e| e.pack).collect();
-        // Nothing may be reported as missing that was never reserved, so the listing stops below
-        // the highest id the store knows about.
-        let hi_limit = acked
+        // Packs an operator accepted as wholly lost, so a file that reappears at one of those ids
+        // is a restore rather than a torn tail. A pending entry does not count: the loss is still
+        // being reported, and that report is what makes a restore visible.
+        let known: HashSet<u32> = acked
             .iter()
+            .filter(|e| {
+                e.state.accepted() && e.offset == ack::WHOLE_PACK.0 && e.len == ack::WHOLE_PACK.1
+            })
             .map(|e| e.pack)
-            .max()
-            .map_or(u32::MAX, |p| p.saturating_add(1))
-            .max(wm.next_id())
-            .max(last.map_or(0, |l| l.saturating_add(1)));
+            .collect();
+        // Nothing is reported missing above the highest id that a file or an acceptance names.
         let mut recovery = RecoveryReport {
             watermark_missing: mark.is_none() && !ids.is_empty(),
             ..RecoveryReport::default()
@@ -508,10 +507,6 @@ impl Store {
                 None if Some(id) == active => PACK_HEADER_LEN,
                 None => sealed.unwrap_or(u64::MAX),
             }
-            .max(match mark {
-                Some(m) if m.pack < id && wm.uncertain() => m.len,
-                _ => 0,
-            })
         };
         // A pack id is never reused, so every id above the high-water is free and everything at or
         // below it is either a pack we know or a loss we already reported.
@@ -525,13 +520,14 @@ impl Store {
             } else {
                 ids.first().copied().unwrap_or(0)
             };
-            // The high-water is the strongest statement about which ids ever existed, so a pack
-            // that is gone below it is a loss, even when the watermark was rolled back and its
-            // mark no longer reaches that far.
+            // Only the mark promises a pack, and the high-water says how far the store ever
+            // allocated, so the listing covers every id the store could have promised a file for.
+            // An id the high-water passed but that no file or acceptance names was reserved and
+            // never created, which is not a loss.
             let hi = mark
                 .map_or_else(|| last.unwrap_or(0), |m| m.pack)
-                .max(wm.next_id().saturating_sub(1))
-                .min(hi_limit);
+                .min(wm.next_id().saturating_sub(1))
+                .max(lo);
             recovery.missing_synced = (lo..=hi)
                 .filter(|_| mark.is_some() || wm.next_id() == 0)
                 .filter(|p| !lens.contains_key(p))

@@ -31,40 +31,27 @@ pub(crate) struct Header {
     pub crc: u32,
 }
 
-/// The length a record at `pos` claims, if its header still says one.
-pub(crate) fn claimed_total_at(file: &File, pos: u64, end: u64) -> io::Result<Option<u64>> {
+/// The offset where the record whose header starts at `pos` ends, when that header checksums.
+///
+/// A header that passes its own checksum states its length truthfully, even when its payload does
+/// not verify, so the bytes up to that offset are that record's and a record found inside them is
+/// nested, not real. A header whose checksum fails says nothing about its length, since the flipped
+/// byte may be the length itself, so trusting it could hide the real records that follow.
+pub(crate) fn trusted_end_at(file: &File, pos: u64, end: u64) -> io::Result<Option<u64>> {
     if pos + HEADER_LEN as u64 > end {
         return Ok(None);
     }
     let mut raw = [0u8; HEADER_LEN];
     file.read_exact_at(&mut raw, pos)?;
-    Ok(Header::claimed_total(&raw))
+    Ok(Header::parse(&raw)
+        .ok()
+        .map(|h| pos + h.total_len())
+        .filter(|&e| e <= end && e > pos))
 }
 
 impl Header {
     pub(crate) fn total_len(&self) -> u64 {
         HEADER_LEN as u64 + u64::from(self.slen)
-    }
-
-    /// The length a header claims, ignoring its checksums, when the magic and the codec rule hold.
-    ///
-    /// A damaged header can still say how long its record was, and those bytes belong to that
-    /// record, so a scanner must not index anything it finds inside them.
-    pub(crate) fn claimed_total(buf: &[u8; HEADER_LEN]) -> Option<u64> {
-        if buf[..4] != RECORD_MAGIC || buf[5..8] != [0, 0, 0] {
-            return None;
-        }
-        let ulen = u32_at(buf, 8);
-        let slen = u32_at(buf, 12);
-        if ulen as usize > MAX_BLOCK_LEN {
-            return None;
-        }
-        let fits = match buf[4] {
-            0 => slen == ulen,
-            1 => slen < ulen,
-            _ => return None,
-        };
-        fits.then(|| HEADER_LEN as u64 + u64::from(slen))
     }
 
     /// Header-only checks: magic, header checksum, padding, codec and length rules.
