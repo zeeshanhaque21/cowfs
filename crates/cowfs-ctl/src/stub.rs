@@ -370,6 +370,8 @@ impl ControlHandler for StubHandler {
 mod conformance_tests {
     use super::*;
     use crate::conformance::handler_conformance;
+    use crate::CancelToken;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn holder_pid() -> u32 {
@@ -394,5 +396,34 @@ mod conformance_tests {
             )
         });
         handler_conformance(h as Arc<dyn ControlHandler>, inject).unwrap();
+    }
+
+    #[test]
+    fn import_reports_unverified_when_the_source_changes_while_it_is_ingested() {
+        let h = StubHandler::new("/s", "/m").with_work(2, Duration::ZERO);
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("a");
+        std::fs::write(&source_path, b"before").unwrap();
+        let touched = Arc::new(source_path.clone());
+        let changed = Arc::new(AtomicBool::new(false));
+        let once = Arc::clone(&changed);
+        let mut ctx = OpContext::new(CancelToken::new(), move |_| {
+            if !once.swap(true, Ordering::SeqCst) {
+                std::fs::write(touched.as_path(), b"after!").unwrap();
+            }
+            true
+        });
+        let report = h
+            .import(
+                ImportParams {
+                    path: dir.path().to_string_lossy().into_owned(),
+                    name: "imp".into(),
+                },
+                &mut ctx,
+            )
+            .unwrap();
+        assert!(!report.verified, "{report:?}");
+        assert_ne!(report.source_root_hash, report.imported_root_hash);
+        assert!(!report.mismatches.is_empty());
     }
 }

@@ -1,7 +1,7 @@
 use crate::error::{CtlResult, ErrorCode};
 use crate::handler::{ControlHandler, HolderGuard};
 use crate::types::SnapshotInfo;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 /// How a backend injects a holder for the racing test, and takes the same per-snapshot lock the
@@ -34,7 +34,18 @@ pub fn handler_conformance(
     assert_eq!(slot, names[1]);
 
     let held: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-    let source = |n: &str| handler.holders(n);
+    let under_lock = Arc::new(Mutex::new(0u32));
+    let probe = Arc::clone(&under_lock);
+    let held_probe = Arc::clone(&held);
+    // A compliant handler holds `guard.lock()` while it checks holders, so the lock is taken when
+    // `holders` runs. Counting that kills a handler that checks before it locks.
+    let for_probe = Arc::clone(&handler);
+    let source = move |n: &str| {
+        if held_probe.try_lock().is_err() {
+            *probe.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        }
+        for_probe.holders(n)
+    };
 
     // A holder present before the operation is `busy` and changes nothing.
     add_holder(names[1]);
@@ -44,8 +55,14 @@ pub fn handler_conformance(
             "the framework holder check passed with a holder present",
         ));
     }
+    *under_lock.lock().unwrap_or_else(PoisonError::into_inner) = 0;
     if handler.swap(names[1], names[0], &g).is_ok() {
         return Err(failure("swap succeeded with a holder present"));
+    }
+    if *under_lock.lock().unwrap_or_else(PoisonError::into_inner) == 0 {
+        return Err(failure(
+            "swap checked holders without holding the guard lock, so a holder can slip in",
+        ));
     }
     if handler
         .remove(
