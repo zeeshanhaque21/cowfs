@@ -88,15 +88,37 @@ Treat spreads as wide.
 
 ### Incremental rebuild is still 2.6x to 3.8x, and probably structural
 
-A one-line-edit rebuild is 13,000 to 26,000 operations, mostly LOOKUP.
-A lookup of a missing file cost 45 to 69 microseconds over the loopback against about 3 microseconds native (n=3 by 3,000).
-The server's share is about 10 to 20 microseconds.
+A one-line-edit rebuild of crate X was first estimated at 13,000 to 26,000 operations, mostly LOOKUP, and about 20,000 lookups.
+Spike 18 counted them per procedure and that estimate was wrong for this crate: see the next section.
+A lookup of a missing file cost 45 to 69 microseconds over the loopback against about 3 microseconds native (n=3 by 3,000), of which the server's share is 10 to 40 microseconds.
 The rest is the macOS NFS client, TCP loopback and RPC.
-About 20,000 operations at 50 microseconds with 1.8 in flight gives about 0.55s, which matches the observed gap of about 0.6s.
-This is the agent's inference from one microbenchmark.
-It is not a proven root cause, and I have not verified it independently.
-If it holds, the incremental case cannot reach 1.5x by server tuning alone, and this is the workload agents hit most.
-The seeded-build measurement (spike #3 scope) tests exactly this case.
+
+### Spike 18: cutting round trips (issue #18 option 1)
+
+Method: per-procedure counters in the server, then one mount option or server change at a time, n=5, crates X and Y.
+Scripts and the raw data (1,073 runs) are in `spikes/nfs-loopback/spike18/` and `out/spike18/`; the server changes are `spike18/server-changes.patch`.
+Caveat that limits every ratio: 91% of the runs started or ended at machine load above 30, and native medians inflated by 2x to 3x even in the runs classed as cool.
+Operation counts are exact and do not depend on load. Wall-time ratios are indicative only.
+
+- **Operation counts (crate X).** A no-op build issues 1,500 to 2,400 NFS operations (290 to 790 LOOKUP). A one-line-edit rebuild issues about 9,000 to 9,600 operations, about 4,300 of them LOOKUP: about 3,400 hits and 1,130 to 1,260 misses.
+  About 3,100 of the 4,300 repeat the same directory and name, so they are cacheable. About 1,200 are AppleDouble `._*` names.
+  GETATTR is about 1,500 and ACCESS only 30 to 60, so ACCESS tuning does not matter.
+- **AppleDouble is a large share.** The macOS client writes a `._name` companion whenever it sets an extended attribute such as `com.apple.provenance`. About 1,100 exist in `target/` and they add CREATE, WRITE and SETATTR operations to every build.
+- **Server time** is dominated by SETATTR (0.4 to 20 ms each) and READDIRPLUS of the 23,000-entry `deps/` directory, which the original server re-read and re-sorted for every page (3 to 190 ms per page).
+- **Mount options.** The client already uses negative name caching, `rdirplus`, `wsize=32768`, `dsize=32768` and `accesscache=3`.
+  `nonegnamecache` doubles the misses. `nordirplus` hung `cargo test` for over 8 minutes (not root-caused). `actimeo=3600` gave no consistent gain. `wsize=1048576` cuts WRITE count with mixed wall time.
+  `dsize` is capped by the client at 131072.
+  `nfs.conf` options (access cache) need admin and were not tested.
+- **Server changes.** Refusing `._*` creation cuts operations about 20% and GETATTR 60 to 75%, but makes `xattr -w` fail, so it is not a valid default. A readdir cache for continuation pages cut one edit rebuild from 36.8 s to 16.7 s (one pair, load about 100) but serves stale data if the directory changes between pages, so it needs a cookie verifier.
+  A single `lstat` per lookup and a write-fd cache gave no measurable gain.
+  Fixed a real bug: a SETATTR ctime-guard mismatch sent the error reply and then carried on applying the SETATTR.
+- **Coherence.** With the best configuration, `test_mount.py` passed 25 of 25, hardlink readdir passed (8,000 of 8,000), and a coherence script passed 15 of 15 (edit then build, rename, recreate, unlink then stat, create after a cached negative lookup, directory rename), also with `actimeo=3600`. Single writer through the mount is assumed.
+- **Result.** Best repeatable warm-build ratio is about 2x to 4x, down from about 3x to 12x on this noisy machine. No cell is convincingly within 1.5x. The two cells that read below it had inflated native medians (n=2 and n=3) and are not evidence.
+- **Why it stays above 1.5x.** About 3,500 LOOKUPs remain per edit rebuild and 1,100 to 1,400 are misses the client does not keep: rustc's creates and renames change the directory mtime, which invalidates the client's negative entries. That part is the macOS client.
+  Floor per LOOKUP is 10 to 40 microseconds on the server plus the client round trip (45 to 69 microseconds measured), against about 6 microseconds on Linux FUSE.
+
+Recommendation from the spike, for v1: translate or deny AppleDouble sidecars, add a correct readdir cache (with a cookie verifier) and keep the SETATTR guard fix. Then reframe criterion 2 for macOS warm builds (option 3 in #18) instead of chasing more mount options.
+Not verified: whether denying AppleDouble breaks tools that need extended attributes on the mount (code signing, quarantine).
 
 ### Seeded builds (warm base), tuned server, default cargo profile
 
