@@ -9,6 +9,20 @@ use common::{mkfile, pattern, read_all, test_opts};
 use cowfs_core::Core;
 use cowfs_vfs::{Vfs, ROOT_INO};
 
+fn verify_pid(pid: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        assert!(String::from_utf8_lossy(&cmd).contains("flush_boundary"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert!(Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid=,args="])
+        .status()
+        .unwrap()
+        .success());
+}
+
 #[test]
 fn boundary_child() {
     let Ok(dir) = std::env::var("COWFS_BOUNDARY_DIR") else {
@@ -27,10 +41,7 @@ fn boundary_child() {
             if stop {
                 println!("BOUNDARY after={after}");
                 std::io::stdout().flush().unwrap();
-                Command::new("ps")
-                    .args(["-p", &std::process::id().to_string(), "-o", "pid=,args="])
-                    .status()
-                    .unwrap();
+                verify_pid(std::process::id());
                 let status = Command::new("kill")
                     .args(["-KILL", &std::process::id().to_string()])
                     .status()
@@ -75,10 +86,7 @@ fn sigkill_at_store_sync_boundaries_preserves_fsynced_data_and_whole_commits() {
                 break status;
             }
             if start.elapsed() > std::time::Duration::from_secs(120) {
-                Command::new("ps")
-                    .args(["-p", &child.id().to_string(), "-o", "pid=,args="])
-                    .status()
-                    .unwrap();
+                verify_pid(child.id());
                 child.kill().unwrap();
                 child.wait().unwrap();
                 panic!("store boundary child timed out");
