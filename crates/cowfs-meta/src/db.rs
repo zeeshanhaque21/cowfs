@@ -795,7 +795,7 @@ impl Inner {
             Ok((taken, added)) => {
                 let _ = self
                     .reap_len
-                    .fetch_update(SeqCst, SeqCst, |n| Some(n.saturating_sub(taken) + added));
+                    .try_update(SeqCst, SeqCst, |n| Some(n.saturating_sub(taken) + added));
                 Ok(self.reap_len.load(SeqCst) > 0)
             }
             Err(e) => {
