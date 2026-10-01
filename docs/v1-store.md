@@ -126,7 +126,9 @@ A checkpoint is taken only after the packs it describes are synced, so every ent
   After `sync` returns, every `put` that returned earlier is durable.
   A `sync` with nothing new since the last one does no I/O.
 - Rolling to a new pack is transactional.
-  If creating the next pack fails (for example `EMFILE`), the half-made file is removed, no counter or writer state changes, and the error is returned.
+  The allocator reserves and fsyncs the next id under the writer mutex before creating its file.
+  If creating the next pack fails (for example `EMFILE`), the half-made file is removed, no pack counter or active writer changes, and the error is returned.
+  The reserved id remains consumed; a retry uses a higher id.
   A later `put` retries and succeeds once resources return.
   An empty leftover pack file at the next id is reused, and one that holds data is never overwritten (the roll fails instead).
 - Creating a store or a pack fsyncs the new file and every directory entry that names it: the store directory and its parent, `packs/`, `LOCK`, `SYNCED`, and each pack.
@@ -141,7 +143,9 @@ A checkpoint is taken only after the packs it describes are synced, so every ent
 
 `SYNCED` holds `(pack, len)`, `base`, the lowest pack id that must exist, and `next`, the lowest
 pack id this store may create.
-Missing packs between `base` and the highest known pack are reported as `missing_synced`.
+Missing packs between `base` and the watermark's pack are reported as `missing_synced`.
+Ids reserved but never created are not lost packs.
+Before a later watermark crosses those holes, their whole-pack entries are durably recorded as accepted in `ACKED`.
 `next` is what makes a pack id permanent: it never falls, it is fsynced before the pack file that
 uses the id is created, and it is raised again whenever the watermark advances.
 So an id that has ever been used is never handed out again, not after a pack is deleted, not after
@@ -155,6 +159,10 @@ It exists so that recovery can tell a torn tail (bytes after the watermark, neve
 It has two 32 byte slots written alternately, each with a sequence number and a CRC, so a torn write of one slot leaves the other.
 
 Ordering, enforced by tests through the fsync trace seam:
+
+For every pack creation, including recovery, rollover and `new_pack`: reserve `id + 1`, write and fsync `SYNCED`, then create the pack.
+The writer mutex serializes rollover and `new_pack` reservations; recovery holds the directory lock before a writer exists.
+This reservation does not advance the data watermark.
 
 1. fsync the pack data.
 2. Write the new watermark and fsync `SYNCED`.
@@ -183,6 +191,10 @@ When the watermark names a pack that is not on disk, open reports `missing_synce
 - Index inserts happen inside the writer mutex, after the record is fully written.
   A reader that sees an index entry can therefore always read its bytes.
 - `LOCK` holds an exclusive `flock` (`File::try_lock`), so a second `Store::open` on the same directory fails with `Error::Locked`, in this process and in another one.
+  Open retries for a 250 ms wall-clock budget before refusing a live owner; scheduler delays can overrun that budget.
+  This wait is a mitigation for the hypothesis of an overlapping lock release, not a proven explanation or fix for the intermittent macOS CI failure.
+  The original failure was not reproduced locally and its cause remains unknown.
+  Tests separately pin refusal of a live Store and a second process.
   The kernel drops the lock when the process dies, including `kill -9`, so a crashed store reopens.
   Both cases are tested.
   Locking on a network filesystem was not tested and is not claimed.
@@ -248,6 +260,10 @@ Steps:
    `get` of such an id returns `Error::Corrupt`, and `fsck` lists the region.
    A cut made while the watermark file was missing cannot be classified, so it is recorded as a
    pending loss with `CorruptRegion::unclassified` set and stays reported until it is accepted.
+   A damaged record beyond an older watermark is likewise unclassified when another watermark slot is torn.
+   Before sidecar retention, cut-label publication, relocation or truncation can discard evidence, the pending-loss marker is written to `ACKED.tmp`, fsynced, renamed to `ACKED`, and its directory fsynced.
+   Recovery of a short header that the watermark had promised also saves the loss marker before resetting the file.
+   Header rewrites follow durable loss recording.
 8. A pack that contains any bad region is not appended to: open starts a new pack.
 9. Every pack that contributed records or a cut is fsynced, then the watermark is advanced to the end of the active pack.
    Nothing unresolved sits below it, so a later `sync` can never bless leftover damage as durable.
@@ -327,6 +343,7 @@ Store::ingest(&self, impl Read) -> Result<Vec<ChunkRef>>
 Store::ingest_bytes(&self, &[u8]) -> Result<Vec<ChunkRef>>
 Store::sync(&self) -> Result<()>
 Store::checkpoint(&self) -> Result<()>
+Store::close(self) -> Result<()>                    // synchronous shutdown, reports errors
 Store::stats(&self) -> Stats
 Store::iter_ids(&self) -> impl Iterator<Item = BlockId>
 Store::fsck(&self) -> Result<FsckReport>

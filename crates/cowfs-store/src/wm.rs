@@ -57,6 +57,7 @@ pub(crate) struct Wm {
     mark: Option<Mark>,
     base: u32,
     next: u32,
+    uncertain: bool,
 }
 
 impl std::fmt::Debug for Wm {
@@ -97,19 +98,27 @@ impl Wm {
             .iter()
             .filter_map(|s| decode(s))
             .max_by_key(|(seq, ..)| *seq);
+        let uncertain = buf[..n]
+            .chunks(SLOT)
+            .any(|s| s.iter().any(|&b| b != 0) && decode(s).is_none());
         Ok(Wm {
             io: io.clone(),
             file,
             path,
             seq: best.map_or(0, |(s, ..)| s),
-            mark: best.map(|(_, m, ..)| m),
+            mark: best.and_then(|(_, m, ..)| (m.len > 0).then_some(m)),
             base: best.map_or(0, |(_, _, b, _)| b),
             next: best.map_or(0, |(_, _, _, n)| n),
+            uncertain,
         })
     }
 
     pub(crate) fn mark(&self) -> Option<Mark> {
         self.mark
+    }
+
+    pub(crate) fn uncertain(&self) -> bool {
+        self.uncertain
     }
 
     /// Lowest pack id that must exist.
