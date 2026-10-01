@@ -384,6 +384,9 @@ impl Inner {
                 return Ok(());
             }
         }
+        // The barrier and the meta write can wait for another thread's store fsync, so they run
+        // without the namespace lock: an xattr belongs to an inode, and nothing here renames it.
+        drop(_ns);
         let m = self.committed_meta(&sc, &n)?;
         sc.snap
             .setxattr(mino(m), name, value)
@@ -413,7 +416,7 @@ impl Inner {
         }
         let n = self.live(ino)?;
         let sc = self.snapctx(ino)?;
-        let _ns = sc.ns.lk();
+        let ns = sc.ns.lk();
         let now = Timestamp::now();
         {
             let mut st = n.st.wr();
@@ -426,6 +429,8 @@ impl Inner {
         let Some(m) = self.meta_of(ino) else {
             return Err(Error::NoAttr);
         };
+        // a meta commit can wait for another thread's store fsync, so it runs unlocked
+        drop(ns);
         sc.snap
             .removexattr(mino(m), name)
             .map_err(from_meta)

@@ -376,12 +376,25 @@ impl Inner {
         }
         let (sc, pn) = self.dir(parent)?;
         validate_name(name)?;
+        let cn = {
+            let _ns = sc.ns.lk();
+            let (child, kind) = self.dent_lookup(&sc, &pn, name)?.ok_or(Error::NotFound)?;
+            if kind != FileKind::Directory {
+                return Err(Error::NotDir);
+            }
+            self.node(child)?
+        };
+        // `require_empty` may need a commit, which waits for meta's writer lock. That runs without
+        // the namespace lock: whatever another thread queues meanwhile is not committed, so the
+        // emptiness check that follows still sees everything meta knows.
+        self.barrier_if_needed(&sc, &cn)?;
         let _ns = sc.ns.lk();
-        let (child, kind) = self.dent_lookup(&sc, &pn, name)?.ok_or(Error::NotFound)?;
-        if kind != FileKind::Directory {
-            return Err(Error::NotDir);
+        // the barrier may have applied another thread's queued rename, so the name must still be
+        // this directory before anything is removed
+        match self.dent_lookup(&sc, &pn, name)? {
+            Some((c, FileKind::Directory)) if self.meta_of(c) == self.meta_of(cn.ino) => {}
+            _ => return Err(Error::NotFound),
         }
-        let cn = self.node(child)?;
         self.require_empty(&sc, &cn)?;
         if cn.pinned() {
             self.preserve_orphan(&sc, &cn)?;
@@ -428,6 +441,14 @@ impl Inner {
 
     /// `NotEmpty` unless directory `cn` has no entries. Commits pending changes first if the
     /// answer cannot be known from memory.
+    /// Commits this directory's pending work if it has any, without any lock of ours.
+    fn barrier_if_needed(&self, sc: &SnapCtx, cn: &Node) -> Result<()> {
+        if cn.ns_seq.load(Ordering::Acquire) > sc.flushed() {
+            self.barrier(sc)?;
+        }
+        Ok(())
+    }
+
     fn require_empty(&self, sc: &SnapCtx, cn: &Arc<Node>) -> Result<()> {
         match cn.st.rd().kids {
             Some(0) => return Ok(()),
@@ -473,9 +494,20 @@ impl Inner {
         }
         validate_name(name)?;
         validate_name(new_name)?;
-        let ns = sc.ns.lk();
-        let (src, skind) = self.dent_lookup(&sc, &pn, name)?.ok_or(Error::NotFound)?;
-        let dst = self.dent_lookup(&sc, &qn, new_name)?;
+        let mut ns = sc.ns.lk();
+        let (mut src, mut skind) = self.dent_lookup(&sc, &pn, name)?.ok_or(Error::NotFound)?;
+        let mut dst = self.dent_lookup(&sc, &qn, new_name)?;
+        if skind == FileKind::Directory {
+            // A directory rename writes to meta directly, and needs everything queued committed
+            // first. That commit waits for meta's writer lock, so it runs without the namespace
+            // lock; the names are looked up again afterwards, because the commit may have applied
+            // another thread's rename of either of them.
+            drop(ns);
+            self.barrier(&sc)?;
+            ns = sc.ns.lk();
+            (src, skind) = self.dent_lookup(&sc, &pn, name)?.ok_or(Error::NotFound)?;
+            dst = self.dent_lookup(&sc, &qn, new_name)?;
+        }
         if let Some((d, _)) = dst {
             if flags.no_replace {
                 return Err(Error::Exists);
@@ -486,6 +518,8 @@ impl Inner {
         }
         let sn = self.node(src)?;
         if skind == FileKind::Directory {
+            // the barrier commits queued work and waits for meta's writer lock, so it runs without
+            // the namespace lock; the meta write below keeps it, because that write is not queued
             return self.rename_dir(&sc, ns, (&pn, name), (&qn, new_name), &sn, dst);
         }
         if let Some((_, FileKind::Directory)) = dst {
@@ -619,6 +653,12 @@ impl Inner {
         }
         let pm = self.meta_of(pn.ino).ok_or(Error::Stale)?;
         let qm = self.meta_of(qn.ino).ok_or(Error::Stale)?;
+        // This write is the one place core talks to meta directly instead of queueing, so it has to
+        // be atomic with the queue: releasing the namespace lock here lets a queued rename of an
+        // entry of this directory commit first, and its dentry update then describes a name that no
+        // longer exists (the suite's `concurrent_rename_unlink_lookup` catches exactly that). The
+        // write is `Ack::Applied`, so it does not fsync; it only waits for meta's writer lock,
+        // which the two other lock-across-commit sites no longer hold.
         sc.snap
             .rename(mino(pm), name, mino(qm), new_name)
             .map_err(from_meta)?;

@@ -533,36 +533,41 @@ impl Inner {
         if sc.open_handles.load(Ordering::Acquire) > 0 {
             return Err(ControlError::Busy);
         }
-        let _ns = sc.ns.lk();
-        let _fl = sc.flush.lk();
-        sc.removed.store(true, Ordering::Release);
         {
-            let mut s = self.snaps.wr();
-            s.by_id.remove(&sc.id);
-            s.by_name.remove(&sc.name);
-        }
-        *sc.q.lk() = queue::Queue::default();
-        let mut freed = 0usize;
-        self.nodes.retain(|ino, n| {
-            if ino::snap_of(*ino) == Some(sc.id) {
-                for _ in 0..64 {
-                    match n.st.try_read() {
-                        Ok(st) => {
-                            freed += st.dirty_bytes();
-                            break;
-                        }
-                        Err(_) => std::thread::yield_now(),
-                    }
-                }
-                false
-            } else {
-                true
+            let _ns = sc.ns.lk();
+            let _fl = sc.flush.lk();
+            sc.removed.store(true, Ordering::Release);
+            {
+                let mut s = self.snaps.wr();
+                s.by_id.remove(&sc.id);
+                s.by_name.remove(&sc.name);
             }
-        });
-        self.dirty_bytes.fetch_sub(freed, Ordering::AcqRel);
-        self.dents.purge_snapshot(sc.id);
-        self.aliases.wr().purge_snapshot(sc.id);
-        *self.root_time.lk() = Timestamp::now();
+            *sc.q.lk() = queue::Queue::default();
+            let mut freed = 0usize;
+            self.nodes.retain(|ino, n| {
+                if ino::snap_of(*ino) == Some(sc.id) {
+                    for _ in 0..64 {
+                        match n.st.try_read() {
+                            Ok(st) => {
+                                freed += st.dirty_bytes();
+                                break;
+                            }
+                            Err(_) => std::thread::yield_now(),
+                        }
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            self.dirty_bytes.fetch_sub(freed, Ordering::AcqRel);
+            self.dents.purge_snapshot(sc.id);
+            self.aliases.wr().purge_snapshot(sc.id);
+            *self.root_time.lk() = Timestamp::now();
+        }
+        // `removed` blocks every new operation on this snapshot and its caches are empty, so the
+        // meta commit can run without the namespace and flush locks: it can wait for another
+        // snapshot's store fsync, and holding those locks across that wait is what wedges a mount.
         self.meta
             .remove_snapshot(SnapshotId(sc.id))
             .map_err(control_meta)
