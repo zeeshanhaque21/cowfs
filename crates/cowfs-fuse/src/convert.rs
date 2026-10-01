@@ -121,8 +121,9 @@ pub fn sanitize(a: &Attr, unlinked_ok: bool) -> (Attr, bool) {
     o.size = o.size.min(i64::MAX as u64);
     o.blocks = o.blocks.min(i64::MAX as u64 >> 9);
     let min_links = match (o.kind, unlinked_ok) {
-        (FileKind::Directory, _) => 2,
+        // A removed directory keeps no links, like any other unlinked inode.
         (_, true) => 0,
+        (FileKind::Directory, false) => 2,
         _ => 1,
     };
     o.nlink = o.nlink.clamp(min_links, MAX_NLINK);
@@ -324,6 +325,15 @@ mod tests {
         assert_eq!(sanitize(&a, true), (a, false));
         a.nlink = u32::MAX;
         assert_eq!(sanitize(&a, false).0.nlink, MAX_NLINK);
+        // A removed directory reports no links, which the conformance suite pins.
+        a.kind = FileKind::Directory;
+        a.nlink = 0;
+        assert_eq!(
+            sanitize(&a, false).0.nlink,
+            2,
+            "a live directory has two links"
+        );
+        assert_eq!(sanitize(&a, true).0.nlink, 0, "a removed one has none");
     }
 
     #[test]
