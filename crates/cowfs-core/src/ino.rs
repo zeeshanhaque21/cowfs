@@ -10,11 +10,18 @@ use cowfs_vfs::{Error, Ino, Result, ROOT_INO};
 pub(crate) const VIRT: u64 = 1 << 63;
 /// How many virtual numbers one durable reservation covers.
 pub(crate) const VIRT_BLOCK: u64 = 1 << 20;
-const VIRT_FILE: &str = "virt.ino";
+const VIRT_A: &str = "virt.ino.a";
+const VIRT_B: &str = "virt.ino.b";
 const SHIFT: u32 = 40;
 const LOW: u64 = (1 << SHIFT) - 1;
-/// Snapshot ids must stay below this to fit in an `Ino`.
-pub(crate) const MAX_SNAP: u64 = 1 << 23;
+/// Snapshot ids must stay below this to fit in a meta-derived `Ino`. This is meta's own limit
+/// (`cowfs_meta::SNAPSHOT_LIMIT`), which `Meta::pack_ino` enforces; core must not be stricter, or a
+/// snapshot meta can name would be invisible here.
+pub(crate) const MAX_SNAP: u64 = cowfs_meta::SNAPSHOT_LIMIT;
+/// A virtual number spends its top bit on the virtual flag, so its snapshot id has 23 bits, not 24.
+/// A store with more snapshots than that can still be read; creating a file in the later ones is
+/// `NoSpace` (`virt`), which is loud rather than wrong.
+pub(crate) const MAX_VIRT_SNAP: u64 = 1 << 23;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Id {
@@ -28,7 +35,7 @@ pub(crate) fn classify(ino: Ino) -> Id {
         Id::Root
     } else if ino & VIRT != 0 {
         Id::Virt {
-            snap: (ino >> SHIFT) & (MAX_SNAP - 1),
+            snap: (ino >> SHIFT) & (MAX_VIRT_SNAP - 1),
         }
     } else {
         Id::Meta {
@@ -54,7 +61,7 @@ pub(crate) fn pack(snap: u64, m: u64) -> Result<Ino> {
 }
 
 pub(crate) fn virt(snap: u64, n: u64) -> Result<Ino> {
-    if snap == 0 || snap >= MAX_SNAP || n > LOW {
+    if snap == 0 || snap >= MAX_VIRT_SNAP || n > LOW {
         return Err(Error::NoSpace);
     }
     Ok(VIRT | snap << SHIFT | n)
@@ -119,38 +126,125 @@ impl Aliases {
 }
 
 /// Reads the durable virtual-number high-water mark, 0 when there is none.
-pub(crate) fn read_virt_mark(root: &std::path::Path) -> std::result::Result<u64, String> {
-    let p = root.join(VIRT_FILE);
-    let b = match std::fs::read(&p) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(format!("{}: {e}", p.display())),
-    };
-    let v: [u8; 8] = b
-        .get(..8)
-        .and_then(|s| s.try_into().ok())
-        .ok_or_else(|| format!("{} is short", p.display()))?;
-    let w: [u8; 8] = b
-        .get(8..16)
-        .and_then(|s| s.try_into().ok())
-        .ok_or_else(|| format!("{} is short", p.display()))?;
-    let n = u64::from_le_bytes(v);
-    if u64::from_le_bytes(w) != n {
-        return Err(format!("{} is torn", p.display()));
+/// Where the durable virtual-number mark is read and written.
+///
+/// Two copies of the same 16-byte record (the value twice, so a torn write is detected), written
+/// alternately through a temporary file and a rename, so at least one copy is always intact.
+pub(crate) fn read_virt_mark(root: &std::path::Path) -> Mark {
+    let mut best = 0u64;
+    let mut any = false;
+    let mut bad = false;
+    for name in [VIRT_A, VIRT_B] {
+        match std::fs::read(root.join(name)) {
+            Ok(b) => match parse_mark(&b) {
+                Some(v) => {
+                    any = true;
+                    best = best.max(v);
+                }
+                None => bad = true,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bad = true,
+            Err(_) => bad = true,
+        }
     }
-    Ok(n)
+    if any && !bad {
+        return Mark::Value(best);
+    }
+    if any {
+        return Mark::Damaged(best);
+    }
+    Mark::Missing
 }
 
-/// Records `n` durably (value twice, so a torn write is detected rather than believed).
+/// What the mark file says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mark {
+    /// Both copies agree.
+    Value(u64),
+    /// At least one copy is intact and one is not: take the intact one.
+    Damaged(u64),
+    /// Nothing usable.
+    Missing,
+}
+
+impl Mark {
+    /// The counter to start from, with the reason to log when the mark was not intact.
+    pub(crate) fn counter(&self, has_state: bool) -> (u64, Option<String>) {
+        match *self {
+            // a zero mark with committed state cannot be believed: a rolled-back or restored mark
+            // looks exactly like this
+            Mark::Value(0) if has_state => (
+                SAFETY,
+                Some(format!(
+                    "virt.ino: zero with committed state, continuing from {SAFETY}"
+                )),
+            ),
+            Mark::Value(v) => (v, None),
+            Mark::Damaged(v) => (
+                v,
+                Some(format!(
+                    "virt.ino: one copy is damaged, continuing from {v} (the other copy is intact)"
+                )),
+            ),
+            Mark::Missing if has_state => (
+                SAFETY,
+                Some(format!(
+                    "virt.ino: missing with committed state, continuing from {SAFETY}; \
+                     inode numbers below it may have been handed out by an earlier session"
+                )),
+            ),
+            Mark::Missing => (
+                0,
+                Some("virt.ino: missing and no committed state".to_string()),
+            ),
+        }
+    }
+}
+
+/// Where the counter starts when the mark is lost: far above anything a session could have used, so
+/// a reused number needs billions of creates in one mount.
+pub(crate) const SAFETY: u64 = 1 << 32;
+
+/// The low bits of a virtual inode number that hold the counter, for tests and diagnostics.
+pub const VIRT_COUNTER_MASK: u64 = (1 << SHIFT) - 1;
+
+fn parse_mark(b: &[u8]) -> Option<u64> {
+    let v: [u8; 8] = b.get(..8)?.try_into().ok()?;
+    let w: [u8; 8] = b.get(8..16)?.try_into().ok()?;
+    let n = u64::from_le_bytes(v);
+    (u64::from_le_bytes(w) == n).then_some(n)
+}
+
+/// Records `n` durably in the copy that does not hold the newest value, through a temporary file and
+/// a rename, so the previous copy survives a crash anywhere in here.
 pub(crate) fn write_virt_mark(root: &std::path::Path, n: u64) -> std::io::Result<()> {
-    let p = root.join(VIRT_FILE);
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&n.to_le_bytes());
     b[8..].copy_from_slice(&n.to_le_bytes());
-    let mut f = std::fs::File::create(&p)?;
-    f.write_all(&b)?;
-    f.sync_all()?;
-    std::fs::File::open(root)?.sync_all()
+    let (newest, other) = newest_copy(root);
+    let tmp = root.join(format!("{other}.tmp"));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&b)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, root.join(other))?;
+    let d = std::fs::File::open(root)?;
+    d.sync_all()?;
+    // remember which copy is newest without a durable write: the value itself says
+    let _ = newest;
+    Ok(())
+}
+
+/// The copy that holds the highest intact value, so the next write goes to the other one.
+fn newest_copy(root: &std::path::Path) -> (&'static str, &'static str) {
+    let a = parse_mark(&std::fs::read(root.join(VIRT_A)).unwrap_or_default()).unwrap_or(0);
+    let b = parse_mark(&std::fs::read(root.join(VIRT_B)).unwrap_or_default()).unwrap_or(0);
+    if a >= b {
+        (VIRT_A, VIRT_B)
+    } else {
+        (VIRT_B, VIRT_A)
+    }
 }
 
 #[cfg(test)]
@@ -178,16 +272,24 @@ mod tests {
     }
 
     #[test]
-    fn the_virtual_mark_round_trips_and_a_torn_one_is_refused() {
+    fn the_virtual_mark_round_trips_and_a_torn_one_falls_back_to_the_other() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(read_virt_mark(d.path()), Ok(0));
+        assert_eq!(read_virt_mark(d.path()), Mark::Missing);
+        let (v, e) = read_virt_mark(d.path()).counter(false);
+        assert_eq!(v, 0);
+        assert!(e.unwrap().contains("missing"), "a missing mark is reported");
         write_virt_mark(d.path(), 12345).unwrap();
-        assert_eq!(read_virt_mark(d.path()), Ok(12345));
-        let p = d.path().join("virt.ino");
-        let mut b = std::fs::read(&p).unwrap();
-        b[9] ^= 0xff;
-        std::fs::write(&p, &b).unwrap();
-        assert!(read_virt_mark(d.path()).is_err());
+        write_virt_mark(d.path(), 12346).unwrap();
+        assert_eq!(read_virt_mark(d.path()), Mark::Value(12346));
+        // tear the copy that does not hold the newest value: the newest is intact
+        std::fs::write(d.path().join(newest_copy(d.path()).1), b"").unwrap();
+        assert_eq!(read_virt_mark(d.path()), Mark::Damaged(12346));
+        // both gone with committed state: a safety margin, loudly
+        let _ = std::fs::remove_file(d.path().join(VIRT_A));
+        let _ = std::fs::remove_file(d.path().join(VIRT_B));
+        let (v, e) = read_virt_mark(d.path()).counter(true);
+        assert_eq!(v, SAFETY);
+        assert!(e.unwrap().contains("missing"));
     }
 
     #[test]

@@ -41,9 +41,14 @@ use crate::queue::SnapCtx;
 use crate::util::{MutexExt, RwExt, ShardMap};
 
 pub use crate::inner::{Options, Stats};
+pub use crate::ino::VIRT_COUNTER_MASK;
 pub use crate::snapname::{name_key, validate_snapshot_name, validate_snapshot_name_bytes};
 pub use crate::view::SnapshotView;
 pub use cowfs_vfs::NAME_MAX;
+
+/// The most one `read` call allocates. The trait says "reads up to `size` bytes", so a larger
+/// request is answered in pieces; without a cap a caller can make the mount fault in 4 GiB per call.
+pub const MAX_READ_BYTES: u64 = 8 << 20;
 
 /// Errors from the control plane.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -170,7 +175,8 @@ impl Core {
         let md = std::fs::metadata(dir).map_err(|e| from_io(&e))?;
         let total = fs2::total_space(dir).unwrap_or(1 << 40);
         let avail = fs2::available_space(dir).unwrap_or(total);
-        let mark = ino::read_virt_mark(dir).map_err(Error::Corrupt)?;
+        let (mark, mark_warning) =
+            ino::read_virt_mark(dir).counter(!meta.snapshots().map_err(from_meta)?.is_empty());
         let base_pack_bytes = store.stats().pack_bytes;
         let inner = Arc::new(Inner {
             meta,
@@ -192,7 +198,7 @@ impl Core {
             pressure: Mutex::new(()),
             bg: (Mutex::new(false), Condvar::new()),
             unsynced: Mutex::new(None),
-            last_error: Mutex::new(None),
+            last_error: Mutex::new(mark_warning),
             capacity_blocks: (avail / 4096).max(1 << 20).min(total / 4096 + 1),
             base_pack_bytes,
             root: dir.to_path_buf(),
@@ -201,7 +207,12 @@ impl Core {
         });
         for info in inner.meta.snapshots().map_err(from_meta)? {
             if info.id.0 >= MAX_SNAP {
-                continue;
+                // meta hands out ids below its own SNAPSHOT_LIMIT, which is the same limit, so this
+                // is unreachable; skipping the snapshot silently would hide it
+                return Err(Error::Corrupt(format!(
+                    "snapshot id {} does not fit in an inode number (limit {MAX_SNAP})",
+                    info.id.0
+                )));
             }
             let snap = inner.meta.snapshot_by_id(info.id).map_err(from_meta)?;
             inner.add_snap(&info, snap);
@@ -282,7 +293,7 @@ impl Core {
     /// open. Its snapshot id and every inode number in it change.
     pub fn rename_snapshot(&self, old: &str, new: &str) -> Result<SnapshotEntry, ControlError> {
         self.inner.snap_by_name(old)?;
-        self.swap_snapshot(old, Some(old), new, false)
+        self.swap_snapshot(old, Some(old), new)
     }
 
     /// Makes `base` a clone of `src`, replacing an existing `base`.
@@ -291,14 +302,17 @@ impl Core {
     /// is still there.
     pub fn promote_base(&self, src: &str, base: &str) -> Result<SnapshotEntry, ControlError> {
         self.inner.snap_by_name(src)?;
-        self.swap_snapshot(src, None, base, true)
+        self.swap_snapshot(src, None, base)
     }
 
     /// All snapshots in id order.
+    /// The snapshots in id order. A staging snapshot of an interrupted swap is not listed: its name
+    /// is reserved and it is only reachable through an intent file (see `src/swap.rs`).
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotEntry>, ControlError> {
         let mut out = Vec::new();
         for info in self.inner.meta.snapshots().map_err(control_meta)? {
-            if self.inner.snaps.rd().by_id.contains_key(&info.id.0) {
+            if !swap::is_staging(&info.name) && self.inner.snaps.rd().by_id.contains_key(&info.id.0)
+            {
                 out.push(entry(&info)?);
             }
         }
@@ -348,7 +362,14 @@ impl Core {
 
     /// Blocks that only memory names: chunks of open unlinked files and of files whose chunk list
     /// is not committed yet. Garbage collection must treat them as live.
-    pub fn pinned_blocks(&self) -> Vec<BlockId> {
+    /// The blocks that only memory names right now: those of an open orphan (unlinked, with a
+    /// handle or a lookup reference still held) and those of a chunk list that is not committed yet.
+    ///
+    /// GC (#10) must treat every id here as live. The answer is exact for the state at the end of
+    /// the call, or `ControlError::Busy` if a node lock could not be taken within two seconds; it is
+    /// never partial. A block first referenced after the call is not in it, so the store's own mark
+    /// must protect blocks written during a mark phase.
+    pub fn pinned_blocks(&self) -> Result<Vec<BlockId>, ControlError> {
         self.inner.pinned_blocks()
     }
 
@@ -423,7 +444,16 @@ impl Inner {
         sc
     }
 
+    /// A snapshot by name. A staging name (reserved for an interrupted swap) is not reachable.
     fn snap_by_name(&self, name: &str) -> Result<Arc<SnapCtx>, ControlError> {
+        if swap::is_staging(name) {
+            return Err(ControlError::NotFound);
+        }
+        self.snap_by_name_raw(name)
+    }
+
+    /// A snapshot by name including a staging name, for the swap itself.
+    pub(crate) fn snap_by_name_raw(&self, name: &str) -> Result<Arc<SnapCtx>, ControlError> {
         let s = self.snaps.rd();
         let id = s.by_name.get(name).ok_or(ControlError::NotFound)?;
         s.by_id.get(id).cloned().ok_or(ControlError::NotFound)
@@ -432,16 +462,26 @@ impl Inner {
     /// A name must be free, and must not alias an existing name on a case-insensitive or
     /// normalising mount (see `snapname::name_key`).
     fn check_new_name(&self, name: &str) -> Result<(), ControlError> {
+        self.check_new_name_except(name, None)
+    }
+
+    /// [`Inner::check_new_name`], ignoring `except`, the snapshot whose name a swap is replacing.
+    /// Staging snapshots are never counted: their names are reserved and invisible.
+    fn check_new_name_except(&self, name: &str, except: Option<&str>) -> Result<(), ControlError> {
+        if swap::is_staging(name) {
+            return Err(ControlError::InvalidName(
+                "the name is reserved for an interrupted snapshot swap",
+            ));
+        }
         let key = crate::snapname::name_key(name);
         let s = self.snaps.rd();
-        if s.by_name.contains_key(name) {
-            return Err(ControlError::Exists);
-        }
-        if s.by_name
-            .keys()
-            .any(|n| crate::snapname::name_key(n) == key)
-        {
-            return Err(ControlError::Exists);
+        for n in s.by_name.keys() {
+            if swap::is_staging(n) || Some(n.as_str()) == except {
+                continue;
+            }
+            if crate::snapname::name_key(n) == key {
+                return Err(ControlError::Exists);
+            }
         }
         Ok(())
     }
@@ -449,7 +489,11 @@ impl Inner {
     fn register(&self, snap: cowfs_meta::Snapshot) -> Result<SnapshotEntry, ControlError> {
         let info = snap.info().map_err(control_meta)?;
         if info.id.0 >= MAX_SNAP {
-            let _ = self.meta.remove_snapshot(info.id);
+            *self.last_error.lk() = Some(format!(
+                "snapshot id {} does not fit in an inode number (limit {MAX_SNAP}); it is NOT \
+                 registered and NOT removed",
+                info.id.0
+            ));
             return Err(ControlError::Fs(Error::NoSpace));
         }
         self.add_snap(&info, snap);
@@ -473,7 +517,15 @@ impl Inner {
         let mut freed = 0usize;
         self.nodes.retain(|ino, n| {
             if ino::snap_of(*ino) == Some(sc.id) {
-                freed += n.st.try_read().map_or(0, |st| st.dirty_bytes());
+                for _ in 0..64 {
+                    match n.st.try_read() {
+                        Ok(st) => {
+                            freed += st.dirty_bytes();
+                            break;
+                        }
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
                 false
             } else {
                 true
@@ -508,7 +560,7 @@ impl Inner {
         }
     }
 
-    fn pinned_blocks(&self) -> Vec<BlockId> {
+    fn pinned_blocks(&self) -> Result<Vec<BlockId>, ControlError> {
         let flushed = self.flushed_of();
         let mut out = HashSet::new();
         let mut nodes = Vec::new();
@@ -518,7 +570,11 @@ impl Inner {
         });
         for n in nodes {
             let fl = ino::snap_of(n.ino).and_then(|s| flushed.get(&s)).copied();
-            let Ok(st) = n.st.try_read() else { continue };
+            // exact or Busy, never a partial answer. No other lock is held here, so waiting for a
+            // node lock cannot invert the documented order.
+            let Some(st) = n.try_read_for(Duration::from_secs(2)) else {
+                return Err(ControlError::Busy);
+            };
             let uncommitted = fl.is_none_or(|fl| n.seq.load(Ordering::Acquire) > fl);
             if let Some(f) = &st.file {
                 if st.is_orphan() || uncommitted {
@@ -532,7 +588,7 @@ impl Inner {
                 }
             }
         }
-        out.into_iter().collect()
+        Ok(out.into_iter().collect())
     }
 
     fn drop_caches(&self) {

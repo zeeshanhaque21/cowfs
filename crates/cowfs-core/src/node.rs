@@ -110,6 +110,22 @@ impl Node {
         Error::Corrupt(why)
     }
 
+    /// The state, waiting up to `limit`. `None` means a writer holds it for longer, which is the
+    /// caller's signal to answer `Busy` rather than something partial.
+    pub(crate) fn try_read_for(
+        &self,
+        limit: std::time::Duration,
+    ) -> Option<std::sync::RwLockReadGuard<'_, NodeState>> {
+        let start = std::time::Instant::now();
+        loop {
+            match self.st.try_read() {
+                Ok(g) => return Some(g),
+                Err(_) if start.elapsed() < limit => std::thread::yield_now(),
+                Err(_) => return None,
+            }
+        }
+    }
+
     pub(crate) fn poisoned(&self) -> Option<Error> {
         self.poison
             .lock()

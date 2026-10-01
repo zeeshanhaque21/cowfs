@@ -11,7 +11,14 @@ use crate::blocks::Blocks;
 
 /// Chunk refs with this id are holes: zeros that are never stored.
 pub(crate) const HOLE: BlockId = BlockId::from_bytes([0; 32]);
-const HOLE_MAX: u64 = 1 << 30;
+/// The longest run a hole ref may claim. BLAKE3 never produces the all-zero id, so a zero id with a
+/// longer length is a corrupt entry, not a hole, and is read as `Error::Corrupt`.
+pub(crate) const HOLE_MAX: u64 = 1 << 30;
+
+/// The hole marker: the all-zero id with a length a hole can hold.
+pub(crate) fn is_hole(c: &ChunkRef) -> bool {
+    c.id == HOLE && u64::from(c.len) <= HOLE_MAX
+}
 /// Largest file size, as in the reference implementation.
 pub(crate) const MAX_FILE: u64 = 1 << 42;
 
@@ -82,7 +89,7 @@ impl Chunks {
     pub(crate) fn stored_bytes(&self) -> u64 {
         self.refs
             .iter()
-            .filter(|r| r.id != HOLE)
+            .filter(|r| !is_hole(r))
             .map(|r| u64::from(r.len))
             .sum()
     }
@@ -227,7 +234,7 @@ impl FileData {
         let c = list.refs[i];
         let mut tail = Vec::new();
         if size > start {
-            if c.id == HOLE {
+            if is_hole(&c) {
                 tail = hole_refs(size - start);
             } else {
                 let bytes = blocks.get(c.id)?;
@@ -281,7 +288,7 @@ fn flush_extent(list: &mut Chunks, blocks: &Blocks, a: u64, data: &[u8]) -> Resu
             prefix = hole_refs(a - total);
         } else if let Some(&last) = list.refs.last() {
             // appending: restart chunking at the last chunk so boundaries match a one-shot write
-            if last.id != HOLE && (last.len as usize) < MAX_CHUNK_LEN {
+            if !is_hole(&last) && (last.len as usize) < MAX_CHUNK_LEN {
                 let bytes = blocks.get(last.id)?;
                 check_len(&bytes, last)?;
                 head = bytes.to_vec();
@@ -312,7 +319,7 @@ fn flush_extent(list: &mut Chunks, blocks: &Blocks, a: u64, data: &[u8]) -> Resu
             let c = list.refs[j];
             last_excl = j + 1;
             if b < end {
-                if c.id == HOLE {
+                if is_hole(&c) {
                     suffix = hole_refs(end - b);
                 } else {
                     let bytes = blocks.get(c.id)?;
@@ -346,7 +353,7 @@ pub(crate) fn verify_partial(blocks: &Blocks, list: &Chunks, a: u64, b: u64) -> 
             break;
         }
         let c = list.refs[i];
-        if (s < a || list.ends[i] > b) && c.id != HOLE {
+        if (s < a || list.ends[i] > b) && !is_hole(&c) {
             check_len(&blocks.get(c.id)?, c)?;
         }
         i += 1;
@@ -371,7 +378,7 @@ pub(crate) fn read_range(
                 break;
             }
             let c = list.refs[i];
-            if c.id != HOLE {
+            if !is_hole(&c) {
                 let blk = blocks.get(c.id)?;
                 check_len(&blk, c)?;
                 let lo = off.max(s);
@@ -467,7 +474,7 @@ mod tests {
         }
         f.flush(&b).unwrap();
         assert_eq!(full(&b, &f, m.len() as u64), m);
-        assert!(f.chunks.refs.iter().all(|r| r.id != HOLE || r.len > 0));
+        assert!(f.chunks.refs.iter().all(|r| !is_hole(r) || r.len > 0));
     }
 
     #[test]

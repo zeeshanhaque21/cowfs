@@ -15,6 +15,7 @@ use crate::inner::{kind_of, mino, Inner};
 use crate::ino::{pack, snap_of};
 use crate::node::{Node, NodeState, DIR_SIZE};
 use crate::queue::{Create, Op, SnapCtx};
+use crate::swap;
 use crate::util::{MutexExt, RwExt};
 
 impl Inner {
@@ -143,7 +144,7 @@ impl Inner {
         let mut ids: Vec<(&String, &u64)> = snaps
             .by_name
             .iter()
-            .filter(|(_, id)| **id > cookie)
+            .filter(|(n, id)| **id > cookie && !swap::is_staging(n))
             .collect();
         ids.sort_by_key(|(_, id)| **id);
         let eof = ids.len() <= max;

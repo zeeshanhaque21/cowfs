@@ -65,7 +65,7 @@ fn leftovers(dir: &std::path::Path, c: &Core) -> Vec<String> {
 /// intent file behind once the next open has run.
 #[test]
 fn promote_base_survives_a_failure_at_every_step() {
-    for step in 0..=4u8 {
+    for step in 1..=5u8 {
         let dir = tempfile::tempdir().unwrap();
         {
             let c = Core::open(dir.path(), test_opts()).unwrap();
@@ -78,26 +78,21 @@ fn promote_base_survives_a_failure_at_every_step() {
             c.sync().unwrap();
             c.set_swap_fault(step);
             let res = c.promote_base("src", "base");
-            if step == 0 {
-                assert!(res.is_ok(), "step 0 must succeed: {res:?}");
-                assert_eq!(content(&c, "base", "f"), "new content");
+            if step <= 3 {
+                assert!(res.is_err(), "step {step} was not injected: {res:?}");
+                assert_eq!(
+                    content(&c, "base", "f"),
+                    "old base",
+                    "step {step} lost the old base"
+                );
             } else {
-                assert!(res.is_err(), "step {step} was not injected");
-                if step < 4 {
-                    assert_eq!(
-                        content(&c, "base", "f"),
-                        "old base",
-                        "step {step} lost the old base"
-                    );
-                }
+                // past the point of no return the swap is rolled forward and reported as done
+                assert!(res.is_ok(), "step {step} must roll forward: {res:?}");
+                assert_eq!(content(&c, "base", "f"), "new content", "step {step}");
             }
         }
         let c = Core::open(dir.path(), test_opts()).expect("reopen");
-        let want = if step == 0 || step == 4 {
-            "new content"
-        } else {
-            "old base"
-        };
+        let want = if step >= 4 { "new content" } else { "old base" };
         assert_eq!(content(&c, "base", "f"), want, "step {step} after reopen");
         assert!(
             leftovers(dir.path(), &c).is_empty(),

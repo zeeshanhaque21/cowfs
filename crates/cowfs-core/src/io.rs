@@ -47,7 +47,9 @@ impl Inner {
             if off >= fsize || size == 0 {
                 return Ok(Vec::new());
             }
-            let end = fsize.min(off.saturating_add(u64::from(size)));
+            let end = fsize
+                .min(off.saturating_add(u64::from(size)))
+                .min(off.saturating_add(crate::MAX_READ_BYTES));
             let Some(f) = st.file.as_ref() else {
                 return Err(Error::Stale);
             };
@@ -262,7 +264,8 @@ impl Inner {
 
     pub(crate) fn op_fsync(&self, ino: Ino) -> Result<()> {
         if ino == ROOT_INO {
-            return Ok(());
+            // the trait defines this as the whole-mount barrier
+            return self.sync_all();
         }
         let n = self.live(ino)?;
         if let Some(e) = n.poisoned() {

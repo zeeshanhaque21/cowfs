@@ -532,13 +532,13 @@ fn open_unlinked_data_is_pinned_until_released() {
     c.flush().unwrap();
     assert_eq!(c.getattr(a.ino).unwrap().nlink, 0);
     assert_eq!(read_all(c, a.ino), data);
-    let pinned = c.pinned_blocks();
+    let pinned = c.pinned_blocks().expect("pinned blocks");
     assert!(!pinned.is_empty());
     assert!(pinned.iter().all(|b| c.store().contains(*b)));
     c.release(h).unwrap();
     c.forget(a.ino, 1);
     assert_eq!(c.getattr(a.ino), Err(Error::Stale));
-    assert!(c.pinned_blocks().is_empty());
+    assert!(c.pinned_blocks().expect("pinned blocks").is_empty());
     c.check().unwrap();
 }
 

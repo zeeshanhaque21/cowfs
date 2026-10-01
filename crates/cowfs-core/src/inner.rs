@@ -298,7 +298,8 @@ impl Inner {
         let (snap, m) = match classify(ino) {
             Id::Root => return Err(Error::Stale),
             Id::Meta { snap, m } => {
-                if let Some(v) = self.aliases.rd().canon(snap, m) {
+                let v = self.aliases.rd().canon(snap, m);
+                if let Some(v) = v {
                     return self.nodes.get(&v).map_or_else(|| self.node(v), Ok);
                 }
                 (snap, m)
@@ -322,11 +323,10 @@ impl Inner {
                     self.shrink_nodes(ino);
                     return Ok(n);
                 }
+                // a live node for this inode keeps changing; never overwrite it with a state read
+                // from meta, or a dirty file's unflushed extents are lost
                 Err(()) if tries < 64 => {}
-                Err(()) => {
-                    self.nodes.upsert(ino, node.clone());
-                    return Ok(node);
-                }
+                Err(()) => return Err(Error::Stale),
             }
         }
         Err(Error::Stale)

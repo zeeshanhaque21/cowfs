@@ -27,6 +27,9 @@ pub fn validate_snapshot_name(name: &str) -> Result<(), ControlError> {
     if name.starts_with('.') {
         return bad("must not start with a dot");
     }
+    if name.contains(crate::swap::STAGING) {
+        return bad("is reserved for an interrupted snapshot swap");
+    }
     if name.contains('/') {
         return bad("must not contain a slash");
     }
