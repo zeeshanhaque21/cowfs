@@ -234,6 +234,28 @@ fn filetime_secs(p: &Path, secs: i64) -> i64 {
 
 #[test]
 #[ignore = "mounts a filesystem; run with --ignored"]
+fn readonly_owner_posix_permissions() {
+    let native = tempfile::Builder::new()
+        .prefix("cowfs-native-permissions-")
+        .tempdir()
+        .unwrap();
+    let Some(m) = mounted(MountOptions::default()) else {
+        panic!("permission regression needs a real NFS mount");
+    };
+    for (label, root) in [("APFS", native.path()), ("NFS", m.path())] {
+        let mut cmd = Command::new("python3");
+        cmd.arg(battery("readonly_owner.py"))
+            .arg(root)
+            .arg("--check");
+        let (ok, out) = run_limited(&mut cmd, 180);
+        println!("{label}: {out}");
+        assert!(ok, "{label}: {out}");
+    }
+    m.finish();
+}
+
+#[test]
+#[ignore = "mounts a filesystem; run with --ignored"]
 fn read_only_modes_stay_writable_for_the_owner() {
     let Some(m) = mounted(MountOptions::default()) else {
         return;
