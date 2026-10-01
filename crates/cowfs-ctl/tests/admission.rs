@@ -474,6 +474,64 @@ fn a5_the_framework_rejects_a_reset_whose_holders_appeared() {
     assert!(racer.seen.load(Ordering::SeqCst) > 0);
 }
 
+struct NeverCheck;
+
+impl ControlHandler for NeverCheck {
+    fn swap(&self, name: &str, from: &str, _: &HolderGuard<'_>) -> CtlResult<SnapshotInfo> {
+        Ok(SnapshotInfo {
+            name: name.into(),
+            parent: Some(from.into()),
+            base: None,
+            created_unix_ms: 0,
+        })
+    }
+
+    fn remove(&self, _: &str, _: &HolderGuard<'_>) -> CtlResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a5_the_framework_alone_refuses_a_handler_that_never_checks() {
+    let _w = Watchdog::start(60);
+    let fx = start_arc(Arc::new(NeverCheck), ServerOptions::default());
+    // A handler that ignores the guard is non-conformant, but the framework still refuses a
+    // snapshot that has a holder before the handler ever runs.
+    let fx2 = start_with(
+        stub().with_process(
+            "held",
+            ProcessInfo {
+                pid: 3,
+                command: "x".into(),
+                holds: vec![],
+            },
+        ),
+        ServerOptions::default(),
+    );
+    let mut c = Client::connect(&fx2.path).unwrap();
+    c.call(Request::SnapshotCreate(SnapshotCreate {
+        name: "held".into(),
+        from: None,
+    }))
+    .unwrap();
+    let err = c
+        .call(Request::SnapshotReset(SnapshotReset {
+            name: "held".into(),
+            from: "held2".into(),
+            expect_no_holders: true,
+        }))
+        .unwrap_err();
+    assert_eq!(code(err), ErrorCode::Busy);
+    let err = c
+        .call(Request::SnapshotRm(SnapshotRm {
+            name: "held".into(),
+            expect_no_holders: true,
+        }))
+        .unwrap_err();
+    assert_eq!(code(err), ErrorCode::Busy);
+    drop(fx);
+}
+
 #[test]
 fn a4_reset_rejects_unknown_params_and_rm_validates_the_name() {
     let _w = Watchdog::start(60);
