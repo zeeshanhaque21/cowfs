@@ -645,12 +645,12 @@ impl Inner {
         files.sort_by_key(|f| f.ino);
         let mut lanes = Vec::new();
         for sc in self.all_snaps() {
-            let stuck = sc.q.lk().take_dirty_files();
-            if !stuck.is_empty() {
+            let stuck = sc.q.lk().dirty_file_count();
+            if stuck != 0 {
                 lanes.push(LaneHealth {
                     snapshot: sc.name.clone(),
                     id: sc.id,
-                    files_stuck: stuck.len(),
+                    files_stuck: stuck,
                 });
             }
         }

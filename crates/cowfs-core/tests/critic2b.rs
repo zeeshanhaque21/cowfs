@@ -862,6 +862,34 @@ fn a_refused_rename_leaves_the_mount_exactly_as_it_was() {
     c.check().unwrap();
 }
 
+#[test]
+fn a_step_three_refusal_removes_the_intent_and_staging_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        c.create_snapshot("old").unwrap();
+        mkfile(&c.snapshot_view("old").unwrap(), ROOT_INO, "x", b"OLD");
+        c.sync().unwrap();
+        c.set_swap_fault(3);
+        assert!(c.rename_snapshot("old", "new").is_err());
+        c.set_swap_fault(0);
+        assert!(
+            !dir.path().join("swap-new").exists(),
+            "refusal retained its intent"
+        );
+        assert_eq!(
+            c.meta().snapshots().unwrap().len(),
+            1,
+            "hidden staging state survived"
+        );
+        assert_eq!(snap_names(&c), ["old"]);
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(snap_names(&c), ["old"]);
+    assert_eq!(content(&c, "old", "x"), "OLD");
+    c.check().unwrap();
+}
+
 /// B3: a crash after the staging fork and before the intent file leaves nothing the user can see.
 #[test]
 fn a_crash_between_the_staging_fork_and_the_intent_shows_nothing_new() {
@@ -1083,6 +1111,29 @@ fn a_transient_store_failure_keeps_the_data_pending_and_a_repair_saves_it() {
     assert_eq!(read_all(&fs, a), data, "the acked bytes were lost");
 }
 
+#[test]
+fn a_single_transient_failure_is_retried_in_the_same_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    c.create_snapshot("s").unwrap();
+    let fs = c.snapshot_view("s").unwrap();
+    let a = mkfile(&fs, ROOT_INO, "f", b"retry payload").ino;
+    c.set_flush_fault(a, 1, 1);
+    c.flush().unwrap();
+    assert_eq!(
+        c.stats().dirty_bytes,
+        0,
+        "flush stopped at a retryable error"
+    );
+    assert_eq!(c.stats().transient, 0, "retry budget was not used");
+    assert!(c.health().files.is_empty());
+    fs.fsync(a, false).unwrap();
+    drop(fs);
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "s", "f"), "retry payload");
+}
+
 /// B9: a corruption still poisons, and `unpoison` is the documented repair for it too.
 #[test]
 fn a_corrupt_flush_poisons_the_file_and_unpoison_repairs_it() {
@@ -1137,4 +1188,21 @@ fn health_is_empty_when_nothing_is_broken_and_unpoison_reports_a_bad_inode() {
     assert!(h.files.is_empty(), "{h:?}");
     assert!(h.lanes.is_empty(), "{h:?}");
     assert!(c.unpoison(1 << 40).is_err(), "unpoison of an unknown inode");
+}
+
+#[test]
+fn health_does_not_consume_pending_flush_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    c.create_snapshot("s").unwrap();
+    let fs = c.snapshot_view("s").unwrap();
+    mkfile(&fs, ROOT_INO, "f", b"pending payload");
+    assert_eq!(c.health().lanes.len(), 1);
+    assert_eq!(c.health().lanes.len(), 1, "health consumed the dirty queue");
+    c.sync().unwrap();
+    assert_eq!(c.stats().dirty_bytes, 0);
+    drop(fs);
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "s", "f"), "pending payload");
 }

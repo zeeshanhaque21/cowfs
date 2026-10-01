@@ -171,6 +171,10 @@ impl Queue {
         self.dirty_files.drain().collect()
     }
 
+    pub(crate) fn dirty_file_count(&self) -> usize {
+        self.dirty_files.len()
+    }
+
     /// Cancels a create that has not been taken by a flush yet, together with everything queued
     /// for that inode. Only valid when nothing else in the queue names the node.
     pub(crate) fn try_elide(&mut self, n: &Node) -> bool {
