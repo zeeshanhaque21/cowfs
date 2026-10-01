@@ -236,13 +236,11 @@ impl Inner {
             if let Some(n) = self.nodes.get(&ino) {
                 let _ = n
                     .handles
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1));
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1));
                 if let Ok(sc) = self.snapctx(ino) {
-                    let _ =
-                        sc.open_handles
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                                v.checked_sub(1)
-                            });
+                    let _ = sc
+                        .open_handles
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1));
                 }
                 self.try_reclaim(&n);
             }
@@ -258,12 +256,10 @@ impl Inner {
             return;
         };
         let mut under = false;
-        let _ = n
-            .refs
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                under = v < count;
-                Some(v.saturating_sub(count))
-            });
+        let _ = n.refs.try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            under = v < count;
+            Some(v.saturating_sub(count))
+        });
         if under {
             self.ctr.underflows.fetch_add(1, Ordering::Relaxed);
         }
