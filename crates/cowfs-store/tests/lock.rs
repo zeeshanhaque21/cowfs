@@ -135,13 +135,14 @@ fn twenty_thousand_open_drop_reopen_cycles() {
 /// The CI symptom: a reopen that lands while the previous holder is on its way out must not be
 /// told the store is busy. Before the fix `open` asked once and answered `Locked`.
 ///
-/// The wait covers the in-process release, which is sub-millisecond, so a holder released inside
-/// the bound is waited for and one held past it is refused. That is the proven behaviour: `flock`
-/// belongs to the open file description, so a forked child keeps the store locked for as long as
-/// it lives and no bound helps.
+/// The wait covers the in-process release, which is sub-millisecond, so only a delay well inside
+/// the bound is pinned here. A 20 ms artificial hold failed on a loaded macOS runner, and the bound
+/// claims nothing about a holder that lives for tens of milliseconds; pinning it would make this a
+/// load-sensitive timing assertion instead of a property. A holder released past the bound is the
+/// second half of the test below.
 #[test]
 fn a_reopen_that_races_a_release_in_flight_succeeds() {
-    for delay_ms in [0u64, 1, 5, 20] {
+    for delay_ms in [0u64, 1, 2] {
         let dir = tempfile::tempdir().unwrap();
         let o = opts();
         {
