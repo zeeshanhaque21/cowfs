@@ -564,7 +564,7 @@ explicit steps, so a caller can drive them and a crash can land between any two:
 | 2 | `begin_compaction(&plan, live)` | new pack created, header fsynced, `packs/` fsynced |
 | 3 | `copy_batch(&mut c, budget)` | none, records copied byte for byte into the page cache |
 | 4 | `finish_compaction(&c)` | new pack fsynced, `packs/` fsynced, index repointed, `index.cix` rewritten |
-| 5 | `discard_pack(id, condemned)` | `ACKED` appended and fsynced, pack unlinked, `packs/` fsynced, `SYNCED` base lowered |
+| 5 | `discard_pack(id, condemned)` | `SYNCED` base raised above the pack and fsynced, pack unlinked, `packs/` fsynced, then the whole-pack `ACKED` entry written |
 
 Invariants this crate keeps:
 
@@ -578,8 +578,16 @@ Invariants this crate keeps:
   `begin_compaction`.
   Rewriting it would copy only valid records and silently discard the damaged region, which is
   what `ACKED` and `Store::acknowledge_corruption` exist to make explicit.
-- `discard_pack` records the pack in `ACKED` before unlinking it and lowers `SYNCED`'s base, so a
-  crash between those steps is never reported as a missing synced pack.
+- `discard_pack` raises `SYNCED`'s base above the pack before unlinking it, so a crash in between
+  leaves a file the next open does not scan rather than a gap it reports as a loss.
+- The whole-pack `ACKED` entry is written **after** the unlink, and only then is it true.
+  `ack::find` treats a zero nonce as matching any nonce, so a whole-pack entry written while the
+  pack was still on disk would be a wildcard that swallows damage reported against it later, and a
+  pack id is never reused so nothing can legitimately come back to it.
+  This is the round 4-5 rule that `discard_pack` has to obey, and the crash-at-every-step test in
+  `tests/compact.rs` is what holds it there.
+- A collector pack comes from `alloc_id`, so its id is reserved durably before the file is created
+  and never comes back, even after the collector discards the pack.
 - Crash between any two steps leaves a consistent store.
   The copy is a real pack of real records, so `open` finds and indexes it; the source stays until
   step 5, so the index never names a file that is gone.

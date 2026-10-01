@@ -85,6 +85,32 @@ while blocks really are pinned, and does so on every poll, the collector will fr
 re-poll makes a *transient* lie harmless; it cannot make a *persistent* one safe. That is why the
 methods return `Result`.
 
+### What the collector does with the store
+
+The store refuses to be collected over when it is not in a state the collector understands, and the
+refusal happens before anything is copied or freed:
+
+- **A lock it does not hold.** `Store::open` returns `Error::Locked` with the holder's pid, so a
+  collector can never be built over a store another process holds. `Store::close` consumes the
+  store, and the collector holds an `Arc<Store>`, so there is no window in which a close has
+  happened and the collector then writes: the type system refuses it, not a runtime check.
+- **An unacknowledged loss.** `RecoveryReport::has_corruption` is true for unaccepted damage,
+  for a missing synced pack, and for a missing watermark with a discarded tail or a gap. A cycle
+  over any of those returns `Error::CorruptStore` before the mark, so it copies nothing and frees
+  nothing. Collecting over known data loss would replace a reported loss with a silent one.
+- **A pack it must not rewrite.** A pack with damage to durable bytes is refused by
+  `begin_compaction` and skipped with `SkipReason::Corrupt`, because rewriting it would copy only
+  the valid records and quietly drop the damaged region.
+- **A pack id it did not reserve.** Every collector pack comes from `alloc_id`, so the id is
+  reserved durably before the file exists and is never handed out again, including after the
+  collector discards that pack.
+
+The one ordering the collector owns end to end is copy, then fsync, then unlink:
+`finish_compaction` fsyncs the new pack and the index before `discard_pack` removes the source,
+and `discard_pack` raises the watermark floor before the unlink and writes the whole-pack acceptance
+after it. `docs/v1-store.md` spells that out and `crates/cowfs-store/tests/compact.rs` holds it
+with a crash at every step of the discard.
+
 ## Mark
 
 Marking walks `Snapshot::live_blocks` for every live snapshot and unions the ids, plus
