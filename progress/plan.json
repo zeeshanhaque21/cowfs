@@ -139,12 +139,12 @@
         {
           "id": "10",
           "title": "#10 garbage collection",
-          "state": "building",
+          "state": "fixing",
           "issue": 10,
-          "owner": "subagent (space bunny)",
+          "owner": "builder (subagent)",
           "pr": "#39",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/39",
-          "detail": "Builder writes docs/v1-gc.md first, then mark (subtree skipping, hole refs skipped, core pinned blocks via an ExtraRoots trait, epoch/grace protocol so blocks created during a mark are never swept), access-time hints (hint only), compaction (copy live records, fsync, manifest/watermark/index ordering, atomic swap), dry run, progress and cancellation. Crash injection at every compaction step, kill -9 loop, concurrent stress, negative control. Worktree slot 11, branch v1/10-gc. | Builder still working. Live CI red on both platforms at `cargo test --workspace` (head 664743c, mid-build). Must adopt the store's new pack-id allocator once #24 lands. | NOTE from the core critic: today's Core::pinned_blocks can return an EMPTY answer while a writer holds a node lock (38,372,183 of 38,374,217 polls). The core builder is making it exact or Err(Busy). GC's ExtraRoots must treat Err(Busy) as abort-the-sweep, never as 'nothing pinned'. Verify this when GC reports."
+          "detail": "Builder reports done (head bbb2679): mark with subtree skipping, hole refs skipped, ExtraRoots for core's pinned blocks, access-time hints (hint only), crash-safe compaction on the store's allocator, dry run, cancellation. Builder's numbers: 681 tests pass workspace-wide, cowfs-gc 47 tests, kill -9 x120 (370 live block reads verified), 4-ordering crash matrix with a negative control; mark of 33,516 live blocks 0.017 s, compaction 2.1 MiB/s (slow; sweep is quadratic in pack count via per-pack checkpoint, named as the first thing to fix). Builder found and fixed 2 of its own bugs (hints header written on every flush; bench corpus collided past 1000 files). NOT YET MERGEABLE: (1) ubuntu CI is red on the head, macOS passes; (2) SAFETY: ExtraRoots is infallible, so a pinned-blocks answer cannot be marked incomplete; core's pinned_blocks currently returns empty under write contention (core critic: 38.4M of 38.4M polls), which would let GC free live data: builder making the trait fallible with abort-the-sweep on any error and a re-poll after mark; (3) it carries 33 store files: waits on #24 (store, also fixing a Locked-after-drop race that hit GC's m09 test once); (4) no critic has reviewed it yet and it is the component that deletes data: a critic runs after these fixes. Design decisions in docs/v1-gc.md: the reference barrier is required for any free (without one GC only reports); cross-cycle incrementality is root-granular, node-level skipping needs a meta change. Gaps: 1M-block mark not run, two Gc handles over one store unsupported."
         },
         {
           "id": "11",
