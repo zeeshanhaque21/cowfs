@@ -68,6 +68,8 @@ Track all work as GitHub issues: `gh-axi issue list --repo zeeshanhaque21/cowfs`
 - Verify before any irreversible action (kill, delete, overwrite, drop).
   Check whether a process buffers before killing it.
   Long-running jobs must append and flush per item and resume from a partial file.
+- Load generators and other background loops (CPU burners, sleep-then-kill jobs, poll loops) run in the foreground under `trap '...' EXIT`, or write a PID file the next step kills. A tool timeout kills the shell and orphans them; on 2026-10-01 eight orphaned burners ran 9 hours at 100% CPU each.
+- Never leave a VM mount or FUSE mount wedged: unmount it and verify with `mount` before ending a turn. A stuck mount can hang the whole OrbStack machine in "stopping".
 - Every wait loop must exit on failure as well as success, and must have a no-progress timeout measured in minutes.
 
 ## Writing
