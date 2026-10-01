@@ -192,8 +192,10 @@ fn run_case(seed: u64, mode: WmMode, sector: u64) -> Result<(bool, bool), String
     {
         let s = Store::open_unsynced(img.path(), o).map_err(|e| format!("{tag}: open1 {e:?}"))?;
         let r = s.recovery().clone();
-        first_reported = r.has_corruption();
-        if first_reported && !matches!(mode, WmMode::BothTorn) {
+        // Damage the store could not classify (a cut made with no watermark) is reported until it
+        // is accepted, so it is expected here; anything else is a false report.
+        first_reported = r.has_corruption() && !r.corrupt_synced.iter().all(|c| c.unclassified);
+        if r.has_corruption() && first_reported && !matches!(mode, WmMode::BothTorn) {
             return Err(format!("{tag}: FALSE corruption on open1 {r:?}"));
         }
         check_acked(&s, &model, &acked, &format!("{tag} open1"));
@@ -211,7 +213,7 @@ fn run_case(seed: u64, mode: WmMode, sector: u64) -> Result<(bool, bool), String
     for (id, d) in &second {
         assert_eq!(&s.get(*id).unwrap(), d, "{tag}: second-cycle block lost");
     }
-    if r.has_corruption() {
+    if r.has_corruption() && !r.corrupt_synced.iter().all(|c| c.unclassified) {
         return Err(format!(
             "{tag}: FALSE corruption on open2 (after benign torn write + one sync): {:?}",
             r.corrupt_synced
@@ -286,8 +288,11 @@ fn d1_middle_gap_beyond_watermark_becomes_corruption_after_next_sync() {
     }
     let p = pack_path(dir.path(), 0);
     let f = OpenOptions::new().write(true).open(&p).unwrap();
-    f.write_at(&[0u8; 512], (16 + 2 * REC_HDR + 4000 + 100) as u64)
-        .unwrap();
+    f.write_at(
+        &[0u8; 512],
+        (PACK_HEADER.len() + 2 * REC_HDR + 4000 + 100) as u64,
+    )
+    .unwrap();
     drop(f);
     {
         let s = open(dir.path());
@@ -343,9 +348,13 @@ fn d2_missing_watermark_torn_tail() {
     }
     let s = open(dir.path());
     assert!(
-        !s.recovery().has_corruption(),
-        "torn tail became corruption"
+        s.recovery().has_corruption(),
+        "a cut made without a watermark destroys unclassifiable bytes, so it is a pending loss"
     );
+    assert_eq!(s.acknowledge_corruption().unwrap(), 1);
+    drop(s);
+    let s = open(dir.path());
+    assert!(!s.recovery().has_corruption(), "accepted");
 }
 
 /// N2: the watermark names packs that are gone. It must be loud and `sync` must keep fsyncing.
@@ -438,7 +447,7 @@ fn d5_bit_rot_in_the_checkpointed_region_is_found_by_verify_all_not_by_open() {
         .write(true)
         .open(pack_path(dir.path(), 0))
         .unwrap();
-    f.write_at(&[0xAB; 8], (16 + REC_HDR + 3000) as u64)
+    f.write_at(&[0xAB; 8], (PACK_HEADER.len() + REC_HDR + 3000) as u64)
         .unwrap();
     drop(f);
     let s = open(dir.path());
@@ -469,7 +478,7 @@ fn q1_repair_by_put_makes_later_opens_clean_with_and_without_the_index() {
         .unwrap();
     f.write_at(
         &[0xAB; 8],
-        (16 + (REC_HDR + 5000) * 2 + REC_HDR + 100) as u64,
+        PACK_HEADER.len() as u64 + ((REC_HDR + 5000) * 2 + REC_HDR + 100) as u64,
     )
     .unwrap();
     drop(f);
@@ -522,8 +531,11 @@ fn unknown_damage_needs_an_acknowledgement_that_survives_index_loss() {
         .write(true)
         .open(pack_path(dir.path(), 0))
         .unwrap();
-    f.write_at(&[0xEE; 10], (16 + REC_HDR + 3000 + 8) as u64)
-        .unwrap();
+    f.write_at(
+        &[0xEE; 10],
+        PACK_HEADER.len() as u64 + REC_HDR as u64 + 3008,
+    )
+    .unwrap();
     drop(f);
     {
         let s = open(dir.path());
@@ -556,7 +568,7 @@ fn q3_pack_truncated_at_boundary_below_watermark() {
         .write(true)
         .open(&p)
         .unwrap()
-        .set_len((16 + 3 * (REC_HDR + 5000)) as u64)
+        .set_len((PACK_HEADER.len() + 3 * (REC_HDR + 5000)) as u64)
         .unwrap();
     let s = open(dir.path());
     assert!(
@@ -583,7 +595,8 @@ fn q2_repair_beats_stale_checkpoint_entry() {
         .write(true)
         .open(pack_path(dir.path(), 0))
         .unwrap();
-    f.write_at(&[0xAB; 8], (16 + REC_HDR + 100) as u64).unwrap();
+    f.write_at(&[0xAB; 8], PACK_HEADER.len() as u64 + REC_HDR as u64 + 100)
+        .unwrap();
     drop(f);
     {
         let s = open(dir.path());
@@ -622,7 +635,8 @@ fn v1_bit_rot_after_verify_in_the_same_session_is_a_known_window() {
             .write(true)
             .open(pack_path(dir.path(), 0))
             .unwrap();
-        f.write_at(&[0xAB; 8], (16 + REC_HDR + 100) as u64).unwrap();
+        f.write_at(&[0xAB; 8], PACK_HEADER.len() as u64 + REC_HDR as u64 + 100)
+            .unwrap();
         drop(f);
         assert!(
             s.put(&d).is_ok(),
@@ -724,7 +738,7 @@ fn emfile_child() {
     hog.pop();
     assert!(
         s.put(&b).is_err(),
-        "one fd: the pack is created, the directory fsync fails"
+        "one fd: publishing the skipped reservation or the pack must fail"
     );
     assert!(
         !pack_path(dir, 1).exists(),
@@ -733,7 +747,13 @@ fn emfile_child() {
     drop(hog);
     let ib = s.put(&b).unwrap();
     assert_eq!(s.stats().packs, 2);
-    assert_eq!(pack_ids(dir), vec![0, 1]);
+    let ids = pack_ids(dir);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], 0);
+    assert!(
+        ids[1] > 1,
+        "the failed reservation must stay consumed: {ids:?}"
+    );
     assert_eq!(s.get(ia).unwrap(), a);
     assert_eq!(s.get(ib).unwrap(), b);
     s.sync().unwrap();
@@ -797,7 +817,7 @@ fn many_damaged_records_do_not_hide_the_valid_ones() {
     for i in 0..n / 2 {
         f.write_all_at(
             &[0xEE; 2],
-            (16 + i * (REC_HDR + 3000) + REC_HDR + 100) as u64,
+            (PACK_HEADER.len() + i * (REC_HDR + 3000) + REC_HDR + 100) as u64,
         )
         .unwrap();
     }
@@ -830,7 +850,10 @@ fn salvage_indexes_records_missing_from_a_loaded_index_and_repairs_bad_entries()
     pack.extend_from_slice(&good_a);
     pack.extend_from_slice(&rec_b);
     let slen = 3000u32;
-    let ix = index_bytes(&[(0, pack.len() as u64)], &[(ia, [0, 16, slen, slen])]);
+    let ix = index_bytes(
+        &[(0, pack.len() as u64)],
+        &[(ia, [0, PACK_HEADER.len() as u32, slen, slen])],
+    );
     install_wm(
         dir.path(),
         &[(0, &pack)],
@@ -883,8 +906,8 @@ fn a_swapped_index_is_rejected_as_a_mismatch_between_index_and_record() {
     let mut pack = PACK_HEADER.to_vec();
     pack.extend_from_slice(&record(0, 4000, *ia.as_bytes(), &a));
     pack.extend_from_slice(&record(0, 4000, *ib.as_bytes(), &b));
-    let oa = 16u32;
-    let ob = (16 + REC_HDR + 4000) as u32;
+    let oa = PACK_HEADER.len() as u32;
+    let ob = (PACK_HEADER.len() + REC_HDR + 4000) as u32;
     let ix = index_bytes(
         &[(0, pack.len() as u64)],
         &[(ia, [0, ob, 4000, 4000]), (ib, [0, oa, 4000, 4000])],
@@ -918,7 +941,10 @@ fn a_short_decode_is_corrupt_even_when_the_bytes_hash_to_the_id() {
     pack.extend_from_slice(&record(1, 1000, *id.as_bytes(), &payload));
     let ix = index_bytes(
         &[(0, pack.len() as u64)],
-        &[(id, [0, 16, payload.len() as u32, 1000])],
+        &[(
+            id,
+            [0, PACK_HEADER.len() as u32, payload.len() as u32, 1000],
+        )],
     );
     install_wm(
         dir.path(),

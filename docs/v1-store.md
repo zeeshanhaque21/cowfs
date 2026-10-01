@@ -14,10 +14,12 @@ Only the declared field enforces this: the crate was not built with a 1.89 toolc
 ```
 <store>/
   LOCK                  advisory lock, held while a Store is open
-  SYNCED                durable watermark and pack base, two CRC-protected 32 byte slots
-  ACKED                 optional list of accepted losses (see "Repair and acknowledgement")
+  SYNCED                durable watermark, pack base and pack id high-water, two CRC-protected 32 byte slots
+  ACKED                 optional list of pending and accepted losses (see "Repair and acknowledgement")
   index.cix             optional index checkpoint (rebuildable, see below)
   packs/pack-00000000.cpk
+  packs/pack-00000000.cpk.cut     optional durable length of a pack whose torn tail was cut
+  packs/pack-00000000.cpk.torn-0  optional preserved bytes of a discarded torn tail
   packs/pack-00000001.cpk
   ...
 ```
@@ -32,7 +34,20 @@ A pack starts with a 16 byte header, followed by records with no padding and no 
 |---|---|---|
 | 0 | 8 | magic `COWPACK\0` |
 | 8 | 4 | format version, `2` |
-| 12 | 4 | reserved, zero |
+| 12 | 4 | creation nonce, never 0 |
+
+The nonce is written once, into a file that is empty at the time, and never rewritten.
+It is what binds a checkpoint to one specific pack: a stale checkpoint that names pack `n` cannot
+validate against a different pack that happens to have that id.
+It is not a secret and not integrity protected; flipping it does not lose data, it only makes the
+checkpoint stale.
+Packs written by the version that had a zero there are read unchanged, and a checkpoint made by
+that version carries nonce 0, so both keep working.
+
+The durable length of a cut pack is kept beside the pack in `<pack>.cut` (12 bytes: the length and
+its CRC), written whole and renamed into place.
+Rewriting any byte of a sealed pack would open durable data to a torn write, so the label is a
+separate file.
 
 ### Record
 
@@ -111,7 +126,9 @@ A checkpoint is taken only after the packs it describes are synced, so every ent
   After `sync` returns, every `put` that returned earlier is durable.
   A `sync` with nothing new since the last one does no I/O.
 - Rolling to a new pack is transactional.
-  If creating the next pack fails (for example `EMFILE`), the half-made file is removed, no counter or writer state changes, and the error is returned.
+  The allocator reserves and fsyncs the next id under the writer mutex before creating its file.
+  If creating the next pack fails (for example `EMFILE`), the half-made file is removed, no pack counter or active writer changes, and the error is returned.
+  The reserved id remains consumed; a retry uses a higher id.
   A later `put` retries and succeeds once resources return.
   An empty leftover pack file at the next id is reused, and one that holds data is never overwritten (the roll fails instead).
 - Creating a store or a pack fsyncs the new file and every directory entry that names it: the store directory and its parent, `packs/`, `LOCK`, `SYNCED`, and each pack.
@@ -124,13 +141,28 @@ A checkpoint is taken only after the packs it describes are synced, so every ent
 
 ### The watermark
 
-`SYNCED` holds `(pack, len)` and `base`, the lowest pack id that must exist.
-Missing packs between `base` and the highest known pack are reported as `missing_synced`.
+`SYNCED` holds `(pack, len)`, `base`, the lowest pack id that must exist, and `next`, the lowest
+pack id this store may create.
+Missing packs between `base` and the watermark's pack are reported as `missing_synced`.
+Ids reserved but never created are not lost packs.
+Before a later watermark crosses those holes, their whole-pack entries are durably recorded as accepted in `ACKED`.
+`next` is what makes a pack id permanent: it never falls, it is fsynced before the pack file that
+uses the id is created, and it is raised again whenever the watermark advances.
+So an id that has ever been used is never handed out again, not after a pack is deleted, not after
+an acknowledgement, and not after a loss.
+The trade is that the pack files alone are not enough to tell a deleted pack from one that never
+existed: if `SYNCED` is lost, the allocator falls back to "one above the highest pack on disk" and
+can reuse an id. That case is covered by the pack nonce, which stops a stale checkpoint from
+validating against the recreated pack.
 `(pack, len)` means: everything in packs below `pack`, and the first `len` bytes of pack `pack`, were fsynced before this value was written.
 It exists so that recovery can tell a torn tail (bytes after the watermark, never promised durable) from corruption of synced data (bytes before it).
 It has two 32 byte slots written alternately, each with a sequence number and a CRC, so a torn write of one slot leaves the other.
 
 Ordering, enforced by tests through the fsync trace seam:
+
+For every pack creation, including recovery, rollover and `new_pack`: reserve `id + 1`, write and fsync `SYNCED`, then create the pack.
+The writer mutex serializes rollover and `new_pack` reservations; recovery holds the directory lock before a writer exists.
+This reservation does not advance the data watermark.
 
 1. fsync the pack data.
 2. Write the new watermark and fsync `SYNCED`.
@@ -139,7 +171,8 @@ A crash between 1 and 2 leaves the watermark lower than the truth.
 That is safe: the extra bytes are treated as tail, and open indexes every valid record in them and only cuts what does not verify.
 A watermark higher than the truth is impossible unless a disk lies.
 If a pack is shorter than the watermark says, open reports that as corruption.
-A missing or unreadable `SYNCED` next to existing packs is reported (`watermark_missing`), and the whole last pack is then treated as unclassifiable: any damage in it is reported, loudly, once.
+A missing or unreadable `SYNCED` next to existing packs is reported (`watermark_missing`), and the last pack is then treated as unclassifiable: only its header was promised durable.
+Any damage in it is reported, and because the store cannot say whether those bytes were ever durable, cutting them is recorded as a pending loss that stays reported until somebody accepts it.
 Open never advances the watermark over a region that is not resolved (cut or verified), and never lowers it.
 When the watermark names a pack that is not on disk, open reports `missing_synced` and `sync` keeps fsyncing whatever it appends.
 
@@ -158,6 +191,10 @@ When the watermark names a pack that is not on disk, open reports `missing_synce
 - Index inserts happen inside the writer mutex, after the record is fully written.
   A reader that sees an index entry can therefore always read its bytes.
 - `LOCK` holds an exclusive `flock` (`File::try_lock`), so a second `Store::open` on the same directory fails with `Error::Locked`, in this process and in another one.
+  Open retries for a 250 ms wall-clock budget before refusing a live owner; scheduler delays can overrun that budget.
+  This wait is a mitigation for the hypothesis of an overlapping lock release, not a proven explanation or fix for the intermittent macOS CI failure.
+  The original failure was not reproduced locally and its cause remains unknown.
+  Tests separately pin refusal of a live Store and a second process.
   The kernel drops the lock when the process dies, including `kill -9`, so a crashed store reopens.
   Both cases are tested.
   Locking on a network filesystem was not tested and is not claimed.
@@ -208,10 +245,25 @@ Steps:
    Only when that cap is hit is the rest of the pack reported as one gap, and then it is never cut.
    A damaged record therefore never hides the valid records after it: only records that overlap damaged bytes are lost.
 7. Classify each bad region with the watermark.
-   In the last pack, the first bad region at or after the watermark starts the torn tail.
-   Everything from there is preserved (first 1 MiB) in `<pack>.torn-<n>`, valid records after it are moved down over it (`recovered_from_tail`), and the pack is truncated and fsynced.
-   A bad region before the watermark, or in a sealed pack, is corruption: never cut, never erased, listed in `corrupt_synced` with pack, offset, length and the id its header claims when that still parses.
+   Any pack, active or not, has a durable length: the watermark for the pack it names, its `.cut`
+   label if it was cut, and its whole length otherwise. A pack above the watermark was written
+   after the last completed `sync`, so nothing in it was promised and its durable length is zero.
+   The first bad region at or after that length starts the torn tail.
+   Everything from there is preserved (first 1 MiB) in `<pack>.torn-<n>`, then:
+   - nothing verifiable past the tear: the pack is cut at that point and fsynced;
+   - something verifiable past the tear: the records are read into memory, written into a new pack
+     with a fresh id and fsynced there, and only then is the old pack cut (`recovered_from_tail`).
+     Copy-then-swap, so a crash in the middle of a move never leaves a record half written, and a
+     crash before the new pack is durable leaves the old pack whole and the next open repeats it.
+   A bad region before that length is corruption: never cut, never erased, listed in
+   `corrupt_synced` with pack, offset, length and the id its header claims when that still parses.
    `get` of such an id returns `Error::Corrupt`, and `fsck` lists the region.
+   A cut made while the watermark file was missing cannot be classified, so it is recorded as a
+   pending loss with `CorruptRegion::unclassified` set and stays reported until it is accepted.
+   A damaged record beyond an older watermark is likewise unclassified when another watermark slot is torn.
+   Before sidecar retention, cut-label publication, relocation or truncation can discard evidence, the pending-loss marker is written to `ACKED.tmp`, fsynced, renamed to `ACKED`, and its directory fsynced.
+   Recovery of a short header that the watermark had promised also saves the loss marker before resetting the file.
+   Header rewrites follow durable loss recording.
 8. A pack that contains any bad region is not appended to: open starts a new pack.
 9. Every pack that contributed records or a cut is fsynced, then the watermark is advanced to the end of the active pack.
    Nothing unresolved sits below it, so a later `sync` can never bless leftover damage as durable.
@@ -237,8 +289,27 @@ Data that a pack holds between the watermark and its true end (sealed, but past 
   `Store::acknowledge_corruption()` appends the current `corrupt_synced` regions and missing packs to `ACKED`, fsynced, and lowers the watermark base for missing packs.
   Later opens list them under `acknowledged` and `has_corruption()` is false.
   The bytes stay on disk and the blocks stay unreadable until they are put again.
-- `Store::salvage()` re-indexes every record that verifies (structure, both CRCs, hash) in every pack, including packs with damaged regions, and repairs index entries that cannot be read.
-  It never writes to a pack.
+- `Store::salvage()` slides over every byte of every pack and indexes every record that verifies:
+  header structure, both checksums and the BLAKE3 of the payload.
+  It trusts nothing a header claims, so a flood of forged headers with valid checksums costs one
+  payload read each instead of hiding the real records, and it is linear in the pack size.
+  It repairs index entries that cannot be read and clears the rescan set, so a checkpoint written
+  after it keeps the salvaged records. It never writes to a pack.
+- `Store::new_pack()` creates a pack for compaction to write into. It comes from the same allocator
+  as a rollover, so the two never collide, and the id is recorded as used so a later rollover steps
+  over it. Any code that creates packs must use it.
+
+### Threat model
+
+cowfs assumes a single user on one host and no attacker.
+A header carries two checksums, so damage from a crash or bit rot cannot produce a header that
+passes them, and a record is only ever served after its payload hash matches its id.
+An attacker who can write to the store directory can rewrite a whole pack, including checksums,
+and can then claim any id for any bytes; nothing in this crate defends against that, and no format
+field is a secret.
+What the checksums and the work bound do buy is that crafted input cannot make open read without
+limit: the payload bytes read for header candidates are capped at twice the pack bytes plus 1 MiB,
+and salvage, which has no bound, is a repair tool an operator runs on a store that already needs it.
 
 ### A known window: rot after verification
 
@@ -272,6 +343,7 @@ Store::ingest(&self, impl Read) -> Result<Vec<ChunkRef>>
 Store::ingest_bytes(&self, &[u8]) -> Result<Vec<ChunkRef>>
 Store::sync(&self) -> Result<()>
 Store::checkpoint(&self) -> Result<()>
+Store::close(self) -> Result<()>                    // synchronous shutdown, reports errors
 Store::stats(&self) -> Stats
 Store::iter_ids(&self) -> impl Iterator<Item = BlockId>
 Store::fsck(&self) -> Result<FsckReport>
@@ -294,7 +366,7 @@ Only `put`, no `delete`: blocks leave the store only through compaction.
 
 ## Measured performance
 
-Tool: `cargo run --release -p cowfs-store --example bench -- <data-dir> <store-dir> [MiB] [runs]`.
+Tool: `cargo run --release -p cowfs-store --example store-bench -- <data-dir> <store-dir> [MiB] [runs]`.
 Data: every second file of `RuView/v2/target` (a Rust build output), 3,921 files, 1,037 MiB, 15,029 chunks, average chunk 72,405 bytes.
 Machine: Apple M3 Max, shared with about 19 other sessions.
 Load average during the last full run went from 35 to 140, so every figure is a noisy lower bound.
@@ -444,3 +516,96 @@ The earlier labels N17, N18, N19 and N22 were from round 1 on commit 85727dc: N1
 
 A known gap that no mutant can show: a sealed pack that is cut short at a record boundary is only noticed through the index checkpoint, because nothing else records a sealed pack's length.
 Without the index, open sees a shorter but well-formed pack.
+
+## Round 3: measured results
+
+All runs on the Apple M3 Max, `cargo -j4`, release build for the long runs, with other work on the
+machine. Every figure below is from a run whose output was read, not from an estimate.
+
+### Crash-reopen model (`tests/crash.rs`)
+
+A history of puts, syncs and checkpoints, a power cut at any operation, then open, and again until
+a full recovery, with the checkpoint written at random points.
+`C7C_SEEDS=1000` is 4000 cases, about 12 minutes.
+
+| Cases | Acked blocks lost | Wrong bytes served | False corruption report | fsck dirty | Open failures |
+|---|---|---|---|---|---|
+| 800 (default) | 0 | 0 | 0 | 0 | 0 |
+| 4000 (`C7C_SEEDS=1000`) | 0 | 0 | 0 | 0 | 0 |
+
+The same harness on the pre-round-3 code also reported 0 lost and 0 false corruption on its 800
+seeds, so the new recovery rules did not cost that property; the round-3 tests are what make the
+losses that *were* possible before impossible.
+
+### Power-loss model (`tests/round2.rs`)
+
+`COWFS_POWERLOSS_SEEDS=400` is 1800 cases, 324 s.
+0 acked blocks lost, 0 wrong bytes, 0 reports of damage that a sync had not promised.
+
+### Eight threads for three minutes (`tests/stress.rs`)
+
+`C7C_SECS=180`, 50 KB packs, two read handles open, puts, gets, syncs, checkpoints, fsck, salvage
+and acknowledgements all at once.
+
+```
+ops=29638 errors=0 model=13262 stats.blocks=13262 iter_ids=13262
+fsck.verified=13262 fsck.dupes=0 stats.packs=1280 disk.packs=1280
+stats.pack_bytes=58828455 disk.bytes=58828455
+reopen ok, corruption=false torn=0
+```
+
+### Throughput on the round-3 code
+
+`examples/bench.rs` on a treehouse pool (9908 files, 618 MiB, stride 3), release build, n=5,
+under the shared benchmark lock, machine load 28 to 50 throughout, so the spread is the machine.
+
+| Metric | median | min | max |
+|---|---|---|---|
+| Chunk plus hash, 1 thread | 430 MiB/s | 350 | 508 |
+| Ingest plus sync, 1 thread | 191 MiB/s | 165 | 220 |
+| Ingest plus sync, 8 threads | 501 MiB/s | 399 | 695 |
+| Verified read, 1 thread | 547 MiB/s | 460 | 602 |
+| Verified read, 8 threads | 3049 MiB/s | 2783 | 3480 |
+| Re-ingest of duplicates after reopen, 1 thread | 785 MiB/s | 773 | 1112 |
+| Re-ingest of duplicates, warm session, 1 thread | 996 MiB/s | 830 | 1077 |
+| Re-ingest of duplicates, warm session, 8 threads | 5973 MiB/s | 5708 | 7099 |
+| Index lookup (`contains`) | 30350 k/s | 19797 | 30518 |
+
+Store after the run: 8019 blocks, 430 MiB uncompressed unique, 151 MiB stored, 4.09x on the input,
+`fsck` clean.
+
+These are single figures on a loaded shared machine, not a comparison.
+The round-2 A/B in the table above stands as the only measured before-and-after, and it was itself
+inconclusive. The new work is in the open path, not in `put` or `get`, so the hot path is unchanged
+by inspection rather than by measurement.
+
+### Mutation testing, round 3 (`tests/mutate3.py`)
+
+14 mutations of the round-3 code, run against `round3`, `round2`, `store` and `durability`, plus the
+library unit tests for the ones they cover. Results in `target/mut3/results.txt`.
+
+Killed: N02 (a checkpoint may validate against a recreated pack), N05 (the work bound refuses a
+candidate that exactly fits), N06 (a repairing `put` leaves the block in the damaged list), N07 (an
+acknowledgement does not sync first), N08 (a pack with a lost header is refused again), N09 (salvage
+trusts the header instead of the payload hash), N10 (sidecars are never pruned), N12 (an
+unclassifiable cut is not remembered), N14 (salvage does not clear the rescan set).
+
+Survivors, all three equivalent:
+
+- N01 (the allocator ignores the `ACKED` pack ids): equivalent while the watermark holds.
+  Losing `SYNCED` loses the high-water, and then `base` and `acked` are what still keep an
+  acknowledged id from coming back, so this is the second line of the same property.
+- N03 (records are moved down in reverse order): equivalent.
+  Relocation writes whole records into a new pack and indexes them by id; nothing reads them in
+  file order, and the copy never overlaps its source.
+- N11 (a pack above the watermark uses 0 instead of its cut label): equivalent.
+  A pack above the watermark was written after the last `sync`, so treating all of it as
+  unpromised is the same answer the label gives.
+
+Two mutations from the critic's list are answered by superseding rather than by a new test: M01 and
+M02 (dropping or ignoring `base`) target a field whose role changed. The slot now carries the pack
+id high-water instead, `base` is the lowest pack that must exist, and a missing pack stays reported
+because an `ACKED` entry must be accepted before it is silent, which `d4` and `p13` cover.
+M04 (moving records down in place) is gone with the in-place move: recovery copies into a new pack
+and only then cuts, which `f4_two_torn_regions_survive_a_crash_at_every_write` exercises at every
+write of the recovery.

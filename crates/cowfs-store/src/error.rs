@@ -36,6 +36,16 @@ pub enum Error {
         /// What failed.
         reason: &'static str,
     },
+    /// A torn tail could not be preserved in a sidecar, so nothing was cut.
+    #[error("torn bytes at offset {offset} of pack {pack} cannot be preserved: {reason}")]
+    Quarantine {
+        /// Pack id.
+        pack: u32,
+        /// Offset of the discarded region.
+        offset: u64,
+        /// Why the sidecar could not be written.
+        reason: String,
+    },
     /// Another handle holds the store lock.
     #[error("store {0} is open elsewhere")]
     Locked(PathBuf),

@@ -35,11 +35,15 @@ fn name(p: &std::path::Path) -> String {
 }
 
 fn assert_in_order(ops: &[Op], want: &[Op]) {
+    assert_in_order_msg(ops, want, "wrong op order")
+}
+
+fn assert_in_order_msg(ops: &[Op], want: &[Op], msg: &str) {
     let mut it = ops.iter();
     for w in want {
         assert!(
             it.any(|o| o == w),
-            "{w:?} missing or out of order in {ops:#?}"
+            "{msg}: {w:?} missing or out of order in {ops:#?}"
         );
     }
 }
@@ -102,7 +106,13 @@ fn rolling_syncs_the_sealed_pack_then_creates_and_syncs_the_next() {
     s.put(&random(2, 100)).unwrap();
     assert_eq!(
         take(&t),
-        vec![sync(P0), create(P1), sync(P1), dir_sync("packs")]
+        vec![
+            sync(P0),
+            sync("SYNCED"),
+            create(P1),
+            sync(P1),
+            dir_sync("packs")
+        ]
     );
     s.sync().unwrap();
     assert_eq!(take(&t), vec![sync(P1), sync("SYNCED")]);
@@ -144,7 +154,7 @@ fn recovery_syncs_what_it_scanned_and_what_it_truncated() {
     assert_eq!(
         take(&t),
         vec![sync(P0)],
-        "rebuild scan syncs the pack it read"
+        "an unchanged watermark needs no rewrite"
     );
 
     OpenOptions::new()
@@ -153,9 +163,30 @@ fn recovery_syncs_what_it_scanned_and_what_it_truncated() {
         .unwrap()
         .write_all(&[7u8; 30])
         .unwrap();
-    let s = Store::open_traced(dir.path(), opts(), Arc::clone(&t)).unwrap();
-    assert_eq!(take(&t), vec![Op::Truncate(P0.into()), sync(P0)]);
+    let t2 = Arc::clone(&t);
+    let s = Store::open_traced(dir.path(), opts(), t2).unwrap();
+    // The tail is copied to a sidecar and the pack is labelled before it is cut, so a cut that is
+    // interrupted is recognizable next time. The watermark itself does not move: the cut lands
+    // exactly on it.
+    assert_in_order(
+        &take(&t),
+        &[
+            create("pack-00000000.cpk.torn-0"),
+            sync("pack-00000000.cpk.torn-0"),
+            Op::DirSync("packs".into()),
+            create("pack-00000000.cpk.cut.tmp"),
+            sync("pack-00000000.cpk.cut.tmp"),
+            Op::Rename(
+                "pack-00000000.cpk.cut.tmp".into(),
+                "pack-00000000.cpk.cut".into(),
+            ),
+            Op::DirSync("packs".into()),
+            Op::Truncate(P0.into()),
+            sync(P0),
+        ],
+    );
     assert_eq!(s.recovery().truncated_bytes, 30);
+    assert_eq!(s.recovery().torn_sidecars.len(), 1);
 }
 
 #[test]
@@ -203,7 +234,10 @@ fn wrong_hash_store(compressed: bool) -> (tempfile::TempDir, BlockId, Vec<u8>) {
     pack.extend_from_slice(&rec);
     let ix = index_bytes(
         &[(0, pack.len() as u64)],
-        &[(id, [0, 16, payload.len() as u32, ulen])],
+        &[(
+            id,
+            [0, PACK_HEADER.len() as u32, payload.len() as u32, ulen],
+        )],
     );
     install_wm(
         dir.path(),

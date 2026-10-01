@@ -1,11 +1,11 @@
 //! Every durability-relevant call goes through [`Io`], so tests can record the order of writes
 //! and fsyncs, and a crash model can rebuild the disk image from them.
 
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// One recorded durability operation. Names are file names relative to the store directory.
@@ -68,45 +68,38 @@ pub enum LogOp {
     Marker(u64),
 }
 
-static LOG: AtomicBool = AtomicBool::new(false);
-static LOG_OPS: Mutex<Vec<LogOp>> = Mutex::new(Vec::new());
+thread_local! {
+    /// Per thread, so tests that run beside each other cannot log into each other's model.
+    static LOG: RefCell<Option<Vec<LogOp>>> = const { RefCell::new(None) };
+}
 
-/// Start recording data writes and fsyncs into a global log. For the crash model.
+/// Start recording data writes and fsyncs into this thread's log. For the crash model.
 #[doc(hidden)]
 pub fn oplog_start() {
-    LOG.store(true, Relaxed);
-    LOG_OPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
+    LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
 }
 
 /// Stop recording and take the log.
 #[doc(hidden)]
 pub fn oplog_take() -> Vec<LogOp> {
-    LOG.store(false, Relaxed);
-    std::mem::take(&mut *LOG_OPS.lock().unwrap_or_else(PoisonError::into_inner))
+    LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
 }
 
 /// Put a marker in the log, so a test can tell where a sync was called.
 #[doc(hidden)]
 pub fn oplog_marker(v: u64) {
-    if LOG.load(Relaxed) {
-        LOG_OPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(LogOp::Marker(v));
-    }
+    log_data(LogOp::Marker(v));
 }
 
 fn log_data(op: LogOp) {
-    if LOG.load(Relaxed) {
-        LOG_OPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(op);
-    }
+    LOG.with(|l| {
+        if let Some(v) = &mut *l.borrow_mut() {
+            v.push(op);
+        }
+    });
 }
+
+// The log itself lives in the thread local above.
 
 /// Shared log of [`Op`]s, filled while a store built with `Store::open_traced` runs.
 #[doc(hidden)]
@@ -152,7 +145,10 @@ impl Io {
             off,
             data: buf.to_vec(),
         });
-        file.write_all_at(buf, off)
+        file.write_all_at(buf, off)?;
+        #[cfg(feature = "fault-injection")]
+        fault_boundary("write");
+        Ok(())
     }
 
     pub(crate) fn sync_file(&self, file: &File, path: &Path) -> io::Result<()> {
@@ -161,7 +157,20 @@ impl Io {
         if self.nosync {
             return Ok(());
         }
-        file.sync_data()
+        file.sync_data()?;
+        #[cfg(feature = "fault-injection")]
+        {
+            fault_boundary("sync");
+            if std::env::var("C7D_EXIT_FILE").ok().as_deref() == Some(name(path).as_str())
+                && std::env::var("C7D_EXIT_LEN")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    == Some(file.metadata()?.len())
+            {
+                std::process::exit(77);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn sync_dir(&self, dir: &Path) -> io::Result<()> {
@@ -171,12 +180,18 @@ impl Io {
         if self.nosync {
             return Ok(());
         }
-        d.sync_all()
+        d.sync_all()?;
+        #[cfg(feature = "fault-injection")]
+        fault_boundary("sync");
+        Ok(())
     }
 
     pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.log(|| Op::Rename(name(from), name(to)));
-        std::fs::rename(from, to)
+        std::fs::rename(from, to)?;
+        #[cfg(feature = "fault-injection")]
+        fault_boundary("rename");
+        Ok(())
     }
 
     pub(crate) fn truncate(&self, file: &File, path: &Path, len: u64) -> io::Result<()> {
@@ -185,7 +200,10 @@ impl Io {
             file: name(path),
             len,
         });
-        file.set_len(len)
+        file.set_len(len)?;
+        #[cfg(feature = "fault-injection")]
+        fault_boundary("truncate");
+        Ok(())
     }
 
     /// Write a whole file, fsync it, rename it into place and fsync the directory.
@@ -199,6 +217,8 @@ impl Io {
             .open(&tmp)?;
         self.created(&tmp);
         f.write_all(data)?;
+        #[cfg(feature = "fault-injection")]
+        fault_boundary("write");
         self.sync_file(&f, &tmp)?;
         self.rename(&tmp, &dst)?;
         self.sync_dir(dir)
@@ -229,5 +249,18 @@ impl Io {
         self.sync_dir(dir)?;
         let parent = dir.parent().filter(|p| !p.as_os_str().is_empty());
         self.sync_dir(parent.unwrap_or_else(|| Path::new(".")))
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+fn fault_boundary(kind: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ALL: AtomicU64 = AtomicU64::new(0);
+    static SYNCS: AtomicU64 = AtomicU64::new(0);
+    let n = ALL.fetch_add(1, Relaxed) + 1;
+    let target = |key| std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok());
+    let sync = kind == "sync" && target("C7D_EXIT_SYNC_N") == Some(SYNCS.fetch_add(1, Relaxed) + 1);
+    if target("C7D_EXIT_BOUNDARY_N") == Some(n) || sync {
+        std::process::exit(77);
     }
 }

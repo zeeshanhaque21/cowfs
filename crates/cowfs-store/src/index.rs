@@ -13,7 +13,8 @@ use crate::record::HEADER_LEN;
 use crate::{BlockId, BLOCK_ID_LEN};
 
 const SHARDS: usize = 64;
-const MAGIC: [u8; 8] = *b"COWIDX01";
+const MAGIC: [u8; 8] = *b"COWIDX02";
+const PACK_LEN: usize = 16;
 pub(crate) const FILE_NAME: &str = "index.cix";
 const ENTRY_LEN: usize = BLOCK_ID_LEN + 16;
 
@@ -175,9 +176,9 @@ impl Index {
     }
 }
 
-/// A loaded checkpoint: per pack, the length up to which records are indexed, and the entries.
+/// A loaded checkpoint: per pack, the length indexed, its creation nonce, and the entries.
 pub(crate) struct Checkpoint {
-    pub packs: Vec<(u32, u64)>,
+    pub packs: Vec<(u32, u64, u32)>,
     pub entries: Vec<(BlockId, Loc)>,
 }
 
@@ -211,14 +212,14 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<Checkpoint> {
     let nentries = usize::try_from(c.u64()?).ok()?;
     if c.0.len()
         != npacks
-            .checked_mul(12)?
+            .checked_mul(PACK_LEN)?
             .checked_add(nentries.checked_mul(ENTRY_LEN)?)?
     {
         return None;
     }
     let mut packs = Vec::with_capacity(npacks);
     for _ in 0..npacks {
-        packs.push((c.u32()?, c.u64()?));
+        packs.push((c.u32()?, c.u64()?, c.u32()?));
     }
     let mut entries = Vec::with_capacity(nentries);
     for _ in 0..nentries {
@@ -244,16 +245,17 @@ pub(crate) fn load(store: &Path) -> Option<Checkpoint> {
 pub(crate) fn save(
     io: &Io,
     store: &Path,
-    packs: &[(u32, u64)],
+    packs: &[(u32, u64, u32)],
     entries: &[(BlockId, Loc)],
 ) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(20 + packs.len() * 12 + entries.len() * ENTRY_LEN + 4);
+    let mut buf = Vec::with_capacity(20 + packs.len() * PACK_LEN + entries.len() * ENTRY_LEN + 4);
     buf.extend_from_slice(&MAGIC);
     buf.extend_from_slice(&(packs.len() as u32).to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-    for (id, len) in packs {
+    for (id, len, nonce) in packs {
         buf.extend_from_slice(&id.to_le_bytes());
         buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&nonce.to_le_bytes());
     }
     for (id, loc) in entries {
         buf.extend_from_slice(id.as_bytes());

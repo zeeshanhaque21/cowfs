@@ -8,6 +8,13 @@ repository.workspace = true
 publish.workspace = true
 rust-version = "1.89"
 
+[features]
+fault-injection = []
+
+[[example]]
+name = "store-bench"
+path = "examples/bench.rs"
+
 [dependencies]
 blake3.workspace = true
 thiserror.workspace = true
