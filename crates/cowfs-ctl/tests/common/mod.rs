@@ -165,6 +165,20 @@ pub fn wait_for(what: &str, cond: impl Fn() -> bool) {
     }
 }
 
+/// Sends a request and returns the first frame that is not progress.
+pub fn req(r: &mut Raw, id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+    r.send(
+        &serde_json::json!({"type": "request", "id": id, "method": method, "params": params})
+            .to_string(),
+    );
+    r.recv_final()
+}
+
+/// The error code of an error frame, or a marker when the frame is not an error.
+pub fn code_of(f: &serde_json::Value) -> &str {
+    f["error"]["code"].as_str().unwrap_or("not-an-error")
+}
+
 pub fn code(err: ClientError) -> ErrorCode {
     match err {
         ClientError::Server(e) => e.code,

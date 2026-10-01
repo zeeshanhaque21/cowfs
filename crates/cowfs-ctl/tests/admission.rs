@@ -5,6 +5,7 @@ mod common;
 
 use common::*;
 use cowfs_ctl::*;
+use serde_json::json;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -486,8 +487,34 @@ fn a4_reset_rejects_unknown_params_and_rm_validates_the_name() {
     assert_eq!(code_of(&r.recv_final()), "invalid_params");
 }
 
-fn code_of(f: &serde_json::Value) -> &str {
-    f["error"]["code"].as_str().unwrap_or("not-an-error")
+#[test]
+fn a5_a_holder_is_reported_before_the_snapshot_is_looked_up() {
+    let _w = Watchdog::start(60);
+    let holder = ProcessInfo {
+        pid: 7,
+        command: "x".into(),
+        holds: vec![],
+    };
+    let fx = start(stub().with_process("held", holder));
+    let mut r = Raw::hello(&fx.path);
+    assert_eq!(
+        req(&mut r, 1, "snapshot_create", json!({"name": "base"}))["type"],
+        "response"
+    );
+    assert_eq!(
+        code_of(&req(
+            &mut r,
+            2,
+            "snapshot_reset",
+            json!({"name": "held", "from": "ghost"})
+        )),
+        "busy",
+        "the framework holder check runs before the backend looks the snapshots up"
+    );
+    assert_eq!(
+        code_of(&req(&mut r, 3, "snapshot_rm", json!({"name": "held"}))),
+        "busy"
+    );
 }
 
 fn bounded_connect(path: &std::path::Path) -> Client {
