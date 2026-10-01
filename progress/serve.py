@@ -154,5 +154,4 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8780
-    threading.Thread(target=_measure_sizes, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()

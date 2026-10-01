@@ -1,0 +1,18 @@
+[package]
+name = "cowfs-vfs-path"
+description = "A Vfs over a directory path, to run the conformance suite on native filesystems and through mounts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cowfs-vfs = { path = "../cowfs-vfs" }
+libc = "0.2"
+
+[dev-dependencies]
+cowfs-vfs-test = { path = "../cowfs-vfs-test" }
+
+[lints]
+workspace = true

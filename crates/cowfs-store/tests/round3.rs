@@ -861,3 +861,53 @@ fn f1_random_sequences_keep_every_acked_block_readable() {
         }
     }
 }
+
+/// F1, second half: with the watermark gone the allocator falls back to the pack files, so an id can
+/// be used again. The checkpoint that named the old pack must not be trusted for the new one.
+#[test]
+fn f1_a_stale_checkpoint_never_validates_against_a_recreated_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = Store::open(dir.path(), small()).unwrap();
+        for i in 0..14 {
+            s.put(&random(i, 9000)).unwrap();
+        }
+        s.sync().unwrap();
+        s.checkpoint().unwrap();
+    }
+    let top = *pack_ids(dir.path()).last().unwrap();
+    fs::remove_file(pack_path(dir.path(), top)).unwrap();
+    // No acknowledgement: the loss is still open, and losing the watermark drops the durable
+    // high-water, so the allocator may hand the same id out again.
+    let _ = fs::remove_file(dir.path().join("SYNCED"));
+    {
+        let s = Store::open(dir.path(), small()).unwrap();
+        s.put(&random(200, 4000)).unwrap();
+        s.sync().unwrap();
+    }
+    assert!(
+        pack_ids(dir.path()).contains(&top),
+        "without a watermark the id is reused, which is what this test needs: {:?}",
+        pack_ids(dir.path())
+    );
+    let s = Store::open(dir.path(), small()).unwrap();
+    assert!(
+        !s.recovery().index_loaded,
+        "a checkpoint that names a pack id must not survive that pack being recreated: {:?}",
+        s.recovery()
+    );
+    let d = random(200, 4000);
+    assert_eq!(
+        s.get(BlockId::of(&d)).unwrap(),
+        d,
+        "the new block must be readable"
+    );
+    s.checkpoint().unwrap();
+    drop(s);
+    let s = Store::open(dir.path(), small()).unwrap();
+    assert_eq!(
+        s.get(BlockId::of(&d)).unwrap(),
+        d,
+        "and after a fresh checkpoint"
+    );
+}
