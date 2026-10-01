@@ -27,8 +27,17 @@ Blocks that only memory names are reached through the [`ExtraRoots`](#extraroots
 
 ```rust
 pub trait ExtraRoots {
-    fn pinned_blocks(&self) -> Vec<BlockId>;
-    fn reference_barrier(&self) -> Option<Box<dyn Barrier + Send>> { None }
+    fn pinned_blocks(&self) -> Result<Vec<BlockId>, RootsError>;
+    fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier + Send>>, RootsError> {
+        Ok(None)
+    }
+}
+
+pub enum RootsError {
+    /// A writer holds a lock the answer needs. Try again later.
+    Busy,
+    /// The answer cannot be produced at all.
+    Unavailable,
 }
 ```
 
@@ -38,8 +47,43 @@ committed yet, which is what `Core::pinned_blocks` already provides.
 `reference_barrier` returns a guard that, while alive, keeps the reference side still: no new
 metadata commit can make a new block reference visible.
 `cowfs-core` returns its flusher lock.
-`None` means the caller offers no ordering, and the collector then reports candidates and
+`Ok(None)` means the caller offers no ordering, and the collector then reports candidates and
 reclaims nothing (see "The barrier is required").
+
+### The contract core must meet
+
+**Both methods are fallible, and that is the whole point of them.**
+
+The reason is measured, not theoretical. `Core::pinned_blocks` returns an empty vector whenever
+any writer holds a node lock: 38,372,183 of 38,374,217 polls against a live writer returned zero of
+three chunks. A collector cannot tell that answer from "nothing is pinned", so a garbage collector
+wired to that implementation frees whatever those writers have in flight. Those three chunks were
+live data. This is the single worst failure mode in the crate, because it is silent and it deletes
+the thing the whole design exists to protect.
+
+So the rules are:
+
+1. **An answer is exact or it is an error.** There is no partial answer. If you cannot enumerate
+   every block you hold right now, return `RootsError::Busy`. Do not return what you managed to
+   read, and above all do not return an empty vector because a lock was contended.
+2. **`Busy` and `Unavailable` mean the same thing to the collector: nothing is freed.** The
+   collector marks, reports the failure in `GcReport::roots_error`, skips every candidate with
+   `SkipReason::RootsUnavailable`, and frees nothing and copies nothing. It does not distinguish
+   them, because both mean "I cannot tell you what is pinned".
+3. **A barrier that cannot be promised is no barrier.** `reference_barrier` returning `Err` stops
+   the cycle exactly as returning `Ok(None)` does.
+4. **Answering twice is safe; answering once is not required to be stable.** The collector polls
+   more than once per cycle: at the freeze, after the mark, before the copy, and once per pack
+   before each unlink. It unions every answer, so a block reported on any poll survives. An
+   implementation that is lazy on one poll and correct on another loses nothing, which means a
+   reference side under load can afford to answer `Busy` rather than a guess.
+5. **Reporting a block that is not pinned is safe and costs only space.** Unioning never removes a
+   block from the protected set, so over-reporting is the cheap direction.
+
+The collector cannot defend against rule 1 being broken. If `pinned_blocks` returns an empty vector
+while blocks really are pinned, and does so on every poll, the collector will free them. The
+re-poll makes a *transient* lie harmless; it cannot make a *persistent* one safe. That is why the
+methods return `Result`.
 
 ## Mark
 

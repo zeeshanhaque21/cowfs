@@ -35,4 +35,25 @@ pub enum Error {
         "store has {0} damaged regions in durable bytes; collect nothing over known data loss"
     )]
     CorruptStore(usize),
+    /// The reference side would not answer, so the cycle marked and reported and freed nothing.
+    #[error("the reference side would not answer ({0}); nothing was freed")]
+    RootsUnavailable(RootsError),
+}
+
+/// Why an [`crate::ExtraRoots`] could not answer.
+///
+/// An answer the collector cannot trust is never a partial one. The collector treats every variant
+/// the same way: mark what it can, report, and free nothing. An empty answer and a failed answer
+/// are the same thing to a collector that is about to delete bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RootsError {
+    /// The reference side is mid-change: a writer holds a lock the answer needs.
+    ///
+    /// The answer is not "nothing is pinned", it is "I cannot tell right now". Treating it as an
+    /// empty set frees whatever those writers have in flight.
+    #[error("the reference side is busy")]
+    Busy,
+    /// The reference side cannot answer at all: not implemented, misconfigured, or failed.
+    #[error("the reference side is unavailable")]
+    Unavailable,
 }

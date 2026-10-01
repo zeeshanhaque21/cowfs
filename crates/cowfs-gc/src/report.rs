@@ -26,6 +26,8 @@ pub enum SkipReason {
     NotReached,
     /// The store directory could not be read.
     Io,
+    /// The reference side would not answer, so the cycle was stopped before it copied anything.
+    RootsUnavailable,
 }
 
 impl fmt::Display for SkipReason {
@@ -37,6 +39,7 @@ impl fmt::Display for SkipReason {
             SkipReason::Corrupt => "pack holds durable corruption",
             SkipReason::NotReached => "cancelled or out of I/O budget",
             SkipReason::Io => "i/o error",
+            SkipReason::RootsUnavailable => "the reference side would not answer",
         };
         f.write_str(s)
     }
@@ -85,6 +88,13 @@ pub struct GcReport {
     pub dry_run: bool,
     /// True when the caller supplied a reference barrier, so packs were actually unlinked.
     pub barrier: bool,
+    /// Why the cycle freed nothing because the reference side would not answer, if it would not.
+    ///
+    /// Any error from [`crate::ExtraRoots`] lands here and stops the cycle. The mark still ran and
+    /// its numbers are here, so the report explains itself, but nothing was freed and nothing was
+    /// compacted. An empty answer is indistinguishable from "nothing pinned" and this is how that
+    /// case is spelled.
+    pub roots_error: Option<crate::RootsError>,
 }
 
 impl GcReport {

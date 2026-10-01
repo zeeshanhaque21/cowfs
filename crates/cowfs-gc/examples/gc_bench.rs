@@ -22,11 +22,11 @@ struct Root;
 struct Held;
 impl Barrier for Held {}
 impl ExtraRoots for Root {
-    fn pinned_blocks(&self) -> Vec<cowfs_store::BlockId> {
-        Vec::new()
+    fn pinned_blocks(&self) -> Result<Vec<cowfs_store::BlockId>, cowfs_gc::RootsError> {
+        Ok(Vec::new())
     }
-    fn reference_barrier(&self) -> Option<Box<dyn Barrier>> {
-        Some(Box::new(Held))
+    fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier>>, cowfs_gc::RootsError> {
+        Ok(Some(Box::new(Held)))
     }
 }
 

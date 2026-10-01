@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use cowfs_gc::{Barrier, ExtraRoots, Gc, Options};
+use cowfs_gc::{Barrier, ExtraRoots, Gc, Options, RootsError};
 use cowfs_meta::{ChunkRef, Meta, Snapshot};
 use cowfs_store::{BlockId, Options as StoreOptions, Store};
 
@@ -433,13 +433,13 @@ impl Roots {
 }
 
 impl ExtraRoots for Roots {
-    fn pinned_blocks(&self) -> Vec<BlockId> {
-        self.pinned.lock().unwrap().clone()
+    fn pinned_blocks(&self) -> std::result::Result<Vec<BlockId>, RootsError> {
+        Ok(self.pinned.lock().unwrap().clone())
     }
 
-    fn reference_barrier(&self) -> Option<Box<dyn Barrier>> {
+    fn reference_barrier(&self) -> std::result::Result<Option<Box<dyn Barrier>>, RootsError> {
         if !self.offers {
-            return None;
+            return Ok(None);
         }
         let start = Instant::now();
         let mut g = self.inner.gate.lock().unwrap();
@@ -449,10 +449,10 @@ impl ExtraRoots for Roots {
         }
         drop(g);
         self.inner.taken.fetch_add(1, Relaxed);
-        Some(Box::new(Guard {
+        Ok(Some(Box::new(Guard {
             inner: Arc::clone(&self.inner),
             start,
-        }))
+        })))
     }
 }
 
