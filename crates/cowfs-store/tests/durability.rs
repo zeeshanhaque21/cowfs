@@ -106,7 +106,13 @@ fn rolling_syncs_the_sealed_pack_then_creates_and_syncs_the_next() {
     s.put(&random(2, 100)).unwrap();
     assert_eq!(
         take(&t),
-        vec![sync(P0), create(P1), sync(P1), dir_sync("packs")]
+        vec![
+            sync(P0),
+            sync("SYNCED"),
+            create(P1),
+            sync(P1),
+            dir_sync("packs")
+        ]
     );
     s.sync().unwrap();
     assert_eq!(take(&t), vec![sync(P1), sync("SYNCED")]);
@@ -145,10 +151,10 @@ fn recovery_syncs_what_it_scanned_and_what_it_truncated() {
     }
     let t = trace();
     drop(Store::open_traced(dir.path(), opts(), Arc::clone(&t)).unwrap());
-    assert_in_order_msg(
-        &take(&t),
-        &[sync(P0), sync("SYNCED")],
-        "a rebuild syncs the pack it read, then the watermark it advanced",
+    assert_eq!(
+        take(&t),
+        vec![sync(P0)],
+        "an unchanged watermark needs no rewrite"
     );
 
     OpenOptions::new()

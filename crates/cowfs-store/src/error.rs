@@ -47,8 +47,16 @@ pub enum Error {
         reason: String,
     },
     /// Another handle holds the store lock.
-    #[error("store {0} is open elsewhere")]
-    Locked(PathBuf),
+    ///
+    /// `flock` belongs to the open file description, so a process that forked without `exec`
+    /// keeps holding it after the parent drops its store, until the child exits.
+    #[error("store {dir} is open elsewhere{}", holder.map(|p| format!(" (holder pid {p})")).unwrap_or_default())]
+    Locked {
+        /// The store directory.
+        dir: PathBuf,
+        /// Pid recorded in the lock file, when one is readable.
+        holder: Option<u32>,
+    },
 }
 
 /// Result alias for this crate.

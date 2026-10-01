@@ -407,17 +407,6 @@ impl Store {
     pub fn discard_pack(&self, id: u32, condemned: &[BlockId]) -> Result<u64> {
         self.sync()?;
         let g = self.guts();
-        let lowest = self.packs()?.first().map_or(id, |p| p.id);
-        let mut entries = ack::load(g.dir);
-        entries.push(ack::Entry {
-            pack: id,
-            nonce: 0,
-            state: ack::State::Acked,
-            offset: ack::WHOLE_PACK.0,
-            len: ack::WHOLE_PACK.1,
-            id: None,
-        });
-        ack::save(g.io, g.dir, entries)?;
         for b in condemned {
             if g.index.get(b).is_some_and(|l| l.pack == id) {
                 g.index.remove(b);
@@ -430,22 +419,41 @@ impl Store {
             return Ok(0);
         };
         let len = meta.len();
+        // The watermark floor goes above this pack before the file is unlinked, and durably. A crash
+        // after that leaves a file the next open does not scan, which converges on a later cycle; a
+        // crash with the gap still in the scan range would be reported as a lost pack, which is a
+        // false loss report about bytes that were copied first.
+        {
+            let mut wm =
+                g.wm.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(m) = wm.mark() {
+                let lowest = self.packs()?.first().map_or(id, |p| p.id);
+                let base = wm.base().max(lowest).max(id.saturating_add(1));
+                let next = wm.next_id();
+                wm.reset(m, base, next)?;
+            }
+        }
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
         }
         g.io.sync_dir(&pack::pack_dir(g.dir))?;
-        {
-            let mut wm =
-                g.wm.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(m) = wm.mark() {
-                let base = wm.base().max(lowest);
-                let next = wm.next_id();
-                wm.reset(m, base, next)?;
-            }
-        }
+        // Only now, with the file really gone, is a whole-pack acceptance true. Written while the
+        // pack was still there it would be a wildcard: `find` treats a zero nonce as matching any,
+        // so it would swallow damage reported against this pack later, and the pack id is never
+        // reused, so nothing can legitimately come back to that id.
+        let mut entries = ack::load(g.dir);
+        entries.push(ack::Entry {
+            pack: id,
+            nonce: 0,
+            state: ack::State::Acked,
+            offset: ack::WHOLE_PACK.0,
+            len: ack::WHOLE_PACK.1,
+            id: None,
+        });
+        ack::save(g.io, g.dir, entries)?;
         self.forget_pack(id);
         Ok(len)
     }

@@ -57,6 +57,7 @@ pub(crate) struct Wm {
     mark: Option<Mark>,
     base: u32,
     next: u32,
+    uncertain: bool,
 }
 
 impl std::fmt::Debug for Wm {
@@ -97,19 +98,44 @@ impl Wm {
             .iter()
             .filter_map(|s| decode(s))
             .max_by_key(|(seq, ..)| *seq);
+        // A slot that no longer decodes still says how far it promised, if the shape is intact.
+        // If that is more than the mark that survived, bytes in between may have been promised and
+        // are now unclassifiable. If it is not more, the lost slot promised nothing extra, so the
+        // bytes above the mark are an ordinary torn tail.
+        let lost = |s: &[u8]| -> Option<Mark> {
+            if s.iter().all(|&b| b == 0) || s.len() < 24 {
+                return None;
+            }
+            let pack = u32::from_le_bytes(s[8..12].try_into().ok()?);
+            let len = u64::from_le_bytes(s[16..24].try_into().ok()?);
+            (len > 0).then_some(Mark { pack, len })
+        };
+        let kept = best.map(|(_, m, ..)| m);
+        let uncertain = buf[..n]
+            .chunks(SLOT)
+            .filter(|s| s.iter().any(|&b| b != 0) && decode(s).is_none())
+            .any(|s| match lost(s) {
+                Some(m) => kept.is_none_or(|k| m > k),
+                None => true,
+            });
         Ok(Wm {
             io: io.clone(),
             file,
             path,
             seq: best.map_or(0, |(s, ..)| s),
-            mark: best.map(|(_, m, ..)| m),
+            mark: best.and_then(|(_, m, ..)| (m.len > 0).then_some(m)),
             base: best.map_or(0, |(_, _, b, _)| b),
             next: best.map_or(0, |(_, _, _, n)| n),
+            uncertain,
         })
     }
 
     pub(crate) fn mark(&self) -> Option<Mark> {
         self.mark
+    }
+
+    pub(crate) fn uncertain(&self) -> bool {
+        self.uncertain
     }
 
     /// Lowest pack id that must exist.

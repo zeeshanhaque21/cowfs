@@ -1,7 +1,9 @@
 //! Record format and per-block compression. See `docs/v1-store.md`.
 
 use std::cell::RefCell;
+use std::fs::File;
 use std::io;
+use std::os::unix::fs::FileExt;
 
 use zstd::bulk::{Compressor, Decompressor};
 
@@ -27,6 +29,24 @@ pub(crate) struct Header {
     pub slen: u32,
     pub id: BlockId,
     pub crc: u32,
+}
+
+/// The offset where the record whose header starts at `pos` ends, when that header checksums.
+///
+/// A header that passes its own checksum states its length truthfully, even when its payload does
+/// not verify, so the bytes up to that offset are that record's and a record found inside them is
+/// nested, not real. A header whose checksum fails says nothing about its length, since the flipped
+/// byte may be the length itself, so trusting it could hide the real records that follow.
+pub(crate) fn trusted_end_at(file: &File, pos: u64, end: u64) -> io::Result<Option<u64>> {
+    if pos + HEADER_LEN as u64 > end {
+        return Ok(None);
+    }
+    let mut raw = [0u8; HEADER_LEN];
+    file.read_exact_at(&mut raw, pos)?;
+    Ok(Header::parse(&raw)
+        .ok()
+        .map(|h| pos + h.total_len())
+        .filter(|&e| e <= end && e > pos))
 }
 
 impl Header {

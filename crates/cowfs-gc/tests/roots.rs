@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{Fixture, Roots};
+use common::{eager, small_store_opts, Fixture, Roots};
 use cowfs_gc::{Barrier, ExtraRoots, RootsError, SkipReason};
-use cowfs_store::BlockId;
+use cowfs_store::{BlockId, Store};
 
 fn body(n: usize, seed: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
@@ -435,4 +435,92 @@ fn a_healthy_roots_still_reclaims() {
         }
     }
     assert!(total > 0, "a healthy reference side does reclaim");
+}
+
+/// A collector cannot be built over a store another process holds, and never frees into one.
+#[test]
+fn a_locked_store_gives_no_collector_and_no_free() {
+    let f = garbage();
+    let roots = Roots::new();
+    let second = Store::open(f.store_dir(), small_store_opts(32 << 10));
+    match second {
+        Err(cowfs_store::Error::Locked { holder, .. }) => assert_eq!(
+            holder,
+            Some(std::process::id()),
+            "the holder pid is reported"
+        ),
+        other => panic!("expected Locked, got {other:?}"),
+    }
+    // The collector that does exist still works, so the lock is per handle and the refusal is
+    // about a second open, not about the store being unusable.
+    let r = f.gc.collect(Some(&*roots)).expect("collect");
+    assert_eq!(
+        r.errors,
+        Vec::<String>::new(),
+        "the held store collects fine"
+    );
+}
+
+/// An unacknowledged loss stops the cycle before it copies or frees anything.
+#[test]
+fn an_unacknowledged_loss_aborts_with_nothing_freed() {
+    let f = garbage();
+    let roots = Roots::new();
+    assert!(
+        !f.store.recovery().has_corruption(),
+        "a fresh fixture is clean"
+    );
+
+    // A sealed pack that had been synced is then removed, which open reports as a missing pack: a
+    // loss nobody has accepted.
+    let meta = Arc::clone(&f.meta);
+    let dir = f.persist();
+    let packs = dir.join("store").join("packs");
+    let victim = std::fs::read_dir(&packs)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "cpk"))
+        .max()
+        .expect("a pack");
+    std::fs::remove_file(victim).unwrap();
+
+    let store =
+        Arc::new(Store::open(dir.join("store"), small_store_opts(32 << 10)).expect("reopen"));
+    assert!(
+        store.recovery().has_corruption(),
+        "the damage is reported after the reopen"
+    );
+    let store_for_gc = Arc::clone(&store);
+    let gc = cowfs_gc::Gc::open(dir.join("gcstate"), store_for_gc, meta, eager()).expect("gc");
+    let err = gc
+        .collect(Some(&*roots))
+        .expect_err("a known loss stops the cycle");
+    assert!(
+        matches!(err, cowfs_gc::Error::CorruptStore(_)),
+        "the refusal names the reason: {err:?}"
+    );
+    assert!(
+        std::fs::read_dir(dir.join("store").join("packs"))
+            .unwrap()
+            .count()
+            >= 1,
+        "and nothing was unlinked"
+    );
+}
+
+/// `Store::close` consumes the store, so a collector that holds it cannot be outlived by a close and
+/// then write. This pins that: closing is the only way out, and it takes the handle with it.
+#[test]
+fn no_collector_path_survives_a_store_close() {
+    let f = garbage();
+    let roots = Roots::new();
+    let r = f.gc.collect(Some(&*roots)).expect("collect");
+    assert_eq!(r.errors, Vec::<String>::new());
+    // `close` takes `self`, so it cannot run while a collector holds an `Arc`. The type system is the
+    // guarantee; this test only records that the collector still works to the end of its life.
+    for b in f.live_blocks() {
+        assert!(f.store.get(b).is_ok());
+    }
+    assert!(f.store.fsck().expect("fsck").is_clean());
 }

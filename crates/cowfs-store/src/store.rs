@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ack::{self, Entry};
 use crate::chunk::{chunks, Chunker};
@@ -30,9 +30,11 @@ const TORN_KEEP: u64 = 1 << 20;
 /// Most missing pack ids listed in a recovery report.
 const MAX_LISTED: usize = 1 << 16;
 /// How long `open` waits for a lock whose owner is closing before it reports the store as busy.
-const LOCK_WAIT: Duration = Duration::from_millis(250);
+/// A forked child inherits the lock, so this only covers the in-process release, which is
+/// sub-millisecond. It is not a fix for an inherited lock.
+const LOCK_WAIT: Duration = Duration::from_millis(50);
 /// How often that wait looks again.
-const LOCK_POLL: Duration = Duration::from_millis(5);
+const LOCK_POLL: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Default)]
 struct Counters {
@@ -75,6 +77,8 @@ pub struct Store {
     wm: Mutex<Wm>,
     checkpointing: Mutex<()>,
     dirty: AtomicBool,
+    /// Set once the shutdown work has run, so `close` and `Drop` never repeat it.
+    finished: AtomicBool,
     max_pack_size: u64,
     checkpoint_on_drop: bool,
     counters: Counters,
@@ -86,6 +90,25 @@ pub struct Store {
     /// store owns is closed before the lock is released, so a reopen never races a half-closed
     /// store. `None` only between `close` taking it and the field dropping.
     _lock: Option<File>,
+}
+
+/// The pid recorded in the lock file, so a refusal can name the process that holds it.
+fn lock_holder(lock: &File) -> Option<u32> {
+    let len = lock.metadata().ok()?.len();
+    if len == 0 || len > 24 {
+        return None;
+    }
+    let mut b = vec![0u8; len as usize];
+    lock.read_exact_at(&mut b, 0).ok()?;
+    std::str::from_utf8(&b).ok()?.trim().parse().ok()
+}
+
+/// Record the owner's pid in the lock file. The write is not synced: the flock, not this text, is
+/// what excludes a second writer, and the text is only there to name the holder.
+fn record_holder(lock: &File) {
+    let pid = std::process::id().to_string();
+    let _ = lock.set_len(pid.len() as u64);
+    let _ = lock.write_at(pid.as_bytes(), 0);
 }
 
 /// Write a fresh pack header and return the resulting length.
@@ -213,13 +236,15 @@ fn save_torn(
         offset: from,
         reason: e.to_string(),
     };
-    let mut f = OpenOptions::new()
+    let f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .map_err(|e| quarantine(&e))?;
     io.created(&path);
-    let written = f.write_all(&buf).and_then(|()| io.sync_file(&f, &path));
+    let written = io
+        .write_at(&f, &path, 0, &buf)
+        .and_then(|()| io.sync_file(&f, &path));
     if let Err(e) = written {
         let _ = fs::remove_file(&path);
         return Err(quarantine(&e));
@@ -337,21 +362,28 @@ impl Store {
             io.created(&lock_path);
             io.sync_dir(&dir)?;
         }
-        // A handle that is closing right now still shows the lock as held for a moment, so a
-        // reopen that races a release waits for it instead of failing. A live owner keeps it for
-        // as long as it likes: the wait is bounded and then the store reports Locked.
-        let mut waited = Duration::ZERO;
+        // `flock` lives on the open file description, so a bare `fork` keeps the store locked until
+        // the child exits. `O_CLOEXEC` does not help that, so the wait below only covers the
+        // in-process release, and the holder's pid is reported so the cause is visible.
+        let deadline = Instant::now() + LOCK_WAIT;
         loop {
             match lock.try_lock() {
                 Ok(()) => break,
-                Err(TryLockError::WouldBlock) if waited < LOCK_WAIT => {
-                    std::thread::sleep(LOCK_POLL);
-                    waited += LOCK_POLL;
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(
+                        LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
-                Err(TryLockError::WouldBlock) => return Err(Error::Locked(dir)),
+                Err(TryLockError::WouldBlock) => {
+                    return Err(Error::Locked {
+                        dir,
+                        holder: lock_holder(&lock),
+                    });
+                }
                 Err(TryLockError::Error(e)) => return Err(e.into()),
             }
         }
+        record_holder(&lock);
         let max_pack_size = options.max_pack_size.clamp(1, MAX_PACK_LIMIT);
 
         let mut ids = Vec::new();
@@ -366,6 +398,7 @@ impl Store {
         let mut head_lost: Vec<u32> = Vec::new();
         let mut cuts: Vec<CorruptRegion> = Vec::new();
         let mut sealed_len: HashMap<u32, u64> = HashMap::new();
+        let mut wm = Wm::open(&io, &dir)?;
         for &id in &ids {
             let path = pack::pack_path(&dir, id);
             let mut file = open_pack(&dir, id)?;
@@ -379,6 +412,23 @@ impl Store {
                 }
                 // A crash between extending a pack file and writing its header leaves a short or
                 // zero-filled file. It never held data, so it is reset like a fresh pack.
+                if wm
+                    .mark()
+                    .is_some_and(|m| m.pack >= id && m.len > PACK_HEADER_LEN)
+                {
+                    ack::save(
+                        &io,
+                        &dir,
+                        vec![Entry {
+                            pack: id,
+                            nonce: 0,
+                            state: ack::State::Pending,
+                            offset: 0,
+                            len: PACK_HEADER_LEN,
+                            id: None,
+                        }],
+                    )?;
+                }
                 io.truncate(&file, &path, 0)?;
                 len = reset_header(&io, &dir, &mut file, id)?;
             } else {
@@ -392,8 +442,10 @@ impl Store {
                         // whatever verifies is kept. The header is written again after the scan.
                         head_lost.push(id);
                     }
-                    Err(reason) => {
-                        return Err(Error::BadPack { path, reason });
+                    Err(_) => {
+                        // A torn or rotted header is not fatal: the records past it are still
+                        // scanned and the header is written again afterwards.
+                        head_lost.push(id);
                     }
                 }
             }
@@ -412,10 +464,20 @@ impl Store {
         }
         let last = ids.last().copied();
 
-        let mut wm = Wm::open(&io, &dir)?;
         let mark = wm.mark();
         let mut acked = ack::load(&dir);
         let table = ack::Table::new(&acked);
+        // Packs an operator accepted as wholly lost, so a file that reappears at one of those ids
+        // is a restore rather than a torn tail. A pending entry does not count: the loss is still
+        // being reported, and that report is what makes a restore visible.
+        let known: HashSet<u32> = acked
+            .iter()
+            .filter(|e| {
+                e.state.accepted() && e.offset == ack::WHOLE_PACK.0 && e.len == ack::WHOLE_PACK.1
+            })
+            .map(|e| e.pack)
+            .collect();
+        // Nothing is reported missing above the highest id that a file or an acceptance names.
         let mut recovery = RecoveryReport {
             watermark_missing: mark.is_none() && !ids.is_empty(),
             ..RecoveryReport::default()
@@ -425,14 +487,25 @@ impl Store {
         let active = ids.last().copied();
         // How much of a pack a completed `sync` promised, and so how much damage is corruption and
         // how much is a torn tail. A cut label only speaks for a pack the watermark has moved past.
+        //
+        // A mark that fell back to an older slot, or that is behind a pack the store already knows
+        // about, cannot speak for the bytes above it, so they are unclassifiable rather than a torn
+        // tail. A pack above the mark with no cut label and no record of its own is one the
+        // operator restored, so it gets the same treatment.
         let durable = |id: u32| -> u64 {
+            let sealed = sealed_len.get(&id).copied();
             match mark {
                 Some(m) if m.pack == id => m.len,
-                Some(m) if m.pack > id => sealed_len.get(&id).copied().unwrap_or(u64::MAX),
-                // Above the mark: written after the last completed `sync`, so nothing in it was promised.
-                Some(_) => sealed_len.get(&id).copied().unwrap_or(0),
+                Some(m) if m.pack > id => sealed.unwrap_or(u64::MAX),
+                Some(_) => sealed.unwrap_or_else(|| {
+                    if wm.uncertain() || known.contains(&id) {
+                        u64::MAX
+                    } else {
+                        0
+                    }
+                }),
                 None if Some(id) == active => PACK_HEADER_LEN,
-                None => sealed_len.get(&id).copied().unwrap_or(u64::MAX),
+                None => sealed.unwrap_or(u64::MAX),
             }
         };
         // A pack id is never reused, so every id above the high-water is free and everything at or
@@ -447,8 +520,16 @@ impl Store {
             } else {
                 ids.first().copied().unwrap_or(0)
             };
-            let hi = mark.map_or(0, |m| m.pack).max(last.unwrap_or(0));
+            // Only the mark promises a pack, and the high-water says how far the store ever
+            // allocated, so the listing covers every id the store could have promised a file for.
+            // An id the high-water passed but that no file or acceptance names was reserved and
+            // never created, which is not a loss.
+            let hi = mark
+                .map_or_else(|| last.unwrap_or(0), |m| m.pack)
+                .min(wm.next_id().saturating_sub(1))
+                .max(lo);
             recovery.missing_synced = (lo..=hi)
+                .filter(|_| mark.is_some() || wm.next_id() == 0)
                 .filter(|p| !lens.contains_key(p))
                 .filter(|&p| !ack::covers_pack(&acked, p))
                 .take(MAX_LISTED)
@@ -477,7 +558,9 @@ impl Store {
                             && u64::from(loc.offset) + HEADER_LEN as u64 + u64::from(loc.slen) <= n
                     })
             });
-            if packs_ok && entries_ok {
+            // A watermark that fell back to an older slot means the checkpoint may name bytes the
+            // store cannot vouch for any more, so the packs are read again instead.
+            if packs_ok && entries_ok && !wm.uncertain() {
                 for (id, loc) in ck.entries {
                     index.insert_if_absent(id, loc);
                 }
@@ -598,10 +681,40 @@ impl Store {
                         b.len
                     },
                     id: b.id,
-                    unclassified: false,
+                    // Damage the watermark cannot vouch for is a loss of unknown promise, not a
+                    // broken promise, and is reported as such until somebody accepts it.
+                    unclassified: dur == u64::MAX || wm.uncertain(),
                 });
             }
             if let Some(t) = torn_from {
+                // Anything the watermark cannot speak for is unclassifiable, so the loss is
+                // recorded and made durable before the bytes are cut.
+                if dur == u64::MAX || recovery.watermark_missing || wm.uncertain() {
+                    let cut = CorruptRegion {
+                        pack: id,
+                        offset: t,
+                        len: len - t,
+                        id: None,
+                        unclassified: true,
+                    };
+                    if !ack::find(&table, id, 0, t, len - t, None)
+                        .is_some_and(|e| e.state.accepted())
+                    {
+                        ack::save(
+                            &io,
+                            &dir,
+                            vec![Entry {
+                                pack: id,
+                                nonce: 0,
+                                state: ack::State::Unclassified,
+                                offset: t,
+                                len: len - t,
+                                id: None,
+                            }],
+                        )?;
+                        cuts.push(cut);
+                    }
+                }
                 save_torn(&io, &dir, id, &file, (t, len), &options, &mut recovery)?;
                 // The label is what lets a later open tell a torn tail from corruption once this
                 // pack is no longer the active one, and what lets an interrupted cut be finished.
@@ -619,18 +732,6 @@ impl Store {
                     cut_at = Some((id, t));
                 }
                 recovery.torn_tail_discarded += len - t;
-                if recovery.watermark_missing {
-                    // Without a watermark the bytes past the header cannot be classified, so cutting
-                    // them destroys data that may have been promised. Remember the cut, so a later
-                    // open still reports the loss until somebody accepts it.
-                    cuts.push(CorruptRegion {
-                        pack: id,
-                        offset: t,
-                        len: len - t,
-                        id: None,
-                        unclassified: true,
-                    });
-                }
                 len = t;
             }
             if scanned > 0 || torn_from.is_some() {
@@ -642,11 +743,6 @@ impl Store {
             }
         }
         recovery.truncated_bytes = recovery.torn_tail_discarded;
-        for &id in &head_lost {
-            let nonce = rewrite_header(&io, &dir, id)?;
-            nonces.insert(id, nonce);
-        }
-
         let counters = Counters::default();
         let (id, file, mut len) = match (last, last_file) {
             (Some(id), Some(f))
@@ -658,9 +754,14 @@ impl Store {
                 (id, Arc::new(f), len)
             }
             _ => {
-                let file = Arc::new(create_pack(&io, &dir, next_id)?);
-                lens.insert(next_id, PACK_HEADER_LEN);
-                (next_id, file, PACK_HEADER_LEN)
+                let id = next_id;
+                next_id = id
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("pack ids exhausted"))?;
+                wm.raise_next(next_id)?;
+                let file = Arc::new(create_pack(&io, &dir, id)?);
+                lens.insert(id, PACK_HEADER_LEN);
+                (id, file, PACK_HEADER_LEN)
             }
         };
         if have_tail {
@@ -736,7 +837,11 @@ impl Store {
             fresh.push(Entry {
                 pack: r.pack,
                 nonce,
-                state: ack::State::Pending,
+                state: if r.unclassified {
+                    ack::State::Unclassified
+                } else {
+                    ack::State::Pending
+                },
                 offset: r.offset,
                 len: r.len,
                 id: r.id,
@@ -806,10 +911,30 @@ impl Store {
             ack::save(&io, &dir, fresh)?;
             acked.extend(ack::load(&dir));
         }
+        for &id in &head_lost {
+            let nonce = rewrite_header(&io, &dir, id)?;
+            nonces.insert(id, nonce);
+        }
 
         // Every byte scanned above was fsynced and any torn tail is gone, so nothing unresolved
         // sits below this mark. A mark that is already ahead of the packs is left alone.
         let here = Mark { pack: id, len };
+        let first = lens.keys().next().copied().unwrap_or(id);
+        let reserved_start = mark.map_or(first, |m| m.pack.saturating_add(1));
+        let unused: Vec<Entry> = (reserved_start..id)
+            .filter(|p| !lens.contains_key(p) && !recovery.missing_synced.contains(p))
+            .map(|pack| Entry {
+                pack,
+                nonce: 0,
+                state: ack::State::Acked,
+                offset: ack::WHOLE_PACK.0,
+                len: ack::WHOLE_PACK.1,
+                id: None,
+            })
+            .collect();
+        if !unused.is_empty() {
+            ack::save(&io, &dir, unused)?;
+        }
         let base = recovery
             .missing_synced
             .iter()
@@ -819,7 +944,12 @@ impl Store {
             .or_else(|| wm.base().checked_add(0))
             .unwrap_or(0);
         if wm.mark().is_none() {
-            wm.init(here)?;
+            if first == wm.base() {
+                wm.init(here)?;
+            } else {
+                wm.reset(here, first, next_id)?;
+                wm.reset(here, first, next_id)?;
+            }
         } else if !recovery.missing_synced.is_empty() {
             wm.reset(here, base, next_id)?;
         } else {
@@ -847,6 +977,7 @@ impl Store {
             wm: Mutex::new(wm),
             checkpointing: Mutex::new(()),
             dirty: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             max_pack_size,
             checkpoint_on_drop: options.checkpoint_on_drop,
             counters,
@@ -978,12 +1109,32 @@ impl Store {
     }
 
     /// The id of a pack this store may create: above every pack it knows and never reused.
-    fn alloc_id(&self, w: &Writer) -> Result<u32> {
+    fn alloc_id(&self, w: &mut Writer) -> Result<u32> {
         let above = w.pack_lens().keys().next_back().copied().unwrap_or(0);
-        w.next_id
-            .max(above.saturating_add(1))
-            .checked_add(0)
-            .ok_or_else(|| io::Error::other("pack ids exhausted").into())
+        let id = w.next_id.max(above.saturating_add(1));
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("pack ids exhausted"))?;
+        let mut wm = self.wm.lock().unwrap_or_else(PoisonError::into_inner);
+        let start = above
+            .saturating_add(1)
+            .max(wm.mark().map_or(0, |m| m.pack.saturating_add(1)));
+        let unused = (start..id)
+            .map(|pack| Entry {
+                pack,
+                nonce: 0,
+                state: ack::State::Acked,
+                offset: ack::WHOLE_PACK.0,
+                len: ack::WHOLE_PACK.1,
+                id: None,
+            })
+            .collect::<Vec<_>>();
+        if !unused.is_empty() {
+            ack::save(&self.io, &self.dir, unused)?;
+        }
+        wm.raise_next(next)?;
+        w.next_id = next;
+        Ok(id)
     }
 
     fn roll(&self, w: &mut Writer) -> Result<()> {
@@ -1007,7 +1158,7 @@ impl Store {
     /// id is recorded as used, so a later roll steps over it instead of reusing it.
     pub fn new_pack(&self) -> Result<(u32, Arc<File>)> {
         let mut w = self.writer();
-        let id = self.alloc_id(&w)?;
+        let id = self.alloc_id(&mut w)?;
         let file = Arc::new(create_pack(&self.io, &self.dir, id)?);
         w.sealed.insert(id, PACK_HEADER_LEN);
         w.next_id = id.saturating_add(1);
@@ -1335,28 +1486,36 @@ impl Store {
     /// put again. Returns the number of entries recorded.
     pub fn acknowledge_corruption(&self) -> Result<usize> {
         let r = &self.recovery;
+        let nonces = self.nonces();
         let mut entries: Vec<Entry> = r
             .corrupt_synced
             .iter()
             .map(|c| Entry {
                 pack: c.pack,
-                // Any nonce and any claimed id: an operator accepted this byte range, and the
-                // region cannot be matched more precisely than the pack and the offset.
-                nonce: 0,
+                // The real creation nonce and the real claimed id, so the entry cannot go on
+                // hiding damage in a different pack that reappears with the same id.
+                nonce: nonces.get(&c.pack).copied().unwrap_or(0),
                 state: ack::State::Acked,
                 offset: c.offset,
                 len: c.len,
-                id: None,
+                id: c.id,
             })
             .collect();
-        entries.extend(r.missing_synced.iter().map(|&pack| Entry {
-            pack,
-            nonce: 0,
-            state: ack::State::Acked,
-            offset: ack::WHOLE_PACK.0,
-            len: ack::WHOLE_PACK.1,
-            id: None,
-        }));
+        // A whole-pack entry outlives the file it described, so it is only written while the pack
+        // is really gone. A pack that is present is reported as corruption, not as a lost pack.
+        entries.extend(
+            r.missing_synced
+                .iter()
+                .filter(|&&pack| !pack::pack_path(&self.dir, pack).exists())
+                .map(|&pack| Entry {
+                    pack,
+                    nonce: 0,
+                    state: ack::State::Acked,
+                    offset: ack::WHOLE_PACK.0,
+                    len: ack::WHOLE_PACK.1,
+                    id: None,
+                }),
+        );
         if entries.is_empty() {
             return Ok(0);
         }
@@ -1368,10 +1527,20 @@ impl Store {
             fs::remove_file(self.index_path())?;
             self.io.sync_dir(&self.dir)?;
         }
-        if !r.missing_synced.is_empty() {
+        // A pack that is on disk again was never a lost pack, so its acceptance is not recorded and
+        // the watermark base is only lowered for packs that are really gone.
+        if r.missing_synced
+            .iter()
+            .any(|&p| !pack::pack_path(&self.dir, p).exists())
+        {
             let (mark, base, next) = {
                 let w = self.writer();
-                let base = w.pack_lens().keys().next().copied().unwrap_or(0);
+                let base = r
+                    .missing_synced
+                    .iter()
+                    .copied()
+                    .min()
+                    .unwrap_or_else(|| w.pack_lens().keys().next().copied().unwrap_or(0));
                 (
                     Mark {
                         pack: w.id,
@@ -1453,8 +1622,14 @@ impl Store {
 }
 
 impl Store {
-    /// Do what a drop would, but report the error.
-    fn shutdown(&self) -> Result<()> {
+    /// Do the shutdown work once, under the lock, and report it.
+    ///
+    /// `close` and `Drop` both call this. It runs at most once, so nothing is ever written after
+    /// the lock has been released.
+    fn finish(&self) -> Result<()> {
+        if self.finished.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
         if self.checkpoint_on_drop && self.dirty.load(Relaxed) {
             self.checkpoint()?;
         }
@@ -1474,7 +1649,7 @@ impl Store {
     /// A drop does the same work and cannot report it, so a caller that has to know should call
     /// this. It is the only way to finish a store whose drop would have complained.
     pub fn close(mut self) -> Result<()> {
-        let flushed = self.shutdown();
+        let flushed = self.finish();
         let released = self.release_lock();
         flushed.and(released.map_err(Error::from))
     }
@@ -1482,7 +1657,7 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        let _ = self.finish();
     }
 }
 

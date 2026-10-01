@@ -87,7 +87,7 @@ fn lock_is_held_across_processes_and_released_by_kill_9() {
     }
     assert!(matches!(
         Store::open(dir.path(), opts()),
-        Err(Error::Locked(_))
+        Err(Error::Locked { .. })
     ));
     child.kill().unwrap();
     child.wait().unwrap();
