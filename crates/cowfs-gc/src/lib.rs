@@ -440,6 +440,11 @@ impl Gc {
         // 5. Verify and unlink with the reference side held still. The guard is alive from before
         // the copy, so no commit landed during the copy; its `hold` waits for the writers already
         // inside one.
+        //
+        // A cancel does not stop this step. Every pack here has already been copied and indexed, so
+        // refusing to unlink it would leave its source and its copy both on disk for a cycle that
+        // has already stopped, and the next cycle redoes the copy. A cancel bounds how much work a
+        // cycle starts, not what it finishes.
         if let Some(guard) = barrier {
             guard.hold();
             match self.marked(&mut marker, &mut r, false, &mut walked_roots) {
@@ -456,10 +461,6 @@ impl Gc {
                     // written and indexed, so a later cycle reuses them instead of redoing them.
                     r.skip(rw.from, SkipReason::RootsUnavailable);
                     r.error(Error::RootsUnavailable(e));
-                    continue;
-                }
-                if self.is_cancelled() {
-                    r.skip(rw.from, SkipReason::NotReached);
                     continue;
                 }
                 if rw.condemned.iter().any(|b| live.contains(b)) {

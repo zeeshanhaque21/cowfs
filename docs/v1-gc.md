@@ -212,9 +212,15 @@ A read never writes: the map is only touched, and flushed in batches.
 - `Options::io_budget_bytes` bounds the bytes copied per cycle (default 2 GiB, 0 means no bound),
   which bounds a cycle's duration and its I/O rate.
 - Progress is reported through `Gc::set_progress` after each pack copied and after each pack
-  unlinked, and `Gc::cancel` is polled before each pack, inside the copy loop, and before each
-  unlink, so a client can cancel from its own progress handler and the store is left consistent: a
-  half-copied new pack is a pack with no index entries, and open indexes it as ordinary data.
+  unlinked, and `Gc::cancel` is polled before each pack inside the copy loop, so a client can
+  cancel from its own progress handler and the store is left consistent: a half-copied new pack is
+  a pack with no index entries, and open indexes it as ordinary data.
+- A cancel bounds how much work a cycle **starts**, not what it **finishes**. Every pack in the
+  unlink loop has already been copied and indexed, so those are unlinked even though the cancel is
+  set. Leaving them would leave the source and its copy both on disk, and the next cycle redoes
+  the copy to reclaim the same bytes. This was a real bug: a cancelled cycle reported
+  `packs_rewritten: 1, packs_unlinked: 0` and freed nothing, and the cycle after it redid the same
+  copy instead of finishing the job.
 - A cancel is **sticky** until `Gc::resume`. A client that cancels once and then polls `collect`
   must not get a second full cycle by accident.
 - A cycle that cannot free, because the caller offered no barrier, does not copy either. A copy

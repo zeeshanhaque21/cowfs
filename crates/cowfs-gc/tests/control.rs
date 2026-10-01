@@ -2,7 +2,6 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use common::{eager, Fixture, Roots};
@@ -204,41 +203,107 @@ fn a_cancel_stops_the_cycle_and_is_reported() {
 fn a_cancel_mid_cycle_leaves_the_store_consistent() {
     let f = garbage();
     let roots = Roots::new();
-    let reached = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&reached);
-    f.gc.set_progress(move |p| {
+    // Cancel from inside the progress callback, which the collector calls from its own copy loop,
+    // so the cancel lands inside the cycle deterministically. A cancel from a second thread races
+    // the loop: on a fast machine the whole sweep finishes first, and then there is no mid-cycle
+    // cancel to observe at all. The callback is 'static, so it holds an owned collector.
+    let gc = Arc::new(
+        cowfs_gc::Gc::open(
+            f.gc_dir(),
+            Arc::clone(&f.store),
+            Arc::clone(&f.meta),
+            eager(),
+        )
+        .expect("gc"),
+    );
+    let cancel = Arc::clone(&gc);
+    gc.set_progress(move |p| {
         if p.packs_done == 1 {
-            flag.store(true, Relaxed);
+            cancel.cancel();
         }
     });
-    // The cycle and the cancel run together: the waiter exits on the flag or on a no-progress
-    // timeout in minutes, so it cannot hang.
-    let r = std::thread::scope(|sc| {
-        let gc = &f.gc;
-        sc.spawn(move || {
-            let start = std::time::Instant::now();
-            while !reached.load(Relaxed) {
-                if start.elapsed() > std::time::Duration::from_secs(60) {
-                    panic!("the cycle never reported progress");
-                }
-                std::thread::yield_now();
-            }
-            gc.cancel();
-        });
-        f.gc.collect(Some(&*roots)).expect("collect")
-    });
+    let r = gc.collect(Some(&*roots)).expect("collect");
     assert!(r.errors.is_empty(), "{:?}", r.errors);
+    // The cancel landed mid-cycle, which is what this test is for: some packs were reached and the
+    // rest were not. Without this the assertions below pass vacuously on a fast machine.
+    assert!(
+        r.packs_unlinked < r.candidates,
+        "the cancel stopped the cycle part way: {r:?}"
+    );
     for b in f.live_blocks() {
         assert!(f.store.get(b).is_ok(), "a cancel never loses a live block");
     }
     assert!(f.store.fsck().expect("fsck").is_clean());
-    f.gc.resume();
-    let r2 = f.gc.collect(Some(&*roots)).expect("collect");
+    gc.resume();
+    let r2 = gc.collect(Some(&*roots)).expect("collect");
     assert!(r2.errors.is_empty(), "{:?}", r2.errors);
+    // The work the cancel stopped is still there, so the next cycle reclaims it.
     assert!(
         r2.freed_bytes > 0,
-        "the cycle after the cancel reclaims: {r2:?}"
+        "the cycle after the cancel reclaims what it stopped: {r2:?}"
     );
+    for b in f.live_blocks() {
+        assert!(f.store.get(b).is_ok());
+    }
+}
+
+/// A cancel raised mid-cycle stops the copy loop, and every pack the cycle did copy is unlinked.
+///
+/// The cancel bounds how much work a cycle starts, not what it finishes: a pack that was copied and
+/// indexed is unlinked even after the cancel, because leaving it leaves its source and its copy both
+/// on disk and the next cycle redoes the copy.
+#[test]
+fn a_cancel_stops_the_copy_loop_but_finishes_what_it_copied() {
+    let f = garbage();
+    let roots = Roots::new();
+    let gc = Arc::new(
+        cowfs_gc::Gc::open(
+            f.gc_dir(),
+            Arc::clone(&f.store),
+            Arc::clone(&f.meta),
+            eager(),
+        )
+        .expect("gc"),
+    );
+    let cancel = Arc::clone(&gc);
+    gc.set_progress(move |p| {
+        if p.packs_done == 1 {
+            cancel.cancel();
+        }
+    });
+    let r = gc.collect(Some(&*roots)).expect("collect");
+
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(
+        r.candidates > 1,
+        "the fixture must have more than one candidate, or this proves nothing: {r:?}"
+    );
+    // The cycle stopped before every candidate, so the packs it never reached are the ones that
+    // stay, and the packs it did copy are the ones that went.
+    assert_eq!(
+        r.packs_rewritten, r.packs_unlinked,
+        "every copy that was made was also unlinked, so no pack is left behind: {r:?}"
+    );
+    assert!(
+        r.packs_rewritten < r.candidates,
+        "the cancel stopped the cycle part way, so some candidates were never copied: {r:?}"
+    );
+    assert!(
+        r.skipped.iter().any(|s| s.reason == SkipReason::NotReached),
+        "and the packs it never reached say so: {:?}",
+        r.skipped
+    );
+    assert!(f.store.fsck().expect("fsck").is_clean());
+    for b in f.live_blocks() {
+        assert!(f.store.get(b).is_ok(), "a cancel never loses a live block");
+    }
+
+    // And the resumed cycle finishes the rest.
+    gc.resume();
+    let r2 = gc.collect(Some(&*roots)).expect("collect");
+    assert!(r2.errors.is_empty(), "{:?}", r2.errors);
+    assert!(r2.freed_bytes > 0, "and it reclaims: {r2:?}");
+    assert!(f.store.fsck().expect("fsck").is_clean());
     for b in f.live_blocks() {
         assert!(f.store.get(b).is_ok());
     }
