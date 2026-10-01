@@ -117,9 +117,17 @@ impl Inner {
             }
             if after >= self.opts.file_flush_bytes {
                 if let Err(e) = self.flush_locked(&sc, &node, &mut st) {
-                    let err = node.poison(format!("{e} (file {ino:#x})"));
+                    // the write is reported as failed either way; only a corruption is permanent
+                    let err = if Node::classify(&e) {
+                        let err = node.poison(format!("{e} (file {ino:#x})"));
+                        self.ctr.poisoned.fetch_add(1, Ordering::Relaxed);
+                        err
+                    } else {
+                        node.degrade(format!("{e} (file {ino:#x})"));
+                        self.ctr.transient.fetch_add(1, Ordering::Relaxed);
+                        e
+                    };
                     *self.last_error.lk() = Some(err.to_string());
-                    self.ctr.poisoned.fetch_add(1, Ordering::Relaxed);
                     return Err(err);
                 }
             }
@@ -272,8 +280,13 @@ impl Inner {
             return Err(e);
         }
         let sc = self.snapctx(ino)?;
+        // the file is back in the dirty set if a transient failure kept it there, so this retries
+        // the store for it; only a failure that survives is reported
         self.fsync_snapshot(&sc)?;
         if let Some(e) = n.poisoned() {
+            return Err(e);
+        }
+        if let Some(e) = n.degraded() {
             return Err(e);
         }
         Ok(())

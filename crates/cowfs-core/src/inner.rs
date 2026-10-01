@@ -83,6 +83,8 @@ pub struct Stats {
     pub flush_errors: u64,
     /// Files whose flush failed and are poisoned.
     pub poisoned: u64,
+    /// Flush failures that kept their data pending (transient, retried).
+    pub transient: u64,
     /// Virtual aliases released because nothing held their number.
     pub aliases_dropped: u64,
     /// Dentry cache hits and misses.
@@ -111,10 +113,47 @@ pub(crate) struct Counters {
     pub(crate) flush_errors: AtomicU64,
     /// Files whose flush failed and are therefore poisoned.
     pub(crate) poisoned: AtomicU64,
+    /// Flush failures that kept their data pending (transient, retried).
+    pub(crate) transient: AtomicU64,
     pub(crate) aliases_dropped: AtomicU64,
     pub(crate) dhit: AtomicU64,
     pub(crate) dmiss: AtomicU64,
     pub(crate) inodes_net: AtomicI64,
+}
+
+/// One file that cannot currently be written, from `Core::health`.
+#[derive(Debug, Clone)]
+pub struct FileHealth {
+    /// The file's inode number.
+    pub ino: Ino,
+    /// The snapshot holding it, if any.
+    pub snapshot: Option<u64>,
+    /// True when the failure was a corruption: the file is dead until `Core::unpoison`.
+    pub poisoned: bool,
+    /// Why it last failed.
+    pub reason: Option<String>,
+}
+
+/// One snapshot's commit lane, from `Core::health`.
+#[derive(Debug, Clone)]
+pub struct LaneHealth {
+    /// The snapshot's name.
+    pub snapshot: String,
+    /// The snapshot's id.
+    pub id: u64,
+    /// Files whose data is still pending, so this lane is not making progress on them.
+    pub files_stuck: usize,
+}
+
+/// What `Core::health` reports.
+#[derive(Debug, Clone, Default)]
+pub struct Health {
+    /// Poisoned files first, then files whose last flush failed transiently.
+    pub files: Vec<FileHealth>,
+    /// Snapshots with files still pending.
+    pub lanes: Vec<LaneHealth>,
+    /// The last error a flush reported, whatever its kind.
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -153,6 +192,8 @@ pub(crate) struct Inner {
     pub(crate) root: std::path::PathBuf,
     /// Test seam for the swap, see `Core::set_swap_fault`.
     pub(crate) swap_fault: std::sync::atomic::AtomicU8,
+    /// Test seam: per-inode flush faults `(kind, times remaining)`, see `Core::set_flush_fault`.
+    pub(crate) flush_fault: Mutex<HashMap<Ino, (u8, u32)>>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -633,6 +674,9 @@ impl Inner {
         if f.is_clean() {
             return Ok(());
         }
+        if let Some(e) = self.take_flush_fault(node.ino) {
+            return Err(e);
+        }
         let n = f.dirty_bytes();
         f.flush(&self.blocks)?;
         self.dirty_bytes.fetch_sub(n, Ordering::AcqRel);
@@ -645,31 +689,91 @@ impl Inner {
         self.flush_locked(sc, node, &mut st)
     }
 
+    /// How often a transient flush failure is retried inside one flush, with a short backoff.
+    const FLUSH_RETRIES: u32 = 3;
+
     /// Chunks and stores every file with unflushed bytes in `sc`.
     ///
-    /// A file whose flush fails is poisoned and dropped from the dirty set, so the rest of the
-    /// snapshot still commits and the queue cannot be wedged by one damaged block.
-    /// The file's bytes stay in memory and stay counted; `fsync` of that file reports the error.
+    /// A corruption poisons the file and drops it from the dirty set, so the rest of the snapshot
+    /// still commits and the queue cannot be wedged by one damaged block. The file's bytes stay in
+    /// memory and stay counted, and `fsync` of that file reports the error until `Core::unpoison`.
+    ///
+    /// A transient failure (out of space, too many descriptors, a retryable I/O error) is retried a
+    /// few times, then leaves the file dirty and in the dirty set: nothing is lost, the next flush
+    /// tries again, and only `fsync` of that file reports `EIO`.
     pub(crate) fn flush_data(&self, sc: &SnapCtx) -> Result<()> {
         let files = sc.q.lk().take_dirty_files();
-        let mut first: Option<Error> = None;
+        let mut poison: Option<Error> = None;
+        let mut transient: Option<String> = None;
+        let mut backoff = 50u64;
         for ino in files {
             let Some(node) = self.nodes.get(&ino) else {
                 continue;
             };
-            if let Err(e) = self.flush_node(sc, &node) {
+            let mut err = None;
+            for _ in 0..=Self::FLUSH_RETRIES {
+                match self.flush_node(sc, &node) {
+                    Ok(()) => {
+                        err = None;
+                        node.clear_degraded();
+                        break;
+                    }
+                    Err(e) => {
+                        let fatal = Node::classify(&e);
+                        err = Some(e);
+                        if fatal {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(backoff));
+                        backoff *= 8;
+                    }
+                }
+            }
+            let Some(e) = err else {
+                continue;
+            };
+            if Node::classify(&e) {
                 let err = node.poison(format!("{e} (file {ino:#x})"));
-                first.get_or_insert(err);
+                poison.get_or_insert(err);
                 self.ctr.poisoned.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let why = format!("{e} (file {ino:#x})");
+                node.degrade(why.clone());
+                transient.get_or_insert(why);
+                // keep the bytes and keep the file in the dirty set for the next flush
+                sc.q.lk().add_dirty_file(ino);
+                self.ctr.transient.fetch_add(1, Ordering::Relaxed);
             }
         }
-        match first {
-            Some(e) => {
-                *self.last_error.lk() = Some(format!("poisoned file: {e}"));
-                Ok(())
-            }
-            None => Ok(()),
+        let msg = match (poison, transient) {
+            (Some(p), Some(t)) => Some(format!("poisoned file: {p}; transient: {t}")),
+            (Some(p), None) => Some(format!("poisoned file: {p}")),
+            (None, Some(t)) => Some(format!("transient flush failure: {t}")),
+            (None, None) => None,
+        };
+        *self.last_error.lk() = msg;
+        Ok(())
+    }
+
+    /// Test seam: the next `times` flushes of `ino` fail, `kind` 1 transient (out of space),
+    /// 2 corruption. Only `tests/` sets it, and the real store is never asked.
+    pub(crate) fn take_flush_fault(&self, ino: Ino) -> Option<Error> {
+        let mut f = self.flush_fault.lk();
+        let &(kind, times) = f.get(&ino)?;
+        if times == 0 {
+            f.remove(&ino);
+            return None;
         }
+        if times == 1 {
+            f.remove(&ino);
+        } else {
+            f.insert(ino, (kind, times - 1));
+        }
+        Some(match kind {
+            1 => Error::NoSpace,
+            2 => Error::Corrupt("injected flush fault".to_string()),
+            _ => Error::Retry,
+        })
     }
 
     /// Commits everything queued for `sc`: data to the store, then one meta batch.

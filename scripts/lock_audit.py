@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "crates/cowfs-core/src"
 DOC = ROOT / "docs/v1-core.md"
 HEADER = "| Site | Locks held together | Order |"
-MARKER = "| `Inner::flush_snapshot`, `Inner::barrier` |"
+# the generated table: header, separator, then rows, until a blank line
+HEADER_MARK = "| Site | Locks held together | Order |"
 
 # What each lock means, for the "order" column.
 ORDER = {
@@ -111,16 +112,12 @@ def table() -> str:
 if __name__ == "__main__":
     t = table()
     if "--write" in sys.argv:
-        doc = DOC.read_text()
-        head = doc[: doc.index(MARKER)]
-        rest = doc[doc.index(MARKER) :]
-        # keep the prose after the table (the paragraph starting with a blank line and text)
-        lines = rest.split("\n")
-        # lines[0] is the first old row; drop it plus every other row, and the old header
-        tail = [l for l in lines[1:] if not l.startswith(("| `", "| Site |", "|---|---|---|"))]
-        tail = "\n".join(tail).lstrip("\n")
-        tail = tail[tail.index("\n\n") :] if "\n\n" in tail else tail
-        DOC.write_text(head + t + "\n\n" + tail.lstrip("\n"))
+        lines = DOC.read_text().split("\n")
+        i = lines.index(HEADER_MARK)
+        j = i + 2
+        while j < len(lines) and lines[j].startswith("|"):
+            j += 1
+        DOC.write_text("\n".join(lines[:i] + t.split("\n") + lines[j:]))
         print(f"wrote {len(t.splitlines()) - 2} rows")
     else:
         print(t)

@@ -74,9 +74,13 @@ pub(crate) struct Node {
     created_gen: AtomicU64,
     /// The create was cancelled before it reached meta, so nothing of this node is ever committed.
     pub(crate) elided: AtomicBool,
-    /// Set when a flush of this file failed: its data cannot be chunked into the store, so every
-    /// operation on it reports the error instead of writing back around the damage.
+    /// Set when a flush of this file hit a corruption: its data cannot be chunked into the store, so
+    /// every operation on it reports the error instead of writing back around the damage.
     pub(crate) poison: Mutex<Option<String>>,
+    /// Set when the last flush hit a transient error (out of space, too many descriptors, a
+    /// retryable I/O error). The data stays pending and the file is retried; `fsync` of the file
+    /// reports `EIO` while this is set, and `Core::unpoison` clears it.
+    pub(crate) transient: Mutex<Option<String>>,
     pub(crate) st: RwLock<NodeState>,
 }
 
@@ -92,6 +96,7 @@ impl Node {
             created_gen: AtomicU64::new(NO_GEN),
             elided: AtomicBool::new(false),
             poison: Mutex::new(None),
+            transient: Mutex::new(None),
             st: RwLock::new(st),
         }
     }
@@ -104,10 +109,39 @@ impl Node {
         self.refs.load(Ordering::Acquire) > 0 || self.handles.load(Ordering::Acquire) > 0
     }
 
-    /// Records why this file cannot be written, and returns the error to report to callers.
+    /// Records why this file cannot be written. Only a corruption poisons: a transient error (out
+    /// of space, too many descriptors, a retryable I/O error) leaves the data pending instead.
     pub(crate) fn poison(&self, why: String) -> Error {
-        *self.poison.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.clone());
-        Error::Corrupt(why)
+        let e = Error::Corrupt(why.clone());
+        *self.poison.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
+        e
+    }
+
+    /// Clears the poison so the next flush can try again.
+    pub(crate) fn unpoison(&self) {
+        *self.poison.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Records a transient flush failure, which keeps the data pending instead of poisoning.
+    pub(crate) fn degrade(&self, why: String) {
+        *self.transient.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
+    }
+
+    pub(crate) fn degraded(&self) -> Option<Error> {
+        self.transient
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .map(Error::Io)
+    }
+
+    pub(crate) fn clear_degraded(&self) {
+        *self.transient.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Transient or corruption? Only a corruption poisons a file for the life of the mount.
+    pub(crate) fn classify(e: &Error) -> bool {
+        matches!(e, Error::Corrupt(_))
     }
 
     /// The state, waiting up to `limit`. `None` means a writer holds it for longer, which is the
@@ -132,6 +166,13 @@ impl Node {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .map(Error::Corrupt)
+    }
+
+    pub(crate) fn poison_reason(&self) -> Option<String> {
+        self.poison
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(crate) fn set_created_gen(&self, gen: u64) {

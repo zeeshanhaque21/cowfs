@@ -40,6 +40,7 @@ use crate::ino::{pack, Aliases, MAX_SNAP};
 use crate::queue::SnapCtx;
 use crate::util::{MutexExt, RwExt, ShardMap};
 
+pub use crate::inner::{FileHealth, Health, LaneHealth};
 pub use crate::inner::{Options, Stats};
 pub use crate::ino::VIRT_COUNTER_MASK;
 pub use crate::snapname::{name_key, validate_snapshot_name, validate_snapshot_name_bytes};
@@ -203,6 +204,7 @@ impl Core {
             base_pack_bytes,
             root: dir.to_path_buf(),
             swap_fault: AtomicU8::new(0),
+            flush_fault: Mutex::new(HashMap::new()),
             opts,
         });
         for info in inner.meta.snapshots().map_err(from_meta)? {
@@ -355,13 +357,39 @@ impl Core {
         self.inner.stats()
     }
 
-    /// The most recent error a background flush hit, if any.
+    /// The most recent error a background flush hit, of any kind, if any.
     pub fn last_flush_error(&self) -> Option<String> {
         self.inner.last_error.lk().clone()
     }
 
     /// Blocks that only memory names: chunks of open unlinked files and of files whose chunk list
     /// is not committed yet. Garbage collection must treat them as live.
+    /// What is broken, for an operator: files that are dead, files that are only temporarily
+    /// unwritable, the lanes still holding pending data, and the last error. Pollable.
+    pub fn health(&self) -> Health {
+        self.inner.health()
+    }
+
+    /// Repairs a file whose data cannot currently be stored, after the cause is gone (space freed,
+    /// a descriptor problem fixed, a block rewritten). The bytes are still in memory; this puts the
+    /// file back in the dirty set so the next flush stores them. `NotFound` for an inode the mount
+    /// does not know.
+    pub fn unpoison(&self, ino: Ino) -> Result<(), Error> {
+        self.inner.unpoison(ino)
+    }
+
+    /// Test seam: make the next `times` flushes of `ino` fail, `kind` 1 transient (out of space),
+    /// 2 corruption. Only `tests/` uses it; there is no other way to make a store fail on demand.
+    #[doc(hidden)]
+    pub fn set_flush_fault(&self, ino: Ino, kind: u8, times: u32) {
+        let mut f = self.inner.flush_fault.lk();
+        if times == 0 {
+            f.remove(&ino);
+        } else {
+            f.insert(ino, (kind, times));
+        }
+    }
+
     /// The blocks that only memory names right now: those of an open orphan (unlinked, with a
     /// handle or a lookup reference still held) and those of a chunk list that is not committed yet.
     ///
@@ -548,6 +576,7 @@ impl Inner {
             barriers: self.ctr.barriers.load(Ordering::Relaxed),
             forget_underflows: self.ctr.underflows.load(Ordering::Relaxed),
             flush_errors: self.ctr.flush_errors.load(Ordering::Relaxed),
+            transient: self.ctr.transient.load(Ordering::Relaxed),
             poisoned: self.ctr.poisoned.load(Ordering::Relaxed),
             aliases_dropped: self.ctr.aliases_dropped.load(Ordering::Relaxed),
             dentry_hits: self.ctr.dhit.load(Ordering::Relaxed),
@@ -589,6 +618,53 @@ impl Inner {
             }
         }
         Ok(out.into_iter().collect())
+    }
+
+    /// Everything an operator needs after a failure: which files are dead, which are only
+    /// temporarily unwritable, and the last error. Cheap enough to poll.
+    fn health(&self) -> Health {
+        let mut files = Vec::new();
+        self.nodes.retain(|ino, n| {
+            let poisoned = n.poison_reason();
+            let degraded = n.degraded().map(|e| e.to_string());
+            if poisoned.is_some() || degraded.is_some() {
+                files.push(FileHealth {
+                    ino: *ino,
+                    snapshot: ino::snap_of(*ino),
+                    poisoned: poisoned.is_some(),
+                    reason: poisoned.or(degraded),
+                });
+            }
+            true
+        });
+        files.sort_by_key(|f| f.ino);
+        let mut lanes = Vec::new();
+        for sc in self.all_snaps() {
+            let stuck = sc.q.lk().take_dirty_files();
+            if !stuck.is_empty() {
+                lanes.push(LaneHealth {
+                    snapshot: sc.name.clone(),
+                    id: sc.id,
+                    files_stuck: stuck.len(),
+                });
+            }
+        }
+        Health {
+            files,
+            lanes,
+            last_error: self.last_error.lk().clone(),
+        }
+    }
+
+    /// Clears a file's poison and its transient failure, and puts it back in the dirty set so the
+    /// next flush tries again. The bytes are still in memory, so this is a repair, not a recovery.
+    fn unpoison(&self, ino: Ino) -> Result<(), Error> {
+        let n = self.live(ino)?;
+        let sc = self.snapctx(ino)?;
+        n.unpoison();
+        n.clear_degraded();
+        sc.q.lk().add_dirty_file(ino);
+        Ok(())
     }
 
     fn drop_caches(&self) {

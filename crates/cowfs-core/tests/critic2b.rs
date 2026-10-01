@@ -993,3 +993,129 @@ fn a_torn_intent_file_is_reported_and_cleans_up() {
     assert!(!dir.path().join("swap-base2").exists());
     c.check().unwrap();
 }
+
+// ---------------------------------------------------------------- B9: error classification
+
+/// B9: a transient store failure must not kill the file. The data stays pending, `fsync` reports
+/// EIO, and the acked bytes are there after a repair.
+#[test]
+fn a_transient_store_failure_keeps_the_data_pending_and_a_repair_saves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(
+        dir.path(),
+        Options {
+            // above the size written below, so the write is acked with its bytes still dirty
+            file_flush_bytes: 8 << 20,
+            ..test_opts()
+        },
+    )
+    .unwrap();
+    c.create_snapshot("s").unwrap();
+    let fs = c.snapshot_view("s").unwrap();
+    let a = fs.create(ROOT_INO, b"f", 0o644).unwrap().ino;
+    let data = pattern(5 << 20, 7);
+    fs.write(a, 0, &data).unwrap();
+    // every flush of this file fails out of space, for longer than the in-flush retry budget
+    c.set_flush_fault(a, 1, 1000);
+    c.flush().unwrap();
+    let h = c.health();
+    println!(
+        "after a transient failure: health {:?}, last_error {:?}",
+        h.files, h.last_error
+    );
+    let f = h
+        .files
+        .iter()
+        .find(|f| f.ino == a)
+        .expect("health must name the file");
+    assert!(!f.poisoned, "a transient failure poisoned the file: {f:?}");
+    assert!(
+        h.lanes.iter().any(|l| l.files_stuck > 0),
+        "the data must stay pending: {h:?}"
+    );
+    assert!(c.stats().transient > 0, "{:?}", c.stats());
+    // the mount is still writable and the file still reads
+    let b = fs.create(ROOT_INO, b"g", 0o644).unwrap().ino;
+    fs.write(b, 0, b"ok").unwrap();
+    c.flush().unwrap();
+    assert_eq!(
+        read_all(&fs, b),
+        b"ok",
+        "a transient failure wedged the whole mount"
+    );
+    // fsync of the affected file reports EIO, not a corruption
+    assert!(
+        matches!(fs.fsync(a, false), Err(cowfs_vfs::Error::Io(_))),
+        "fsync of a stuck file must report EIO"
+    );
+    // cause gone: the repair puts the bytes in
+    c.set_flush_fault(a, 0, 0);
+    c.unpoison(a).expect("unpoison");
+    fs.fsync(a, false).expect("fsync after the repair");
+    c.sync().unwrap();
+    assert_eq!(read_all(&fs, a), data, "the acked bytes did not survive");
+    let h = c.health();
+    assert!(!h.files.iter().any(|f| f.ino == a), "{h:?}");
+    drop(fs);
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    let fs = c.snapshot_view("s").unwrap();
+    let a = fs.lookup(ROOT_INO, b"f").unwrap().ino;
+    assert_eq!(read_all(&fs, a), data, "the acked bytes were lost");
+}
+
+/// B9: a corruption still poisons, and `unpoison` is the documented repair for it too.
+#[test]
+fn a_corrupt_flush_poisons_the_file_and_unpoison_repairs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(
+        dir.path(),
+        Options {
+            file_flush_bytes: 8 << 20,
+            ..test_opts()
+        },
+    )
+    .unwrap();
+    c.create_snapshot("s").unwrap();
+    let fs = c.snapshot_view("s").unwrap();
+    let a = fs.create(ROOT_INO, b"f", 0o644).unwrap().ino;
+    let data = pattern(5 << 20, 9);
+    fs.write(a, 0, &data).unwrap();
+    assert!(c.stats().dirty_bytes > 0, "the write left nothing to flush");
+    c.set_flush_fault(a, 2, 1000);
+    c.flush().unwrap();
+    let h = c.health();
+    let f = h
+        .files
+        .iter()
+        .find(|f| f.ino == a)
+        .expect("health must name the file");
+    println!("after a corruption: {f:?}");
+    assert!(f.poisoned, "a corruption did not poison the file: {f:?}");
+    assert!(c.stats().poisoned > 0);
+    assert!(
+        fs.write(a, 0, b"x").is_err(),
+        "a poisoned file accepted a write"
+    );
+    c.set_flush_fault(a, 0, 0);
+    c.unpoison(a).expect("unpoison");
+    c.flush().unwrap();
+    assert_eq!(read_all(&fs, a), data, "the repair lost the bytes");
+    assert!(c.health().files.is_empty(), "{:?}", c.health());
+}
+
+/// B9: the health report is a plain snapshot of the state, and an unknown inode is `NotFound`.
+#[test]
+fn health_is_empty_when_nothing_is_broken_and_unpoison_reports_a_bad_inode() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    c.create_snapshot("s").unwrap();
+    let fs = c.snapshot_view("s").unwrap();
+    let a = fs.create(ROOT_INO, b"f", 0o644).unwrap().ino;
+    fs.write(a, 0, b"fine").unwrap();
+    c.sync().unwrap();
+    let h = c.health();
+    assert!(h.files.is_empty(), "{h:?}");
+    assert!(h.lanes.is_empty(), "{h:?}");
+    assert!(c.unpoison(1 << 40).is_err(), "unpoison of an unknown inode");
+}

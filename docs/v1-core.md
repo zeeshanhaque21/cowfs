@@ -353,6 +353,7 @@ that takes a lock is not listed here.
 | `inner::queue_content` | sc.q | 1 |
 | `inner::flush_node` | st.wr | 2 |
 | `inner::flush_data` | sc.q, nodes, last_error | 1 then 2 then leaf |
+| `inner::take_flush_fault` | leaf | 1 |
 | `inner::flush_snapshot` | sc.flush, last_error | 1 then leaf |
 | `inner::flush_locked_snapshot` | sc.q | 1 |
 | `inner::commit_batch` | sc.q, nodes, dents, aliases, unsynced | 1 then 2 then leaf |
@@ -382,6 +383,7 @@ that takes a lock is not listed here.
 | `lib::list_snapshots` | leaf | 1 |
 | `lib::merkle_root` | snap. | 3 |
 | `lib::last_flush_error` | last_error | leaf |
+| `lib::set_flush_fault` | leaf | 1 |
 | `lib::live_blocks` | snap. | 3 |
 | `lib::add_snap` | leaf | 1 |
 | `lib::snap_by_name_raw` | leaf | 1 |
@@ -389,6 +391,8 @@ that takes a lock is not listed here.
 | `lib::register` | root_time, last_error, snap. | 3 then leaf |
 | `lib::unregister` | sc.ns, sc.flush, sc.q, st.try_read, nodes, dents, aliases, root_time | 1 then 2 then leaf |
 | `lib::stats` | sc.q, nodes, dents, aliases | 1 then 2 then leaf |
+| `lib::health` | sc.q, nodes, last_error | 1 then 2 then leaf |
+| `lib::unpoison` | sc.q | 1 |
 | `lib::drop_caches` | st.try_read, nodes, dents | 2 |
 | `node::try_read_for` | st.try_read | 2 |
 | `ns::root_attr` | root_time | leaf |
