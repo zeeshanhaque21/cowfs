@@ -1,0 +1,411 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// An object with no fields, used where a request or response carries no data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Empty {}
+
+/// Parameters that must be exactly `{}`: unknown fields are rejected, for requests where a
+/// misspelt option must not be silently dropped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoParams {}
+
+/// Parameters of `snapshot_create`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCreate {
+    pub name: String,
+    /// Clone this snapshot. `None` creates a snapshot of the empty tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+/// Parameters of `snapshot_promote`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotName {
+    pub name: String,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Parameters of `snapshot_rm`. Unknown fields are rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRm {
+    pub name: String,
+    /// Fail with `busy` when a holder exists, checked under the same lock as the removal.
+    #[serde(default = "yes")]
+    pub expect_no_holders: bool,
+}
+
+/// Parameters of `snapshot_reset`. Unknown fields are rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotReset {
+    /// The snapshot to replace.
+    pub name: String,
+    /// The snapshot to clone into its place.
+    pub from: String,
+    /// Fail with `busy` when a holder exists, checked under the same lock as the swap.
+    #[serde(default = "yes")]
+    pub expect_no_holders: bool,
+}
+
+/// Parameters of `snapshot_rename`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRename {
+    pub from: String,
+    pub to: String,
+}
+
+/// Parameters of `gc`. `dry_run` is required: a real run is never the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcParams {
+    pub dry_run: bool,
+}
+
+/// Parameters of `import`. Unknown fields are rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportParams {
+    pub path: String,
+    pub name: String,
+}
+
+/// Parameters of `base_refresh`. Unknown fields are rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaseRefreshParams {
+    pub repo: String,
+    pub git_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Parameters of `ps`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PsParams {
+    pub snapshot: String,
+}
+
+/// Where a base snapshot came from. Every field is null for a promoted clone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseMeta {
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub git_ref: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+}
+
+/// One snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    pub name: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Set when the snapshot is a base.
+    #[serde(default)]
+    pub base: Option<BaseMeta>,
+    pub created_unix_ms: u64,
+}
+
+/// Result of `version`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionInfo {
+    pub protocol: u32,
+    pub server: String,
+    pub ctl: String,
+}
+
+/// Result of `status`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Status {
+    pub store_path: String,
+    pub mount_path: String,
+    pub snapshot_count: u64,
+    pub block_count: u64,
+    pub logical_bytes: u64,
+    pub stored_bytes: u64,
+    pub uptime_secs: u64,
+}
+
+/// Result of `snapshot_list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotList {
+    pub snapshots: Vec<SnapshotInfo>,
+}
+
+/// Result of `gc`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcReport {
+    pub dry_run: bool,
+    pub candidate_blocks: u64,
+    pub candidate_bytes: u64,
+    pub freed_blocks: u64,
+    pub freed_bytes: u64,
+}
+
+/// One problem found by `fsck`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsckProblem {
+    pub kind: String,
+    pub detail: String,
+}
+
+/// Result of `fsck`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsckReport {
+    pub ok: bool,
+    pub blocks_checked: u64,
+    pub bytes_checked: u64,
+    pub snapshots_checked: u64,
+    pub problems: Vec<FsckProblem>,
+}
+
+/// Most mismatches an `ImportReport` lists.
+pub const MAX_MISMATCHES: usize = 100;
+
+/// One difference between the source tree and the imported tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportMismatch {
+    /// Path relative to the source root.
+    pub path: String,
+    /// What differs, for example `content`, `mode`, `missing` or `extra`.
+    pub reason: String,
+}
+
+/// Result of `import`. The two root hashes let the caller check independently (see
+/// `hash_tree`) before it swaps the directory for a mount.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub name: String,
+    pub files: u64,
+    pub bytes: u64,
+    /// True only when the source was re-read after ingest and the root hashes match.
+    pub verified: bool,
+    /// Always `blake3` in protocol version 1.
+    pub hash_algorithm: String,
+    /// Root hash of the source directory, hex.
+    pub source_root_hash: String,
+    /// Root hash of the imported snapshot, hex.
+    pub imported_root_hash: String,
+    /// Up to `MAX_MISMATCHES` differences. Empty when verified.
+    pub mismatches: Vec<ImportMismatch>,
+    /// True when there were more mismatches than listed.
+    pub mismatches_truncated: bool,
+}
+
+/// Result of `base_refresh`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseRefreshReport {
+    pub snapshot: SnapshotInfo,
+    #[serde(default)]
+    pub previous_commit: Option<String>,
+}
+
+/// Why a process appears in `ps`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldKind {
+    Cwd,
+    Fd,
+    Lock,
+    #[serde(other)]
+    Other,
+}
+
+/// One hold a process has on the snapshot directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hold {
+    pub kind: HoldKind,
+    pub path: String,
+}
+
+/// One process holding a snapshot directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub command: String,
+    pub holds: Vec<Hold>,
+}
+
+/// Result of `ps`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessList {
+    pub processes: Vec<ProcessInfo>,
+}
+
+/// Result of `mount_info`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountInfo {
+    pub mount_path: String,
+    pub adapter: String,
+    pub mounted: bool,
+}
+
+/// What a progress event counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unit {
+    Bytes,
+    Items,
+    #[serde(other)]
+    Other,
+}
+
+/// A progress event of a long operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressEvent {
+    pub phase: String,
+    pub done: u64,
+    #[serde(default)]
+    pub total: Option<u64>,
+    pub unit: Unit,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// A request: `{"method": ..., "params": {...}}` on the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", rename_all = "snake_case")]
+pub enum Request {
+    Ping(Empty),
+    Version(Empty),
+    Status(Empty),
+    SnapshotList(Empty),
+    SnapshotCreate(SnapshotCreate),
+    SnapshotRm(SnapshotRm),
+    SnapshotReset(SnapshotReset),
+    SnapshotRename(SnapshotRename),
+    SnapshotPromote(SnapshotName),
+    Gc(GcParams),
+    Fsck(Empty),
+    Import(ImportParams),
+    BaseRefresh(BaseRefreshParams),
+    Ps(PsParams),
+    MountInfo(Empty),
+    Shutdown(NoParams),
+}
+
+/// Every method name the server understands, in `hello.methods` order.
+pub const METHODS: &[&str] = &[
+    "ping",
+    "version",
+    "status",
+    "snapshot_list",
+    "snapshot_create",
+    "snapshot_rm",
+    "snapshot_reset",
+    "snapshot_rename",
+    "snapshot_promote",
+    "gc",
+    "fsck",
+    "import",
+    "base_refresh",
+    "ps",
+    "mount_info",
+    "shutdown",
+];
+
+/// A successful result: `{"kind": ..., "data": {...}}` on the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum Response {
+    Pong(Empty),
+    Version(VersionInfo),
+    Status(Status),
+    SnapshotList(SnapshotList),
+    Snapshot(SnapshotInfo),
+    Ok(Empty),
+    Gc(GcReport),
+    Fsck(FsckReport),
+    Import(ImportReport),
+    BaseRefresh(BaseRefreshReport),
+    Processes(ProcessList),
+    MountInfo(MountInfo),
+    /// A result kind from a newer server. Only ever produced by decoding, never sent.
+    #[serde(skip)]
+    Unknown {
+        /// The `kind` string.
+        kind: String,
+        /// The raw `data` value.
+        data: Value,
+    },
+}
+
+/// Every response kind this version defines.
+pub const RESPONSE_KINDS: &[&str] = &[
+    "pong",
+    "version",
+    "status",
+    "snapshot_list",
+    "snapshot",
+    "ok",
+    "gc",
+    "fsck",
+    "import",
+    "base_refresh",
+    "processes",
+    "mount_info",
+];
+
+impl Request {
+    /// The wire method name.
+    pub fn method(&self) -> &'static str {
+        match self {
+            Request::Ping(_) => "ping",
+            Request::Version(_) => "version",
+            Request::Status(_) => "status",
+            Request::SnapshotList(_) => "snapshot_list",
+            Request::SnapshotCreate(_) => "snapshot_create",
+            Request::SnapshotRm(_) => "snapshot_rm",
+            Request::SnapshotReset(_) => "snapshot_reset",
+            Request::SnapshotRename(_) => "snapshot_rename",
+            Request::SnapshotPromote(_) => "snapshot_promote",
+            Request::Gc(_) => "gc",
+            Request::Fsck(_) => "fsck",
+            Request::Import(_) => "import",
+            Request::BaseRefresh(_) => "base_refresh",
+            Request::Ps(_) => "ps",
+            Request::MountInfo(_) => "mount_info",
+            Request::Shutdown(_) => "shutdown",
+        }
+    }
+}
+
+impl Response {
+    /// The wire `kind` string.
+    pub fn kind(&self) -> &str {
+        match self {
+            Response::Pong(_) => "pong",
+            Response::Version(_) => "version",
+            Response::Status(_) => "status",
+            Response::SnapshotList(_) => "snapshot_list",
+            Response::Snapshot(_) => "snapshot",
+            Response::Ok(_) => "ok",
+            Response::Gc(_) => "gc",
+            Response::Fsck(_) => "fsck",
+            Response::Import(_) => "import",
+            Response::BaseRefresh(_) => "base_refresh",
+            Response::Processes(_) => "processes",
+            Response::MountInfo(_) => "mount_info",
+            Response::Unknown { kind, .. } => kind,
+        }
+    }
+
+    /// The `data` object as JSON, including for kinds this version does not know.
+    pub fn data_json(&self) -> Value {
+        match self {
+            Response::Unknown { data, .. } => data.clone(),
+            known => serde_json::to_value(known)
+                .ok()
+                .and_then(|mut v| v.get_mut("data").map(Value::take))
+                .unwrap_or(Value::Null),
+        }
+    }
+}

@@ -1,0 +1,80 @@
+//! The conformance suite from `cowfs-vfs-test` through this adapter.
+//!
+//! Each check gets a fresh `PathVfs` rooted inside one mount, so every syscall the suite makes
+//! goes through FUSE to the `Vfs` under the mount.
+//!
+//! Run: `cargo test -p cowfs-fuse -j4 --test conformance -- --ignored --nocapture --test-threads=1`
+//! Set `COWFS_FUSE_STRICT=1` to fail the test when a check fails.
+
+#![cfg(target_os = "linux")]
+
+mod common;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use cowfs_vfs::Vfs;
+use cowfs_vfs_path::{force_remove_dir_all, PathVfs};
+use cowfs_vfs_test::conformance::{run_all, Options};
+
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+struct Cleanup(PathBuf);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        force_remove_dir_all(&self.0);
+        PENDING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The runner drops a check's filesystem on another thread after the result is out, so without
+/// waiting the previous check's tree is still being deleted while the next one measures free
+/// space, and a check that unlinks its only file cannot return the store to where it started.
+fn wait_for_cleanup() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while PENDING.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+#[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
+fn mount_conformance() {
+    // Zero cache lifetimes: the suite asks the `Vfs` about the tree immediately after each
+    // operation, so a cached attribute or page would be a cache-policy artefact, not a defect.
+    let opts = std::env::var("COWFS_FUSE_CONF_MOUNT_OPTS")
+        .unwrap_or_else(|_| "attr_ttl=0,entry_ttl=0,noneg,workers=4".into());
+    let Some(fx) = common::Fixture::new(&opts) else {
+        return;
+    };
+    let base = fx.dir.clone();
+    static N: AtomicU32 = AtomicU32::new(0);
+    let factory = || -> Arc<dyn Vfs> {
+        wait_for_cleanup();
+        let dir = base.join(format!(
+            "cowfs-conformance-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create the per-check directory");
+        PENDING.fetch_add(1, Ordering::SeqCst);
+        Arc::new(
+            PathVfs::new(&dir)
+                .expect("open the per-check directory")
+                .keep_alive(Cleanup(dir)),
+        )
+    };
+    eprintln!("suite base directory: {}", base.display());
+    let mut opts = Options::from_env();
+    if opts.timeout.is_none() {
+        opts.timeout = std::time::Duration::from_secs(300).into();
+    }
+    let report = run_all(&factory, &opts);
+    eprintln!("{}", report.table());
+    wait_for_cleanup();
+    if std::env::var("COWFS_FUSE_STRICT").is_ok_and(|v| v == "1") {
+        assert!(report.passed(), "some checks failed");
+    }
+}
