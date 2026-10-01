@@ -18,7 +18,7 @@ mod naming;
 mod report;
 mod th;
 
-pub use ctl::Daemon;
+pub use ctl::{poll_busy, Daemon, BUSY_POLL, DEFAULT_BUSY_TIMEOUT};
 pub use error::{
     Env, Error, Result, EXIT_BUSY, EXIT_ERROR, EXIT_INTERRUPTED, EXIT_NOT_RUNNING, EXIT_OK,
     EXIT_TIMEOUT, EXIT_USAGE,

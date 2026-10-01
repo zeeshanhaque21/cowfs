@@ -511,6 +511,8 @@ pub struct ReturnOptions {
     pub drop_snapshot: bool,
     /// How long treehouse itself may take.
     pub treehouse_timeout: Duration,
+    /// How long a busy snapshot is retried before the return gives up.
+    pub busy_timeout: Duration,
 }
 
 /// Returns a slot: report holders, optionally terminate them, wait for silly-rename dirt to clear,
@@ -604,7 +606,9 @@ pub fn return_slot(
             ));
         };
         daemon.ensure_snapshot(from, None)?;
-        match daemon.snapshot_reset(snapshot, from, true) {
+        // The holders were signalled just above, so a holder that is on its way out is the common
+        // case. The protocol has no wait-until-free, so poll rather than fail on the first busy.
+        match daemon.snapshot_reset_wait(snapshot, from, opts.busy_timeout) {
             Ok(_) => {}
             Err(Error::Busy(_)) => {
                 outcome.refused_busy = true;
@@ -634,7 +638,7 @@ pub fn return_slot(
     if opts.drop_snapshot {
         if let Some(snapshot) = &opts.snapshot {
             if let Some(daemon) = daemon {
-                daemon.snapshot_rm(snapshot, true)?;
+                daemon.snapshot_rm_wait(snapshot, opts.busy_timeout)?;
                 outcome.snapshot = None;
             }
         }

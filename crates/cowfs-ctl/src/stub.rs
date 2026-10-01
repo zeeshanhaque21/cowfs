@@ -1,11 +1,11 @@
 use crate::error::{CtlError, CtlResult, ErrorCode};
-use crate::handler::{ControlHandler, OpContext};
+use crate::handler::{ControlHandler, HolderGuard, OpContext};
 use crate::treehash::{hash_tree, HASH_ALGORITHM};
 use crate::types::*;
 use crate::validate::{name_key, validate_snapshot_name};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -84,6 +84,13 @@ impl StubHandler {
             .push(process);
     }
 
+    /// Adds a holder while the snapshot's framework lock is held, which is what a real adapter
+    /// must do too, so a check inside a swap cannot miss it.
+    pub fn add_holder(&self, snapshot: &str, process: ProcessInfo, lock: &Arc<Mutex<()>>) {
+        let _serialised = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.add_process(snapshot, process);
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -125,21 +132,6 @@ impl State {
         self.snapshots
             .keys()
             .any(|k| Some(k.as_str()) != except && name_key(k) == key)
-    }
-
-    fn holders(&self, name: &str) -> Option<&Vec<ProcessInfo>> {
-        self.processes.get(name).filter(|p| !p.is_empty())
-    }
-
-    fn busy(&self, name: &str) -> CtlResult<()> {
-        match self.holders(name) {
-            Some(p) => Err(CtlError::new(
-                ErrorCode::Busy,
-                format!("snapshot {name:?} is held by {} process(es)", p.len()),
-            )
-            .with_details(serde_json::json!({ "holders": p }))),
-            None => Ok(()),
-        }
     }
 
     fn insert(&mut self, info: SnapshotInfo) -> SnapshotInfo {
@@ -187,34 +179,27 @@ impl ControlHandler for StubHandler {
         }))
     }
 
-    fn snapshot_rm(&self, name: &str, expect_no_holders: bool) -> CtlResult<()> {
+    fn remove(&self, name: &str, guard: &HolderGuard<'_>) -> CtlResult<()> {
+        let _serialised = guard.lock();
+        guard.check_holders()?;
         let mut st = self.lock();
         if !st.snapshots.contains_key(name) {
             return Err(missing(name));
-        }
-        if expect_no_holders {
-            st.busy(name)?;
         }
         st.snapshots.remove(name);
         st.processes.remove(name);
         Ok(())
     }
 
-    fn snapshot_reset(
-        &self,
-        name: &str,
-        from: &str,
-        expect_no_holders: bool,
-    ) -> CtlResult<SnapshotInfo> {
+    fn swap(&self, name: &str, from: &str, guard: &HolderGuard<'_>) -> CtlResult<SnapshotInfo> {
+        let _serialised = guard.lock();
+        guard.check_holders()?;
         let mut st = self.lock();
         if !st.snapshots.contains_key(name) {
             return Err(missing(name));
         }
         if !st.snapshots.contains_key(from) {
             return Err(missing(from));
-        }
-        if expect_no_holders {
-            st.busy(name)?;
         }
         Ok(st.insert(SnapshotInfo {
             name: name.to_owned(),
@@ -364,7 +349,7 @@ impl ControlHandler for StubHandler {
         })
     }
 
-    fn ps(&self, snapshot: &str) -> CtlResult<Vec<ProcessInfo>> {
+    fn holders(&self, snapshot: &str) -> CtlResult<Vec<ProcessInfo>> {
         let st = self.lock();
         if !st.snapshots.contains_key(snapshot) && !st.processes.contains_key(snapshot) {
             return Err(missing(snapshot));
@@ -378,5 +363,67 @@ impl ControlHandler for StubHandler {
             adapter: "stub".into(),
             mounted: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::*;
+    use crate::conformance::handler_conformance;
+    use crate::CancelToken;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn holder_pid() -> u32 {
+        0xC0FFEE
+    }
+
+    #[test]
+    fn the_stub_passes_the_handler_conformance() {
+        let h = Arc::new(StubHandler::new("/s", "/m"));
+        let held: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let h2 = Arc::clone(&h);
+        let held2 = Arc::clone(&held);
+        let inject: Arc<crate::conformance::AddHolder> = Arc::new(move |name: &str| {
+            h2.add_holder(
+                name,
+                ProcessInfo {
+                    pid: holder_pid(),
+                    command: "conformance".into(),
+                    holds: Vec::new(),
+                },
+                &held2,
+            )
+        });
+        handler_conformance(h as Arc<dyn ControlHandler>, inject).unwrap();
+    }
+
+    #[test]
+    fn import_reports_unverified_when_the_source_changes_while_it_is_ingested() {
+        let h = StubHandler::new("/s", "/m").with_work(2, Duration::ZERO);
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("a");
+        std::fs::write(&source_path, b"before").unwrap();
+        let touched = Arc::new(source_path.clone());
+        let changed = Arc::new(AtomicBool::new(false));
+        let once = Arc::clone(&changed);
+        let ctx = OpContext::new(CancelToken::new(), move |_| {
+            if !once.swap(true, Ordering::SeqCst) {
+                std::fs::write(touched.as_path(), b"after!").unwrap();
+            }
+            true
+        });
+        let report = h
+            .import(
+                ImportParams {
+                    path: dir.path().to_string_lossy().into_owned(),
+                    name: "imp".into(),
+                },
+                &ctx,
+            )
+            .unwrap();
+        assert!(!report.verified, "{report:?}");
+        assert_ne!(report.source_root_hash, report.imported_root_hash);
+        assert!(!report.mismatches.is_empty());
     }
 }

@@ -91,8 +91,8 @@ fn serve(backend: &dyn Backend, config: &ServeConfig, socket: &Path) -> Result<(
 
 /// Writes `text` and a newline to `w` and flushes. A broken pipe means the reader left on
 /// purpose and counts as success; any other failure is reported and is an error.
-pub fn write_line(w: &mut dyn Write, text: &str) -> i32 {
-    match writeln!(w, "{text}").and_then(|()| w.flush()) {
+pub fn write_bytes(w: &mut dyn Write, bytes: &[u8]) -> i32 {
+    match w.write_all(bytes).and_then(|()| w.flush()) {
         Ok(()) => EXIT_OK,
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => EXIT_OK,
         Err(e) => {
@@ -100,6 +100,17 @@ pub fn write_line(w: &mut dyn Write, text: &str) -> i32 {
             EXIT_ERROR
         }
     }
+}
+
+/// Writes one line, checking the write.
+pub fn write_line(w: &mut dyn Write, text: &str) -> i32 {
+    write_bytes(w, format!("{text}\n").as_bytes())
+}
+
+/// Reports a clap usage error and returns the exit code, honouring `--json`.
+pub fn usage_error(json: bool, message: &str) -> i32 {
+    report(json, "usage", message, None);
+    EXIT_USAGE
 }
 
 fn report(json: bool, code: &str, message: &str, details: Option<&Value>) {
@@ -285,7 +296,9 @@ fn client_failure(json: bool, socket: &Path, err: &ClientError) -> i32 {
         report(json, "not_running", &msg, None);
         return EXIT_NOT_RUNNING;
     }
-    if err.is_timeout() {
+    if err.is_timeout()
+        || matches!(err, ClientError::Connect { source, .. } if source.kind() == io::ErrorKind::TimedOut)
+    {
         report(json, "timeout", &err.to_string(), None);
         return EXIT_TIMEOUT;
     }
@@ -342,8 +355,9 @@ pub fn run(cli: Cli) -> i32 {
     match &cli.command {
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
-            clap_complete::generate(*shell, &mut cmd, "cowfs", &mut io::stdout());
-            EXIT_OK
+            let mut script: Vec<u8> = Vec::new();
+            clap_complete::generate(*shell, &mut cmd, "cowfs", &mut script);
+            write_bytes(&mut io::stdout(), &script)
         }
         Command::Serve {
             store,

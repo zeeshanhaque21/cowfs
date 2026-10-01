@@ -81,6 +81,20 @@ pub fn start_with(handler: impl ControlHandler + 'static, opts: ServerOptions) -
     }
 }
 
+/// A fixture from an already-boxed handler, so a test can keep a handle to it.
+pub fn start_arc(handler: Arc<dyn ControlHandler>, opts: ServerOptions) -> Fixture {
+    let watchdog = Watchdog::start(120);
+    let dir = private_tempdir();
+    let path = dir.path().join("c.sock");
+    let server = Server::start(&path, handler, opts).unwrap();
+    Fixture {
+        _dir: dir,
+        path,
+        server: Some(server),
+        _watchdog: watchdog,
+    }
+}
+
 pub fn start(handler: impl ControlHandler + 'static) -> Fixture {
     start_with(handler, ServerOptions::default())
 }
@@ -149,6 +163,20 @@ pub fn wait_for(what: &str, cond: impl Fn() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Sends a request and returns the first frame that is not progress.
+pub fn req(r: &mut Raw, id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+    r.send(
+        &serde_json::json!({"type": "request", "id": id, "method": method, "params": params})
+            .to_string(),
+    );
+    r.recv_final()
+}
+
+/// The error code of an error frame, or a marker when the frame is not an error.
+pub fn code_of(f: &serde_json::Value) -> &str {
+    f["error"]["code"].as_str().unwrap_or("not-an-error")
 }
 
 pub fn code(err: ClientError) -> ErrorCode {

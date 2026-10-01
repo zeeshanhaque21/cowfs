@@ -8,11 +8,12 @@
 mod common;
 
 use common::{private_tempdir, stub_in, Fixture, Watchdog};
-use cowfs_ctl::{Hold, HoldKind, ProcessInfo};
+use cowfs_ctl::{Hold, HoldKind, ProcessInfo, StubHandler};
 use cowfs_treehouse::{
     base_status, pool_id, slot_of, slot_snapshot, CowfsMaterialiser, Daemon, Error, Materialiser,
     Provision, RecordingMaterialiser, EXIT_BUSY, EXIT_ERROR, EXIT_NOT_RUNNING, EXIT_OK,
 };
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// A stub daemon plus a throwaway repository, which is what a slot path needs to be real.
 struct Fixture2 {
@@ -123,6 +124,7 @@ fn a_slot_is_created_from_the_warm_base() {
         materialiser: &materialiser,
         slot_path: slot.clone(),
         pool_id: None,
+        busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
     }
     .run()
     .expect("provision");
@@ -162,6 +164,7 @@ fn a_second_acquisition_resets_rather_than_recreating() {
             materialiser: &materialiser,
             slot_path: slot.clone(),
             pool_id: None,
+            busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
         }
         .run()
         .expect("provision")
@@ -198,6 +201,7 @@ fn provisioning_is_idempotent_and_converges_when_repeated() {
                 materialiser: &materialiser,
                 slot_path: slot.clone(),
                 pool_id: None,
+                busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
             }
             .run()
             .expect("provision"),
@@ -244,6 +248,7 @@ fn a_partial_run_leaves_no_trace_and_the_next_run_converges() {
         materialiser: &materialiser,
         slot_path: slot.clone(),
         pool_id: None,
+        busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
     }
     .run()
     .expect("the rerun converges");
@@ -279,6 +284,7 @@ fn a_slot_git_file_git_already_wrote_is_left_alone() {
         materialiser: &materialiser,
         slot_path: slot.clone(),
         pool_id: None,
+        busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
     }
     .run()
     .expect("provision");
@@ -303,6 +309,7 @@ fn provisioning_without_a_warm_base_says_so_instead_of_creating_an_empty_slot() 
         materialiser: &materialiser,
         slot_path: slot.clone(),
         pool_id: None,
+        busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
     }
     .run()
     .expect_err("no base");
@@ -328,6 +335,7 @@ fn a_holder_makes_the_atomic_reset_refuse_and_change_nothing() {
         materialiser: &materialiser,
         slot_path: slot.clone(),
         pool_id: None,
+        busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
     }
     .run()
     .expect("provision");
@@ -380,6 +388,7 @@ fn a_holder_appears_between_the_scan_and_the_swap_and_is_still_caught() {
         materialiser: &materialiser,
         slot_path: slot.clone(),
         pool_id: None,
+        busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
     }
     .run()
     .expect("provision");
@@ -416,7 +425,7 @@ fn busy_maps_to_exit_five_and_a_missing_snapshot_to_exit_one() {
     f.daemon.snapshot_create("held", None).expect("create held");
     let busy = f.daemon.snapshot_rm("held", true).expect_err("busy");
     assert_eq!(busy.exit_code(), EXIT_BUSY);
-    assert!(busy.to_string().contains("held by"), "{busy}");
+    assert!(busy.to_string().contains("holder"), "{busy}");
 
     let missing = f.daemon.snapshot_rm("nope", true).expect_err("not found");
     assert_eq!(missing.exit_code(), EXIT_ERROR);
@@ -533,6 +542,7 @@ fn a_slot_path_outside_the_pool_layout_is_refused() {
         materialiser: &materialiser,
         slot_path: std::path::PathBuf::from("/"),
         pool_id: Some("pool-abcdef".into()),
+        busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
     }
     .run()
     .expect_err("no slot name");
@@ -547,6 +557,7 @@ fn a_slot_path_outside_the_pool_layout_is_refused() {
         materialiser: &materialiser,
         slot_path: shaped,
         pool_id: None,
+        busy_timeout: cowfs_treehouse::DEFAULT_BUSY_TIMEOUT,
     }
     .run()
     .expect_err("no base");
@@ -631,4 +642,179 @@ fn a_report_of_checks_drives_its_own_exit_code() {
     r.fail("no .nfs* dirt", ".nfs.0001 in /pool/1/repo");
     assert_eq!(r.exit_code(), EXIT_ERROR);
     assert_eq!(r.failures(), 1);
+}
+
+/// A handler whose `swap` answers `busy` a fixed number of times and then behaves.
+///
+/// The control protocol has no wait-until-free, so the companion polls. This is the only way to
+/// prove the poll actually retries: the stub handler has no way to remove a holder once added.
+#[derive(Debug)]
+struct FlakySwap {
+    inner: StubHandler,
+    remaining: std::sync::Mutex<u32>,
+    calls: std::sync::atomic::AtomicU32,
+}
+
+impl FlakySwap {
+    fn new(busy_for: u32) -> FlakySwap {
+        FlakySwap {
+            inner: StubHandler::new("store", "mnt"),
+            remaining: Mutex::new(busy_for),
+            calls: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn attempts(&self) -> u32 {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl cowfs_ctl::ControlHandler for FlakySwap {
+    fn status(&self) -> cowfs_ctl::CtlResult<cowfs_ctl::Status> {
+        self.inner.status()
+    }
+    fn snapshot_list(&self) -> cowfs_ctl::CtlResult<Vec<cowfs_ctl::SnapshotInfo>> {
+        self.inner.snapshot_list()
+    }
+    fn snapshot_create(
+        &self,
+        params: cowfs_ctl::SnapshotCreate,
+    ) -> cowfs_ctl::CtlResult<cowfs_ctl::SnapshotInfo> {
+        self.inner.snapshot_create(params)
+    }
+    fn holders(&self, snapshot: &str) -> cowfs_ctl::CtlResult<Vec<cowfs_ctl::ProcessInfo>> {
+        self.inner.holders(snapshot)
+    }
+    fn snapshot_rename(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> cowfs_ctl::CtlResult<cowfs_ctl::SnapshotInfo> {
+        self.inner.snapshot_rename(from, to)
+    }
+    fn base_refresh(
+        &self,
+        params: cowfs_ctl::BaseRefreshParams,
+        ctx: &cowfs_ctl::OpContext<'_>,
+    ) -> cowfs_ctl::CtlResult<cowfs_ctl::BaseRefreshReport> {
+        self.inner.base_refresh(params, ctx)
+    }
+    fn mount_info(&self) -> cowfs_ctl::CtlResult<cowfs_ctl::MountInfo> {
+        self.inner.mount_info()
+    }
+    fn import(
+        &self,
+        params: cowfs_ctl::ImportParams,
+        ctx: &cowfs_ctl::OpContext<'_>,
+    ) -> cowfs_ctl::CtlResult<cowfs_ctl::ImportReport> {
+        self.inner.import(params, ctx)
+    }
+    fn swap(
+        &self,
+        name: &str,
+        from: &str,
+        guard: &cowfs_ctl::HolderGuard<'_>,
+    ) -> cowfs_ctl::CtlResult<cowfs_ctl::SnapshotInfo> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut left = self
+            .remaining
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *left > 0 {
+            *left -= 1;
+            return Err(cowfs_ctl::CtlError::new(
+                cowfs_ctl::ErrorCode::Busy,
+                format!("snapshot {name:?} is still busy"),
+            ));
+        }
+        self.inner.swap(name, from, guard)
+    }
+    fn remove(&self, name: &str, guard: &cowfs_ctl::HolderGuard<'_>) -> cowfs_ctl::CtlResult<()> {
+        self.inner.remove(name, guard)
+    }
+}
+
+/// A busy snapshot that frees up inside the wait is retried, not failed.
+#[test]
+fn a_swap_that_is_busy_then_free_is_retried_until_it_succeeds() {
+    let _w = Watchdog::start(60);
+    let dir = private_tempdir();
+    let sock_dir = dir.path().join("run");
+    std::fs::create_dir_all(&sock_dir).expect("mkdir");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let socket = sock_dir.join("control.sock");
+    let flaky = Arc::new(FlakySwap::new(3));
+    let server = cowfs_ctl::Server::start(
+        &socket,
+        Arc::clone(&flaky) as Arc<dyn cowfs_ctl::ControlHandler>,
+        cowfs_ctl::ServerOptions::default(),
+    )
+    .expect("server");
+    let mut daemon = Daemon::connect(Some(&socket), Some(5)).expect("connect");
+
+    daemon.snapshot_create("base", None).expect("create base");
+    daemon.snapshot_create("slot", None).expect("create slot");
+
+    let started = std::time::Instant::now();
+    let info = daemon
+        .snapshot_reset_wait("slot", "base", std::time::Duration::from_secs(10))
+        .expect("the retry succeeds once the holder is gone");
+    assert_eq!(info.parent.as_deref(), Some("base"));
+    assert_eq!(flaky.attempts(), 4, "one attempt plus three retries");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(200),
+        "it really waited between attempts: {:?}",
+        started.elapsed()
+    );
+    server.shutdown();
+}
+
+/// A snapshot that stays busy fails with `busy` when the wait runs out, never looping forever.
+#[test]
+fn a_swap_that_stays_busy_fails_within_its_bounded_wait() {
+    let _w = Watchdog::start(60);
+    let dir = private_tempdir();
+    let sock_dir = dir.path().join("run");
+    std::fs::create_dir_all(&sock_dir).expect("mkdir");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let socket = sock_dir.join("control.sock");
+    let flaky = Arc::new(FlakySwap::new(u32::MAX));
+    let server = cowfs_ctl::Server::start(
+        &socket,
+        Arc::clone(&flaky) as Arc<dyn cowfs_ctl::ControlHandler>,
+        cowfs_ctl::ServerOptions::default(),
+    )
+    .expect("server");
+    let mut daemon = Daemon::connect(Some(&socket), Some(5)).expect("connect");
+    daemon.snapshot_create("base", None).expect("create base");
+    daemon.snapshot_create("slot", None).expect("create slot");
+
+    let err = daemon
+        .snapshot_reset_wait("slot", "base", std::time::Duration::from_millis(300))
+        .expect_err("never frees");
+    assert_eq!(err.exit_code(), EXIT_BUSY, "{err}");
+    assert!(err.to_string().contains("still held"), "{err}");
+    assert!(
+        flaky.attempts() > 1,
+        "it really retried: {}",
+        flaky.attempts()
+    );
+    server.shutdown();
+}
+
+/// A non-busy failure is returned at once: retrying it cannot help.
+#[test]
+fn a_non_busy_failure_is_not_retried() {
+    let _w = Watchdog::start(60);
+    let mut daemon_calls = 0u32;
+    let err = cowfs_treehouse::poll_busy(std::time::Duration::from_secs(5), || {
+        daemon_calls += 1;
+        Err::<(), _>(Error::Cowfs("not_found: snapshot \"nope\"".into()))
+    })
+    .expect_err("must fail");
+    assert_eq!(daemon_calls, 1, "one attempt only, {daemon_calls}");
+    assert_eq!(err.exit_code(), EXIT_ERROR, "{err}");
+    assert!(err.to_string().contains("not_found"), "{err}");
 }

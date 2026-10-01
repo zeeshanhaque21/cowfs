@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::ctl::DEFAULT_BUSY_TIMEOUT;
 use crate::error::{Env, Error, Result, EXIT_ERROR, EXIT_OK};
 use crate::mode_a::{Doctor, ReturnOptions};
 use crate::mode_b::{BaseRefresh, PromoteOptions, DEFAULT_NFS_TIMEOUT, DEFAULT_TREEHOUSE_TIMEOUT};
@@ -335,6 +336,7 @@ fn dispatch(cli: &Cli, env: &Env) -> Result<i32> {
                 materialiser: &materialiser,
                 slot_path: a.slot.clone(),
                 pool_id: a.pool_id.clone(),
+                busy_timeout: DEFAULT_BUSY_TIMEOUT,
             }
             .run()?;
             emit(env, &out)?;
@@ -473,6 +475,7 @@ fn do_return(
                 a.treehouse_timeout
                     .unwrap_or(DEFAULT_TREEHOUSE_TIMEOUT.as_secs()),
             ),
+            busy_timeout: DEFAULT_BUSY_TIMEOUT,
         },
     )
 }

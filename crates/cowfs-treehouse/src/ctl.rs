@@ -3,10 +3,41 @@ use cowfs_ctl::{
     MountInfo, ProcessInfo, Request, Response, SnapshotInfo, Status,
 };
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::naming::from_client_error;
+
+/// How long a busy snapshot is retried before the wait gives up. Short, because the transient case
+/// is a holder on its way out and the durable case must not turn into a long stall.
+pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a busy snapshot is retried.
+pub const BUSY_POLL: Duration = Duration::from_millis(100);
+
+/// Retries `op` while it answers `busy`.
+///
+/// The control protocol has no wait-until-free, and the common holder is a process that is exiting:
+/// the companion signals it and then wants the swap. So the caller polls. Two bounds keep that safe.
+/// Every error other than `busy` returns at once, because retrying it cannot help, and the deadline
+/// returns rather than looping forever against a holder that is not going anywhere.
+pub fn poll_busy<T>(timeout: Duration, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(Error::Busy(_)) if Instant::now() >= deadline => {
+                let why = format!(
+                    "still held after {}s: not an exiting process",
+                    timeout.as_secs()
+                );
+                return Err(Error::Busy(why));
+            }
+            // `busy` is only retried while there is time left. Anything else fails at once.
+            Err(Error::Busy(_)) => std::thread::sleep(BUSY_POLL),
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// A connection to the cowfs daemon, with the companion's calls on it. Every method is one control
 /// request; nothing here interprets a result beyond turning a mismatched `kind` into an error.
@@ -129,6 +160,22 @@ impl Daemon {
             Response::Snapshot(s) => Some(s),
             _ => None,
         })
+    }
+
+    /// `snapshot_reset` retried while the snapshot is busy, for a caller that has just told a
+    /// holder to go and is waiting for it to.
+    pub fn snapshot_reset_wait(
+        &mut self,
+        name: &str,
+        from: &str,
+        timeout: Duration,
+    ) -> Result<SnapshotInfo> {
+        poll_busy(timeout, || self.snapshot_reset(name, from, true))
+    }
+
+    /// `snapshot_rm` retried while the snapshot is busy.
+    pub fn snapshot_rm_wait(&mut self, name: &str, timeout: Duration) -> Result<()> {
+        poll_busy(timeout, || self.snapshot_rm(name, true))
     }
 
     /// `snapshot_create` unless the name is already taken, which is what makes a repeated wrapper

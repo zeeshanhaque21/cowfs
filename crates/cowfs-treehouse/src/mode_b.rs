@@ -101,6 +101,8 @@ pub struct Provision<'a> {
     pub slot_path: PathBuf,
     /// Force the pool id instead of deriving it, for a caller that already knows it.
     pub pool_id: Option<String>,
+    /// How long a busy snapshot is retried, default [`crate::ctl::DEFAULT_BUSY_TIMEOUT`].
+    pub busy_timeout: Duration,
 }
 
 impl std::fmt::Debug for Provision<'_> {
@@ -153,7 +155,10 @@ impl Provision<'_> {
 
         let existing = self.snapshot_exists(&snapshot)?;
         if existing {
-            self.daemon.snapshot_reset(&snapshot, &base, true)?;
+            // A recycled slot's previous holder may still be exiting, so a busy is retried rather
+            // than failed on.
+            self.daemon
+                .snapshot_reset_wait(&snapshot, &base, self.busy_timeout)?;
         } else {
             self.materialiser.materialise(&snapshot, &self.slot_path)?;
             self.daemon.snapshot_create(&snapshot, Some(&base))?;
@@ -376,6 +381,7 @@ pub fn get(
         materialiser,
         slot_path,
         pool_id: None,
+        busy_timeout: crate::ctl::DEFAULT_BUSY_TIMEOUT,
     }
     .run()?;
     guard.keep();
