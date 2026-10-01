@@ -22,7 +22,7 @@ struct Gens {
 /// it on the way in, so a hit is never unverified data.
 #[derive(Debug)]
 pub(crate) struct Blocks {
-    pub(crate) store: Arc<Store>,
+    pub(crate) store: Option<Arc<Store>>,
     half: usize,
     gens: Mutex<Gens>,
 }
@@ -30,10 +30,21 @@ pub(crate) struct Blocks {
 impl Blocks {
     pub(crate) fn new(store: Arc<Store>, cache_bytes: usize) -> Self {
         Self {
-            store,
+            store: Some(store),
             half: (cache_bytes / 2).max(MAX_BLOCK_LEN),
             gens: Mutex::new(Gens::default()),
         }
+    }
+
+    pub(crate) fn store(&self) -> &Store {
+        self.store
+            .as_deref()
+            .expect("the store is gone: the mount is closed")
+    }
+
+    /// Hands the store over so it can be closed with its own error reporting.
+    pub(crate) fn take_store(&mut self) -> Arc<Store> {
+        self.store.take().expect("the store was already taken")
     }
 
     fn insert(&self, id: BlockId, data: Arc<Vec<u8>>) {
@@ -59,14 +70,14 @@ impl Blocks {
                 return Ok(b);
             }
         }
-        let data = Arc::new(self.store.get(id).map_err(from_store)?);
+        let data = Arc::new(self.store().get(id).map_err(from_store)?);
         self.insert(id, data.clone());
         Ok(data)
     }
 
     /// Stores `data` (at most 256 KiB) and remembers it for reads.
     pub(crate) fn put(&self, data: &[u8]) -> Result<BlockId> {
-        let id = self.store.put(data).map_err(from_store)?;
+        let id = self.store().put(data).map_err(from_store)?;
         self.insert(id, Arc::new(data.to_vec()));
         Ok(id)
     }

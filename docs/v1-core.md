@@ -377,7 +377,7 @@ that takes a lock is not listed here.
 | `io::op_setxattr` | sc.ns, st.wr | 1 then 2 |
 | `io::xattr_exists` | st.rd, snap. | 2 then 3 |
 | `io::op_removexattr` | sc.ns, st.wr | 1 then 2 |
-| `lib::drop` | leaf | 1 |
+| `lib::shutdown` | leaf | 1 |
 | `lib::from_parts` | nodes, dents, aliases, handles, root_time, pressure, unsynced, last_error, virt_lock | 2 then leaf |
 | `lib::fork_snapshot` | snap. | 3 |
 | `lib::list_snapshots` | leaf | 1 |

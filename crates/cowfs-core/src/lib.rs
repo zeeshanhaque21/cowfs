@@ -23,7 +23,7 @@ mod view;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -89,9 +89,15 @@ pub struct SnapshotEntry {
 }
 
 /// The sync hook that orders a store sync before every durable meta commit.
+///
+/// It holds the store weakly, so a closed store is not kept alive by the hook: a commit after
+/// [`Core::close`] fails instead of writing to a store that no longer reports its state.
 pub fn store_sync_hook(store: &Arc<Store>) -> SyncHook {
-    let store = store.clone();
+    let store = Arc::downgrade(store);
     Arc::new(move || {
+        let store = store
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("the block store is closed"))?;
         store.sync().map_err(|e| match e {
             cowfs_store::Error::Io(e) => e,
             e => std::io::Error::other(e.to_string()),
@@ -102,17 +108,29 @@ pub fn store_sync_hook(store: &Arc<Store>) -> SyncHook {
 struct Guard {
     inner: Arc<Inner>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    done: AtomicBool,
 }
 
-impl Drop for Guard {
-    fn drop(&mut self) {
+impl Guard {
+    /// Stops the background flusher and makes everything durable, reporting what went wrong.
+    /// Runs at most once, so a drop after an explicit close does not repeat the work.
+    fn shutdown(&self) -> Result<(), Error> {
+        if self.done.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         *self.inner.bg.0.lk() = true;
         self.inner.bg.1.notify_all();
         if let Some(t) = self.thread.lk().take() {
             let _ = t.join();
         }
-        let _ = self.inner.sync_all();
-        let _ = self.inner.meta.close();
+        self.inner.sync_all()?;
+        self.inner.meta.close().map_err(from_meta)
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -250,6 +268,7 @@ impl Core {
             _guard: Arc::new(Guard {
                 inner: inner.clone(),
                 thread: Mutex::new(thread),
+                done: AtomicBool::new(false),
             }),
             inner,
         };
@@ -347,9 +366,32 @@ impl Core {
         self.inner.meta.check().map_err(from_meta)
     }
 
+    /// Shuts the mount down: stops the background flusher, makes everything durable, then closes
+    /// the metadata database and the block store, releasing the store lock.
+    ///
+    /// Dropping the last [`Core`] does the same work but cannot report it. This is the way to
+    /// release the lock and learn whether the final flush worked. It needs the last handle, and
+    /// reports `Error::Stale` while another clone is still open.
+    pub fn close(self) -> Result<(), Error> {
+        let Core { inner, _guard } = self;
+        if Arc::strong_count(&_guard) > 1 {
+            return Err(Error::Stale);
+        }
+        let guard = Arc::try_unwrap(_guard).map_err(|_| Error::Stale)?;
+        guard.shutdown()?;
+        // the guard holds its own reference to the shared state, and it must go before the store
+        // inside it can be taken out
+        drop(guard);
+        let mut inner = Arc::try_unwrap(inner).map_err(|_| Error::Stale)?;
+        let store = inner.blocks.take_store();
+        drop(inner);
+        let store = Arc::try_unwrap(store).map_err(|_| Error::Stale)?;
+        store.close().map_err(from_store)
+    }
+
     /// Re-hashes every block in the store.
     pub fn fsck(&self) -> Result<FsckReport, Error> {
-        self.inner.blocks.store.fsck().map_err(from_store)
+        self.inner.blocks.store().fsck().map_err(from_store)
     }
 
     /// Counters and cache sizes.
@@ -426,8 +468,8 @@ impl Core {
     }
 
     /// The block store.
-    pub fn store(&self) -> &Arc<Store> {
-        &self.inner.blocks.store
+    pub fn store(&self) -> &Store {
+        self.inner.blocks.store()
     }
 
     /// The metadata database.

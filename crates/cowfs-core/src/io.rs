@@ -438,7 +438,7 @@ impl Inner {
     pub(crate) fn op_statfs(&self) -> Result<StatFs> {
         let used_bytes = self
             .blocks
-            .store
+            .store()
             .stats()
             .pack_bytes
             .saturating_sub(self.base_pack_bytes)

@@ -39,7 +39,7 @@ pub(crate) fn from_store(e: cowfs_store::Error) -> Error {
         S::Io(e) => from_io(&e),
         S::NotFound(id) => Error::Corrupt(format!("block {id} named by a file is missing")),
         S::Corrupt { .. } | S::HashMismatch(_) => Error::Corrupt(e.to_string()),
-        S::BlockTooLarge(_) | S::BadPack { .. } | S::Locked(_) | S::Quarantine { .. } => {
+        S::BlockTooLarge(_) | S::BadPack { .. } | S::Locked { .. } | S::Quarantine { .. } => {
             Error::Io(e.to_string())
         }
     }
@@ -128,7 +128,13 @@ mod tests {
             Error::Io(_)
         ));
         assert!(matches!(from_store(S::BlockTooLarge(1)), Error::Io(_)));
-        assert!(matches!(from_store(S::Locked("p".into())), Error::Io(_)));
+        assert!(matches!(
+            from_store(S::Locked {
+                dir: "p".into(),
+                holder: Some(7)
+            }),
+            Error::Io(_)
+        ));
         assert!(matches!(
             from_store(S::Quarantine {
                 pack: 0,

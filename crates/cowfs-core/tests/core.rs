@@ -411,6 +411,38 @@ fn corrupt_block_under_an_open_core_is_eio_never_wrong_data() {
     assert!(!c.fsck().unwrap().is_clean());
 }
 
+/// `Core::close` must release the store lock, so the same directory opens again immediately.
+#[test]
+fn close_releases_the_store_lock_and_keeps_the_data() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        c.create_snapshot("s").unwrap();
+        let r = root_entry(&c, "s").ino;
+        mkfile(&c, r, "f", &pattern(600_000, 3));
+        c.close().expect("close");
+    }
+    let c = Core::open(dir.path(), test_opts()).expect("the lock was not released");
+    let fs = c.snapshot_view("s").unwrap();
+    let a = fs.lookup(ROOT_INO, b"f").unwrap();
+    assert_eq!(read_all(&fs, a.ino), pattern(600_000, 3));
+    c.check().unwrap();
+}
+
+/// A second handle means the mount is not really closing, so `close` says so instead of tearing
+/// the shared state down under the other clone.
+#[test]
+fn close_refuses_while_another_handle_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    let other = c.clone();
+    assert!(
+        matches!(c.close(), Err(Error::Stale)),
+        "close ignored a live clone"
+    );
+    other.create_snapshot("s").unwrap();
+}
+
 #[test]
 fn a_store_that_lost_durable_data_is_not_opened() {
     let dir = tempfile::tempdir().unwrap();
