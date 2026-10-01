@@ -376,7 +376,7 @@ impl Inner {
         }
         let (sc, pn) = self.dir(parent)?;
         validate_name(name)?;
-        let cn = {
+        let before = {
             let _ns = sc.ns.lk();
             let (child, kind) = self.dent_lookup(&sc, &pn, name)?.ok_or(Error::NotFound)?;
             if kind != FileKind::Directory {
@@ -387,14 +387,15 @@ impl Inner {
         // `require_empty` may need a commit, which waits for meta's writer lock. That runs without
         // the namespace lock: whatever another thread queues meanwhile is not committed, so the
         // emptiness check that follows still sees everything meta knows.
-        self.barrier_if_needed(&sc, &cn)?;
+        self.barrier_if_needed(&sc, &before)?;
         let _ns = sc.ns.lk();
-        // the barrier may have applied another thread's queued rename, so the name must still be
-        // this directory before anything is removed
-        match self.dent_lookup(&sc, &pn, name)? {
-            Some((c, FileKind::Directory)) if self.meta_of(c) == self.meta_of(cn.ino) => {}
+        // the barrier may have applied another thread's queued rename, so the name must be resolved
+        // again and the node it now names is the one removed. It is rarely the same node: committing
+        // releases a clean directory's virtual alias, so the name is then carried by the meta number.
+        let cn = match self.dent_lookup(&sc, &pn, name)? {
+            Some((c, FileKind::Directory)) => self.node(c)?,
             _ => return Err(Error::NotFound),
-        }
+        };
         self.require_empty(&sc, &cn)?;
         if cn.pinned() {
             self.preserve_orphan(&sc, &cn)?;

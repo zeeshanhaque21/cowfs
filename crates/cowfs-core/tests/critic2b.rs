@@ -1232,3 +1232,44 @@ fn health_does_not_consume_pending_flush_work() {
     let c = Core::open(dir.path(), test_opts()).unwrap();
     assert_eq!(content(&c, "s", "f"), "pending payload");
 }
+
+/// `rmdir` resolves the name again after the barrier, because committing a directory's create
+/// releases its virtual alias and the name is then carried by the meta number. That must not turn a
+/// non-empty directory into `NotFound`.
+#[test]
+fn rmdir_reports_not_empty_when_the_directory_holds_a_symlink() {
+    for (name, o) in [
+        ("default", test_opts()),
+        (
+            "tiny",
+            Options {
+                background: false,
+                max_pending_ops: 16,
+                file_flush_bytes: 64 << 10,
+                node_cache: 256,
+                dentry_cache: 256,
+                block_cache_bytes: 1 << 20,
+                ..test_opts()
+            },
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Core::open(dir.path(), o).unwrap();
+        c.create_snapshot("s").unwrap();
+        let fs = c.snapshot_view("s").unwrap();
+        let d = fs.mkdir(ROOT_INO, b"b", 0o755).unwrap().ino;
+        let looked = fs.lookup(ROOT_INO, b"b").unwrap().ino;
+        assert_eq!(looked, d);
+        fs.forget(looked, 1);
+        let l = fs.symlink(d, b"a", b"target").unwrap().ino;
+        let held = fs.lookup(d, b"a").unwrap().ino;
+        fs.forget(held, 1);
+        let r = fs.rmdir(ROOT_INO, b"b");
+        println!("{name}: mkdir {d:#x}, symlink {l:#x}, rmdir -> {r:?}");
+        assert!(
+            matches!(r, Err(cowfs_vfs::Error::NotEmpty)),
+            "{name}: rmdir of a directory holding a symlink did not report NotEmpty"
+        );
+        fs.forget(l, 1);
+    }
+}

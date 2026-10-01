@@ -7,3 +7,4 @@
 cc 3beef530f18441bc795813e04ba2d708ea94cb1728f238497ee06ea0efebfc88 # shrinks to ops = [Symlink([0], 0), Symlink([2], 0), Rename([0], [1], false), Write([0], 0, 37208, 38)]
 cc dd0ff1bb5eca7cc19f68d4d9912e955b6b7cd659d9c83ef6c0fadca3b5563338 # shrinks to ops = [Create([2], 0), Rename([2], [0], false)]
 cc 4a5e174768f5e5feab96056df60a826b8d23646952c6e94f3c171971a10a09fe # shrinks to ops = [Mkdir([2], 0), Rename([2], [0], false)]
+cc 2aca1cfbc7135f54cb2fa0378bdea3fb5e12aa879c0b9005ab41d273f13f8566 # shrinks to ops = [Mkdir([1], 0), Symlink([1, 0], 0), Rmdir([1])]
