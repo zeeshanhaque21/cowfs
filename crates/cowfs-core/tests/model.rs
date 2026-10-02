@@ -160,6 +160,15 @@ fn apply(side: &mut Fs, op: &MOp) -> Out {
     r
 }
 
+fn held_key(op: &MOp) -> Option<u8> {
+    match op {
+        MOp::HeldRead(k, ..) | MOp::HeldWrite(k, ..) | MOp::HeldStat(k) | MOp::HeldRelease(k) => {
+            Some(*k)
+        }
+        _ => None,
+    }
+}
+
 fn held_of(side: &Fs, k: u8) -> Option<(Ino, FileHandle)> {
     let live: Vec<&Held> = side.held.iter().flatten().collect();
     if live.is_empty() {
@@ -511,10 +520,14 @@ impl World {
                 _ => {
                     let i = op_side(op, self.sides.len()).unwrap_or_default();
                     let s = &mut self.sides[i];
+                    // a held op with no live handle on this side changed nothing, so it must not
+                    // enter the log: replaying it in a later fork would give it a handle the
+                    // snapshot never had and make the memory model diverge from the core
+                    let effective = held_key(op).is_none_or(|k| held_of(&s.core, k).is_some());
                     let a = apply(&mut s.core, op);
                     let b = apply(&mut s.mem, op);
                     assert_eq!(a, b, "snapshot {} result differs at {what}", s.name);
-                    if !op.session_only() {
+                    if !op.session_only() && effective {
                         s.log.push(op.clone());
                     }
                 }

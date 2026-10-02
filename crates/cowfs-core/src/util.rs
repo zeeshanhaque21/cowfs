@@ -6,11 +6,17 @@ use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub(crate) trait MutexExt<T> {
     fn lk(&self) -> MutexGuard<'_, T>;
+    /// Takes the lock only if it is free right now, so a test can assert nothing is holding it.
+    fn try_lk(&self) -> Option<MutexGuard<'_, T>>;
 }
 
 impl<T> MutexExt<T> for Mutex<T> {
     fn lk(&self) -> MutexGuard<'_, T> {
         self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn try_lk(&self) -> Option<MutexGuard<'_, T>> {
+        self.try_lock().ok()
     }
 }
 
@@ -105,6 +111,11 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardMap<K, V> {
             s.map.remove(k);
         }
         hit
+    }
+
+    /// Makes every insertion of `k` fail its epoch check, as a competing write to the shard would.
+    pub(crate) fn bump_shard_of(&self, k: &K) {
+        self.shard(k).epoch += 1;
     }
 
     pub(crate) fn bump_all(&self) {

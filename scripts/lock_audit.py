@@ -105,7 +105,9 @@ def table() -> str:
             if not TAKES.search(body):
                 continue
             locks, order = describe(body).rsplit(" | ", 1)
-            rows.append(f"| `{path.stem}::{name}` | {locks} | {order} |")
+            row = f"| `{path.stem}::{name}` | {locks} | {order} |"
+            if row not in rows:
+                rows.append(row)
     return "\n".join([HEADER, "|---|---|---|", *rows])
 
 

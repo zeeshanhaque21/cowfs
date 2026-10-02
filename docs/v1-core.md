@@ -335,6 +335,7 @@ that takes a lock is not listed here.
 | `inner::snapctx_id` | leaf | 1 |
 | `inner::all_snaps` | leaf | 1 |
 | `inner::reserve_virt` | virt_lock | leaf |
+| `inner::lose_the_next_insert` | leaf | 1 |
 | `inner::drop_stale_aliases` | nodes, aliases | 2 then leaf |
 | `inner::meta_of` | aliases | leaf |
 | `inner::canon` | aliases | leaf |
@@ -383,6 +384,7 @@ that takes a lock is not listed here.
 | `lib::list_snapshots` | leaf | 1 |
 | `lib::merkle_root` | snap. | 3 |
 | `lib::last_flush_error` | last_error | leaf |
+| `lib::set_load_node_contention` | leaf | 1 |
 | `lib::set_flush_fault` | leaf | 1 |
 | `lib::live_blocks` | snap. | 3 |
 | `lib::add_snap` | leaf | 1 |
@@ -415,6 +417,8 @@ that takes a lock is not listed here.
 | `swap::swap_snapshot` | last_error | leaf |
 | `swap::stage_and_intent` | snap. | 3 |
 | `swap::finish_swap` | snap. | 3 |
+| `util::lk` | leaf | 1 |
+| `util::try_lk` | leaf | 1 |
 | `util::shard` | leaf | 1 |
 | `util::bump_all` | leaf | 1 |
 | `util::len` | leaf | 1 |
@@ -641,3 +645,31 @@ The `hammer` phase requires its representative run to pass before launching 180 
 Raw local evidence is in `target/fsx-round2-seed{1,2}.log`, `target/hammer-macos180.log`, `target/hammer-linux180.log`, `target/mutants.out`, and each retained `target/mutants/<name>/run.log`.
 After #24 lands, re-merge any newer store revision and rerun both workspace platforms, fsx, flush boundaries, checkpoint invariants and the unresolved Linux hammer before claiming an integration pass.
 Explicit hole markers, durable inode reservations, shared snapshot-ID bounds, and atomic snapshot replacement remain metadata requests in #42.
+
+## Round-3 mutants
+
+Tracked in #49, branched from merged `main` at `cdc90d3`.
+All 30 mutants are killed by an assertion now; the three survivors of round 2 and the one invalid entry are fixed.
+
+`cowfs_core::fsops` is a `doc(hidden)` test seam with two inert parts, both off unless a test arms them.
+A fault rule makes the next `times` `sync`s of a file or directory whose path contains a substring fail, and a trace records those calls in order.
+`write_intent` and `write_virt_mark` now go through the seam, so the durability orderings the design argument depends on are observable:
+
+- `n02_swap_intent_no_fsync` is killed by `a_swap_refuses_when_the_intent_file_cannot_be_made_durable` (an intent file that cannot be made durable stops the swap, with the mount unchanged) and by `the_intent_file_is_durable_before_the_victim_snapshot_is_removed` (the trace shows the record's own file sync, then its rename, then the directory sync, then the victim unregister).
+  Making the intent directory sync a checked call rather than a swallowed one is a real change: a rename that cannot be made durable is now a refused swap, not a silent one.
+- `n04_virt_mark_no_dir_fsync` is killed by `a_reservation_refuses_when_its_directory_cannot_be_made_durable` and by `a_new_virtual_reservation_is_durable_before_any_of_its_numbers_is_handed_out` (the trace shows the mark's file sync, its rename, the directory sync, and only then a number from the new reservation is handed out).
+- `b11_load_node_upserts` is killed by `a_node_load_that_exhausts_its_retry_budget_fails_closed`.
+  `Core::set_load_node_contention` makes the next `tries` node-table insertions lose their race by bumping the shard epoch between the epoch read and the insert, which is the contention the retry loop exists for, without a timing race.
+  The test arms it across a core reopen, so the first lookup builds its node from meta, and asserts the exhausted budget is `Stale` rather than a node built from meta.
+  It does not prove data loss, because a dirty node is never evicted from the table while its bytes are unflushed; it proves the load fails closed, which is the property the code claims.
+- `b07_unregister_locked_meta` is valid again: it now takes the namespace and flush locks immediately before the metadata commit, which compiles and keeps the original defect.
+  `SnapshotLockProbe` holds a snapshot's own locks after it leaves the table, and `removing_a_snapshot_releases_its_locks_before_its_metadata_commit` uses a slow store-sync hook to hold the commit open, so the locks are observed free throughout.
+  The test is wall-clock sensitive: it passes when the commit is held long enough to sample and would miss a mutant that held the locks for a shorter window.
+
+A proptest seed found while this work ran (`cc 1c48a6cc`, persisted in `model.proptest-regressions`) failed against the memory model, not against the core.
+It reproduces on `main` with the same seed, so it is a harness bug: a held op that hit no live handle on its own side still entered the operation log, and a later fork replayed it against a handle only the memory model had.
+`run` now logs a held op only when it had a live handle.
+
+Reproduce the four with `python3 scripts/mutants.py n02_swap_intent_no_fsync n04_virt_mark_no_dir_fsync b11_load_node_upserts b07_unregister_locked_meta`.
+Each run has its own target directory, a total hard timeout, and restores its source in `finally`.
+A timeout counts as UNKNOWN, never as killed.
