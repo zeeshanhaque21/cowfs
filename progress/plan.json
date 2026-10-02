@@ -138,13 +138,13 @@
         },
         {
           "id": "10",
-          "title": "#10 garbage collection",
-          "state": "reviewing",
+          "title": "#10 GC (merged, PR #39)",
+          "state": "done",
           "issue": 10,
-          "owner": "critic round 2 (subagent)",
+          "owner": "lead",
           "pr": "#39",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/39",
-          "detail": "Round-1 critic findings fixed (builder, head 6b654e2) and re-verified by me: main merged, scope clean, ci.yml untouched, CI green on both platforms, fmt/clippy clean, 243 gc+store tests pass. F1 per-root mark attribution, F2 barrier held only in step 5, F3 forget_pack on early returns, F4 crash-ordering tests now run in plain cargo test. Mutants 22: 18 killed, 4 survive (two argued unreachable or redundant, unverified). Quadratic sweep documented, not fixed. GAP: a collect over core's store is blocked because Core exposes &Store, not the Arc; needs one accessor on cowfs-core. NOT MERGED: narrowing the barrier is the safety-critical change, so a round-2 critic is running."
+          "detail": "Round-2 critic blockers fixed (builder, head db216ad): F1 step 5 re-reads durable roots after a sync, so a snapshot committed mid-cycle is never freed (failing before: DATA LOSS reported by the critic, byte identical); F2 barrier guard held from each pack root read through that pack unlink; F3 dedup test rewritten with a committing writer, all 21 mutants killed, incl. step5-reread-removed and barrier-guard-dropped-before-unlink; F4 fsck-on-lost-race tested. F5: barrier window measured equal to candidate count (252/252 at 253 packs), quadratic gone (117k-167k us per pack flat), writer worst us documented honestly. My checks: main merged, scope clean, ci.yml untouched, vs core/store/docs only, F1/F2 regression tests pass, CI green on all three platforms. Gap, not a blocker: F1 and F2 have not been exercised through real cowfs-core because Core exposes &Store not Arc<Store>; needs one accessor (store_arc or daemon owns Arc) - tracked for a follow-up."
         },
         {
           "id": "11",
@@ -356,5 +356,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45). | In flight in parallel: #50 daemon, #51 bench harness, #52 torn read (PR #44). | Merged since: #48. | Merged since: #36 (core), #48. Waiting: #39 (fixing), #44 (held on #45). In flight: #50 daemon, #52 torn read, core-mutants follow-up. | Merged since: #50 daemon, #52 core mutants. Waiting: #39 GC (fixing), #44 (statfs flake), #56 (cleaning), #53 core alias (fixing). | Merged since: #56. #39 under round-2 critic. | Merged since: #59 (core alias). | Merged since: #44. In flight: #60 nfs sidebit, #61 vfs-path reuse, #39 GC round-2 critic. | Merged since: #64 (nfs sidebit). | Merged since: #65. Open: #39 GC round-2 fix, v1/coldread profiling."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45). | In flight in parallel: #50 daemon, #51 bench harness, #52 torn read (PR #44). | Merged since: #48. | Merged since: #36 (core), #48. Waiting: #39 (fixing), #44 (held on #45). In flight: #50 daemon, #52 torn read, core-mutants follow-up. | Merged since: #50 daemon, #52 core mutants. Waiting: #39 GC (fixing), #44 (statfs flake), #56 (cleaning), #53 core alias (fixing). | Merged since: #56. #39 under round-2 critic. | Merged since: #59 (core alias). | Merged since: #44. In flight: #60 nfs sidebit, #61 vfs-path reuse, #39 GC round-2 critic. | Merged since: #64 (nfs sidebit). | Merged since: #65. Open: #39 GC round-2 fix, v1/coldread profiling. | Merged since: #39 GC, #65 vfs-path, #64 nfs sidebit."
 }
