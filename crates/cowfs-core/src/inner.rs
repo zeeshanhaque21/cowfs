@@ -1,6 +1,6 @@
 //! Shared state, node loading, and the flush and commit machinery.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -43,8 +43,11 @@ pub struct Options {
     pub block_cache_bytes: usize,
     /// Run the background flusher thread. Without it only explicit flushes and thresholds commit.
     pub background: bool,
-    /// The alias table is swept when it holds this many entries.
-    pub alias_batch: usize,
+    /// How many session aliases the mount keeps at once. Every inode a session creates needs one,
+    /// and it is released when the inode is unlinked and unreferenced, so this is the ceiling on how
+    /// many files one session may create. A create past it is `Error::NoSpace` rather than a number
+    /// that later goes stale.
+    pub alias_limit: usize,
 }
 
 impl Default for Options {
@@ -61,7 +64,7 @@ impl Default for Options {
             node_cache: 131_072,
             block_cache_bytes: 128 << 20,
             background: true,
-            alias_batch: 4096,
+            alias_limit: 1 << 20,
         }
     }
 }
@@ -245,7 +248,18 @@ impl Inner {
 
     /// The meta inode number behind `ino`, if meta has one yet.
     /// The next virtual number, extending the durable reservation when it runs out.
+    ///
+    /// Refuses at the alias ceiling: the number would be handed out now and released later, and a
+    /// client still holding it would see `Stale`, so the create fails here instead.
     pub(crate) fn alloc_virt(&self, snap: u64) -> Result<Ino> {
+        let live = self.aliases.rd().len();
+        if live >= self.opts.alias_limit {
+            *self.last_error.lk() = Some(format!(
+                "session inode limit reached: {live} inodes are live, the ceiling is {}",
+                self.opts.alias_limit
+            ));
+            return Err(Error::NoSpace);
+        }
         let n = self.next_virt.fetch_add(1, Ordering::AcqRel) + 1;
         if n >= self.virt_reserved.load(Ordering::Acquire) {
             self.reserve_virt()?;
@@ -278,28 +292,6 @@ impl Inner {
             }
             _ => false,
         }
-    }
-
-    /// Releases aliases whose node has left the node table or is no longer eligible.
-    fn drop_stale_aliases(&self) {
-        if self.aliases.rd().len() < self.opts.alias_batch {
-            return;
-        }
-        let mut al = self.aliases.wr();
-        // keep every alias that is NOT eligible for release: a pinned node (a caller may hold the
-        // number), one with unflushed data, an unlinked one, or one with no node at all
-        let keep: HashSet<Ino> = al
-            .live()
-            .filter(|ino| {
-                self.nodes.get(ino).is_none_or(|n| {
-                    n.pinned()
-                        || n.st
-                            .try_read()
-                            .map_or(true, |st| st.dirty_bytes() > 0 || st.attr.nlink == 0)
-                })
-            })
-            .collect();
-        al.retain_only(&keep);
     }
 
     pub(crate) fn meta_of(&self, ino: Ino) -> Option<u64> {
@@ -612,15 +604,10 @@ impl Inner {
         Ok(())
     }
 
-    /// Drops a virtual alias once nothing can still be holding its number: the file is committed,
-    /// nobody holds a reference or a handle, and it has no unflushed data.
-    /// Its number reverts to the meta-derived one, which is what a caller sees after a restart
-    /// anyway. A dentry entry keeps working because the dentry cache holds meta numbers and every
-    /// hit is canonicalised through `canon`.
-    fn maybe_drop_alias(&self, node: &Arc<Node>) {
-        if self.aliases.rd().meta_of(node.ino).is_none() {
-            return;
-        }
+    /// Drops a committed, clean, unreferenced node from the node table, so a file a session created
+    /// does not keep a node for the rest of the session. Its alias stays: the number a client was
+    /// handed has to keep naming this inode, and reloading it from meta resolves the alias.
+    fn maybe_evict_node(&self, node: &Arc<Node>) {
         if node.pinned()
             || node
                 .st
@@ -638,14 +625,9 @@ impl Inner {
             return;
         }
         let ino = node.ino;
-        // the node and the alias go together, so the file is loaded once more from meta if needed
-        let removed = self.nodes.remove_if(&ino, |n| {
+        self.nodes.remove_if(&ino, |n| {
             Arc::ptr_eq(n, node) && !n.pinned() && n.seq.load(Ordering::Acquire) <= sc.flushed()
         });
-        if removed {
-            self.aliases.wr().remove(ino);
-            self.ctr.aliases_dropped.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     /// Drops an orphan nobody holds once its removal is committed.
@@ -869,13 +851,13 @@ impl Inner {
                         }
                     }
                 }
-                // aliases of files that are committed, clean and unreferenced are released
+                // the node of a file that is committed, clean and unreferenced can go; its alias
+                // cannot, since the number was handed out already
                 for (v, _) in created.iter() {
                     if let Some(n) = self.nodes.get(v) {
-                        self.maybe_drop_alias(&n);
+                        self.maybe_evict_node(&n);
                     }
                 }
-                self.drop_stale_aliases();
                 Ok(())
             }
             Err(e) => {

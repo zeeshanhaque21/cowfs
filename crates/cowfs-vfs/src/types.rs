@@ -8,6 +8,15 @@ use crate::error::{Error, Result};
 /// - An `Ino` is never reused for a different file for the lifetime of the mount: NFS file
 ///   handles and kernel dentry caches outlive the file, and a reused number would let a
 ///   stale handle read another file's bytes. Every implementation must guarantee this.
+/// - An `Ino` that has been handed out keeps meaning the same inode for the rest of the mount
+///   session, for as long as that inode exists. The number of an inode is not a function of
+///   when the caller last mentioned it: two lookups of one inode in one session return the
+///   same number, and a number does not revert to a different form when the implementation
+///   commits it. Hardlinks and renames keep that number too, so a client never sees two
+///   numbers for one inode in a session.
+/// - The only thing that makes a number `Stale` is the inode going away: unlinked with no
+///   other name and no open handle. A protocol that cannot say when it is done with a number,
+///   such as NFS where a filehandle is just the number, relies on this rule; see `forget`.
 /// - Two snapshots that share content still report different numbers, so tools never
 ///   mistake them for hardlinks. Hardlinks within one snapshot share one `Ino`.
 /// - Uniqueness is per mount, not per host. Whether numbers survive a restart is up to the

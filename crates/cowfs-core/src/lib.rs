@@ -450,6 +450,22 @@ impl Core {
         self.inner.snap_by_name(name).ok().map(SnapshotLockProbe)
     }
 
+    /// Test seam: the bytes the session alias table holds, and how many entries it has.
+    #[doc(hidden)]
+    pub fn alias_table(&self) -> (usize, usize) {
+        (
+            self.inner.aliases.rd().len(),
+            self.inner.aliases.rd().bytes(),
+        )
+    }
+
+    /// Test seam: the meta inode number behind `ino`, for a test that has to read meta's own view
+    /// of a file. A number a session created is virtual, so it is not the packed meta number.
+    #[doc(hidden)]
+    pub fn meta_inode(&self, ino: Ino) -> Option<u64> {
+        self.inner.meta_of(ino)
+    }
+
     /// Test seam: make the next `tries` node-table insertions lose their race, so `load_node` takes
     /// the retry path instead of relying on a real race to reach it. `ino` 0 arms every inode, which
     /// is what a caller that only knows the alias needs.
