@@ -21,7 +21,7 @@ fn one_pack(dir: &std::path::Path) -> std::path::PathBuf {
 
 /// The end offset of the chunk that contains file offset 70_000, read from meta.
 fn chunk_end(c: &Core, ino: u64) -> u64 {
-    let m = cowfs_meta::Meta::unpack_ino(ino).1;
+    let m = cowfs_meta::Ino(c.meta_inode(ino).expect("no meta inode behind the number"));
     let refs = c.meta().snapshot("s").unwrap().chunks(m).unwrap();
     let mut acc = 0u64;
     for r in refs {

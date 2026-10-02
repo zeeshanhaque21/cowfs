@@ -179,7 +179,7 @@ fn boundary_sized_files_round_trip_and_sequential_appends_dedup_with_a_single_wr
 /// The chunk ends of a file, read from meta after a commit, so the writes below aim at real
 /// content-defined boundaries.
 fn chunk_ends(c: &Core, ino: u64) -> Vec<u64> {
-    let m = cowfs_meta::Meta::unpack_ino(ino).1;
+    let m = cowfs_meta::Ino(c.meta_inode(ino).expect("no meta inode behind the number"));
     let refs = c.meta().snapshot("s").unwrap().chunks(m).unwrap();
     let mut out = Vec::new();
     let mut acc = 0u64;
@@ -201,9 +201,8 @@ fn writes_ending_at_a_real_chunk_boundary_minus_one_plus_one_keep_every_byte() {
     let mut data = pattern(1200 << 10, 31);
     let ino = c.create(r, b"f", 0o644).unwrap().ino;
     write_all(c, ino, 0, &data);
-    // drop the reference so the file settles on its meta-derived number, which the boundary lookup
-    // below needs; a number nothing holds any more is free to change, so every later write looks
-    // the file up again
+    // the boundary lookup below reads meta directly, so it needs the meta number behind the one the
+    // caller holds
     c.forget(ino, 1);
     c.sync().unwrap();
     c.drop_caches();
