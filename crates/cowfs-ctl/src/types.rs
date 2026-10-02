@@ -91,6 +91,28 @@ pub struct PsParams {
     pub snapshot: String,
 }
 
+/// Parameters of `mount_snapshot`. Unknown fields are rejected: a misspelled `path` must not
+/// silently become the default export root.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountSnapshot {
+    /// The snapshot to export.
+    pub name: String,
+    /// Where to export it. Absolute; the daemon refuses a path outside its export roots.
+    pub path: String,
+    /// Fail with `busy` when a holder exists, checked under the same lock as the export.
+    #[serde(default = "yes")]
+    pub expect_no_holders: bool,
+}
+
+/// Parameters of `unmount_snapshot`. Unknown fields are rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnmountSnapshot {
+    /// The path the daemon exported. One the daemon did not export is `not_found`.
+    pub path: String,
+}
+
 /// Where a base snapshot came from. Every field is null for a promoted clone.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseMeta {
@@ -289,6 +311,8 @@ pub enum Request {
     BaseRefresh(BaseRefreshParams),
     Ps(PsParams),
     MountInfo(Empty),
+    MountSnapshot(MountSnapshot),
+    UnmountSnapshot(UnmountSnapshot),
     Shutdown(NoParams),
 }
 
@@ -309,6 +333,8 @@ pub const METHODS: &[&str] = &[
     "base_refresh",
     "ps",
     "mount_info",
+    "mount_snapshot",
+    "unmount_snapshot",
     "shutdown",
 ];
 
@@ -373,6 +399,8 @@ impl Request {
             Request::BaseRefresh(_) => "base_refresh",
             Request::Ps(_) => "ps",
             Request::MountInfo(_) => "mount_info",
+            Request::MountSnapshot(_) => "mount_snapshot",
+            Request::UnmountSnapshot(_) => "unmount_snapshot",
             Request::Shutdown(_) => "shutdown",
         }
     }

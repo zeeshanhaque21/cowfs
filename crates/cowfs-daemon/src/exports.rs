@@ -14,7 +14,10 @@ use crate::backend::Backend;
 use crate::daemon::uid;
 use crate::holders;
 use crate::mounts::Mounted;
-use cowfs_ctl::{validate_abs_path, validate_snapshot_name, CtlError, CtlResult, ErrorCode};
+use cowfs_ctl::{
+    validate_abs_path, validate_snapshot_name, CtlError, CtlResult, ErrorCode, MountSnapshot,
+    UnmountSnapshot,
+};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -23,24 +26,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// How many components below an export root a path must sit, so it is at least
 /// `{root}/{pool}/{slot}/{repo}`.
 pub const MIN_COMPONENTS_BELOW_ROOT: usize = 3;
-
-/// A `mount_snapshot` request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MountSnapshot {
-    /// The snapshot to export. Must pass `validate_snapshot_name` and exist.
-    pub name: String,
-    /// Where to export it.
-    pub path: String,
-    /// Fail `busy` when a holder exists, checked under the same lock as the export.
-    pub expect_no_holders: bool,
-}
-
-/// An `unmount_snapshot` request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnmountSnapshot {
-    /// The path the daemon exported.
-    pub path: String,
-}
 
 fn invalid(why: impl Into<String>) -> CtlError {
     CtlError::new(ErrorCode::InvalidParams, why.into())
@@ -70,13 +55,23 @@ pub struct Exports {
     backend: Arc<dyn Backend>,
     roots: Arc<Vec<PathBuf>>,
     forbidden: Arc<Vec<PathBuf>>,
+    /// Where the default mount is. A holder is a process inside the snapshot a client sees,
+    /// which is under here. On the core backend the store holds no per-snapshot directory at
+    /// all, so scanning the store would report no holder for any snapshot.
+    default_mount: PathBuf,
     live: Arc<Mutex<HashMap<PathBuf, Export>>>,
 }
 
 impl Exports {
-    /// Builds the registry. `roots` is the set of directories a client may export inside, and
-    /// `forbidden` is the default mount point and the store, which are never targets.
-    pub fn new(backend: Arc<dyn Backend>, roots: Vec<PathBuf>, forbidden: Vec<PathBuf>) -> Exports {
+    /// Builds the registry. `roots` is the set of directories a client may export inside,
+    /// `forbidden` is the default mount point and the store, which are never targets, and
+    /// `default_mount` is the default mount point itself.
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        roots: Vec<PathBuf>,
+        forbidden: Vec<PathBuf>,
+        default_mount: PathBuf,
+    ) -> Exports {
         let resolve = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
             let mut out: Vec<PathBuf> = paths
                 .into_iter()
@@ -90,6 +85,7 @@ impl Exports {
             backend,
             roots: Arc::new(resolve(roots)),
             forbidden: Arc::new(resolve(forbidden)),
+            default_mount,
             live: Arc::default(),
         }
     }
@@ -371,8 +367,10 @@ impl Exports {
         Ok(())
     }
 
+    /// Where a client sees snapshot `name`: a directory under the default mount. This is also what
+    /// the handler's `ps` scans, so the two agree on who is holding what.
     fn snapshot_dir(&self, name: &str) -> PathBuf {
-        self.backend.store_path().join(name)
+        self.default_mount.join(name)
     }
 
     fn not_found_or_io(&self, e: std::io::Error, name: &str) -> CtlError {
@@ -556,9 +554,9 @@ mod tests {
     #[test]
     fn a_holder_makes_the_export_busy_and_changes_nothing() {
         let f = Fixture::new();
-        let held = f.backend.store_path().join("base");
+        let held = f.mount.join("base");
         std::fs::write(held.join("marker"), b"x").unwrap();
-        let keep = std::fs::File::open(held.join("marker")).unwrap();
+        let keep = crate::holders::Holder::holding(&held.join("marker"));
         let req = f.request("1");
         let e = f
             .exports
@@ -623,7 +621,7 @@ mod tests {
         let held = f.exports.live().keys().next().unwrap().clone();
         assert!(mounts::available());
         std::fs::write(held.join("marker"), b"x").unwrap();
-        let keep = std::fs::File::open(held.join("marker")).unwrap();
+        let keep = crate::holders::Holder::holding(&held.join("marker"));
         let e = f
             .exports
             .unmount_snapshot(&UnmountSnapshot {
@@ -702,11 +700,18 @@ mod tests {
             // The root rule is the socket directory's rule, so the fixture obeys it.
             std::fs::set_permissions(&root, private()).unwrap();
             let mount = real.join("mnt");
+            // The default mount shows each snapshot as a directory under it, and the holder
+            // check looks there: a holder is a process inside what a client sees. A real mount
+            // creates these; without an adapter the fixture does it by hand.
+            for name in ["base", "base2"] {
+                std::fs::create_dir_all(mount.join(name)).unwrap();
+            }
             Fixture {
                 exports: Exports::new(
                     Arc::clone(&backend),
                     vec![root.clone()],
                     vec![store, mount.clone()],
+                    mount.clone(),
                 ),
                 backend,
                 root,
