@@ -666,6 +666,10 @@ A fault rule makes the next `times` `sync`s of a file or directory whose path co
   `SnapshotLockProbe` holds a snapshot's own locks after it leaves the table, and `removing_a_snapshot_releases_its_locks_before_its_metadata_commit` uses a slow store-sync hook to hold the commit open, so the locks are observed free throughout.
   The test is wall-clock sensitive: it passes when the commit is held long enough to sample and would miss a mutant that held the locks for a shorter window.
 
+A proptest seed found while this work ran (`cc 1c48a6cc`, persisted in `model.proptest-regressions`) failed against the memory model, not against the core.
+It reproduces on `main` with the same seed, so it is a harness bug: a held op that hit no live handle on its own side still entered the operation log, and a later fork replayed it against a handle only the memory model had.
+`run` now logs a held op only when it had a live handle.
+
 Reproduce the four with `python3 scripts/mutants.py n02_swap_intent_no_fsync n04_virt_mark_no_dir_fsync b11_load_node_upserts b07_unregister_locked_meta`.
 Each run has its own target directory, a total hard timeout, and restores its source in `finally`.
 A timeout counts as UNKNOWN, never as killed.
