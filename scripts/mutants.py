@@ -103,6 +103,19 @@ M = {
  "b08_hole_ignores_length": ("file.rs",
    "pub(crate) fn is_hole(c: &ChunkRef) -> bool {\n    c.id == HOLE && u64::from(c.len) <= HOLE_MAX\n}",
    "pub(crate) fn is_hole(c: &ChunkRef) -> bool {\n    c.id == HOLE\n}"),
+ # the session contract: an alias lives as long as the inode has a name
+ "a01_alias_released_on_commit": ("inner.rs",
+   "    /// Drops an orphan nobody holds once its removal is committed.\n    pub(crate) fn try_reclaim(&self, node: &Arc<Node>) {",
+   "    /// Drops an orphan nobody holds once its removal is committed.\n    pub(crate) fn try_reclaim(&self, node: &Arc<Node>) {\n        self.aliases.wr().remove(node.ino);"),
+ "a02_reclaim_keeps_nlink_zero": ("inner.rs",
+   "        if node.st.rd().attr.nlink != 0 {\n            return;\n        }",
+   "        if false {\n            return;\n        }"),
+ "a03_no_alias_ceiling": ("inner.rs",
+   "        let live = self.aliases.rd().len();\n        if live >= self.opts.alias_limit {",
+   "        let live = 0usize;\n        if live >= self.opts.alias_limit {"),
+ "a04_canon_returns_meta_number": ("ino.rs",
+   "    pub(crate) fn canon(&self, snap: u64, m: u64) -> Option<Ino> {\n        if self.rev.is_empty() {\n            return None;\n        }\n        self.rev.get(&pack(snap, m).ok()?).copied()",
+   "    pub(crate) fn canon(&self, snap: u64, m: u64) -> Option<Ino> {\n        if self.rev.is_empty() {\n            return None;\n        }\n        let _ = m;\n        None"),
  "b11_load_node_upserts": ("inner.rs",
    "                // a live node for this inode keeps changing; never overwrite it with a state read\n                // from meta, or a dirty file's unflushed extents are lost\n                Err(()) if tries < 64 => {}\n                Err(()) => return Err(Error::Stale),",
    "                Err(()) if tries < 64 => {}\n                Err(()) => {\n                    self.nodes.upsert(ino, node.clone());\n                    return Ok(node);\n                }"),
@@ -115,6 +128,28 @@ ORDER = [["--lib"], ["--test", "core"], ["--test", "chunks"], ["--test", "names_
          ["--test", "crash"], ["--test", "kill9"]]
 TIMEOUT = int(os.environ.get("COWFS_MUT_TIMEOUT", "1800"))
 FOCUSED = {
+    "a01_alias_released_on_commit": [
+        ["--test", "alias_session", "a_forgotten_directory_keeps_its_number_after_the_commit"],
+        ["--test", "alias_session", "a_directory_created_through_the_session_still_takes_children_after_the_commit"],
+        ["--test", "alias"],
+        ["--test", "core"],
+    ],
+    "a02_reclaim_keeps_nlink_zero": [
+        ["--test", "alias_session", "an_unlinked_inode_goes_stale"],
+        # the whole file: reclaiming a named inode drops its node and its alias, so every
+        # session number goes stale, and the per-test filters above hide that
+        ["--test", "alias_session"],
+        ["--test", "core"],
+        ["--test", "caches"],
+    ],
+    "a03_no_alias_ceiling": [
+        ["--test", "alias", "a_create_past_the_alias_ceiling_is_refused"],
+    ],
+    "a04_canon_returns_meta_number": [
+        ["--test", "alias_session"],
+        ["--test", "alias"],
+        ["--test", "model"],
+    ],
     "n02_swap_intent_no_fsync": [
         # the fault test first: the mutant stops calling the seam, so the swap no longer fails
         ["--test", "durability", "a_swap_refuses_when_the_intent_file_cannot_be_made_durable"],
