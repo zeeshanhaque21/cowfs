@@ -108,12 +108,24 @@ On Linux the cowfs arm is a `cowfs-fuse` mount; the harness is unchanged, only t
 
 The Linux arm runs in the `cowfs-spike3` OrbStack VM:
 
+`bench/linux-sample.sh` is that script:
+
 ```sh
-. /Users/zeeshanhaque/Projects/cowfs/spikes/nfs-loopback/spike3/env.sh
-orb -m cowfs-spike3 sh /path/to/run-linux.sh
+orb -m cowfs-spike3 env \
+  COWFS_BENCH_REPO=/path/to/cowfs-as-the-vm-sees-it \
+  COWFS_BENCH_SCALE=2 \
+  sh /path/to/cowfs-as-the-vm-sees-it/bench/linux-sample.sh
 ```
 
-Keep the measured root VM-local (under `/home/zeeshanhaque/cowfs-bench-work`), and put `CARGO_TARGET_DIR` on tmpfs if the run builds anything, so the measurement is of the filesystem under test and not of the VM's own disk.
+The measured root is VM-local, never a shared host mount, and g1 and g2 build with a tmpfs `CARGO_TARGET_DIR`, so the number is of the filesystem under test and not of the VM's own disk.
+
+Two VM facts worth knowing, both hit on 2026-10-01 and both worked around inside the script:
+
+- The btrfs subvolume behind `/home/zeeshanhaque` refuses new files with ENOSPC while `df` reports 200 GiB free.
+  So the default `COWFS_BENCH_WORK` is `/tmp/cowfs-bench-work`, which is tmpfs.
+- `RUSTUP_HOME` must be set alongside `CARGO_HOME`.
+  Without it `cargo` is a rustup shim with no default toolchain and every build fails.
+  `COWFS_BENCH_CARGO_HOME` must also be writable and outside the measured directory, since cargo unpacks the whole registry into it.
 
 ## What this does not measure
 
