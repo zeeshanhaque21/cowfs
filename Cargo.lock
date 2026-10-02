@@ -303,6 +303,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cowfs-gc"
+version = "0.0.0"
+dependencies = [
+ "cowfs-core",
+ "cowfs-meta",
+ "cowfs-store",
+ "cowfs-vfs",
+ "cowfs-vfs-path",
+ "proptest",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "cowfs-meta"
 version = "0.0.0"
 dependencies = [
@@ -334,6 +348,7 @@ name = "cowfs-store"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "cowfs-store",
  "crc32c",
  "fastcdc",
  "proptest",

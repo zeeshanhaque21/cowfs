@@ -1,0 +1,25 @@
+[package]
+name = "cowfs-gc"
+description = "Garbage collection for cowfs: mark-and-sweep from snapshot roots with pack compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cowfs-store = { path = "../cowfs-store" }
+cowfs-meta = { path = "../cowfs-meta" }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+# Only for the end-to-end test that wires the collector to the real reference side, so the
+# `ExtraRoots` contract is checked against the implementation that has to meet it.
+cowfs-core = { path = "../cowfs-core" }
+cowfs-vfs = { path = "../cowfs-vfs" }
+cowfs-vfs-path = { path = "../cowfs-vfs-path" }
+
+[lints]
+workspace = true

@@ -139,6 +139,18 @@ impl Index {
         self.add(&loc);
     }
 
+    /// Drop an entry. Compaction uses this for blocks no pack holds any more.
+    pub(crate) fn remove(&self, id: &BlockId) {
+        let mut map = self
+            .shard(id)
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Entry::Occupied(o) = map.entry(*id) {
+            self.sub(o.get());
+            o.remove();
+        }
+    }
+
     /// Mark the entry verified if it still points at `loc`.
     pub(crate) fn mark_verified(&self, id: &BlockId, loc: Loc) {
         let mut map = self

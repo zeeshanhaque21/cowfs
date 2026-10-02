@@ -1660,3 +1660,45 @@ impl Drop for Store {
         let _ = self.finish();
     }
 }
+
+/// Store internals `crate::compact` needs, bundled so that module never names a private field.
+#[derive(Debug)]
+pub(crate) struct Guts<'a> {
+    pub(crate) dir: &'a Path,
+    pub(crate) io: &'a Io,
+    pub(crate) index: &'a Index,
+    pub(crate) wm: &'a Mutex<Wm>,
+}
+
+impl Store {
+    pub(crate) fn guts(&self) -> Guts<'_> {
+        Guts {
+            dir: &self.dir,
+            io: &self.io,
+            index: &self.index,
+            wm: &self.wm,
+        }
+    }
+
+    /// Forget a pack that no longer exists: drop it from the writer's map and recount the sizes.
+    pub(crate) fn forget_pack(&self, id: u32) {
+        self.writer().sealed.remove(&id);
+        let mut packs = 0u64;
+        let mut bytes = 0u64;
+        if let Ok(entries) = fs::read_dir(pack::pack_dir(&self.dir)) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .and_then(pack::parse_pack_name)
+                    .is_some()
+                {
+                    packs += 1;
+                    bytes += entry.metadata().map_or(0, |m| m.len());
+                }
+            }
+        }
+        self.counters.packs.store(packs, Relaxed);
+        self.counters.pack_bytes.store(bytes, Relaxed);
+    }
+}
