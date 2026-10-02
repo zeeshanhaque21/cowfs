@@ -486,19 +486,27 @@ fn socket_comes_from_the_environment_too() {
     assert_eq!(out.status.code(), Some(0), "--socket beats COWFS_SOCKET");
 }
 
+/// `serve` without `--stub` runs the real daemon, so a store it cannot open fails with the
+/// store's own error and binds nothing. Nothing is mounted either: the mount comes after the
+/// store is open.
 #[test]
-fn serve_without_stub_says_the_real_backend_is_missing() {
+fn serve_without_stub_reports_why_the_store_could_not_be_opened() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("c.sock");
+    let store = dir.path().join("store");
+    std::fs::write(&store, b"not a directory").unwrap();
     let out = Command::new(BIN)
-        .args(["serve", "--store", "/s", "--mount", "/m", "--socket"])
+        .args(["serve", "--store"])
+        .arg(&store)
+        .args(["--mount", "/m", "--socket"])
         .arg(&socket)
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8(out.stderr).unwrap().contains("--stub"));
-    assert!(!socket.exists());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains(&store.display().to_string()), "{err}");
+    assert!(!socket.exists(), "nothing was bound");
 }
 
 #[test]
