@@ -523,6 +523,118 @@ mod tests {
     }
 
     #[test]
+    fn reads_match_the_model_at_every_chunk_boundary_alignment() {
+        let (_d, b) = blocks();
+        let data = pattern(3 << 20, 21);
+        let mut f = FileData::default();
+        f.write(0, &data);
+        f.flush(&b).unwrap();
+        let ends: Vec<u64> = f.chunks.ends.clone();
+        assert!(ends.len() > 8, "the file must span many chunks");
+        for &e in ends.iter().step_by(ends.len() / 8 + 1) {
+            for (off, len) in [
+                (e, 1usize),
+                (e, 64 << 10),
+                (e.saturating_sub(1), 2),
+                (e.saturating_sub(7), 15),
+                (0, e as usize),
+            ] {
+                if (off + len as u64) > data.len() as u64 {
+                    continue;
+                }
+                let got = read_range(&b, &f.chunks, &[], off, off + len as u64).unwrap();
+                assert_eq!(
+                    got,
+                    &data[off as usize..off as usize + len],
+                    "off {off} len {len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reads_over_a_hole_match_the_model_and_keep_the_ref_valid() {
+        let (_d, b) = blocks();
+        let mid = pattern(200_000, 22);
+        let mut f = FileData::default();
+        f.write(0, b"head");
+        f.write(3 << 20, &mid);
+        f.write(9 << 20, b"tail");
+        f.flush(&b).unwrap();
+        let holes: Vec<&ChunkRef> = f.chunks.refs.iter().filter(|r| is_hole(r)).collect();
+        assert!(
+            !holes.is_empty(),
+            "the gaps must stay holes, not stored zeros"
+        );
+        assert!(
+            holes
+                .iter()
+                .all(|r| r.id == HOLE && u64::from(r.len) <= HOLE_MAX),
+            "a hole ref must stay the all-zero id with a length a hole can hold"
+        );
+        let mut model = vec![0u8; (9 << 20) + 4];
+        model[..4].copy_from_slice(b"head");
+        model[(3 << 20)..(3 << 20) + mid.len()].copy_from_slice(&mid);
+        model[(9 << 20)..(9 << 20) + 4].copy_from_slice(b"tail");
+        let size = model.len() as u64;
+        for (off, len) in [
+            (0u64, 4usize),
+            ((3 << 20) - 3, 6),
+            ((3 << 20) + mid.len() as u64 - 2, 5),
+            (1, (3 << 20) as usize),
+            (0, model.len()),
+            (size - 1, 1),
+        ] {
+            if (off + len as u64) > size {
+                continue;
+            }
+            let got = read_range(&b, &f.chunks, &[], off, off + len as u64).unwrap();
+            assert_eq!(
+                got,
+                &model[off as usize..off as usize + len],
+                "off {off} len {len}"
+            );
+        }
+        assert_eq!(f.chunks.total(), size);
+    }
+
+    #[test]
+    fn reads_over_a_flushed_chunk_and_its_dirty_overlay_match_the_model() {
+        let (_d, b) = blocks();
+        let base = pattern(1 << 20, 23);
+        let mut f = FileData::default();
+        f.write(0, &base);
+        f.flush(&b).unwrap();
+        let mut model = base.clone();
+        // one dirty byte inside a flushed chunk, one just past its end, one out in a fresh hole
+        for (off, patch) in [
+            (7usize, b"X".as_slice()),
+            (1 << 20, b"Y".as_slice()),
+            (5 << 20, b"Z".as_slice()),
+        ] {
+            f.write(off as u64, patch);
+            model.resize(model.len().max(off + patch.len()), 0);
+            model[off..off + patch.len()].copy_from_slice(patch);
+        }
+        for (off, len) in [
+            (0u64, 16usize),
+            ((1 << 20) - 2, 5),
+            ((1 << 20) - 1, 3),
+            ((5 << 20) - 1, 2),
+            (0, model.len()),
+        ] {
+            let end = off + len as u64;
+            let ov = f.overlay(off, end);
+            let got = read_range(&b, &f.chunks, &ov, off, end).unwrap();
+            assert_eq!(
+                got,
+                &model[off as usize..off as usize + len],
+                "off {off} len {len}"
+            );
+        }
+    }
+
+    #[test]
     fn sequential_appends_chunk_like_a_single_write() {
         let (_d, b) = blocks();
         let data = pattern(3 << 20, 9);

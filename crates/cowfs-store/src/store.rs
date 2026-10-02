@@ -1232,18 +1232,49 @@ impl Store {
                 None => Error::NotFound(id),
             });
         };
-        let (header, mut buf) = self.read_record(id, loc)?;
+        let corrupt = |reason| Error::Corrupt {
+            pack: loc.pack,
+            offset: u64::from(loc.offset),
+            reason,
+        };
+        if !locate_ok(&loc) {
+            return Err(corrupt("index entry out of range"));
+        }
+        let file = self.reads.get(loc.pack).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => corrupt("pack file missing"),
+            _ => Error::Io(e),
+        })?;
+        let short = |e: io::Error| match e.kind() {
+            io::ErrorKind::UnexpectedEof => corrupt("record extends past end of pack"),
+            _ => Error::Io(e),
+        };
+        // The header is read on its own so each payload byte is read once, straight into the buffer
+        // it is returned in. Reading the whole record first and draining the header off the front
+        // moved every byte of every block a second time.
+        let mut raw = [0u8; HEADER_LEN];
+        file.read_exact_at(&mut raw, u64::from(loc.offset))
+            .map_err(short)?;
+        let header = Header::parse(&raw).map_err(corrupt)?;
+        if header.id != id || header.slen != loc.slen || header.ulen != loc.ulen {
+            return Err(corrupt("record does not match index"));
+        }
+        let body = u64::from(loc.offset) + HEADER_LEN as u64;
         let data = match header.codec {
             Codec::Raw => {
-                buf.drain(..HEADER_LEN);
-                buf
+                let mut v = vec![0u8; header.ulen as usize];
+                file.read_exact_at(&mut v, body).map_err(short)?;
+                if Header::expected_crc(&raw, &v) != header.crc {
+                    return Err(corrupt("checksum mismatch"));
+                }
+                v
             }
             Codec::Zstd => {
-                record::decode(&header, &buf[HEADER_LEN..]).map_err(|reason| Error::Corrupt {
-                    pack: loc.pack,
-                    offset: u64::from(loc.offset),
-                    reason,
-                })?
+                let mut payload = vec![0u8; header.slen as usize];
+                file.read_exact_at(&mut payload, body).map_err(short)?;
+                if Header::expected_crc(&raw, &payload) != header.crc {
+                    return Err(corrupt("checksum mismatch"));
+                }
+                record::decode(&header, &payload).map_err(corrupt)?
             }
         };
         if BlockId::of(&data) != id {
