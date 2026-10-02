@@ -157,7 +157,19 @@ fn child_writes_and_collects() {
 #[test]
 #[ignore = "forks processes; see the module docs for the command"]
 fn kill_9_in_a_loop_loses_nothing() {
-    let n = rounds();
+    kill_9_rounds(rounds());
+}
+
+/// The same loop, short enough for every CI run, so the crash claim is not only checked by hand.
+///
+/// `kill_9_in_a_loop_loses_nothing` is the long form and stays ignored; this one is what a plain
+/// `cargo test --workspace` runs, so a kill at an arbitrary moment is checked on every push.
+#[test]
+fn a_few_kills_lose_nothing() {
+    kill_9_rounds(5);
+}
+
+fn kill_9_rounds(n: u32) {
     let exe = std::env::current_exe().expect("current exe");
     let mut killed = 0u32;
     let mut checked = 0usize;

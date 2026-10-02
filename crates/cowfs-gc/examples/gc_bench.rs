@@ -20,13 +20,19 @@ use cowfs_store::{Options as StoreOptions, Store};
 /// collector and not a contended mutex.
 struct Root;
 struct Held;
-impl Barrier for Held {}
+impl Barrier for Held {
+    fn take(&mut self) -> Option<Box<dyn cowfs_gc::Held>> {
+        Some(Box::new(HeldNoop))
+    }
+}
+struct HeldNoop;
+impl cowfs_gc::Held for HeldNoop {}
 impl ExtraRoots for Root {
     fn pinned_blocks(&self) -> Result<Vec<cowfs_store::BlockId>, cowfs_gc::RootsError> {
         Ok(Vec::new())
     }
     fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier>>, cowfs_gc::RootsError> {
-        Ok(Some(Box::new(Held)))
+        Ok(Some(Box::new(Held) as Box<dyn Barrier>))
     }
 }
 

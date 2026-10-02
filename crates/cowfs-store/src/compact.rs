@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use crate::ack;
 use crate::error::{Error, Result};
+use crate::fsio;
 use crate::index::Loc;
 use crate::pack::{self, PACK_HEADER_LEN};
 use crate::record::{Header, HEADER_LEN};
@@ -50,6 +51,13 @@ pub struct PackInfo {
 }
 
 /// What one scan of a pack found, counted against the caller's live set. Reading it writes nothing.
+/// Markers the durability tests place in the op log, so an ordering can be asserted across a
+/// process exit, which no crash test can observe.
+const MARK_UNLINK: u64 = 9_001;
+const MARK_AFTER_DIRSYNC: u64 = 9_002;
+const MARK_BEFORE_SYNC: u64 = 9_101;
+const MARK_AFTER_SYNC: u64 = 9_102;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PackPlan {
     /// Pack id.
@@ -377,8 +385,10 @@ impl Store {
         // Nothing live in the source: there is no copy to make durable, only the free to come.
         if let Some(target) = &c.target {
             let path = pack::pack_path(g.dir, c.to);
+            fsio::oplog_marker(MARK_BEFORE_SYNC);
             g.io.sync_file(target, &path)?;
             g.io.sync_dir(&pack::pack_dir(g.dir))?;
+            fsio::oplog_marker(MARK_AFTER_SYNC);
             for (id, loc) in &c.moved {
                 g.index.replace(*id, *loc);
             }
@@ -414,8 +424,11 @@ impl Store {
         }
         let path = pack::pack_path(g.dir, id);
         // Two collectors on one store is not a supported configuration, but it must not corrupt
-        // anything: if the pack is already gone the second caller has nothing to do.
+        // anything: if the pack is already gone the second caller has nothing to do. It still has to
+        // drop the id from the writer's map, or `fsck` walks a map naming a file that is not there
+        // and fails forever.
         let Ok(meta) = fs::metadata(&path) else {
+            self.forget_pack(id);
             return Ok(0);
         };
         let len = meta.len();
@@ -434,12 +447,17 @@ impl Store {
                 wm.reset(m, base, next)?;
             }
         }
+        fsio::oplog_marker(MARK_UNLINK);
         match fs::remove_file(&path) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.forget_pack(id);
+                return Ok(0);
+            }
             Err(e) => return Err(e.into()),
         }
         g.io.sync_dir(&pack::pack_dir(g.dir))?;
+        fsio::oplog_marker(MARK_AFTER_DIRSYNC);
         // Only now, with the file really gone, is a whole-pack acceptance true. Written while the
         // pack was still there it would be a wildcard: `find` treats a zero nonce as matching any,
         // so it would swallow damage reported against this pack later, and the pack id is never

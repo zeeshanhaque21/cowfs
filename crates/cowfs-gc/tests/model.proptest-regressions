@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc e4fa856c1f3e99c44abb0fcbe1586376e25937399230de416474a6f1c5b6a384 # shrinks to ops = [Write(0, 0, 1)]
+cc 1da25715f21bc10a71254e94e24c2d76c447a0da9fdfc6af7fb7e4395293df5a # shrinks to ops = [Fork(0), Unlink(1, 0), Fork(0), Remove(1), Fork(0), Write(6, 0, 1), Remove(1), Fork(0), Fork(0), Write(0, 0, 18627), Collect, Write(0, 0, 19220), Reopen]
+cc 20abc0a250e3d21fcbf94fa5100e2ed272e5a55ee0d9e977f5c3587aebb9a466 # shrinks to ops = [Write(0, 0, 12185), Fork(0), Remove(0), Write(0, 0, 9485), Write(4, 3, 16179), Reopen, Unlink(4, 3), Fork(7), Reopen, Write(1, 0, 1), Collect]

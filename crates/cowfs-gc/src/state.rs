@@ -4,7 +4,7 @@
 //! The batch file is append-only and a torn last record is dropped on load, so a crash in the
 //! middle of a flush costs the hints in that batch and nothing else.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
@@ -178,8 +178,9 @@ impl Hints {
 #[derive(Debug)]
 pub struct Marks {
     path: PathBuf,
-    roots: HashSet<[u8; 32]>,
-    blocks: HashSet<BlockId>,
+    /// Which blocks each walked root contributed. Per root, not one flat set: a flat set cannot
+    /// drop a removed snapshot's blocks, because it cannot tell whose they were.
+    roots: BTreeMap<[u8; 32], HashSet<BlockId>>,
     cap: usize,
     /// Set when the file held more ids than the cap. The set is then dropped, and the next cycle
     /// does a full walk, which is always correct.
@@ -195,8 +196,7 @@ impl Marks {
             path,
             cap,
             dropped: false,
-            roots: HashSet::new(),
-            blocks: HashSet::new(),
+            roots: BTreeMap::new(),
         };
         let Ok(bytes) = fs::read(&out.path) else {
             return out;
@@ -221,29 +221,48 @@ impl Marks {
         }
         let (roots, blocks) = rest.split_at(root_bytes);
         for c in roots.as_chunks::<ROOT_ENTRY>().0 {
-            out.roots.insert(*c);
-        }
-        for c in blocks.as_chunks::<ROOT_ENTRY>().0 {
-            if out.blocks.len() >= cap {
+            if out.roots.len() >= cap {
                 out.dropped = true;
                 break;
             }
-            out.blocks.insert(BlockId::from_bytes(*c));
+            out.roots.insert(*c, HashSet::new());
         }
-        if out.roots.len() >= cap {
-            out.dropped = true;
+        for c in blocks.as_chunks::<ROOT_ENTRY>().0 {
+            if out.roots.is_empty() || out.n_blocks() >= cap {
+                out.dropped = true;
+                break;
+            }
+            let id = BlockId::from_bytes(*c);
+            // The file does not say which root a block came from, so it is credited to every root
+            // that was walked. Over-crediting only costs a walk later; under-crediting would free a
+            // live block, so this errs the safe way.
+            for set in out.roots.values_mut() {
+                set.insert(id);
+            }
         }
         out
     }
 
-    /// True when an earlier cycle already walked this root.
-    pub fn has_root(&self, root: &[u8; ROOT_ENTRY]) -> bool {
-        self.roots.contains(root)
+    pub fn n_blocks(&self) -> usize {
+        let mut seen = HashSet::new();
+        for s in self.roots.values() {
+            seen.extend(s.iter().copied());
+        }
+        seen.len()
     }
 
-    /// Every block an earlier cycle yielded, so a skipped root's blocks stay live.
-    pub fn blocks(&self) -> &HashSet<BlockId> {
-        &self.blocks
+    /// True when an earlier cycle already walked this root *and* its recorded blocks survived.
+    ///
+    /// Never true once anything was dropped: a walk can record a root and then overflow the cap
+    /// before recording its blocks, and a cycle that trusted that root would skip the walk and seed
+    /// live from an empty set, which frees exactly what it should have protected.
+    pub fn has_root(&self, root: &[u8; ROOT_ENTRY]) -> bool {
+        !self.dropped && self.roots.contains_key(root)
+    }
+
+    /// The blocks an earlier cycle yielded for this root, so a skipped root's blocks stay live.
+    pub fn blocks_of(&self, root: &[u8; ROOT_ENTRY]) -> Option<&HashSet<BlockId>> {
+        self.roots.get(root)
     }
 
     /// Record a root an earlier cycle walked.
@@ -252,16 +271,21 @@ impl Marks {
             self.dropped = true;
             return;
         }
-        self.roots.insert(*root);
+        self.roots.entry(*root).or_default();
     }
 
-    /// Record a block a walk yielded.
-    pub fn add_block(&mut self, id: BlockId) {
-        if self.blocks.len() >= self.cap {
+    /// Record a block a walk yielded for this root.
+    pub fn add_block(&mut self, root: &[u8; ROOT_ENTRY], id: BlockId) {
+        if self.n_blocks() >= self.cap {
             self.dropped = true;
             return;
         }
-        self.blocks.insert(id);
+        self.roots.entry(*root).or_default().insert(id);
+    }
+
+    /// Drop the roots `keep` rejects, and the blocks only they held.
+    pub fn retain_roots(&mut self, keep: &dyn Fn(&[u8; 32]) -> bool) {
+        self.roots.retain(|r, _| keep(r));
     }
 
     /// Replace the file with the current set, dropping `dead` first.
@@ -270,27 +294,31 @@ impl Marks {
     /// set or the new one, never a half-written mix that would let a later cycle condemn a block
     /// whose root it is about to skip.
     pub fn save(&mut self, dead: &HashSet<BlockId>) -> io::Result<()> {
-        for id in dead {
-            self.blocks.remove(id);
+        if !dead.is_empty() {
+            for set in self.roots.values_mut() {
+                set.retain(|b| !dead.contains(b));
+            }
+            self.roots.retain(|_, s| !s.is_empty());
         }
         if self.dropped {
             let _ = fs::remove_file(&self.path);
             self.roots.clear();
-            self.blocks.clear();
             return Ok(());
         }
+        let mut all: HashSet<BlockId> = HashSet::new();
+        for set in self.roots.values() {
+            all.extend(set.iter().copied());
+        }
         let mut buf = Vec::with_capacity(
-            MAGIC_MARKS.len() + 16 + (self.roots.len() + self.blocks.len()) * ROOT_ENTRY,
+            MAGIC_MARKS.len() + 16 + (self.roots.len() + all.len()) * ROOT_ENTRY,
         );
         buf.extend_from_slice(MAGIC_MARKS);
         buf.extend_from_slice(&(self.roots.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&(self.blocks.len() as u64).to_le_bytes());
-        let mut roots: Vec<&[u8; 32]> = self.roots.iter().collect();
-        roots.sort_unstable();
-        for r in roots {
+        buf.extend_from_slice(&(all.len() as u64).to_le_bytes());
+        for r in self.roots.keys() {
             buf.extend_from_slice(r);
         }
-        let mut blocks: Vec<&BlockId> = self.blocks.iter().collect();
+        let mut blocks: Vec<&BlockId> = all.iter().collect();
         blocks.sort_unstable();
         for b in blocks {
             buf.extend_from_slice(b.as_bytes());
@@ -333,11 +361,11 @@ mod tests {
         let b = BlockId::of(b"x");
         let mut m = Marks::load(d.path(), 16);
         m.add_root(&root(7));
-        m.add_block(b);
+        m.add_block(&root(7), b);
         m.save(&HashSet::new()).unwrap();
         let back = Marks::load(d.path(), 16);
         assert!(back.has_root(&root(7)));
-        assert!(back.blocks().contains(&b));
+        assert!(back.blocks_of(&root(7)).unwrap().contains(&b));
         assert!(!back.dropped);
     }
 
@@ -377,9 +405,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let b = BlockId::of(b"x");
         let mut m = Marks::load(d.path(), 16);
-        m.add_block(b);
+        m.add_root(&root(3));
+        m.add_block(&root(3), b);
         m.save(&HashSet::from([b])).unwrap();
-        assert!(Marks::load(d.path(), 16).blocks().is_empty());
+        assert!(Marks::load(d.path(), 16).n_blocks() == 0);
     }
 
     #[test]
@@ -387,7 +416,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("mark.bin"), b"not a mark file at all").unwrap();
         let m = Marks::load(d.path(), 16);
-        assert!(m.blocks().is_empty());
+        assert!(m.n_blocks() == 0);
         assert!(!m.dropped);
     }
 
@@ -395,22 +424,24 @@ mod tests {
     fn a_truncated_file_is_an_empty_set() {
         let d = tempfile::tempdir().unwrap();
         let mut m = Marks::load(d.path(), 16);
-        m.add_block(BlockId::of(b"x"));
+        m.add_root(&root(3));
+        m.add_block(&root(3), BlockId::of(b"x"));
         m.save(&HashSet::new()).unwrap();
         let path = d.path().join("mark.bin");
         let mut b = fs::read(&path).unwrap();
         b.truncate(b.len() - 3);
         fs::write(&path, &b).unwrap();
-        assert!(Marks::load(d.path(), 16).blocks().is_empty());
+        assert!(Marks::load(d.path(), 16).n_blocks() == 0);
     }
 
     #[test]
     fn a_full_set_is_dropped_rather_than_written_huge() {
         let d = tempfile::tempdir().unwrap();
         let mut m = Marks::load(d.path(), 2);
-        m.add_block(BlockId::of(b"a"));
-        m.add_block(BlockId::of(b"b"));
-        m.add_block(BlockId::of(b"c"));
+        m.add_root(&root(1));
+        m.add_block(&root(1), BlockId::of(b"a"));
+        m.add_block(&root(1), BlockId::of(b"b"));
+        m.add_block(&root(1), BlockId::of(b"c"));
         assert!(m.dropped);
         m.save(&HashSet::new()).unwrap();
         assert!(!d.path().join("mark.bin").exists());

@@ -4,10 +4,34 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use cowfs_store::{BlockId, Options, Store};
+use cowfs_store::{BlockId, LogOp, Options, Store};
 
 fn store(dir: &Path) -> Store {
     Store::open(dir, Options::default()).expect("open")
+}
+
+/// A store that rolls every 32 KiB, so a test has a sealed pack to work on. `data` is highly
+/// compressible, so the records are noise instead: otherwise nothing rolls.
+fn small_store(dir: &Path) -> Store {
+    Store::open(
+        dir,
+        Options {
+            max_pack_size: 32 << 10,
+            ..Options::default()
+        },
+    )
+    .expect("open")
+}
+
+/// Bytes that do not compress, so a pack fills at the size it claims.
+fn noisy(n: usize, seed: u32) -> Vec<u8> {
+    let mut h = seed.wrapping_mul(2654435761).wrapping_add(1);
+    (0..n)
+        .map(|_| {
+            h = h.wrapping_mul(1664525).wrapping_add(1013904223);
+            (h >> 24) as u8
+        })
+        .collect()
 }
 
 fn data(n: usize, seed: u8) -> Vec<u8> {
@@ -410,7 +434,6 @@ fn covers_whole_pack(bytes: &[u8], pack: u32) -> bool {
 /// `remove_file` is not in the op log, so this cannot be replayed from the log. Instead a child
 /// process dies at the Nth fault boundary inside the discard, which is the only place the ordering
 /// can go wrong, and the parent inspects what survived.
-#[cfg(feature = "fault-injection")]
 #[test]
 fn a_crash_at_every_step_of_a_discard_leaves_the_store_clean() {
     use std::process::Command;
@@ -450,7 +473,7 @@ fn a_crash_at_every_step_of_a_discard_leaves_the_store_clean() {
         )
         .unwrap();
         let code = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "discard_crash_child"])
+            .args(["--exact", "--nocapture", "discard_crash_child"])
             .env("C7D_DISCARD_DIR", &sub)
             .env("C7D_DISCARD_N", n.to_string())
             .output()
@@ -488,7 +511,6 @@ fn a_crash_at_every_step_of_a_discard_leaves_the_store_clean() {
     assert_eq!(cases, 40, "every boundary tried");
 }
 
-#[cfg(feature = "fault-injection")]
 #[test]
 fn discard_crash_child() {
     let Ok(dir) = std::env::var("C7D_DISCARD_DIR") else {
@@ -510,6 +532,8 @@ fn discard_crash_child() {
         .collect();
     // Set after the open, so the boundaries that matter are the ones inside the discard.
     std::env::set_var("C7D_EXIT_BOUNDARY_N", n.to_string());
+    cowfs_store::oplog_start();
+    cowfs_store::oplog_marker(n);
     let _ = s.discard_pack(s.packs().unwrap()[0].id, &condemned);
     std::process::exit(0);
 }
@@ -519,14 +543,12 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-#[cfg(feature = "fault-injection")]
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap_or(0))
         .collect()
 }
 
-#[cfg(feature = "fault-injection")]
 fn copy_tree(from: &Path, to: &Path) {
     fs::create_dir_all(to.join("packs")).unwrap();
     for e in fs::read_dir(from).unwrap().flatten() {
@@ -603,4 +625,263 @@ fn a_collector_pack_id_is_reserved_durably_and_never_reused() {
     for b in &live {
         assert!(s.get(*b).is_ok(), "a live block survived the whole thing");
     }
+}
+
+/// `discard_pack` drops an index entry only when it points into the pack being discarded.
+///
+/// After a compaction the index points at the new pack, so the copied ids are named in the source
+/// pack's condemned list while their entries belong to the copy. Dropping those entries
+/// unconditionally makes the copied blocks unreadable, which is data loss, not bookkeeping.
+#[test]
+fn discarding_a_pack_keeps_an_index_entry_that_points_at_the_copy() {
+    let d = tempfile::tempdir().unwrap();
+    // A small roll, so a sealed pack exists to compact and discard.
+    let s = small_store(d.path());
+    let live: Vec<BlockId> = (0..3u32).map(|i| s.put(&noisy(4096, i)).unwrap()).collect();
+    for i in 20..24u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    for i in 100..140u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    s.sync().unwrap();
+    let old = s
+        .packs()
+        .unwrap()
+        .into_iter()
+        .find(|p| !p.active)
+        .expect("a sealed pack")
+        .id;
+
+    let plan = s
+        .plan_pack(old, &|b| live.contains(&b), &mut Vec::new())
+        .unwrap();
+    let mut c = s.begin_compaction(&plan, &|b| live.contains(&b)).unwrap();
+    while !s.copy_batch(&mut c, 0).unwrap() {}
+    let rw = s.finish_compaction(&c).unwrap();
+    assert_eq!(rw.records, 3, "the live records were copied");
+    assert!(s.pack_len(old) > 0, "the source is still whole");
+    for b in &live {
+        assert!(s.contains(*b), "still indexed after the repoint");
+    }
+
+    // A caller that condemns the copied ids while discarding the source must not drop their
+    // entries, because those entries name the copy.
+    s.discard_pack(old, &live).expect("discard");
+    for (i, b) in live.iter().enumerate() {
+        assert!(
+            s.contains(*b),
+            "the index entry for a copied block was dropped: {b:?}"
+        );
+        assert_eq!(s.get(*b).unwrap(), noisy(4096, i as u32));
+    }
+    assert!(s.fsck().unwrap().is_clean());
+}
+
+/// A crash at every step of finishing a copy leaves a store that reads.
+///
+/// `finish_compaction` fsyncs the new pack before the index names it, so a crash anywhere in it
+/// leaves either the old index or a new one that points at bytes that are already durable.
+#[test]
+fn a_crash_at_every_step_of_finishing_a_copy_leaves_the_store_readable() {
+    use std::process::Command;
+    let d = tempfile::tempdir().unwrap();
+    let s = small_store(d.path());
+    let live: Vec<BlockId> = (0..3u32).map(|i| s.put(&noisy(4096, i)).unwrap()).collect();
+    for i in 20..24u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    for i in 100..140u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    s.sync().unwrap();
+    // The pack is named in a file, so the child compacts exactly this one. It picks the first
+    // sealed pack itself otherwise, and a different pack holds no live record, so there is no copy
+    // to make durable and the test would assert nothing.
+    let old = s
+        .packs()
+        .unwrap()
+        .into_iter()
+        .find(|p| !p.active)
+        .expect("a sealed pack")
+        .id;
+    fs::write(d.path().join("COPY_PACK"), old.to_string()).unwrap();
+
+    let plan = s
+        .plan_pack(old, &|b| live.contains(&b), &mut Vec::new())
+        .unwrap();
+    assert!(
+        plan.live_bytes > 0,
+        "the pack holds live records, so a copy is made"
+    );
+    let mut c = s.begin_compaction(&plan, &|b| live.contains(&b)).unwrap();
+    while !s.copy_batch(&mut c, 0).unwrap() {}
+    drop(s);
+    let mut ids = String::new();
+    for i in 20..24u32 {
+        ids.push_str(&hex(BlockId::of(&noisy(4096, i)).as_bytes()));
+        ids.push('\n');
+    }
+    fs::write(d.path().join("CONDEMNED"), ids).unwrap();
+
+    let mut cases = 0;
+    for n in 1..=30u64 {
+        let sub = d.path().join(format!("f{n}"));
+        copy_tree(d.path(), &sub);
+        let code = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "--nocapture", "finish_copy_crash_child"])
+            .env("C7D_FINISH_DIR", &sub)
+            .env("C7D_FINISH_N", n.to_string())
+            .output()
+            .unwrap();
+        let status = code.status.code().unwrap_or(-1);
+        assert!(
+            matches!(status, 0 | 77),
+            "child n={n} failed: {status} {}",
+            String::from_utf8_lossy(&code.stderr)
+        );
+        cases += 1;
+        let reopened = small_store(&sub);
+        assert!(
+            reopened.fsck().unwrap().is_clean(),
+            "n={n}: fsck dirty after a crash finishing a copy"
+        );
+        assert!(
+            !reopened.recovery().has_corruption(),
+            "n={n}: corruption reported"
+        );
+        for (i, b) in live.iter().enumerate() {
+            assert_eq!(
+                reopened.get(*b).expect("a live block reads"),
+                noisy(4096, i as u32),
+                "n={n}: a live block lost"
+            );
+        }
+    }
+    let _ = old;
+    assert_eq!(cases, 30, "every boundary tried");
+}
+
+#[test]
+fn finish_copy_crash_child() {
+    let Ok(dir) = std::env::var("C7D_FINISH_DIR") else {
+        return;
+    };
+    let n: u64 = std::env::var("C7D_FINISH_N").unwrap().parse().unwrap();
+    let s = small_store(Path::new(&dir));
+    let live: std::collections::HashSet<BlockId> =
+        (0..3u32).map(|i| BlockId::of(&noisy(4096, i))).collect();
+    let sealed = fs::read_to_string(Path::new(&dir).join("COPY_PACK")).expect("COPY_PACK");
+    let sealed = sealed.trim().parse::<u32>().expect("a pack id");
+    let plan = s
+        .plan_pack(sealed, &|b| live.contains(&b), &mut Vec::new())
+        .unwrap();
+    let mut c = s.begin_compaction(&plan, &|b| live.contains(&b)).unwrap();
+    while !s.copy_batch(&mut c, 0).unwrap() {}
+    std::env::set_var("C7D_EXIT_BOUNDARY_N", n.to_string());
+    let _ = s.finish_compaction(&c);
+    std::process::exit(0);
+}
+
+/// The two fsyncs the ordering rests on, asserted through the op log.
+///
+/// A process exit cannot show either one: the index entry names a pack that is already visible, and
+/// an unlinked name is already gone as far as the next open is concerned. So the ordering is
+/// asserted where it can be seen, in the op log, between the markers the two paths place.
+#[test]
+fn the_copy_is_fsynced_before_the_index_names_it() {
+    let d = tempfile::tempdir().unwrap();
+    let s = small_store(d.path());
+    let live: Vec<BlockId> = (0..3u32).map(|i| s.put(&noisy(4096, i)).unwrap()).collect();
+    for i in 20..24u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    for i in 100..140u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    s.sync().unwrap();
+    let old = s
+        .packs()
+        .unwrap()
+        .into_iter()
+        .find(|p| !p.active)
+        .expect("a sealed pack")
+        .id;
+    let plan = s
+        .plan_pack(old, &|b| live.contains(&b), &mut Vec::new())
+        .unwrap();
+    assert!(plan.live_bytes > 0, "the pack holds live records");
+    let mut c = s.begin_compaction(&plan, &|b| live.contains(&b)).unwrap();
+    while !s.copy_batch(&mut c, 0).unwrap() {}
+
+    cowfs_store::oplog_start();
+    let rw = s.finish_compaction(&c).expect("finish");
+    let ops = cowfs_store::oplog_take();
+    assert_eq!(rw.records, 3, "the live records were copied");
+
+    let (before, after) = window(&ops, 9_101, 9_102);
+    assert!(
+        ops[before..after]
+            .iter()
+            .any(|o| matches!(o, LogOp::Sync { file } if file.contains(".cpk"))),
+        "the new pack was not fsynced between the markers, so the index can name bytes that are \
+         not durable: {ops:?}"
+    );
+    assert!(
+        !ops[after..]
+            .iter()
+            .any(|o| matches!(o, LogOp::Sync { file } if file.contains(".cpk"))),
+        "the pack is fsynced again after the index names it, which is too late: {ops:?}"
+    );
+    for b in &live {
+        assert!(s.contains(*b), "still indexed: {b:?}");
+    }
+}
+
+/// An unlink is only durable once the packs directory is fsynced after it.
+#[test]
+fn the_packs_directory_is_fsynced_after_the_unlink() {
+    let d = tempfile::tempdir().unwrap();
+    let s = small_store(d.path());
+    for i in 0..3u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    for i in 20..24u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    for i in 100..140u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    s.sync().unwrap();
+    let victim = s
+        .packs()
+        .unwrap()
+        .into_iter()
+        .find(|p| !p.active)
+        .expect("a sealed pack")
+        .id;
+
+    cowfs_store::oplog_start();
+    let freed = s.discard_pack(victim, &[]).expect("discard");
+    let ops = cowfs_store::oplog_take();
+    assert!(freed > 0, "the pack was freed");
+
+    let (before, after) = window(&ops, 9_001, 9_002);
+    assert!(
+        ops[before..after].iter().any(|o| matches!(o, LogOp::DirSync)),
+        "the packs directory was not fsynced after the unlink, so the unlink can be lost while the \
+         watermark already says the pack is gone: {ops:?}"
+    );
+}
+
+/// The half-open slice between two markers.
+fn window(ops: &[LogOp], lo: u64, hi: u64) -> (usize, usize) {
+    let at = |v: u64| {
+        ops.iter()
+            .position(|o| matches!(o, LogOp::Marker(m) if *m == v))
+            .unwrap_or_else(|| panic!("marker {v} was never placed: {ops:?}"))
+    };
+    let (a, b) = (at(lo), at(hi));
+    assert!(a < b, "marker {hi} came before marker {lo}: {ops:?}");
+    (a, b)
 }

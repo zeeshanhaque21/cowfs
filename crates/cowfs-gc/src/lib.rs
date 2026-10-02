@@ -27,7 +27,7 @@ mod error;
 mod report;
 mod state;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -42,17 +42,27 @@ use state::{Hints, Marks};
 /// The block id a sparse hole chunk carries. It is not a block and is never stored.
 pub const HOLE: BlockId = BlockId::from_bytes([0; 32]);
 
-/// A held-still reference side. Implemented by `cowfs-core` over its flusher lock.
+/// A way to hold the reference side still, without holding it yet.
+///
+/// [`ExtraRoots::reference_barrier`] returns this. It must not block: constructing the value costs
+/// nothing and stalls nobody, and the collector holds it across the whole cycle. Acquiring is
+/// [`Barrier::take`], and that is where a writer waits.
 pub trait Barrier: Send + Sync {
-    /// Nothing to do: holding the value is the barrier.
-    fn hold(&self) {}
+    /// Acquire, if it can be acquired, and return the guard that holds it. `None` means the
+    /// reference side would not hold still, and the collector frees nothing.
+    fn take(&mut self) -> Option<Box<dyn Held>>;
 }
 
 impl<T: Barrier + ?Sized> Barrier for Box<T> {
-    fn hold(&self) {
-        (**self).hold();
+    fn take(&mut self) -> Option<Box<dyn Held>> {
+        (**self).take()
     }
 }
+
+/// Proof that the reference side is held still for as long as this value exists.
+pub trait Held: Send + Sync {}
+
+impl<T: Held + ?Sized> Held for Box<T> {}
 
 /// Roots and pinned blocks the collector cannot find by walking snapshots alone.
 ///
@@ -302,20 +312,41 @@ impl Gc {
         };
         r.pinned = pinned.len() as u64;
         self.meta.sync()?;
+        // Listed after the sync, or a snapshot this cycle just made durable is invisible to its own
+        // freeze and the walk below never sees it.
+        let durable: Vec<([u8; 32], cowfs_meta::SnapshotId)> = self
+            .meta
+            .durable_snapshots()?
+            .iter()
+            .map(|i| (*i.root.as_bytes(), i.id))
+            .collect();
 
         // 2. Mark. No barrier: a root captured above is immutable, so a write during the walk
         // cannot change what it yields.
         let mut marker = Marker::new();
         let mut live: HashSet<BlockId> = HashSet::new();
+        // Roots an earlier cycle walked. One that is still durable keeps its recorded blocks, and
+        // one that is gone takes them with it, which is the only way anything this crate records
+        // ever shrinks.
+        let mut persisted: HashMap<[u8; 32], Vec<BlockId>> = HashMap::new();
         {
-            // Blocks an earlier cycle yielded. They are live because a root that is still there
-            // still references them, and a root that is gone lets them go, which the prune in
-            // `finish` handles.
-            let marks = self.marks();
-            live.extend(marks.blocks().iter().copied());
+            let mut marks = self.marks();
+            marks.retain_roots(&|r| durable.iter().any(|(k, _)| k == r));
+            for (root, _) in &durable {
+                if let Some(set) = marks.blocks_of(root) {
+                    persisted.insert(*root, set.iter().copied().collect());
+                }
+            }
         }
         let mut walked_roots: HashSet<[u8; 32]> = HashSet::new();
-        let walked = self.marked(&mut marker, &mut r, true, &mut walked_roots)?;
+        let walked = self.marked(
+            &mut marker,
+            &mut r,
+            true,
+            &mut walked_roots,
+            &durable,
+            &persisted,
+        )?;
         live.extend(walked);
         // The second poll closes the window between the freeze and the end of the mark. A block the
         // first poll missed is caught here, and a block that was pinned only for the duration of
@@ -437,17 +468,38 @@ impl Gc {
             self.emit(&progress);
         }
 
-        // 5. Verify and unlink with the reference side held still. The guard is alive from before
-        // the copy, so no commit landed during the copy; its `hold` waits for the writers already
-        // inside one.
+        // 5. Verify and unlink with the reference side held still. This is the only place a writer
+        // ever waits: the mark and every copied byte ran with the reference side free, which is
+        // what makes a cycle cheap for a live store. Acquiring here is late enough that the re-walk
+        // and every unlink are covered and early enough that nothing has been freed yet.
         //
         // A cancel does not stop this step. Every pack here has already been copied and indexed, so
         // refusing to unlink it would leave its source and its copy both on disk for a cycle that
         // has already stopped, and the next cycle redoes the copy. A cancel bounds how much work a
         // cycle starts, not what it finishes.
-        if let Some(guard) = barrier {
-            guard.hold();
-            match self.marked(&mut marker, &mut r, false, &mut walked_roots) {
+        let mut barrier = barrier;
+        if let Some(factory) = barrier.as_mut() {
+            let Some(_held) = factory.take() else {
+                // The reference side would not hold still after all, so nothing is freed.
+                for rw in &copied {
+                    r.skip(rw.from, SkipReason::RootsUnavailable);
+                }
+                r.barrier = false;
+                r.roots_error.get_or_insert(RootsError::Unavailable);
+                live.extend(pinned.iter().copied());
+                self.finish(&mut r, &live, &pinned);
+                return Ok(r);
+            };
+        }
+        if barrier.is_some() {
+            match self.marked(
+                &mut marker,
+                &mut r,
+                false,
+                &mut walked_roots,
+                &durable,
+                &persisted,
+            ) {
                 Ok(new) => live.extend(new),
                 Err(e) => r.error(e),
             }
@@ -499,24 +551,28 @@ impl Gc {
         r: &mut GcReport,
         record: bool,
         walked: &mut HashSet<[u8; 32]>,
+        durable: &[([u8; 32], cowfs_meta::SnapshotId)],
+        persisted: &HashMap<[u8; 32], Vec<BlockId>>,
     ) -> Result<HashSet<BlockId>> {
         let mut live = HashSet::new();
-        for info in self.meta.durable_snapshots()? {
-            let key = *info.root.as_bytes();
+        for (key, id) in durable.iter().copied() {
             if walked.contains(&key) {
                 // Already covered this cycle, by the step 2 pass or by an earlier cycle. Its
                 // blocks are in the set and the marker holds its subtrees.
                 continue;
             }
             if record && self.marks().has_root(&key) {
-                // An earlier cycle walked this exact root, so its blocks are already in the set.
+                // An earlier cycle walked this exact root, so its recorded blocks are its blocks.
+                if let Some(bs) = persisted.get(&key) {
+                    live.extend(bs.iter().copied());
+                }
                 r.marked_skipped_roots += 1;
                 walked.insert(key);
                 continue;
             }
             // A snapshot removed between the listing and the lookup is gone, so its blocks are
             // not live. That is not an error: a collect runs while snapshots come and go.
-            let Ok(snap) = self.meta.snapshot_by_id(info.id) else {
+            let Ok(snap) = self.meta.snapshot_by_id(id) else {
                 continue;
             };
             for b in snap.live_blocks(marker)? {
@@ -527,7 +583,7 @@ impl Gc {
                 r.marked += 1;
                 live.insert(b);
                 if record {
-                    self.marks().add_block(b);
+                    self.marks().add_block(&key, b);
                 }
             }
             walked.insert(key);
@@ -610,6 +666,9 @@ impl Gc {
             Err(e) => r.error(e),
         }
         let mut marks = self.marks.lock().unwrap_or_else(PoisonError::into_inner);
+        // Anything this cycle found unreachable. A block in `live` is either walked this cycle or
+        // credited to a root that is still durable, so it is reachable; anything else is not, and
+        // dropping it is what lets a later cycle free it.
         let dead: HashSet<BlockId> = self
             .store
             .iter_ids()
@@ -645,7 +704,7 @@ impl std::fmt::Debug for Gc {
             )
             .field(
                 "marked_blocks",
-                &self.marks.lock().map(|m| m.blocks().len()).unwrap_or(0),
+                &self.marks.lock().map(|m| m.n_blocks()).unwrap_or(0),
             )
             .field("cancelled", &self.is_cancelled())
             .finish_non_exhaustive()
@@ -657,7 +716,13 @@ mod tests {
     use super::*;
 
     struct Noop;
-    impl Barrier for Noop {}
+    impl Barrier for Noop {
+        fn take(&mut self) -> Option<Box<dyn Held>> {
+            Some(Box::new(HeldMarker))
+        }
+    }
+    struct HeldMarker;
+    impl Held for HeldMarker {}
 
     struct Roots {
         pinned: Vec<BlockId>,
@@ -692,6 +757,10 @@ mod tests {
             pinned: Vec::new(),
             barrier: true,
         };
-        r.reference_barrier().unwrap().unwrap().hold();
+        r.reference_barrier()
+            .unwrap()
+            .unwrap()
+            .take()
+            .expect("the test barrier always holds");
     }
 }

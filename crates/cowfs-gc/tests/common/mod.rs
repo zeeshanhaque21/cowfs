@@ -426,6 +426,11 @@ impl Roots {
         self.inner.waited_us.load(Relaxed)
     }
 
+    /// True while a barrier is held. Lets a test ask when the writer gate is closed.
+    pub fn barrier_live(&self) -> bool {
+        self.inner.gate.lock().unwrap().held
+    }
+
     /// How many barriers were taken.
     pub fn barrier_taken(&self) -> usize {
         self.inner.taken.load(Relaxed)
@@ -441,6 +446,21 @@ impl ExtraRoots for Roots {
         if !self.offers {
             return Ok(None);
         }
+        // Constructing the value stalls nobody. The gate is taken in `take`, so the writers this
+        // test measures are only blocked for the window the collector actually needs.
+        Ok(Some(Box::new(Gate {
+            inner: Arc::clone(&self.inner),
+        }) as Box<dyn Barrier>))
+    }
+}
+
+/// Acquires the writer gate on `take`, so a collect only stalls writers for its unlink window.
+struct Gate {
+    inner: Arc<Inner>,
+}
+
+impl Barrier for Gate {
+    fn take(&mut self) -> Option<Box<dyn cowfs_gc::Held>> {
         let start = Instant::now();
         let mut g = self.inner.gate.lock().unwrap();
         g.held = true;
@@ -449,10 +469,10 @@ impl ExtraRoots for Roots {
         }
         drop(g);
         self.inner.taken.fetch_add(1, Relaxed);
-        Ok(Some(Box::new(Guard {
+        Some(Box::new(Guard {
             inner: Arc::clone(&self.inner),
             start,
-        })))
+        }))
     }
 }
 
@@ -462,9 +482,7 @@ struct Guard {
     start: Instant,
 }
 
-impl Barrier for Guard {
-    fn hold(&self) {}
-}
+impl cowfs_gc::Held for Guard {}
 
 impl Drop for Guard {
     fn drop(&mut self) {

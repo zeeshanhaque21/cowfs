@@ -44,7 +44,13 @@ fn garbage() -> Fixture {
 }
 
 struct Noop;
-impl Barrier for Noop {}
+impl Barrier for Noop {
+    fn take(&mut self) -> Option<Box<dyn cowfs_gc::Held>> {
+        Some(Box::new(HeldNoop))
+    }
+}
+struct HeldNoop;
+impl cowfs_gc::Held for HeldNoop {}
 
 /// A reference side that answers until a poll counter reaches a set point, then fails forever.
 ///

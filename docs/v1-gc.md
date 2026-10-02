@@ -28,7 +28,7 @@ Blocks that only memory names are reached through the [`ExtraRoots`](#extraroots
 ```rust
 pub trait ExtraRoots {
     fn pinned_blocks(&self) -> Result<Vec<BlockId>, RootsError>;
-    fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier + Send>>, RootsError> {
+    fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier>>, RootsError> {
         Ok(None)
     }
 }
@@ -44,8 +44,11 @@ pub enum RootsError {
 `pinned_blocks` returns the chunk ids of open orphans and of files whose chunk list is not
 committed yet, which is what `Core::pinned_blocks` already provides.
 
-`reference_barrier` returns a guard that, while alive, keeps the reference side still: no new
-metadata commit can make a new block reference visible.
+`reference_barrier` returns a *way* to keep the reference side still, not a guard that already
+does.
+Constructing it must cost nothing and stall nobody; acquiring is `Barrier::take`, and that is where
+a writer waits.
+The collector calls `take` once, in step 5.
 `cowfs-core` returns its flusher lock.
 `Ok(None)` means the caller offers no ordering, and the collector then reports candidates and
 reclaims nothing (see "The barrier is required").
@@ -172,7 +175,9 @@ A cycle is these steps.
    The new pack is fsynced, then the index entries of the copied ids are repointed at it, then
    `index.cix` is rewritten.
    The old pack stays on disk.
-5. **`W` Verify and unlink.** Take the barrier.
+5. **`W` Verify and unlink.** `Barrier::take` the barrier. A `None` here means the reference side
+   would not hold still after all, so every candidate is skipped as `RootsUnavailable` and nothing
+   is freed.
    Re-read the roots and `pinned_blocks`, re-walk only the roots that the `Marker` has not already
    seen, and union them into the live set.
    Then, for every candidate:
@@ -202,6 +207,12 @@ exactly the condition for its being garbage.
 A put during step 4 is handled the same way: the new record is above the epoch, or the dedup hit
 lands in a pack that step 5 will refuse to unlink.
 So the copies need no barrier and the barrier is held only for step 5.
+This is not a free choice: holding it across the whole cycle was measured at 94 of 94 progress
+callbacks with the barrier live and 47 packs rewritten under it, which is a full-store write stall
+for the length of a sweep.
+`the_barrier_is_not_held_while_packs_are_copied` in `tests/regressions.rs` holds that line, and
+`a_writer_that_dedups_onto_a_rewritten_pack_keeps_the_block` holds the correctness that depends on
+it, which a writer blocked for the whole cycle would have hidden.
 The benchmark in this document measures the write stall that step 5 costs.
 
 ### The barrier is required
@@ -212,6 +223,20 @@ So a collector with no barrier marks, reports, and reclaims nothing, and says so
 `GcReport::skipped`.
 This is a decision for the lead: `cowfs-core` needs about ten lines to implement
 `reference_barrier` for its flusher lock, and then collection works.
+
+### What still blocks the wiring
+
+Two gaps in `cowfs-core`, both of which the collector's tests are written against today.
+
+`reference_barrier` does not exist, so every cycle over core reports and frees nothing.
+`tests/core_end_to_end.rs` checks the half that can be checked: `Core::pinned_blocks` is exact or
+`Busy` and never partial, even with a writer committing, which is the contract
+`ExtraRoots::pinned_blocks` needs.
+
+`Core` exposes `store(&self) -> &Store` and `meta(&self) -> &Meta`, not the `Arc`s, and
+`Gc::open` needs `Arc<Store>`. Opening the store a second time is `Locked`, by design.
+So `Gc::open` cannot be handed core's store today, which is why the end-to-end collect over core is
+not in this change: it needs one accessor on `cowfs-core`, and this branch does not own that crate.
 
 ## Access-time hints
 
@@ -313,6 +338,12 @@ They are added in `crates/cowfs-store/src/compact.rs`, with one `pub(crate) fn g
 2. Cross-cycle incrementality is at **root** granularity: a snapshot whose root an earlier cycle
    walked is skipped whole. Within a cycle it is at **node** granularity through `cowfs-meta`'s
    `Marker`, which is where the measured 4.8x comes from.
+   The persisted set attributes blocks to the root that yielded them, so a root that leaves drops
+   its blocks with it.
+   A flat set cannot: it cannot say whose blocks they were, so nothing is ever pruned and the store
+   never shrinks after the first cycle.
+   The file format does not record the attribution, so a loaded set credits every block to every
+   root it knows; that only costs a walk later, where under-crediting would free a live block.
    A persistent set of *node* ids would make a single changed file cheap too, but `Marker` does not
    expose its contents, so that needs a change in `cowfs-meta`.
    Until then a change to one snapshot costs one full walk of that snapshot.
@@ -325,9 +356,18 @@ They are added in `crates/cowfs-store/src/compact.rs`, with one `pub(crate) fn g
    A pack is only rewritten when it is mostly dead, so live data spread evenly through every pack
    leaves most of the garbage in place. That is the correct trade: rewriting a pack that is mostly
    live costs a copy and frees almost nothing.
-6. `Store::finish_compaction` checkpoints `index.cix` per pack, which is O(entries) per pack and
-   therefore quadratic over a sweep. Dropping it to one checkpoint per cycle, or making the
-   checkpoint incremental, is the first thing to fix if a sweep over many packs is slow.
+6. **The sweep is quadratic in pack count, and that is measured, not guessed.**
+   Two causes, both in `crates/cowfs-store`: `finish_compaction` checkpoints `index.cix` per pack,
+   which is O(entries) per pack, and the candidate scan re-reads each pack's `index.cix` once per
+   cycle. Measured per-pack cost grows from 102 ms at 16 packs to 156 ms at 253 packs.
+   The default roll size is 256 MiB, so 1000 packs is about 256 GiB of store and this is a
+   first-order cost there, not a footnote.
+   Not fixed in this change: both are store-wide concerns and a fix belongs in `cowfs-store`, not
+   in the collector.
+   Dropping the checkpoint to one per cycle, and doing one candidate scan per cycle instead of per
+   pack, is the fix. Both are localised and neither touches the durability ordering.
+   **All measurements in this document were taken at load 1 on a machine with 32 to 60 cores
+   available.** Nothing here is claimed at load above 30.
 7. One cycle runs at a time per collector: a second `collect` waits.
    Two overlapping cycles each hold their own picture of what is live, and the second to unlink a
    pack can free a block the first has just decided to keep.

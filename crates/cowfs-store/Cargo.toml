@@ -25,6 +25,10 @@ crc32c = "0.6"
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# A dev-dependency on itself, which is how a crate enables one of its own features for `cargo
+# test` without CI having to pass `--features`. The crash-ordering tests are the proof that the
+# discard ordering holds, so they run in the default configuration or they do not run at all.
+cowfs-store = { path = ".", features = ["fault-injection"] }
 
 [lints]
 workspace = true
