@@ -15,9 +15,6 @@ pub struct ServeConfig {
 /// Why a backend could not be built or opened.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BackendError {
-    /// The real core, store and mount adapters are not linked in yet.
-    #[error("the real backend is not wired in yet; run with --stub")]
-    NotWired,
     /// The backend failed to open its store or mount.
     #[error("{0}")]
     Open(String),
@@ -66,7 +63,24 @@ impl Backend for StubBackend {
     }
 }
 
-/// The factory `cowfs serve` uses. The `Real` arm is where the core is wired in later.
+/// The real backend: `cowfs-daemon` opens the store, sweeps stale mounts, installs the
+/// platform's signal cleanup and mounts it. The handler owns the mount, so dropping it (or
+/// its `shutdown`) unmounts, and `cowfs serve` already owns the control server and the signal
+/// handling.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RealBackend;
+
+impl Backend for RealBackend {
+    fn open(&self, config: &ServeConfig) -> Result<Arc<dyn ControlHandler>, BackendError> {
+        let daemon = cowfs_daemon::DaemonConfig::new(&config.store, &config.mount, "");
+        cowfs_daemon::open_handler(&daemon)
+            .map(|h| h as Arc<dyn ControlHandler>)
+            .map_err(|e| BackendError::Open(e.to_string()))
+    }
+}
+
+/// The factory `cowfs serve` uses. `Real` is the daemon; `Stub` is the in-memory one the
+/// tests and `cowfs serve --stub` use.
 pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>, BackendError> {
     match kind {
         BackendKind::Stub {
@@ -76,6 +90,6 @@ pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>, BackendError>
             work_delay,
             ignore_cancel,
         })),
-        BackendKind::Real => Err(BackendError::NotWired),
+        BackendKind::Real => Ok(Box::new(RealBackend)),
     }
 }
