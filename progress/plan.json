@@ -261,10 +261,10 @@
         },
         {
           "id": "51",
-          "title": "bench: gates harness for success criterion 2",
-          "state": "building",
-          "owner": "builder (subagent)",
-          "detail": "New. bench/gates.py (clean cargo build, warm edit-rebuild, git status on 100k+ files, tree walk, large file, metadata storm), compare.py that refuses to print a ratio when load is above 30 or the arms' load differ by 2x (prints 'unmeasurable'), native-vs-native noise floor, run-pair.sh under the CPU lock. Small sample only for now; the full run is scheduled by the lead. Branch v1/bench-gates."
+          "title": "#51 bench: gates harness (merged, PR #48)",
+          "state": "done",
+          "owner": "lead",
+          "detail": "Merged. Six gates (clean build, warm rebuild, git status on 100k files, walk and read, 1 GiB file, metadata storm), compare.py refuses ratios above load1 30 or 2x arm skew, noise floor, run-pair.sh under the CPU lock, resumable JSONL (kill -9 tested). Validated at 2% scale only. Small PathVfs-over-NFS pair was unmeasured at load 105; g6 metadata storm 57.7x and g5 4.7x are adapter overhead and NOT results. No full-size run yet: needs a quiet machine under the CPU lock."
         },
         {
           "id": "52",
@@ -313,5 +313,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45). | In flight in parallel: #50 daemon, #51 bench harness, #52 torn read (PR #44)."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45). | In flight in parallel: #50 daemon, #51 bench harness, #52 torn read (PR #44). | Merged since: #48."
 }
