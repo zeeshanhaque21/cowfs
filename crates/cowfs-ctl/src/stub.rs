@@ -311,6 +311,7 @@ impl ControlHandler for StubHandler {
             imported_root_hash: ingested.root,
             mismatches,
             mismatches_truncated: false,
+            stored_bytes: None,
         })
     }
 

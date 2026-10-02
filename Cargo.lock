@@ -258,6 +258,8 @@ name = "cowfs-ctl"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "cowfs-vfs",
+ "cowfs-vfs-path",
  "libc",
  "serde",
  "serde_json",

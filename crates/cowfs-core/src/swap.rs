@@ -47,8 +47,8 @@ fn intent_path(root: &Path, target: &str) -> PathBuf {
 }
 
 /// The staging name for `target`; deterministic, so recovery can clean it up without the intent
-/// file.
-fn staging_name(target: &str) -> String {
+/// file. An import stages into the same name: its crash leaves nothing a caller can see either.
+pub(crate) fn staging_name(target: &str) -> String {
     let base: String = target.chars().take(200).collect();
     format!("{base}{STAGING}0")
 }

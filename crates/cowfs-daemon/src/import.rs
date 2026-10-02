@@ -172,6 +172,7 @@ pub fn run(
         imported_root_hash: got.root,
         mismatches,
         mismatches_truncated,
+        stored_bytes: None,
     })
 }
 

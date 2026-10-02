@@ -218,6 +218,7 @@ fn server_frames() -> Vec<(&'static str, ServerFrame)> {
                     reason: "content".into(),
                 }],
                 mismatches_truncated: true,
+                stored_bytes: Some(1728),
             })),
         ),
         (

@@ -66,7 +66,9 @@ pub trait Backend: Send + Sync + fmt::Debug {
     fn snapshots(&self) -> &dyn Snapshots;
     fn usage(&self) -> io::Result<Option<Usage>>;      // blocks and bytes, for status
     fn close(&self) -> io::Result<()>;                  // durable, and release the store lock
-    fn ingests_directories(&self) -> bool;              // import and base_refresh
+    fn ingests_directories(&self) -> bool;              // base_refresh only; import uses ingest
+    fn ingest(&self, from: &Path, name: &str, progress: &mut dyn FnMut(u64, u64) -> bool)
+        -> CtlResult<Option<Ingested>>;                  // ingest through this backend's writer
     fn fsck(&self) -> io::Result<Option<FsckReport>>;
 }
 ```
@@ -94,7 +96,8 @@ Every snapshot operation is the core's own control plane. No tree is ever copied
 | `snapshot_promote` | a set in the daemon, because the core does not record base-ness |
 | `fsck` | `Core::fsck`, mapped to the protocol's report |
 | `gc` | not wired: the core's mark-and-sweep needs the reference barrier first (#10) |
-| `import`, `base_refresh` | refused, see below |
+| `import` | `import::ingest`: a reserved staging snapshot, a durable read-back compared byte for byte with the source, then one fork into the name. See below |
+| `base_refresh` | refused, see below |
 
 Two of those need a word.
 
@@ -120,13 +123,31 @@ would be making it on their behalf. The error names the store and says so.
 A store that is merely torn past the durable watermark is not damage and opens as normal; the
 bytes are cut into sidecars and reported.
 
-### What the core backend does not do
+### `import` on the core backend
 
-`import` and `base_refresh` copy a directory into the store.
-That means nothing for a backend whose snapshots are trees: the core would not read the copied
-directory back as a snapshot, and writing into the store directory behind its back is worse than
-refusing. So the handler answers `unsupported` and says to copy the source through the mount
-instead. An ingest that writes through the `Vfs` is a request at the end of this document.
+`import` is the one directory-ingest operation the core backend has, and it goes through the core
+rather than through the store directory: `crates/cowfs-core/src/import.rs`. The bytes go into a
+staging snapshot whose name is reserved (the same one a swap stages into, so a crash leaves
+nothing a caller can see), the tree is made durable, read back through the `Vfs` and compared with
+the source byte for byte, and only then is the name made visible.
+
+The switch is one fork of the staging snapshot into the requested name, so it is a single root
+write. An import of the same content twice therefore costs nothing the second time: the blocks are
+already stored, and the report's `stored_bytes` says so (0 for a repeat of identical content).
+
+- Peak extra disk is bounded by construction: the source is never written to, no uncompressed copy
+  is staged on disk, and one 64 KiB buffer (`import::CHUNK`) is in flight per file. The only new
+  bytes are the store's own compressed, deduplicated blocks.
+- Symlinks are kept as symlinks and never followed. Anything else that is not a regular file or a
+  directory (a fifo, a socket, a device) is refused with `invalid_params`, because the core cannot
+  hold one and dropping it silently would make the imported tree differ from the source.
+- No directory is special-cased, `.git` included: the source is copied as it is found.
+- A name that exists is `already_exists`. An import never replaces a snapshot.
+- A mismatch, a cancellation or an error leaves the store exactly as the call found it: the staging
+  snapshot is dropped and no snapshot named as requested exists.
+- `base_refresh` is still refused here, because it copies a git worktree into the store directory,
+  which means nothing for a backend whose snapshots are trees. The handler answers `unsupported`
+  and says to copy the source through the mount instead.
 
 `gc` is not wired. The core has `pinned_blocks` and the reference barrier, and mark-and-sweep is
 #10; until that lands the handler answers `unsupported` rather than reporting a number it cannot
@@ -143,6 +164,7 @@ That is a real atomicity property, not the same one as the core's: a core swap i
 
 `import` follows the migration rules in `docs/design.md`: copy the tree in, re-read the source, hash both with `cowfs_ctl::hash_tree`, and only then report success.
 The report carries both root hashes, so a caller can hash the source itself and compare before it swaps a directory for the mount.
+This backend has no block store, so its report has no `stored_bytes`: every byte is written once and stored once only because the store is a normal filesystem.
 `base_refresh` checks out the ref with `git worktree add` rather than trusting a working tree, and records the real commit, so `base status` compares commits instead of comparing nothing.
 
 ## mount_snapshot

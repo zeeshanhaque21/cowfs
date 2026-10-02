@@ -18,6 +18,14 @@ fn bytes(n: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+/// `part` as a percentage of `whole`, or `all of it` when the store holds nothing new.
+fn percent(whole: u64, part: u64) -> String {
+    if whole == 0 {
+        return "all of it".to_owned();
+    }
+    format!("{:.1}%", part as f64 / whole as f64 * 100.0)
+}
+
 fn count(n: u64, unit: Unit) -> String {
     match unit {
         Unit::Bytes => bytes(n),
@@ -113,21 +121,38 @@ pub fn human(response: &Response) -> String {
             }
             out
         }
-        Response::Import(i) => format!(
-            "imported {} files ({}) into {}; {}",
-            i.files,
-            bytes(i.bytes),
-            esc(&i.name),
-            if i.verified {
-                format!("verified by hash ({} {})", i.hash_algorithm, esc(&i.imported_root_hash))
-            } else {
-                format!(
-                    "NOT verified: {} mismatches{}",
-                    i.mismatches.len(),
-                    if i.mismatches_truncated { " (truncated)" } else { "" }
-                )
+        Response::Import(i) => {
+            let mut out = format!(
+                "imported {} files ({}) into {}; {}",
+                i.files,
+                bytes(i.bytes),
+                esc(&i.name),
+                if i.verified {
+                    format!(
+                        "verified by hash ({} {})",
+                        i.hash_algorithm,
+                        esc(&i.imported_root_hash)
+                    )
+                } else {
+                    format!(
+                        "NOT verified: {} mismatches{}",
+                        i.mismatches.len(),
+                        if i.mismatches_truncated { " (truncated)" } else { "" }
+                    )
+                }
+            );
+            // What the content cost in the store, which is the deduplicated and compressed size
+            // rather than the bytes a native copy would take.
+            if let Some(stored) = i.stored_bytes {
+                let _ = write!(
+                    out,
+                    "\nstore took {} ({} of the source)",
+                    bytes(stored),
+                    percent(i.bytes, stored)
+                );
             }
-        ),
+            out
+        }
         Response::BaseRefresh(r) => {
             let mut out = snapshot_line(&r.snapshot);
             if let Some(prev) = &r.previous_commit {

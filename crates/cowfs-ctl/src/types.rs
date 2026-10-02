@@ -220,6 +220,11 @@ pub struct ImportReport {
     pub mismatches: Vec<ImportMismatch>,
     /// True when there were more mismatches than listed.
     pub mismatches_truncated: bool,
+    /// Bytes the store actually took for this import, after compression and deduplication, so a
+    /// caller can see what the content cost against `bytes`. Absent when the backend has no block
+    /// store, which is the passthrough backend and the stub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
 }
 
 /// Result of `base_refresh`.
