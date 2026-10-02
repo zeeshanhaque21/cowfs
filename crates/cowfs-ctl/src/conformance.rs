@@ -132,6 +132,52 @@ pub fn handler_conformance(
         return Err(failure("swap succeeded after a holder appeared"));
     }
 
+    // An export is a mount, so a holder stops it the same way, under the same lock. A handler
+    // that refuses the path for a reason of its own (no export root configured, or a backend that
+    // does not export at all) never reaches its own holder check, so `unsupported` is the one
+    // answer that cannot be judged here.
+    let before: Vec<_> = handler
+        .snapshot_list()?
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    let path = "/conf-export/pool/slot/repo";
+    *under_lock.lock().unwrap_or_else(PoisonError::into_inner) = 0;
+    let exported = handler.mount_snapshot(
+        &crate::types::MountSnapshot {
+            name: names[1].into(),
+            path: path.into(),
+            expect_no_holders: true,
+        },
+        &HolderGuard::new(names[1], true, Arc::clone(&held), &source),
+    );
+    let under = *under_lock.lock().unwrap_or_else(PoisonError::into_inner);
+    match exported {
+        Ok(_) => return Err(failure("mount_snapshot succeeded with a holder present")),
+        Err(e) if e.code == ErrorCode::Unsupported => {}
+        Err(_) if under == 0 => return Err(failure(
+            "mount_snapshot did not check holders under the guard lock, so a holder can slip in",
+        )),
+        Err(_) => {}
+    }
+    assert_eq!(
+        handler
+            .snapshot_list()?
+            .into_iter()
+            .map(|s| s.name)
+            .collect::<Vec<_>>(),
+        before,
+        "a refused export must not change the snapshots"
+    );
+    if handler
+        .unmount_snapshot(&crate::types::UnmountSnapshot { path: path.into() })
+        .is_ok()
+    {
+        return Err(failure(
+            "unmount_snapshot claimed an export it does not have",
+        ));
+    }
+
     // Concurrent changes of one snapshot are serialised by the framework's per-snapshot lock, so
     // the snapshot set never shows a half-applied change and never loses the name.
     handler.snapshot_create(crate::types::SnapshotCreate {
