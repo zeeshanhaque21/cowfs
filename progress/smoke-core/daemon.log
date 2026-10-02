@@ -1,2 +1,0 @@
-cowfs-daemon: serving /Users/zeeshanhaque/.treehouse/cowfs-7c1bf8/7/cowfs/progress/smoke-core/mnt on /Users/zeeshanhaque/.treehouse/cowfs-7c1bf8/7/cowfs/progress/smoke-core/mnt with the nfs adapter, socket /Users/zeeshanhaque/.treehouse/cowfs-7c1bf8/7/cowfs/progress/smoke-core/rt/c.sock
-cowfs-daemon: signal 15, shutting down
