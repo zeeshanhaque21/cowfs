@@ -192,6 +192,8 @@ pub(crate) struct Inner {
     pub(crate) root: std::path::PathBuf,
     /// Test seam for the swap, see `Core::set_swap_fault`.
     pub(crate) swap_fault: std::sync::atomic::AtomicU8,
+    /// Test seam: the inode whose node-table insertions lose this many races before they win.
+    pub(crate) load_node_contention: Mutex<Option<(Ino, usize)>>,
     /// Test seam: per-inode flush faults `(kind, times remaining)`, see `Core::set_flush_fault`.
     pub(crate) flush_fault: Mutex<HashMap<Ino, (u8, u32)>>,
 }
@@ -263,6 +265,19 @@ impl Inner {
         crate::ino::write_virt_mark(&self.root, new).map_err(|e| crate::error::from_io(&e))?;
         self.virt_reserved.store(new, Ordering::Release);
         Ok(())
+    }
+
+    /// Test seam: report that the next node-table insertion for `ino` lost its race, up to the
+    /// armed count. 0 disables it.
+    fn lose_the_next_insert(&self, ino: Ino) -> bool {
+        let mut f = self.load_node_contention.lk();
+        match *f {
+            Some((target, left)) if (target == ino || target == 0) && left > 0 => {
+                *f = Some((target, left - 1));
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Releases aliases whose node has left the node table or is no longer eligible.
@@ -359,6 +374,10 @@ impl Inner {
                 kids: None,
             };
             let node = Arc::new(Node::new(ino, st));
+            // a competing write to the shard makes the epoch read above stale, so the insert loses
+            if self.lose_the_next_insert(ino) {
+                self.nodes.bump_shard_of(&ino);
+            }
             match self.nodes.insert_if(ino, node.clone(), epoch) {
                 Ok(n) => {
                     self.shrink_nodes(ino);

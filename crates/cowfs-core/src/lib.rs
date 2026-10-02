@@ -40,6 +40,9 @@ use crate::ino::{pack, Aliases, MAX_SNAP};
 use crate::queue::SnapCtx;
 use crate::util::{MutexExt, RwExt, ShardMap};
 
+/// Test seams for the durability calls the design argument depends on. Not a stable API.
+#[doc(hidden)]
+pub mod fsops;
 pub use crate::inner::{FileHealth, Health, LaneHealth};
 pub use crate::inner::{Options, Stats};
 pub use crate::ino::VIRT_COUNTER_MASK;
@@ -142,6 +145,24 @@ pub struct Core {
     _guard: Arc<Guard>,
 }
 
+/// One snapshot's namespace and flush locks, as a test can observe them.
+#[doc(hidden)]
+pub struct SnapshotLockProbe(Arc<crate::queue::SnapCtx>);
+
+#[doc(hidden)]
+impl SnapshotLockProbe {
+    /// True when neither lock is held right now.
+    pub fn free(&self) -> bool {
+        self.0.ns.try_lk().is_some() && self.0.flush.try_lk().is_some()
+    }
+}
+
+impl std::fmt::Debug for SnapshotLockProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotLockProbe").finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Core").finish_non_exhaustive()
@@ -222,6 +243,7 @@ impl Core {
             base_pack_bytes,
             root: dir.to_path_buf(),
             swap_fault: AtomicU8::new(0),
+            load_node_contention: Mutex::new(None),
             flush_fault: Mutex::new(HashMap::new()),
             opts,
         });
@@ -418,6 +440,22 @@ impl Core {
     /// does not know.
     pub fn unpoison(&self, ino: Ino) -> Result<(), Error> {
         self.inner.unpoison(ino)
+    }
+
+    /// Test seam: a handle on one snapshot's own locks, kept after the snapshot leaves the table. The
+    /// liveness property is that nothing holds those locks across a wait for meta's writer lock, and
+    /// that is not observable from outside without holding the handle first.
+    #[doc(hidden)]
+    pub fn snapshot_lock_probe(&self, name: &str) -> Option<SnapshotLockProbe> {
+        self.inner.snap_by_name(name).ok().map(SnapshotLockProbe)
+    }
+
+    /// Test seam: make the next `tries` node-table insertions lose their race, so `load_node` takes
+    /// the retry path instead of relying on a real race to reach it. `ino` 0 arms every inode, which
+    /// is what a caller that only knows the alias needs.
+    #[doc(hidden)]
+    pub fn set_load_node_contention(&self, ino: Ino, tries: usize) {
+        *self.inner.load_node_contention.lk() = (tries > 0).then_some((ino, tries));
     }
 
     /// Test seam: make the next `times` flushes of `ino` fail, `kind` 1 transient (out of space),

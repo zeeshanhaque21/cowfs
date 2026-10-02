@@ -62,10 +62,10 @@ M = {
    "            attr.size = size;\n            attr.mtime = now;\n            self.queue_content",
    "            attr.size = size.min(cur);\n            attr.mtime = now;\n            self.queue_content"),
  "n02_swap_intent_no_fsync": ("swap.rs",
-   "    f.sync_all().map_err(|e| io(&e.to_string()))?;",
+   "    crate::fsops::sync_file(&f, &tmp).map_err(|e| io(&e.to_string()))?;",
    "    let _ = f.sync_all();"),
  "n04_virt_mark_no_dir_fsync": ("ino.rs",
-   "    let d = std::fs::File::open(root)?;\n    d.sync_all()?;",
+   "    crate::fsops::sync_dir(root)?;",
    "    let _ = std::fs::File::open(root);"),
  "n09_pinned_blocks_skips_busy": ("lib.rs",
    "            let Some(st) = n.try_read_for(Duration::from_secs(2)) else {\n                return Err(ControlError::Busy);\n            };",
@@ -92,8 +92,8 @@ M = {
    "            Mark::Value(0) if has_state => (\n                SAFETY,",
    "            Mark::Value(0) if has_state => (\n                0,"),
  "b07_unregister_locked_meta": ("lib.rs",
-   "            *self.root_time.lk() = Timestamp::now();\n        }\n        // `removed` blocks every new operation on this snapshot and its caches are empty, so the\n        // meta commit can run without the namespace and flush locks: it can wait for another\n        // snapshot's store fsync, and holding those locks across that wait is what wedges a mount.\n        self.meta",
-   "            *self.root_time.lk() = Timestamp::now();\n            self.meta"),
+   "        // `removed` blocks every new operation on this snapshot and its caches are empty, so the\n        // meta commit can run without the namespace and flush locks: it can wait for another\n        // snapshot's store fsync, and holding those locks across that wait is what wedges a mount.\n        self.meta",
+   "        let _wedged = sc.ns.lk();\n        let _also = sc.flush.lk();\n        self.meta"),
  "b09_transient_poisons": ("inner.rs",
    "                        let fatal = Node::classify(&e);",
    "                        let fatal = true;"),
@@ -115,6 +115,26 @@ ORDER = [["--lib"], ["--test", "core"], ["--test", "chunks"], ["--test", "names_
          ["--test", "crash"], ["--test", "kill9"]]
 TIMEOUT = int(os.environ.get("COWFS_MUT_TIMEOUT", "1800"))
 FOCUSED = {
+    "n02_swap_intent_no_fsync": [
+        # the fault test first: the mutant stops calling the seam, so the swap no longer fails
+        ["--test", "durability", "a_swap_refuses_when_the_intent_file_cannot_be_made_durable"],
+        ["--test", "durability", "the_intent_file_is_durable_before_the_victim_snapshot_is_removed"],
+        ["--test", "swap"],
+    ],
+    "n04_virt_mark_no_dir_fsync": [
+        ["--test", "durability", "a_reservation_refuses_when_its_directory_cannot_be_made_durable"],
+        ["--test", "durability", "a_new_virtual_reservation_is_durable_before_any_of_its_numbers_is_handed_out"],
+        ["--test", "names_ino"],
+    ],
+    "b11_load_node_upserts": [
+        ["--test", "durability", "a_node_load_that_exhausts_its_retry_budget_fails_closed"],
+        ["--test", "caches"],
+        ["--test", "stress"],
+    ],
+    "b07_unregister_locked_meta": [
+        ["--test", "durability", "removing_a_snapshot_releases_its_locks_before_its_metadata_commit"],
+        ["--test", "locks"],
+    ],
     "b03_no_rollback": ["--test", "critic2b", "a_step_three_refusal_removes_the_intent_and_staging_snapshot"],
     "b09_transient_poisons": ["--test", "critic2b", "a_single_transient_failure_is_retried_in_the_same_flush"],
     "n15_staging_name_visible": ["--lib", "staging_snapshots_are_hidden_from_mount_root_readdir"],
@@ -150,7 +170,7 @@ def run(name):
         p.write_text(orig.replace(old, new))
         env = dict(os.environ, CARGO_TARGET_DIR=str(tgt))
         with open(log_path, "w") as log:
-            for t in [FOCUSED[name]] if name in FOCUSED else RECHECK.get(name, ORDER):
+            for t in FOCUSED.get(name) or RECHECK.get(name) or ORDER:
                 pr = subprocess.Popen(
                     ["rtk", "cargo", "test", "-j4", "-p", "cowfs-core"] + t,
                     cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,

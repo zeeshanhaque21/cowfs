@@ -226,11 +226,11 @@ pub(crate) fn write_virt_mark(root: &std::path::Path, n: u64) -> std::io::Result
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&b)?;
-        f.sync_all()?;
+        crate::fsops::sync_file(&f, &tmp)?;
     }
     std::fs::rename(&tmp, root.join(other))?;
-    let d = std::fs::File::open(root)?;
-    d.sync_all()?;
+    crate::fsops::note("virt_mark_renamed");
+    crate::fsops::sync_dir(root)?;
     // remember which copy is newest without a durable write: the value itself says
     let _ = newest;
     Ok(())
