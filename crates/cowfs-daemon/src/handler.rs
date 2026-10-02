@@ -7,13 +7,13 @@
 //! shared cache regime stays bounded instead of stale.
 
 use crate::backend::{Backend, Snapshots};
-use crate::exports::{Exports, MountSnapshot, UnmountSnapshot};
+use crate::exports::Exports;
 use crate::holders;
 use crate::mounts::Mounted;
 use cowfs_ctl::{
     BaseRefreshParams, BaseRefreshReport, ControlHandler, CtlError, CtlResult, ErrorCode,
-    FsckReport, GcParams, GcReport, HolderGuard, ImportParams, ImportReport, MountInfo, OpContext,
-    ProcessInfo, SnapshotCreate, SnapshotInfo, Status,
+    FsckReport, GcParams, GcReport, HolderGuard, ImportParams, ImportReport, MountInfo,
+    MountSnapshot, OpContext, ProcessInfo, SnapshotCreate, SnapshotInfo, Status, UnmountSnapshot,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +25,8 @@ fn io(e: std::io::Error, what: &str) -> CtlError {
         std::io::ErrorKind::AlreadyExists => ErrorCode::AlreadyExists,
         std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
         std::io::ErrorKind::Unsupported => ErrorCode::Unsupported,
+        std::io::ErrorKind::InvalidInput => ErrorCode::InvalidParams,
+        std::io::ErrorKind::WouldBlock => ErrorCode::Busy,
         _ => ErrorCode::IoError,
     };
     CtlError::new(code, format!("{what}: {e}"))
@@ -123,6 +125,33 @@ impl Handler {
             .is_some_and(|m| m.is_alive())
     }
 
+    /// Makes the backend durable and releases what it holds, after the mount is gone. This is
+    /// what releases the block store's lock, so a daemon that exits before this leaves the store
+    /// refusing to open until the process is gone.
+    pub fn close_backend(&self) -> Result<(), String> {
+        self.backend.close().map_err(|e| e.to_string())
+    }
+
+    /// What the backend's block store holds, when it has one.
+    fn usage(&self) -> Option<crate::backend::Usage> {
+        self.backend.usage().ok().flatten()
+    }
+
+    /// `import` and `base_refresh` copy a directory into the store, which only means anything for
+    /// a backend whose snapshots are directories. On the core the source has to go in through the
+    /// mount, which is a different operation, so this says so instead of writing a tree the core
+    /// would not read back as a snapshot.
+    fn can_ingest(&self) -> CtlResult<()> {
+        if self.backend.ingests_directories() {
+            return Ok(());
+        }
+        Err(CtlError::new(
+            ErrorCode::Unsupported,
+            "this backend stores snapshots as trees, not as directories: copy the source into the \
+             mount path instead",
+        ))
+    }
+
     fn dir_of(&self, name: &str) -> PathBuf {
         self.mount_path.join(name)
     }
@@ -134,16 +163,21 @@ impl ControlHandler for Handler {
             .snaps()
             .list()
             .map_err(|e| io(e, "cannot list snapshots"))?;
-        let (logical, files) = walk_sizes(&self.store_path);
+        let (block_count, logical, stored) = match self.usage() {
+            Some(u) => (u.blocks, u.logical_bytes, u.stored_bytes),
+            // A passthrough backend has no block store, so these count the tree instead.
+            None => {
+                let (logical, files) = walk_sizes(&self.store_path);
+                (files, logical, logical)
+            }
+        };
         Ok(Status {
             store_path: self.store_path.display().to_string(),
             mount_path: self.mount_path.display().to_string(),
             snapshot_count: names.len() as u64,
-            // A passthrough backend has no block store, so these are counts of what it holds
-            // rather than of blocks. The core reports the real numbers.
-            block_count: files,
+            block_count,
             logical_bytes: logical,
-            stored_bytes: logical,
+            stored_bytes: stored,
             uptime_secs: self.started.elapsed().as_secs(),
         })
     }
@@ -234,20 +268,42 @@ impl ControlHandler for Handler {
         Err(CtlError::new(
             ErrorCode::Unsupported,
             format!(
-                "garbage collection needs the block store, which this backend does not have (dry_run: {})",
+                "garbage collection is not wired to the core's mark-and-sweep yet, and this \
+                 backend has no block store to sweep (dry_run: {})",
                 params.dry_run
             ),
         ))
     }
 
-    fn fsck(&self, _ctx: &OpContext<'_>) -> CtlResult<FsckReport> {
-        Err(CtlError::new(
-            ErrorCode::Unsupported,
-            "fsck needs the block store, which this backend does not have",
-        ))
+    fn fsck(&self, ctx: &OpContext<'_>) -> CtlResult<FsckReport> {
+        let report = self
+            .backend
+            .fsck()
+            .map_err(|e| CtlError::new(ErrorCode::IoError, format!("fsck: {e}")))?
+            .ok_or_else(|| {
+                CtlError::new(
+                    ErrorCode::Unsupported,
+                    "fsck needs the block store, which this backend does not have",
+                )
+            })?;
+        ctx.progress(cowfs_ctl::ProgressEvent {
+            phase: "verify".into(),
+            done: report.bytes_scanned,
+            total: Some(report.bytes_scanned),
+            unit: cowfs_ctl::Unit::Bytes,
+            message: Some("re-hashed every block".into()),
+        })?;
+        Ok(FsckReport {
+            ok: report.damage.is_empty(),
+            blocks_checked: report.blocks_verified,
+            bytes_checked: report.bytes_scanned,
+            snapshots_checked: self.snaps().list().map(|n| n.len() as u64).unwrap_or(0),
+            problems: report.damage.iter().map(damage).collect(),
+        })
     }
 
     fn import(&self, params: ImportParams, ctx: &OpContext<'_>) -> CtlResult<ImportReport> {
+        self.can_ingest()?;
         crate::import::run(self.backend.as_ref(), self.snaps(), &params, ctx)
     }
 
@@ -256,6 +312,7 @@ impl ControlHandler for Handler {
         params: BaseRefreshParams,
         ctx: &OpContext<'_>,
     ) -> CtlResult<BaseRefreshReport> {
+        self.can_ingest()?;
         crate::import::base_refresh(self.backend.as_ref(), self.snaps(), &params, ctx)
     }
 
@@ -265,6 +322,30 @@ impl ControlHandler for Handler {
             adapter: crate::mounts::adapter_name().to_owned(),
             mounted: self.live(),
         })
+    }
+
+    fn mount_snapshot(
+        &self,
+        params: &MountSnapshot,
+        guard: &HolderGuard<'_>,
+    ) -> CtlResult<MountInfo> {
+        // Held across the check and the export, the same as a removal: whoever adds a holder
+        // takes this lock, so a holder cannot appear between the check and the mount.
+        let _serialised = guard.lock();
+        guard.check_holders()?;
+        self.exports.mount_snapshot(params)?;
+        self.changed();
+        Ok(MountInfo {
+            mount_path: params.path.clone(),
+            adapter: crate::mounts::adapter_name().to_owned(),
+            mounted: true,
+        })
+    }
+
+    fn unmount_snapshot(&self, params: &UnmountSnapshot) -> CtlResult<()> {
+        self.exports.unmount_snapshot(params)?;
+        self.changed();
+        Ok(())
     }
 
     fn shutdown(&self) -> CtlResult<()> {
@@ -277,24 +358,27 @@ impl ControlHandler for Handler {
     }
 }
 
-impl Handler {
-    /// `mount_snapshot {name, path, expect_no_holders?}`. The whole rule table lives in
-    /// `Exports`, so this only translates the result and announces the change.
-    pub fn mount_snapshot(&self, req: &MountSnapshot) -> CtlResult<MountInfo> {
-        self.exports.mount_snapshot(req)?;
-        self.changed();
-        Ok(MountInfo {
-            mount_path: req.path.clone(),
-            adapter: crate::mounts::adapter_name().to_owned(),
-            mounted: true,
-        })
-    }
-
-    /// `unmount_snapshot {path}`.
-    pub fn unmount_snapshot(&self, req: &UnmountSnapshot) -> CtlResult<()> {
-        self.exports.unmount_snapshot(req)?;
-        self.changed();
-        Ok(())
+/// One store damage record as the protocol's problem, so `fsck` reports where it is rather than
+/// that something is wrong.
+fn damage(d: &cowfs_store::Damage) -> cowfs_ctl::FsckProblem {
+    use cowfs_store::Damage;
+    match d {
+        Damage::Gap { pack, offset, len } => cowfs_ctl::FsckProblem {
+            kind: "gap".into(),
+            detail: format!("pack {pack} at offset {offset}, {len} bytes"),
+        },
+        Damage::HashMismatch { pack, offset, id } => cowfs_ctl::FsckProblem {
+            kind: "hash_mismatch".into(),
+            detail: format!("pack {pack} at offset {offset}, block {id}"),
+        },
+        Damage::BadPayload { pack, offset, id } => cowfs_ctl::FsckProblem {
+            kind: "bad_payload".into(),
+            detail: format!("pack {pack} at offset {offset}, block {id}"),
+        },
+        Damage::IndexEntry { id } => cowfs_ctl::FsckProblem {
+            kind: "index_entry".into(),
+            detail: format!("block {id}"),
+        },
     }
 }
 
@@ -344,6 +428,7 @@ mod tests {
             Arc::clone(&backend),
             vec![dir.path().join("pool")],
             vec![backend.store_path().to_owned()],
+            dir.path().join("mnt"),
         );
         (dir, Handler::new(backend, mount, exports))
     }
@@ -551,6 +636,18 @@ mod tests {
         }
         fn mount_info(&self) -> CtlResult<MountInfo> {
             self.inner.mount_info()
+        }
+        fn mount_snapshot(
+            &self,
+            params: &MountSnapshot,
+            guard: &HolderGuard<'_>,
+        ) -> CtlResult<MountInfo> {
+            let held = self.lock_for(guard.name());
+            let _serialised = held.lock();
+            self.inner.mount_snapshot(params, guard)
+        }
+        fn unmount_snapshot(&self, params: &UnmountSnapshot) -> CtlResult<()> {
+            self.inner.unmount_snapshot(params)
         }
     }
 

@@ -17,8 +17,10 @@ req import	{"id":7,"method":"import","params":{"name":"slot1","path":"/srv/slot"
 req base_refresh	{"id":7,"method":"base_refresh","params":{"git_ref":"main","repo":"/srv/repo"},"type":"request"}
 req ps	{"id":7,"method":"ps","params":{"snapshot":"slot1"},"type":"request"}
 req mount_info	{"id":7,"method":"mount_info","params":{},"type":"request"}
+req mount_snapshot	{"id":7,"method":"mount_snapshot","params":{"expect_no_holders":true,"name":"slot1","path":"/srv/pool/slot1/repo"},"type":"request"}
+req unmount_snapshot	{"id":7,"method":"unmount_snapshot","params":{"path":"/srv/pool/slot1/repo"},"type":"request"}
 req shutdown	{"id":7,"method":"shutdown","params":{},"type":"request"}
-server hello	{"methods":["ping","version","status","snapshot_list","snapshot_create","snapshot_rm","snapshot_reset","snapshot_rename","snapshot_promote","gc","fsck","import","base_refresh","ps","mount_info","shutdown"],"server":"cowfs-ctl/0.0.0","type":"hello","version":1}
+server hello	{"methods":["ping","version","status","snapshot_list","snapshot_create","snapshot_rm","snapshot_reset","snapshot_rename","snapshot_promote","gc","fsck","import","base_refresh","ps","mount_info","mount_snapshot","unmount_snapshot","shutdown"],"server":"cowfs-ctl/0.0.0","type":"hello","version":1}
 server progress	{"event":{"done":120,"message":null,"phase":"mark","total":400,"unit":"items"},"id":7,"type":"progress"}
 res pong	{"id":7,"result":{"data":{},"kind":"pong"},"type":"response"}
 res version	{"id":7,"result":{"data":{"ctl":"0.0.0","protocol":1,"server":"cowfs-ctl/0.0.0"},"kind":"version"},"type":"response"}

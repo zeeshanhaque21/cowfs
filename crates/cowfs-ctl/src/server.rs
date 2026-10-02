@@ -989,6 +989,22 @@ fn dispatch(
             })
         }
         Request::MountInfo(_) => Response::MountInfo(h.mount_info()?),
+        Request::MountSnapshot(p) => {
+            validate_snapshot_name(&p.name)?;
+            validate_abs_path("path", &p.path)?;
+            // Same lock and same guard as a removal, so the holder check and the export are one
+            // critical section and a holder cannot appear between them.
+            let held = shared.snapshot_lock(&p.name);
+            let source = |n: &str| h.holders(n);
+            let guard = HolderGuard::new(&p.name, p.expect_no_holders, held, &source);
+            guard.check_holders()?;
+            Response::MountInfo(h.mount_snapshot(&p, &guard)?)
+        }
+        Request::UnmountSnapshot(p) => {
+            validate_abs_path("path", &p.path)?;
+            h.unmount_snapshot(&p)?;
+            Response::Ok(Empty {})
+        }
         Request::Shutdown(_) => {
             h.shutdown()?;
             Response::Ok(Empty {})

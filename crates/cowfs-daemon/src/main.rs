@@ -21,9 +21,12 @@ use std::thread;
     about = "Serve a cowfs store over a mount and the control API"
 )]
 struct Cli {
-    /// Block store directory; one subdirectory per snapshot
+    /// Block store directory; one subdirectory per snapshot under the path backend
     #[arg(long)]
     store: PathBuf,
+    /// Which backend serves the store: core is the real one
+    #[arg(long, value_enum, default_value_t = cowfs_daemon::BackendKind::Core)]
+    backend: cowfs_daemon::BackendKind,
     /// Where the default mount goes
     #[arg(long)]
     mount: PathBuf,
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
     for root in &cli.export_root {
         config = config.with_export_root(root);
     }
+    config = config.with_backend(cli.backend);
     // Before anything is mounted: a mount left by a killed daemon hangs every `ls` on it for
     // twenty seconds or more on macOS 26, so it is swept first.
     prepare_platform(&config.mount);

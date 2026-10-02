@@ -127,14 +127,16 @@ A violation is `invalid_params`.
 | `base_refresh` | `{repo, git_ref, name?}` | `base_refresh`: `BaseRefreshReport` | yes |
 | `ps` | `{snapshot}` | `processes`: `{processes: [ProcessInfo]}` | no |
 | `mount_info` | `{}` | `mount_info`: `{mount_path, adapter, mounted}` | no |
+| `mount_snapshot` | `{name, path, expect_no_holders?}` | `mount_info`: `{mount_path, adapter, mounted}` | no |
+| `unmount_snapshot` | `{path}` | `ok`: `{}` | no |
 | `shutdown` | `{}` (no fields) | `ok`: `{}` | no |
 
 ### Params strictness
 
 - `params` must be a JSON object (or absent, which means `{}`).
   An array, string or number is `invalid_params`.
-- Params of the destructive methods `gc`, `snapshot_rm`, `snapshot_reset`, `import`, `base_refresh` and `shutdown` reject unknown fields with `invalid_params`.
-  A misspelt option must never turn into a different operation.
+- Params of the destructive methods `gc`, `snapshot_rm`, `snapshot_reset`, `import`, `base_refresh`, `mount_snapshot`, `unmount_snapshot` and `shutdown` reject unknown fields with `invalid_params`.
+  A misspelt option must never turn into a different operation, and a mount is the sharpest case: a misspelt `path` must not silently become some other directory.
   Params of the read-only methods and of `snapshot_create`, `snapshot_rename`, `snapshot_promote` and `ps` ignore unknown fields.
 - `gc` requires an explicit `dry_run` boolean.
   There is no default, so a real run is never the result of an omission or a typo.
@@ -177,14 +179,18 @@ So the authoritative check is inside the operation, and the framework owns the l
 atomic:
 
 - The framework keeps one lock per snapshot name.
-- For `snapshot_rm` and `snapshot_reset` it builds a `HolderGuard` and runs `check_holders` itself,
-  so a holder present when the request arrives is refused before the handler is called.
-- It then calls the handler's `remove(name, &guard)` or `swap(name, from, &guard)`.
+- For `snapshot_rm`, `snapshot_reset` and `mount_snapshot` it builds a `HolderGuard` and runs
+  `check_holders` itself, so a holder present when the request arrives is refused before the
+  handler is called.
+- It then calls the handler's `remove(name, &guard)`, `swap(name, from, &guard)` or
+  `mount_snapshot(params, &guard)`.
   A handler must hold `guard.lock()` across its holder check and its change, and whoever adds or
   removes a holder must take the same lock.
   A handler that ignores this is not conformant: `cowfs_ctl::handler_conformance` fails it, and it
   must pass before a daemon is wired in.
 - `expect_no_holders: false` skips the check, and is what `cowfs snapshot rm --force` sends.
+- `unmount_snapshot` takes no guard: the path is the daemon's own export, and it is `busy` while
+  anything holds it, which the handler checks under the export registry lock.
 
 The result is either done, or `busy` with nothing changed.
 `busy` is checked before `not_found`, so a snapshot with a holder reports `busy` even when the
@@ -192,9 +198,12 @@ source snapshot is also missing.
 The cost of `ps` and of the holder check is a process scan, bounded by the request timeouts.
 There is no bounded "wait until free" call in v1: a caller that gets `busy` retries.
 `cowfs_ctl::handler_conformance(handler, add_holder)` is the reusable check a backend must pass:
-it verifies that a holder makes both operations `busy` and change nothing, that `holders` reports
-injected holders, that the swap is atomic and leaves exactly one snapshot, and that concurrent
-changes of one snapshot are serialised.
+it verifies that a holder makes those operations `busy` and change nothing, that `holders` reports
+injected holders, that the swap is atomic and leaves exactly one snapshot, that concurrent
+changes of one snapshot are serialised, that `mount_snapshot` also checks under the guard lock,
+and that `unmount_snapshot` never claims an export it does not have.
+A handler that does not implement `mount_snapshot` at all answers `unsupported`, and the lock
+check for it is skipped, because there is nothing of it to check.
 `add_holder` must add the holder while holding the same lock `guard.lock()` returns, which is what
 a real adapter must do.
 
@@ -205,6 +214,28 @@ There is no instant at which `name` is missing, and a crash leaves either the ol
 It fails `not_found` when either snapshot is missing, `invalid_params` when they are the same, and `busy` as described above.
 The result is the new `SnapshotInfo`, with `parent` set to `from`.
 Treehouse mode (b) uses it to reset a slot to the warm base.
+
+### `mount_snapshot`
+
+Exports snapshot `name` at the absolute `path` the client chooses, and answers `mount_info` for
+that path.
+This is a mount primitive, so it is a capability the server keeps: the daemon refuses every path
+that is not inside a configured export root, at least three components below it, free of `..` and
+of symlinked components, and absent or an empty directory. The whole rule table and where each row
+is enforced is in `docs/v1-daemon.md`; every refusal is `invalid_params`, except a missing snapshot
+(`not_found`) and a holder (`busy`).
+`name` must not already be exported at a different path: one snapshot, one export.
+`expect_no_holders` defaults to true and is evaluated under the same per-snapshot lock as the
+export, exactly as for `snapshot_reset`, so a holder appearing between the check and the export
+cannot slip through.
+The whole operation is atomic: the export is either fully visible or not visible at all, and a
+refused one leaves no trace, so a later attempt with a good path succeeds.
+The daemon owns the lifetime: the export is unmounted by `unmount_snapshot` or at daemon shutdown.
+
+`unmount_snapshot {path}` removes one. `path` must be one the daemon exported (`not_found`
+otherwise) and it is `busy` with nothing changed while anything holds it.
+
+`cowfs-treehouse` mode (b) is the consumer: see `docs/v1-treehouse.md`.
 
 ### Semantics worth knowing
 
@@ -230,6 +261,7 @@ Treehouse mode (b) uses it to reset a slot to the warm base.
   `cowfs_ctl::hash_tree` implements it.
   `verified` is true only when the two root hashes are equal and `mismatches` is empty.
 - `ps` lists processes that hold the snapshot's directory on the mount: as a working directory, an open file or a lock.
+  It never lists the daemon itself, which holds the mount by definition.
   Treehouse detects only working directories (`docs/spikes/5-treehouse-process-detection.md`), so this call closes issue #20.
 - `shutdown` responds first, then cancels other in-flight requests, closes connections, removes the socket and stops.
 
@@ -384,11 +416,13 @@ Within major version 1:
 
 ## Server framework
 
-- `ControlHandler` (`cowfs-ctl`) is the trait a daemon implements: `status`, `snapshot_list`, `snapshot_create`, `remove`, `swap`, `holders`, `gc`, `fsck`, `import`, `base_refresh`, `mount_info`, `shutdown`.
+- `ControlHandler` (`cowfs-ctl`) is the trait a daemon implements: `status`, `snapshot_list`, `snapshot_create`, `remove`, `swap`, `holders`, `gc`, `fsck`, `import`, `base_refresh`, `mount_info`, `mount_snapshot`, `unmount_snapshot`, `shutdown`.
   `ping`, `version` and `ps` (which is `holders`) are answered by the framework.
-- `remove` and `swap` replace the old `snapshot_rm` and `snapshot_reset` methods: they take a
+- `remove`, `swap` and `mount_snapshot` replace the old `snapshot_rm` and `snapshot_reset` methods
+  and the export calls the daemon used to expose as library entry points: they take a
   `&HolderGuard` instead of a boolean, which is the whole enforcement mechanism.
   PR #38 (cowfs-treehouse) and any real backend must adapt to that signature.
+  Every method defaults to `unsupported`, so a backend implements what it has.
 - Names, paths and refs are validated before the call, see "Validation done by the framework".
 - It is `Send + Sync` and called concurrently from one thread per in-flight request.
   Handlers own their locking.
@@ -423,6 +457,8 @@ Within major version 1:
 | `shutdown` | `shutdown` |
 | `completions SHELL` | none, prints a shell completion script |
 
+- There is no CLI subcommand for `mount_snapshot` and `unmount_snapshot` yet.
+  They are the treehouse mode (b) API, and the consumer is `cowfs-treehouse` (see `docs/v1-treehouse.md`), which speaks the protocol directly.
 - The socket comes from `--socket`, else `COWFS_SOCKET`, else the default.
   An empty `COWFS_SOCKET` or `COWFS_TIMEOUT` counts as unset.
 - Human output by default, with control characters escaped.
