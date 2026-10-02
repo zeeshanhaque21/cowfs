@@ -848,8 +848,16 @@ fn probe_alias_release_makes_a_held_number_stale() {
     // The NFS adapter forgets the reference the moment it hands the attribute out.
     v.forget(d.ino, 1);
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    eprintln!("forgotten+flushed: getattr {:#x} -> {:?}", d.ino, v.getattr(d.ino).err());
+    eprintln!(
+        "forgotten+flushed: getattr {:#x} -> {:?}",
+        d.ino,
+        v.getattr(d.ino).err()
+    );
     let held = v.mkdir(r, b"e", 0o755).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    eprintln!("reference held: getattr {:#x} -> {:?}", held.ino, v.getattr(held.ino).err());
+    eprintln!(
+        "reference held: getattr {:#x} -> {:?}",
+        held.ino,
+        v.getattr(held.ino).err()
+    );
 }

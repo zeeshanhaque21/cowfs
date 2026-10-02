@@ -13,17 +13,23 @@ use std::time::Duration;
 /// caller retries, so a bound beats a hang.
 pub const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Every process holding something below `prefix`.
+/// Every process holding something below `prefix`, except this one.
+///
+/// This process is never a holder: the daemon holds the store and the mount it serves by
+/// definition, so counting it would make every `expect_no_holders` check `busy`. What the caller
+/// wants to know is who *else* is inside.
 pub fn scan(prefix: &Path) -> Vec<ProcessInfo> {
     let Ok(prefix) = std::fs::canonicalize(prefix) else {
         return Vec::new();
     };
+    let me = std::process::id();
     #[cfg(target_os = "linux")]
     let mut out = imp::scan_proc(&prefix);
     #[cfg(target_os = "macos")]
     let mut out = imp::scan_lsof(&prefix, SCAN_TIMEOUT).unwrap_or_default();
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut out: Vec<ProcessInfo> = Vec::new();
+    out.retain(|p| p.pid != me);
     out.sort_by_key(|p| p.pid);
     out
 }
@@ -212,6 +218,52 @@ mod imp {
     }
 }
 
+/// A child process holding `file` open, so a test can have a holder that is not this process.
+/// `scan` deliberately ignores this process, so a holder has to be somebody else. Reading it
+/// waits until the child has the descriptor, so a check cannot race the child.
+#[cfg(test)]
+#[derive(Debug)]
+pub struct Holder(std::process::Child);
+
+#[cfg(test)]
+impl Holder {
+    pub fn holding(file: &Path) -> Holder {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            // `exec` on the sleep keeps the pid and the descriptor, so killing the one pid the
+            // helper knows really does release the file.
+            .arg("exec 9< \"$1\"; echo ready; exec sleep 600")
+            .arg("sh")
+            .arg(file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("the holder child runs");
+        let mut line = String::new();
+        {
+            use std::io::Read;
+            let mut out = child
+                .stdout
+                .take()
+                .expect("the holder says when it is ready");
+            let mut byte = [0u8; 1];
+            while out.read(&mut byte).unwrap_or(0) == 1 && byte[0] != b'\n' {
+                line.push(byte[0] as char);
+            }
+        }
+        assert_eq!(line.trim(), "ready", "the holder did not open the file");
+        Holder(child)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Holder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,11 +282,16 @@ mod tests {
         let sub = real.join("held");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("f"), b"x").unwrap();
-        let file = std::fs::File::open(sub.join("f")).unwrap();
+        let file = sub.join("f");
+        let holder = Holder::holding(&file);
         let found = scan(&real);
         assert!(
-            found.iter().any(|p| p.pid == std::process::id()),
+            found.iter().any(|p| p.pid != std::process::id()),
             "the process holding the file was not reported: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.pid == std::process::id()),
+            "this process must not be reported as a holder: {found:?}"
         );
         assert!(
             found
@@ -243,7 +300,7 @@ mod tests {
                 .any(|h| Path::new(&h.path).starts_with(&real)),
             "no hold below the prefix: {found:?}"
         );
-        drop(file);
+        drop(holder);
     }
 
     #[cfg(not(target_os = "linux"))]

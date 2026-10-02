@@ -237,6 +237,7 @@ pub fn open_handler(config: &DaemonConfig) -> Result<Arc<Handler>, DaemonError> 
         Arc::clone(&backend),
         config.export_roots.clone(),
         vec![store, mount_path.clone()],
+        mount_path.clone(),
     );
     let vfs = backend
         .root()

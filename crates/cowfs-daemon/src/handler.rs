@@ -428,6 +428,7 @@ mod tests {
             Arc::clone(&backend),
             vec![dir.path().join("pool")],
             vec![backend.store_path().to_owned()],
+            dir.path().join("mnt"),
         );
         (dir, Handler::new(backend, mount, exports))
     }
