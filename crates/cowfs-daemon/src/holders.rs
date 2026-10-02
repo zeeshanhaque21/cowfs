@@ -45,12 +45,13 @@ fn finish(pid: u32, command: String, holds: Vec<Hold>) -> Option<ProcessInfo> {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::{finish, hold, Hold, HoldKind, Path, PathBuf, ProcessInfo};
+    use super::{finish, hold, Hold, HoldKind, Path, ProcessInfo};
     use std::collections::BTreeSet;
 
-    /// `(device, inode)` pairs named by `/proc/locks`, which is how a flock is seen here:
-    /// `F_GETLK` needs the fd, and the whole point is a process nobody asked.
-    fn locked() -> BTreeSet<(u64, u64)> {
+    /// `(major, minor, inode)` triples named by `/proc/locks`, which is how a flock is seen
+    /// here: `F_GETLK` needs the fd, and the whole point is a process nobody asked. The device
+    /// is split the way the kernel writes it, so it compares with `libc::major` on a `st_dev`.
+    fn locked() -> BTreeSet<(u64, u64, u64)> {
         let mut out = BTreeSet::new();
         let Ok(text) = std::fs::read_to_string("/proc/locks") else {
             return out;
@@ -62,15 +63,12 @@ mod imp {
             else {
                 continue;
             };
-            let Some((maj, min)) = dev
+            let device = dev
                 .split_once(':')
-                .and_then(|(maj, rest)| rest.split_once(':'))
-                .and_then(|(maj, min)| maj.parse::<u64>().ok().zip(min.parse::<u64>().ok()))
-            else {
-                continue;
-            };
-            if let Some(ino) = ino.parse::<u64>().ok() {
-                out.insert((maj << 20 | min, ino));
+                .and_then(|(_maj, rest)| rest.split_once(':'))
+                .and_then(|(maj, min)| Some((maj.parse().ok()?, min.parse().ok()?)));
+            if let (Some((maj, min)), Some(ino)) = (device, ino.parse::<u64>().ok()) {
+                out.insert((maj, min, ino));
             }
         }
         out
@@ -111,8 +109,13 @@ mod imp {
                     holds.push(h);
                     // A lock lives on an open descriptor, so the target's inode is what says
                     // whether this process also holds a lock on it.
-                    if std::fs::metadata(&target).is_ok_and(|m| locks.contains(&(m.dev(), m.ino())))
-                    {
+                    if std::fs::metadata(&target).is_ok_and(|m| {
+                        locks.contains(&(
+                            u64::from(libc::major(m.dev())),
+                            u64::from(libc::minor(m.dev())),
+                            m.ino(),
+                        ))
+                    }) {
                         holds.push(Hold {
                             kind: HoldKind::Lock,
                             path: target.to_string_lossy().into_owned(),

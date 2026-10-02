@@ -63,16 +63,20 @@ pub fn is_mounted(path: &Path) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
+        // `cowfs-fuse` mounts as the `cowfs` source with the `fuse.cowfs` type, and an export
+        // is one of ours for the same reason, so both match on the type rather than on the
+        // device, which is a different node per mount.
+        const FSTYPE: &str = "fuse.cowfs";
         let Ok(text) = std::fs::read_to_string("/proc/mounts") else {
             return false;
         };
         let want = path.display().to_string();
         text.lines().any(|l| {
             let mut f = l.split_whitespace();
-            let (Some(device), Some(where_)) = (f.next(), f.next()) else {
+            let (Some(_source), Some(where_), Some(fstype)) = (f.next(), f.next(), f.next()) else {
                 return false;
             };
-            device.starts_with("/dev/fuse") && where_ == want
+            fstype == FSTYPE && where_ == want
         })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -132,8 +136,11 @@ impl fmt::Debug for Mounted {
 }
 
 impl Mounted {
-    /// Mounts `vfs` at `path`, which is created if missing.
+    /// Mounts `vfs` at `path`, which is created if missing. `mount_snapshot` accepts a path
+    /// that does not exist yet, so creating it here is what makes an absent target work on
+    /// both adapters: the NFS one creates it itself, and FUSE needs it to exist.
     pub fn mount(vfs: Arc<dyn Vfs>, path: &Path) -> io::Result<Mounted> {
+        std::fs::create_dir_all(path)?;
         #[cfg(target_os = "macos")]
         {
             let handle = cowfs_nfs::Mount::new(vfs, path, cowfs_nfs::MountOptions::default())
@@ -145,7 +152,8 @@ impl Mounted {
         }
         #[cfg(target_os = "linux")]
         {
-            let handle = cowfs_fuse::Mount::new(vfs, path, cowfs_fuse::MountOptions::default())?;
+            let handle = cowfs_fuse::Mount::new(vfs, path, cowfs_fuse::MountOptions::default())
+                .map_err(|e| io::Error::other(e.to_string()))?;
             Ok(Mounted {
                 handle: Some(handle),
                 path: path.to_owned(),
