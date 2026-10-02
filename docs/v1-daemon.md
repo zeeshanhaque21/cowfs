@@ -6,6 +6,10 @@ It owns a `Vfs` backend, mounts it with the platform adapter, serves the control
 Implementation: `crates/cowfs-daemon/`.
 Contracts it implements: `docs/v1-architecture.md` (the `Vfs` trait), `docs/v1-control-api.md` (the protocol), `docs/v1-treehouse.md` (the `mount_snapshot` rule table).
 
+## Known limits
+
+macOS NFS on the core backend is broken until issue #53 is fixed: two end-to-end tests fail as its repro, because a directory the mount created goes stale once the write-back layer commits it. Linux FUSE passes everything.
+
 ## The pieces
 
 | Module | What it is |
