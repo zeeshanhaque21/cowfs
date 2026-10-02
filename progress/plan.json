@@ -254,10 +254,10 @@
         },
         {
           "id": "50",
-          "title": "daemon: wire backend, control API and mount adapters",
-          "state": "building",
-          "owner": "builder (subagent)",
-          "detail": "New. The end-to-end seam: daemon crate taking Arc<dyn Vfs> (MemVfs and PathVfs today, Core after #36), ControlHandler for the new ctl API, mount_snapshot/unmount_snapshot enforcing the 13-row treehouse rule table, NFS signal cleanup and stale-mount sweep on macOS, FUSE Invalidator on Linux, real end-to-end test through a mount with SIGTERM and kill -9 cases. Branch v1/daemon."
+          "title": "#50 daemon (merged, PR #50)",
+          "state": "done",
+          "owner": "lead",
+          "detail": "Merged to main (777573c) at 9b517ab. I verified: scope clean (daemon crate, daemon doc, 4 cowfs-cli files for the serve seam, lockfile), CI green on both platforms, 74 daemon+cli tests pass, and the exact merge result with main (which was 69 commits ahead) passes fmt, clippy and all 1194 workspace tests. Builder reports 34 daemon unit tests (one per treehouse rule-table row, handler_conformance), and 3 ignored end-to-end tests that mount for real with PathVfs (Mac NFS and Linux VM FUSE) including SIGTERM and kill -9 recovery; I did not re-run those. NOT REVIEWED by a critic. Known holes (follow-up issue): ctl has no mount_snapshot/unmount_snapshot methods yet, so treehouse cannot reach it; holder check not under the framework lock; containment walk is not openat2 RESOLVE_BENEATH; NFS signal backstop not installed by design."
         },
         {
           "id": "51",
