@@ -99,6 +99,20 @@ fn client_frames() -> Vec<(&'static str, ClientFrame)> {
             })),
         ),
         ("req mount_info", req(Request::MountInfo(Empty {}))),
+        (
+            "req mount_snapshot",
+            req(Request::MountSnapshot(crate::MountSnapshot {
+                name: "slot1".into(),
+                path: "/srv/pool/slot1/repo".into(),
+                expect_no_holders: true,
+            })),
+        ),
+        (
+            "req unmount_snapshot",
+            req(Request::UnmountSnapshot(crate::UnmountSnapshot {
+                path: "/srv/pool/slot1/repo".into(),
+            })),
+        ),
         ("req shutdown", req(Request::Shutdown(NoParams {}))),
     ]
 }

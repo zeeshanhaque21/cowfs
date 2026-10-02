@@ -5,6 +5,8 @@ target/
 __pycache__/
 *.pyc
 /progress/serve.log
+# progress/ is the lead's tracker. A run's store, socket and log belong under bench/out/.
+/progress/*/
 /bench/out/
 /bench/mount-nfs/target/
 /bench/mount-nfs/Cargo.lock

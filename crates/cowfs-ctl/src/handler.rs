@@ -84,7 +84,7 @@ impl<'a> OpContext<'a> {
     }
 }
 
-/// What the framework hands to `ControlHandler::remove` and `::swap`.
+/// What the framework hands to `ControlHandler::remove`, `::swap` and `::mount_snapshot`.
 ///
 /// It carries the per-snapshot lock for the whole call, so two changes of one snapshot cannot
 /// overlap and a holder check cannot be separated from the change it guards. A handler must hold
@@ -253,6 +253,25 @@ pub trait ControlHandler: Send + Sync {
     /// Where and how the store is mounted.
     fn mount_info(&self) -> CtlResult<MountInfo> {
         unsupported("mount_info")
+    }
+
+    /// Exports snapshot `params.name` at `params.path`. `guard` carries the framework's
+    /// per-snapshot lock and the `expect_no_holders` flag, and the handler must hold
+    /// `guard.lock()` across `check_holders` and the export, so a holder cannot appear between
+    /// the check and the mount.
+    fn mount_snapshot(
+        &self,
+        params: &MountSnapshot,
+        guard: &HolderGuard<'_>,
+    ) -> CtlResult<MountInfo> {
+        let _ = (params, guard);
+        unsupported("mount_snapshot")
+    }
+
+    /// Removes the export at `params.path`. A path the daemon did not export is `not_found`.
+    fn unmount_snapshot(&self, params: &UnmountSnapshot) -> CtlResult<()> {
+        let _ = params;
+        unsupported("unmount_snapshot")
     }
 
     /// Called after a `shutdown` request, before the response is sent. The framework stops the
