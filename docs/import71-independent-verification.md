@@ -41,6 +41,11 @@ This is not a crash-injection test.
 ## Evidence limitation
 
 Review found that the original `import-e2e.sh` preservation check captured its baseline after import and compared names only.
-The worker is correcting that harness and adding content/metadata mutation checks.
+The worker corrected that harness at `21bab727d3d8fe083375778ffa7cdc5d5d974088`.
 The reported 192 MiB workload and macOS/Linux crash/restart figures remain builder-reported, not independently rerun here.
-Publication concurrency and the corrected source-preservation harness remain under review before merge.
+Independent review confirmed the manifest is taken before imports and compared afterward.
+The extracted manifest selftest independently passed: unchanged trees compare equal, while same-size content, mode, mtime, symlink-target and rename mutations are detected.
+Source review confirmed the Core backend's `with_core` mutex guard spans the entire ingest and publication operation.
+Only harness and documentation changed since the independently tested production code.
+PR #71 was merged after confirming the exact reviewed head and all three green CI checks.
+The existing NFS regression #57 remains a reliability blocker, and this import validation does not close full-stack crash or performance gates.
