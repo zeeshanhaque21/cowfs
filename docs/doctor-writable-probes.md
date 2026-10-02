@@ -25,4 +25,10 @@ Report the actual probe directory and result rather than checking whether the al
 
 Regression tests cover pool-root selection, the no-pool fallback, outside roots, missing roots, and a symlink escaping the mount.
 The unfixed live command above is the end-to-end baseline.
-Crate tests and the fixed live command are pending; this document does not claim they passed.
+`cargo test --locked -p cowfs-treehouse -j2` passed all 115 tests.
+`cargo clippy --locked -p cowfs-treehouse --all-targets -j2 -- -D warnings` passed.
+The fixed live command exits 0: all seven report checks pass, including flock and hardlinks in the configured `base` pool root.
+The holder check reports that no slot-backed snapshot was scanned; it does not prove active agents have no open files.
+No daemon restart or existing lease modification was needed.
+
+Closes #69.
