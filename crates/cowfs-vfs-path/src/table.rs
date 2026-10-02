@@ -72,9 +72,10 @@ pub(crate) enum Loc {
 /// references and handles that keep it alive.
 #[derive(Debug)]
 pub(crate) struct Node {
-    /// The file's identity on the backing filesystem. A number may be reused once the file is
-    /// gone, which is safe here because `by_id` only holds an entry while the node still has a
-    /// name the Vfs knows, and a number is only reusable after every name is gone.
+    /// The file's identity on the backing filesystem. A number belongs to one file only while
+    /// that file is alive, and the filesystem hands a freed number to another file, so this is
+    /// worth trusting only while one of the node's names still resolves to it. `register` proves
+    /// that before it reuses an entry, and unbinds the node when it cannot.
     pub id: (u64, u64),
     pub kind: FileKind,
     /// `(parent, name)` pairs known to lead here. Enough to reopen the file, never a full list.
@@ -397,6 +398,38 @@ impl State {
         })
     }
 
+    /// Whether the file behind `ino` is still the file `id` names: one of the names the Vfs
+    /// knows must still resolve to it. A number the filesystem has handed to another file
+    /// resolves to nothing, which is the only sign that the node's file is gone.
+    fn still_here(&mut self, ino: Ino, id: (u64, u64)) -> bool {
+        let names = self.node(ino).map(|n| n.names.clone()).unwrap_or_default();
+        for (parent, name) in names {
+            let Ok(dir) = self.dir_fd(parent) else {
+                continue;
+            };
+            if let Ok(st) = sys::fstatat(dir.file.as_fd(), &name) {
+                if (st.dev, st.ino) == id {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Drops the binding of a node whose file the filesystem has replaced: its number now names
+    /// another file, so nothing may resolve through it, and the node keeps no way back.
+    fn unbind(&mut self, ino: Ino) {
+        let Some(n) = self.nodes.get_mut(&ino) else {
+            return;
+        };
+        n.names.clear();
+        n.unlinked = true;
+        let id = n.id;
+        self.by_id.remove(&id);
+        self.cache.remove(&ino);
+        self.reclaim(ino);
+    }
+
     /// Finds or creates the node for the file at `parent`/`name` whose stat is `st`, and
     /// records that name for it. Does not take a reference.
     pub(crate) fn register(
@@ -409,12 +442,20 @@ impl State {
         let id = (st.dev, st.ino);
         let kind = kind_of(st)?;
         if let Some(ino) = self.node_by_id(id) {
-            if let Some(n) = self.nodes.get_mut(&ino) {
-                if !n.names.iter().any(|(p, nm)| *p == parent && nm == name) {
-                    n.names.push((parent, name.to_vec()));
+            let known = self
+                .node(ino)
+                .is_ok_and(|n| n.names.iter().any(|(p, nm)| *p == parent && nm == name));
+            if known || self.still_here(ino, id) {
+                if let Some(n) = self.nodes.get_mut(&ino) {
+                    if !n.names.iter().any(|(p, nm)| *p == parent && nm == name) {
+                        n.names.push((parent, name.to_vec()));
+                    }
+                    return Ok(ino);
                 }
-                return Ok(ino);
             }
+            // The file this node named is gone and the filesystem has given its number to the
+            // file at `name`, so the two are unrelated and get numbers of their own.
+            self.unbind(ino);
         }
         let ino = self.alloc_ino();
         let target = if kind == FileKind::Symlink {
