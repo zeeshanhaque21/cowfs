@@ -97,6 +97,30 @@ Test: `a_create_past_the_alias_ceiling_is_refused`, with the limit set to 4 so i
 The same window exists in principle and the fix closes it: an alias now survives `forget` for as long as the inode has a name, so a FUSE client cannot see a number change under a cached dentry either.
 No FUSE-only change was needed or made, and none of that crate was touched.
 
+### The real mount still fails, for a different reason (#53 is not the whole story)
+
+Verified on macOS 26 against `v1/daemon-core` merged into this branch, driving the real stack
+(`cowfs-daemon --backend core`, a real `mount_nfs`, real `mkdir`):
+`mkdir d` succeeds, `mkdir d/e` fails with `Stale NFS file handle`, and a `git clone` into the mount fails on its first `.git` entry.
+
+With this branch's core, `mkdir d` now keeps its number (the core test proves it), and the failure moves one layer up, into `cowfs-nfs`:
+
+```
+SCRATCH side_getattr id=0x8000010000000001 -> taken as a sidecar
+```
+
+`cowfs_nfs::sidecar::SIDE_BIT` is `1 << 63` and `cowfs_core::ino::VIRT` is `1 << 63`, so **every virtual inode number the core hands out looks like an AppleDouble sidecar to the adapter** and is answered `ESTALE` without ever reaching the `Vfs`. Measured: 12 operations entered `Adapter::getattr` with a virtual number and 0 reached `Vfs::getattr`.
+
+That is a namespace collision between two crates, so the fix belongs to whichever side gives up the bit, and this branch does not edit `cowfs-nfs`.
+Two requests, in preference order:
+
+1. `cowfs-nfs`: mint the sidecar bit from the adapter's own space instead of the `Ino`'s. The adapter already has a per-inode `parents` map and a handle codec with a keyed MAC, so a sidecar can be named by a handle the adapter mints, and `is_side` stops testing an `Ino` bit it does not own.
+2. Failing that, `cowfs-core`: move `VIRT` off bit 63 (bit 62 is free, and `MAX_VIRT_SNAP` already accounts for the lost bit). That changes the durable `virt.ino` mark format, so it needs a one-line version bump in the mark and an explicit "an old mark is not a new mark" rule at open, since a number from a session with the old layout must not name a file under the new one.
+
+The same collision is why writes into an existing directory work and creating a nested one does not: a file's own number is only used by `getattr` after `lookup`, and `cowfs-nfs` handles a lookup's result by returning the number it was given.
+
+`the_core_backend_serves_real_bytes_and_survives_a_restart_and_a_kill` and `the_core_refuses_a_store_that_reports_damage_and_does_not_acknowledge_it` therefore still fail on macOS with this branch, for this reason and not the alias release. The other three end-to-end tests pass.
+
 ### What this costs the store and meta
 
 Nothing.

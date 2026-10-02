@@ -7,7 +7,7 @@
 mod common;
 
 use common::*;
-use cowfs_core::Core;
+use cowfs_core::{Core, Options};
 use cowfs_vfs::{Error, Vfs, ROOT_INO};
 
 /// The reproducer from the issue, verbatim: `mkdir d`, forget it the way a stateless adapter
@@ -122,4 +122,36 @@ fn an_unlinked_inode_goes_stale() {
     c.sync().unwrap();
     assert_eq!(v.getattr(f.ino), Err(Error::Stale));
     assert_eq!(v.lookup(ROOT_INO, b"a"), Err(Error::NotFound));
+}
+
+/// The issue's shell session, with the real background flusher rather than an explicit sync: the
+/// daemon runs with one, and the commit is what releases the alias under the old rule.
+#[test]
+fn the_issue_session_with_the_background_flusher() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(
+        dir.path(),
+        Options {
+            background: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    c.create_snapshot("base").unwrap();
+    let v = c.snapshot_view("base").unwrap();
+    let d = v.mkdir(ROOT_INO, b"d", 0o755).unwrap();
+    v.forget(d.ino, 1);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        v.getattr(d.ino).is_ok(),
+        "getattr after the background commit"
+    );
+    let e = v
+        .mkdir(d.ino, b"e", 0o755)
+        .unwrap_or_else(|err| panic!("mkdir d/e with the flusher running: {err:?}"));
+    v.forget(e.ino, 1);
+    let f = v.create(e.ino, b"f", 0o644).unwrap();
+    assert_eq!(v.write(f.ino, 0, b"x").unwrap(), 1);
+    v.forget(f.ino, 1);
+    assert_eq!(read_all(&v, f.ino), b"x");
 }
