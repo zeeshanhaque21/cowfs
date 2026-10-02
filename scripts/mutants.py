@@ -32,8 +32,8 @@ M = {
    "            if b < end {\n                if is_hole(&c) {",
    "            if b + 1 < end {\n                if is_hole(&c) {"),
  "m06_dir_rename_no_barrier": ("ns.rs",
-   "        self.barrier(sc)?;\n        // The barrier commits, which may release virtual inode numbers",
-   "        // The barrier commits, which may release virtual inode numbers"),
+   "        self.barrier(sc)?;\n        // The barrier commits, which may evict the nodes behind these names",
+   "        // The barrier commits, which may evict the nodes behind these names"),
  "m06b_rename_dir_no_barrier": ("ns.rs",
    "        self.barrier(sc)?;\n        // The barrier commits",
    "        // The barrier commits"),
@@ -70,9 +70,6 @@ M = {
  "n09_pinned_blocks_skips_busy": ("lib.rs",
    "            let Some(st) = n.try_read_for(Duration::from_secs(2)) else {\n                return Err(ControlError::Busy);\n            };",
    "            let Ok(st) = n.st.try_read() else { continue };"),
- "n12_released_virt_ok": ("inner.rs",
-   "    fn virt_committed_without_alias(&self, ino: Ino) -> bool {\n        if !matches!(classify(ino), Id::Virt { .. })",
-   "    fn virt_committed_without_alias(&self, ino: Ino) -> bool {\n        if true { return false; }\n        if !matches!(classify(ino), Id::Virt { .. })"),
  "n15_staging_name_visible": ("ns.rs",
    ".filter(|(n, id)| **id > cookie && !swap::is_staging(n))",
    ".filter(|(n, id)| **id > cookie && (swap::is_staging(n) || true))"),
@@ -103,6 +100,24 @@ M = {
  "b08_hole_ignores_length": ("file.rs",
    "pub(crate) fn is_hole(c: &ChunkRef) -> bool {\n    c.id == HOLE && u64::from(c.len) <= HOLE_MAX\n}",
    "pub(crate) fn is_hole(c: &ChunkRef) -> bool {\n    c.id == HOLE\n}"),
+ # the session contract: an alias lives as long as the inode has a name
+ "a01_alias_released_on_commit": ("inner.rs",
+   "    /// Drops an orphan nobody holds once its removal is committed.\n    pub(crate) fn try_reclaim(&self, node: &Arc<Node>) {",
+   "    /// Drops an orphan nobody holds once its removal is committed.\n    pub(crate) fn try_reclaim(&self, node: &Arc<Node>) {\n        self.aliases.wr().remove(node.ino);"),
+ "a02_reclaim_keeps_nlink_zero": ("inner.rs",
+   "        if node.st.rd().attr.nlink != 0 {\n            return;\n        }",
+   "        if false {\n            return;\n        }"),
+ "a03_no_alias_ceiling": ("inner.rs",
+   "        let live = self.aliases.rd().len();\n        if live >= self.opts.alias_limit {",
+   "        let live = 0usize;\n        if live >= self.opts.alias_limit {"),
+ # the mirror of the rule: an unlinked file a handle is open on stays usable, so this mutation is
+ # only visible if the pin is ignored the other way
+ "a05_pinned_unlinked_is_stale": ("inner.rs",
+   "        if !n.pinned() && n.st.rd().attr.nlink == 0 {\n            return Err(Error::Stale);\n        }",
+   "        if n.pinned() && n.st.rd().attr.nlink == 0 {\n            return Err(Error::Stale);\n        }"),
+ "a04_canon_returns_meta_number": ("ino.rs",
+   "    pub(crate) fn canon(&self, snap: u64, m: u64) -> Option<Ino> {\n        if self.rev.is_empty() {\n            return None;\n        }\n        self.rev.get(&pack(snap, m).ok()?).copied()",
+   "    pub(crate) fn canon(&self, snap: u64, m: u64) -> Option<Ino> {\n        if self.rev.is_empty() {\n            return None;\n        }\n        let _ = m;\n        None"),
  "b11_load_node_upserts": ("inner.rs",
    "                // a live node for this inode keeps changing; never overwrite it with a state read\n                // from meta, or a dirty file's unflushed extents are lost\n                Err(()) if tries < 64 => {}\n                Err(()) => return Err(Error::Stale),",
    "                Err(()) if tries < 64 => {}\n                Err(()) => {\n                    self.nodes.upsert(ino, node.clone());\n                    return Ok(node);\n                }"),
@@ -115,6 +130,32 @@ ORDER = [["--lib"], ["--test", "core"], ["--test", "chunks"], ["--test", "names_
          ["--test", "crash"], ["--test", "kill9"]]
 TIMEOUT = int(os.environ.get("COWFS_MUT_TIMEOUT", "1800"))
 FOCUSED = {
+    "a01_alias_released_on_commit": [
+        ["--test", "alias_session", "a_forgotten_directory_keeps_its_number_after_the_commit"],
+        ["--test", "alias_session", "a_directory_created_through_the_session_still_takes_children_after_the_commit"],
+        ["--test", "alias"],
+        ["--test", "core"],
+    ],
+    "a02_reclaim_keeps_nlink_zero": [
+        ["--test", "alias_session", "an_unlinked_inode_goes_stale"],
+        # the whole file: reclaiming a named inode drops its node and its alias, so every
+        # session number goes stale, and the per-test filters above hide that
+        ["--test", "alias_session"],
+        ["--test", "core"],
+        ["--test", "caches"],
+    ],
+    "a03_no_alias_ceiling": [
+        ["--test", "alias", "a_create_past_the_alias_ceiling_is_refused"],
+    ],
+    "a05_pinned_unlinked_is_stale": [
+        ["--test", "core", "open_unlinked_data_is_pinned_until_released"],
+        ["--test", "core"],
+    ],
+    "a04_canon_returns_meta_number": [
+        ["--test", "alias_session"],
+        ["--test", "alias"],
+        ["--test", "model"],
+    ],
     "n02_swap_intent_no_fsync": [
         # the fault test first: the mutant stops calling the seam, so the swap no longer fails
         ["--test", "durability", "a_swap_refuses_when_the_intent_file_cannot_be_made_durable"],
@@ -170,7 +211,10 @@ def run(name):
         p.write_text(orig.replace(old, new))
         env = dict(os.environ, CARGO_TARGET_DIR=str(tgt))
         with open(log_path, "w") as log:
-            for t in FOCUSED.get(name) or RECHECK.get(name) or ORDER:
+            plan = FOCUSED.get(name) or RECHECK.get(name) or ORDER
+            # a FOCUSED entry may be one command as a flat list of strings
+            plan = [plan] if plan and isinstance(plan[0], str) else plan
+            for t in plan:
                 pr = subprocess.Popen(
                     ["rtk", "cargo", "test", "-j4", "-p", "cowfs-core"] + t,
                     cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,

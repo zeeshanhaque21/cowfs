@@ -1,6 +1,6 @@
 //! Shared state, node loading, and the flush and commit machinery.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -43,8 +43,11 @@ pub struct Options {
     pub block_cache_bytes: usize,
     /// Run the background flusher thread. Without it only explicit flushes and thresholds commit.
     pub background: bool,
-    /// The alias table is swept when it holds this many entries.
-    pub alias_batch: usize,
+    /// How many session aliases the mount keeps at once. Every inode a session creates needs one,
+    /// and it is released when the inode is unlinked and unreferenced, so this is the ceiling on how
+    /// many files one session may create. A create past it is `Error::NoSpace` rather than a number
+    /// that later goes stale.
+    pub alias_limit: usize,
 }
 
 impl Default for Options {
@@ -61,7 +64,7 @@ impl Default for Options {
             node_cache: 131_072,
             block_cache_bytes: 128 << 20,
             background: true,
-            alias_batch: 4096,
+            alias_limit: 1 << 20,
         }
     }
 }
@@ -245,7 +248,18 @@ impl Inner {
 
     /// The meta inode number behind `ino`, if meta has one yet.
     /// The next virtual number, extending the durable reservation when it runs out.
+    ///
+    /// Refuses at the alias ceiling: the number would be handed out now and released later, and a
+    /// client still holding it would see `Stale`, so the create fails here instead.
     pub(crate) fn alloc_virt(&self, snap: u64) -> Result<Ino> {
+        let live = self.aliases.rd().len();
+        if live >= self.opts.alias_limit {
+            *self.last_error.lk() = Some(format!(
+                "session inode limit reached: {live} inodes are live, the ceiling is {}",
+                self.opts.alias_limit
+            ));
+            return Err(Error::NoSpace);
+        }
         let n = self.next_virt.fetch_add(1, Ordering::AcqRel) + 1;
         if n >= self.virt_reserved.load(Ordering::Acquire) {
             self.reserve_virt()?;
@@ -278,28 +292,6 @@ impl Inner {
             }
             _ => false,
         }
-    }
-
-    /// Releases aliases whose node has left the node table or is no longer eligible.
-    fn drop_stale_aliases(&self) {
-        if self.aliases.rd().len() < self.opts.alias_batch {
-            return;
-        }
-        let mut al = self.aliases.wr();
-        // keep every alias that is NOT eligible for release: a pinned node (a caller may hold the
-        // number), one with unflushed data, an unlinked one, or one with no node at all
-        let keep: HashSet<Ino> = al
-            .live()
-            .filter(|ino| {
-                self.nodes.get(ino).is_none_or(|n| {
-                    n.pinned()
-                        || n.st
-                            .try_read()
-                            .map_or(true, |st| st.dirty_bytes() > 0 || st.attr.nlink == 0)
-                })
-            })
-            .collect();
-        al.retain_only(&keep);
     }
 
     pub(crate) fn meta_of(&self, ino: Ino) -> Option<u64> {
@@ -392,27 +384,6 @@ impl Inner {
         Err(Error::Stale)
     }
 
-    /// True for a virtual number whose file is committed to meta but whose alias is gone, so the
-    /// number itself is no longer known. A create that is still queued has no alias yet and is
-    /// perfectly good.
-    fn virt_committed_without_alias(&self, ino: Ino) -> bool {
-        if !matches!(classify(ino), Id::Virt { .. }) || self.aliases.rd().meta_of(ino).is_some() {
-            return false;
-        }
-        let Ok(sc) = self.snapctx(ino) else {
-            return true;
-        };
-        let fl = sc.flushed();
-        self.nodes.get(&ino).is_none_or(|n| {
-            n.seq.load(Ordering::Acquire) <= fl && n.ns_seq.load(Ordering::Acquire) <= fl
-        })
-    }
-
-    /// True for a virtual inode number that is committed but whose alias was released.
-    fn is_released_virt(&self, ino: Ino) -> bool {
-        self.virt_committed_without_alias(ino)
-    }
-
     /// The node for `ino`, unless it is an unlinked file nobody holds any more.
     pub(crate) fn live(&self, ino: Ino) -> Result<Arc<Node>> {
         let n = self.node(ino)?;
@@ -424,12 +395,8 @@ impl Inner {
 
     /// A live directory node together with its snapshot.
     ///
-    /// A virtual number whose alias was released (nothing held it, so its number was free to
-    /// change) is `Stale`, not a silent "no such name".
+    /// An unlinked directory nobody holds is `Stale`, not a silent "no such name".
     pub(crate) fn dir(&self, ino: Ino) -> Result<(Arc<SnapCtx>, Arc<Node>)> {
-        if self.is_released_virt(ino) {
-            return Err(Error::Stale);
-        }
         let sc = self.snapctx(ino)?;
         let n = self.live(ino)?;
         if n.st.rd().attr.kind != FileKind::Directory {
@@ -508,16 +475,8 @@ impl Inner {
             .transpose()
         };
         if let Some(d) = self.dents.get(parent.ino, name) {
-            // A cached pending create whose alias was released (a rename before the batch
-            // committed leaves the entry naming the old name's number) must not be believed:
-            // fall through to meta, which has the committed number.
-            let stale_virt = d
-                .target
-                .is_some_and(|(i, _)| self.virt_committed_without_alias(i));
-            if !stale_virt {
-                self.ctr.dhit.fetch_add(1, Ordering::Relaxed);
-                return canon(d.target);
-            }
+            self.ctr.dhit.fetch_add(1, Ordering::Relaxed);
+            return canon(d.target);
         }
         self.ctr.dmiss.fetch_add(1, Ordering::Relaxed);
         let Some(pm) = self.meta_of(parent.ino) else {
@@ -612,15 +571,10 @@ impl Inner {
         Ok(())
     }
 
-    /// Drops a virtual alias once nothing can still be holding its number: the file is committed,
-    /// nobody holds a reference or a handle, and it has no unflushed data.
-    /// Its number reverts to the meta-derived one, which is what a caller sees after a restart
-    /// anyway. A dentry entry keeps working because the dentry cache holds meta numbers and every
-    /// hit is canonicalised through `canon`.
-    fn maybe_drop_alias(&self, node: &Arc<Node>) {
-        if self.aliases.rd().meta_of(node.ino).is_none() {
-            return;
-        }
+    /// Drops a committed, clean, unreferenced node from the node table, so a file a session created
+    /// does not keep a node for the rest of the session. Its alias stays: the number a client was
+    /// handed has to keep naming this inode, and reloading it from meta resolves the alias.
+    fn maybe_evict_node(&self, node: &Arc<Node>) {
         if node.pinned()
             || node
                 .st
@@ -638,14 +592,9 @@ impl Inner {
             return;
         }
         let ino = node.ino;
-        // the node and the alias go together, so the file is loaded once more from meta if needed
-        let removed = self.nodes.remove_if(&ino, |n| {
+        self.nodes.remove_if(&ino, |n| {
             Arc::ptr_eq(n, node) && !n.pinned() && n.seq.load(Ordering::Acquire) <= sc.flushed()
         });
-        if removed {
-            self.aliases.wr().remove(ino);
-            self.ctr.aliases_dropped.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     /// Drops an orphan nobody holds once its removal is committed.
@@ -869,13 +818,13 @@ impl Inner {
                         }
                     }
                 }
-                // aliases of files that are committed, clean and unreferenced are released
+                // the node of a file that is committed, clean and unreferenced can go; its alias
+                // cannot, since the number was handed out already
                 for (v, _) in created.iter() {
                     if let Some(n) = self.nodes.get(v) {
-                        self.maybe_drop_alias(&n);
+                        self.maybe_evict_node(&n);
                     }
                 }
-                self.drop_stale_aliases();
                 Ok(())
             }
             Err(e) => {

@@ -39,15 +39,92 @@ The virtual form exists because `create`, `mkdir` and `symlink` must return an `
 When the batch that creates the file commits, meta reports its real inode number and `Core` records the pair in an alias table (virtual to meta, and meta to virtual).
 From then on `lookup`, `readdir` and every other path canonicalise the meta number to the virtual one, so a file has exactly one `Ino` while anything can still hold it.
 
-**The counter is durable.** `<root>/virt.ino` holds the highest number handed out, written and synced in blocks of 2^20 before any number of the block is used (`Options::alias_batch` is unrelated; the block size is `VIRT_BLOCK`).
+**The counter is durable.** `<root>/virt.ino` holds the highest number handed out, written and synced in blocks of 2^20 before any number of the block is used (the block size is `VIRT_BLOCK`; `Options::alias_limit` is unrelated).
 A crash can therefore waste numbers but never reuse one, and a number from an earlier session is `Stale` rather than another file's data.
 The mark is written twice (value, then the same value again), so a torn write is refused at open instead of believed.
 Tests: `virtual_inode_numbers_are_never_reused_across_a_restart` (a clean reopen) and `the_virtual_number_reservation_survives_a_crash` (a child process that aborts without syncing, three times in a row).
 
-**Aliases are released.** Once a file is committed, has no unflushed bytes, is not unlinked, and no caller holds a reference or a handle, its alias is dropped and its number reverts to the meta-derived one.
-The dentry cache stores meta-derived numbers only and canonicalises every hit, so releasing an alias cannot leave a cached name pointing at a number nothing knows (`DCache::retarget` re-points a committed create's entry, and only if it still names that inode, so a rename or unlink in between is not undone).
-A released number used again as a directory gives `Stale`, not a silent `NotFound` (`Inner::is_released_virt`).
-Tests: `aliases_drain_for_committed_files_with_no_references` (20,000 creates leave 1 alias and 2 nodes; 500,000 leave 130), `a_referenced_file_keeps_its_number_across_a_flush`, `live_blocks_filters_holes_and_yields_only_stored_blocks`.
+**An alias lives as long as the inode has a name.** The rule is in `cowfs-vfs` under `Ino` and `forget`, and it is a session contract, not an optimisation:
+
+> An `Ino` handed to a client keeps meaning the same inode for the rest of the mount session, for as long as that inode exists, whatever the adapter does with `forget`.
+
+A stateless protocol has to be able to do that, because the client never tells the server it is done with a number.
+`cowfs-nfs` hands out attributes and immediately calls `forget` (`crates/cowfs-nfs/src/adapter.rs:170`), because an NFS filehandle is just the `Ino` and nothing pins it.
+So `forget` cannot mean "the inode may stop existing"; it means "the adapter is done with its own bookkeeping", and the release rule moved from "no caller holds a reference" to "the inode has no name left and nothing holds a handle".
+Before this rule, issue #53: `mkdir d` through a real macOS NFS mount, forget it the way the adapter does, wait for the commit, and `mkdir d/e` fails with `Stale NFS file handle`, because the alias went away and the number reverted from `0x8000010000000001` to `0x10000000002`.
+The reproducer needs no adapter: `crates/cowfs-core/tests/alias_session.rs`.
+
+The release point is `Inner::try_reclaim`: an alias goes when its inode is unlinked, its removal is committed, and no handle is open. An NFS client holding a handle to an unlinked file still gets `ESTALE`, which is correct and is what POSIX allows.
+`Inner::maybe_evict_node` still drops the *node* of a committed, clean, unreferenced file, so the node table stays bounded; the alias is what survives.
+An unlinked inode nobody holds is `Stale`, not a silent `NotFound`.
+
+Hardlinks and renames keep one number because the alias is keyed by the meta inode, and `canon` is applied on every `lookup`, `readdir` and dentry hit.
+A client never sees two numbers for one inode in a session.
+The `is_released_virt` check is gone with the rule it existed for: a released alias now means an unlinked inode, which `Inner::live` already answers `Stale`, so the second spelling was dead.
+Tests: `a_forgotten_directory_keeps_its_number_after_the_commit`, `a_directory_created_through_the_session_still_takes_children_after_the_commit`, `a_rename_keeps_one_number`, `a_hardlink_keeps_one_number`, `an_unlinked_inode_goes_stale`, `a_number_never_changes_while_its_inode_has_a_name`, `live_blocks_filters_holes_and_yields_only_stored_blocks`.
+
+Mutants for the rule: `a01_alias_released_on_commit` (release the alias on every reclaim), `a02_reclaim_keeps_nlink_zero` (reclaim a named inode), `a03_no_alias_ceiling` (never refuse a create past the ceiling), `a04_canon_returns_meta_number` (`canon` answers nothing, so a lookup names the file by its meta number), `a05_pinned_unlinked_is_stale` (the mirror: an unlinked file a handle is open on goes `Stale`).
+All five are killed by assertion.
+The whole sweep is 34 mutants, all killed; the `n12_released_virt_ok` entry went with the function it patched.
+
+### What a session alias costs, and the ceiling
+
+One entry per inode a session created that still has a name.
+The table is two `HashMap`s: virtual to meta inode, and packed meta inode to virtual.
+`Aliases::bytes` reports it from the bucket counts, which is exact; an RSS delta is not, since it also carries the dentry table and redb's own database growth.
+
+Measured at 500,000 creates (`ALIAS_FILES=500000 cargo test -p cowfs-core --release --test alias -- --ignored alias_bytes_at_500k_creates`, `target/alias-500k.txt`):
+
+| | |
+|---|---|
+| entries | 500,100 |
+| bytes | 31,195,136 |
+| bytes per entry | 62.4 |
+| node table | 101 entries |
+| process RSS per file | 600 bytes (includes redb and the dentry table, so an upper bound on everything, not on the alias) |
+
+62.4 bytes per entry is what two `(u64, u64)` maps cost at 500,100 entries: 17 bytes per bucket (two `u64`s plus a control byte) and a power-of-two bucket count, so the worst case just past a doubling is 68 and the floor at a full load factor is 39.
+31 MiB for half a million files is the price of the contract, and it is paid once per inode created, not once per lookup.
+
+`Options::alias_limit` (default `1 << 20`, so about 65 MiB of alias table) is the ceiling on how many inodes one session may hold at once.
+Past it, `create`, `mkdir` and `symlink` return `Error::NoSpace` and `last_error` names the ceiling, instead of handing out a number that would go stale later. That is the honest failure: a client gets `ENOSPC` on a new file and keeps every number it already holds.
+Unlinking an inode frees its alias, so the ceiling is on live inodes and not on the session's total.
+Test: `a_create_past_the_alias_ceiling_is_refused`, with the limit set to 4 so it is reachable without a million creates.
+
+### FUSE
+
+`cowfs-fuse` has its own inode table (`crates/cowfs-fuse/src/table.rs`) and the kernel's `FORGET` arrives when the kernel drops the inode, which is much later than the NFS case.
+The same window exists in principle and the fix closes it: an alias now survives `forget` for as long as the inode has a name, so a FUSE client cannot see a number change under a cached dentry either.
+No FUSE-only change was needed or made, and none of that crate was touched.
+
+### The real mount still fails, for a different reason (#53 is not the whole story)
+
+Verified on macOS 26 against `v1/daemon-core` merged into this branch, driving the real stack
+(`cowfs-daemon --backend core`, a real `mount_nfs`, real `mkdir`):
+`mkdir d` succeeds, `mkdir d/e` fails with `Stale NFS file handle`, and a `git clone` into the mount fails on its first `.git` entry.
+
+With this branch's core, `mkdir d` now keeps its number (the core test proves it), and the failure moves one layer up, into `cowfs-nfs`:
+
+```
+SCRATCH side_getattr id=0x8000010000000001 -> taken as a sidecar
+```
+
+`cowfs_nfs::sidecar::SIDE_BIT` is `1 << 63` and `cowfs_core::ino::VIRT` is `1 << 63`, so **every virtual inode number the core hands out looks like an AppleDouble sidecar to the adapter** and is answered `ESTALE` without ever reaching the `Vfs`. Measured: 12 operations entered `Adapter::getattr` with a virtual number and 0 reached `Vfs::getattr`.
+
+That is a namespace collision between two crates, so the fix belongs to whichever side gives up the bit, and this branch does not edit `cowfs-nfs`.
+Two requests, in preference order:
+
+1. `cowfs-nfs`: mint the sidecar bit from the adapter's own space instead of the `Ino`'s. The adapter already has a per-inode `parents` map and a handle codec with a keyed MAC, so a sidecar can be named by a handle the adapter mints, and `is_side` stops testing an `Ino` bit it does not own.
+2. Failing that, `cowfs-core`: move `VIRT` off bit 63 (bit 62 is free, and `MAX_VIRT_SNAP` already accounts for the lost bit). That changes the durable `virt.ino` mark format, so it needs a one-line version bump in the mark and an explicit "an old mark is not a new mark" rule at open, since a number from a session with the old layout must not name a file under the new one.
+
+The same collision is why writes into an existing directory work and creating a nested one does not: a file's own number is only used by `getattr` after `lookup`, and `cowfs-nfs` handles a lookup's result by returning the number it was given.
+
+`the_core_backend_serves_real_bytes_and_survives_a_restart_and_a_kill` and `the_core_refuses_a_store_that_reports_damage_and_does_not_acknowledge_it` therefore still fail on macOS with this branch, for this reason and not the alias release. The other three end-to-end tests pass.
+
+### What this costs the store and meta
+
+Nothing.
+Both the alias table and the durable counter are in `cowfs-core`, and `cowfs-meta` is unaware of the virtual form.
 
 Snapshot ids and meta inode numbers are never reused, so a number never names two files.
 The meta-derived number is exactly `Meta::pack_ino(snapshot id, meta inode)`, so the layout is meta's and restart stable by construction.
@@ -334,14 +411,13 @@ that takes a lock is not listed here.
 | `file::read_range` | blocks | ? |
 | `inner::snapctx_id` | leaf | 1 |
 | `inner::all_snaps` | leaf | 1 |
+| `inner::alloc_virt` | aliases, last_error | leaf |
 | `inner::reserve_virt` | virt_lock | leaf |
 | `inner::lose_the_next_insert` | leaf | 1 |
-| `inner::drop_stale_aliases` | nodes, aliases | 2 then leaf |
 | `inner::meta_of` | aliases | leaf |
 | `inner::canon` | aliases | leaf |
 | `inner::flushed_of` | leaf | 1 |
 | `inner::load_node` | nodes, aliases, snap. | 2 then 3 then leaf |
-| `inner::virt_committed_without_alias` | nodes, aliases | 2 then leaf |
 | `inner::live` | st.rd | 2 |
 | `inner::dir` | st.rd | 2 |
 | `inner::shrink_nodes` | st.try_read, nodes | 2 |
@@ -349,7 +425,7 @@ that takes a lock is not listed here.
 | `inner::ensure_file` | st.wr, st.rd, snap. | 2 then 3 |
 | `inner::ensure_target` | st.wr, st.rd | 2 |
 | `inner::preserve_orphan` | st.wr, st.rd | 2 |
-| `inner::maybe_drop_alias` | nodes, aliases | 2 then leaf |
+| `inner::maybe_evict_node` | nodes | 2 |
 | `inner::try_reclaim` | st.wr, st.rd, nodes, aliases | 2 then leaf |
 | `inner::queue_content` | sc.q | 1 |
 | `inner::flush_node` | st.wr | 2 |
@@ -384,6 +460,7 @@ that takes a lock is not listed here.
 | `lib::list_snapshots` | leaf | 1 |
 | `lib::merkle_root` | snap. | 3 |
 | `lib::last_flush_error` | last_error | leaf |
+| `lib::alias_table` | aliases | leaf |
 | `lib::set_load_node_contention` | leaf | 1 |
 | `lib::set_flush_fault` | leaf | 1 |
 | `lib::live_blocks` | snap. | 3 |
@@ -411,7 +488,7 @@ that takes a lock is not listed here.
 | `ns::require_empty` | st.rd | 2 |
 | `ns::op_rename` | sc.ns, sc.q, st.wr, st.rd, dents | 1 then 2 |
 | `ns::adjust_kids` | st.wr | 2 |
-| `ns::rename_dir` | st.wr, dents | 2 |
+| `ns::rename_dir` | st.wr, nodes, dents | 2 |
 | `ns::refresh_dir_attr` | st.wr, snap. | 2 then 3 |
 | `swap::recover` | last_error | leaf |
 | `swap::swap_snapshot` | last_error | leaf |

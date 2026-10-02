@@ -34,10 +34,19 @@ pub trait Vfs: Send + Sync {
     fn lookup(&self, parent: Ino, name: &[u8]) -> Result<Attr>;
 
     /// Called when an adapter drops `count` of its references to `ino` that were handed out
-    /// by `lookup`, `create`, `mkdir`, `symlink` or `link`. An inode with no links, no
-    /// outstanding references and no open handles must then be reclaimed: later operations on
-    /// it return `Error::Stale`. The default does nothing, which is correct only for an
-    /// implementation that never reclaims inodes and therefore leaks them.
+    /// by `lookup`, `create`, `mkdir`, `symlink` or `link`.
+    ///
+    /// This is the adapter saying it is done with its own bookkeeping, not permission for the
+    /// inode to disappear. `forget` says nothing about whether the client still holds the
+    /// number, and a stateless protocol cannot say: an NFS client hands out filehandles that
+    /// are just the number and never tells the server it is finished, so an adapter that
+    /// forgets immediately must still get `ino` back for as long as the inode exists (see
+    /// `Ino`).
+    ///
+    /// An inode with no names left, no outstanding references and no open handles may then be
+    /// reclaimed, and later operations on it return `Error::Stale`. The default does nothing,
+    /// which is correct only for an implementation that never reclaims inodes and therefore
+    /// leaks them.
     fn forget(&self, _ino: Ino, _count: u64) {}
 
     fn getattr(&self, ino: Ino) -> Result<Attr>;
