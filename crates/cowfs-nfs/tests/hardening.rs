@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use common::reuse::ReusingVfs;
 use common::*;
-use cowfs_nfs::MountOptions;
+use cowfs_nfs::{MountOptions, HANDLE_LEN};
 use nfsserve::nfs::{nfs_fh3, nfsstat3};
 use nfsserve::tcp::Limits;
 
@@ -156,20 +156,25 @@ fn forged_and_guessed_handles_are_refused() {
     legit.write(&secret, 0, b"top secret", 2);
     let mut attacker = Nfs::attach(s.port(), nfs_fh3::default());
 
+    // The MAC is the last 16 bytes, so everything before it is what it covers.
+    let split = HANDLE_LEN - 16;
     let mut wrong_ino = secret.data.clone();
     wrong_ino[8..16].copy_from_slice(&1u64.to_le_bytes());
+    let mut wrong_kind = secret.data.clone();
+    wrong_kind[split - 1] ^= 1;
     let mut wrong_mac = secret.data.clone();
-    wrong_mac[39] ^= 0xff;
+    wrong_mac[HANDLE_LEN - 1] ^= 0xff;
     let mut zero_mac = secret.data.clone();
-    zero_mac[24..].fill(0);
-    let mut plain = secret.data[..24].to_vec();
+    zero_mac[split..].fill(0);
+    let mut plain = secret.data[..split].to_vec();
     plain.extend_from_slice(&[0; 16]);
     for (why, data) in [
         ("another inode, old MAC", wrong_ino),
+        ("another kind, old MAC", wrong_kind),
         ("flipped MAC", wrong_mac),
         ("zero MAC", zero_mac),
         ("no MAC", plain),
-        ("short", secret.data[..24].to_vec()),
+        ("short", secret.data[..split].to_vec()),
         ("empty", vec![]),
     ] {
         let fh = nfs_fh3 { data };
@@ -185,7 +190,7 @@ fn forged_and_guessed_handles_are_refused() {
     for guess in 1u64..2000 {
         let mut d = secret.data.clone();
         d[8..16].copy_from_slice(&guess.to_le_bytes());
-        d[24..].copy_from_slice(&guess.to_le_bytes().repeat(2));
+        d[split..].copy_from_slice(&guess.to_le_bytes().repeat(2));
         brute += usize::from(attacker.getattr(&nfs_fh3 { data: d }).0 == OK);
     }
     assert_eq!(brute, 0, "2000 guessed handles, none accepted");

@@ -2,8 +2,9 @@
 //! the extended attributes of `name`, so they never become inodes and never show up on other
 //! mounts of the same data.
 //!
-//! - A sidecar's file id is the file's inode number with the top bit set (so a `Vfs` must keep
-//!   its inode numbers below 2^63).
+//! - A sidecar is named by a file id of its own, not by a mark on the file's inode number: the
+//!   `Vfs` owns the whole `u64` inode space and may use every bit of it (issue #60). Where that id
+//!   comes from is [`crate::adapter::Id`].
 //! - Reading synthesises the bytes from the current xattrs.
 //! - Writing (the client writes and truncates the file in pieces) is buffered per file. Whenever
 //!   the buffer is a well formed AppleDouble file its attributes are applied to the `Vfs`. The
@@ -14,21 +15,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use cowfs_vfs::{Attr, Error, FileKind, Ino, SetAttr, Timestamp, XattrFlags};
-use nfsserve::nfs::{fattr3, fileid3, nfsstat3, sattr3};
+use nfsserve::nfs::{fattr3, nfsstat3, sattr3};
 
-use crate::adapter::{is_appledouble, lock, stat, Adapter, NfsResult};
+use crate::adapter::{is_appledouble, lock, stat, Adapter, Id, NfsResult};
 use crate::appledouble::{is_plain_attr, is_plausible_prefix, Sidecar, FINDER_INFO, RESOURCE_FORK};
 use crate::convert::set_attr;
+use crate::handle::Kind;
 
-/// Set on the file id of a sidecar.
-pub const SIDE_BIT: u64 = 1 << 63;
 const MAX_SIDECAR: usize = 8 << 20;
 const MAX_BUFFERS: usize = 1024;
 const MAX_BYTES: usize = 32 << 20;
-
-pub fn is_side(id: u64) -> bool {
-    id & SIDE_BIT != 0
-}
 
 #[derive(Debug)]
 struct Pending {
@@ -204,17 +200,20 @@ impl Adapter {
 
     fn side_attr(&self, t: &Attr, size: usize) -> NfsResult<fattr3> {
         let size = size as u64;
-        self.fa(&Attr {
-            ino: t.ino | SIDE_BIT,
-            kind: FileKind::Regular,
-            mode: 0o644,
-            nlink: 1,
-            size,
-            blocks: size.div_ceil(512),
-            atime: t.atime,
-            mtime: t.ctime,
-            ..*t
-        })
+        self.fa(
+            &Attr {
+                ino: t.ino,
+                kind: FileKind::Regular,
+                mode: 0o644,
+                nlink: 1,
+                size,
+                blocks: size.div_ceil(512),
+                atime: t.atime,
+                mtime: t.ctime,
+                ..*t
+            },
+            Kind::Sidecar,
+        )
     }
 
     /// Makes the xattrs of `ino` equal to those in `sc`.
@@ -261,24 +260,24 @@ impl Adapter {
         Ok((t, bytes))
     }
 
-    pub(crate) fn side_lookup(&self, dir: Ino, name: &[u8]) -> NfsResult<(fileid3, fattr3)> {
+    pub(crate) fn side_lookup(&self, dir: Ino, name: &[u8]) -> NfsResult<(Id, fattr3)> {
         let t = self.side_target(dir, name)?;
         let bytes = self.side_bytes(&t)?.ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        Ok((t.ino | SIDE_BIT, self.side_attr(&t, bytes.len())?))
+        Ok((Id::side(t.ino), self.side_attr(&t, bytes.len())?))
     }
 
-    pub(crate) fn side_getattr(&self, id: fileid3) -> NfsResult<fattr3> {
-        let (t, bytes) = self.side_file(id & !SIDE_BIT)?;
+    pub(crate) fn side_getattr(&self, ino: Ino) -> NfsResult<fattr3> {
+        let (t, bytes) = self.side_file(ino)?;
         self.side_attr(&t, bytes.len())
     }
 
     pub(crate) fn side_read(
         &self,
-        id: fileid3,
+        ino: Ino,
         offset: u64,
         count: u32,
     ) -> NfsResult<(Vec<u8>, bool)> {
-        let (_, bytes) = self.side_file(id & !SIDE_BIT)?;
+        let (_, bytes) = self.side_file(ino)?;
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
             .min(bytes.len());
@@ -288,16 +287,16 @@ impl Adapter {
 
     pub(crate) fn side_write(
         &self,
-        id: fileid3,
+        ino: Ino,
         offset: u64,
         data: &[u8],
     ) -> NfsResult<(u32, fattr3)> {
         let one = {
             let mut locks = lock(&self.sidecar_locks);
-            locks.of(id & !SIDE_BIT)
+            locks.of(ino)
         };
         let _held = one.lock().unwrap_or_else(PoisonError::into_inner);
-        let (t, mut buf) = self.side_file(id & !SIDE_BIT)?;
+        let (t, mut buf) = self.side_file(ino)?;
         let start = usize::try_from(offset).map_err(|_| nfsstat3::NFS3ERR_FBIG)?;
         let end = start
             .checked_add(data.len())
@@ -318,13 +317,13 @@ impl Adapter {
     }
 
     /// SETATTR on a sidecar: only the size matters, mode and times are accepted and ignored.
-    pub(crate) fn side_setattr(&self, id: fileid3, s: &sattr3) -> NfsResult<fattr3> {
+    pub(crate) fn side_setattr(&self, ino: Ino, s: &sattr3) -> NfsResult<fattr3> {
         let one = {
             let mut locks = lock(&self.sidecar_locks);
-            locks.of(id & !SIDE_BIT)
+            locks.of(ino)
         };
         let _held = one.lock().unwrap_or_else(PoisonError::into_inner);
-        let (t, mut buf) = self.side_file(id & !SIDE_BIT)?;
+        let (t, mut buf) = self.side_file(ino)?;
         let changes: SetAttr = set_attr(s);
         let Some(size) = changes.size else {
             return self.side_attr(&t, buf.len());
@@ -345,7 +344,7 @@ impl Adapter {
         name: &[u8],
         attr: &sattr3,
         guarded: bool,
-    ) -> NfsResult<(fileid3, fattr3)> {
+    ) -> NfsResult<(Id, fattr3)> {
         let t = self.side_target(dir, name)?;
         let existing = self.side_bytes(&t)?;
         let truncate = set_attr(attr).size == Some(0);
@@ -357,15 +356,11 @@ impl Adapter {
                 0
             }
         };
-        Ok((t.ino | SIDE_BIT, self.side_attr(&t, len)?))
+        Ok((Id::side(t.ino), self.side_attr(&t, len)?))
     }
 
     /// CREATE with mode EXCLUSIVE: a retry finds the file it created.
-    pub(crate) fn side_create_exclusive(
-        &self,
-        dir: Ino,
-        name: &[u8],
-    ) -> NfsResult<(fileid3, fattr3)> {
+    pub(crate) fn side_create_exclusive(&self, dir: Ino, name: &[u8]) -> NfsResult<(Id, fattr3)> {
         self.side_create(dir, name, &sattr3::default(), false)
     }
 

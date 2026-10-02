@@ -612,8 +612,8 @@ impl Inner {
         let (pn, name) = from;
         let (qn, new_name) = to;
         self.barrier(sc)?;
-        // The barrier commits, which may release virtual inode numbers nothing holds any more
-        // (`Inner::maybe_drop_alias`). Re-resolve both names to the numbers the mount uses now.
+        // The barrier commits, which may evict the nodes behind these names from the node table.
+        // Re-resolve both names to the numbers the mount uses now.
         let re = |ino: Ino| match self.meta_of(ino) {
             Some(m) => self.canon(sc.id, m).unwrap_or(ino),
             None => ino,

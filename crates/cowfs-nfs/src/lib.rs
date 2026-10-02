@@ -19,7 +19,8 @@
 //!   file instead, which is what an archive extraction and a checkout of a tree that tracks `._*`
 //!   need; such a file stays a real file, and is never merged into `name`. A whole-file write at
 //!   offset 0 whose bytes cannot be a sidecar is refused, so a real file under a reserved name is
-//!   never accepted and then dropped.
+//!   never accepted and then dropped. A translated sidecar has no inode, so it has a file id of
+//!   its own that is never a number an inode of the `Vfs` is using.
 //! - `Store`: `._` names are ordinary names.
 //!
 //! # Mount options and a dead server
@@ -45,7 +46,9 @@
 //! - An `Ino` is never reused for a different file within a mount's lifetime. The adapter adds a
 //!   per-inode generation to file handles as a second line of defence (a handle minted before the
 //!   last name of an inode went away is `STALE`), but only for removals it performed itself.
-//! - `Ino` values stay below 2^63: the top bit marks a translated sidecar.
+//! - Every `u64` but 0 is a legal `Ino`. The adapter spends no bit of the inode space on its own
+//!   bookkeeping: a translated sidecar is not an inode, so it carries its own file id, allocated by
+//!   the adapter and kept out of the way of any inode number the `Vfs` hands out (issue #60).
 //! - `lookup`, `create`, `mkdir`, `symlink` and `link` each take one reference and the adapter
 //!   gives every one back at once with `forget`. NFS handles are stateless, so nothing is pinned.
 //! - Every call may block, and each one runs on its own blocking task, so a slow `Vfs` costs
@@ -104,7 +107,7 @@ pub use appledouble::Sidecar;
 pub use cleanup::{install_signal_cleanup, sweep_stale_mounts};
 pub use convert::{fattr, nfstime, set_attr, timestamp, FSID};
 pub use errors::nfsstat;
-pub use handle::{random_key, HandleCodec, HANDLE_LEN};
+pub use handle::{random_key, HandleCodec, Kind, HANDLE_LEN};
 pub use mount::{
     is_listed, is_our_export, mount_nfs_available, Mount, MountError, MountOptions, Server,
 };

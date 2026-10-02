@@ -1,6 +1,6 @@
 //! Inode number shapes and the alias table. See `docs/v1-core.md`, "Inode numbers".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write as _;
 
 use cowfs_meta::SnapshotId;
@@ -67,13 +67,17 @@ pub(crate) fn virt(snap: u64, n: u64) -> Result<Ino> {
     Ok(VIRT | snap << SHIFT | n)
 }
 
-/// Virtual inode number to meta inode number and back, for files created by this mount session.
+/// Virtual inode number to meta inode number and back, for inodes created by this mount session.
+///
+/// An entry lives for as long as the inode it names has a name, so a number a client already holds
+/// keeps meaning the same inode for the whole session. Both directions are stored because `canon`
+/// is on the `lookup` path.
 ///
 /// `Clone` so a commit can take a copy of the map before opening meta's writer lock.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Aliases {
     fwd: HashMap<Ino, u64>,
-    rev: HashMap<(u64, u64), Ino>,
+    rev: HashMap<Ino, Ino>,
 }
 
 impl Aliases {
@@ -86,42 +90,38 @@ impl Aliases {
         if self.rev.is_empty() {
             return None;
         }
-        self.rev.get(&(snap, m)).copied()
+        self.rev.get(&pack(snap, m).ok()?).copied()
     }
 
     pub(crate) fn insert(&mut self, virt: Ino, snap: u64, m: u64) {
         self.fwd.insert(virt, m);
-        self.rev.insert((snap, m), virt);
+        if let Ok(pm) = pack(snap, m) {
+            self.rev.insert(pm, virt);
+        }
     }
 
     pub(crate) fn remove(&mut self, virt: Ino) {
         if let (Some(m), Some(snap)) = (self.fwd.remove(&virt), snap_of(virt)) {
-            self.rev.remove(&(snap, m));
+            if let Ok(pm) = pack(snap, m) {
+                self.rev.remove(&pm);
+            }
         }
     }
 
     pub(crate) fn purge_snapshot(&mut self, snap: u64) {
         self.fwd.retain(|v, _| snap_of(*v) != Some(snap));
-        self.rev.retain(|(s, _), _| *s != snap);
+        self.rev
+            .retain(|pm, _| matches!(classify(*pm), Id::Meta { snap: s, .. } if s != snap));
     }
 
     pub(crate) fn len(&self) -> usize {
         self.fwd.len()
     }
 
-    /// Every virtual number that still has a meta number.
-    pub(crate) fn live(&self) -> impl Iterator<Item = Ino> + '_ {
-        self.fwd.keys().copied()
-    }
-
-    /// Drops every alias except those in `keep`, so `canon` can never return a released number.
-    pub(crate) fn retain_only(&mut self, keep: &HashSet<Ino>) {
-        self.fwd.retain(|v, _| keep.contains(v));
-        self.rev = self
-            .fwd
-            .iter()
-            .filter_map(|(v, m)| snap_of(*v).map(|s| ((s, *m), *v)))
-            .collect();
+    /// Bytes the two maps hold, from their bucket counts. Exact, unlike an RSS delta, which also
+    /// carries the dentry table and redb's own growth.
+    pub(crate) fn bytes(&self) -> usize {
+        (self.fwd.capacity() + self.rev.capacity()) * (2 * size_of::<u64>() + 1)
     }
 }
 
