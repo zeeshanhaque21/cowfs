@@ -272,6 +272,22 @@
           "state": "investigating",
           "owner": "builder (subagent)",
           "detail": "New. Reproduce the intermittent concurrent_readers_and_writers torn read 200+ times through FUSE and on native tmpfs/ext4/btrfs under CPU contention; classify; make PR #44's linux-fuse job honest (known native limit gated with a native control in the same job, genuine adapter failures stay red); 5 reruns."
+        },
+        {
+          "id": "56",
+          "title": "daemon on the real core backend (PR #56)",
+          "state": "fixing",
+          "owner": "builder (subagent)",
+          "pr": "#56",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/56",
+          "detail": "Builder done (head 9b2d62a), CI green. Core is now the default daemon backend: clone = fork_snapshot, reset = promote_base, rename = rename_snapshot; a store with unacknowledged damage is refused at open. ctl gained mount_snapshot and unmount_snapshot with the holder check under the framework's per-snapshot lock (issue #51 items 1-2). Two real daemon bugs found by the end-to-end run and fixed: expect_no_holders scanned the store instead of the mount; the store lock released at drop instead of in order. 5 real-mount e2e tests: all pass on Linux FUSE; on macOS NFS 2 FAIL on #53. Smoke (VM, FUSE, 2% scale, 1 rep, load1 0.07): g4 0.003 to 0.345 s, g5 write 5792 to 46 MiB/s, g6 9 ms to 511 ms: tiny corpus, treat as a first look only. NOT MERGED: the PR commits smoke-run artifacts under progress/smoke-core (store files, lock, socket lock), which must go; branch is 4 behind main; macOS is broken on core until #53. Builder cleaning and merging main."
+        },
+        {
+          "id": "53",
+          "title": "#53 P0: core alias release vs stateless NFS handles",
+          "state": "fixing",
+          "owner": "builder (subagent)",
+          "detail": "Found by the daemon e2e. A directory created through the macOS NFS mount goes Stale seconds later: cowfs-nfs forgets the Ino right after handing it out (stateless), core then releases the virtual alias at commit and the number changes. Reproduces in core alone. Core builder making the Ino stable for the session (retained compact alias map, bounded, documented cap) on branch v1/core-alias, with real-mount proof against PR #56's two failing e2e tests. FUSE keeps its own table; checking whether it has the same window."
         }
       ]
     },
@@ -313,5 +329,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45). | In flight in parallel: #50 daemon, #51 bench harness, #52 torn read (PR #44). | Merged since: #48. | Merged since: #36 (core), #48. Waiting: #39 (fixing), #44 (held on #45). In flight: #50 daemon, #52 torn read, core-mutants follow-up."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45). | In flight in parallel: #50 daemon, #51 bench harness, #52 torn read (PR #44). | Merged since: #48. | Merged since: #36 (core), #48. Waiting: #39 (fixing), #44 (held on #45). In flight: #50 daemon, #52 torn read, core-mutants follow-up. | Merged since: #50 daemon, #52 core mutants. Waiting: #39 GC (fixing), #44 (statfs flake), #56 (cleaning), #53 core alias (fixing)."
 }
