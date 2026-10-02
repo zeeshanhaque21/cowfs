@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
 use common::{eager, Fixture, Roots};
@@ -235,37 +235,58 @@ fn a_second_discard_of_the_same_pack_leaves_fsck_clean() {
     }
 }
 
-/// F5: the became-live check is the only thing between a block that became reachable during the
-/// cycle and the unlink of its only copy. A writer that dedups onto a condemned pack and commits
-/// while the copies run must still be protected.
+/// F3a/F5: a writer that deduplicates onto a condemned record **and commits** keeps the block.
+///
+/// Both halves matter. Ingesting alone leaves the bytes unreferenced, so the block really is
+/// garbage and freeing it is correct; the earlier version of this test asserted after re-ingesting,
+/// which put the bytes back and made it pass on a store that had already lost them. Committing is
+/// what makes the reference real, and the reference is what the step-5 re-read has to find.
 #[test]
-fn a_writer_that_dedups_onto_a_rewritten_pack_keeps_the_block() {
+fn a_committing_writer_that_dedups_onto_a_rewritten_pack_keeps_the_block() {
     let f = Fixture::eager(32 << 10);
     let parts = f.parts();
-    let parts = &parts;
     let roots = Roots::new();
     let snap = f.meta.new_snapshot("s").expect("snapshot");
     parts.write(&snap, b"keep", &body(60_000, 1));
     for i in 0..40u32 {
-        parts.store.put(&body(4000, i)).unwrap();
+        parts.store.put(&body(4000, i)).expect("put");
     }
     parts.store.sync().unwrap();
     parts.meta.sync().unwrap();
 
-    // Bytes a writer will put while the copies run. Each is a block that lives in a pack the sweep
-    // is about to condemn, so putting it again deduplicates onto a record that is about to go.
     let late: Arc<Vec<Vec<u8>>> = Arc::new((0..24u32).map(|i| body(4000, i)).collect());
+    // The ids are read once, before the cycle. Re-deriving them afterwards would put the bytes back.
+    let ids: Vec<BlockId> = late
+        .iter()
+        .flat_map(|d| parts.store.ingest_bytes(d).expect("ids"))
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(ids.len(), late.len(), "each payload is one block");
+    parts.store.sync().expect("sync");
+
+    let meta_h = Arc::clone(&parts.meta);
+    let store_h = Arc::clone(&parts.store);
     let done = Arc::new(AtomicUsize::new(0));
 
     std::thread::scope(|sc| {
         let done = Arc::clone(&done);
-        let writer = Arc::clone(&roots);
+        let writer = roots.clone();
         let payload = Arc::clone(&late);
         sc.spawn(move || {
             let late = payload;
-            for d in late.iter() {
+            for (i, d) in late.iter().enumerate() {
+                let name = format!("late{i}");
                 writer.write(|| {
-                    parts.store.ingest_bytes(d).expect("put during the sweep");
+                    let s = meta_h.new_snapshot(&name).expect("snapshot");
+                    let got = store_h.ingest_bytes(d).expect("put during the sweep");
+                    assert_eq!(got.len(), 1, "the put deduplicated rather than stored");
+                    let ino = s
+                        .batch(|tx| tx.create(cowfs_meta::ROOT_INO, name.as_bytes(), 0o644))
+                        .expect("create")
+                        .ino;
+                    s.batch(|tx| tx.set_content(ino, &got, d.len() as u64))
+                        .expect("set content");
+                    meta_h.sync().expect("sync");
                 });
                 done.fetch_add(1, Relaxed);
             }
@@ -273,18 +294,19 @@ fn a_writer_that_dedups_onto_a_rewritten_pack_keeps_the_block() {
 
         let r = parts.gc.collect(Some(&*roots)).expect("collect");
         assert!(r.errors.is_empty(), "{r:?}");
-        // Whatever the cycle decided, every block a writer handed it must still read.
-        for d in late.iter() {
-            for c in parts.store.ingest_bytes(d).expect("ids") {
-                assert!(
-                    parts.store.get(c.id).is_ok(),
-                    "a block a writer deduplicated onto during the sweep is gone: {:?}",
-                    c.id
-                );
-            }
-        }
     });
-    assert!(done.load(Relaxed) > 0, "the writer ran");
+
+    assert_eq!(done.load(Relaxed), late.len(), "every writer commit ran");
+    for b in &ids {
+        assert!(
+            parts.live().contains(b),
+            "the committed snapshots do not name {b:?}, so this test proves nothing"
+        );
+        assert!(
+            parts.store.get(*b).is_ok(),
+            "a block a committing writer deduplicated onto during the sweep is gone: {b:?}"
+        );
+    }
     for b in parts.live() {
         assert!(parts.store.get(b).is_ok(), "a live block lost: {b:?}");
     }
@@ -718,4 +740,273 @@ fn has(hay: &[u8], needle: &[u8; 32]) -> bool {
 /// The bytes of the collector's persisted mark set, which is a root list then a block list.
 fn mark_bytes(f: &Fixture) -> Vec<u8> {
     std::fs::read(f.gc_dir().join("mark.bin")).unwrap_or_default()
+}
+
+/// F1: a snapshot committed while the copies run must keep its blocks.
+///
+/// The commit is placed on the collector's own thread from the progress callback, so the ordering
+/// is forced rather than raced for. Before the fix the step-5 pass was handed the root list from
+/// the freeze with every root already walked, so it returned nothing and the pack was unlinked:
+///
+/// ```text
+/// DATA LOSS: a durable snapshot references BlockId(e5eea69c..10fbef1), the collector freed it,
+/// and the cycle reported 5 packs unlinked and no error. freed_bytes=159132 errors=[]
+/// ```
+#[test]
+fn a_snapshot_committed_during_the_copy_keeps_its_blocks() {
+    let f = Fixture::eager(32 << 10);
+    let parts = f.parts();
+    let base = f.meta.new_snapshot("base").expect("snapshot");
+    parts.write(&base, b"keep", &body(60_000, 1));
+
+    let victim = body(4000, 7);
+    let vid = parts.store.put(&victim).expect("put");
+    for i in 0..40u32 {
+        parts.store.put(&body(4000, i)).expect("put");
+    }
+    parts.store.sync().unwrap();
+    parts.meta.sync().unwrap();
+    assert!(
+        parts.store.get(vid).is_ok(),
+        "the block is there before the cycle"
+    );
+
+    let roots = Roots::new();
+    let committed = Arc::new(AtomicUsize::new(0));
+    let meta_h = Arc::clone(&parts.meta);
+    let store_h = Arc::clone(&parts.store);
+    {
+        let committed = Arc::clone(&committed);
+        let victim = victim.clone();
+        let roots = roots.clone();
+        f.gc.set_progress(move |p| {
+            // Fires once per pack copied, inside the copy phase, which runs with no barrier. A
+            // commit now lands before every unlink.
+            if p.sweeping && committed.load(Relaxed) == 0 {
+                roots.write(|| {
+                    let snap = meta_h.new_snapshot("late").expect("snapshot");
+                    let chunks = store_h.ingest_bytes(&victim).expect("ingest");
+                    assert_eq!(chunks[0].id, vid, "the commit deduplicated onto the victim");
+                    let ino = snap
+                        .batch(|tx| tx.create(cowfs_meta::ROOT_INO, b"late", 0o644))
+                        .expect("create")
+                        .ino;
+                    snap.batch(|tx| tx.set_content(ino, &chunks, victim.len() as u64))
+                        .expect("set content");
+                    meta_h.sync().expect("sync");
+                    committed.fetch_add(1, Relaxed);
+                });
+            }
+        });
+    }
+
+    let r = f.gc.collect(Some(&*roots)).expect("collect");
+    assert!(r.errors.is_empty(), "the cycle reported no error: {r:?}");
+    assert_eq!(
+        committed.load(Relaxed),
+        1,
+        "the commit ran inside the copy phase"
+    );
+    assert!(r.packs_unlinked > 0, "the cycle unlinked packs: {r:?}");
+
+    assert!(
+        parts.live().contains(&vid),
+        "the snapshot committed mid-cycle is not in the durable live set, so this test proves \
+         nothing: {r:?}"
+    );
+    let got = parts.store.get(vid);
+    assert!(
+        got.is_ok(),
+        "DATA LOSS: a durable snapshot references {vid:?}, the collector freed it, and the cycle \
+         reported {} packs unlinked and no error. freed_bytes={} errors={:?}",
+        r.packs_unlinked,
+        r.freed_bytes,
+        r.errors
+    );
+    assert_eq!(
+        got.unwrap(),
+        victim,
+        "and the bytes are right when they survive"
+    );
+}
+
+/// F1: the same commit, but after the last copy and before the unlinks, on another thread, which
+/// is what a real writer does. Several rounds, because this one is a race.
+#[test]
+fn a_snapshot_committed_while_the_cycle_runs_keeps_its_blocks() {
+    for round in 0..3u32 {
+        let f = Fixture::eager(32 << 10);
+        let parts = f.parts();
+        let base = f.meta.new_snapshot("base").expect("snapshot");
+        parts.write(&base, b"keep", &body(60_000, 900 + round));
+        let victim = body(4000, 500 + round);
+        let vid = parts.store.put(&victim).expect("put");
+        for i in 0..60u32 {
+            parts.store.put(&body(4000, round * 100 + i)).expect("put");
+        }
+        parts.store.sync().unwrap();
+        parts.meta.sync().unwrap();
+
+        let roots = Roots::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let committed = Arc::new(AtomicUsize::new(0));
+        let roots_w = roots.clone();
+        let stop_w = Arc::clone(&stop);
+        let committed_w = Arc::clone(&committed);
+        let victim_w = victim.clone();
+
+        std::thread::scope(|sc| {
+            let parts = &parts;
+            sc.spawn(move || {
+                let mut i = 0u32;
+                while !stop_w.load(Relaxed) && i < 80 {
+                    let name = format!("late{i}");
+                    let victim = &victim_w;
+                    roots_w.write(|| {
+                        let snap = parts.meta.new_snapshot(&name).expect("snapshot");
+                        let chunks = parts.store.ingest_bytes(victim).expect("ingest");
+                        let ino = snap
+                            .batch(|tx| tx.create(cowfs_meta::ROOT_INO, name.as_bytes(), 0o644))
+                            .expect("create")
+                            .ino;
+                        snap.batch(|tx| tx.set_content(ino, &chunks, victim.len() as u64))
+                            .expect("set content");
+                        parts.meta.sync().expect("sync");
+                        committed_w.fetch_add(1, Relaxed);
+                    });
+                    i += 1;
+                }
+                stop_w.store(true, Relaxed);
+            });
+            let r = f.gc.collect(Some(&*roots)).expect("collect");
+            stop.store(true, Relaxed);
+            assert!(r.errors.is_empty(), "round {round}: {r:?}");
+        });
+
+        assert!(
+            committed.load(Relaxed) > 0,
+            "round {round}: the writer committed"
+        );
+        assert!(
+            parts.live().contains(&vid),
+            "round {round}: the committed snapshots do not name the victim, so this test proves \
+             nothing"
+        );
+        assert!(
+            parts.store.get(vid).is_ok(),
+            "round {round}: DATA LOSS, a durable snapshot references {vid:?} and the store cannot \
+             produce it"
+        );
+    }
+}
+
+/// F2: the barrier guard must be alive from the last root read through the discard it gates.
+///
+/// It used to be bound inside the `if let` that acquired it, so it dropped before both. Measured
+/// then: `barrier taken: 1, polls with a guard alive: 0, polls with NO guard alive: 8, packs
+/// unlinked: 5`.
+#[test]
+fn the_barrier_is_held_across_every_discard_it_gates() {
+    let f = Fixture::eager(32 << 10);
+    let parts = f.parts();
+    let base = f.meta.new_snapshot("base").expect("snapshot");
+    parts.write(&base, b"keep", &body(60_000, 1));
+    for i in 0..40u32 {
+        parts.store.put(&body(4000, i)).expect("put");
+    }
+    parts.store.sync().unwrap();
+    parts.meta.sync().unwrap();
+
+    let roots = Roots::new();
+    let live_at_discard = Arc::new(AtomicUsize::new(0));
+    let unheld_at_discard = Arc::new(AtomicUsize::new(0));
+    {
+        let live_at_discard = Arc::clone(&live_at_discard);
+        let unheld_at_discard = Arc::clone(&unheld_at_discard);
+        let r = roots.clone();
+        // Fired once per pack unlinked. A guard has to be alive here, or the became-live check
+        // that ran just before was not gated by anything.
+        f.gc.set_progress(move |p| {
+            if p.freed_bytes > 0 {
+                if r.barrier_live() {
+                    live_at_discard.fetch_add(1, Relaxed);
+                } else {
+                    unheld_at_discard.fetch_add(1, Relaxed);
+                }
+            }
+        });
+        let report = f.gc.collect(Some(&*roots)).expect("collect");
+        assert!(
+            report.packs_unlinked > 0,
+            "the cycle unlinked packs: {report:?}"
+        );
+    }
+    assert_eq!(
+        unheld_at_discard.load(Relaxed),
+        0,
+        "a discard ran with no barrier alive"
+    );
+    assert!(
+        live_at_discard.load(Relaxed) > 0,
+        "no discard ran, so this test proves nothing"
+    );
+}
+
+/// F1, second shape: a snapshot forked during the cycle from one that was walked before it. The
+/// fork shares most of its tree with a walked root, so only the changed path is re-walked.
+#[test]
+fn a_snapshot_forked_during_the_cycle_keeps_its_blocks() {
+    let f = Fixture::eager(32 << 10);
+    let parts = f.parts();
+    let base = f.meta.new_snapshot("base").expect("snapshot");
+    parts.write(&base, b"keep", &body(60_000, 1));
+    let victim = body(4000, 31);
+    parts.store.put(&victim).expect("put");
+    for i in 0..40u32 {
+        parts.store.put(&body(4000, i)).expect("put");
+    }
+    parts.store.sync().unwrap();
+    parts.meta.sync().unwrap();
+
+    let roots = Roots::new();
+    let forked = Arc::new(AtomicBool::new(false));
+    let meta_h = Arc::clone(&parts.meta);
+    let store_h = Arc::clone(&parts.store);
+    let base_snap = parts.meta.snapshot("base").expect("base");
+    {
+        let forked = Arc::clone(&forked);
+        let roots = roots.clone();
+        let victim = victim.clone();
+        let base_snap = base_snap.clone();
+        f.gc.set_progress(move |p| {
+            if p.sweeping && !forked.swap(true, Relaxed) {
+                roots.write(|| {
+                    // A fork of the root the collector already walked: most of its tree is
+                    // unchanged, so only the new path is re-walked.
+                    let fork = base_snap.fork("fork").expect("fork");
+                    let chunks = store_h.ingest_bytes(&victim).expect("ingest");
+                    let ino = fork
+                        .batch(|tx| tx.create(cowfs_meta::ROOT_INO, b"fork", 0o644))
+                        .expect("create")
+                        .ino;
+                    fork.batch(|tx| tx.set_content(ino, &chunks, victim.len() as u64))
+                        .expect("set content");
+                    meta_h.sync().expect("sync");
+                });
+            }
+        });
+    }
+    let r = f.gc.collect(Some(&*roots)).expect("collect");
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(forked.load(Relaxed), "the fork ran inside the copy phase");
+    assert!(
+        parts.store.fsck().expect("fsck").is_clean(),
+        "fsck is clean: {r:?}"
+    );
+    for b in parts.live() {
+        assert!(
+            parts.store.get(b).is_ok(),
+            "a block a snapshot forked during the cycle references was freed: {b:?}"
+        );
+    }
 }

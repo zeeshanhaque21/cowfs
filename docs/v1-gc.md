@@ -175,18 +175,28 @@ A cycle is these steps.
    The new pack is fsynced, then the index entries of the copied ids are repointed at it, then
    `index.cix` is rewritten.
    The old pack stays on disk.
-5. **`W` Verify and unlink.** `Barrier::take` the barrier. A `None` here means the reference side
-   would not hold still after all, so every candidate is skipped as `RootsUnavailable` and nothing
-   is freed.
-   Re-read the roots and `pinned_blocks`, re-walk only the roots that the `Marker` has not already
-   seen, and union them into the live set.
-   Then, for every candidate:
-   - if every condemned id is still absent from the live set, unlink the old pack, fsync
-     `packs/`, drop the index entries of the condemned ids, and lower the watermark `base` to the
-     lowest pack that still exists;
-   - if any condemned id is now live, leave the old pack alone and report the pack as skipped.
-   Its records are still indexed, so every live block stays readable.
-   Release the barrier.
+5. **`W` Verify and unlink, one candidate at a time, each under its own barrier.**
+   For each candidate, in turn:
+   - `Barrier::take` the barrier. A `None` means the reference side would not hold still after all,
+     so this pack is skipped as `RootsUnavailable` and the rest are too.
+     The guard has to be alive from here through this pack's unlink: bound inside the block that
+     acquired it, it dies before either, and the check below then races the discard it exists to
+     gate.
+   - `Meta::sync`, then re-read `durable_snapshots`. **Not** the list from step 1: a snapshot
+     committed while the copies ran is in no list the earlier passes consult again, so its blocks
+     would look dead and be unlinked. This re-read is the load-bearing one.
+   - Re-walk every root not already in `walked`, sharing the one `Marker`, so only the paths that
+     changed during the copy are descended. Union into the live set, and union `pinned_blocks`
+     again.
+   - If any condemned id is in the live set, leave the old pack alone and report it as skipped.
+     Its records are still indexed, so every live block stays readable.
+   - Otherwise unlink the old pack, fsync `packs/`, drop the index entries of the condemned ids,
+     and lower the watermark `base` to the lowest pack that still exists.
+   - Drop the barrier.
+
+   One barrier per pack, not one per sweep. Measured, the barrier is taken exactly once per
+   discarded pack: 63 takes for 63 candidates at 64 packs, 252 for 252 at 253. That is the bound on
+   what a writer waits for.
 
 The epoch rule from the task is a second, independent guard: a record at or above the epoch
 watermark was written after the cycle's freeze, so it is never condemned.
@@ -210,6 +220,8 @@ So the copies need no barrier and the barrier is held only for step 5.
 This is not a free choice: holding it across the whole cycle was measured at 94 of 94 progress
 callbacks with the barrier live and 47 packs rewritten under it, which is a full-store write stall
 for the length of a sweep.
+It is not free in the other direction either: one guard for the whole sweep, moved to step 5 alone,
+cost a 684 ms worst single write at 253 packs, because the window scaled with the sweep.
 `the_barrier_is_not_held_while_packs_are_copied` in `tests/regressions.rs` holds that line, and
 `a_writer_that_dedups_onto_a_rewritten_pack_keeps_the_block` holds the correctness that depends on
 it, which a writer blocked for the whole cycle would have hidden.
@@ -235,8 +247,13 @@ Two gaps in `cowfs-core`, both of which the collector's tests are written agains
 
 `Core` exposes `store(&self) -> &Store` and `meta(&self) -> &Meta`, not the `Arc`s, and
 `Gc::open` needs `Arc<Store>`. Opening the store a second time is `Locked`, by design.
-So `Gc::open` cannot be handed core's store today, which is why the end-to-end collect over core is
-not in this change: it needs one accessor on `cowfs-core`, and this branch does not own that crate.
+So `Gc::open` cannot be handed core's store today.
+
+The fix is one accessor on `cowfs-core`: `pub fn store_arc(&self) -> Arc<Store>`, handing out the
+`Arc` `Inner` already holds. The better shape is the daemon owning the `Arc<Store>` and passing it
+to both core and the collector. **This branch does not own `cowfs-core`**, so the accessor is not
+added here and the end-to-end collect over core is still not in this change. That is the one thing
+standing between this crate and a real reference side.
 
 ## Access-time hints
 
@@ -368,6 +385,28 @@ They are added in `crates/cowfs-store/src/compact.rs`, with one `pub(crate) fn g
    pack, is the fix. Both are localised and neither touches the durability ordering.
    **All measurements in this document were taken at load 1 on a machine with 32 to 60 cores
    available.** Nothing here is claimed at load above 30.
+
+### The step-5 write stall, measured
+
+`examples/writer_stall.rs` runs a writer that ingests, commits and syncs a snapshot while a collect
+runs, and reports its worst single write. Release build, 64 KiB packs, garbage interleaved with
+live data so every pack is a candidate, load 0.00:
+
+| packs | candidates | barrier takes | cycle ms | per pack us | writer worst us |
+|---|---|---|---|---|---|
+| 32 | 31 | 31 | 3637 | 117322 | 79886 |
+| 64 | 63 | 63 | 7842 | 124476 | 105999 |
+| 127 | 126 | 126 | 21102 | 167476 | 371799 |
+| 253 | 252 | 252 | 33480 | 132857 | 2962616 |
+
+Per-pack cost is flat from 32 to 253 packs and the barrier takes equal the candidate count exactly,
+so the window is one pack's check and discard.
+
+**The 253-pack figure is not a window measurement.** In the same run, rounds with zero candidates
+and therefore zero barrier takes still cost the writer 66 ms to 193 ms per write, because the
+writer does a full `Meta::sync` per write and that dominates. One 253-pack sweep reported 2.96 s
+against a 66 to 193 ms no-barrier baseline in the same run: scheduling noise on a worst-of-run
+sample. Re-measure with core's real barrier before quoting a number.
 7. One cycle runs at a time per collector: a second `collect` waits.
    Two overlapping cycles each hold their own picture of what is live, and the second to unlink a
    pack can free a block the first has just decided to keep.

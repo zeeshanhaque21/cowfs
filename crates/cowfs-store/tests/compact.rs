@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use cowfs_store::{BlockId, LogOp, Options, Store};
 
@@ -884,4 +885,101 @@ fn window(ops: &[LogOp], lo: u64, hi: u64) -> (usize, usize) {
     let (a, b) = (at(lo), at(hi));
     assert!(a < b, "marker {hi} came before marker {lo}: {ops:?}");
     (a, b)
+}
+
+/// F4: a pack that is named in the writer's map but gone from disk must leave `fsck` usable.
+///
+/// Round 2 measured this as `fsck unusable after a lost race: Corrupt { pack: 11, reason: "pack
+/// file missing" }`, permanently, because `discard_pack`'s early return happened before
+/// `forget_pack`. The fix moved `forget_pack` into that arm; this is the regression test for it.
+#[test]
+fn fsck_recovers_when_a_pack_named_in_the_writer_map_is_gone() {
+    let d = tempfile::tempdir().unwrap();
+    let s = small_store(d.path());
+    let live: Vec<BlockId> = (0..3u32).map(|i| s.put(&noisy(4096, i)).unwrap()).collect();
+    for i in 20..80u32 {
+        s.put(&noisy(4096, i)).unwrap();
+    }
+    s.sync().unwrap();
+
+    // A sealed pack that holds no live block, so deleting it is exactly what a discard does.
+    let mut victim = None;
+    for p in s.packs().unwrap() {
+        if p.active {
+            continue;
+        }
+        let plan = s
+            .plan_pack(p.id, &|b| live.contains(&b), &mut Vec::new())
+            .unwrap();
+        if plan.live_bytes == 0 {
+            victim = Some(p.id);
+            break;
+        }
+    }
+    let victim = victim.expect("a sealed pack with nothing live in it");
+
+    // A crash between the unlink and `forget_pack` leaves exactly this state.
+    let path = d.path().join("packs").join(format!("pack-{victim:08}.cpk"));
+    fs::remove_file(&path).expect("simulate the crash window");
+    assert!(!path.exists(), "the file really is gone");
+
+    let freed = s.discard_pack(victim, &[]).expect("discard must not error");
+    assert_eq!(freed, 0, "nothing was freed, the file was already gone");
+
+    let f = s
+        .fsck()
+        .unwrap_or_else(|e| panic!("fsck unusable after a lost race: {e:?}"));
+    assert!(f.is_clean(), "fsck dirty: {f:?}");
+    assert!(!s.recovery().has_corruption());
+    for b in &live {
+        assert!(s.get(*b).is_ok(), "a live block lost");
+    }
+}
+
+/// F4: the same property when two callers race for one pack, which is how the file gets deleted
+/// under a caller that has not looked yet.
+#[test]
+fn two_discards_of_one_pack_keep_fsck_usable() {
+    for round in 0..24u32 {
+        let d = tempfile::tempdir().unwrap();
+        let s = Arc::new(small_store(d.path()));
+        let live: Vec<BlockId> = (0..3u32).map(|i| s.put(&noisy(4096, i)).unwrap()).collect();
+        for i in 20..60u32 {
+            s.put(&noisy(4096, i)).unwrap();
+        }
+        s.sync().unwrap();
+        // A sealed pack that holds nothing live, so discarding it is not the test's own bug.
+        let keep: std::collections::HashSet<BlockId> = live.iter().copied().collect();
+        let mut victim = None;
+        for p in s.packs().unwrap() {
+            if p.active {
+                continue;
+            }
+            let plan = s
+                .plan_pack(p.id, &|b| keep.contains(&b), &mut Vec::new())
+                .unwrap();
+            if plan.live_bytes == 0 {
+                victim = Some(p.id);
+                break;
+            }
+        }
+        let victim = victim.expect("a sealed pack holding nothing live");
+
+        std::thread::scope(|sc| {
+            for _ in 0..2 {
+                let s = Arc::clone(&s);
+                sc.spawn(move || {
+                    let _ = s.discard_pack(victim, &[]);
+                });
+            }
+        });
+
+        let f = s
+            .fsck()
+            .unwrap_or_else(|e| panic!("round {round}: fsck unusable: {e:?}"));
+        assert!(f.is_clean(), "round {round}: fsck dirty: {f:?}");
+        for b in &live {
+            assert!(s.get(*b).is_ok(), "round {round}: a live block lost");
+        }
+    }
 }

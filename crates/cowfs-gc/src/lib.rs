@@ -468,44 +468,45 @@ impl Gc {
             self.emit(&progress);
         }
 
-        // 5. Verify and unlink with the reference side held still. This is the only place a writer
-        // ever waits: the mark and every copied byte ran with the reference side free, which is
-        // what makes a cycle cheap for a live store. Acquiring here is late enough that the re-walk
-        // and every unlink are covered and early enough that nothing has been freed yet.
+        // 5. Verify and unlink, one pack at a time, each under its own barrier.
+        //
+        // The roots are re-read here, not taken from the freeze. A snapshot committed while the
+        // copies ran is in no list the earlier passes consult again, so its blocks would look dead
+        // and be unlinked. Re-reading costs a walk of the roots that are new since the freeze,
+        // which is the only work the barrier has to cover.
+        //
+        // The barrier is taken and dropped per pack, so a writer waits for one pack's check and
+        // unlink rather than for the whole sweep. Holding one guard to the end is not merely
+        // slower: it also widens nothing that the per-pack check does not already cover.
         //
         // A cancel does not stop this step. Every pack here has already been copied and indexed, so
         // refusing to unlink it would leave its source and its copy both on disk for a cycle that
         // has already stopped, and the next cycle redoes the copy. A cancel bounds how much work a
         // cycle starts, not what it finishes.
         let mut barrier = barrier;
-        if let Some(factory) = barrier.as_mut() {
-            let Some(_held) = factory.take() else {
-                // The reference side would not hold still after all, so nothing is freed.
-                for rw in &copied {
-                    r.skip(rw.from, SkipReason::RootsUnavailable);
-                }
-                r.barrier = false;
-                r.roots_error.get_or_insert(RootsError::Unavailable);
-                live.extend(pinned.iter().copied());
-                self.finish(&mut r, &live, &pinned);
-                return Ok(r);
-            };
-        }
         if barrier.is_some() {
-            match self.marked(
-                &mut marker,
-                &mut r,
-                false,
-                &mut walked_roots,
-                &durable,
-                &persisted,
-            ) {
-                Ok(new) => live.extend(new),
-                Err(e) => r.error(e),
-            }
-            // The poll just before each unlink, so a reference side that fails late still stops the
-            // unlinks and a block that only now reports itself pinned is unioned in and survives.
             for rw in &copied {
+                // Alive from here through this pack's unlink: the guard has to cover both, or the
+                // check below races the discard it exists to gate.
+                let Some(_held) = barrier.as_mut().and_then(|b| b.take()) else {
+                    r.skip(rw.from, SkipReason::RootsUnavailable);
+                    r.error(Error::RootsUnavailable(RootsError::Unavailable));
+                    r.roots_error.get_or_insert(RootsError::Unavailable);
+                    r.barrier = false;
+                    continue;
+                };
+                let fresh = self.fresh_roots()?;
+                match self.marked(
+                    &mut marker,
+                    &mut r,
+                    false,
+                    &mut walked_roots,
+                    &fresh,
+                    &persisted,
+                ) {
+                    Ok(new) => live.extend(new),
+                    Err(e) => r.error(e),
+                }
                 self.repin(roots, &mut pinned, &mut r);
                 live.extend(pinned.iter().copied());
                 if let Some(e) = r.roots_error {
@@ -536,6 +537,18 @@ impl Gc {
         }
         self.finish(&mut r, &live, &pinned);
         Ok(r)
+    }
+
+    /// Every durable root right now, read after a sync so a snapshot this cycle made durable is
+    /// in the list.
+    fn fresh_roots(&self) -> Result<Vec<([u8; 32], cowfs_meta::SnapshotId)>> {
+        self.meta.sync()?;
+        Ok(self
+            .meta
+            .durable_snapshots()?
+            .iter()
+            .map(|i| (*i.root.as_bytes(), i.id))
+            .collect())
     }
 
     /// Walk every durable snapshot root, sharing one marker, and union what they reference.
