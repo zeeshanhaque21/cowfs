@@ -384,27 +384,6 @@ impl Inner {
         Err(Error::Stale)
     }
 
-    /// True for a virtual number whose file is committed to meta but whose alias is gone, so the
-    /// number itself is no longer known. A create that is still queued has no alias yet and is
-    /// perfectly good.
-    fn virt_committed_without_alias(&self, ino: Ino) -> bool {
-        if !matches!(classify(ino), Id::Virt { .. }) || self.aliases.rd().meta_of(ino).is_some() {
-            return false;
-        }
-        let Ok(sc) = self.snapctx(ino) else {
-            return true;
-        };
-        let fl = sc.flushed();
-        self.nodes.get(&ino).is_none_or(|n| {
-            n.seq.load(Ordering::Acquire) <= fl && n.ns_seq.load(Ordering::Acquire) <= fl
-        })
-    }
-
-    /// True for a virtual inode number that is committed but whose alias was released.
-    fn is_released_virt(&self, ino: Ino) -> bool {
-        self.virt_committed_without_alias(ino)
-    }
-
     /// The node for `ino`, unless it is an unlinked file nobody holds any more.
     pub(crate) fn live(&self, ino: Ino) -> Result<Arc<Node>> {
         let n = self.node(ino)?;
@@ -416,12 +395,8 @@ impl Inner {
 
     /// A live directory node together with its snapshot.
     ///
-    /// A virtual number whose alias was released (nothing held it, so its number was free to
-    /// change) is `Stale`, not a silent "no such name".
+    /// An unlinked directory nobody holds is `Stale`, not a silent "no such name".
     pub(crate) fn dir(&self, ino: Ino) -> Result<(Arc<SnapCtx>, Arc<Node>)> {
-        if self.is_released_virt(ino) {
-            return Err(Error::Stale);
-        }
         let sc = self.snapctx(ino)?;
         let n = self.live(ino)?;
         if n.st.rd().attr.kind != FileKind::Directory {
@@ -500,16 +475,8 @@ impl Inner {
             .transpose()
         };
         if let Some(d) = self.dents.get(parent.ino, name) {
-            // A cached pending create whose alias was released (a rename before the batch
-            // committed leaves the entry naming the old name's number) must not be believed:
-            // fall through to meta, which has the committed number.
-            let stale_virt = d
-                .target
-                .is_some_and(|(i, _)| self.virt_committed_without_alias(i));
-            if !stale_virt {
-                self.ctr.dhit.fetch_add(1, Ordering::Relaxed);
-                return canon(d.target);
-            }
+            self.ctr.dhit.fetch_add(1, Ordering::Relaxed);
+            return canon(d.target);
         }
         self.ctr.dmiss.fetch_add(1, Ordering::Relaxed);
         let Some(pm) = self.meta_of(parent.ino) else {

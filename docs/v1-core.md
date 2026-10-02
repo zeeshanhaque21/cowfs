@@ -56,11 +56,16 @@ The reproducer needs no adapter: `crates/cowfs-core/tests/alias_session.rs`.
 
 The release point is `Inner::try_reclaim`: an alias goes when its inode is unlinked, its removal is committed, and no handle is open. An NFS client holding a handle to an unlinked file still gets `ESTALE`, which is correct and is what POSIX allows.
 `Inner::maybe_evict_node` still drops the *node* of a committed, clean, unreferenced file, so the node table stays bounded; the alias is what survives.
-A released number used again as a directory gives `Stale`, not a silent `NotFound` (`Inner::is_released_virt`).
+An unlinked inode nobody holds is `Stale`, not a silent `NotFound`.
 
 Hardlinks and renames keep one number because the alias is keyed by the meta inode, and `canon` is applied on every `lookup`, `readdir` and dentry hit.
 A client never sees two numbers for one inode in a session.
+The `is_released_virt` check is gone with the rule it existed for: a released alias now means an unlinked inode, which `Inner::live` already answers `Stale`, so the second spelling was dead.
 Tests: `a_forgotten_directory_keeps_its_number_after_the_commit`, `a_directory_created_through_the_session_still_takes_children_after_the_commit`, `a_rename_keeps_one_number`, `a_hardlink_keeps_one_number`, `an_unlinked_inode_goes_stale`, `a_number_never_changes_while_its_inode_has_a_name`, `live_blocks_filters_holes_and_yields_only_stored_blocks`.
+
+Mutants for the rule: `a01_alias_released_on_commit` (release the alias on every reclaim), `a02_reclaim_keeps_nlink_zero` (reclaim a named inode), `a03_no_alias_ceiling` (never refuse a create past the ceiling), `a04_canon_returns_meta_number` (`canon` answers nothing, so a lookup names the file by its meta number), `a05_pinned_unlinked_is_stale` (the mirror: an unlinked file a handle is open on goes `Stale`).
+All five are killed by assertion.
+The whole sweep is 34 mutants, all killed; the `n12_released_virt_ok` entry went with the function it patched.
 
 ### What a session alias costs, and the ceiling
 
@@ -389,7 +394,6 @@ that takes a lock is not listed here.
 | `inner::canon` | aliases | leaf |
 | `inner::flushed_of` | leaf | 1 |
 | `inner::load_node` | nodes, aliases, snap. | 2 then 3 then leaf |
-| `inner::virt_committed_without_alias` | nodes, aliases | 2 then leaf |
 | `inner::live` | st.rd | 2 |
 | `inner::dir` | st.rd | 2 |
 | `inner::shrink_nodes` | st.try_read, nodes | 2 |
