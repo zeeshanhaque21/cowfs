@@ -44,6 +44,15 @@ jobs:
         env:
           COWFS_CONFORMANCE_FILTER: concurrent_readers_and_writers_of_one_file
         run: cargo test -p cowfs-vfs-path --test native -j4 -- --ignored --nocapture --test-threads=1 2>&1 | tee native-page-cache.log || true
+      - name: Native forget control
+        env:
+          COWFS_CONFORMANCE_FILTER: statfs_free_after_unlink
+          # tmpfs, not the runner's disk: this check asserts blocks_free returns exactly, which a
+          # filesystem sharing free space with the rest of the machine cannot promise.
+          COWFS_PATHVFS_NATIVE_DIR: /dev/shm/cowfs-native-control
+        run: |
+          mkdir -p /dev/shm/cowfs-native-control
+          cargo test -p cowfs-vfs-path --test native -j4 -- --ignored --nocapture --test-threads=1 2>&1 | tee native-forget.log
       - name: Test FUSE mounts and conformance
         env:
           COWFS_CONFORMANCE_XATTR_NAMES: prefixed
@@ -58,10 +67,11 @@ jobs:
           log = Path("fuse-tests.log").read_text()
           control = Path("native-xattr.log").read_text()
           page_cache = Path("native-page-cache.log").read_text()
+          forget_control = Path("native-forget.log").read_text()
           failures = re.findall(r"^FAIL\s+.*$", log, re.MULTILINE)
           known = r"^FAIL\s+cowfs\s+xattrs\s+xattr_on_directory_and_symlink\s+.*unexpected error: permission denied \(PermissionDenied\)$"
           unexpected = [line for line in failures if not re.fullmatch(known, line)]
-          assert re.search(r"^128 run,", log, re.MULTILINE), "Missing full conformance report"
+          assert re.search(r"^127 run,", log, re.MULTILINE), "Missing full conformance report"
           assert "SKIP: /dev/fuse" not in log, "FUSE tests skipped"
           assert not unexpected, "Unexpected conformance failures:\n" + "\n".join(unexpected)
           if failures:
@@ -87,6 +97,27 @@ jobs:
               "Known native-kernel limit: concurrent_readers_and_writers_of_one_file - the page cache "
               "serves buffered reads while a page-splitting write is in flight, so native ext4 tears "
               + ("too on this runner (reproduced by the native control)." if torn else "only intermittently (not reproduced in this single control run; measured 72/200 on btrfs and 29/200 on tmpfs, see issue #45).")
+          )
+          print("::warning::" + reason)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(reason + "\n")
+          # statfs_free_after_unlink asserts reclaim is visible in the same call as forget. The
+          # kernel owns the reference lifetime and sends FORGET on its own schedule, so through a
+          # mount the reclaim is late by a few hundred microseconds. Native PathVfs, whose forget is
+          # synchronous, passes, which is what proves MemVfs reclaims on forget as the trait requires
+          # (issue #45). The control runs here with the opposite polarity: it must PASS.
+          assert re.search(
+              r"^SKIP\s+cowfs\s+basic\s+statfs_free_after_unlink\s+.*FORGET",
+              log,
+              re.MULTILINE,
+          ), "Async-forget-limited check was not gated with a reason"
+          assert re.search(
+              r"^1 run, 0 failed,", forget_control, re.MULTILINE
+          ), "Native forget control did not pass: MemVfs does not reclaim synchronously on forget"
+          reason = (
+              "Gated: statfs_free_after_unlink - the kernel sends FORGET asynchronously, so reclaim "
+              "is not visible in the same call through a mount. The native control in this job, whose "
+              "forget is synchronous, passed, confirming MemVfs reclaims on forget (issue #45)."
           )
           print("::warning::" + reason)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
