@@ -1,0 +1,15 @@
+[package]
+name = "mount-nfs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "mount-nfs"
+path = "src/main.rs"
+
+[dependencies]
+cowfs-nfs = { path = "../../crates/cowfs-nfs" }
+cowfs-vfs-path = { path = "../../crates/cowfs-vfs-path" }
