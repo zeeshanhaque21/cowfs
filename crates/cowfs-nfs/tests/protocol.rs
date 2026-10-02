@@ -4,7 +4,7 @@ mod common;
 use std::collections::HashSet;
 
 use common::*;
-use cowfs_nfs::{AdapterOptions, AppleDoubleMode, CowNfs, MountOptions};
+use cowfs_nfs::{AdapterOptions, AppleDoubleMode, CowNfs, MountOptions, HANDLE_LEN};
 use nfsserve::nfs::{ftype3, nfs_fh3, nfsstat3};
 use nfsserve::vfs::NFSFileSystem;
 
@@ -324,7 +324,14 @@ fn readdir_pages_are_complete_and_unique() {
     assert_eq!((st, page.len(), eof), (OK, 300, true));
     let (st, page, eof) = c.readdir_page(&d, page[299].cookie, true, 100_000);
     assert_eq!((st, page.len(), eof), (OK, 0, true));
-    let (st, ..) = c.readdir_page(&nfs_fh3 { data: vec![0; 40] }, 0, false, 4096);
+    let (st, ..) = c.readdir_page(
+        &nfs_fh3 {
+            data: vec![0; HANDLE_LEN],
+        },
+        0,
+        false,
+        4096,
+    );
     assert_eq!(st, STALE, "generation 0 predates this server");
 }
 

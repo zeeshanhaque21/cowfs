@@ -1,11 +1,15 @@
 //! A `Vfs` that hands out inode numbers the way a careless backend might: the number of a
 //! reclaimed inode goes to the next file created. The adapter must still never serve one file's
-//! bytes through another file's old handle.
+//! bytes through another file's old handle. `virtuals` adds an offset, so every number it reports
+//! has the top bit set, the way `cowfs-core` numbers a virtual inode (issue #60).
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use cowfs_vfs::*;
 use cowfs_vfs_test::MemVfs;
+
+/// What `cowfs-core` puts on the top bit of a virtual inode number.
+pub const VIRT: Ino = 1 << 63;
 
 #[derive(Debug, Default)]
 struct Ids {
@@ -19,12 +23,38 @@ struct Ids {
 pub struct ReusingVfs {
     inner: Arc<MemVfs>,
     ids: Mutex<Ids>,
+    /// Added to every number the inner file system reports.
+    offset: Ino,
+    /// Whether the numbers are handed out from the top of the `u64` space downwards, which is
+    /// where the adapter takes the file ids of sidecars that are not inodes (issue #60).
+    descending: bool,
 }
 
 impl ReusingVfs {
     pub fn new() -> Arc<ReusingVfs> {
+        Self::at(0)
+    }
+
+    /// The same file system with every inode number but the root's shifted by `offset`.
+    pub fn at(offset: Ino) -> Arc<ReusingVfs> {
+        Self::shape(offset, false)
+    }
+
+    /// Every inode number but the root's has its top bit set, the way `cowfs-core` numbers a
+    /// virtual inode (issue #60). The root of a mount is always `ROOT_INO`.
+    pub fn virtuals() -> Arc<ReusingVfs> {
+        Self::at(VIRT)
+    }
+
+    /// Inode numbers from `u64::MAX` downwards, so the file ids an adapter gives to sidecars that
+    /// are not inodes collide with a real inode.
+    pub fn from_the_top() -> Arc<ReusingVfs> {
+        Self::shape(0, true)
+    }
+
+    fn shape(offset: Ino, descending: bool) -> Arc<ReusingVfs> {
         let mut ids = Ids {
-            next: ROOT_INO + 1,
+            next: if descending { 0 } else { ROOT_INO + 1 },
             ..Ids::default()
         };
         ids.to_ext.insert(ROOT_INO, ROOT_INO);
@@ -32,7 +62,13 @@ impl ReusingVfs {
         Arc::new(ReusingVfs {
             inner: Arc::new(MemVfs::new()),
             ids: Mutex::new(ids),
+            offset,
+            descending,
         })
+    }
+
+    pub fn offset(&self) -> Ino {
+        self.offset
     }
 
     fn ids(&self) -> std::sync::MutexGuard<'_, Ids> {
@@ -44,13 +80,21 @@ impl ReusingVfs {
     }
 
     fn ext_of(&self, int: Ino) -> Ino {
+        if int == ROOT_INO {
+            return ROOT_INO;
+        }
         let mut g = self.ids();
         if let Some(e) = g.to_ext.get(&int) {
             return *e;
         }
         let e = g.free.pop().unwrap_or_else(|| {
-            g.next += 1;
-            g.next - 1
+            if self.descending {
+                g.next = g.next.checked_sub(1).unwrap_or(Ino::MAX);
+                g.next
+            } else {
+                g.next += 1;
+                g.next - 1 + self.offset
+            }
         });
         g.to_ext.insert(int, e);
         g.to_int.insert(e, int);

@@ -1,4 +1,4 @@
-//! File handles: `server generation || ino || inode generation || MAC`, 40 bytes.
+//! File handles: `server generation || ino || inode generation || kind || MAC`, 41 bytes.
 //!
 //! - The generation (start time of the server) makes a restarted server refuse old handles.
 //! - The MAC is a keyed BLAKE3 hash with a random per-server key, so a process that never
@@ -6,8 +6,12 @@
 //! - The inode generation detects inode reuse: the adapter counts the removals of each inode,
 //!   the count is in the handle, and a handle minted before the last removal of its inode is
 //!   stale even if the `Vfs` reuses the number. The handle of a live inode never changes.
-//! - A file and its AppleDouble sidecar share one generation, because they are one inode, so a
-//!   sidecar handle goes stale exactly when the file's does.
+//! - The kind says what the inode names: the file itself, or its AppleDouble sidecar. It is
+//!   covered by the MAC like everything else, so it cannot be flipped on a valid handle. It is a
+//!   field of its own and not a bit of the number, because the `Vfs` owns the whole `u64` inode
+//!   space and spends the top bits itself (`cowfs-core` marks a virtual inode with `1 << 63`).
+//! - A file and its AppleDouble sidecar share one inode generation, because they are one inode, so
+//!   a sidecar handle goes stale exactly when the file's does.
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::{Mutex, PoisonError};
@@ -16,10 +20,37 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cowfs_vfs::Ino;
 use nfsserve::nfs::nfsstat3;
 
-use crate::sidecar::SIDE_BIT;
+/// What a handle names. A translated AppleDouble sidecar is not an inode of the `Vfs`, so it needs
+/// a mark of its own somewhere the `Vfs` cannot reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// An inode of the `Vfs`.
+    Plain,
+    /// The AppleDouble sidecar of that inode.
+    Sidecar,
+}
+
+impl Kind {
+    fn byte(self) -> u8 {
+        match self {
+            Kind::Plain => 0,
+            Kind::Sidecar => 1,
+        }
+    }
+
+    fn from_byte(b: u8) -> Result<Self, nfsstat3> {
+        match b {
+            0 => Ok(Kind::Plain),
+            1 => Ok(Kind::Sidecar),
+            _ => Err(nfsstat3::NFS3ERR_BADHANDLE),
+        }
+    }
+}
 
 /// Length of every handle.
-pub const HANDLE_LEN: usize = 40;
+pub const HANDLE_LEN: usize = 41;
+/// Everything the MAC covers: the three words and the kind.
+const BODY: usize = 25;
 const MAC_LEN: usize = 16;
 /// Removed inodes remembered for the epoch check. Beyond it the oldest are forgotten, which only
 /// weakens the reuse check for a `Vfs` that breaks the "an Ino is never reused" contract.
@@ -96,49 +127,44 @@ impl HandleCodec {
         }
     }
 
-    /// The generation of the inode `id` names, ignoring the sidecar bit, which only tells a
-    /// sidecar apart from the file it belongs to.
-    fn inode_generation(&self, id: Ino) -> u64 {
+    /// The generation of the inode `ino` names.
+    fn inode_generation(&self, ino: Ino) -> u64 {
         let b = self.buried.lock().unwrap_or_else(PoisonError::into_inner);
-        b.generation.get(&(id & !SIDE_BIT)).copied().unwrap_or(0)
+        b.generation.get(&ino).copied().unwrap_or(0)
     }
 
     /// The handle for `ino` as of now.
-    pub fn encode(&self, ino: Ino) -> Vec<u8> {
+    pub fn encode(&self, ino: Ino, kind: Kind) -> Vec<u8> {
         let mut h = Vec::with_capacity(HANDLE_LEN);
         h.extend_from_slice(&self.generation.to_le_bytes());
         h.extend_from_slice(&ino.to_le_bytes());
         h.extend_from_slice(&self.inode_generation(ino).to_le_bytes());
-        let m = mac(&self.key, &h);
-        h.extend_from_slice(&m);
+        h.push(kind.byte());
+        h.extend_from_slice(&mac(&self.key, &h));
         h
     }
 
-    /// The inode a handle names, or why it is refused: `BADHANDLE` for anything not minted by
-    /// this server, `STALE` for a previous server generation or a removed inode.
-    pub fn decode(&self, data: &[u8]) -> Result<Ino, nfsstat3> {
-        let word = |i: usize| -> Option<u64> {
-            data.get(i..i + 8)
-                .and_then(|b| <[u8; 8]>::try_from(b).ok())
-                .map(u64::from_le_bytes)
-        };
-        let (Some(generation), Some(ino), Some(inode_generation)) = (word(0), word(8), word(16))
-        else {
-            return Err(nfsstat3::NFS3ERR_BADHANDLE);
-        };
+    /// The inode and kind a handle names, or why it is refused: `BADHANDLE` for anything not
+    /// minted by this server, `STALE` for a previous server generation or a removed inode.
+    pub fn decode(&self, data: &[u8]) -> Result<(Ino, Kind), nfsstat3> {
         if data.len() != HANDLE_LEN {
             return Err(nfsstat3::NFS3ERR_BADHANDLE);
         }
+        let word = |i: usize| -> u64 {
+            u64::from_le_bytes(<[u8; 8]>::try_from(&data[i..i + 8]).expect("checked above"))
+        };
+        let (generation, ino, inode_generation) = (word(0), word(8), word(16));
         if generation < self.generation {
             return Err(nfsstat3::NFS3ERR_STALE);
         }
-        if generation > self.generation || !same(&mac(&self.key, &data[..24]), &data[24..]) {
+        if generation > self.generation || !same(&mac(&self.key, &data[..BODY]), &data[BODY..]) {
             return Err(nfsstat3::NFS3ERR_BADHANDLE);
         }
+        let kind = Kind::from_byte(data[BODY - 1])?;
         if inode_generation != self.inode_generation(ino) {
             return Err(nfsstat3::NFS3ERR_STALE);
         }
-        Ok(ino)
+        Ok((ino, kind))
     }
 }
 
@@ -153,27 +179,53 @@ mod tests {
     #[test]
     fn a_handle_round_trips_and_is_stable() {
         let c = codec();
-        let h = c.encode(77);
+        let h = c.encode(77, Kind::Plain);
         assert_eq!(h.len(), HANDLE_LEN);
-        assert_eq!(c.decode(&h), Ok(77));
+        assert_eq!(c.decode(&h), Ok((77, Kind::Plain)));
         c.bury(1);
-        assert_eq!(c.encode(77), h, "removals elsewhere do not change it");
+        assert_eq!(
+            c.encode(77, Kind::Plain),
+            h,
+            "removals elsewhere do not change it"
+        );
+    }
+
+    /// The `Vfs` owns every `u64` but 0 as an inode number, so no bit of it may change what a
+    /// handle means. `cowfs-core` puts `1 << 63` on every virtual inode.
+    #[test]
+    fn every_inode_number_round_trips_as_an_ordinary_inode() {
+        let c = codec();
+        for ino in [
+            1,
+            2,
+            1 << 63,
+            (1 << 63) | 1,
+            0x8000_0100_0000_0001,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                c.decode(&c.encode(ino, Kind::Plain)),
+                Ok((ino, Kind::Plain)),
+                "{ino:#x}"
+            );
+        }
     }
 
     #[test]
     fn forged_and_malformed_handles_are_refused() {
         let c = codec();
-        let mut h = c.encode(77);
+        let mut h = c.encode(77, Kind::Plain);
         h[8] ^= 1;
         assert_eq!(
             c.decode(&h),
             Err(nfsstat3::NFS3ERR_BADHANDLE),
             "another ino, old MAC"
         );
-        let mut h = c.encode(77);
+        let mut h = c.encode(77, Kind::Plain);
         h[39] ^= 1;
         assert_eq!(c.decode(&h), Err(nfsstat3::NFS3ERR_BADHANDLE));
-        for len in [0, 1, 16, 24, 39, 41, 64] {
+        for len in [0, 1, 16, 24, 25, 40, 42, 64] {
             assert_eq!(
                 c.decode(&vec![0; len]),
                 Err(nfsstat3::NFS3ERR_BADHANDLE),
@@ -182,23 +234,47 @@ mod tests {
         }
         let other = HandleCodec::with_key([8; 32]);
         assert_eq!(
-            c.decode(&other.encode(77)),
+            c.decode(&other.encode(77, Kind::Plain)),
             Err(nfsstat3::NFS3ERR_BADHANDLE),
             "another key"
+        );
+    }
+
+    /// The kind is covered by the MAC, so it cannot be changed on a handle that is otherwise
+    /// valid: that would turn a file into its sidecar without ever having seen the sidecar.
+    #[test]
+    fn the_kind_cannot_be_changed_on_a_valid_handle() {
+        let c = codec();
+        let mut forged = c.encode(9, Kind::Plain);
+        forged[BODY - 1] = Kind::Sidecar.byte();
+        assert_eq!(c.decode(&forged), Err(nfsstat3::NFS3ERR_BADHANDLE));
+        let mut back = c.encode(9, Kind::Sidecar);
+        back[BODY - 1] = Kind::Plain.byte();
+        assert_eq!(c.decode(&back), Err(nfsstat3::NFS3ERR_BADHANDLE));
+        let mut unknown = c.encode(9, Kind::Plain);
+        unknown[BODY - 1] = 2;
+        assert_eq!(c.decode(&unknown), Err(nfsstat3::NFS3ERR_BADHANDLE));
+        let mut stale = c.encode(9, Kind::Sidecar);
+        c.bury(9);
+        stale[16] ^= 1;
+        assert_eq!(
+            c.decode(&stale),
+            Err(nfsstat3::NFS3ERR_BADHANDLE),
+            "a stale inode generation with a kind of its own is still refused"
         );
     }
 
     #[test]
     fn other_generations_are_told_apart() {
         let c = codec();
-        let mut old = c.encode(1);
+        let mut old = c.encode(1, Kind::Plain);
         old[..8].copy_from_slice(&(c.generation() - 1).to_le_bytes());
         assert_eq!(
             c.decode(&old),
             Err(nfsstat3::NFS3ERR_STALE),
             "an earlier server, whatever its MAC"
         );
-        let mut new = c.encode(1);
+        let mut new = c.encode(1, Kind::Plain);
         new[..8].copy_from_slice(&(c.generation() + 1).to_le_bytes());
         assert_eq!(c.decode(&new), Err(nfsstat3::NFS3ERR_BADHANDLE));
     }
@@ -206,15 +282,15 @@ mod tests {
     #[test]
     fn removing_an_inode_stales_its_old_handles_only() {
         let c = codec();
-        let before = c.encode(5);
-        let other = c.encode(6);
+        let before = c.encode(5, Kind::Plain);
+        let other = c.encode(6, Kind::Plain);
         c.bury(5);
         assert_eq!(c.decode(&before), Err(nfsstat3::NFS3ERR_STALE));
-        assert_eq!(c.decode(&other), Ok(6));
-        let reused = c.encode(5);
+        assert_eq!(c.decode(&other), Ok((6, Kind::Plain)));
+        let reused = c.encode(5, Kind::Plain);
         assert_eq!(
             c.decode(&reused),
-            Ok(5),
+            Ok((5, Kind::Plain)),
             "a handle minted after the removal is good"
         );
         assert_eq!(c.decode(&before), Err(nfsstat3::NFS3ERR_STALE));
@@ -236,12 +312,12 @@ mod tests {
     #[test]
     fn a_sidecar_handle_stales_with_its_file() {
         let c = codec();
-        let file = c.encode(5);
-        let side = c.encode(5 | SIDE_BIT);
+        let file = c.encode(5, Kind::Plain);
+        let side = c.encode(5, Kind::Sidecar);
         assert_eq!(
             c.decode(&side),
-            Ok(5 | SIDE_BIT),
-            "a sidecar handle decodes to its own id"
+            Ok((5, Kind::Sidecar)),
+            "a sidecar handle names the same inode as the file's"
         );
         c.bury(5);
         assert_eq!(c.decode(&side), Err(nfsstat3::NFS3ERR_STALE));
