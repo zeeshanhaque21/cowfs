@@ -469,3 +469,253 @@ fn a_pack_below_the_dead_ratio_is_left_alone() {
         assert!(f.store.get(b).is_ok());
     }
 }
+
+/// A pack that holds one condemned record, and the fixture that builds one.
+///
+/// Returned alongside the id of a record that no live snapshot references, in a sealed pack that
+/// the collector will choose.
+fn one_condemned(f: &Fixture) -> BlockId {
+    let keep = f.live_blocks();
+    for info in f.store.packs().expect("packs") {
+        if info.active {
+            continue;
+        }
+        let mut live = Vec::new();
+        let plan = f
+            .store
+            .plan_pack(info.id, &|b| keep.contains(&b), &mut live)
+            .expect("plan");
+        // A pack with nothing live in it, so the collector really does choose to rewrite it.
+        if plan.live_bytes != 0 || plan.dead_bytes == 0 {
+            continue;
+        }
+        let mut all = Vec::new();
+        f.store
+            .plan_pack(info.id, &|_| true, &mut all)
+            .expect("plan");
+        if let Some(b) = all.into_iter().find(|b| !keep.contains(b)) {
+            return b;
+        }
+    }
+    panic!("no sealed pack holds a condemned record");
+}
+
+/// A fixture with one live snapshot and one condemned record in a sealed pack.
+fn with_one_condemned() -> Fixture {
+    let f = Fixture::eager(32 << 10);
+    let snap = f.meta.new_snapshot("s").expect("snapshot");
+    f.write(&snap, b"keep", &body(60_000, 1));
+    for i in 0..40u32 {
+        f.store.put(&body(4_000, 900 + i)).expect("put");
+    }
+    f.store.sync().unwrap();
+    f.meta.sync().unwrap();
+    f
+}
+
+/// F5: a block that becomes reachable while the copies run is only spared by the became-live check
+/// at the unlink.
+///
+/// `pinned_blocks` is polled at the freeze, after the mark, before the copy, and again before every
+/// unlink. Reporting the block only from the fourth poll on is exactly a write that lands during
+/// the copy, so a collector that does not re-check at the unlink frees it.
+#[test]
+fn a_block_that_becomes_live_during_the_copy_is_spared_the_unlink() {
+    let f = with_one_condemned();
+    let condemned = one_condemned(&f);
+
+    struct Late {
+        polls: AtomicUsize,
+        id: BlockId,
+    }
+    impl ExtraRoots for Late {
+        fn pinned_blocks(&self) -> Result<Vec<BlockId>, RootsError> {
+            let n = self.polls.fetch_add(1, Relaxed);
+            // Polls 1 to 3 are the freeze, the end of the mark and the start of the copy. A write
+            // that lands during the copy is first seen by the poll before the first unlink.
+            Ok(if n >= 3 { vec![self.id] } else { Vec::new() })
+        }
+        fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier>>, RootsError> {
+            Ok(Some(Box::new(Noop)))
+        }
+    }
+    let roots = Late {
+        polls: AtomicUsize::new(0),
+        id: condemned,
+    };
+
+    let r = f.gc.collect(Some(&roots)).expect("collect");
+    assert!(r.errors.is_empty(), "the cycle reported errors: {r:?}");
+    assert!(
+        r.skipped
+            .iter()
+            .any(|s| s.reason == cowfs_gc::SkipReason::BecameLive),
+        "the pack holding a block that became live was not spared: {:?} {r:?}",
+        r.skipped
+    );
+    assert!(
+        f.store.get(condemned).is_ok(),
+        "a block that became live while the copies ran was freed"
+    );
+}
+
+/// F5: the polls are unioned. A collector that keeps only the first answer drops everything the
+/// later polls reported, so a block named on the second poll and after is freed.
+#[test]
+fn a_block_reported_on_a_later_poll_only_is_still_protected() {
+    let f = with_one_condemned();
+    let condemned = one_condemned(&f);
+
+    struct Later {
+        polls: AtomicUsize,
+        first: BlockId,
+        later: BlockId,
+    }
+    impl ExtraRoots for Later {
+        fn pinned_blocks(&self) -> Result<Vec<BlockId>, RootsError> {
+            let n = self.polls.fetch_add(1, Relaxed);
+            Ok(if n == 0 {
+                vec![self.first]
+            } else {
+                vec![self.later]
+            })
+        }
+        fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier>>, RootsError> {
+            Ok(Some(Box::new(Noop)))
+        }
+    }
+    let roots = Later {
+        polls: AtomicUsize::new(0),
+        first: BlockId::of(b"first poll only"),
+        later: condemned,
+    };
+    let r = f.gc.collect(Some(&roots)).expect("collect");
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(
+        f.store.get(condemned).is_ok(),
+        "a block reported only on a later poll was freed: {r:?}"
+    );
+}
+
+/// F5: the persisted set must not keep naming a block whose snapshot is gone.
+///
+/// Without the prune the set grows for ever, so a later cycle still treats the block as live. The
+/// store is the observable, and `mark.bin` is the thing being asserted about.
+#[test]
+fn the_persisted_set_forgets_a_block_whose_snapshot_is_gone() {
+    let f = Fixture::eager(32 << 10);
+    let doomed = f.meta.new_snapshot("doomed").expect("snapshot");
+    for i in 0..8u32 {
+        f.write(&doomed, format!("d{i}").as_bytes(), &body(6_000, 40 + i));
+    }
+    let keep = f.meta.new_snapshot("keep").expect("snapshot");
+    f.write(&keep, b"keep", &body(6_000, 3));
+    f.meta.sync().unwrap();
+    f.store.sync().unwrap();
+
+    let roots = Roots::new();
+    f.gc.collect(Some(&*roots)).expect("first collect");
+    let mut marker = cowfs_meta::Marker::new();
+    let gone: Vec<BlockId> = doomed
+        .live_blocks(&mut marker)
+        .expect("walk")
+        .map(|b| b.expect("block"))
+        .filter(|b| *b != cowfs_gc::HOLE)
+        .collect();
+    assert!(!gone.is_empty(), "the doomed snapshot holds blocks");
+    let recorded = mark_bytes(&f);
+    assert!(
+        gone.iter().all(|b| has(&recorded, b.as_bytes())),
+        "the first cycle recorded every block of the doomed snapshot"
+    );
+
+    f.meta.remove_snapshot(doomed.id()).unwrap();
+    f.meta.reap_all().unwrap();
+    f.meta.sync().unwrap();
+    f.gc.collect(Some(&*roots)).expect("second collect");
+
+    let after = mark_bytes(&f);
+    for b in &gone {
+        assert!(
+            !has(&after, b.as_bytes()),
+            "mark.bin still names a block whose snapshot is gone: {b:?}"
+        );
+    }
+    for b in f.live_blocks() {
+        assert!(f.store.get(b).is_ok(), "a live block was freed: {b:?}");
+    }
+}
+
+/// F5: the persisted root set must not keep naming a root that is gone, or every later cycle
+/// believes it has already walked it.
+#[test]
+fn the_persisted_set_forgets_a_root_that_is_gone() {
+    let f = Fixture::eager(32 << 10);
+    let doomed = f.meta.new_snapshot("doomed").expect("snapshot");
+    f.write(&doomed, b"x", &body(6_000, 11));
+    f.meta.sync().unwrap();
+    let roots = Roots::new();
+    f.gc.collect(Some(&*roots)).expect("first collect");
+
+    let doomed_root = *f
+        .meta
+        .snapshot_by_id(doomed.id())
+        .unwrap()
+        .root()
+        .unwrap()
+        .as_bytes();
+    let recorded = mark_bytes(&f);
+    assert!(
+        recorded.windows(32).any(|w| w == doomed_root),
+        "the first cycle recorded the root"
+    );
+
+    f.meta.remove_snapshot(doomed.id()).unwrap();
+    f.meta.reap_all().unwrap();
+    f.meta.sync().unwrap();
+    f.gc.collect(Some(&*roots)).expect("second collect");
+
+    let after = mark_bytes(&f);
+    assert!(
+        !after.windows(32).any(|w| w == doomed_root),
+        "mark.bin still names a root that is gone"
+    );
+}
+
+/// F5: the durable roots are read after the metadata sync, or a snapshot this cycle makes durable is
+/// invisible to its own freeze and its blocks are freed.
+#[test]
+fn a_snapshot_this_cycle_makes_durable_is_not_swept() {
+    let f = Fixture::eager(32 << 10);
+    let snap = f.meta.new_snapshot("fresh").expect("snapshot");
+    let refs = f.write(&snap, b"fresh", &body(20_000, 77));
+    let blocks: Vec<BlockId> = refs.iter().map(|c| c.id).collect();
+    assert!(!blocks.is_empty(), "the file produced blocks");
+    // No metadata sync: the collector's own sync is what makes this snapshot durable.
+    f.store.sync().unwrap();
+    for i in 0..30u32 {
+        f.store.put(&body(4_000, 300 + i)).expect("put");
+    }
+    f.store.sync().unwrap();
+
+    let roots = Roots::new();
+    let r = f.gc.collect(Some(&*roots)).expect("collect");
+    assert!(r.errors.is_empty(), "{r:?}");
+    for b in &blocks {
+        assert!(
+            f.store.get(*b).is_ok(),
+            "a block of a snapshot the cycle itself made durable was freed: {b:?} {r:?}"
+        );
+    }
+    assert!(f.store.fsck().expect("fsck").is_clean());
+}
+
+/// True when `needle` appears as a whole 32 byte entry in `hay`.
+fn has(hay: &[u8], needle: &[u8; 32]) -> bool {
+    hay.windows(32).any(|w| w == needle)
+}
+
+/// The bytes of the collector's persisted mark set, which is a root list then a block list.
+fn mark_bytes(f: &Fixture) -> Vec<u8> {
+    std::fs::read(f.gc_dir().join("mark.bin")).unwrap_or_default()
+}
