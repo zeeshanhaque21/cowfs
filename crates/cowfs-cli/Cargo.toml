@@ -18,6 +18,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 cowfs-ctl = { path = "../cowfs-ctl" }
+cowfs-daemon = { path = "../cowfs-daemon" }
 serde_json = "1"
 signal-hook = "0.3"
 thiserror.workspace = true

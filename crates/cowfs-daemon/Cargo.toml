@@ -1,0 +1,39 @@
+[package]
+name = "cowfs-daemon"
+description = "The cowfs daemon: a Vfs backend, the control API and the platform mount adapter, wired into one process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+
+[lib]
+name = "cowfs_daemon"
+
+[[bin]]
+name = "cowfs-daemon"
+path = "src/main.rs"
+
+[dependencies]
+cowfs-ctl = { path = "../cowfs-ctl" }
+cowfs-vfs = { path = "../cowfs-vfs" }
+cowfs-vfs-path = { path = "../cowfs-vfs-path" }
+cowfs-vfs-test = { path = "../cowfs-vfs-test" }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cowfs-nfs = { path = "../cowfs-nfs" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cowfs-fuse = { path = "../cowfs-fuse" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
