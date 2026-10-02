@@ -54,9 +54,7 @@ fn staging_name(target: &str) -> String {
 }
 
 fn sync_dir(dir: &Path) {
-    if let Ok(d) = fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
+    let _ = crate::fsops::sync_dir(dir);
 }
 
 fn io(msg: &str) -> ControlError {
@@ -69,10 +67,13 @@ fn write_intent(root: &Path, staged: &str, target: &str) -> Result<(), ControlEr
     let mut f = fs::File::create(&tmp).map_err(|e| io(&e.to_string()))?;
     f.write_all(format!("{staged}\n{target}\n").as_bytes())
         .map_err(|e| io(&e.to_string()))?;
-    f.sync_all().map_err(|e| io(&e.to_string()))?;
+    // the record must be on the medium before the rename, and the rename on the medium before
+    // anything destructive reads the intent file
+    crate::fsops::sync_file(&f, &tmp).map_err(|e| io(&e.to_string()))?;
     drop(f);
     fs::rename(&tmp, &p).map_err(|e| io(&e.to_string()))?;
-    sync_dir(root);
+    crate::fsops::note("intent_renamed");
+    crate::fsops::sync_dir(root).map_err(|e| io(&e.to_string()))?;
     Ok(())
 }
 
@@ -187,6 +188,7 @@ impl Core {
                 self.rollback(&staged, new);
                 return Err(e);
             }
+            crate::fsops::note("victim_removed");
         }
         // Past this point an error cannot be reported as "nothing happened", so the swap is rolled
         // forward instead and the call succeeds. The only exception is a failure of the roll
