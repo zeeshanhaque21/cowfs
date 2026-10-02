@@ -610,7 +610,7 @@ fn the_core_refuses_a_store_that_reports_damage_and_does_not_acknowledge_it() {
     let mut hit = false;
     for entry in packs.flatten() {
         let p = entry.path();
-        if p.extension().is_some_and(|e| e == "pack") {
+        if p.extension().is_some_and(|e| e == "cpk") {
             let bytes = std::fs::read(&p).unwrap();
             let m = bytes.len() / 2;
             std::fs::write(&p, &bytes[..m]).unwrap();
