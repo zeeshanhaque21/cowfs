@@ -277,21 +277,26 @@ pub fn doctor(daemon: &mut Daemon, opts: &Doctor) -> Result<Report> {
             info.adapter, info.mounted, info.mount_path
         ),
     );
-    let mount = opts.mount.clone();
-    report.check("locks (flock)", flock_works(&mount), {
-        let d = mount.join(".cowfs-treehouse-doctor.lock");
-        if d.exists() {
-            "flock took and released a file on the mount".to_owned()
-        } else {
-            format!("could not create {}", d.display())
-        }
-    });
-    report.check("hardlinks", hardlink_works(&mount), {
-        format!(
-            "link created at {}",
-            mount.join(".cowfs-treehouse-doctor.link").display()
-        )
-    });
+    if let Some(probe) = doctor_probe_directory(opts) {
+        let locked = flock_works(&probe);
+        report.check(
+            "locks (flock)",
+            locked,
+            format!("flock probe in {}: {locked}", probe.display()),
+        );
+        let linked = hardlink_works(&probe);
+        report.check(
+            "hardlinks",
+            linked,
+            format!("hardlink probe in {}: {linked}", probe.display()),
+        );
+    } else {
+        report.fail(
+            "locks (flock)",
+            "probe directory must exist inside the mount",
+        );
+        report.fail("hardlinks", "probe directory must exist inside the mount");
+    }
 
     let snapshots = daemon.snapshot_list()?;
     let missing: Vec<String> = snapshots
@@ -403,6 +408,12 @@ pub fn doctor(daemon: &mut Daemon, opts: &Doctor) -> Result<Report> {
         );
     }
     Ok(report)
+}
+
+fn doctor_probe_directory(opts: &Doctor) -> Option<PathBuf> {
+    let mount = fs::canonicalize(&opts.mount).ok()?;
+    let probe = fs::canonicalize(opts.pool_root.as_deref().unwrap_or(&opts.mount)).ok()?;
+    (probe.starts_with(mount) && probe.is_dir()).then_some(probe)
 }
 
 /// Every slot directory of every pool under a treehouse root, which is `{root}/.treehouse/{pool}/{slot}/{repo}`.
@@ -668,6 +679,45 @@ fn survivors_as_info(pids: &[u32]) -> Vec<ProcessInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_probes_the_pool_root_not_the_namespace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = dir.path().join("base");
+        fs::create_dir(&pool).expect("mkdir");
+        let mut opts = Doctor {
+            mount: dir.path().to_owned(),
+            pool_root: Some(pool.clone()),
+            main_checkout: None,
+        };
+        assert_eq!(
+            doctor_probe_directory(&opts),
+            Some(fs::canonicalize(&pool).unwrap())
+        );
+        opts.pool_root = None;
+        assert_eq!(
+            doctor_probe_directory(&opts),
+            Some(fs::canonicalize(dir.path()).unwrap())
+        );
+    }
+
+    #[test]
+    fn doctor_refuses_an_outside_or_missing_probe_directory() {
+        let mount = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let mut opts = Doctor {
+            mount: mount.path().to_owned(),
+            pool_root: Some(outside.path().to_owned()),
+            main_checkout: None,
+        };
+        assert_eq!(doctor_probe_directory(&opts), None);
+        let link = mount.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        opts.pool_root = Some(link);
+        assert_eq!(doctor_probe_directory(&opts), None);
+        opts.pool_root = Some(mount.path().join("missing"));
+        assert_eq!(doctor_probe_directory(&opts), None);
+    }
 
     #[test]
     fn count_prefix_finds_only_the_prefix() {
