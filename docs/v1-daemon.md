@@ -135,9 +135,14 @@ The switch is one fork of the staging snapshot into the requested name, so it is
 write. An import of the same content twice therefore costs nothing the second time: the blocks are
 already stored, and the report's `stored_bytes` says so (0 for a repeat of identical content).
 
-- Peak extra disk is bounded by construction: the source is never written to, no uncompressed copy
-  is staged on disk, and one 64 KiB buffer (`import::CHUNK`) is in flight per file. The only new
-  bytes are the store's own compressed, deduplicated blocks.
+- Peak extra disk is bounded by construction: the source is opened read-only and no uncompressed copy
+  is staged on disk, so the only new bytes are the store's own compressed, deduplicated blocks and
+  one 64 KiB buffer (`import::CHUNK`) is in flight per file.
+  `import-e2e.sh` measures the read-only claim rather than asserting it: a manifest of the whole
+  source tree, taken before the daemon starts, is compared with one taken after the last import, over
+  every path, kind, mode, size, SHA-256, symlink target, and mtime, ctime, inode, link count, uid
+  and gid. atime is excluded on purpose, because the import reads the source and atime is expected to
+  move.
 - Symlinks are kept as symlinks and never followed. Anything else that is not a regular file or a
   directory (a fifo, a socket, a device) is refused with `invalid_params`, because the core cannot
   hold one and dropping it silently would make the imported tree differ from the source.
@@ -145,6 +150,14 @@ already stored, and the report's `stored_bytes` says so (0 for a repeat of ident
 - A name that exists is `already_exists`. An import never replaces a snapshot.
 - A mismatch, a cancellation or an error leaves the store exactly as the call found it: the staging
   snapshot is dropped and no snapshot named as requested exists.
+- Two concurrent imports naming the same snapshot cannot both write. `import` takes no per-name
+  snapshot lock from the control server (unlike `snapshot_rm`, `snapshot_reset` and `mount_snapshot`,
+  which do), but it does not need one: `Cowfs` sits behind a single `Mutex` in the backend
+  (`CoreSlot` in `backend.rs`), and `ingest` is called with that mutex held for its whole duration,
+  from `check_new_name` through `finish_swap`. So the loser of the race does not find a half-written
+  staging snapshot, it runs afterwards and gets `already_exists` from `check_new_name`. Across
+  processes it is stronger still: the store holds an exclusive `flock` on its `LOCK` file, so a
+  second daemon on the same store refuses to open it.
 - `base_refresh` is still refused here, because it copies a git worktree into the store directory,
   which means nothing for a backend whose snapshots are trees. The handler answers `unsupported`
   and says to copy the source through the mount instead.
