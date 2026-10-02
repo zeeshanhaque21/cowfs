@@ -169,9 +169,17 @@ impl Host {
         match client.call(request) {
             Ok(response) => (0, response.data_json().to_string()),
             Err(e) => match e {
-                cowfs_ctl::ClientError::Server(err) => {
-                    (1, format!("{}: {}", err.code, err.message))
-                }
+                cowfs_ctl::ClientError::Server(err) => (
+                    1,
+                    format!(
+                        "{}: {}{}",
+                        err.code,
+                        err.message,
+                        err.details
+                            .as_ref()
+                            .map_or_else(String::new, |d| format!(" [{d}]"))
+                    ),
+                ),
                 other => (2, other.to_string()),
             },
         }
@@ -370,27 +378,23 @@ fn mount_snapshot_exports_a_snapshot_and_unmount_removes_it() {
     let target = host.slot("7");
     // Through the control methods now, which is where a client reaches them: the request goes
     // over the socket, the framework validates it and hands the handler its snapshot lock.
-    assert_eq!(
-        host.call(Request::MountSnapshot(cowfs_ctl::MountSnapshot {
+    ok(
+        &host,
+        Request::MountSnapshot(cowfs_ctl::MountSnapshot {
             name: "base".into(),
             path: target.display().to_string(),
             expect_no_holders: true,
-        }))
-        .0,
-        0,
-        "the export is inside the root, deep enough and empty"
+        }),
     );
     assert!(
         cowfs_daemon::mounts::is_mounted(&target),
         "the export is not mounted"
     );
-    assert_eq!(
-        host.call(Request::UnmountSnapshot(cowfs_ctl::UnmountSnapshot {
+    ok(
+        &host,
+        Request::UnmountSnapshot(cowfs_ctl::UnmountSnapshot {
             path: target.display().to_string(),
-        }))
-        .0,
-        0,
-        "unmounting our own export"
+        }),
     );
     assert!(
         !cowfs_daemon::mounts::is_mounted(&target),
@@ -671,7 +675,16 @@ fn read(p: &std::path::Path) -> Vec<u8> {
 
 fn ok(h: &Host, request: Request) -> String {
     let (code, body) = h.call(request);
-    assert_eq!(code, 0, "{body}");
+    if code != 0 {
+        let holders: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        panic!(
+            "the request failed: {body}\nholders: {}",
+            holders
+                .get("holders")
+                .map_or_else(|| body.clone(), |h| h.to_string())
+        );
+    }
     body
 }
 

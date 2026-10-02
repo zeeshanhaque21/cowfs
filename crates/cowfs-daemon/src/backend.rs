@@ -836,3 +836,20 @@ impl Snapshots for MemSnapshots {
         Err(unsupported("the in-memory backend has no snapshots"))
     }
 }
+#[test]
+fn probe_alias_release_makes_a_held_number_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = CoreBackend::open(dir.path(), cowfs_core::Options::default()).unwrap();
+    b.snapshots().create("base", None).unwrap();
+    let v = b.snapshot("base").unwrap();
+    let r = cowfs_vfs::ROOT_INO;
+    let d = v.mkdir(r, b"d", 0o755).unwrap();
+    eprintln!("mkdir d -> {:#x}", d.ino);
+    // The NFS adapter forgets the reference the moment it hands the attribute out.
+    v.forget(d.ino, 1);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    eprintln!("forgotten+flushed: getattr {:#x} -> {:?}", d.ino, v.getattr(d.ino).err());
+    let held = v.mkdir(r, b"e", 0o755).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    eprintln!("reference held: getattr {:#x} -> {:?}", held.ino, v.getattr(held.ino).err());
+}
