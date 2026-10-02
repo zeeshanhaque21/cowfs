@@ -62,11 +62,18 @@ fn stub_kind_builds_a_working_backend() {
     server.shutdown();
 }
 
+/// The real backend is the daemon. It needs a real store directory and a real mount, so this
+/// checks the wiring (it builds, and it reports a mount it cannot make) rather than a mount.
 #[test]
-fn the_real_backend_is_an_explicit_error_until_it_is_wired_in() {
-    assert_eq!(
-        make_backend(BackendKind::Real).err(),
-        Some(BackendError::NotWired)
+fn the_real_backend_builds_and_reports_a_store_it_cannot_serve() {
+    let backend = make_backend(BackendKind::Real).expect("the real backend builds");
+    let err = backend
+        .open(&config())
+        .err()
+        .expect("a store that does not exist cannot be served");
+    assert!(
+        matches!(err, BackendError::Open(_)),
+        "the failure names the store, not the wiring: {err}"
     );
 }
 

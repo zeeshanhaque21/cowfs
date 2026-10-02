@@ -228,6 +228,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "cowfs-ctl",
+ "cowfs-daemon",
  "serde_json",
  "signal-hook",
  "tempfile",
@@ -245,6 +246,25 @@ dependencies = [
  "tempfile",
  "thiserror",
  "unicode-normalization",
+]
+
+[[package]]
+name = "cowfs-daemon"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "cowfs-ctl",
+ "cowfs-fuse",
+ "cowfs-nfs",
+ "cowfs-vfs",
+ "cowfs-vfs-path",
+ "cowfs-vfs-test",
+ "libc",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
