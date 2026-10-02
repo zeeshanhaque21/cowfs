@@ -306,6 +306,15 @@
           "pr": "#64",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/64",
           "detail": "Merged. The macOS stack on the core backend works now: real-mount proof by the builder (0 failures): mkdir and nested, write and read after 3 s, git clone in and out, git status, cargo build, tar extract with ._ files, rm -rf, SIGTERM unmounts. Daemon e2e 5/5 on the branch, ignored NFS mount suite 20/20, all 5 mutants caught, security properties kept (forged kind, stale generation, guessed handles refused). Builder figures not independently re-run by me. Known flake filed by the builder: #66 (half_sent_frames test RSS bound under load) and #57."
+        },
+        {
+          "id": "61",
+          "title": "#61 vfs-path inode reuse (merged, PR #65)",
+          "state": "done",
+          "owner": "lead",
+          "pr": "#65",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/65",
+          "detail": "Merged at 1f561dd after I verified: scope limited to crates/cowfs-vfs-path (lib, sys, table, tests), CI green on macOS, Ubuntu and linux-fuse, mergeable clean. The fix: never let a recycled backing inode number name another file (the backing inode reuse path can no longer satisfy a stale Ino's identity). The worker's 2000-iteration macOS repro and the VM runs were its evidence; I did not independently re-run the loop. This closes the fall-back from the old F1 round (#35) being incomplete. The slot-11 worktree is left on the v1/vfs-path-reuse branch; its local loops should exit soon or I will check their PID before killing."
         }
       ]
     },
@@ -347,5 +356,5 @@
       ]
     }
   ],
-  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45). | In flight in parallel: #50 daemon, #51 bench harness, #52 torn read (PR #44). | Merged since: #48. | Merged since: #36 (core), #48. Waiting: #39 (fixing), #44 (held on #45). In flight: #50 daemon, #52 torn read, core-mutants follow-up. | Merged since: #50 daemon, #52 core mutants. Waiting: #39 GC (fixing), #44 (statfs flake), #56 (cleaning), #53 core alias (fixing). | Merged since: #56. #39 under round-2 critic. | Merged since: #59 (core alias). | Merged since: #44. In flight: #60 nfs sidebit, #61 vfs-path reuse, #39 GC round-2 critic. | Merged since: #64 (nfs sidebit)."
+  "merge_rule": "merge only after an adversarial critic's blockers are fixed and re-verified by the lead. Merged: #22 #23 #27 #30 #25 #41 #35 #32 #31. Waiting: #24 (round-4 critic running), #36 (fixing, needs #24), #39 (needs #24, then a critic), #33 (fixing), #38 (verified, stacked on #33). In flight: NFS 0444 policy PR, Linux FUSE CI job PR. Each must merge main and adopt the frozen trait first. | main CI was red from Rust 1.99 deprecating AtomicU64::fetch_update; fixed in #47 (merged). Every open PR must merge main again to go green. | Merged since: #33. | Merged since: #38. | Merged since: #24. Waiting: #36 (merging main), #39 (merging main, then critic), #44 (held on #45). | In flight in parallel: #50 daemon, #51 bench harness, #52 torn read (PR #44). | Merged since: #48. | Merged since: #36 (core), #48. Waiting: #39 (fixing), #44 (held on #45). In flight: #50 daemon, #52 torn read, core-mutants follow-up. | Merged since: #50 daemon, #52 core mutants. Waiting: #39 GC (fixing), #44 (statfs flake), #56 (cleaning), #53 core alias (fixing). | Merged since: #56. #39 under round-2 critic. | Merged since: #59 (core alias). | Merged since: #44. In flight: #60 nfs sidebit, #61 vfs-path reuse, #39 GC round-2 critic. | Merged since: #64 (nfs sidebit). | Merged since: #65. Open: #39 GC round-2 fix, v1/coldread profiling."
 }
