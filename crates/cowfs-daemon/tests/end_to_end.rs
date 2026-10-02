@@ -10,7 +10,7 @@
 //! Every wait loop below exits on failure as well as on success, and a watchdog force-unmounts
 //! a mount whose server died, so a hung syscall fails the test instead of wedging the machine.
 
-use cowfs_ctl::{Client, ClientOptions, ControlHandler, NoParams, Request, Response};
+use cowfs_ctl::{Client, ClientOptions, NoParams, Request, Response};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -44,10 +44,12 @@ struct Host {
     mount: PathBuf,
     socket: PathBuf,
     root: PathBuf,
+    backend: cowfs_daemon::BackendKind,
 }
 
 impl Host {
-    fn new() -> Option<Host> {
+    /// A host for one backend. `None` when this machine cannot mount at all.
+    fn new(backend: cowfs_daemon::BackendKind) -> Option<Host> {
         if !available() {
             eprintln!("SKIP: no usable mount adapter on this host");
             return None;
@@ -76,28 +78,9 @@ impl Host {
             child: None,
             live: None,
             root: pool,
+            backend,
         };
         Some(host)
-    }
-
-    /// Starts the daemon in this process, so a test can reach the library entry points the
-    /// control methods will call once cowfs-ctl grows `mount_snapshot`.
-    fn start_here(&mut self) -> std::sync::Arc<cowfs_daemon::Daemon> {
-        assert!(self.live.is_none(), "already running");
-        let mut config = cowfs_daemon::DaemonConfig::new(
-            &self.store,
-            &self.mount,
-            self.socket.display().to_string(),
-        )
-        .with_export_root(self.root.parent().unwrap());
-        config.export_roots = vec![self.root.parent().unwrap().to_owned()];
-        let daemon = cowfs_daemon::Daemon::start(&config).expect("the daemon starts");
-        self.live = Some(std::sync::Arc::clone(&daemon));
-        assert!(
-            cowfs_daemon::mounts::is_mounted(&self.mount),
-            "the daemon mounted nothing"
-        );
-        daemon
     }
 
     fn slot(&self, slot: &str) -> PathBuf {
@@ -115,6 +98,11 @@ impl Host {
             .arg(self.socket.display().to_string())
             .arg("--export-root")
             .arg(self.root.parent().unwrap().display().to_string())
+            .arg("--backend")
+            .arg(match self.backend {
+                cowfs_daemon::BackendKind::Core => "core",
+                cowfs_daemon::BackendKind::Path => "path",
+            })
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -245,7 +233,7 @@ impl Drop for Host {
 #[test]
 #[ignore = "needs a real mount adapter"]
 fn a_daemon_serves_a_mount_writes_and_a_shutdown_leaves_nothing() {
-    let Some(mut h) = Host::new() else {
+    let Some(mut h) = Host::new(cowfs_daemon::BackendKind::Path) else {
         return;
     };
     h.start();
@@ -338,7 +326,7 @@ fn a_daemon_serves_a_mount_writes_and_a_shutdown_leaves_nothing() {
 #[test]
 #[ignore = "needs a real mount adapter"]
 fn a_killed_daemon_leaves_a_stale_mount_the_next_start_sweeps() {
-    let Some(mut h) = Host::new() else {
+    let Some(mut h) = Host::new(cowfs_daemon::BackendKind::Path) else {
         return;
     };
     h.start();
@@ -370,40 +358,330 @@ fn a_killed_daemon_leaves_a_stale_mount_the_next_start_sweeps() {
 #[test]
 #[ignore = "needs a real mount adapter"]
 fn mount_snapshot_exports_a_snapshot_and_unmount_removes_it() {
-    let Some(mut host) = Host::new() else {
+    let Some(mut host) = Host::new(cowfs_daemon::BackendKind::Path) else {
         return;
     };
-    let daemon = host.start_here();
-    daemon
-        .handler()
-        .snapshot_create(cowfs_ctl::SnapshotCreate {
-            name: "base".into(),
-            from: None,
-        })
-        .expect("a snapshot to export");
+    host.start();
+    let (code, body) = host.call(Request::SnapshotCreate(cowfs_ctl::SnapshotCreate {
+        name: "base".into(),
+        from: None,
+    }));
+    assert_eq!(code, 0, "a snapshot to export: {body}");
     let target = host.slot("7");
-    let info = daemon
-        .handler()
-        .mount_snapshot(&cowfs_daemon::MountSnapshot {
+    // Through the control methods now, which is where a client reaches them: the request goes
+    // over the socket, the framework validates it and hands the handler its snapshot lock.
+    assert_eq!(
+        host.call(Request::MountSnapshot(cowfs_ctl::MountSnapshot {
             name: "base".into(),
             path: target.display().to_string(),
             expect_no_holders: true,
-        })
-        .expect("the export is inside the root, deep enough and empty");
-    assert_eq!(info.mount_path, target.display().to_string());
+        }))
+        .0,
+        0,
+        "the export is inside the root, deep enough and empty"
+    );
     assert!(
         cowfs_daemon::mounts::is_mounted(&target),
         "the export is not mounted"
     );
-    let target_mount = target.clone();
-    daemon
-        .handler()
-        .unmount_snapshot(&cowfs_daemon::UnmountSnapshot {
+    assert_eq!(
+        host.call(Request::UnmountSnapshot(cowfs_ctl::UnmountSnapshot {
             path: target.display().to_string(),
-        })
-        .expect("unmounting our own export");
+        }))
+        .0,
+        0,
+        "unmounting our own export"
+    );
     assert!(
-        !cowfs_daemon::mounts::is_mounted(&target_mount),
+        !cowfs_daemon::mounts::is_mounted(&target),
         "the export outlived unmount_snapshot"
     );
+}
+
+/// Bytes a file of `n` bytes holds, built so a read that is short, shifted or repeated cannot
+/// look right.
+fn pattern(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+
+/// The core backend end to end: a real store, a real mount, real bytes.
+///
+/// Everything here goes through the mount or the control socket, so it is the whole stack:
+/// `cowfs-core`'s `Vfs`, the adapter, the control plane, the store. A restart and a kill are in
+/// here because the only way to know a snapshot survived is to reopen the store and look.
+#[test]
+#[ignore = "needs a real mount adapter"]
+fn the_core_backend_serves_real_bytes_and_survives_a_restart_and_a_kill() {
+    let Some(mut h) = Host::new(cowfs_daemon::BackendKind::Core) else {
+        return;
+    };
+    h.start();
+    let big = pattern(5 << 20);
+    let many = 300;
+
+    // A snapshot, then bytes through the mount: one multi-MiB file and many small ones, because
+    // those take different paths (chunked writes against the store, one write per file).
+    ok(
+        &h,
+        Request::SnapshotCreate(cowfs_ctl::SnapshotCreate {
+            name: "base".into(),
+            from: None,
+        }),
+    );
+    let base = h.mount.join("base");
+    std::fs::write(base.join("big.bin"), &big).expect("write the big file");
+    for i in 0..many {
+        std::fs::write(base.join(format!("small-{i}")), format!("small {i}\n"))
+            .unwrap_or_else(|e| panic!("write small-{i}: {e}"));
+    }
+    std::fs::create_dir_all(base.join("d").join("e")).expect("mkdir");
+    std::fs::write(base.join("d").join("e").join("f"), b"nested\n").expect("nested write");
+    assert_eq!(
+        read(&base.join("big.bin")),
+        big,
+        "the big file reads back wrong"
+    );
+    for i in 0..many {
+        assert_eq!(
+            read(&base.join(format!("small-{i}"))),
+            format!("small {i}\n").into_bytes(),
+            "small-{i} reads back wrong"
+        );
+    }
+    assert_eq!(read(&base.join("d").join("e").join("f")), b"nested\n");
+
+    // fsync through the mount is what makes the bytes survive a kill, so do it explicitly.
+    sync_dir(&base);
+
+    // A clone, then a write into the clone that the base must not see: this is the O(1) fork,
+    // and it is the property the whole design rests on.
+    ok(
+        &h,
+        Request::SnapshotCreate(cowfs_ctl::SnapshotCreate {
+            name: "slot".into(),
+            from: Some("base".into()),
+        }),
+    );
+    let slot = h.mount.join("slot");
+    assert_eq!(
+        read(&slot.join("big.bin")),
+        big,
+        "the clone lost the big file"
+    );
+    std::fs::write(slot.join("only-slot"), b"x").expect("write into the clone");
+    sync_dir(&slot);
+    assert!(
+        !base.join("only-slot").exists(),
+        "the clone leaked into base"
+    );
+    assert_eq!(h.names(), ["base", "slot"]);
+
+    // The clone's own file is dropped and base's file is kept by a reset. Read the store through
+    // a fresh daemon-side view instead of the mount: what the mount shows right after a reset is
+    // bounded by the adapter's cache (actimeo 120 s on NFS), not by the reset.
+    ok(
+        &h,
+        Request::SnapshotReset(cowfs_ctl::SnapshotReset {
+            name: "slot".into(),
+            from: "base".into(),
+            expect_no_holders: true,
+        }),
+    );
+    assert_eq!(
+        h.names(),
+        ["base", "slot"],
+        "a reset keeps one snapshot per name"
+    );
+    assert!(
+        !h.snapshot_has("slot", "only-slot"),
+        "the reset left the clone's file"
+    );
+    assert!(
+        h.snapshot_has("slot", "big.bin"),
+        "the reset lost the base's file"
+    );
+
+    // SIGTERM: unmount, close the store, leave nothing. Then the same daemon again on the same
+    // store, which is the only proof the bytes were made durable and the store reopened.
+    let mount = h.mount.clone();
+    h.kill("TERM");
+    assert!(
+        !cowfs_daemon::mounts::is_mounted(&mount),
+        "the mount outlived SIGTERM"
+    );
+    assert!(!h.socket.exists(), "the socket outlived SIGTERM");
+    h.start();
+    assert!(
+        cowfs_daemon::mounts::is_mounted(&mount),
+        "the second daemon did not mount"
+    );
+    assert_eq!(
+        h.names(),
+        ["base", "slot"],
+        "the snapshots did not survive SIGTERM"
+    );
+    assert_eq!(
+        read(&h.mount.join("base").join("big.bin")),
+        big,
+        "the big file did not survive SIGTERM"
+    );
+    assert!(
+        !h.snapshot_has("base", "only-slot"),
+        "a file from the clone appeared in base"
+    );
+    assert!(
+        h.snapshot_has("base", "d/e/f"),
+        "a nested file went missing"
+    );
+
+    // SIGKILL: nothing can clean up, so the next start sweeps the mount, reopens the store (the
+    // lock is gone with the process) and finds the fsynced bytes.
+    h.kill("KILL");
+    assert!(
+        cowfs_daemon::mounts::is_mounted(&mount),
+        "SIGKILL should have left the mount behind, otherwise this proves nothing"
+    );
+    h.start();
+    assert!(
+        cowfs_daemon::mounts::is_mounted(&mount),
+        "the third daemon did not mount"
+    );
+    assert_eq!(
+        read(&h.mount.join("base").join("big.bin")),
+        big,
+        "the fsynced bytes did not survive SIGKILL"
+    );
+    assert_eq!(
+        h.names(),
+        ["base", "slot"],
+        "the snapshots did not survive SIGKILL"
+    );
+    let (code, body) = h.call(Request::Status(Default::default()));
+    assert_eq!(code, 0, "{body}");
+    let status: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(status["block_count"].as_u64().unwrap_or(0) > 0, "{body}");
+    ok(&h, Request::Shutdown(NoParams {}));
+}
+
+/// The core refuses to open a store with unacknowledged damage, and says so.
+#[test]
+#[ignore = "needs a real mount adapter"]
+fn the_core_refuses_a_store_that_reports_damage_and_does_not_acknowledge_it() {
+    let Some(mut h) = Host::new(cowfs_daemon::BackendKind::Core) else {
+        return;
+    };
+    h.start();
+    ok(
+        &h,
+        Request::SnapshotCreate(cowfs_ctl::SnapshotCreate {
+            name: "base".into(),
+            from: None,
+        }),
+    );
+    let f = h.mount.join("base").join("f");
+    std::fs::write(&f, b"durable\n").unwrap();
+    sync_file(&f);
+    ok(&h, Request::Shutdown(NoParams {}));
+    assert!(!h.socket.exists());
+
+    // Destroy a pack: the data a completed sync made durable is gone, and nothing acknowledged
+    // it. Opening must refuse and name the loss.
+    let packs = std::fs::read_dir(h.store.join("packs")).expect("the store has packs");
+    let mut hit = false;
+    for entry in packs.flatten() {
+        let p = entry.path();
+        if p.extension().is_some_and(|e| e == "pack") {
+            let bytes = std::fs::read(&p).unwrap();
+            let m = bytes.len() / 2;
+            std::fs::write(&p, &bytes[..m]).unwrap();
+            hit = true;
+            break;
+        }
+    }
+    assert!(hit, "no pack file to damage");
+    let out = Command::new(daemon_bin())
+        .args(["--store", &h.store.display().to_string()])
+        .args(["--mount", &h.mount.display().to_string()])
+        .args(["--socket", &h.socket.display().to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("the daemon binary runs");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a damaged store must not be served"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("corruption") || err.contains("lost"), "{err}");
+    assert!(!h.socket.exists(), "a refused store bound nothing");
+}
+
+/// A path in the store's snapshot namespace as the daemon itself sees it, without the mount's
+/// cache in the way: a second daemon opened on the same store, asked over the control socket.
+impl Host {
+    fn names(&self) -> Vec<String> {
+        let (code, body) = self.call(Request::SnapshotList(Default::default()));
+        assert_eq!(code, 0, "snapshot_list: {body}");
+        let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let mut names: Vec<String> = listed["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// True when `snapshot` has `path`, read through a fresh export rather than the default
+    /// mount. A new mount has no cached attributes, so this reports what the store holds rather
+    /// than what the adapter last saw.
+    fn snapshot_has(&self, snapshot: &str, path: &str) -> bool {
+        let at = self.root.join(slot_for(snapshot, path)).join("repo");
+        let (code, body) = self.call(Request::MountSnapshot(cowfs_ctl::MountSnapshot {
+            name: snapshot.into(),
+            path: at.display().to_string(),
+            expect_no_holders: true,
+        }));
+        assert_eq!(code, 0, "exporting {snapshot}: {body}");
+        let there = at.join(path).exists();
+        let (code, body) = self.call(Request::UnmountSnapshot(cowfs_ctl::UnmountSnapshot {
+            path: at.display().to_string(),
+        }));
+        assert_eq!(code, 0, "removing the export: {body}");
+        there
+    }
+}
+
+/// A slot name for one check, unique per call so no export is ever reused.
+fn slot_for(snapshot: &str, path: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "s{}-{snapshot}-{}-{}",
+        NEXT.fetch_add(1, Ordering::SeqCst),
+        path.replace(['/', '.'], "_"),
+        std::process::id()
+    )
+}
+
+fn read(p: &std::path::Path) -> Vec<u8> {
+    std::fs::read(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+}
+
+fn ok(h: &Host, request: Request) -> String {
+    let (code, body) = h.call(request);
+    assert_eq!(code, 0, "{body}");
+    body
+}
+
+fn sync_file(p: &std::path::Path) {
+    let f = std::fs::File::open(p).expect("open to fsync");
+    f.sync_all()
+        .unwrap_or_else(|e| panic!("fsync {}: {e}", p.display()));
+}
+
+fn sync_dir(p: &std::path::Path) {
+    let d = std::fs::File::open(p).expect("open the directory to fsync");
+    let _ = d.sync_all();
 }

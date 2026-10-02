@@ -6,7 +6,7 @@
 //! default mount, then stops the control server and closes the backend, all synchronously:
 //! nothing is left for a later process to clean up.
 
-use crate::backend::{Backend, PathBackend};
+use crate::backend::{Backend, CoreBackend, PathBackend};
 use crate::exports::Exports;
 use crate::handler::Handler;
 use crate::mounts::{self, Mounted};
@@ -16,10 +16,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Which backend the daemon serves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum BackendKind {
+    /// `cowfs-core`: the block store, the metadata tree and O(1) snapshots.
+    #[default]
+    Core,
+    /// A directory of a native filesystem, one directory per snapshot. No store, so a clone is a
+    /// copy. For a store that already exists on another filesystem, and for tests.
+    Path,
+}
+
 /// What the daemon was asked to serve.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonConfig {
-    /// Block store directory. With the passthrough backend it holds one directory per snapshot.
+    /// Block store directory. With [`BackendKind::Path`] it holds one directory per snapshot.
     pub store: PathBuf,
     /// Where the default mount goes.
     pub mount: PathBuf,
@@ -28,16 +39,20 @@ pub struct DaemonConfig {
     /// Directories a client may export a snapshot inside. Empty means `mount_snapshot` refuses
     /// every path, which is the safe default.
     pub export_roots: Vec<PathBuf>,
+    /// Which backend serves the store.
+    pub backend: BackendKind,
 }
 
 impl DaemonConfig {
-    /// The default configuration for a store, a mount point and a socket.
+    /// The default configuration for a store, a mount point and a socket: the core backend,
+    /// because that is the real one.
     pub fn new(store: impl AsRef<Path>, mount: impl AsRef<Path>, socket: impl AsRef<Path>) -> Self {
         Self {
             store: store.as_ref().to_owned(),
             mount: mount.as_ref().to_owned(),
             socket: socket.as_ref().to_owned(),
             export_roots: Vec::new(),
+            backend: BackendKind::default(),
         }
     }
 
@@ -45,6 +60,13 @@ impl DaemonConfig {
     #[must_use]
     pub fn with_export_root(mut self, root: impl AsRef<Path>) -> Self {
         self.export_roots.push(root.as_ref().to_owned());
+        self
+    }
+
+    /// Serves a different backend.
+    #[must_use]
+    pub fn with_backend(mut self, backend: BackendKind) -> Self {
+        self.backend = backend;
         self
     }
 }
@@ -134,7 +156,7 @@ impl Daemon {
     /// gone. Synchronous, so the caller knows nothing is mounted and no socket is left when it
     /// returns.
     pub fn stop(&self) -> Vec<String> {
-        let problems = self.handler.shutdown_mount_tree();
+        let problems = self.shutdown();
         self.server_handle.shutdown();
         self.wait_stopped();
         problems
@@ -144,7 +166,18 @@ impl Daemon {
     /// request both end here, because both make the server stop.
     pub fn run(&self) -> Vec<String> {
         self.wait_stopped();
-        self.handler.shutdown_mount_tree()
+        self.shutdown()
+    }
+
+    /// Unmounts every export and the default mount, then closes the backend. The backend goes
+    /// last because it holds the store lock, and the mount must be gone before the tree it
+    /// serves is closed underneath it.
+    fn shutdown(&self) -> Vec<String> {
+        let mut problems = self.handler.shutdown_mount_tree();
+        if let Err(e) = self.handler.close_backend() {
+            problems.push(format!("closing the backend: {e}"));
+        }
+        problems
     }
 
     /// Joins the control server if this call owns it, and waits for the owner otherwise. The
@@ -188,10 +221,13 @@ impl Daemon {
 /// when the handler is dropped or when its `shutdown` runs.
 pub fn open_handler(config: &DaemonConfig) -> Result<Arc<Handler>, DaemonError> {
     prepare_platform(&config.mount);
-    let backend: Arc<dyn Backend> = Arc::new(
-        PathBackend::open(&config.store)
-            .map_err(|e| DaemonError::Open(format!("{}: {e}", config.store.display())))?,
-    );
+    let open = |e: std::io::Error| DaemonError::Open(format!("{}: {e}", config.store.display()));
+    let backend: Arc<dyn Backend> = match config.backend {
+        BackendKind::Core => Arc::new(
+            CoreBackend::open(&config.store, cowfs_core::Options::default()).map_err(open)?,
+        ),
+        BackendKind::Path => Arc::new(PathBackend::open(&config.store).map_err(open)?),
+    };
     let store = backend.store_path().to_owned();
     std::fs::create_dir_all(&config.mount)
         .map_err(|e| DaemonError::Open(format!("{}: {e}", config.mount.display())))?;

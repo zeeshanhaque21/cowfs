@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 cowfs-ctl = { path = "../cowfs-ctl" }
+cowfs-core = { path = "../cowfs-core" }
+cowfs-store = { path = "../cowfs-store" }
 cowfs-vfs = { path = "../cowfs-vfs" }
 cowfs-vfs-path = { path = "../cowfs-vfs-path" }
 cowfs-vfs-test = { path = "../cowfs-vfs-test" }

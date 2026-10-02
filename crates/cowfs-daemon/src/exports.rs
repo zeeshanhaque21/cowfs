@@ -14,7 +14,10 @@ use crate::backend::Backend;
 use crate::daemon::uid;
 use crate::holders;
 use crate::mounts::Mounted;
-use cowfs_ctl::{validate_abs_path, validate_snapshot_name, CtlError, CtlResult, ErrorCode};
+use cowfs_ctl::{
+    validate_abs_path, validate_snapshot_name, CtlError, CtlResult, ErrorCode, MountSnapshot,
+    UnmountSnapshot,
+};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -23,24 +26,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// How many components below an export root a path must sit, so it is at least
 /// `{root}/{pool}/{slot}/{repo}`.
 pub const MIN_COMPONENTS_BELOW_ROOT: usize = 3;
-
-/// A `mount_snapshot` request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MountSnapshot {
-    /// The snapshot to export. Must pass `validate_snapshot_name` and exist.
-    pub name: String,
-    /// Where to export it.
-    pub path: String,
-    /// Fail `busy` when a holder exists, checked under the same lock as the export.
-    pub expect_no_holders: bool,
-}
-
-/// An `unmount_snapshot` request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnmountSnapshot {
-    /// The path the daemon exported.
-    pub path: String,
-}
 
 fn invalid(why: impl Into<String>) -> CtlError {
     CtlError::new(ErrorCode::InvalidParams, why.into())
