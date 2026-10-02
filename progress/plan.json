@@ -275,12 +275,12 @@
         },
         {
           "id": "56",
-          "title": "daemon on the real core backend (PR #56)",
-          "state": "fixing",
-          "owner": "builder (subagent)",
+          "title": "#56 daemon on the real core backend (merged)",
+          "state": "done",
+          "owner": "lead",
           "pr": "#56",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/56",
-          "detail": "Builder done (head 9b2d62a), CI green. Core is now the default daemon backend: clone = fork_snapshot, reset = promote_base, rename = rename_snapshot; a store with unacknowledged damage is refused at open. ctl gained mount_snapshot and unmount_snapshot with the holder check under the framework's per-snapshot lock (issue #51 items 1-2). Two real daemon bugs found by the end-to-end run and fixed: expect_no_holders scanned the store instead of the mount; the store lock released at drop instead of in order. 5 real-mount e2e tests: all pass on Linux FUSE; on macOS NFS 2 FAIL on #53. Smoke (VM, FUSE, 2% scale, 1 rep, load1 0.07): g4 0.003 to 0.345 s, g5 write 5792 to 46 MiB/s, g6 9 ms to 511 ms: tiny corpus, treat as a first look only. NOT MERGED: the PR commits smoke-run artifacts under progress/smoke-core (store files, lock, socket lock), which must go; branch is 4 behind main; macOS is broken on core until #53. Builder cleaning and merging main."
+          "detail": "Builder done (head 9b2d62a), CI green. Core is now the default daemon backend: clone = fork_snapshot, reset = promote_base, rename = rename_snapshot; a store with unacknowledged damage is refused at open. ctl gained mount_snapshot and unmount_snapshot with the holder check under the framework's per-snapshot lock (issue #51 items 1-2). Two real daemon bugs found by the end-to-end run and fixed: expect_no_holders scanned the store instead of the mount; the store lock released at drop instead of in order. 5 real-mount e2e tests: all pass on Linux FUSE; on macOS NFS 2 FAIL on #53. Smoke (VM, FUSE, 2% scale, 1 rep, load1 0.07): g4 0.003 to 0.345 s, g5 write 5792 to 46 MiB/s, g6 9 ms to 511 ms: tiny corpus, treat as a first look only. MERGED at c4187ef after the builder removed the committed smoke artifacts (verified: no progress/ files in the diff, no store binaries), merged main, and documented that macOS NFS on core is broken until #53. My checks: scope clean, CI green on both platforms, fmt/clippy clean, 124 daemon+ctl tests pass. Not independently re-run: the 5 real-mount e2e tests and the smoke numbers."
         },
         {
           "id": "53",
