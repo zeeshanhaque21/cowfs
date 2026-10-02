@@ -420,15 +420,18 @@ fn a_recycled_inode_number_never_hands_out_the_file_that_took_it() {
     let a_id = backing_id(&scratch.0, "a");
     let b = v.create(ROOT_INO, b"b", 0o644).expect("create").ino;
     v.write(b, 0, b"other").expect("write");
-    // Another writer puts `b` where `a`'s name was, which leaves `a` unlinked: its number is
-    // free, and any file made from now on may take it.
-    std::fs::rename(scratch.0.join("b"), scratch.0.join("a")).expect("replace the name");
-    // Cold the descriptor cache, so reading `a` has to go back to the filesystem by name.
+    // Cold the descriptor cache before the name is replaced, so no padding file can be the one
+    // that takes the freed number and reading `a` has to go back to the filesystem by name.
     for i in 0..pads() {
         v.create(ROOT_INO, format!("pad{i}").as_bytes(), 0o644)
             .expect("pad");
     }
+    // Another writer puts `b` where `a`'s name was, which leaves `a` unlinked: its number is
+    // free, and the next file made may take it.
+    std::fs::rename(scratch.0.join("b"), scratch.0.join("a")).expect("replace the name");
     std::fs::write(scratch.0.join("newcomer"), b"theirs").expect("create outside");
+    // This file is the first made after the replacement, so where the filesystem recycles it has
+    // the freed number already, and `fake_inode` gives it that number where it does not.
     let _fake = sys::fake_inode(backing_id(&scratch.0, "newcomer").1, a_id.1);
 
     let theirs = v.lookup(ROOT_INO, b"newcomer").expect("lookup").ino;
