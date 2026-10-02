@@ -71,6 +71,15 @@ fn mount_conformance() {
     if opts.timeout.is_none() {
         opts.timeout = std::time::Duration::from_secs(300).into();
     }
+    // The Linux page cache owns the bytes a reader sees, so a `Cowfs`-level read/write atomicity
+    // contract is not observable through a mount: the same test body tore 181 of 200 runs through
+    // FUSE, 72 of 200 on native btrfs and 29 of 200 on native tmpfs, with no cowfs code in the
+    // native arms. MemVfs itself is covered by `cowfs-vfs-test`'s own suite. See issue #45.
+    opts.skip.push((
+        "concurrent_readers_and_writers_of_one_file".into(),
+        "not observable through a kernel page cache: native ext4/btrfs/tmpfs tear at this size too"
+            .into(),
+    ));
     let report = run_all(&factory, &opts);
     eprintln!("{}", report.table());
     wait_for_cleanup();
