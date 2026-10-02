@@ -9,7 +9,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--output", type=Path, required=True)
 args = parser.parse_args()
 out = args.output.resolve()
-out.mkdir(parents=True, exist_ok=False)
+out.mkdir(mode=0o700, parents=True, exist_ok=False)
 repo = Path(__file__).resolve().parents[1]
 source = out / "source"
 source.mkdir()
@@ -55,6 +55,9 @@ with (out / "daemon.log").open("wb", buffering=0) as log:
         cli("snapshot", "list")
         first = cli("import", source, "--store-name", "sample")
         (out / "first.json").write_text(first.stdout)
+        first_report = json.loads(first.stdout)
+        assert first_report["verified"]
+        assert first_report["source_root_hash"] == first_report["imported_root_hash"]
         imported = mount / "sample"
         for name, data in files.items():
             assert (imported / name).read_bytes() == data, name
@@ -68,6 +71,9 @@ with (out / "daemon.log").open("wb", buffering=0) as log:
         assert duplicate.returncode != 0 and "already_exists" in duplicate.stdout + duplicate.stderr
         second = cli("import", source, "--store-name", "sample2")
         (out / "second.json").write_text(second.stdout)
+        second_report = json.loads(second.stdout)
+        assert second_report["verified"] and second_report["stored_bytes"] == 0
+        assert second_report["imported_root_hash"] == first_report["imported_root_hash"]
         bad = out / "unsupported"
         bad.mkdir()
         os.mkfifo(bad / "pipe")
