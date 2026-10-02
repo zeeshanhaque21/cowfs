@@ -608,3 +608,210 @@ fn bounded_connect(path: &std::path::Path) -> Client {
         panic!("never served");
     })
 }
+
+/// Records what the framework let through to a handler, and whether two exports of one snapshot
+/// ever overlapped: the handler holds the guard lock for its whole call, so they cannot.
+struct ExportGate {
+    calls: AtomicU64,
+    in_flight: Arc<AtomicU64>,
+    overlapped: Arc<AtomicBool>,
+    seen: std::sync::Mutex<Vec<String>>,
+    holders: Vec<String>,
+}
+
+impl ExportGate {
+    fn overlapped(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.overlapped)
+    }
+}
+
+impl ControlHandler for ExportGate {
+    fn holders(&self, name: &str) -> CtlResult<Vec<ProcessInfo>> {
+        Ok(self
+            .holders
+            .iter()
+            .filter(|h| *h == name)
+            .map(|h| ProcessInfo {
+                pid: 7,
+                command: h.clone(),
+                holds: vec![],
+            })
+            .collect())
+    }
+
+    fn mount_snapshot(
+        &self,
+        params: &MountSnapshot,
+        guard: &HolderGuard<'_>,
+    ) -> CtlResult<MountInfo> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _serialised = guard.lock();
+        if self.in_flight.fetch_add(1, Ordering::SeqCst) > 0 {
+            self.overlapped.store(true, Ordering::SeqCst);
+        }
+        thread::sleep(Duration::from_millis(120));
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.seen.lock().unwrap().push(params.path.clone());
+        Ok(MountInfo {
+            mount_path: params.path.clone(),
+            adapter: "gate".into(),
+            mounted: true,
+        })
+    }
+
+    fn unmount_snapshot(&self, params: &UnmountSnapshot) -> CtlResult<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut seen = self.seen.lock().unwrap();
+        if let Some(at) = seen.iter().position(|p| *p == params.path) {
+            seen.remove(at);
+            Ok(())
+        } else {
+            Err(CtlError::not_found(format!(
+                "{} is not an export",
+                params.path
+            )))
+        }
+    }
+}
+
+#[test]
+fn mount_snapshot_is_gated_by_the_framework_the_way_a_removal_is() {
+    let _w = Watchdog::start(60);
+    let gate = Arc::new(ExportGate {
+        calls: AtomicU64::default(),
+        in_flight: Arc::default(),
+        overlapped: Arc::default(),
+        seen: Default::default(),
+        holders: vec!["held".into()],
+    });
+    let overlapped = gate.overlapped();
+    let fx = start_arc(gate.clone(), ServerOptions::default());
+    let mut r = Raw::hello(&fx.path);
+
+    // A holder, and no `expect_no_holders` in the request: the field defaults to true, and the
+    // framework refuses before the handler runs at all.
+    assert_eq!(
+        code_of(&req(
+            &mut r,
+            1,
+            "mount_snapshot",
+            json!({"name": "held", "path": "/srv/pool/slot/repo"})
+        )),
+        "busy"
+    );
+    assert_eq!(
+        gate.calls.load(Ordering::SeqCst),
+        0,
+        "the handler must not run"
+    );
+
+    // The same export with the check waived goes through, under the framework's lock.
+    let f = req(
+        &mut r,
+        2,
+        "mount_snapshot",
+        json!({"name": "free", "path": "/srv/pool/slot/repo", "expect_no_holders": false}),
+    );
+    assert_eq!(f["result"]["kind"], "mount_info", "{f}");
+
+    // Two exports of one snapshot at once must serialise, which only happens if the handler holds
+    // the framework's per-snapshot lock for its whole call.
+    let path = fx.path.clone();
+    let racer = thread::spawn(move || {
+        bounded(30, move || {
+            let mut c = Client::connect(&path).unwrap();
+            c.call(Request::MountSnapshot(MountSnapshot {
+                name: "free".into(),
+                path: "/srv/pool/slot/racer".into(),
+                expect_no_holders: false,
+            }))
+            .unwrap()
+        })
+    });
+    thread::sleep(Duration::from_millis(20));
+    let f = req(
+        &mut r,
+        9,
+        "mount_snapshot",
+        json!({"name": "free", "path": "/srv/pool/slot/second", "expect_no_holders": false}),
+    );
+    assert_eq!(f["result"]["kind"], "mount_info", "{f}");
+    racer.join().unwrap();
+    assert!(
+        !overlapped.load(Ordering::SeqCst),
+        "two exports of one snapshot overlapped, so the guard lock was not held"
+    );
+
+    assert_eq!(
+        code_of(&req(
+            &mut r,
+            3,
+            "unmount_snapshot",
+            json!({"path": "/srv/pool/slot/repo"})
+        )),
+        "not-an-error"
+    );
+    assert_eq!(
+        code_of(&req(
+            &mut r,
+            4,
+            "unmount_snapshot",
+            json!({"path": "/srv/pool/slot/nothing"})
+        )),
+        "not_found",
+        "a path this daemon did not export is not_found, not a silent success"
+    );
+
+    // Validation is the framework's, and it is strict: a relative path, a bad snapshot name and
+    // an unknown field all fail before the handler.
+    assert_eq!(
+        code_of(&req(
+            &mut r,
+            5,
+            "mount_snapshot",
+            json!({"name": "free", "path": "relative/path"})
+        )),
+        "invalid_params"
+    );
+    assert_eq!(
+        code_of(&req(
+            &mut r,
+            6,
+            "mount_snapshot",
+            json!({"name": "bad/name", "path": "/srv/pool/slot/repo"})
+        )),
+        "invalid_params"
+    );
+    assert_eq!(
+        code_of(&req(
+            &mut r,
+            7,
+            "mount_snapshot",
+            json!({"name": "free", "path": "/srv/pool/slot/repo", "expect_no_holder": true})
+        )),
+        "invalid_params",
+        "a misspelled option must not be silently dropped"
+    );
+    assert_eq!(
+        code_of(&req(
+            &mut r,
+            8,
+            "unmount_snapshot",
+            json!({"path": "/srv/pool/slot/repo", "extra": 1})
+        )),
+        "invalid_params"
+    );
+    assert_eq!(
+        gate.calls.load(Ordering::SeqCst),
+        5,
+        "three exports, one unmount of a real export and one of a path that was not one"
+    );
+    assert!(
+        !gate
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&"/srv/pool/slot/repo".to_owned()),
+        "the unmounted export is gone"
+    );
+}

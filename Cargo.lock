@@ -271,9 +271,11 @@ name = "cowfs-daemon"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "cowfs-core",
  "cowfs-ctl",
  "cowfs-fuse",
  "cowfs-nfs",
+ "cowfs-store",
  "cowfs-vfs",
  "cowfs-vfs-path",
  "cowfs-vfs-test",

@@ -1,19 +1,21 @@
 //! The backend seam: what the daemon serves, and the snapshot namespace above it.
 //!
-//! `PathBackend` is the real backend today: a directory of a native filesystem, every
-//! snapshot a directory under it. `MemBackend` keeps everything in memory. `cowfs-core`
-//! plugs in later by implementing the same two traits, and nothing above this line changes.
+//! `CoreBackend` is the real backend: `cowfs-core`'s `Vfs` over the block store, whose root lists
+//! the snapshots and whose control plane is the snapshot namespace. `PathBackend` serves a
+//! directory of a native filesystem and exists for the tests that need no store; `MemBackend`
+//! keeps everything in memory.
 //!
-//! A snapshot set answers with tree operations, not a `Vfs`: a snapshot is not one
-//! filesystem, it is one entry in a namespace whose root the mount shows. That is why the
-//! mount's root needs no synthetic layer here: the directories are already there.
+//! A snapshot set answers with tree operations, not a `Vfs`: a snapshot is not one filesystem,
+//! it is one entry in a namespace whose root the mount shows. That is why the mount's root needs
+//! no synthetic layer here: the entries are already there.
 
+use cowfs_core::Core;
 use cowfs_ctl::{BaseMeta, SnapshotInfo};
 use cowfs_vfs::Vfs;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The snapshot namespace a daemon serves.
 pub trait Snapshots: Send + Sync + fmt::Debug {
@@ -52,6 +54,320 @@ pub trait Backend: Send + Sync + fmt::Debug {
 
     /// The namespace operations a control handler needs.
     fn snapshots(&self) -> &dyn Snapshots;
+
+    /// Bytes and blocks to report, or `None` when the backend has no block store and the caller
+    /// counts the tree itself.
+    fn usage(&self) -> io::Result<Option<Usage>> {
+        Ok(None)
+    }
+
+    /// Makes everything durable and releases whatever the store holds. Called after the mount is
+    /// gone, so a backend that locks its store releases the lock here and not at drop.
+    fn close(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// True when a directory can be copied in as a snapshot, which only a backend whose snapshots
+    /// are directories can do. A content-addressed backend needs a writer, so it says no rather
+    /// than writing a tree where its store cannot read it back.
+    fn ingests_directories(&self) -> bool {
+        false
+    }
+
+    /// Re-hashes every block, or `None` when the backend has no block store to check.
+    fn fsck(&self) -> io::Result<Option<cowfs_store::FsckReport>> {
+        Ok(None)
+    }
+}
+
+/// What a block store holds, for `status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    /// Unique blocks in the store.
+    pub blocks: u64,
+    /// Sum of the uncompressed sizes of those blocks.
+    pub logical_bytes: u64,
+    /// Bytes those blocks take on disk, headers and compression included.
+    pub stored_bytes: u64,
+}
+
+/// The handle every backend operation shares, so `close` can take the last one.
+type CoreSlot = Arc<Mutex<Option<Core>>>;
+
+/// A backend over `cowfs-core`: the `Vfs` over the block store, whose root lists the snapshots
+/// and whose control plane is the snapshot namespace.
+///
+/// `Core` sits behind a lock in an `Option`, not held directly, because [`Core::close`] needs the
+/// last handle and every method here takes `&self`.
+pub struct CoreBackend {
+    core: CoreSlot,
+    snaps: CoreSnapshots,
+    store: PathBuf,
+}
+
+impl fmt::Debug for CoreBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreBackend")
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CoreBackend {
+    /// Opens the store and metadata under `store`, created if absent.
+    ///
+    /// `cowfs-core` refuses to open a store that reports damage to data a completed sync made
+    /// durable. That refusal is surfaced as it stands: the loss is not acknowledged for the
+    /// operator, because accepting it is their decision.
+    pub fn open(store: impl AsRef<Path>, opts: cowfs_core::Options) -> io::Result<Self> {
+        let store = store.as_ref().to_owned();
+        let core = Arc::new(Mutex::new(Some(Core::open(&store, opts).map_err(|e| {
+            io::Error::other(format!(
+                "{}: {e}. cowfs did not acknowledge the loss; the store needs an operator's \
+                     decision (docs/v1-store.md)",
+                store.display()
+            ))
+        })?)));
+        Ok(Self {
+            snaps: CoreSnapshots {
+                core: Arc::clone(&core),
+                bases: Mutex::new(Default::default()),
+            },
+            core,
+            store,
+        })
+    }
+}
+
+/// The snapshot namespace of a `Core`. Every method is the core's own control plane: a clone is a
+/// fork, a reset is a staged swap, and no tree is ever copied.
+///
+/// `base` is the one thing the core does not track, so the daemon keeps it, as `PathSnapshots`
+/// does: `snapshot_promote` says how a snapshot is used, not what is in it.
+#[derive(Debug)]
+pub struct CoreSnapshots {
+    core: CoreSlot,
+    bases: Mutex<std::collections::BTreeSet<String>>,
+}
+
+/// Runs `f` against the core in `slot`, or fails once the backend has been closed.
+fn with_core<T>(slot: &CoreSlot, f: impl FnOnce(&Core) -> io::Result<T>) -> io::Result<T> {
+    let guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    match guard.as_ref() {
+        Some(core) => f(core),
+        None => Err(io::Error::other("the core backend is closed")),
+    }
+}
+
+fn missing(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("snapshot {name:?} does not exist"),
+    )
+}
+
+impl CoreSnapshots {
+    fn with<T>(&self, f: impl FnOnce(&Core) -> io::Result<T>) -> io::Result<T> {
+        with_core(&self.core, f)
+    }
+
+    fn info(&self, name: &str) -> io::Result<SnapshotInfo> {
+        let is_base = self.is_base(name);
+        self.with(|c| {
+            let all = CoreSnapshots::names(c)?;
+            let entry = all
+                .iter()
+                .find(|e| e.name == name)
+                .ok_or_else(|| missing(name))?;
+            Ok(core_info(entry, &all, is_base))
+        })
+    }
+
+    fn is_base(&self, name: &str) -> bool {
+        self.bases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(name)
+    }
+
+    /// The core's `list_snapshots`.
+    fn names(core: &Core) -> io::Result<Vec<cowfs_core::SnapshotEntry>> {
+        core.list_snapshots().map_err(control_io)
+    }
+}
+
+/// A control-plane error as an `io::Error`, keeping which refusal it was: the handler maps the
+/// kind to a protocol error code, so `already_exists` and `busy` must not become one code.
+fn control_io(e: cowfs_core::ControlError) -> io::Error {
+    let kind = match &e {
+        cowfs_core::ControlError::InvalidName(_) => io::ErrorKind::InvalidInput,
+        cowfs_core::ControlError::Exists => io::ErrorKind::AlreadyExists,
+        cowfs_core::ControlError::NotFound => io::ErrorKind::NotFound,
+        cowfs_core::ControlError::Busy => io::ErrorKind::WouldBlock,
+        cowfs_core::ControlError::Fs(e) => match e {
+            cowfs_vfs::Error::NotFound => io::ErrorKind::NotFound,
+            cowfs_vfs::Error::Exists => io::ErrorKind::AlreadyExists,
+            cowfs_vfs::Error::PermissionDenied => io::ErrorKind::PermissionDenied,
+            cowfs_vfs::Error::NotSupported => io::ErrorKind::Unsupported,
+            cowfs_vfs::Error::InvalidArgument => io::ErrorKind::InvalidInput,
+            _ => io::ErrorKind::Other,
+        },
+    };
+    io::Error::new(kind, e)
+}
+
+/// The `SnapshotInfo` of one core snapshot entry, with the parent's name resolved from its id.
+fn core_info(
+    entry: &cowfs_core::SnapshotEntry,
+    all: &[cowfs_core::SnapshotEntry],
+    is_base: bool,
+) -> SnapshotInfo {
+    SnapshotInfo {
+        name: entry.name.clone(),
+        parent: entry
+            .parent
+            .and_then(|id| all.iter().find(|n| n.id == id))
+            .map(|n| n.name.clone()),
+        base: is_base.then_some(BaseMeta {
+            repo: None,
+            git_ref: None,
+            commit: None,
+        }),
+        created_unix_ms: u64::try_from(entry.created.secs)
+            .unwrap_or(0)
+            .saturating_mul(1000)
+            .saturating_add(u64::from(entry.created.nanos / 1_000_000)),
+    }
+}
+
+impl Backend for CoreBackend {
+    fn root(&self) -> io::Result<Arc<dyn Vfs>> {
+        // The core's root already lists the snapshots, so the default mount needs no wrapper.
+        with_core(&self.core, |c| Ok(Arc::new(c.clone()) as Arc<dyn Vfs>))
+    }
+
+    fn snapshot(&self, name: &str) -> io::Result<Arc<dyn Vfs>> {
+        with_core(&self.core, |c| {
+            Ok(Arc::new(c.snapshot_view(name).map_err(control_io)?) as Arc<dyn Vfs>)
+        })
+    }
+
+    fn store_path(&self) -> &Path {
+        &self.store
+    }
+
+    fn snapshots(&self) -> &dyn Snapshots {
+        &self.snaps
+    }
+
+    fn usage(&self) -> io::Result<Option<Usage>> {
+        with_core(&self.core, |c| {
+            let s = c.store().stats();
+            Ok(Some(Usage {
+                blocks: s.blocks,
+                logical_bytes: s.uncompressed_bytes,
+                stored_bytes: s.stored_bytes,
+            }))
+        })
+    }
+
+    /// The core needs a writer to ingest a directory, which it has through the mount and not
+    /// through the store directory, so `import` refuses here rather than writing a tree the core
+    /// cannot read back as a snapshot.
+    fn ingests_directories(&self) -> bool {
+        false
+    }
+
+    fn fsck(&self) -> io::Result<Option<cowfs_store::FsckReport>> {
+        with_core(&self.core, |c| {
+            c.fsck()
+                .map(Some)
+                .map_err(|e| io::Error::other(e.to_string()))
+        })
+    }
+
+    fn close(&self) -> io::Result<()> {
+        let taken = self
+            .core
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match taken {
+            Some(core) => core
+                .close()
+                .map_err(|e| io::Error::other(format!("closing the core: {e}"))),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Snapshots for CoreSnapshots {
+    fn list(&self) -> io::Result<Vec<String>> {
+        self.with(|c| Ok(Self::names(c)?.into_iter().map(|e| e.name).collect()))
+    }
+
+    fn create(&self, name: &str, from: Option<&str>) -> io::Result<SnapshotInfo> {
+        self.with(|c| {
+            let entry = match from {
+                None => c.create_snapshot(name),
+                Some(from) => c.fork_snapshot(from, name),
+            };
+            entry.map_err(control_io).map(|_| ())
+        })?;
+        self.info(name)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        self.with(|c| c.remove_snapshot(name).map_err(control_io).map(|_| ()))
+    }
+
+    fn swap(&self, name: &str, from: &str) -> io::Result<SnapshotInfo> {
+        // Replacing `name` with a clone of `from` is what the core's staged swap does for a base:
+        // one fork and one rename, with an intent record, so a crash mid-way is finished on the
+        // next open rather than losing the old snapshot.
+        self.with(|c| {
+            // `promote_base` creates its target when it is absent, which is what a base wants and
+            // a reset does not: `snapshot_reset` replaces a snapshot, so a missing one is
+            // `not_found` rather than a new snapshot that was never asked for.
+            for n in [name, from] {
+                Self::names(c)?
+                    .into_iter()
+                    .any(|e| e.name == n)
+                    .then_some(())
+                    .ok_or_else(|| missing(n))?;
+            }
+            c.promote_base(from, name).map_err(control_io).map(|_| ())
+        })?;
+        let mut info = self.info(name)?;
+        // The core forks twice: `from` into a staging name, then the staging name into `name`. So
+        // the parent it records is the staging snapshot, which the swap then removes. The
+        // protocol's `parent` is the snapshot this one was cloned from, which is `from`.
+        info.parent = Some(from.to_owned());
+        Ok(info)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.with(|c| c.rename_snapshot(from, to).map_err(control_io).map(|_| ()))
+    }
+
+    fn promote(&self, name: &str) -> io::Result<SnapshotInfo> {
+        self.with(|c| {
+            Self::names(c)?
+                .into_iter()
+                .any(|e| e.name == name)
+                .then_some(())
+                .ok_or_else(|| missing(name))
+        })?;
+        self.bases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(name.to_owned());
+        self.info(name)
+    }
+
+    fn create_meta(&self, name: &str) -> io::Result<SnapshotInfo> {
+        self.info(name)
+    }
 }
 
 /// A backend over a directory of a native filesystem. It has no block store, so `status`
@@ -75,6 +391,10 @@ impl PathBackend {
 }
 
 impl Backend for PathBackend {
+    fn ingests_directories(&self) -> bool {
+        true
+    }
+
     fn root(&self) -> io::Result<Arc<dyn Vfs>> {
         Ok(Arc::new(cowfs_vfs_path::PathVfs::new(&self.store)?))
     }
@@ -332,6 +652,160 @@ impl Backend for MemBackend {
     }
 }
 
+/// Bytes a file of `n` bytes of that pattern holds, so a write through the core can be checked
+/// against what it should be without keeping the pattern in the test.
+#[cfg(test)]
+fn pattern(n: u64) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A core over a temp dir, with its store closed by the end of the test whatever happens.
+    fn core() -> (tempfile::TempDir, CoreBackend) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = CoreBackend::open(dir.path(), cowfs_core::Options::default())
+            .expect("a core over a fresh store");
+        (dir, backend)
+    }
+
+    #[test]
+    fn the_core_namespace_adds_clones_resets_renames_and_removes() {
+        let (_d, b) = core();
+        let s = b.snapshots();
+        assert_eq!(s.list().unwrap(), Vec::<String>::new());
+        assert_eq!(s.create("base", None).unwrap().name, "base");
+        assert_eq!(
+            s.create("slot", Some("base")).unwrap().parent.as_deref(),
+            Some("base"),
+            "a clone knows its parent"
+        );
+        assert_eq!(s.list().unwrap(), ["base", "slot"]);
+        assert_eq!(
+            s.swap("slot", "base").unwrap().parent.as_deref(),
+            Some("base"),
+            "a reset is a clone of the other snapshot"
+        );
+        assert_eq!(s.list().unwrap(), ["base", "slot"]);
+        s.remove("slot").unwrap();
+        assert_eq!(s.list().unwrap(), ["base"]);
+    }
+
+    #[test]
+    fn a_clone_of_the_core_is_o1_and_independent() {
+        let (_d, b) = core();
+        let s = b.snapshots();
+        s.create("base", None).unwrap();
+        s.create("slot", Some("base")).unwrap();
+        // Written through the core's own Vfs, not through the mount: this is the filesystem the
+        // adapters serve, and a write into one clone must not reach the other.
+        let base = b.snapshot("base").unwrap();
+        let slot = b.snapshot("slot").unwrap();
+        let root = cowfs_vfs::ROOT_INO;
+        let file = base.create(root, b"only-base", 0o644).unwrap();
+        let h = base.open(file.ino).unwrap();
+        assert_eq!(base.write(file.ino, 0, b"one").unwrap(), 3);
+        base.release(h).unwrap();
+        assert!(slot.lookup(root, b"only-base").is_err(), "the clone leaked");
+        assert_eq!(base.read(file.ino, 0, 8).unwrap(), b"one");
+        s.remove("slot").unwrap();
+        s.remove("base").unwrap();
+    }
+
+    #[test]
+    fn every_refusal_is_the_error_code_the_protocol_uses() {
+        let (_d, b) = core();
+        let s = b.snapshots();
+        s.create("base", None).unwrap();
+        assert_eq!(
+            s.create("base", None).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        // The framework validates the name before the call, so what is left here is the core's
+        // own rule: no slash, no leading dot.
+        assert_eq!(
+            s.create("bad/name", None).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            s.remove("nosuch").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            s.swap("nosuch", "base").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            s.create("slot", Some("nosuch")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn a_promoted_snapshot_reports_itself_as_a_base_and_keeps_doing_so() {
+        let (_d, b) = core();
+        let s = b.snapshots();
+        s.create("base", None).unwrap();
+        assert!(s.create_meta("base").unwrap().base.is_none());
+        let first = s.promote("base").unwrap();
+        assert!(first.base.is_some(), "{first:?}");
+        assert!(s.promote("base").unwrap().base.is_some(), "idempotent");
+        assert!(s.create_meta("base").unwrap().base.is_some());
+        assert_eq!(
+            s.promote("nosuch").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn usage_reports_the_blocks_the_store_holds() {
+        let (_d, b) = core();
+        b.snapshots().create("base", None).unwrap();
+        // The core's own root is a read-only namespace of snapshots, so the bytes go into one.
+        let base = b.snapshot("base").unwrap();
+        let file = base.create(cowfs_vfs::ROOT_INO, b"payload", 0o644).unwrap();
+        let h = base.open(file.ino).unwrap();
+        assert_eq!(base.write(file.ino, 0, &pattern(3 << 20)).unwrap(), 3 << 20);
+        base.fsync(file.ino, false).unwrap();
+        base.release(h).unwrap();
+        let u = b.usage().unwrap().expect("the core has a store");
+        assert!(u.blocks > 0, "{u:?}");
+        assert!(
+            u.stored_bytes > 0 && u.stored_bytes <= u.logical_bytes,
+            "{u:?}"
+        );
+    }
+
+    #[test]
+    fn close_releases_the_store_so_the_next_open_is_not_locked_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = CoreBackend::open(dir.path(), cowfs_core::Options::default()).unwrap();
+        b.snapshots().create("base", None).unwrap();
+        b.close().expect("the core closes");
+        let again = CoreBackend::open(dir.path(), cowfs_core::Options::default())
+            .expect("the store reopens after a close");
+        assert_eq!(again.snapshots().list().unwrap(), ["base"]);
+    }
+
+    #[test]
+    fn a_store_that_is_still_open_is_not_closed_behind_another_handles_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = CoreBackend::open(dir.path(), cowfs_core::Options::default()).unwrap();
+        let live = b.snapshots().create("base", None).unwrap();
+        let core_again = CoreBackend::open(dir.path(), cowfs_core::Options::default());
+        assert!(
+            core_again.is_err(),
+            "the second open must fail while the first holds the store"
+        );
+        assert_eq!(live.name, "base");
+        b.close().unwrap();
+        CoreBackend::open(dir.path(), cowfs_core::Options::default())
+            .expect("the store is free again");
+    }
+}
+
 #[derive(Debug)]
 struct MemSnapshots;
 
@@ -361,4 +835,29 @@ impl Snapshots for MemSnapshots {
     fn create_meta(&self, _name: &str) -> io::Result<SnapshotInfo> {
         Err(unsupported("the in-memory backend has no snapshots"))
     }
+}
+#[test]
+fn probe_alias_release_makes_a_held_number_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = CoreBackend::open(dir.path(), cowfs_core::Options::default()).unwrap();
+    b.snapshots().create("base", None).unwrap();
+    let v = b.snapshot("base").unwrap();
+    let r = cowfs_vfs::ROOT_INO;
+    let d = v.mkdir(r, b"d", 0o755).unwrap();
+    eprintln!("mkdir d -> {:#x}", d.ino);
+    // The NFS adapter forgets the reference the moment it hands the attribute out.
+    v.forget(d.ino, 1);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    eprintln!(
+        "forgotten+flushed: getattr {:#x} -> {:?}",
+        d.ino,
+        v.getattr(d.ino).err()
+    );
+    let held = v.mkdir(r, b"e", 0o755).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    eprintln!(
+        "reference held: getattr {:#x} -> {:?}",
+        held.ino,
+        v.getattr(held.ino).err()
+    );
 }
