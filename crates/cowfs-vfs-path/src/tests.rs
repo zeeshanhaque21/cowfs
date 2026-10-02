@@ -32,6 +32,15 @@ fn fs() -> (Scratch, PathVfs) {
     (s, v)
 }
 
+/// Padding files that evict the descriptor cache. `COWFS_PATHVFS_PADS` raises the count when
+/// hunting for the filesystem behaviour that makes a reused inode number reachable.
+fn pads() -> u32 {
+    std::env::var("COWFS_PATHVFS_PADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400)
+}
+
 #[test]
 fn hardlinked_names_share_an_ino_and_nlink_comes_from_the_backing_fs() {
     let (_s, v) = fs();
@@ -211,7 +220,7 @@ fn readonly_file_is_writable_after_the_descriptor_cache_is_cold() {
     let a = v.create(dir, b"ro", 0o444).expect("create");
     assert_eq!(v.write(a.ino, 0, b"before").expect("write while warm"), 6);
     // Evict every cached descriptor: the cache is dropped once it holds more than its cap.
-    for i in 0..400 {
+    for i in 0..pads() {
         let n = format!("f{i}");
         v.create(dir, n.as_bytes(), 0o644).expect("create");
     }
@@ -359,7 +368,7 @@ fn a_pinned_descriptor_lets_a_read_only_file_be_written_after_the_cache_is_cold(
         .mode,
         0o444
     );
-    for i in 0..400 {
+    for i in 0..pads() {
         let n = format!("f{i}");
         v.create(dir, n.as_bytes(), 0o644).expect("pad");
     }
@@ -381,12 +390,53 @@ fn an_inode_never_names_another_file_after_the_number_is_reused() {
     v.write(b, 0, b"other").expect("write");
     // Another writer puts `b` where `a`'s name was.
     std::fs::rename(scratch.0.join("b"), scratch.0.join("a")).expect("replace the name");
-    for i in 0..400 {
+    for i in 0..pads() {
         let n = format!("pad{i}");
         v.create(ROOT_INO, n.as_bytes(), 0o644).expect("pad");
     }
     // The old inode is `Stale` or still its own file. It must never be the file that took the
     // name, which is what reopening without an identity check would return.
+    match v.read(a, 0, 5) {
+        Ok(got) => assert_eq!(got, b"mine".to_vec(), "inode {a} now names another file"),
+        Err(Error::Stale) => {}
+        Err(e) => panic!("read a by inode: {e:?}"),
+    }
+}
+
+/// The identity the backing filesystem reports for `name`.
+fn backing_id(dir: &std::path::Path, name: &str) -> (u64, u64) {
+    let m = std::fs::metadata(dir.join(name)).expect("stat");
+    (m.dev(), m.ino())
+}
+
+/// The failure in #61, forced on every filesystem: the backing filesystem hands the freed inode
+/// number of an unlinked file to the next file it makes, which tmpfs and macOS APFS rarely do
+/// on demand. `sys::fake_inode` stands in for that, so the reuse is the same every run.
+#[test]
+fn a_recycled_inode_number_never_hands_out_the_file_that_took_it() {
+    let (scratch, v) = fs();
+    let a = v.create(ROOT_INO, b"a", 0o644).expect("create").ino;
+    v.write(a, 0, b"mine").expect("write");
+    let a_id = backing_id(&scratch.0, "a");
+    let b = v.create(ROOT_INO, b"b", 0o644).expect("create").ino;
+    v.write(b, 0, b"other").expect("write");
+    // Another writer puts `b` where `a`'s name was, which leaves `a` unlinked: its number is
+    // free, and any file made from now on may take it.
+    std::fs::rename(scratch.0.join("b"), scratch.0.join("a")).expect("replace the name");
+    // Cold the descriptor cache, so reading `a` has to go back to the filesystem by name.
+    for i in 0..pads() {
+        v.create(ROOT_INO, format!("pad{i}").as_bytes(), 0o644)
+            .expect("pad");
+    }
+    std::fs::write(scratch.0.join("newcomer"), b"theirs").expect("create outside");
+    let _fake = sys::fake_inode(backing_id(&scratch.0, "newcomer").1, a_id.1);
+
+    let theirs = v.lookup(ROOT_INO, b"newcomer").expect("lookup").ino;
+    assert_ne!(
+        theirs, a,
+        "the file that took the freed number was given inode {a}"
+    );
+    assert_eq!(v.read(theirs, 0, 6).expect("read the newcomer"), b"theirs");
     match v.read(a, 0, 5) {
         Ok(got) => assert_eq!(got, b"mine".to_vec(), "inode {a} now names another file"),
         Err(Error::Stale) => {}
@@ -468,7 +518,7 @@ fn a_renamed_file_is_still_reachable_by_its_inode() {
     let (_s, v) = fs();
     let f = v.create(ROOT_INO, b"a", 0o644).expect("create").ino;
     v.write(f, 0, b"data").expect("write");
-    for i in 0..400 {
+    for i in 0..pads() {
         let n = format!("pad{i}");
         v.create(ROOT_INO, n.as_bytes(), 0o644).expect("pad");
     }
@@ -563,7 +613,7 @@ fn reopening_a_file_never_follows_a_symlink_swapped_into_its_name() {
     let (scratch, v) = fs();
     let f = v.create(ROOT_INO, b"a", 0o644).expect("create").ino;
     v.write(f, 0, b"mine").expect("write");
-    for i in 0..400 {
+    for i in 0..pads() {
         let n = format!("pad{i}");
         v.create(ROOT_INO, n.as_bytes(), 0o644).expect("pad");
     }

@@ -44,6 +44,9 @@
 //! * A file with no known name and no descriptor cannot be found again, so unlinking the last
 //!   known name of a file whose descriptor cannot be opened (a file with mode 000, say) while a
 //!   reference remains makes the inode `Stale` earlier than the trait requires.
+//! * A file another writer replaced under a name the Vfs knows, whose inode number the
+//!   filesystem then hands to another file the Vfs sees, makes the old inode `Stale`: the two
+//!   files are unrelated and the new one gets an inode of its own.
 //! * A single `read` call returns at most 64 MiB at a time internally and fills the caller's
 //!   buffer up to the size asked for, so a short read only happens at the real end of the file.
 //! * Symlink extended attributes on Linux go through `/proc/self/fd`.

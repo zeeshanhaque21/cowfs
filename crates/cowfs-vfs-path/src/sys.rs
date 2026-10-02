@@ -60,12 +60,52 @@ impl Stat {
     }
 }
 
+/// The number a stat reports. A filesystem hands a freed number to another file, so this is
+/// only the file's identity while the file is alive.
+#[cfg(not(test))]
+fn reported_ino(ino: u64) -> u64 {
+    ino
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The one backing number to report as another, keyed by the number the filesystem gave.
+    static RENAMED_INO: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Reports `real` as `fake` in every stat until the guard is dropped. Keyed by the real number,
+/// so only the file the test picks is affected, and a filesystem that recycles a freed inode
+/// number can be stood in for on one that never does.
+#[cfg(test)]
+pub fn fake_inode(real: u64, fake: u64) -> FakeInode {
+    RENAMED_INO.with(|c| c.set(Some((real, fake))));
+    FakeInode(())
+}
+
+#[cfg(test)]
+pub struct FakeInode(());
+
+#[cfg(test)]
+impl Drop for FakeInode {
+    fn drop(&mut self) {
+        RENAMED_INO.with(|c| c.set(None));
+    }
+}
+
+#[cfg(test)]
+fn reported_ino(ino: u64) -> u64 {
+    RENAMED_INO.with(|c| match c.get() {
+        Some((real, fake)) if real == ino => fake,
+        _ => ino,
+    })
+}
+
 #[allow(clippy::unnecessary_cast)]
 fn widen(st: &libc::stat) -> Stat {
     let ts = |s: i64, n: i64| (s, n as u32);
     Stat {
         dev: st.st_dev as u64,
-        ino: st.st_ino as u64,
+        ino: reported_ino(st.st_ino as u64),
         mode: st.st_mode as u32,
         nlink: st.st_nlink as u64,
         uid: st.st_uid,
