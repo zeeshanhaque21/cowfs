@@ -9,6 +9,12 @@
 //!
 //! Every wait loop below exits on failure as well as on success, and a watchdog force-unmounts
 //! a mount whose server died, so a hung syscall fails the test instead of wedging the machine.
+//!
+//! Two of the tests need `mkdir a/b` to work on a directory the mount created. On the macOS NFS
+//! mount that fails with `Stale NFS file handle` because `cowfs-core` releases a file's virtual
+//! inode alias as soon as its create commits, while the stateless NFS client still holds the
+//! handle (issue #53). They pass on Linux with FUSE, which keeps its own inode table. They are
+//! left failing rather than weakened: that is the repro.
 
 use cowfs_ctl::{Client, ClientOptions, NoParams, Request, Response};
 use std::path::PathBuf;
@@ -150,6 +156,11 @@ impl Host {
         let _ = child.kill();
         let _ = child.wait();
         panic!("the daemon ignored {signal}");
+    }
+
+    /// True while the child process is still there.
+    fn running(&mut self) -> bool {
+        self.child.as_mut().is_some_and(running)
     }
 
     /// One control call, or `None` when there is no daemon to answer.
@@ -586,7 +597,10 @@ fn the_core_refuses_a_store_that_reports_damage_and_does_not_acknowledge_it() {
     std::fs::write(&f, b"durable\n").unwrap();
     sync_file(&f);
     ok(&h, Request::Shutdown(NoParams {}));
-    assert!(!h.socket.exists());
+    // The socket goes when the control server stops, which is after the answer, so wait for it
+    // rather than looking once.
+    wait_gone("the socket after shutdown", || !h.socket.exists());
+    wait_gone("the daemon process after shutdown", || !h.running());
 
     // Destroy a pack: the data a completed sync made durable is gone, and nothing acknowledged
     // it. Opening must refuse and name the loss.
@@ -686,6 +700,19 @@ fn ok(h: &Host, request: Request) -> String {
         );
     }
     body
+}
+
+/// Waits for `cond`, and fails when it never holds. Every wait in this file ends on failure as
+/// well as on success, so a daemon that never stops fails the test instead of hanging it.
+fn wait_gone(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + SETTLE;
+    while Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("{what} did not happen within {SETTLE:?}");
 }
 
 fn sync_file(p: &std::path::Path) {
