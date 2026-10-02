@@ -69,11 +69,11 @@ pub enum Command {
     Fsck,
     /// Ingest a directory into a new snapshot and verify it by hash
     Import {
-        /// Directory to ingest
+        /// Directory to ingest, never written to
         dir: PathBuf,
-        /// Name of the new snapshot
-        #[arg(long)]
-        name: String,
+        /// Name of the new snapshot (default: the directory's own name)
+        #[arg(long, visible_alias = "store-name")]
+        name: Option<String>,
     },
     /// Manage warm bases
     Base {

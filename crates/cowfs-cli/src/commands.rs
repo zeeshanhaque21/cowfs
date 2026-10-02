@@ -125,6 +125,24 @@ fn report(json: bool, code: &str, message: &str, details: Option<&Value>) {
     }
 }
 
+/// The snapshot name an import uses when the caller names none: the directory's own name. A
+/// directory whose name is not a legal snapshot name (`/`, `.`, a name over 255 bytes) has to be
+/// given one explicitly, and the error says so.
+fn default_store_name(dir: &Path) -> Result<String, String> {
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
+    let name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| cowfs_ctl::validate_snapshot_name(n).is_ok())
+        .ok_or_else(|| {
+            format!(
+                "{} has no usable directory name for a snapshot; pass --store-name",
+                abs.display()
+            )
+        })?;
+    Ok(name)
+}
+
 fn utf8_path(p: &Path) -> Result<String, String> {
     let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_owned());
     abs.to_str().map(str::to_owned).ok_or_else(|| {
@@ -166,7 +184,12 @@ fn request_for(command: &Command) -> Result<Option<Request>, String> {
         Command::Fsck => Request::Fsck(Empty {}),
         Command::Import { dir, name } => Request::Import(ImportParams {
             path: utf8_path(dir)?,
-            name: name.clone(),
+            // The slot's own name is the obvious snapshot name, so deriving it means the common
+            // case needs no flag at all.
+            name: match name {
+                Some(n) => n.clone(),
+                None => default_store_name(dir)?,
+            },
         }),
         Command::Base {
             command:

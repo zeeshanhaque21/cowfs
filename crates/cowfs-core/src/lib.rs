@@ -8,6 +8,7 @@ mod blocks;
 mod dcache;
 mod error;
 mod file;
+mod import;
 mod inner;
 mod ino;
 mod io;
@@ -43,6 +44,7 @@ use crate::util::{MutexExt, RwExt, ShardMap};
 /// Test seams for the durability calls the design argument depends on. Not a stable API.
 #[doc(hidden)]
 pub mod fsops;
+pub use crate::import::{ingest, Hooks, ImportError, Ingested};
 pub use crate::inner::{FileHealth, Health, LaneHealth};
 pub use crate::inner::{Options, Stats};
 pub use crate::ino::VIRT_COUNTER_MASK;

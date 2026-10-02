@@ -13,7 +13,8 @@ use crate::mounts::Mounted;
 use cowfs_ctl::{
     BaseRefreshParams, BaseRefreshReport, ControlHandler, CtlError, CtlResult, ErrorCode,
     FsckReport, GcParams, GcReport, HolderGuard, ImportParams, ImportReport, MountInfo,
-    MountSnapshot, OpContext, ProcessInfo, SnapshotCreate, SnapshotInfo, Status, UnmountSnapshot,
+    MountSnapshot, OpContext, ProcessInfo, ProgressEvent, SnapshotCreate, SnapshotInfo, Status,
+    Unit, UnmountSnapshot,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -154,6 +155,50 @@ impl Handler {
 
     fn dir_of(&self, name: &str) -> PathBuf {
         self.mount_path.join(name)
+    }
+
+    /// The report for a backend that ingested and verified the tree itself. Both root hashes are
+    /// recomputed here, the source on disk and the snapshot through its `Vfs`, so the caller gets
+    /// the same evidence the passthrough backend reports and can check it independently.
+    fn verified_report(
+        &self,
+        params: &ImportParams,
+        ingested: cowfs_core::Ingested,
+    ) -> CtlResult<ImportReport> {
+        let source = PathBuf::from(&params.path);
+        let source_hash = cowfs_ctl::hash_tree(&source).map_err(|e| {
+            CtlError::new(ErrorCode::IoError, format!("cannot hash the source: {e}"))
+        })?;
+        let view = self
+            .backend
+            .snapshot(&params.name)
+            .map_err(|e| io(e, "cannot read the imported snapshot"))?;
+        let got = cowfs_ctl::hash_view(view.as_ref(), cowfs_vfs::ROOT_INO).map_err(|e| {
+            CtlError::new(
+                ErrorCode::IoError,
+                format!("cannot hash the imported snapshot: {e}"),
+            )
+        })?;
+        let verified = source_hash.root == got.root;
+        Ok(ImportReport {
+            name: params.name.clone(),
+            files: ingested.files,
+            bytes: ingested.bytes,
+            verified,
+            hash_algorithm: cowfs_ctl::HASH_ALGORITHM.to_owned(),
+            source_root_hash: source_hash.root,
+            imported_root_hash: got.root,
+            mismatches: if verified {
+                Vec::new()
+            } else {
+                vec![cowfs_ctl::ImportMismatch {
+                    path: ".".into(),
+                    reason: "the source changed while it was ingested".into(),
+                }]
+            },
+            mismatches_truncated: false,
+            stored_bytes: Some(ingested.stored_bytes),
+        })
     }
 }
 
@@ -302,7 +347,26 @@ impl ControlHandler for Handler {
         })
     }
 
+    /// Ingests a directory as a new snapshot. A backend with a writer of its own (the core) does
+    /// the ingest through it, staging, verifying and switching atomically; the passthrough backend
+    /// copies the tree into the store and reports `stored_bytes: None`, because it has no store to
+    /// compress into.
     fn import(&self, params: ImportParams, ctx: &OpContext<'_>) -> CtlResult<ImportReport> {
+        let source = std::path::PathBuf::from(&params.path);
+        let mut progress = |done: u64, total: u64| {
+            ctx.progress(ProgressEvent {
+                phase: "ingest".into(),
+                done,
+                total: Some(total),
+                unit: Unit::Bytes,
+                message: None,
+            })
+            .is_ok()
+        };
+        if let Some(ingested) = self.backend.ingest(&source, &params.name, &mut progress)? {
+            self.changed();
+            return self.verified_report(&params, ingested);
+        }
         self.can_ingest()?;
         crate::import::run(self.backend.as_ref(), self.snaps(), &params, ctx)
     }

@@ -331,7 +331,7 @@ fn exit_code_2_for_usage_errors() {
         &["frobnicate"],
         &["snapshot"],
         &["snapshot", "create"],
-        &["import", "dir"],
+        &["import"],
         &["base", "refresh", "--repo", "r"],
         &["gc", "--nope"],
     ] {
@@ -948,7 +948,7 @@ fn a7_json_mode_emits_a_json_error_for_usage_errors() {
         vec!["--json", "bogus"],
         vec!["--json", "snapshot"],
         vec!["--json", "gc", "--nope"],
-        vec!["--json", "import", "dir"],
+        vec!["--json", "import"],
     ] {
         let out = Command::new(BIN).args(&args).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{args:?}");

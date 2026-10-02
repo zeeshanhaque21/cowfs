@@ -278,8 +278,9 @@ otherwise) and it is `busy` with nothing changed while anything holds it.
 
 `FsckReport`: `{ok, blocks_checked, bytes_checked, snapshots_checked, problems: [{kind, detail}]}`.
 
-`ImportReport`: `{name, files, bytes, verified, hash_algorithm, source_root_hash, imported_root_hash, mismatches: [{path, reason}], mismatches_truncated}`.
+`ImportReport`: `{name, files, bytes, verified, hash_algorithm, source_root_hash, imported_root_hash, mismatches: [{path, reason}], mismatches_truncated, stored_bytes?}`.
 `mismatches` lists at most 100 differences, relative to the source root, and `mismatches_truncated` says whether there were more.
+`stored_bytes` is what the store took for the import, after compression and deduplication, so `bytes` against `stored_bytes` is what the content cost; it is absent from a backend with no block store.
 
 `BaseRefreshReport`: `{snapshot: SnapshotInfo, previous_commit}`.
 
@@ -450,7 +451,7 @@ Within major version 1:
 | `snapshot promote NAME` | `snapshot_promote` |
 | `gc [--dry-run]` | `gc` (always sends `dry_run` explicitly) |
 | `fsck` | `fsck` |
-| `import DIR --name NAME` | `import` |
+| `import DIR [--store-name NAME]` | `import` |
 | `base refresh --repo PATH --ref REF [--name NAME]` | `base_refresh` |
 | `ps SNAPSHOT` | `ps` |
 | `mount-info` | `mount_info` |

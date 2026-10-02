@@ -26,7 +26,7 @@ pub use server::{PeerCheck, Server, ServerOptions, ShutdownHandle};
 pub use socket::default_socket_path;
 pub use stub::StubHandler;
 pub use sys::current_uid;
-pub use treehash::{hash_tree, TreeHash, HASH_ALGORITHM};
+pub use treehash::{hash_tree, hash_view, TreeHash, HASH_ALGORITHM};
 pub use types::*;
 pub use validate::{
     escape_control, name_key, validate_abs_path, validate_git_ref, validate_repo,

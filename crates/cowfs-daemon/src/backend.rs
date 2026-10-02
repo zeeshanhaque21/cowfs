@@ -9,8 +9,8 @@
 //! it is one entry in a namespace whose root the mount shows. That is why the mount's root needs
 //! no synthetic layer here: the entries are already there.
 
-use cowfs_core::Core;
-use cowfs_ctl::{BaseMeta, SnapshotInfo};
+use cowfs_core::{Core, Ingested};
+use cowfs_ctl::{BaseMeta, CtlError, CtlResult, ErrorCode, SnapshotInfo};
 use cowfs_vfs::Vfs;
 use std::fmt;
 use std::io;
@@ -76,6 +76,18 @@ pub trait Backend: Send + Sync + fmt::Debug {
 
     /// Re-hashes every block, or `None` when the backend has no block store to check.
     fn fsck(&self) -> io::Result<Option<cowfs_store::FsckReport>> {
+        Ok(None)
+    }
+
+    /// Ingests `from` as a new snapshot `name` through the backend's own writer, then verifies it
+    /// byte for byte and only then makes the name visible. `None` when this backend has no writer
+    /// for a directory, which is the passthrough backend: it copies the directory itself instead.
+    fn ingest(
+        &self,
+        _from: &Path,
+        _name: &str,
+        _progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> CtlResult<Option<Ingested>> {
         Ok(None)
     }
 }
@@ -198,6 +210,28 @@ impl CoreSnapshots {
 
 /// A control-plane error as an `io::Error`, keeping which refusal it was: the handler maps the
 /// kind to a protocol error code, so `already_exists` and `busy` must not become one code.
+/// Maps an ingest failure onto the protocol's codes. A cancelled import is `cancelled`, a refused
+/// source or an entry the core cannot hold is `invalid_params`, and a verification mismatch is an
+/// `io_error` that says which path differs.
+fn ingest_error(e: cowfs_core::ImportError) -> CtlError {
+    use cowfs_core::ControlError as E;
+    use cowfs_core::ImportError as I;
+    match e {
+        I::Cancelled => CtlError::cancelled(),
+        I::Invalid(m) => CtlError::invalid(m),
+        I::Mismatch { path, reason } => CtlError::new(
+            ErrorCode::IoError,
+            format!("the imported tree is not the source tree: {path}: {reason}"),
+        ),
+        I::Core(E::Exists) => CtlError::new(
+            ErrorCode::AlreadyExists,
+            "that snapshot name is already taken".to_owned(),
+        ),
+        I::Core(E::InvalidName(why)) => CtlError::invalid(format!("invalid snapshot name: {why}")),
+        I::Core(e) => CtlError::new(ErrorCode::IoError, e.to_string()),
+    }
+}
+
 fn control_io(e: cowfs_core::ControlError) -> io::Error {
     let kind = match &e {
         cowfs_core::ControlError::InvalidName(_) => io::ErrorKind::InvalidInput,
@@ -271,11 +305,45 @@ impl Backend for CoreBackend {
         })
     }
 
-    /// The core needs a writer to ingest a directory, which it has through the mount and not
-    /// through the store directory, so `import` refuses here rather than writing a tree the core
-    /// cannot read back as a snapshot.
+    /// `base_refresh` still copies a git worktree into the store directory, which means nothing
+    /// for a backend whose snapshots are trees, so it is refused here. `import` does not come
+    /// through this flag: it goes through [`Backend::ingest`].
     fn ingests_directories(&self) -> bool {
         false
+    }
+
+    fn ingest(
+        &self,
+        from: &Path,
+        name: &str,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> CtlResult<Option<Ingested>> {
+        // `with_core` speaks `io::Error`, so the ingest error is carried through the message and
+        // re-mapped by the one call that can afford to hold both types.
+        let mut out: Result<Ingested, CtlError> =
+            Err(CtlError::new(ErrorCode::IoError, "the ingest did not run"));
+        with_core(&self.core, |c| {
+            let mut hooks = cowfs_core::Hooks {
+                progress: &mut *progress,
+            };
+            match cowfs_core::ingest(c, from, name, &mut hooks) {
+                Ok(i) => {
+                    out = Ok(i);
+                    Ok(())
+                }
+                Err(e) => {
+                    out = Err(ingest_error(e));
+                    Ok(())
+                }
+            }
+        })
+        .map_err(|e| {
+            CtlError::new(
+                ErrorCode::IoError,
+                format!("cannot ingest into the core: {e}"),
+            )
+        })?;
+        out.map(Some)
     }
 
     fn fsck(&self) -> io::Result<Option<cowfs_store::FsckReport>> {
