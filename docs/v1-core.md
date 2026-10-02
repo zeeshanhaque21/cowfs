@@ -318,6 +318,14 @@ Chunk data comes through a block cache (`Options::block_cache_bytes`, default 12
 A verification failure is `Error::Corrupt` (EIO), never wrong data, and the cache never holds an unverified block.
 Blocks that were just put are cached.
 
+A cold read moves each byte twice and cannot move it once: `pread` fills a buffer the store returns, and the caller copies that into its own `Vec`, because `Vfs::read` hands back an owned buffer while the cache holds an `Arc<Vec<u8>>` that outlives the call.
+`Store::get` reads the 56-byte header on its own and then reads the payload straight into the buffer it returns, so the record is never read whole and shifted: draining the header off a record-sized buffer moved every byte of every block a second time.
+One `pread` per block is the floor, since each block carries its own header.
+
+Measured on the 512 MiB cold read of `examples/coldread` (`sample`, 1 ms, self time, idle and reopen noise excluded), the read path is verification-bound, not copy-bound: BLAKE3 76%, crc32c 6%, `pread` 10%, `memmove` 5%.
+Removing the extra copy cut `memmove` 42% and total read-path work 2.2%, because it trades one `memmove` for one small `pread`.
+Closing the gap to a native cold read needs verification to cost less, not fewer copies; `docs/v1-store.md` already records BLAKE3 alone at 1129 MiB/s against 939 MiB/s for a verified read of the same block.
+
 ## Caches and invalidation
 
 - Dentry cache: per directory, name to `Some(child, kind)` or `None` (a negative entry), bounded to `Options::dentry_cache` entries, evicting clean entries only.
