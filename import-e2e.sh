@@ -19,8 +19,9 @@ chmod 700 "$OUT" "$OUT/rt"
 SRC="$OUT/src"
 mkdir -p "$SRC/deep/a/b/c" "$SRC/empty-dir"
 printf 'hello cowfs\n' > "$SRC/readme.txt"
-# ~12 MiB of incompressible-ish bytes so the import is long enough to kill in the middle
-dd if=/dev/urandom of="$SRC/deep/a/b/c/big.bin" bs=1M count=12 2>/dev/null
+# 192 MiB of incompressible bytes: large enough that the import is still running well after the
+# kill, so the check below proves the partial import was never published rather than racing it.
+dd if=/dev/urandom of="$SRC/deep/a/b/c/big.bin" bs=1M count=192 2>/dev/null
 : > "$SRC/zero-byte"
 printf 'utf-8 names\n' > "$SRC/café 😀.txt"
 ln -sf ../readme.txt "$SRC/deep/a/link"
@@ -89,7 +90,7 @@ for _ in $(seq 1 300); do [ -S "$OUT/rt/c2.sock" ] && break; sleep 0.1; done
 "$BIN" --socket "$OUT/rt/c2.sock" import "$SRC" --store-name killed > "$OUT/killed.out" 2>&1 &
 IMPORT_PID=$!
 # The import must still be running when the daemon dies, or nothing was proven.
-sleep 0.4
+sleep 1
 if ! kill -0 "$IMPORT_PID" 2>/dev/null; then
   echo "FAIL: the import finished before the kill; make the source tree bigger"; exit 1
 fi
