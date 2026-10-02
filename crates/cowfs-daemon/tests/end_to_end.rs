@@ -603,8 +603,10 @@ fn the_core_refuses_a_store_that_reports_damage_and_does_not_acknowledge_it() {
     wait_gone("the daemon process after shutdown", || !h.running());
 
     // Destroy a pack: the data a completed sync made durable is gone, and nothing acknowledged
-    // it. Opening must refuse and name the loss.
-    let packs = std::fs::read_dir(h.store.join("packs")).expect("the store has packs");
+    // it. Opening must refuse and name the loss. The packs live under the store's own `store`
+    // directory, which is where `cowfs-store` puts them.
+    let packs = std::fs::read_dir(h.store.join("store").join("packs"))
+        .unwrap_or_else(|e| panic!("the store has packs: {e}"));
     let mut hit = false;
     for entry in packs.flatten() {
         let p = entry.path();
