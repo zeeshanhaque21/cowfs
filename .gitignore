@@ -5,3 +5,6 @@ target/
 __pycache__/
 *.pyc
 /progress/serve.log
+/bench/out/
+/bench/mount-nfs/target/
+/bench/mount-nfs/Cargo.lock
