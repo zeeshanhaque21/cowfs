@@ -10,6 +10,8 @@ mod error;
 mod file;
 mod gate;
 mod gc;
+#[cfg(test)]
+mod gc_barrier_window;
 mod import;
 mod inner;
 mod ino;
@@ -484,17 +486,16 @@ impl Core {
     /// Test seam: 1 makes the collector's barrier succeed without closing the reference gate, which
     /// is the negative control for the barrier. 0 restores it.
     ///
-    /// Only built under `test-hooks` (or this crate's own tests). It removes the barrier, so it must
-    /// never be reachable in a production build; the integration test in `cowfs-gc` turns the feature
-    /// on for its own build.
-    #[cfg(any(test, feature = "test-hooks"))]
+    /// Built only for this crate's own tests, so a production build has no such method and cannot
+    /// turn a fail-open barrier on. The barrier window test in `gc_barrier_window` drives it.
+    #[cfg(test)]
     #[doc(hidden)]
     pub fn set_gate_fault(&self, kind: u8) {
         self.inner.gate.set_fault(kind);
     }
 
-    /// Test seam: threads parked at the reference gate right now. Only built under `test-hooks`.
-    #[cfg(any(test, feature = "test-hooks"))]
+    /// Test seam: threads parked at the reference gate right now. Built only for this crate's tests.
+    #[cfg(test)]
     #[doc(hidden)]
     pub fn gate_waiters(&self) -> usize {
         self.inner.gate.waiting()

@@ -17,7 +17,7 @@ proptest.workspace = true
 tempfile.workspace = true
 # Only for the end-to-end test that wires the collector to the real reference side, so the
 # `ExtraRoots` contract is checked against the implementation that has to meet it.
-cowfs-core = { path = "../cowfs-core", features = ["test-hooks"] }
+cowfs-core = { path = "../cowfs-core" }
 cowfs-vfs = { path = "../cowfs-vfs" }
 cowfs-vfs-path = { path = "../cowfs-vfs-path" }
 

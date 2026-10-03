@@ -193,15 +193,19 @@ Adversarial cases, all in that file:
 9. Three writers (with overwrites, unlinks and repeated content), a fork and remove loop and a collection loop run together for six seconds. A watchdog exits the process if no operation completes for 60 s. Every file reads back, before and after a reopen.
 
 Negative control: `Core::set_gate_fault(1)` makes `take` return a hold that does not close the gate.
-`negative_control_a_barrier_that_does_not_close_the_gate_loses_data` runs the window test with it and requires that data is lost (the writer's blocks are gone after the reopen).
+`gc_barrier_window::negative_control_a_barrier_that_does_not_close_the_gate_loses_data` (a `cowfs-core` unit test) runs the window test with it and requires that data is lost (the writer's blocks are gone after the reopen).
 The same scenario with the real barrier loses nothing and shows the writer parked at the gate while the barrier is held.
 So the barrier test is sensitive to the thing it tests, and removing the barrier makes a deterministic test fail.
 
 The mark-phase regression is `a_commit_between_the_freeze_listing_and_a_walks_the_listed_root`, described under Status above.
 Its seam, `Gc::set_between_list_and_walk`, is `#[doc(hidden)]` and production never sets it.
 The barrier-removing core seam is different: `Core::set_gate_fault` is a fail-open switch because it makes `take` succeed without closing the gate.
-It (and `gate_waiters`, and the gate's own `set_fault`/`waiting`) is now compiled only under the `cowfs-core` `test-hooks` feature, which `cowfs-gc`'s dev-dependency turns on for its end-to-end test.
-A production build has neither the method nor the field, so the switch cannot be reached at all: `cargo build -p cowfs-core` has no warning and no `set_gate_fault`.
+It (and `gate_waiters`, and the gate's own `set_fault`/`waiting`) is now compiled only under `#[cfg(test)]`, so it is visible only to `cowfs-core`'s own unit tests.
+The barrier window test therefore lives in `crates/cowfs-core/src/gc_barrier_window.rs`, not in `cowfs-gc`'s integration tests.
+A Cargo feature cannot be used for this: `cowfs-core` is a normal dependency of `cowfs-daemon` and a dev-dependency of `cowfs-gc`, and Cargo unifies a package's features across a resolve, so any feature `cowfs-gc`'s dev-dependency enabled would also land in the `cowfs-core` the daemon links in the same resolve.
+Keeping the seam at `#[cfg(test)]` and the test inside the owning crate removes the leak entirely.
+A production build has neither the method nor the field, so the switch cannot be reached at all: `cargo build -p cowfs-core` and `cargo build -p cowfs-daemon` have no `set_gate_fault`.
+The negative control still runs under `cargo test --workspace`, so no test coverage is lost.
 `Core::store()` and `Core::meta()` still hand out handles a caller could use to write without the gate; the daemon uses neither, and this note records it rather than widening scope here.
 
 `crates/cowfs-daemon/src/handler.rs` tests: a dry run over a real core changes nothing and reports candidates, a live run frees blocks and bytes, emits `mark` and `sweep` progress and leaves survivors readable and fsck-clean, a cancelled request is `cancelled` and the next one finishes the job, closing the backend after a collection releases the store lock, and the passthrough backend still answers `unsupported`.
