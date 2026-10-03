@@ -104,7 +104,7 @@ Reading it:
 - As a non-atomic point-in-time ratio, the store held the same trees in about 27% of the cowfs-reported apparent bytes (1 / 3.66), including metadata.
   This is a reported ratio, not a native-capacity verdict.
 - Compression accounts for most of it (2.87x).
-  Dedup adds about 1.33x on top in the same ratio.
+  The apparent-over-index ratio of 1.33 is a reported ratio, not an attribution of dedup.
 - A per-file-compression-only baseline was not measured.
   The figure A x C = 3.59 GB is an approximation that assumes per-file compression behaves like per-block compression, and it is unverified.
 - D is not a lower bound.
@@ -121,7 +121,7 @@ Each cowfs-arm clean build writes a 949 MB `corpus-target` (5,142 files, apparen
 Store index growth measured across the three clean builds was 560, 316 and 755 MB logical.
 These are per-run upper bounds only: the shared store also took background growth from other agents, which reached 19.4 MB/s in short native phases, so they are not a write-counter dedup figure.
 A 949 MB rebuild into the same path therefore added no growth distinguishable from the other writers at this resolution.
-That is consistent with near-total dedup of repeated builds of identical output, but it cannot be quantified here.
+No dedup inference is made from these non-atomic counters; dirty write-back and concurrent writers are not isolated.
 Settling it needs the `put_bytes` and `dedup_bytes` counters, or a quiesced store.
 The two 60 s idle samples measured growth of 1.1 MB/s (22:03) and 0.7 MB/s (22:40); the cowfs-build phases measured 1.4, 0.7 and 1.4 MB/s.
 
