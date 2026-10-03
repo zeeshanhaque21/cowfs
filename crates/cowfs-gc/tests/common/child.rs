@@ -177,8 +177,9 @@ fn drain(mut r: impl Read, tx: mpsc::Sender<String>) {
 
 /// Confirm the pid we are about to signal is still the child we started, and that it is our
 /// fixture child and not something reused. A mismatch aborts rather than killing a stranger.
+/// Uses `ps` from `PATH` so it works on both macOS and Linux runners, not a hardcoded `/bin`.
 fn verify_child(pid: u32, test_name: &str) {
-    let out = Command::new("/bin/ps")
+    let out = Command::new("ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output();
     match out {
@@ -189,7 +190,7 @@ fn verify_child(pid: u32, test_name: &str) {
                 "refusing to kill pid {pid}: its command does not name this fixture ({cmd:?})"
             );
         }
-        // The process is already gone; kill is a no-op and wait reaps it.
+        // The process is already gone, or `ps` is unavailable; kill is a no-op and wait reaps it.
         _ => {}
     }
 }
