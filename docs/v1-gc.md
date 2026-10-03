@@ -164,6 +164,15 @@ A cycle is these steps.
    That watermark is the cycle's **epoch**.
 2. **Mark, no barrier.** Walk every root with one shared `Marker` and union `pinned_blocks`.
    The live set is complete for every root that existed at the freeze.
+   A root listed in step 1 can have moved by the time it is walked: a writer may have committed to
+   that snapshot in between.
+   The walk therefore reports the root it actually read (`snapshot_by_id`'s current root, read in the
+   same read transaction as the nodes it walks), and that walked root is what is recorded in
+   `walked`, in the persisted `mark.bin`, and in the `Marker`.
+   Recording the listed key instead would claim a root the walk never descended, and a fork still
+   on the listed root would be skipped as already covered while its blocks sat in no live set.
+   When the walked root differs from the listed key, the listed key is left unwalked so the entries
+   that still resolve to it are walked themselves.
 3. **Choose candidates, no barrier.** For every pack, one scan counts its live and dead record
    bytes with respect to the live set.
    A pack is a candidate when its dead bytes reach `dead_ratio` of its record bytes and it has at

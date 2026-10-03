@@ -190,6 +190,7 @@ fn the_barrier_costs_writers_a_bounded_stall() {
 
     let writes = Arc::new(AtomicU64::new(0));
     let worst = Arc::new(AtomicU64::new(0));
+    let collect_wall = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     std::thread::scope(|sc| {
         for w in 0..2u64 {
@@ -213,16 +214,32 @@ fn the_barrier_costs_writers_a_bounded_stall() {
             });
         }
         std::thread::sleep(Duration::from_millis(250));
+        let started = Instant::now();
         for _ in 0..4 {
             let r = parts.gc.collect(Some(&*roots)).expect("collect");
             assert!(r.errors.is_empty(), "{:?}", r.errors);
         }
+        collect_wall.store(started.elapsed().as_micros() as u64, Relaxed);
         stop.store(true, Relaxed);
     });
     assert!(writes.load(Relaxed) > 0, "writers made no progress");
     let worst_us = worst.load(Relaxed);
+    let held_us = roots.held_us();
+    let collect_us = collect_wall.load(Relaxed);
+    // The raw wall-clock stall also contains scheduler descheduling, which the collector does not
+    // control and a busy runner makes unbounded. It failed on CI at 3.2 s on a runner whose suite ran
+    // 30x slower than normal, so an absolute bound on it is a test of the machine, not the collector.
+    // The barrier's own held time is the property that matters and descheduling inflates the collect
+    // window with it, so compare the two instead: a collector that takes the barrier once per pack
+    // holds it for a fraction of the sweep, and one that holds it to the end cannot.
     assert!(
-        worst_us < 3_000_000,
+        held_us < collect_us,
+        "the barrier was held for {held_us} us of a {collect_us} us collect: it is not handed off per pack"
+    );
+    // A loose backstop for a barrier that is pathological for some other reason. Kept generous
+    // because a descheduled single write can push the wall clock to seconds on a loaded runner.
+    assert!(
+        worst_us < 30_000_000,
         "a write stalled for {worst_us} us, the barrier is not short"
     );
 }

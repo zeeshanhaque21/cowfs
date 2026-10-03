@@ -149,6 +149,26 @@ impl Gate {
         }
         let deadline = Instant::now() + patience;
         let mut s = self.st.lk();
+        // Hand off to parked readers first. A collector re-takes the barrier immediately between
+        // packs, and a reader that was already waiting loses the race for the mutex every time, so
+        // it can wait out a whole sweep instead of one pack. Letting the queue drain before closing
+        // again gives them their turn; each entry is one commit, so this is short. The wait is
+        // strictly bounded and never abandons the sweep: if the queue is still busy after the small
+        // handoff slice, the barrier closes anyway and the collector makes progress. This is
+        // fairness only, not a safety gate, so it must not turn a busy reader into a lost pack.
+        const HANDOFF: Duration = Duration::from_millis(50);
+        let handoff = Instant::now() + HANDOFF;
+        if s.waiting > 0 {
+            self.cv.notify_all();
+        }
+        while s.waiting > 0 && Instant::now() < handoff {
+            let left = handoff.saturating_duration_since(Instant::now());
+            s = self
+                .cv
+                .wait_timeout(s, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
         if s.phase != Phase::Open {
             return None;
         }
@@ -222,6 +242,7 @@ impl cowfs_gc::Held for Hold {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     fn is_send_sync<T: Send + Sync>() {}
 
@@ -303,6 +324,34 @@ mod tests {
         let g = Arc::new(Gate::new());
         let _first = g.take(Duration::from_secs(1)).unwrap();
         assert!(g.take(Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn a_re_take_hands_the_gate_to_a_parked_reader_first() {
+        // A collector drops one hold and takes the next immediately. A reader parked in `enter`
+        // must get in during that gap, not starve for the whole sweep.
+        let g = Arc::new(Gate::new());
+        let first = g.take(Duration::from_secs(1)).unwrap();
+        let g2 = Arc::clone(&g);
+        let entered = Arc::new(AtomicBool::new(false));
+        let e2 = Arc::clone(&entered);
+        let t = std::thread::spawn(move || {
+            let _e = g2.enter();
+            e2.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        while g.waiting() == 0 {
+            assert!(start.elapsed() < Duration::from_secs(10), "never parked");
+            std::thread::yield_now();
+        }
+        drop(first);
+        let second = g.take(Duration::from_secs(5)).expect("still holds");
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the parked reader was admitted before the next barrier closed"
+        );
+        drop(second);
+        t.join().unwrap();
     }
 
     #[test]
