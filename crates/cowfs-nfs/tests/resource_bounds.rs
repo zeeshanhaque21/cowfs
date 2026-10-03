@@ -72,6 +72,20 @@ fn the_limit_reader_accepts_what_ulimit_prints() {
 }
 
 #[test]
+fn the_rss_probe_sees_a_real_allocation() {
+    let _x = exclusive();
+    let before = rss_bytes();
+    let held = vec![1u8; 64 << 20];
+    let grown = rss_bytes().saturating_sub(before);
+    assert!(
+        grown >= 48 << 20,
+        "ps saw {} MiB for a touched 64 MiB buffer",
+        grown >> 20
+    );
+    drop(std::hint::black_box(held));
+}
+
+#[test]
 fn oversized_frames_close_the_connection_before_any_allocation() {
     let _x = exclusive();
     let (s, mut c) = serve(memfs(), MountOptions::default());
