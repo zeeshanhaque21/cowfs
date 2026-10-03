@@ -5,13 +5,20 @@
 //! Without a barrier the same workload would lose blocks, which is why the crate refuses to free
 //! anything when no barrier is offered, and a test here proves that it does refuse.
 //!
-//! Every concurrent fixture here is **bounded** (issue 83): a fixed byte budget, a fixed iteration
-//! cap, a finite run time, a no-progress watchdog, and a stop-on-error flag any worker or collector
-//! sets. Before those bounds, a collector that stalled would let the writer loops append until the
-//! runner's disk filled (`StorageFull` in CI). The bound is on the rate and the total, so a
-//! descheduled runner stops early instead of growing without limit. The numbers each run actually
-//! reached are printed (and asserted non-zero) so a bound that silently disabled the workload fails
-//! loudly instead of passing empty.
+//! Every concurrent fixture here is **bounded** (issue 83): one shared byte budget across all
+//! writers in a test (24 MiB of input, not per writer), a fixed iteration cap, a finite cooperative
+//! run time, a no-progress watchdog, and a stop-on-error flag any worker or collector sets. Before
+//! those bounds, a collector that stalled would let the writer loops append until the runner's disk
+//! filled (`StorageFull` in CI). The bound is on the rate and the total, so a descheduled runner
+//! stops early instead of growing without limit. The numbers each run actually reached are printed
+//! (and asserted non-zero) so a bound that silently disabled the workload fails loudly instead of
+//! passing empty.
+//!
+//! These in-process bounds are **cooperative**: they set a flag every loop checks, so they bound
+//! what the writers do. They cannot end a test whose collector parks forever inside a blocking call,
+//! because the collector runs inside `std::thread::scope` and the scope joins it. That case needs an
+//! outer process with its own deadline, which `tests/resource_watchdog.rs` proves. See
+//! `docs/gc-race-bounds.md` for the exact numbers.
 
 mod common;
 
@@ -23,13 +30,20 @@ use std::time::{Duration, Instant};
 use common::{Fixture, Roots};
 use cowfs_store::BlockId;
 
-/// Total bytes any concurrent writer group may store in one test. A few MB, not tens.
+/// Total input bytes one test's writers may store, **shared** across all of that test's writers
+/// (`clone_state` shares one counter): 24 MiB per test, not per writer. Two bounded tests exist, so
+/// the job's input bound is about 48 MiB plus at most one write of overshoot. This counts input
+/// bytes only, not the stored bytes, which also include compaction copies and the metadata file.
 const WRITE_BYTE_BUDGET: u64 = 24 << 20;
-/// Iterations one writer thread may run, independent of the byte budget.
+/// Iterations one writer thread may run, independent of the byte budget. Not the binding limit at
+/// the default write size (100000 x 8000 B exceeds the byte budget); kept as a backstop.
 const WRITE_ITER_CAP: u64 = 100_000;
-/// Wall-clock cap for a concurrent phase.
+/// Cooperative wall-clock cap for a concurrent phase, applied as `RUN_CAP + 5 s` by the in-process
+/// watchdog: the phase is asked to stop at 9 s. A collector parked inside `thread::scope` is joined
+/// regardless, so this is not a hard bound; the process-level deadline in `resource_watchdog.rs` is.
 const RUN_CAP: Duration = Duration::from_secs(4);
-/// Stop if no thread makes progress for this long: a stalled collector must not hang CI.
+/// Stop if no thread makes progress for this long: a stalled collector must not hang CI's *workers*.
+/// Cooperative, like `RUN_CAP`; it cannot end a joined, parked collector.
 const NO_PROGRESS: Duration = Duration::from_secs(60);
 
 /// The shared bound state of one concurrent phase.
@@ -105,10 +119,13 @@ fn body(n: usize, seed: u32) -> Vec<u8> {
     out
 }
 
-/// Run `body` while a watchdog stops the shared flag after `RUN_CAP` or a no-progress stall.
+/// Run `body` while an in-process watchdog stops the shared flag after `RUN_CAP + 5 s` or a stall.
 ///
-/// The watchdog is the outermost bound: even if a worker blocks, the phase ends and the test
-/// reports the failure the worker set (or the no-progress timeout) instead of hanging.
+/// This is a **cooperative** bound: it only sets a flag the workers poll. It ends the writers at the
+/// time cap, but it cannot end `body` itself if a thread inside it is blocked in a join, so it is not
+/// a hard runtime bound. The hard bound for the resource-sensitive fixture is the parent process
+/// deadline in `tests/resource_watchdog.rs`. The failure a worker set, or a no-progress stall, is
+/// still reported here.
 fn run_bounded(b: &Bounds, phase: impl FnOnce()) -> Result<(), String> {
     let stop = Arc::clone(&b.stop);
     let last = Arc::clone(&b.last_progress);
@@ -372,14 +389,20 @@ fn without_a_barrier_nothing_is_freed() {
     assert!(r2.freed_bytes > 0, "and bytes come back: {r2:?}");
 }
 
-/// The barrier is short: writers are not starved by a collect over many packs.
+/// The stall fixture: writers run beside a bounded number of collects, and no block is lost.
 ///
 /// Bounded like the other concurrent fixture: the writer loops have a byte and iteration budget
-/// and stop on any error, so a collect that stalls cannot let them fill the disk. The assertion is
-/// the same relative one: the barrier's own held time is a fraction of the collect window, so it is
-/// handed off per pack rather than held to the end. It is explicitly **not** a performance gate:
-/// wall-clock under a descheduled runner is variance, and the loose backstop below only catches a
-/// barrier that is pathological for some other reason.
+/// and stop on any error, so a collect that stalls cannot let them fill the disk.
+///
+/// This is a **functional** concurrency check only: it asserts that the barrier is taken, that the
+/// writers and the collector both make progress, and that a collect causes no loss. It is **not** a
+/// latency or fairness gate. An earlier version compared the barrier's held time against the
+/// collect window (`held_us < collect_us`) on the theory that a collector holding one barrier to the
+/// end of the sweep could not pass it; that was reproduced false - a mutant that takes the barrier
+/// once and holds it for the whole sweep, and one that holds it for the whole cycle, both pass it
+/// (reviewer evidence, issue 83). The ratio does not discriminate the hand-off property, so it is
+/// gone and no hand-off or latency claim is made here. The hand-off itself is covered by the gate
+/// unit test in `cowfs-core`, not by this wall-clock fixture.
 #[test]
 fn the_barrier_costs_writers_a_bounded_stall() {
     let f = Fixture::eager(64 << 10);
@@ -396,8 +419,6 @@ fn the_barrier_costs_writers_a_bounded_stall() {
 
     let b = Bounds::new();
     let writes = Arc::new(AtomicU64::new(0));
-    let worst = Arc::new(AtomicU64::new(0));
-    let collect_wall = Arc::new(AtomicU64::new(0));
     let collected = Arc::new(AtomicU64::new(0));
 
     run_bounded(&b, || {
@@ -411,7 +432,6 @@ fn the_barrier_costs_writers_a_bounded_stall() {
                     failure,
                 } = b.clone_state();
                 let writes = Arc::clone(&writes);
-                let worst = Arc::clone(&worst);
                 let roots = Arc::clone(&roots);
                 let snap = &snap;
                 sc.spawn(move || {
@@ -437,11 +457,9 @@ fn the_barrier_costs_writers_a_bounded_stall() {
                             }
                             break;
                         }
-                        let t = Instant::now();
                         let name = format!("f{i:03}");
                         let data = body(8000, i as u32);
                         roots.write(|| parts.write(&snap2, name.as_bytes(), &data));
-                        worst.fetch_max(t.elapsed().as_micros() as u64, Relaxed);
                         bytes.fetch_add(data.len() as u64, Relaxed);
                         ops.fetch_add(1, Relaxed);
                         writes.fetch_add(1, Relaxed);
@@ -452,7 +470,6 @@ fn the_barrier_costs_writers_a_bounded_stall() {
             }
             // Let the writers get going, then collect a bounded number of cycles.
             std::thread::sleep(Duration::from_millis(250));
-            let started = Instant::now();
             for _ in 0..4 {
                 if b.stop.load(Relaxed) {
                     break;
@@ -469,7 +486,6 @@ fn the_barrier_costs_writers_a_bounded_stall() {
                 collected.fetch_add(1, Relaxed);
                 *b.last_progress.lock().unwrap() = Instant::now();
             }
-            collect_wall.store(started.elapsed().as_micros() as u64, Relaxed);
             b.stop.store(true, Relaxed);
         });
     })
@@ -478,31 +494,26 @@ fn the_barrier_costs_writers_a_bounded_stall() {
     assert!(writes.load(Relaxed) > 0, "writers made no progress");
     let cycles = collected.load(Relaxed);
     assert!(cycles > 0, "no bounded cycle ran");
+    // The barrier must actually have been taken: a run that freed nothing and never closed the
+    // gate would not exercise the concurrency this test exists for.
+    assert!(
+        roots.barrier_taken() > 0,
+        "the barrier must be taken at least once"
+    );
     println!(
-        "stall bounds: bytes={} writes={} cycles={}",
+        "stall bounds: bytes={} writes={} cycles={} barriers={}",
         b.bytes.load(Relaxed),
         writes.load(Relaxed),
-        cycles
+        cycles,
+        roots.barrier_taken()
     );
-    let worst_us = worst.load(Relaxed);
-    let held_us = roots.held_us();
-    let collect_us = collect_wall.load(Relaxed);
-    // The raw wall-clock stall also contains scheduler descheduling, which the collector does not
-    // control and a busy runner makes unbounded. It failed on CI at 3.2 s on a runner whose suite ran
-    // 30x slower than normal, so an absolute bound on it is a test of the machine, not the collector.
-    // The barrier's own held time is the property that matters and descheduling inflates the collect
-    // window with it, so compare the two instead: a collector that takes the barrier once per pack
-    // holds it for a fraction of the sweep, and one that holds it to the end cannot.
-    assert!(
-        held_us < collect_us,
-        "the barrier was held for {held_us} us of a {collect_us} us collect: it is not handed off per pack"
-    );
-    // A loose backstop for a barrier that is pathological for some other reason. Kept generous
-    // because a descheduled single write can push the wall clock to seconds on a loaded runner.
-    assert!(
-        worst_us < 30_000_000,
-        "a write stalled for {worst_us} us, the barrier is not short"
-    );
+    // Every block a live snapshot still references reads back: the concurrency lost nothing.
+    for blk in parts.live() {
+        assert!(
+            parts.store.get(blk).is_ok(),
+            "a live block is gone after the stall fixture"
+        );
+    }
 }
 
 /// Two collectors at once: neither loses a block and neither reports an error.

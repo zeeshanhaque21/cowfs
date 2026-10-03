@@ -5,31 +5,81 @@ Its concurrent fixtures are now bounded, for the reason in issue 83: on a runner
 stalled, the writer loops kept appending until the disk filled (`StorageFull`, "No space left on
 device"), and the workspace step ran for about five hours.
 
-## What changed
+## The two bounds, stated exactly
 
-- Every concurrent writer loop has a fixed byte budget (`WRITE_BYTE_BUDGET`, 24 MiB) and a fixed
-  iteration cap (`WRITE_ITER_CAP`).
-- The phase has a finite wall-clock cap (`RUN_CAP`, 4 s) and a no-progress timeout
-  (`NO_PROGRESS`, 60 s) enforced by an outermost watchdog thread that sets the shared stop flag.
-- Any worker or collector error sets the stop flag and records the failure; the phase then asserts
-  on that failure instead of panicking inside a spawned thread.
-- Each run prints the bytes, writes and collects it actually reached, and asserts they are
+There are two different bounds, and only one of them is hard.
+
+**Cooperative in-process bound** (`race.rs`):
+
+- `WRITE_BYTE_BUDGET` is 24 MiB **per test, shared across all of that test's writers** (`clone_state`
+  shares one counter), not per writer. It counts input bytes only (20000 or 8000 per write), not the
+  stored bytes, which also include compaction copies and the metadata file. Overshoot is at most one
+  write per writer.
+- Two tests carry a budget, so the in-job input bound is about 48 MiB plus overshoot. This is an
+  input bound, not a claim about physical bytes on disk.
+- `WRITE_ITER_CAP` (100000) is never the binding limit at the default write size, so it adds nothing
+  beyond a backstop.
+- The phase is asked to stop at `RUN_CAP + 5 s` (9 s); the doc previously said 4 s, which is only the
+  half of the expression. The writers test has no other time stop; the stall test also stops when its
+  4 cycles finish.
+- Any worker or collector error sets the stop flag and records the failure; the phase then asserts on
+  that failure instead of panicking inside a spawned thread.
+- Each run prints the bytes, writes, cycles and barriers it actually reached, and asserts they are
   non-zero, so a budget that silently starved the workload fails loudly rather than passing empty.
 
-The bound is on the rate as well as the total: a writer stops as soon as the byte budget is spent,
-so a descheduled runner stops early instead of growing the store without limit.
+This whole bound is **cooperative**: it sets a flag every loop checks. It bounds what the writers do,
+but it cannot end a test whose collector parks forever inside a blocking call, because the collector
+runs inside `std::thread::scope` and the scope joins it. Reproduced: with the collector parked in a
+seam, the test ran until an external 40 s alarm killed it (`rc=142`), despite the 9 s cooperative cap
+and the 60 s no-progress timeout.
+
+**Hard process-level bound** (`tests/resource_watchdog.rs`), for the resource-sensitive fixture:
+
+- The fixture runs in a child of the same test binary. The parent holds a fixed deadline of its own
+  and polls `try_wait`, so it detects a prompt non-zero exit and otherwise ends at the deadline.
+  The parent's deadline does not depend on the child's own joins, cancels or progress flags.
+- At the deadline the parent kills **only the child it spawned**, after re-checking the child's pid
+  and command; it never signals a process group and never touches any other process.
+- The child's stdout and stderr are piped and drained on threads, and the child appends and fsyncs a
+  phase log, so a hard kill still leaves the phase it reached.
+- A recursion guard makes the spawned process run the fixture body instead of spawning again, and the
+  parent requires the child's evidence line, so a filter typo that makes the child run nothing cannot
+  pass.
+- Three controls run: a happy child that reclaims real packs and reads a survivor back after a
+  reopen (the parent accepts it); a child that parks its collector forever (the parent kills it at
+  the deadline and the parent FAILS, never PASS or SKIP); and a child whose writer fails (it exits
+  non-zero promptly and the parent fails with its log). The parked case is the exact situation the
+  cooperative bound cannot end.
+
+The `24 MiB` and `9 s` figures are the cooperative in-process knobs, not the hard runtime bound. The
+hard bound for the wrapped fixture is the parent's declared deadline.
 
 ## What did not change
 
 - The adversarial structure is preserved: a shared `base` snapshot, forked per writer, with a
-  concurrent create/remove/reap thread and a collect loop, and every collect's live set re-read
-  from the store.
-- The stall test's assertion is still the relative one (`held_us < collect_us`): the barrier's own
-  held time is a fraction of the collect window, so it is handed off per pack. That assertion is a
-  functional concurrency check, **not** a performance gate: wall-clock under a descheduled runner is
-  variance. The loose `worst_us < 30_000_000` line is only a backstop for a barrier that is
-  pathological for some other reason.
-- No timeout was loosened and no failure is ignored.
+  concurrent create/remove/reap thread and a collect loop, and every collect's live set re-read from
+  the store.
+- No timeout was loosened and no failure is ignored. The parent deadline fails (never skips) on a
+  hang.
+- Coverage, observed on the committed fixture (reviewer evidence, issue 83): the writers test did 8
+  to 26 writes and 1 to 2 collects per run, and the stall test 2 of 4 cycles, because the collector
+  loop starves the writers and each cycle is slow. The per-collect "every live block reads" check
+  therefore ran once or twice. The floors are `writes > 0`, `cycles > 0` and
+  `barriers > 0`; that is a low-work floor, not a throughput claim.
+
+## The barrier-stall assertion
+
+The stall fixture is a **functional** concurrency check: the barrier is taken at least once, the
+writers and the collector both make progress, and a collect causes no loss (every live block reads
+back). It is **not** a latency or fairness gate.
+
+An earlier version asserted `held_us < collect_us`, on the theory that a collector holding one
+barrier to the end of the sweep could not pass it. That was reproduced false: a mutant that takes the
+barrier once and holds it for the whole sweep (199 writes, 4 cycles), and a mutant that takes it once
+and holds it for the whole cycle (8 writes, 4 cycles), both pass it, and both pass the 30 s backstop.
+The ratio does not discriminate the hand-off property, so both the ratio and the backstop are gone,
+and no hand-off or latency claim is made from this fixture. The hand-off itself is covered by the gate
+unit test in `cowfs-core`, not by this wall-clock test.
 
 ## The `NoSuchSnapshot` failure is not the fixture's
 
