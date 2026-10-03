@@ -16,9 +16,12 @@
 //!
 //! These in-process bounds are **cooperative**: they set a flag every loop checks, so they bound
 //! what the writers do. They cannot end a test whose collector parks forever inside a blocking call,
-//! because the collector runs inside `std::thread::scope` and the scope joins it. That case needs an
-//! outer process with its own deadline, which `tests/resource_watchdog.rs` proves. See
-//! `docs/gc-race-bounds.md` for the exact numbers.
+//! because the collector runs inside `std::thread::scope` and the scope joins it. The three
+//! concurrent fixtures below are therefore also wrapped in a **process-level watchdog**
+//! (`common::child`): each named test runs its real body in a child of the same binary with a fixed
+//! parent-owned deadline, and the parent fails if the child is still alive at the deadline or exits
+//! non-zero. The parent requires the child's typed `race bounds:`/`stall bounds:` line with non-zero
+//! work, so a filter typo or an empty run cannot pass. See `docs/gc-race-bounds.md` for the numbers.
 
 mod common;
 
@@ -27,8 +30,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use common::child::{child_log, is_child, is_park_child, run_child_fixture, PARK_ENV};
 use common::{Fixture, Roots};
 use cowfs_store::BlockId;
+
+/// Hard parent-owned deadline for one wrapped race fixture child. Explicit finite budget, not a
+/// raised CI job timeout: the cooperative cap is `RUN_CAP + 5 s` (9 s), the bounded race phase then
+/// does a final collect, a readback of every live block and `fsck`, and the child needs startup and
+/// reopen; 120 s is a few minutes short of the runner limit and still ends a parked collector. It is
+/// far longer than a passing run (seconds), so a pass never waits it out.
+const CHILD_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Total input bytes one test's writers may store, **shared** across all of that test's writers
 /// (`clone_state` shares one counter): 24 MiB per test, not per writer. Two bounded tests exist, so
@@ -155,11 +166,130 @@ fn run_bounded(b: &Bounds, phase: impl FnOnce()) -> Result<(), String> {
     }
 }
 
+/// Parse `key=value` unsigned fields from the child's typed evidence line (the line containing
+/// `marker`). Returns `None` for a missing marker or any missing/unparsable field, so a fabricated
+/// constant marker without real counts is rejected rather than accepted.
+fn parse_fields(output: &str, marker: &str) -> Option<Vec<(String, u64)>> {
+    let line = output.lines().find(|l| l.contains(marker))?;
+    let tail = line.split_once(marker)?.1;
+    let mut out = Vec::new();
+    for tok in tail.split_whitespace() {
+        let (k, v) = tok.split_once('=')?;
+        out.push((k.to_string(), v.parse::<u64>().ok()?));
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Fetch one parsed field by name.
+fn field(fields: &[(String, u64)], key: &str) -> Option<u64> {
+    fields.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+}
+
+/// Whether every named field is present and strictly greater than zero.
+fn all_nonzero(fields: &[(String, u64)], keys: &[&str]) -> bool {
+    keys.iter().all(|k| field(fields, k).is_some_and(|v| v > 0))
+}
+
 /// Writers, snapshot creates, snapshot removes and collects, all at once.
 ///
 /// After every collect, and at the end, every block any live snapshot references reads back.
+///
+/// Run under the process-level watchdog: this body runs in a child with a fixed parent deadline. When
+/// `COWFS_GC_CHILD_PARK` is set it parks the collector forever *after real setup, before the walk*
+/// through the existing `Gc` test seam, with the cycle lock held; the parent must kill it at the
+/// deadline and FAIL. That negative control runs this same real writers fixture, so the guard is
+/// exercised on the actual racing workload, not a demo.
 #[test]
 fn writers_and_collects_at_once_lose_nothing() {
+    if is_child() {
+        writers_and_collects_body(is_park_child());
+        return;
+    }
+    let keep = tempfile::tempdir().expect("parent tempdir");
+    let log = keep.path().join("race-writers.log");
+    let (outcome, _) = run_child_fixture(
+        "writers_and_collects_at_once_lose_nothing",
+        &[],
+        CHILD_DEADLINE,
+        &log,
+    );
+    assert!(
+        !outcome.timed_out && outcome.code == Some(0),
+        "the race child must complete under the deadline: code={:?} timed_out={} waited={}ms\n{}",
+        outcome.code,
+        outcome.timed_out,
+        outcome.waited.as_millis(),
+        outcome.output
+    );
+    let fields = parse_fields(&outcome.output, "race bounds:").unwrap_or_else(|| {
+        panic!(
+            "the child must print a typed `race bounds:` line:\n{}",
+            outcome.output
+        )
+    });
+    assert!(
+        all_nonzero(&fields, &["writes", "collects", "ops"]),
+        "the child must do real, non-zero concurrent work: {fields:?}\n{}",
+        outcome.output
+    );
+}
+
+/// Negative control: the same real writers fixture with the collector parked forever inside the
+/// cycle-lock seam. The parent must kill *this* child at the deadline and FAIL; the fixture is not a
+/// pass until the inner fixture is observed to time out. The child log proves the child reached the
+/// park phase after real setup and never logged the collect completing.
+#[test]
+fn a_parked_writers_fixture_is_killed_by_the_parent_and_the_parent_fails() {
+    if is_child() {
+        writers_and_collects_body(is_park_child());
+        return;
+    }
+    let keep = tempfile::tempdir().expect("parent tempdir");
+    let log = keep.path().join("race-writers-park.log");
+    let deadline = Duration::from_secs(20);
+    let (outcome, _) = run_child_fixture(
+        "writers_and_collects_at_once_lose_nothing",
+        &[(PARK_ENV, "1")],
+        deadline,
+        &log,
+    );
+    assert!(
+        outcome.timed_out,
+        "the parent must kill the parked race child: code={:?} waited={}ms\n{}",
+        outcome.code,
+        outcome.waited.as_millis(),
+        outcome.output
+    );
+    assert!(
+        outcome.waited < deadline + Duration::from_secs(10),
+        "the parent deadline must bound the job: waited={}ms",
+        outcome.waited.as_millis()
+    );
+    // No success evidence escaped: a parked child must never print real counts.
+    assert!(
+        parse_fields(&outcome.output, "race bounds:").is_none(),
+        "a parked child must never print its success line: {}",
+        outcome.output
+    );
+    let logtext = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        logtext.contains("phase=race-setup-done"),
+        "the child did real setup before parking: {logtext:?}"
+    );
+    assert!(
+        logtext.contains("phase=parking-collector"),
+        "the child reached the park phase (not a spawn/filter failure): {logtext:?}"
+    );
+    assert!(
+        !logtext.contains("phase=race-collected"),
+        "the parked child was ended before the collect returned: {logtext:?}"
+    );
+}
+
+fn writers_and_collects_body(park: bool) {
     let f = Fixture::eager(128 << 10);
     // The fixture owns a TempDir and a lock, so the threads take the parts that are Send + Sync.
     let parts = f.parts();
@@ -175,6 +305,19 @@ fn writers_and_collects_at_once_lose_nothing() {
     }
     parts.meta.sync().unwrap();
     parts.store.sync().unwrap();
+    child_log("phase=race-setup-done");
+
+    if park {
+        // Park the collector forever inside the cycle-lock seam, after real setup. The in-process
+        // scope would join this forever; only the parent deadline ends the job.
+        child_log("phase=parking-collector");
+        parts.gc.set_between_list_and_walk(Box::new(|| {
+            child_log("phase=parked");
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }));
+    }
 
     let b = Bounds::new();
     let writes = Arc::new(AtomicU64::new(0));
@@ -323,7 +466,7 @@ fn writers_and_collects_at_once_lose_nothing() {
     assert!(wrote > 0, "no writes happened");
     assert!(collected > 0, "no collects happened");
     // Report what the bounds actually admitted, so a budget that silently starved the workload
-    // fails here instead of passing empty.
+    // fails here instead of passing empty. The parent parses these typed fields and rejects zeros.
     println!(
         "race bounds: bytes={} writes={} collects={} ops={}",
         b.bytes.load(Relaxed),
@@ -346,6 +489,7 @@ fn writers_and_collects_at_once_lose_nothing() {
     }
     assert!(parts.store.fsck().expect("fsck").is_clean());
     assert!(!parts.store.recovery().has_corruption());
+    child_log("phase=race-collected");
 }
 
 /// A cycle with no barrier reports its candidates and frees nothing.
@@ -405,6 +549,40 @@ fn without_a_barrier_nothing_is_freed() {
 /// unit test in `cowfs-core`, not by this wall-clock fixture.
 #[test]
 fn the_barrier_costs_writers_a_bounded_stall() {
+    if is_child() {
+        the_barrier_costs_writers_a_bounded_stall_body();
+        return;
+    }
+    let keep = tempfile::tempdir().expect("parent tempdir");
+    let log = keep.path().join("race-stall.log");
+    let (outcome, _) = run_child_fixture(
+        "the_barrier_costs_writers_a_bounded_stall",
+        &[],
+        CHILD_DEADLINE,
+        &log,
+    );
+    assert!(
+        !outcome.timed_out && outcome.code == Some(0),
+        "the stall child must complete under the deadline: code={:?} timed_out={} waited={}ms\n{}",
+        outcome.code,
+        outcome.timed_out,
+        outcome.waited.as_millis(),
+        outcome.output
+    );
+    let fields = parse_fields(&outcome.output, "stall bounds:").unwrap_or_else(|| {
+        panic!(
+            "the child must print a typed `stall bounds:` line:\n{}",
+            outcome.output
+        )
+    });
+    assert!(
+        all_nonzero(&fields, &["writes", "cycles", "barriers"]),
+        "the stall child must take the barrier and make real progress: {fields:?}\n{}",
+        outcome.output
+    );
+}
+
+fn the_barrier_costs_writers_a_bounded_stall_body() {
     let f = Fixture::eager(64 << 10);
     let parts = f.parts();
     let parts = &parts;
@@ -514,11 +692,43 @@ fn the_barrier_costs_writers_a_bounded_stall() {
             "a live block is gone after the stall fixture"
         );
     }
+    child_log("phase=stall-collected");
 }
 
 /// Two collectors at once: neither loses a block and neither reports an error.
+///
+/// Wrapped like the other concurrent fixtures: the collectors run inside `thread::scope`, so a
+/// collector that parked would hang the scope. The parent owns the deadline.
 #[test]
 fn two_collectors_on_one_store_are_safe() {
+    if is_child() {
+        two_collectors_on_one_store_are_safe_body();
+        return;
+    }
+    let keep = tempfile::tempdir().expect("parent tempdir");
+    let log = keep.path().join("race-two-collectors.log");
+    let (outcome, _) = run_child_fixture(
+        "two_collectors_on_one_store_are_safe",
+        &[],
+        CHILD_DEADLINE,
+        &log,
+    );
+    assert!(
+        !outcome.timed_out && outcome.code == Some(0),
+        "the two-collector child must complete under the deadline: code={:?} timed_out={} waited={}ms\n{}",
+        outcome.code,
+        outcome.timed_out,
+        outcome.waited.as_millis(),
+        outcome.output
+    );
+    assert!(
+        outcome.output.contains("two-collectors done"),
+        "the child must report its real completion line:\n{}",
+        outcome.output
+    );
+}
+
+fn two_collectors_on_one_store_are_safe_body() {
     let f = Fixture::eager(32 << 10);
     let parts = f.parts();
     let snap = f.meta.new_snapshot("s").unwrap();
@@ -547,6 +757,7 @@ fn two_collectors_on_one_store_are_safe() {
         );
     }
     assert!(parts.store.fsck().expect("fsck").is_clean());
+    println!("two-collectors done barriers={}", roots.barrier_taken());
 }
 
 /// A pinned block survives a collect, and goes on a later one once it is unpinned.

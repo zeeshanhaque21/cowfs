@@ -1,33 +1,33 @@
 //! Process-level watchdog around a resource-sensitive fixture (issue 83).
 //!
-//! The other concurrent fixtures bound themselves in-process. That bounds the *writers* (they stop
-//! at a byte/time budget), but it cannot end a test whose collector parks forever: those fixtures
-//! call the collector inside `std::thread::scope`, so the scope joins the parked thread and the test
-//! never returns. The only bound that survives that is a separate process with a deadline held by
-//! its parent.
-//!
-//! This file proves the process-level bound, end to end, on a real `cowfs-core` GC fixture:
+//! The actual race fixtures now run under this watchdog from `tests/race.rs` (the real
+//! resource-sensitive entrypoints). This file proves the *helper's* mechanics on a smaller real
+//! `cowfs-core` fixture and exercises its failure paths, so the guard itself is tested independently
+//! of the racing workload:
 //! - a happy child runs a real collect to a real reclaim, and the parent accepts it;
 //! - a child that parks its collector forever is killed by the parent at the deadline, and the
 //!   parent FAILS (it never returns PASS or SKIP);
-//! - a child whose writer fails exits non-zero promptly, and the parent fails with its log.
+//! - a child that fails generically exits non-zero promptly, and the parent fails with its log;
+//! - the helper rejects a bad filter (zero tests), a preset inherited guard, and a nonce mismatch.
 //!
 //! The parent owns the child's deadline and polls `try_wait`, so it detects a prompt non-zero exit
-//! and otherwise ends at a fixed bound. It kills only the child it spawned, after re-checking the
-//! child's pid and command, and never signals a process group.
+//! and otherwise ends at a fixed bound. It kills only the child it spawned and never signals a
+//! process group.
 
 mod common;
 
 use std::time::Duration;
 
 use common::child::{
-    child_log, is_child, is_fail_child, is_park_child, run_child_fixture, FAIL_ENV, PARK_ENV,
+    child_log, guard_present, is_child, is_fail_child, is_park_child, run_child_fixture, FAIL_ENV,
+    NONCE_ENV, PARK_ENV,
 };
 use cowfs_core::{Core, Options as CoreOptions, SnapshotView};
 use cowfs_gc::Options as GcOptions;
 use cowfs_vfs::{Vfs, ROOT_INO};
 
 const FIXTURE: &str = "a_real_collect_reclaims_and_reads_back_under_a_parent_deadline";
+const EVIDENCE: &str = "CHILD_FIXTURE_OK";
 
 fn core_opts() -> CoreOptions {
     CoreOptions {
@@ -115,9 +115,11 @@ fn child_fixture_body(park: bool, fail: bool) {
 
     let c = core.collector(gc_opts()).expect("collector");
     if fail {
-        // The writer-failure path: fail before the collect, so writers would stop promptly.
-        child_log("phase=arming-failure");
-        panic!("injected writer failure (fail child)");
+        // A generic child failure (a panic on the child's main thread): proves exit-code
+        // propagation. It is not a writer-thread failure; that is exercised inside the actual race
+        // fixture in `race.rs`.
+        child_log("phase=failing");
+        panic!("injected child failure (generic failure control)");
     }
     if park {
         // Park the collector forever inside a seam that runs with the cycle lock held. The
@@ -141,6 +143,8 @@ fn child_fixture_body(park: bool, fail: bool) {
         "phase=collected unlinked={} freed={}",
         r.packs_unlinked, r.freed_bytes
     ));
+    let unlinked = r.packs_unlinked;
+    let freed = r.freed_bytes;
     drop(c);
     core.close().expect("close");
 
@@ -156,15 +160,17 @@ fn child_fixture_body(park: bool, fail: bool) {
     assert!(fs.damage.is_empty(), "fsck damage: {:?}", fs.damage);
     drop(fv);
     core.close().expect("close");
-    // The single line the parent requires. A child that skipped its work never prints it.
+    // The evidence line the parent requires, with the actual counts and the nonce it was started
+    // with. A child that skipped its work, a stale line, or a filter typo never produces this.
     println!(
-        "CHILD_FIXTURE_OK unlinked={} freed={} survivor_hash_ok=1 fsck_clean=1",
-        r.packs_unlinked, r.freed_bytes
+        "{EVIDENCE} unlinked={unlinked} freed={freed} nonce={}",
+        common::child::child_nonce()
     );
 }
 
 /// Happy path under the parent watchdog: a real reclaim, a survivor read after reopen, and the
-/// parent accepts it. Also the child body when `CHILD_ENV` is set.
+/// parent accepts it after parsing the child's nonce + counts. Also the child body when
+/// `CHILD_ENV` is set.
 #[test]
 fn a_real_collect_reclaims_and_reads_back_under_a_parent_deadline() {
     if is_child() {
@@ -173,14 +179,21 @@ fn a_real_collect_reclaims_and_reads_back_under_a_parent_deadline() {
     }
     let keep = tempfile::tempdir().expect("parent tempdir");
     let log = keep.path().join("child.log");
-    let outcome = run_child_fixture(FIXTURE, &[], Duration::from_secs(120), &log);
+    let (outcome, nonce) = run_child_fixture(FIXTURE, &[], Duration::from_secs(120), &log);
     assert!(
-        outcome.succeeded("CHILD_FIXTURE_OK"),
-        "happy child must complete its fixture: code={:?} timed_out={} waited={}ms\n{}",
+        outcome.succeeded(EVIDENCE, &nonce),
+        "happy child must complete its fixture: code={:?} timed_out={} drain_expired={} waited={}ms\n{}",
         outcome.code,
         outcome.timed_out,
+        outcome.drain_expired,
         outcome.waited.as_millis(),
         outcome.output
+    );
+    // Parse the actual counts, not just the marker.
+    let (unlinked, freed) = parse_counts(&outcome.output, EVIDENCE);
+    assert!(
+        unlinked >= 1 && freed > 0,
+        "the child's reclaim must be real and non-zero: unlinked={unlinked} freed={freed}"
     );
 }
 
@@ -196,7 +209,7 @@ fn a_permanently_parked_collector_is_killed_by_the_parent_and_the_parent_fails()
     let keep = tempfile::tempdir().expect("parent tempdir");
     let log = keep.path().join("park.log");
     let deadline = Duration::from_secs(20);
-    let outcome = run_child_fixture(FIXTURE, &[(PARK_ENV, "1")], deadline, &log);
+    let (outcome, nonce) = run_child_fixture(FIXTURE, &[(PARK_ENV, "1")], deadline, &log);
     // The parent must have ended the child itself, within the declared bound.
     assert!(
         outcome.timed_out,
@@ -212,7 +225,7 @@ fn a_permanently_parked_collector_is_killed_by_the_parent_and_the_parent_fails()
     );
     // The child reached the park phase and never printed the success line.
     assert!(
-        !outcome.succeeded("CHILD_FIXTURE_OK"),
+        !outcome.succeeded(EVIDENCE, &nonce),
         "a parked child must never pass"
     );
     // The child log proves the child actually executed the fixture and reached the park phase, so
@@ -237,10 +250,12 @@ fn a_permanently_parked_collector_is_killed_by_the_parent_and_the_parent_fails()
     );
 }
 
-/// Negative control: a child whose writer fails must exit non-zero promptly, and the parent must
-/// fail with the child's log rather than wait out the deadline.
+/// Negative control: a child that fails generically (a panic on its main thread) must exit non-zero
+/// promptly, and the parent must fail with the child's log rather than wait out the deadline. This
+/// proves exit-code propagation; a real writer-thread failure is covered inside the actual race
+/// fixture in `race.rs`.
 #[test]
-fn a_child_writer_error_fails_promptly_and_reaches_the_parent() {
+fn a_generic_child_failure_exits_nonzero_and_reaches_the_parent() {
     if is_child() {
         child_fixture_body(is_park_child(), is_fail_child());
         return;
@@ -248,7 +263,7 @@ fn a_child_writer_error_fails_promptly_and_reaches_the_parent() {
     let keep = tempfile::tempdir().expect("parent tempdir");
     let log = keep.path().join("fail.log");
     let deadline = Duration::from_secs(60);
-    let outcome = run_child_fixture(FIXTURE, &[(FAIL_ENV, "1")], deadline, &log);
+    let (outcome, nonce) = run_child_fixture(FIXTURE, &[(FAIL_ENV, "1")], deadline, &log);
     assert!(
         !outcome.timed_out,
         "the failing child must exit on its own, not need the deadline: waited={}ms",
@@ -262,12 +277,12 @@ fn a_child_writer_error_fails_promptly_and_reaches_the_parent() {
         outcome.output
     );
     assert!(
-        outcome.output.contains("injected writer failure"),
+        outcome.output.contains("injected child failure"),
         "the child's failure is visible to the parent: {}",
         outcome.output
     );
     assert!(
-        !outcome.succeeded("CHILD_FIXTURE_OK"),
+        !outcome.succeeded(EVIDENCE, &nonce),
         "a failing child must never pass"
     );
     let logtext = std::fs::read_to_string(&log).unwrap_or_default();
@@ -275,4 +290,95 @@ fn a_child_writer_error_fails_promptly_and_reaches_the_parent() {
         logtext.contains("phase=setup-done"),
         "the failing child did real setup first: {logtext:?}"
     );
+}
+
+/// The helper rejects a filter that matches no test: a bare name that runs zero tests exits 0 but
+/// prints no evidence and carries no nonce, so the parent must not accept it.
+#[test]
+fn a_filter_that_matches_no_test_does_not_pass() {
+    let keep = tempfile::tempdir().expect("parent tempdir");
+    let log = keep.path().join("badfilter.log");
+    let (outcome, nonce) = run_child_fixture(
+        "this_test_name_does_not_exist",
+        &[],
+        Duration::from_secs(30),
+        &log,
+    );
+    assert!(
+        !outcome.succeeded(EVIDENCE, &nonce),
+        "a zero-test child must never pass: code={:?} timed_out={} output={}",
+        outcome.code,
+        outcome.timed_out,
+        outcome.output
+    );
+    assert!(
+        outcome.output.contains("0 tests") || !outcome.output.contains(EVIDENCE),
+        "the child ran no tests: {}",
+        outcome.output
+    );
+}
+
+/// A preset inherited guard must not turn the parent into an unbounded in-process body. The parent
+/// test still spawns a guarded child and requires the fresh nonce, so the child identity is the
+/// spawned process, not the inherited variable.
+#[test]
+fn a_preset_inherited_guard_does_not_bypass_the_parent() {
+    // Set the guard in this process to simulate an inherited value; the parent must still spawn.
+    std::env::set_var(common::child::CHILD_ENV, "1");
+    // The guard is present, but without a spawned nonce this process is NOT the child.
+    assert!(
+        guard_present() && !is_child(),
+        "an inherited guard alone must not classify this process as the child"
+    );
+    let keep = tempfile::tempdir().expect("parent tempdir");
+    let log = keep.path().join("preset.log");
+    let spawned_ok = std::panic::catch_unwind(|| {
+        // `run_child_fixture` is a parent-only call; it clears the guard from its own environment,
+        // so the parent still spawns even with the guard preset.
+        let (outcome, nonce) = run_child_fixture(FIXTURE, &[], Duration::from_secs(120), &log);
+        outcome.succeeded(EVIDENCE, &nonce)
+    })
+    .unwrap_or(false);
+    std::env::remove_var(common::child::CHILD_ENV);
+    assert!(
+        spawned_ok,
+        "a preset guard must not stop the parent from spawning a guarded child"
+    );
+}
+
+/// The nonce is required: a child line that carries the evidence marker but not this run's nonce is
+/// not a success. Exercised directly on the outcome shape.
+#[test]
+fn an_evidence_line_without_the_run_nonce_is_rejected() {
+    let keep = tempfile::tempdir().expect("parent tempdir");
+    let log = keep.path().join("nonce.log");
+    let (outcome, nonce) = run_child_fixture(
+        FIXTURE,
+        &[(NONCE_ENV, "wrong-nonce")],
+        Duration::from_secs(120),
+        &log,
+    );
+    // The child echoes the nonce it was actually started with; the parent's own nonce differs, so
+    // a forged or stale line cannot satisfy both.
+    assert!(
+        !outcome.succeeded(EVIDENCE, &nonce),
+        "a mismatched nonce must not pass: nonce={nonce} output={}",
+        outcome.output
+    );
+}
+
+/// Parse `unlinked=N freed=M` from the evidence line. Returns `(0, 0)` when the line or a field is
+/// missing, so the caller's non-zero assertion fails instead of accepting a partial line.
+fn parse_counts(output: &str, evidence: &str) -> (u64, u64) {
+    let line = output
+        .lines()
+        .find(|l| l.contains(evidence))
+        .unwrap_or_default();
+    let get = |key: &str| -> u64 {
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix(key))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    (get("unlinked="), get("freed="))
 }
