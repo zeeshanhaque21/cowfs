@@ -55,6 +55,8 @@ FULL = {
     "meta_files": 50_000,
 }
 SEED = 0xC0FFEE
+# A byte count is written in whole chunks of this size, so counts() rounds down to it.
+UNIT = {"large_bytes": 1 << 16, "big_bytes": 1 << 20}
 GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
 
 # g2 edits this file: it is a leaf of the dependency graph (nothing in the
@@ -78,7 +80,8 @@ def counts() -> dict:
     out = {}
     for key, value in FULL.items():
         if key.endswith("_bytes"):
-            out[key] = max(1 << 20, int(value * scale / 100))
+            unit = UNIT[key]
+            out[key] = max(unit, int(value * scale / 100) // unit * unit)
         else:
             out[key] = max(10, int(value * scale / 100))
     return out
@@ -168,7 +171,7 @@ class Ctx:
 
     def ensure_tree(self):
         marker = self.tree / ".generated"
-        want = f"{self.n['small_files']} {self.n['large_files']} {SEED}"
+        want = f"{self.n['small_files']} {self.n['large_files']} {self.n['large_bytes']} {SEED}"
         if marker.exists() and marker.read_text().strip() == want:
             return
         if self.tree.exists():
@@ -184,10 +187,13 @@ class Ctx:
                 (sub / f"f{i:05d}").write_bytes(bodies[(i + d) % 64])
         big = self.tree / "big"
         big.mkdir()
-        chunk = bytes(rng.getrandbits(8) for _ in range(1 << 16))
+        chunk = bytes(rng.getrandbits(8) for _ in range(UNIT["large_bytes"]))
         for i in range(self.n["large_files"]):
             with open(big / f"b{i:03d}", "wb") as fh:
                 fh.writelines(chunk for _ in range(self.n["large_bytes"] // len(chunk)))
+            size = (big / f"b{i:03d}").stat().st_size
+            if size != self.n["large_bytes"]:
+                raise SystemExit(f"tree file b{i:03d} is {size} bytes, counts() says {self.n['large_bytes']}")
         git = [
             "git",
             "-c",
@@ -293,18 +299,22 @@ class Ctx:
         d = self.root / "big"
         d.mkdir(parents=True, exist_ok=True)
         path = d / "seq.bin"
-        chunk = os.urandom(1 << 20)
+        chunk = os.urandom(UNIT["big_bytes"])
+        expected = self.n["big_bytes"]
         t = time.monotonic()
         with open(path, "wb") as fh:
-            fh.writelines(chunk for _ in range(self.n["big_bytes"] // len(chunk)))
+            fh.writelines(chunk for _ in range(expected // len(chunk)))
             fh.flush()
             os.fsync(fh.fileno())
         write = time.monotonic() - t
+        written = path.stat().st_size
+        if written != expected:
+            raise SystemExit(f"g5 wrote {written} bytes, counts() says {expected}")
         t = time.monotonic()
         got = 0
         with open(path, "rb") as fh:
             while True:
-                b = fh.read(1 << 20)
+                b = fh.read(UNIT["big_bytes"])
                 if not b:
                     break
                 got += len(b)
@@ -313,14 +323,16 @@ class Ctx:
         os.fsync(fd)
         os.close(fd)
         path.unlink()
-        mib = self.n["big_bytes"] / (1 << 20)
+        mib = expected / (1 << 20)
         return {
-            "bytes": self.n["big_bytes"],
+            "bytes": expected,
+            "written_bytes": written,
+            "read_bytes": got,
             "write_s": write,
             "read_s": read,
             "write_mib_s": mib / write if write else 0.0,
             "read_mib_s": mib / read if read else 0.0,
-            "read_matches": got == self.n["big_bytes"],
+            "read_matches": got == written == expected,
         }
 
     def g6(self):

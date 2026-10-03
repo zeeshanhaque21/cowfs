@@ -7,6 +7,9 @@ Usage: compare.py --native NATIVE.jsonl [NATIVE2.jsonl ...] --cowfs COWFS.jsonl
 Every rep of every gate is read, not just the median, and the median, min and
 max of the per-rep ratios are printed alongside the rep counts.
 
+A g5 rep whose read-back did not match what it wrote, or what counts() asked for,
+makes the whole comparison invalid (exit 3): that throughput is of a short read.
+
 Ratios are refused, not printed, when the machine was too loaded for them to
 mean anything: load1 above 30 on either side, or the two arms more than 2x
 apart. Two previous reviewers found timings unmeasurable at load 100 to 300,
@@ -58,6 +61,10 @@ def load(paths):
     if not reps:
         raise SystemExit(f"no reps in {paths}")
     return meta, reps
+
+
+def short_reads(reps):
+    return [r for r in reps if r["gate"] == "g5" and not r["metrics"].get("read_matches")]
 
 
 def by_gate(reps):
@@ -116,6 +123,14 @@ def main() -> int:
     on_macos = sys.platform == "darwin"
     _, na = load(args.native)
     _, nb = load([args.cowfs])
+    bad = short_reads(na) + short_reads(nb)
+    if bad:
+        for r in bad:
+            m = r["metrics"]
+            print(f"INVALID g5 rep {r['rep']} of {r['label']}: expected {m.get('bytes')} "
+                  f"written {m.get('written_bytes')} read {m.get('read_bytes')}", file=sys.stderr)
+        print("RESULT: invalid, g5 did not read back what it wrote", file=sys.stderr)
+        return 3
     ga, gb = by_gate(na), by_gate(nb)
 
     print(f"platform      {platform.platform()}")
