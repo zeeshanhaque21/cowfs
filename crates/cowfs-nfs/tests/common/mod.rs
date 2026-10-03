@@ -6,11 +6,13 @@ pub mod reuse;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cowfs_nfs::{MountOptions, Server};
 use cowfs_vfs::Vfs;
 use cowfs_vfs_test::MemVfs;
 use nfsserve::nfs::*;
+use nfsserve::tcp::Limits;
 use nfsserve::xdr::XDR;
 
 pub type Rd = Cursor<Vec<u8>>;
@@ -465,15 +467,46 @@ impl Nfs {
     }
 }
 
-/// Resident memory of this process in bytes, from `ps`.
+/// Resident memory of this process in bytes, from `ps`. A failed reading panics: reading 0 would
+/// make every "memory stayed bounded" assertion pass vacuously.
 pub fn rss_bytes() -> u64 {
     let out = std::process::Command::new("/bin/ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout)
+        .expect("spawn ps to read the resident set");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kib: u64 = text
         .trim()
-        .parse::<u64>()
-        .unwrap_or(0)
-        * 1024
+        .parse()
+        .unwrap_or_else(|_| panic!("ps printed {text:?} instead of a resident set size"));
+    kib * 1024
+}
+
+pub fn opts(limits: Limits) -> MountOptions {
+    MountOptions {
+        limits,
+        ..MountOptions::default()
+    }
+}
+
+pub fn connect_raw(port: u16) -> TcpStream {
+    let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s
+}
+
+/// True if the server closes `s` within `secs`.
+pub fn closed_within(s: &mut TcpStream, secs: u64) -> bool {
+    let t = Instant::now();
+    // A socket that was reset refuses a new timeout, which is itself proof that it is gone.
+    let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut b = [0u8; 16];
+    while t.elapsed() < Duration::from_secs(secs) {
+        match s.read(&mut b) {
+            Ok(0) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return true,
+            Ok(_) | Err(_) => {}
+        }
+    }
+    false
 }
