@@ -255,11 +255,18 @@ sweep or its cancellation under the core backend. That gap is stated here rather
   depends on `cowfs-core` only as a `[dev-dependencies]` entry, and `grep test-hooks` across the tree
   returns nothing. The gate seam is gated on `#[cfg(test)]` (`crates/cowfs-core/src/gate.rs:12`,
   `gc_barrier_window.rs`), so `remove_barrier` and the parked-thread probe are **absent** from the
-  production daemon binary. A residual always-compiled-but-inert durability seam remains
-  (`crates/cowfs-core/src/fsops.rs` is a public `#[doc(hidden)]` module whose `arm()` is called only
-  from `crates/cowfs-core/tests/durability.rs`; the string `injected sync fault on` is therefore still
-  present in the binary). It is unreachable in production because nothing in a production path arms
-  it, and it is not the fail-open barrier seam. Both parts are stated here rather than overclaimed.
+  production daemon binary. A residual `crates/cowfs-core/src/fsops.rs` seam remains: it is `pub
+  #[doc(hidden)]`, always compiled, and holds global process state, so it is **callable by an
+  in-process library embedder** (its `set_fault`/`arm`/`disarm`/`trace_take` compile from an external
+  crate). It is **not remotely invokable** through this daemon: `fsops` has no reference in
+  `cowfs-daemon`, `cowfs-ctl` or `cowfs-cli`, and the control protocol has no fault or arm verb; in
+  the daemon's and any production path it is simply never armed. It is **not** the fail-open barrier
+  seam: an armed fault makes `sync_file`/`sync_dir` return errors. One path, `crates/cowfs-core/src/swap.rs:57`,
+  discards a directory-sync error (`let _ = ...sync_dir`), so an armed fault there is swallowed rather
+  than surfaced; this is a static source observation and no new risk was reproduced. The string
+  `injected sync fault on` is present in the binary because the module always compiles. Stated this
+  way rather than as universal production unreachability: the correct claim is "not invoked by the
+  daemon or any production path; public library API".
 
 ## Known nonblocking issues (not fixed this pass)
 
@@ -273,6 +280,41 @@ sweep or its cancellation under the core backend. That gap is stated here rather
 Both are harness hygiene, not evidence-integrity defects. They are not fixed in this pass so the
 72-record run above is not invalidated by a script change; fixing them requires its own regression
 proof and re-run.
+
+## Combined-graph caveat (documentation only, not this harness's build)
+
+A static reviewer observed that `cargo check --workspace --all-targets` reports the **non-test**
+`cowfs-store` lib feature `fault-injection` in the daemon-bin compile graph. Cause, confirmed here:
+`crates/cowfs-store/Cargo.toml` carries a **self dev-dependency**
+(`cowfs-store = { path = ".", features = ["fault-injection"] }`), and the workspace is
+`resolver = "2"`. When a workspace/`--all-targets` invocation brings dev-dependency edges into the
+graph, that feature is unified onto the **non-test** store lib (`cargo tree -p cowfs-store -e
+features` shows `cowfs-store feature "fault-injection"` active even for the lib). The seamed code is
+`#[cfg(feature = "fault-injection")]` (`crates/cowfs-store/src/fsio.rs`), reads `C7D_EXIT_FILE` /
+`C7D_EXIT_LEN` / `C7D_EXIT_SYNC_N` / `C7D_EXIT_BOUNDARY_N`, and calls `std::process::exit(77)`.
+Facts, stated not overclaimed:
+
+- It is **pre-existing** (the store manifest is unchanged by `89b202c`) and is **not the barrier hook
+  and not the `fsops` seam**.
+- It is **feature-gated, not target-gated**: any build that excludes dev-dependency edges (the plain
+  `cargo build -p cowfs-cli -p cowfs-daemon -p cowfs-gc` binaries this harness ran) omits it, and
+  `C7D_EXIT` appears **0** times in those daemon binaries. This document's proof is the **default
+  daemon build**; the `--all-targets`/workspace fault configuration is a **different graph** and was
+  **not built or executed** here.
+- It was read from cargo's resolved feature graph and source, **not** from an independently executed
+  binary in that configuration, and **no new data-loss claim** is made from it.
+- It is a crash-injection seam, not a reference-barrier fail-open.
+
+## Independent source-side notes (separate reviewer, scope stated)
+
+A fresh native reviewer independently reproduced this harness's behavior on `89b202c`: a small
+14-record actual-reclaim run and the full 72-record run, both 0 failed, with all four reopen files
+matching independently regenerated fixture digests on a fresh NFS mount, plus compile-level proof
+that `Core::set_gate_fault` is not reachable (`E0599`), the gate module is private (`E0603`), and no
+`test-hooks` feature exists. That review certifies **artifact and end-to-end behavior only**; it
+explicitly does **not** certify production source safety, which remains the separate source critic's
+gate. The review report is a local, untracked artifact (`docs/reviews/gc-daemon-final-source.md`), not
+durable GitHub evidence; it is not linked as a URL.
 
 ## Source fixes this head carries (not exercised by this harness)
 
