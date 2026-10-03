@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Turns on the fault seams that remove the reference barrier (`Core::set_gate_fault`). Only a test
+# build enables it, so a production build cannot reach a fail-open switch.
+test-hooks = []
+
 [dependencies]
 cowfs-store = { path = "../cowfs-store" }
 cowfs-gc = { path = "../cowfs-gc" }

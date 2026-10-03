@@ -199,9 +199,10 @@ So the barrier test is sensitive to the thing it tests, and removing the barrier
 
 The mark-phase regression is `a_commit_between_the_freeze_listing_and_a_walks_the_listed_root`, described under Status above.
 Its seam, `Gc::set_between_list_and_walk`, is `#[doc(hidden)]` and production never sets it.
-The same applies to the core seams this file already uses (`set_gate_fault`, `gate_waiters`): they are `#[doc(hidden)]` but still reachable by any API user.
-`set_gate_fault` in particular disables the barrier, so it is a fail-open switch that no production path calls; a later change should gate these behind a test-only feature.
-`Core::store()` and `Core::meta()` likewise hand out handles a caller could use to write without the gate; the daemon uses neither, and this note records it rather than widening scope here.
+The barrier-removing core seam is different: `Core::set_gate_fault` is a fail-open switch because it makes `take` succeed without closing the gate.
+It (and `gate_waiters`, and the gate's own `set_fault`/`waiting`) is now compiled only under the `cowfs-core` `test-hooks` feature, which `cowfs-gc`'s dev-dependency turns on for its end-to-end test.
+A production build has neither the method nor the field, so the switch cannot be reached at all: `cargo build -p cowfs-core` has no warning and no `set_gate_fault`.
+`Core::store()` and `Core::meta()` still hand out handles a caller could use to write without the gate; the daemon uses neither, and this note records it rather than widening scope here.
 
 `crates/cowfs-daemon/src/handler.rs` tests: a dry run over a real core changes nothing and reports candidates, a live run frees blocks and bytes, emits `mark` and `sweep` progress and leaves survivors readable and fsck-clean, a cancelled request is `cancelled` and the next one finishes the job, closing the backend after a collection releases the store lock, and the passthrough backend still answers `unsupported`.
 

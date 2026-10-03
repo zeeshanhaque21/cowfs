@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::marker::PhantomData;
+#[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -40,6 +41,7 @@ pub(crate) struct Gate {
     st: Mutex<State>,
     cv: Condvar,
     /// Test seam, see `Core::set_gate_fault`: 1 makes `take` succeed without closing the gate.
+    #[cfg(any(test, feature = "test-hooks"))]
     fault: AtomicU8,
 }
 
@@ -66,6 +68,7 @@ impl Gate {
                 waiting: 0,
             }),
             cv: Condvar::new(),
+            #[cfg(any(test, feature = "test-hooks"))]
             fault: AtomicU8::new(0),
         }
     }
@@ -141,6 +144,7 @@ impl Gate {
         if self.inside() {
             return None;
         }
+        #[cfg(any(test, feature = "test-hooks"))]
         if self.fault.load(Ordering::Acquire) == 1 {
             return Some(Hold {
                 gate: Arc::clone(self),
@@ -193,11 +197,13 @@ impl Gate {
         })
     }
 
-    /// Threads parked in `enter`. For tests.
+    /// Threads parked in `enter`. For tests. Only built under `test-hooks`.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn waiting(&self) -> usize {
         self.st.lk().waiting
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn set_fault(&self, kind: u8) {
         self.fault.store(kind, Ordering::Release);
     }
