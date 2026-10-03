@@ -857,3 +857,115 @@ fn an_old_format_marks_file_from_before_the_walk_fix_is_not_reused() {
     fsck_clean(&core);
     core.close().unwrap();
 }
+
+/// Issue 83: a snapshot removed between the collector's lookup of a listed snapshot and the walk
+/// that reads its root makes the walk report `NoSuchSnapshot`. The cycle must treat that one error
+/// as a snapshot that came and went - not fail the whole cycle and not free a block a keeper needs.
+///
+/// The seam places the removal in that exact window, so the test needs no timing. The assertions are
+/// not merely that the cycle is `Ok`: a fork of the removed victim must still read every byte of
+/// every file it shares with the victim after a reopen, `fsck` must be clean, and the cycle must
+/// still free real dead packs. A no-op collector that returned `Ok` without working would fail the
+/// reclaim assertion, and one that skipped the walk and then freed the shared blocks would fail the
+/// survivor read.
+#[test]
+fn a_snapshot_removed_between_the_lookup_and_the_walk_does_not_fail_the_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    // Real garbage for the reclaim to free, and a tail so the watermark passes the dead packs.
+    let plan = build(&core);
+
+    core.create_snapshot("src").unwrap();
+    let sv = core.snapshot_view("src").unwrap();
+    let x = body(40_000, 7101);
+    put_file(&sv, "K", &x);
+    core.sync().unwrap();
+
+    // A snapshot that will be removed inside the collector's lookup/walk window. Its own root is
+    // distinct so the collector actually reaches the walk for it, and it holds real blocks that
+    // become dead once it is gone.
+    core.fork_snapshot("src", "victim").unwrap();
+    let vv = core.snapshot_view("victim").unwrap();
+    let mut victim_files: Files = Vec::new();
+    for i in 0..8u32 {
+        let d = body(40_000, 7200 + i);
+        let n = format!("v{i:02}");
+        put_file(&vv, &n, &d);
+        victim_files.push((n, d));
+    }
+    core.sync().unwrap();
+    // A survivor forks the victim with no further writes, so it shares the victim's exact root.
+    // Removing the victim must leave every block this survivor reads in place.
+    core.fork_snapshot("victim", "survivor").unwrap();
+    core.sync().unwrap();
+    let victim_id = core
+        .list_snapshots()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == "victim")
+        .expect("victim listed")
+        .id;
+
+    let mut keep = plan.keep.clone();
+    add_tail(&core, &mut keep, "tail-src", 6);
+
+    let c = core.collector(gc_opts()).unwrap();
+    let removed = Arc::new(AtomicBool::new(false));
+    let removed2 = Arc::clone(&removed);
+    let wcore = core.clone();
+    c.gc().set_between_lookup_and_walk(Box::new(move |id| {
+        if id.0 != victim_id {
+            return;
+        }
+        if removed2.swap(true, SeqCst) {
+            return;
+        }
+        // Remove the snapshot the collector just looked up, before it walks it.
+        wcore.remove_snapshot("victim").expect("remove in window");
+        wcore.sync().expect("sync the removal");
+    }));
+
+    let r = c
+        .gc()
+        .collect(Some(c.roots()))
+        .expect("the removal in the lookup/walk window must not fail the cycle");
+    clean(&r);
+    assert!(
+        removed.load(SeqCst),
+        "the seam fired: the removal landed in the lookup/walk window"
+    );
+    assert!(
+        r.packs_unlinked >= 1 && r.freed_bytes > 0,
+        "the cycle still reclaimed real dead packs: {r:?}"
+    );
+
+    drop(vv);
+    drop(sv);
+    drop(c);
+    core.close().unwrap();
+
+    // The keepers survive a reopen with their real bytes, and the store is sound.
+    let core = reopen(dir.path());
+    let kv = core.snapshot_view("src").unwrap();
+    assert_eq!(
+        read_file(&kv, "K").expect("src's K reads after reopen"),
+        x,
+        "the keeper's block survived the removal race"
+    );
+    drop(kv);
+    // The fork of the removed victim still reads every byte of every file: removing the victim did
+    // not free a block the survivor shares with it.
+    let survivor = core.snapshot_view("survivor").unwrap();
+    for (n, d) in &victim_files {
+        assert_eq!(
+            &read_file(&survivor, n)
+                .unwrap_or_else(|e| panic!("survivor's {n} does not read: {e}")),
+            d,
+            "survivor's {n} survived the victim's removal"
+        );
+    }
+    drop(survivor);
+    verify(&core, &keep);
+    fsck_clean(&core);
+    core.close().unwrap();
+}

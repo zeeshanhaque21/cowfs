@@ -88,6 +88,44 @@ impl Fixture {
         Self::new(small_store_opts(pack), eager())
     }
 
+    /// A fixture whose metadata database runs `hook` before every durable commit.
+    ///
+    /// The hook can be armed from a test to make the next `sync()` fail with a non-`NoSuchSnapshot`
+    /// error, which is how a test proves the collector propagates such an error instead of skipping
+    /// the snapshot it hit it on.
+    pub fn with_hook(pack: u64, hook: cowfs_meta::SyncHook) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            Arc::new(Store::open(dir.path().join("store"), small_store_opts(pack)).expect("store"));
+        let meta = Arc::new(
+            Meta::open(
+                dir.path().join("meta"),
+                cowfs_meta::Options {
+                    background: false,
+                    before_sync: Some(hook),
+                    ..cowfs_meta::Options::default()
+                },
+            )
+            .expect("meta"),
+        );
+        let gc = Gc::open(
+            dir.path().join("gcstate"),
+            Arc::clone(&store),
+            Arc::clone(&meta),
+            eager(),
+        )
+        .expect("gc");
+        Self {
+            dir: dir.path().to_path_buf(),
+            keep: Arc::new(Mutex::new(Some(dir))),
+            store,
+            meta,
+            gc,
+            sopts: small_store_opts(pack),
+            gopts: eager(),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.dir
     }

@@ -137,6 +137,8 @@ impl Default for Options {
 }
 
 type ProgressFn = Box<dyn FnMut(&Progress) + Send + Sync>;
+/// A test seam that runs inside the mark walk. See [`Gc::set_between_lookup_and_walk`].
+type LookupHookFn = Box<dyn FnMut(cowfs_meta::SnapshotId) + Send>;
 
 /// A collector over one store and one metadata database.
 pub struct Gc {
@@ -157,6 +159,10 @@ pub struct Gc {
     /// drive a commit into that exact window deterministically. `None` in production.
     #[doc(hidden)]
     pub between_list_and_walk: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test seam: run once per listed snapshot between its lookup and its walk, so a test can place
+    /// a removal in that exact window deterministically. `None` in production.
+    #[doc(hidden)]
+    pub between_lookup_and_walk: Mutex<Option<LookupHookFn>>,
 }
 
 impl Gc {
@@ -189,6 +195,7 @@ impl Gc {
             cancelled: AtomicBool::new(false),
             cycle: Mutex::new(()),
             between_list_and_walk: Mutex::new(None),
+            between_lookup_and_walk: Mutex::new(None),
         })
     }
 
@@ -270,6 +277,20 @@ impl Gc {
     pub fn set_between_list_and_walk(&self, f: Box<dyn FnMut() + Send>) {
         *self
             .between_list_and_walk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// Test seam: run `f(id)` once per listed snapshot, between the collector's lookup of a listed
+    /// snapshot and the walk that reads its root.
+    ///
+    /// The window is the one where a snapshot removed after the lookup but before the walk makes the
+    /// walk report `NoSuchSnapshot`; a test uses this to place that removal deterministically,
+    /// without timing. Never set outside `tests/`.
+    #[doc(hidden)]
+    pub fn set_between_lookup_and_walk(&self, f: LookupHookFn) {
+        *self
+            .between_lookup_and_walk
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(f);
     }
@@ -607,13 +628,33 @@ impl Gc {
             let Ok(snap) = self.meta.snapshot_by_id(id) else {
                 continue;
             };
+            if let Some(f) = self
+                .between_lookup_and_walk
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                f(id);
+            }
             // The root read here and the nodes it walks are one epoch (`live_blocks_with_root`).
             // The root can differ from the listed `key`: a writer committed to this snapshot after
             // the freeze listing. Recording the listed key then would claim a root this walk never
             // descended, and a fork still on the listed root would be skipped as covered while its
             // blocks sat in no live set. So the walked root is what gets recorded, and the listed
             // key is left unwalked for the entries that still resolve to it.
-            let (root, walk) = snap.live_blocks_with_root(marker)?;
+            //
+            // The lookup above held the session read lock only for its own call, so a removal can
+            // land in the gap before this one. `live_blocks_with_root` re-reads the namespace under
+            // the lock and reports `NoSuchSnapshot` for a id removed in that gap. That id names no
+            // root in the durable table any more, and a fork of it recorded its own root before the
+            // removal committed, so no snapshot this cycle keeps is reached through it: it has no
+            // addressable root entry, and skipping it keeps nothing alive. Only that one error is
+            // skipped. Every other error is a real failure and stops the cycle, still fail-closed.
+            let (root, walk) = match snap.live_blocks_with_root(marker) {
+                Ok(v) => v,
+                Err(cowfs_meta::Error::NoSuchSnapshot) => continue,
+                Err(e) => return Err(e.into()),
+            };
             let walked_root = *root.as_bytes();
             if walked.contains(&walked_root) {
                 // Another entry this cycle already walked exactly this root. Its blocks and the

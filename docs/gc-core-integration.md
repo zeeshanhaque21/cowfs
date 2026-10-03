@@ -36,6 +36,43 @@ Proof (private stores, this worktree):
 - With the old key-recording behaviour restored the deterministic test fails: the fork's block is gone after the cycle (`... named by a file is missing`).
   With the correction it passes 10/10, and the review's timing-based fixture no longer loses data (10/10).
 
+### A snapshot removed between the lookup and the walk
+
+Step 2 looks each listed id up with `snapshot_by_id(id)`, then walks it with
+`live_blocks_with_root`, in a separate call.
+A removal that commits in the gap between those two calls made the walk report `NoSuchSnapshot`, and
+the collector returned that as a cycle error, so a collect running while a snapshot was removed failed
+outright (issue 83).
+
+`NoSuchSnapshot` there is a snapshot that came and went, not a failure:
+
+- The id names no root in the durable table any more, so nothing this cycle keeps is reached through
+  it.
+- A fork of it recorded its own root before the removal committed, so the fork is walked through its
+  own listed id, not the removed one.
+
+The collector therefore skips **that one id** and continues.
+It does not record the failed root as walked, does not add a block or root to the persisted mark, and
+writes no partial marker: the skip happens before any of that.
+Every other error (storage, corruption, a failing hook) still stops the cycle with
+`Err(e) => return Err(e.into())`, the same conversion the old `?` used, so a real failure is never
+treated as a vanished snapshot.
+
+Proof (private stores, this worktree):
+
+- `crates/cowfs-gc/tests/core_reclaim.rs::a_snapshot_removed_between_the_lookup_and_the_walk_does_not_fail_the_cycle`
+  uses the `Gc::set_between_lookup_and_walk` seam to remove the snapshot in the exact window, so the
+  test needs no timing. On the pre-fix source it fails with `Meta(NoSuchSnapshot)`; after the fix the
+  cycle is `Ok`, unlinks at least one real dead pack, and a fork of the removed victim reads every
+  byte of every shared file after a reopen, with `fsck` clean.
+- `crates/cowfs-gc/tests/regressions.rs::a_non_nosuchsnapshot_error_in_the_walk_window_fails_the_cycle_and_frees_nothing`
+  arms a metadata `before_sync` fault in the same window so the walk fails with a non-`NoSuchSnapshot`
+  error. The cycle must fail and free nothing. A fail-open mutation (`Err(_) => continue`) makes the
+  test fail, so the propagation arm is load-bearing.
+
+Both seams, `Gc::set_between_list_and_walk` and `Gc::set_between_lookup_and_walk`, are
+`#[doc(hidden)]` and production never sets them.
+
 ## Problem
 
 `cowfs-gc` needs two things from the reference side.
@@ -200,8 +237,8 @@ Negative control: `Core::set_gate_fault(1)` makes `take` return a hold that does
 The same scenario with the real barrier loses nothing and shows the writer parked at the gate while the barrier is held.
 So the barrier test is sensitive to the thing it tests, and removing the barrier makes a deterministic test fail.
 
-The mark-phase regression is `a_commit_between_the_freeze_listing_and_a_walks_the_listed_root`, described under Status above.
-Its seam, `Gc::set_between_list_and_walk`, is `#[doc(hidden)]` and production never sets it.
+The mark-phase regressions are `a_commit_between_the_freeze_listing_and_a_walks_the_listed_root` and `a_snapshot_removed_between_the_lookup_and_the_walk_does_not_fail_the_cycle`, described under Status above.
+Their seams, `Gc::set_between_list_and_walk` and `Gc::set_between_lookup_and_walk`, are `#[doc(hidden)]` and production never sets them.
 The barrier-removing core seam is different: `Core::set_gate_fault` is a fail-open switch because it makes `take` succeed without closing the gate.
 It (and `gate_waiters`, and the gate's own `set_fault`/`waiting`) is now compiled only under `#[cfg(test)]`, so it is visible only to `cowfs-core`'s own unit tests.
 The barrier window test therefore lives in `crates/cowfs-core/src/gc_barrier_window.rs`, not in `cowfs-gc`'s integration tests.

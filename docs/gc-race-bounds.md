@@ -33,11 +33,40 @@ so a descheduled runner stops early instead of growing the store without limit.
 
 ## The `NoSuchSnapshot` failure is not the fixture's
 
-The CI `NoSuchSnapshot` at `writers_and_collects_at_once_lose_nothing` is a **production defect in
-the collector**, reproduced deterministically and reported in issue 83; it is not this fixture doing
+The CI `NoSuchSnapshot` at `writers_and_collects_at_once_lose_nothing` was a **production defect in
+the collector**, reproduced deterministically and reported in issue 83; it was not this fixture doing
 an invalid operation. The fixture removes snapshots while a collect runs, which the collector's own
-documentation says it supports. See issue 83 for the minimal counterexample.
+documentation says it supports.
 
-The bounded fixture still surfaces that defect (it records the collector error and fails), so it does
-not hide it. This file only bounds resources; it does not change what the test asserts about
+The defect: the mark pass looked a listed snapshot up and then, in a separate call, read its root and
+walked it. A removal that landed in the gap between those two calls made the second call report
+`NoSuchSnapshot`, and the collector returned that as a cycle error, so a collect running while a
+snapshot was removed failed outright.
+
+The fix is in `crates/cowfs-gc/src/lib.rs`, in the mark pass:
+
+- `NoSuchSnapshot` from `live_blocks_with_root` is the snapshot removed in that gap. It names no root
+  in the durable table any more, and a fork of it recorded its own root before the removal
+  committed, so no snapshot the cycle keeps is reached through it. The cycle skips **that one id**
+  and continues.
+- Every other error still stops the cycle (`Err(e) => return Err(e.into())`, the same conversion the
+  old `?` used). It is never treated as a vanished snapshot.
+
+The fix is exactly that match. It does not mark the failed root walked, does not cache a block or a
+root for it, and persists no partial mark: the `continue` is taken before any of that.
+
+Regression tests:
+
+- `crates/cowfs-gc/tests/core_reclaim.rs::a_snapshot_removed_between_the_lookup_and_the_walk_does_not_fail_the_cycle`
+  drives the removal into the exact window with a test seam, over a real store and real core. On the
+  pre-fix source it fails with `Meta(NoSuchSnapshot)`; after the fix the cycle is `Ok`, reclaims real
+  dead packs, and a fork of the removed victim still reads every byte of every shared file after a
+  reopen, with `fsck` clean.
+- `crates/cowfs-gc/tests/regressions.rs::a_non_nosuchsnapshot_error_in_the_walk_window_fails_the_cycle_and_frees_nothing`
+  arms a metadata `before_sync` fault in the same window so the walk fails with a non-`NoSuchSnapshot`
+  error. The cycle must fail and free nothing. A fail-open mutation (`Err(_) => continue`) makes this
+  test fail, so the propagation arm is load-bearing.
+
+The bounded fixture still surfaces any such defect (it records the collector error and fails), so it
+does not hide it. This file only bounds resources; it does not change what the test asserts about
 correctness.
