@@ -518,6 +518,9 @@ struct Conn {
     dead: AtomicBool,
     last_active: AtomicU64,
     inflight: Mutex<HashMap<u64, CancelToken>>,
+    /// Terminal frames whose write is in progress. Counted outside the inflight map so a slow
+    /// write never holds the map lock, yet teardown still sees the request as unfinished.
+    finishing: AtomicU64,
 }
 
 impl Conn {
@@ -529,6 +532,7 @@ impl Conn {
             dead: AtomicBool::new(false),
             last_active: AtomicU64::new(0),
             inflight: Mutex::new(HashMap::new()),
+            finishing: AtomicU64::new(0),
         })
     }
 
@@ -557,14 +561,21 @@ impl Conn {
     /// Closing a connection is the connection thread's job and always drains what the peer sent
     /// first, so a frame that is on its way out cannot be cut by it.
     fn finish(&self, id: u64, frame: &ServerFrame) {
-        let ok = {
+        {
             let mut inflight = lock(&self.inflight);
             if inflight.remove(&id).is_none() {
                 return;
             }
-            // Keep teardown from observing completion before the terminal write finishes.
-            self.write_frame(frame)
-        };
+            // Keep teardown from observing completion before the terminal write finishes, but do
+            // not hold the map lock across the write: admission and shutdown take it too. The
+            // counter is bumped under the lock, so any observer that sees the id gone also sees a
+            // nonzero finishing count until the write below completes.
+            self.finishing.fetch_add(1, Ordering::SeqCst);
+        }
+        let ok = self.write_frame(frame);
+        // Release the completion claim only after the terminal frame is on the wire. The map lock
+        // is free again, so a failed write can safely reacquire it through `kill`.
+        self.finishing.fetch_sub(1, Ordering::SeqCst);
         if !ok {
             self.kill();
         }
@@ -577,7 +588,7 @@ impl Conn {
     }
 
     fn inflight_empty(&self) -> bool {
-        lock(&self.inflight).is_empty()
+        lock(&self.inflight).is_empty() && self.finishing.load(Ordering::SeqCst) == 0
     }
 
     /// Ends every request that is still running with `shutting_down`. Only sent when the server
@@ -1045,21 +1056,20 @@ mod tests {
             move || conn.finish(1, &frame)
         });
         let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match conn.inflight.try_lock() {
-                Ok(inflight) => assert!(
-                    inflight.contains_key(&1),
-                    "teardown can observe completion before the terminal write"
-                ),
-                Err(std::sync::TryLockError::WouldBlock) => break,
-                Err(e) => panic!("{e}"),
-            }
+        // The finisher removes the id under the map lock, bumps `finishing`, then blocks on the
+        // write lock held above. Seeing a nonzero count proves it is inside the terminal write.
+        // Both the map and the counter must report busy in that window.
+        while conn.finishing.load(Ordering::SeqCst) == 0 {
             assert!(
                 Instant::now() < deadline,
                 "finisher did not reach the write"
             );
             thread::sleep(Duration::from_millis(1));
         }
+        assert!(
+            !conn.inflight_empty(),
+            "teardown can observe completion before the terminal write"
+        );
         drop(write);
         worker.join().unwrap();
         assert!(conn.inflight_empty());

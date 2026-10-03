@@ -815,3 +815,91 @@ fn mount_snapshot_is_gated_by_the_framework_the_way_a_removal_is() {
         "the unmounted export is gone"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// A5: a blocked terminal write must not stall admission or shutdown.
+//
+// Retaining the inflight map lock across the terminal write fixed half-close (#58) but made a
+// client that stops reading hold the map lock for the whole write timeout. Admission (max
+// connections eviction) and shutdown (abandon_inflight) take that same map lock, so both stalled
+// for `write_timeout`. These two tests fail on that implementation and pass when the terminal
+// write is tracked by a separate counter instead.
+// ---------------------------------------------------------------------------------------------
+
+/// Returns a snapshot list larger than any socket buffer, so the terminal frame write blocks while
+/// the client never reads.
+struct BigList;
+
+impl ControlHandler for BigList {
+    fn snapshot_list(&self) -> CtlResult<Vec<SnapshotInfo>> {
+        Ok((0..4000)
+            .map(|i| SnapshotInfo {
+                name: format!("{i}-{}", "x".repeat(1000)),
+                parent: None,
+                base: None,
+                created_unix_ms: 0,
+            })
+            .collect())
+    }
+}
+
+const BIG_REQUEST: &str = r#"{"type":"request","id":1,"method":"snapshot_list","params":{}}"#;
+
+#[test]
+fn a5_a_blocked_terminal_write_does_not_stall_shutdown() {
+    let _w = Watchdog::start(120);
+    let mut fx = start_with(
+        BigList,
+        ServerOptions {
+            write_timeout: Duration::from_secs(4),
+            shutdown_deadline: Duration::from_millis(300),
+            ..ServerOptions::default()
+        },
+    );
+    // Connect and ask, then never read, so the 4 MiB terminal frame cannot drain.
+    let mut blocked = Raw::hello(&fx.path);
+    blocked.send(BIG_REQUEST);
+    thread::sleep(Duration::from_millis(500));
+    let server = fx.server.take().unwrap();
+    let t0 = Instant::now();
+    server.handle().shutdown();
+    server.wait();
+    let elapsed = t0.elapsed();
+    eprintln!("A5 shutdown_elapsed_ms={}", elapsed.as_millis());
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "wait() took {elapsed:?}; shutdown_deadline is 300ms and the write lock must not hold it"
+    );
+    drop(blocked);
+}
+
+#[test]
+fn a5_a_blocked_terminal_write_does_not_stall_admission() {
+    let _w = Watchdog::start(120);
+    let fx = start_with(
+        BigList,
+        ServerOptions {
+            write_timeout: Duration::from_secs(4),
+            shutdown_deadline: Duration::from_millis(300),
+            max_connections: 1,
+            ..ServerOptions::default()
+        },
+    );
+    let mut blocked = Raw::hello(&fx.path);
+    blocked.send(BIG_REQUEST);
+    thread::sleep(Duration::from_millis(500));
+    // At the connection cap, a second connection must still get its refusal promptly.
+    let mut second = Raw::connect(&fx.path);
+    let t0 = Instant::now();
+    second.send(HELLO);
+    let f = second.recv();
+    let elapsed = t0.elapsed();
+    eprintln!("A5 admission_first_frame_ms={}", elapsed.as_millis());
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "second connection stalled {elapsed:?}"
+    );
+    assert_eq!(f["type"], "error", "{f}");
+    assert_eq!(f["error"]["code"], "too_many_connections", "{f}");
+    drop(blocked);
+}
