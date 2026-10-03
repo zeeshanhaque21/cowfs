@@ -359,13 +359,24 @@ def setup_arm(run: Run, arm: str):
             "files": ls.count("\n"), "cargo_lock_sha256": lock}
 
 
+def parse_finished(text: str):
+    """Seconds from cargo's `Finished ... in 1.23s` or `in 2m 03s`. None if absent."""
+    m = re.search(r"Finished .*? in ([^\n]*)", text)
+    if not m:
+        return None
+    total, seen = 0.0, False
+    for value, unit in re.findall(r"([0-9]+(?:\.[0-9]+)?)\s*(m|s)\b", m.group(1)):
+        seen = True
+        total += float(value) * (60.0 if unit == "m" else 1.0)
+    return total if seen else None
+
+
 def cargo_build(run: Run, arm: str):
     cmd = ["cargo", "build", "--offline", "--locked", "-p", PACKAGE, "-j", "4"]
     p, secs = sh(cmd, cwd=corpus(run, arm), env=build_env(run, arm))
-    fin = re.search(r"Finished .* in ([0-9.]+)s", p.stderr)
     return {"cmd": " ".join(cmd), "rc": p.returncode, "wall_s": round(secs, 3),
             "compiling": len(re.findall(r"^\s*Compiling ", p.stderr, re.M)),
-            "cargo_s": float(fin.group(1)) if fin else None,
+            "cargo_s": parse_finished(p.stderr),
             "stderr_tail": p.stderr[-300:] if p.returncode else ""}
 
 
@@ -408,10 +419,13 @@ def clean_target(run: Run, arm: str):
     t = run.arm_dir[arm] / "corpus-target"
     if not t.exists():
         return
-    # verification before the irreversible step: own marker, own arm dir, exact name
-    assert run.owned(t) and t.name == "corpus-target" and t.parent == run.arm_dir[arm]
-    p = checked(["rm", "-rf", str(t)])
-    assert not t.exists(), p
+    # verification before the irreversible step: the run's own marker must sit above it.
+    # Explicit if/raise, not assert: python -O strips assert and would remove the guard.
+    if not run.owned(t):
+        raise SystemExit(f"refusing to remove {t}: no run marker above it")
+    checked(["rm", "-rf", str(t)])
+    if t.exists():
+        raise SystemExit(f"{t} survived rm -rf")
 
 
 def edit_leaf(run: Run, arm: str, rep: int):
