@@ -4,16 +4,92 @@
 //! holds, so a commit cannot land between the collector's last reachability check and the unlink.
 //! Without a barrier the same workload would lose blocks, which is why the crate refuses to free
 //! anything when no barrier is offered, and a test here proves that it does refuse.
+//!
+//! Every concurrent fixture here is **bounded** (issue 83): a fixed byte budget, a fixed iteration
+//! cap, a finite run time, a no-progress watchdog, and a stop-on-error flag any worker or collector
+//! sets. Before those bounds, a collector that stalled would let the writer loops append until the
+//! runner's disk filled (`StorageFull` in CI). The bound is on the rate and the total, so a
+//! descheduled runner stops early instead of growing without limit. The numbers each run actually
+//! reached are printed (and asserted non-zero) so a bound that silently disabled the workload fails
+//! loudly instead of passing empty.
 
 mod common;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Fixture, Roots};
 use cowfs_store::BlockId;
+
+/// Total bytes any concurrent writer group may store in one test. A few MB, not tens.
+const WRITE_BYTE_BUDGET: u64 = 24 << 20;
+/// Iterations one writer thread may run, independent of the byte budget.
+const WRITE_ITER_CAP: u64 = 100_000;
+/// Wall-clock cap for a concurrent phase.
+const RUN_CAP: Duration = Duration::from_secs(4);
+/// Stop if no thread makes progress for this long: a stalled collector must not hang CI.
+const NO_PROGRESS: Duration = Duration::from_secs(60);
+
+/// The shared bound state of one concurrent phase.
+///
+/// `stop` is set by any worker or collector that fails, by the byte or iteration budget, and by
+/// the watchdog. Every loop checks it, so one failure ends the whole phase instead of leaving a
+/// thread spinning.
+struct Bounds {
+    stop: Arc<AtomicBool>,
+    bytes: Arc<AtomicU64>,
+    ops: Arc<AtomicU64>,
+    last_progress: Arc<Mutex<Instant>>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl Bounds {
+    fn new() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            bytes: Arc::new(AtomicU64::new(0)),
+            ops: Arc::new(AtomicU64::new(0)),
+            last_progress: Arc::new(Mutex::new(Instant::now())),
+            failure: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn clone_state(&self) -> BoundState {
+        BoundState {
+            stop: Arc::clone(&self.stop),
+            bytes: Arc::clone(&self.bytes),
+            ops: Arc::clone(&self.ops),
+            last_progress: Arc::clone(&self.last_progress),
+            failure: Arc::clone(&self.failure),
+        }
+    }
+
+    fn trip(&self, msg: impl Into<String>) {
+        *self.failure.lock().unwrap() = Some(msg.into());
+        self.stop.store(true, Relaxed);
+    }
+
+    fn phase_over(&self) -> bool {
+        self.stop.load(Relaxed) || self.last_progress.lock().unwrap().elapsed() > NO_PROGRESS
+    }
+}
+
+/// The shared handles one spawned thread clones from [`Bounds`].
+struct BoundState {
+    stop: Arc<AtomicBool>,
+    bytes: Arc<AtomicU64>,
+    ops: Arc<AtomicU64>,
+    last_progress: Arc<Mutex<Instant>>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl Drop for Bounds {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+    }
+}
 
 fn body(n: usize, seed: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
@@ -27,6 +103,39 @@ fn body(n: usize, seed: u32) -> Vec<u8> {
         });
     }
     out
+}
+
+/// Run `body` while a watchdog stops the shared flag after `RUN_CAP` or a no-progress stall.
+///
+/// The watchdog is the outermost bound: even if a worker blocks, the phase ends and the test
+/// reports the failure the worker set (or the no-progress timeout) instead of hanging.
+fn run_bounded(b: &Bounds, phase: impl FnOnce()) -> Result<(), String> {
+    let stop = Arc::clone(&b.stop);
+    let last = Arc::clone(&b.last_progress);
+    let watchdog = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        loop {
+            if stop.load(Relaxed) {
+                return;
+            }
+            if t0.elapsed() >= RUN_CAP + Duration::from_secs(5) {
+                stop.store(true, Relaxed);
+                return;
+            }
+            if last.lock().unwrap().elapsed() > NO_PROGRESS {
+                stop.store(true, Relaxed);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    phase();
+    b.stop.store(true, Relaxed);
+    let _ = watchdog.join();
+    match b.failure.lock().unwrap().clone() {
+        Some(msg) => Err(msg),
+        None => Ok(()),
+    }
 }
 
 /// Writers, snapshot creates, snapshot removes and collects, all at once.
@@ -50,75 +159,165 @@ fn writers_and_collects_at_once_lose_nothing() {
     parts.meta.sync().unwrap();
     parts.store.sync().unwrap();
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let b = Bounds::new();
     let writes = Arc::new(AtomicU64::new(0));
     let collects = Arc::new(AtomicU64::new(0));
-    let names: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-    std::thread::scope(|sc| {
-        for w in 0..3u64 {
-            let stop = Arc::clone(&stop);
-            let writes = Arc::clone(&writes);
-            let names = Arc::clone(&names);
-            let roots = Arc::clone(&roots);
-            let base = &base;
-            sc.spawn(move || {
-                let snap = base.fork(&format!("w{w}")).unwrap();
-                parts.meta.sync().unwrap();
-                for i in 0..40u64 {
-                    if stop.load(Relaxed) {
-                        break;
+    run_bounded(&b, || {
+        std::thread::scope(|sc| {
+            for w in 0..3u64 {
+                let BoundState {
+                    stop,
+                    bytes,
+                    ops,
+                    last_progress: last,
+                    failure,
+                } = b.clone_state();
+                let writes = Arc::clone(&writes);
+                let names = Arc::clone(&names);
+                let roots = Arc::clone(&roots);
+                let base = &base;
+                sc.spawn(move || {
+                    let snap = match base.fork(&format!("w{w}")) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            *failure.lock().unwrap() = Some(format!("writer {w} fork: {e:?}"));
+                            stop.store(true, Relaxed);
+                            return;
+                        }
+                    };
+                    if let Err(e) = parts.meta.sync() {
+                        *failure.lock().unwrap() = Some(format!("writer {w} sync: {e:?}"));
+                        stop.store(true, Relaxed);
+                        return;
                     }
-                    let name = format!("f{i:02}");
-                    let data = body(20_000, (w as u32) << 8 ^ i as u32);
-                    roots.write(|| parts.write(&snap, name.as_bytes(), &data));
-                    names.lock().unwrap().push(name);
-                    writes.fetch_add(1, Relaxed);
-                }
-            });
-        }
-        {
-            let stop = Arc::clone(&stop);
-            sc.spawn(move || {
-                let mut n = 0u32;
-                while !stop.load(Relaxed) {
-                    let s = parts.meta.new_snapshot(&format!("tmp{n}")).unwrap();
-                    parts.meta.sync().unwrap();
-                    parts.meta.remove_snapshot(s.id()).unwrap();
-                    parts.meta.reap_all().unwrap();
-                    n += 1;
-                }
-            });
-        }
-        {
-            let stop = Arc::clone(&stop);
-            let collects = Arc::clone(&collects);
-            let roots = Arc::clone(&roots);
-            sc.spawn(move || {
-                while !stop.load(Relaxed) {
-                    let r = parts.gc.collect(Some(&*roots)).expect("collect");
-                    assert!(r.errors.is_empty(), "{:?}", r.errors);
-                    assert!(!parts.store.recovery().has_corruption(), "corruption");
-                    for b in parts.live() {
-                        assert!(
-                            parts.store.get(b).is_ok(),
-                            "a referenced block lost during a concurrent collect"
-                        );
+                    let mut i = 0u64;
+                    while !stop.load(Relaxed) {
+                        if bytes.load(Relaxed) >= WRITE_BYTE_BUDGET || i >= WRITE_ITER_CAP {
+                            if bytes.load(Relaxed) >= WRITE_BYTE_BUDGET {
+                                stop.store(true, Relaxed);
+                            }
+                            break;
+                        }
+                        let name = format!("f{i:02}");
+                        let data = body(20_000, (w as u32) << 8 ^ i as u32);
+                        roots.write(|| parts.write(&snap, name.as_bytes(), &data));
+                        bytes.fetch_add(data.len() as u64, Relaxed);
+                        ops.fetch_add(1, Relaxed);
+                        writes.fetch_add(1, Relaxed);
+                        names.lock().unwrap().push(name);
+                        *last.lock().unwrap() = Instant::now();
+                        i += 1;
                     }
-                    collects.fetch_add(1, Relaxed);
-                }
-            });
-        }
-        std::thread::sleep(Duration::from_millis(1500));
-        stop.store(true, Relaxed);
-    });
+                });
+            }
+            {
+                let BoundState {
+                    stop,
+                    bytes: _,
+                    ops,
+                    last_progress: last,
+                    failure,
+                } = b.clone_state();
+                sc.spawn(move || {
+                    let mut n = 0u32;
+                    while !stop.load(Relaxed) {
+                        let s = match parts.meta.new_snapshot(&format!("tmp{n}")) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                *failure.lock().unwrap() =
+                                    Some(format!("remover new_snapshot: {e:?}"));
+                                stop.store(true, Relaxed);
+                                return;
+                            }
+                        };
+                        if let Err(e) = parts.meta.sync() {
+                            *failure.lock().unwrap() = Some(format!("remover sync: {e:?}"));
+                            stop.store(true, Relaxed);
+                            return;
+                        }
+                        if let Err(e) = parts.meta.remove_snapshot(s.id()) {
+                            *failure.lock().unwrap() =
+                                Some(format!("remover remove_snapshot: {e:?}"));
+                            stop.store(true, Relaxed);
+                            return;
+                        }
+                        if let Err(e) = parts.meta.reap_all() {
+                            *failure.lock().unwrap() = Some(format!("remover reap_all: {e:?}"));
+                            stop.store(true, Relaxed);
+                            return;
+                        }
+                        ops.fetch_add(1, Relaxed);
+                        *last.lock().unwrap() = Instant::now();
+                        n += 1;
+                    }
+                });
+            }
+            {
+                let BoundState {
+                    stop,
+                    bytes: _,
+                    ops,
+                    last_progress: last,
+                    failure,
+                } = b.clone_state();
+                let collects = Arc::clone(&collects);
+                let roots = Arc::clone(&roots);
+                sc.spawn(move || {
+                    while !stop.load(Relaxed) {
+                        match parts.gc.collect(Some(&*roots)) {
+                            Ok(r) => {
+                                assert!(r.errors.is_empty(), "collect errored: {:?}", r.errors);
+                                assert!(
+                                    !parts.store.recovery().has_corruption(),
+                                    "corruption after a concurrent collect"
+                                );
+                                for blk in parts.live() {
+                                    assert!(
+                                        parts.store.get(blk).is_ok(),
+                                        "a referenced block lost during a concurrent collect"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                *failure.lock().unwrap() = Some(format!("collect: {e:?}"));
+                                stop.store(true, Relaxed);
+                                return;
+                            }
+                        }
+                        ops.fetch_add(1, Relaxed);
+                        collects.fetch_add(1, Relaxed);
+                        *last.lock().unwrap() = Instant::now();
+                    }
+                });
+            }
+            // The watchdog thread in `run_bounded` stops the phase on the time cap or a stall.
+            while !b.phase_over() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            b.stop.store(true, Relaxed);
+        });
+    })
+    .unwrap_or_else(|msg| panic!("bounded race phase failed: {msg}"));
+
+    let wrote = writes.load(Relaxed);
+    let collected = collects.load(Relaxed);
+    assert!(wrote > 0, "no writes happened");
+    assert!(collected > 0, "no collects happened");
+    // Report what the bounds actually admitted, so a budget that silently starved the workload
+    // fails here instead of passing empty.
+    println!(
+        "race bounds: bytes={} writes={} collects={} ops={}",
+        b.bytes.load(Relaxed),
+        wrote,
+        collected,
+        b.ops.load(Relaxed)
+    );
+    assert_eq!(names.lock().unwrap().len() as u64, wrote);
 
     let r = f.gc.collect(Some(&*roots)).expect("final collect");
     assert!(r.errors.is_empty(), "{:?}", r.errors);
-    let wrote = writes.load(Relaxed);
-    assert!(wrote > 0, "no writes happened");
-    assert!(collects.load(Relaxed) > 0, "no collects happened");
-    assert_eq!(names.lock().unwrap().len() as u64, wrote);
 
     let live = parts.live();
     assert!(!live.is_empty(), "the base snapshot is still live");
@@ -174,6 +373,13 @@ fn without_a_barrier_nothing_is_freed() {
 }
 
 /// The barrier is short: writers are not starved by a collect over many packs.
+///
+/// Bounded like the other concurrent fixture: the writer loops have a byte and iteration budget
+/// and stop on any error, so a collect that stalls cannot let them fill the disk. The assertion is
+/// the same relative one: the barrier's own held time is a fraction of the collect window, so it is
+/// handed off per pack rather than held to the end. It is explicitly **not** a performance gate:
+/// wall-clock under a descheduled runner is variance, and the loose backstop below only catches a
+/// barrier that is pathological for some other reason.
 #[test]
 fn the_barrier_costs_writers_a_bounded_stall() {
     let f = Fixture::eager(64 << 10);
@@ -188,41 +394,96 @@ fn the_barrier_costs_writers_a_bounded_stall() {
     parts.meta.sync().unwrap();
     let roots = Roots::new();
 
+    let b = Bounds::new();
     let writes = Arc::new(AtomicU64::new(0));
     let worst = Arc::new(AtomicU64::new(0));
     let collect_wall = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    std::thread::scope(|sc| {
-        for w in 0..2u64 {
-            let writes = Arc::clone(&writes);
-            let worst = Arc::clone(&worst);
-            let stop = Arc::clone(&stop);
-            let roots = Arc::clone(&roots);
-            let snap = &snap;
-            sc.spawn(move || {
-                let snap2 = snap.fork(&format!("w{w}")).unwrap();
-                parts.meta.sync().unwrap();
-                let mut i = 0u64;
-                while !stop.load(Relaxed) {
-                    let t = Instant::now();
-                    let name = format!("f{i:03}");
-                    roots.write(|| parts.write(&snap2, name.as_bytes(), &body(8000, i as u32)));
-                    worst.fetch_max(t.elapsed().as_micros() as u64, Relaxed);
-                    writes.fetch_add(1, Relaxed);
-                    i += 1;
+    let collected = Arc::new(AtomicU64::new(0));
+
+    run_bounded(&b, || {
+        std::thread::scope(|sc| {
+            for w in 0..2u64 {
+                let BoundState {
+                    stop,
+                    bytes,
+                    ops,
+                    last_progress: last,
+                    failure,
+                } = b.clone_state();
+                let writes = Arc::clone(&writes);
+                let worst = Arc::clone(&worst);
+                let roots = Arc::clone(&roots);
+                let snap = &snap;
+                sc.spawn(move || {
+                    let snap2 = match snap.fork(&format!("w{w}")) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            *failure.lock().unwrap() =
+                                Some(format!("stall writer {w} fork: {e:?}"));
+                            stop.store(true, Relaxed);
+                            return;
+                        }
+                    };
+                    if let Err(e) = parts.meta.sync() {
+                        *failure.lock().unwrap() = Some(format!("stall writer {w} sync: {e:?}"));
+                        stop.store(true, Relaxed);
+                        return;
+                    }
+                    let mut i = 0u64;
+                    while !stop.load(Relaxed) {
+                        if bytes.load(Relaxed) >= WRITE_BYTE_BUDGET || i >= WRITE_ITER_CAP {
+                            if bytes.load(Relaxed) >= WRITE_BYTE_BUDGET {
+                                stop.store(true, Relaxed);
+                            }
+                            break;
+                        }
+                        let t = Instant::now();
+                        let name = format!("f{i:03}");
+                        let data = body(8000, i as u32);
+                        roots.write(|| parts.write(&snap2, name.as_bytes(), &data));
+                        worst.fetch_max(t.elapsed().as_micros() as u64, Relaxed);
+                        bytes.fetch_add(data.len() as u64, Relaxed);
+                        ops.fetch_add(1, Relaxed);
+                        writes.fetch_add(1, Relaxed);
+                        *last.lock().unwrap() = Instant::now();
+                        i += 1;
+                    }
+                });
+            }
+            // Let the writers get going, then collect a bounded number of cycles.
+            std::thread::sleep(Duration::from_millis(250));
+            let started = Instant::now();
+            for _ in 0..4 {
+                if b.stop.load(Relaxed) {
+                    break;
                 }
-            });
-        }
-        std::thread::sleep(Duration::from_millis(250));
-        let started = Instant::now();
-        for _ in 0..4 {
-            let r = parts.gc.collect(Some(&*roots)).expect("collect");
-            assert!(r.errors.is_empty(), "{:?}", r.errors);
-        }
-        collect_wall.store(started.elapsed().as_micros() as u64, Relaxed);
-        stop.store(true, Relaxed);
-    });
+                match parts.gc.collect(Some(&*roots)) {
+                    Ok(r) => {
+                        assert!(r.errors.is_empty(), "{:?}", r.errors);
+                    }
+                    Err(e) => {
+                        b.trip(format!("stall collect: {e:?}"));
+                        break;
+                    }
+                }
+                collected.fetch_add(1, Relaxed);
+                *b.last_progress.lock().unwrap() = Instant::now();
+            }
+            collect_wall.store(started.elapsed().as_micros() as u64, Relaxed);
+            b.stop.store(true, Relaxed);
+        });
+    })
+    .unwrap_or_else(|msg| panic!("bounded stall phase failed: {msg}"));
+
     assert!(writes.load(Relaxed) > 0, "writers made no progress");
+    let cycles = collected.load(Relaxed);
+    assert!(cycles > 0, "no bounded cycle ran");
+    println!(
+        "stall bounds: bytes={} writes={} cycles={}",
+        b.bytes.load(Relaxed),
+        writes.load(Relaxed),
+        cycles
+    );
     let worst_us = worst.load(Relaxed);
     let held_us = roots.held_us();
     let collect_us = collect_wall.load(Relaxed);
