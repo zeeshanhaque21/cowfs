@@ -533,17 +533,19 @@ impl Conn {
     }
 
     fn send(&self, frame: &ServerFrame) -> bool {
-        if self.dead.load(Ordering::SeqCst) {
-            return false;
-        }
-        let ok = {
-            let _guard = lock(&self.write_lock);
-            (&self.stream).write_all(&frame.encode()).is_ok()
-        };
+        let ok = self.write_frame(frame);
         if !ok {
             self.kill();
         }
         ok
+    }
+
+    fn write_frame(&self, frame: &ServerFrame) -> bool {
+        if self.dead.load(Ordering::SeqCst) {
+            return false;
+        }
+        let _guard = lock(&self.write_lock);
+        (&self.stream).write_all(&frame.encode()).is_ok()
     }
 
     fn send_error(&self, id: Option<u64>, error: CtlError) -> bool {
@@ -555,8 +557,16 @@ impl Conn {
     /// Closing a connection is the connection thread's job and always drains what the peer sent
     /// first, so a frame that is on its way out cannot be cut by it.
     fn finish(&self, id: u64, frame: &ServerFrame) {
-        if lock(&self.inflight).remove(&id).is_some() {
-            self.send(frame);
+        let ok = {
+            let mut inflight = lock(&self.inflight);
+            if inflight.remove(&id).is_none() {
+                return;
+            }
+            // Keep teardown from observing completion before the terminal write finishes.
+            self.write_frame(frame)
+        };
+        if !ok {
+            self.kill();
         }
     }
 
@@ -1010,4 +1020,79 @@ fn dispatch(
             Response::Ok(Empty {})
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_write_remains_inflight_until_sent() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let conn = Arc::new(Conn::new(&server).unwrap());
+        lock(&conn.inflight).insert(1, CancelToken::new());
+        let write = lock(&conn.write_lock);
+        let frame = ServerFrame::Error {
+            id: Some(1),
+            error: CtlError::new(ErrorCode::Cancelled, "done"),
+        };
+        let expected = frame.encode();
+        let worker = thread::spawn({
+            let conn = Arc::clone(&conn);
+            move || conn.finish(1, &frame)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match conn.inflight.try_lock() {
+                Ok(inflight) => assert!(
+                    inflight.contains_key(&1),
+                    "teardown can observe completion before the terminal write"
+                ),
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Err(e) => panic!("{e}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "finisher did not reach the write"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(write);
+        worker.join().unwrap();
+        assert!(conn.inflight_empty());
+        conn.kill();
+        let mut actual = Vec::new();
+        client.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn terminal_write_failure_does_not_deadlock_cancellation() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let conn = Arc::new(Conn::new(&server).unwrap());
+        let pending = CancelToken::new();
+        lock(&conn.inflight).insert(1, CancelToken::new());
+        lock(&conn.inflight).insert(2, pending.clone());
+        drop(client);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn({
+            let conn = Arc::clone(&conn);
+            move || {
+                conn.finish(
+                    1,
+                    &ServerFrame::Error {
+                        id: Some(1),
+                        error: CtlError::new(ErrorCode::Cancelled, "done"),
+                    },
+                );
+                tx.send(()).unwrap();
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(conn.dead.load(Ordering::SeqCst));
+        assert!(pending.is_cancelled());
+    }
 }
