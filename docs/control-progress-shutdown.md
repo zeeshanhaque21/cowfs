@@ -87,14 +87,19 @@ Full suite on the changed variant: 93 tests pass
 `cargo clippy --locked -p cowfs-ctl --all-targets -- -D warnings` and
 `cargo fmt -p cowfs-ctl -- --check` are clean.
 
+CI run `37104454670` on this branch passed all three jobs
+(`check (ubuntu-latest)`, `check (macos-latest)`, `linux-fuse`), so the workspace suite including
+`progress_shutdown` passes on Linux as well as macOS.
+
 PR #73 behaviour preserved on the changed variant:
 `a5_a_blocked_terminal_write_does_not_stall_admission` first frame 0 ms and
 `a5_a_blocked_terminal_write_does_not_stall_shutdown` 309 ms against a 300 ms deadline.
 
 ## Not done
 
-- Linux was not run.
-  No Linux host was used, and the fix does not depend on Linux-specific socket shutdown semantics;
-  it only stops the accept thread from blocking on a per-connection lock.
+- No dedicated Linux host was used for the local reproduction, and no Linux-specific socket
+  shutdown semantics were exercised beyond what the build needs.
+  CI's `check (ubuntu-latest)` job runs `cargo test --workspace`, which includes
+  `progress_shutdown`, and it passed, so the fix and the new tests run on Linux too.
 - The fix is not a throughput claim.
   It bounds `wait()` at the deadline; it does not change how fast a blocked client is finally closed.
