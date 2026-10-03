@@ -311,9 +311,14 @@ INVALID = {
     "scale is infinite": [meta(GIB, scale=float("inf")), rep(GIB)],
     "empty file": [],
     "meta only": [meta()],
-    "no g5 reps": [meta(), rep(gate="g1")],
     "g5 rep with no metrics": [meta(), {"kind": "rep", "gate": "g5", "rep": 0}],
+    "scale 1e308 overflow": [meta(4 * MIB, scale=1e308), rep()],
+    "json list as a record": [meta(), [1, 2, 3], rep()],
+    "rep missing wall_s": [meta(), {k: v for k, v in rep().items() if k != "wall_s"}],
+    "g5 rep wall_s not a number": [meta(), {**rep(), "wall_s": "1.0"}],
+    "g5 rep wall_s bool": [meta(), {**rep(), "wall_s": True}],
 }
+G1 = [meta(GIB, scale=100), {**rep(GIB), "gate": "g1", "wall_s": 2.0}]
 VALID = {
     "modern without scale": [meta(), rep()],
     "modern with matching scale 100": [meta(GIB, scale=100), rep(GIB)],
@@ -374,6 +379,51 @@ class CompareRefuses(unittest.TestCase):
             junk.write_text("{not json\n" + json.dumps(meta()) + "\n" + json.dumps(rep()) + "\n")
             self.assertEqual(self.run_compare([ok], str(junk))[0], 3)
             self.assertEqual(self.run_compare([ok], str(Path(d) / "absent.jsonl"))[0], 3)
+
+    def test_g1_only_comparison_still_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.write(d, "nat.jsonl", G1)
+            cow = self.write(d, "cow.jsonl", [G1[0], {**G1[1], "wall_s": 2.4}])
+            rc, err, out = self.run_compare([nat], cow)
+            self.assertEqual(rc, 0, err)
+            self.assertIn("g1", out)
+            tail = out.split("RESULT:")[0].splitlines()
+            self.assertEqual([line for line in tail if line.startswith("g5")], ["g5   not run (no input has g5 reps)"])
+
+    def test_g1_g3_only_comparison_still_runs(self):
+        g3 = {**rep(GIB), "gate": "g3", "wall_s": 3.0}
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.write(d, "nat.jsonl", G1 + [g3])
+            cow = self.write(d, "cow.jsonl", [G1[0], {**G1[1], "wall_s": 2.4}, {**g3, "wall_s": 3.3}])
+            rc, err, out = self.run_compare([nat], cow)
+            self.assertEqual(rc, 0, err)
+            self.assertIn("g1", out)
+            self.assertIn("g3", out)
+            tail = out.split("RESULT:")[0].splitlines()
+            self.assertEqual([line for line in tail if line.startswith("g5")], ["g5   not run (no input has g5 reps)"])
+
+    def test_g5_in_some_inputs_only_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            g1f = self.write(d, "g1.jsonl", G1)
+            g5f = self.write(d, "g5.jsonl", [meta(), rep()])
+            for slot, (nat, cow, noise) in {
+                "native lacks g5": ([g1f], g5f, None),
+                "cowfs lacks g5": ([g5f], g1f, None),
+                "noise floor lacks g5": ([g5f], g5f, g1f),
+                "second native lacks g5": ([g5f, g1f], g5f, None),
+            }.items():
+                rc, err, out = self.run_compare(nat, cow, noise)
+                self.assertEqual(rc, 3, (slot, out))
+                self.assertIn("no g5 reps while other inputs have g5", err, slot)
+                self.assertNotIn("PASS", out + err, slot)
+
+    def test_empty_and_meta_only_still_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = self.write(d, "ok.jsonl", [meta(), rep()])
+            for name, rows in (("empty", []), ("meta-only", [meta()])):
+                f = self.write(d, "x.jsonl", rows)
+                self.assertEqual(self.run_compare([ok], f)[0], 3, name)
+                self.assertEqual(self.run_compare([f], ok)[0], 3, name)
 
     def test_pre_fix_baseline_file_is_invalid(self):
         with tempfile.TemporaryDirectory() as d:

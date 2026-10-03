@@ -36,10 +36,12 @@ The baseline row has no `written_bytes` field because the pre-fix gate did not m
   - exactly one `meta` record, before the first rep, with no duplicate or conflicting meta;
   - `counts.big_bytes` is an integer (not bool, not float), at least 1 MiB, and a multiple of 1 MiB;
   - when the meta has a `scale`, it is a finite number and `scaled_bytes("big_bytes", scale)` equals `counts.big_bytes`. So 3 MiB is valid at scale 0.3 and impossible at scale 100;
-  - at least one g5 rep, so every comparison needs g5 in every input. A file with no meta, no reps, or no g5 reps is invalid;
+  - at least one rep. An empty file or a meta-only file is invalid;
   - every g5 rep has `bytes`, `written_bytes` and `read_bytes` present, all integers (not bool, not float, not string), and all equal to the meta `big_bytes`.
   The `read_matches` flag is never consulted. A boolean-only row, however well aligned, is invalid.
-- Scope: this is a byte-accounting check of the harness output. It cannot tell a hand-written but internally consistent file from a real run, and it does not try to. Result files written before this change that lack a meta `scale` are still accepted if their counts are valid and every g5 row has the three integer fields; pre-fix rows are not.
+  - g5 is all or nothing across inputs: if any input has g5 reps, every one must, else exit 3 naming the inputs that do not. If no input has g5 reps, a scoped comparison still runs and is judged per gate as before, and the output prints `g5   not run (no input has g5 reps)` instead of a g5 line. A g5 result is never certified without its byte counts, and a g5-less run is never given a g5 verdict or a throughput claim.
+  - A malformed input is refused, not crashed on: a `scale` that has no representable byte count, a JSON line that is not an object, a g5 rep whose `wall_s` is missing or not a finite number, and a rep missing `wall_s` all exit 3 with `INVALID`. The crash paths exit 1, which is the same code as a real criterion FAIL, so they must not be reachable.
+- Scope: this is a byte-accounting check of the harness output. It cannot tell a hand-written but internally consistent file from a real run, and it does not try to. A file that has no `scale` in its meta is a valid modern file as long as its counts and g5 rows pass the rules above; a pre-fix g5 row, which has no `written_bytes` and `read_bytes`, is not, whatever its `read_matches` says. Those are two different things and there is no exemption for the second.
 
 ## Semantics that changed, and results that are no longer comparable
 
@@ -68,11 +70,12 @@ Negative controls, all in `bench/test_gates.py`:
 - a file truncated after the write: g5 refuses.
 - a read-back one byte short of the file: g5 refuses, through `gates.main()` too, with no rep row and no `seq.bin` left, and a sibling file in `big/` untouched.
 - an unaligned expected size (1 MiB - 1, 2 MiB + 1, 21474836): g5 refuses.
-- a regression matrix of 33 invalid result files, each placed in turn as a native file, a second native file, the cowfs file and the noise-floor file (132 runs), where `compare.py` must exit 3, name the file, and print no `PASS`: legacy boolean-only rows (aligned 1 GiB, with and without the byte fields); no meta; rep before meta; duplicate and conflicting meta; meta without counts or without `big_bytes`; `big_bytes` bool, float, zero, negative, below 1 MiB, unaligned; `bytes` bool, float, zero, negative; missing `written_bytes` or `read_bytes`; string-typed count; the forged 5-written 7-read row with the flag true; a read one byte short with the flag true; forged aligned 3 MiB under a 4 MiB meta; equal counts that differ from meta; 3 MiB under a meta with scale 100; scale as string, bool, infinity; an empty file; meta only; no g5 reps; a g5 rep with no metrics; non-JSON and a missing file.
+- a regression matrix of g5 invalid result files, each placed in turn as a native file, a second native file, the cowfs file and the noise-floor file, where `compare.py` must exit 3, name the file, and print no `PASS`: legacy boolean-only rows (aligned 1 GiB, with and without the byte fields); no meta; rep before meta; duplicate and conflicting meta; meta without counts or without `big_bytes`; `big_bytes` bool, float, zero, negative, below 1 MiB, unaligned; `bytes` bool, float, zero, negative; missing `written_bytes` or `read_bytes`; string-typed count; the forged 5-written 7-read row with the flag true; a read one byte short with the flag true; forged aligned 3 MiB under a 4 MiB meta; equal counts that differ from meta; 3 MiB under a meta with scale 100; scale as string, bool, infinity or 1e308; an empty file; meta only; a g5 rep with no metrics; a g5 rep with `wall_s` missing, non-numeric or bool; a JSON line that is a list; non-JSON and a missing file.
+- scoped comparisons: g1-only and g1+g3-only, both arms valid, exit 0 with `g5   not run (no input has g5 reps)` and no g5 line; and the same g5-less file refused in each input slot when any other input has g5.
 - six valid modern files that must still pass in every slot, including 3 MiB at scale 0.3, 20 MiB at scale 2, the 1 MiB floor at scale 0.001, and one whose flag is false but whose numbers all agree (numbers decide, not the flag).
 - trees: a large file truncated to 5 bytes, a small file truncated, a small file removed, a large file removed, a whole `dNNN` directory removed, and strays (extra `big/b099`, a top-level file, an extra `d300` directory, an extra file or directory inside a `dNNN`, a directory inside `big`), each under an unchanged marker: `ensure_tree` refuses.
 
-The tests that guard the tree rounding use scale 13, where the old 1 MiB floor stops hiding the defect. 26 tests. Run against the pre-fix `gates.py` and `compare.py` (`ab99868`), 22 fail or error. Run against the previous head of this PR (`75f16a9`), 4 fail or error, and the old `compare.py` exits 0 on 18 of the 33 invalid cases (all legacy, missing-meta, bad-meta and no-g5 shapes).
+The tests that guard the tree rounding use scale 13, where the old 1 MiB floor stops hiding the defect. 30 tests. Run against the pre-fix `gates.py` and `compare.py` (`ab99868`), 22 fail or error. Run against the previous head of this PR (`e5fa9e7`), 4 fail or error (the two scoped-comparison tests, `test_g5_in_some_inputs_only_is_refused`, and the widened invalid matrix), which is the required negative control for the all-or-nothing g5 rule. The first revision of this PR (`75f16a9`) exits 0 on 18 of the invalid shapes (legacy, missing-meta, bad-meta and no-g5).
 
 ## Run the tests
 
@@ -82,7 +85,7 @@ This is the exact command a CI step would run. The workflows are not owned by th
 python3 -m unittest discover -s bench -v
 ```
 
-26 tests, a few seconds, a few tens of MiB under a temp directory, no network and no cargo. Needs `git` for the tree fixture tests.
+30 tests, a few seconds, a few tens of MiB under a temp directory, no network and no cargo. Needs `git` for the tree fixture tests.
 
 ## Recipe for the later valid controls (not run here)
 

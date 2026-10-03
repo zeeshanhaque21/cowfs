@@ -79,7 +79,10 @@ def load1() -> float:
 
 
 def scaled_bytes(key: str, scale: float) -> int:
-    return max(MIN_BYTES, int(FULL[key] * scale / 100) // UNIT[key] * UNIT[key])
+    want = int(FULL[key] * (scale / 100)) if -1e300 < scale < 1e300 else None  # a huge scale overflows int() on the product
+    if want is None:
+        raise OverflowError(f"scale {scale} has no representable byte count")
+    return max(MIN_BYTES, want // UNIT[key] * UNIT[key])
 
 
 def counts() -> dict:

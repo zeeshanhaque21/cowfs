@@ -10,13 +10,20 @@ max of the per-rep ratios are printed alongside the rep counts.
 Every input file, the noise-floor file included, is validated first, and any failure
 exits 3 with no comparison printed. A file needs exactly one valid meta record before
 its first rep, whose counts.big_bytes is an integer multiple of 1 MiB, at least 1 MiB,
-and equal to the value its scale implies when the meta records a scale. It needs at
-least one g5 rep, and every g5 rep needs integer (not bool, not float) bytes,
-written_bytes and read_bytes that all equal meta big_bytes. The read_matches flag is
-not consulted. There is no legacy exemption: rows with only a flag, files without a
-meta record, and files without g5 reps are all invalid, so every comparison needs g5.
-This is a byte-accounting check on the harness's own output, not provenance: it cannot
-tell a hand-written but internally consistent file from a real run.
+and equal to the value its scale implies when the meta records a scale. Every g5 rep
+needs integer (not bool, not float) bytes, written_bytes and read_bytes that all equal
+meta big_bytes; the read_matches flag is not consulted. There is no legacy exemption:
+rows with only a flag, and files whose meta or g5 rows break the rules above, are
+invalid.
+
+g5 is all or nothing across the inputs. If any input has g5 reps, every input must,
+else exit 3 naming the ones that do not. If no input has g5 reps, a scoped comparison
+still runs and is judged per gate as before, and the output prints `g5   not run (no
+input has g5 reps)` instead of a g5 line, never a g5 pass or a throughput claim. So
+g1/g2/g3-only comparisons keep working, and a g5 result can never be certified without
+its byte counts. This is a byte-accounting check on the harness's own output, not
+provenance: it cannot tell a hand-written but internally consistent file from a real
+run.
 
 Ratios are refused, not printed, when the machine was too loaded for them to
 mean anything: load1 above 30 on either side, or the two arms more than 2x
@@ -65,6 +72,8 @@ def load(paths):
             if not line:
                 continue
             row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
             if row.get("kind") == "meta":
                 meta = meta or row
             elif row.get("kind") == "rep":
@@ -95,7 +104,10 @@ def meta_problem(meta):
         scale = meta["scale"]
         if not is_num(scale):
             return f"meta scale {scale!r} is not a finite number"
-        want = gates.scaled_bytes("big_bytes", scale)
+        try:
+            want = gates.scaled_bytes("big_bytes", scale)
+        except (OverflowError, ValueError):
+            return f"meta scale {scale!r} implies no representable byte count"
         if big != want:
             return f"meta scale {scale} implies big_bytes {want}, meta says {big}"
     return None
@@ -116,11 +128,11 @@ def g5_problem(row, meta_bytes):
 
 
 def file_problems(path):
-    """Every reason this result file cannot be trusted for g5, empty list when it can."""
+    """Every reason this result file cannot be trusted, plus its g5 rep count."""
     try:
         text = Path(path).read_text()
     except OSError as e:
-        return [f"{path}: unreadable: {e}"]
+        return [f"{path}: unreadable: {e}"], 0
     out = []
     meta_bytes = None
     metas = 0
@@ -133,7 +145,10 @@ def file_problems(path):
         except ValueError:
             out.append(f"{path}:{n}: not JSON")
             continue
-        kind = row.get("kind") if isinstance(row, dict) else None
+        if not isinstance(row, dict):
+            out.append(f"{path}:{n}: not a JSON object")
+            continue
+        kind = row.get("kind")
         if kind == "meta":
             metas += 1
             if metas > 1:
@@ -147,6 +162,8 @@ def file_problems(path):
         elif kind == "rep":
             if metas == 0:
                 out.append(f"{path}:{n}: rep before the meta record")
+            if row.get("gate") == "g5" and not is_num(row.get("wall_s")):
+                out.append(f"{path}:{n}: rep wall_s {row.get('wall_s')!r} is missing or not a finite number")
             if row.get("gate") == "g5":
                 g5 += 1
                 why = g5_problem(row, meta_bytes) if meta_bytes is not None else "no valid meta to check against"
@@ -154,9 +171,7 @@ def file_problems(path):
                     out.append(f"{path}:{n}: g5 rep {row.get('rep')}: {why}")
     if not metas:
         out.append(f"{path}: no meta record")
-    if not g5:
-        out.append(f"{path}: no g5 reps")
-    return out
+    return out, g5
 
 
 def by_gate(reps):
@@ -214,8 +229,13 @@ def main() -> int:
 
     on_macos = sys.platform == "darwin"
     bad = []
+    g5n = {}
     for path in [*args.native, args.cowfs, *([args.noise_floor] if args.noise_floor else [])]:
-        bad += file_problems(path)
+        why, n = file_problems(path)
+        bad += why
+        g5n[path] = n
+    if any(g5n.values()):
+        bad += [f"{p}: no g5 reps while other inputs have g5" for p, n in g5n.items() if not n]
     if bad:
         for line in bad:
             print(f"INVALID {line}", file=sys.stderr)
@@ -291,6 +311,8 @@ def main() -> int:
               "which runs the native arm twice around the cowfs arms.")
 
     print()
+    if not any(g5n.values()):
+        print("g5   not run (no input has g5 reps)")
     if unmeasurable:
         print(f"RESULT: {unmeasurable} gate(s) unmeasurable, {fails} failed")
         return 2
