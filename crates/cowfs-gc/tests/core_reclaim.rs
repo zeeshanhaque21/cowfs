@@ -768,3 +768,92 @@ fn a_commit_between_the_freeze_listing_and_a_walks_the_listed_root() {
     fsck_clean(&core);
     core.close().unwrap();
 }
+
+/// B2: a `mark.bin` written by a collector *before* the walked-root fix can pair a listed root with
+/// a different, newly committed root's blocks. Loading it would let a cycle skip a real root's walk
+/// and free the blocks only that root referenced. The fix is a marks-format magic bump, so the whole
+/// old file is ignored and every root is walked in full.
+///
+/// This drives a real store: `src` and its fork share a root; `F` is overwritten in `src`, so `src`
+/// moves to a new root while the fork stays on the old one. A hand-written old-format cache names the
+/// fork's root but omits the block its `F` chunk lives in - exactly the wrong association the old
+/// collector produced. The corrected collector must reject the file, keep the fork readable after a
+/// reopen, and still free real dead packs.
+#[test]
+fn an_old_format_marks_file_from_before_the_walk_fix_is_not_reused() {
+    use std::fs;
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    // Garbage for the reclaim to have something real to free, and a tail so the watermark passes it.
+    let plan = build(&core);
+    core.create_snapshot("src").unwrap();
+    let sv = core.snapshot_view("src").unwrap();
+    let x = body(40_000, 7001);
+    let y = body(40_000, 7002);
+    put_file(&sv, "F", &x);
+    core.sync().unwrap();
+    drop(sv);
+    core.fork_snapshot("src", "fork").unwrap();
+    core.sync().unwrap();
+
+    // The fork's current root, the key the old collector would have recorded.
+    let fork_root = core
+        .list_snapshots()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == "fork")
+        .expect("fork listed")
+        .root;
+    let fork_key = *fork_root.as_bytes();
+
+    // Move `src` to a new root by overwriting F, which is what makes the fork's key stale-but-live.
+    let sv = core.snapshot_view("src").unwrap();
+    let a = sv.lookup(ROOT_INO, b"F").unwrap();
+    assert_eq!(sv.write(a.ino, 0, &y).unwrap() as usize, y.len());
+    sv.forget(a.ino, 1);
+    core.sync().unwrap();
+    drop(sv);
+    let mut keep = plan.keep.clone();
+    add_tail(&core, &mut keep, "tail-src", 6);
+
+    // Hand-build the old-format file: the fork's root named, with a single unrelated block that is
+    // not its F chunk. A collector that trusted it would skip the fork's walk and free F's block.
+    let decoy = core
+        .pinned_blocks()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| BlockId::of(b"decoy"));
+    let mut poison = Vec::new();
+    poison.extend_from_slice(b"COWMARK1");
+    poison.extend_from_slice(&1u64.to_le_bytes()); // one root
+    poison.extend_from_slice(&1u64.to_le_bytes()); // one block
+    poison.extend_from_slice(&fork_key);
+    poison.extend_from_slice(decoy.as_bytes());
+    fs::create_dir_all(dir.path().join("gc")).unwrap();
+    fs::write(dir.path().join("gc").join("mark.bin"), &poison).unwrap();
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(
+        r.packs_unlinked >= 1 && r.freed_bytes > 0,
+        "the cycle still reclaimed real dead packs: {r:?}"
+    );
+
+    drop(c);
+    core.close().unwrap();
+
+    let core = reopen(dir.path());
+    let fv = core.snapshot_view("fork").unwrap();
+    assert_eq!(
+        read_file(&fv, "F").expect("fork's F reads after reopen"),
+        x,
+        "the old-format cache was rejected, so the fork's block survived"
+    );
+    drop(fv);
+    verify(&core, &keep);
+    fsck_clean(&core);
+    core.close().unwrap();
+}

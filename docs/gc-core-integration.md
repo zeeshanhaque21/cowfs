@@ -23,7 +23,10 @@ The correction is narrow and keeps the algorithm:
 - The collector records the root the walk returned (`walked_roots`, the persisted `mark.bin`, and the marker bookkeeping), never the listed key.
   When a listed key is not the walked root it is left unwalked, so the entries that still resolve to it are walked themselves.
 - A root already walked this cycle is skipped by the walked root, and a persisted mark is honoured by the walked root.
-  A mark recorded under an old, wrong key cannot be reused because the key that names it is the root that was actually walked.
+  In-cycle reuse is safe: a mark this cycle records names the root it actually walked.
+  A mark left on disk by a collector *before* this correction is not safe to reuse, because that collector could record a listed root key next to a different, newly committed root's blocks.
+  The marks file therefore carries a format version (`MAGIC_MARKS`), and this correction bumped it from `COWMARK1` to `COWMARK2`.
+  A file in the old format is treated as empty and every root is walked in full, which is always correct because the cache is derived data; no user block or snapshot root is deleted.
 
 Proof (private stores, this worktree):
 
