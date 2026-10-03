@@ -1,18 +1,18 @@
 # Verification: daemon `gc` end to end over the real core
 
 Independent verification of PR #76 (`Refs #10`), production tree `crates/` at
-`73a22952f2f4b09d4411dfa2bfd0e53b6a4bfaa2` (build head `89b202c893f95a5d287523692a731e51f88fb438`,
+`fe899f9f425d40d5db36d13c8400ef3438676879` (build head `f5011574383dbe4d65bd2a5995cfff9b2d168b3d`,
 a recorded proxy for the binary origin, not cryptographic proof).
 This report is produced by `scripts/verify-gc-daemon.py` and is not part of the production change.
 
-This is the **current** production head: `89b202c` builds on `69ae448`, which replaced `ea958947`
-(the head that carried the PR #76 root-walk identity data-loss race). The verification below was
-re-run against `89b202c` on the actual committed crate tree.
+This is the **current** production head: `f501157` builds on `89b202c`, which built on `69ae448`, which
+replaced `ea958947` (the head that carried the PR #76 root-walk identity data-loss race). The
+verification below was re-run against `f501157` on the actual committed crate tree.
 
-This report makes **no claim that the production GC is safe**, and no claim about the `89b202c`
-identity race beyond what is recorded here. Source safety is separately and independently reviewed
+This report makes **no claim that the production GC is safe**, and no claim about the `f501157`
+lookup/walk race beyond what is recorded here. Source safety is separately and independently reviewed
 (in parallel, native, pending); this document reports only the end-to-end behavior it measured. The
-`89b202c` head must pass that source review before this PR is rebased or merged.
+`f501157` head must pass that source review before this PR is rebased or merged.
 
 ## What was verified, and by what
 
@@ -29,26 +29,36 @@ whose command line does not carry this run's exact socket and store.
 
 ## Result
 
-Current run (head `42e9182`, production crates `89b202c`):
+Current run (head `7c08311`, production crates `f501157`):
 
 ```
 records: 72   failed: 0
-env.harness_head (actual run label): 42e918265792b808b88063928e979cbb4f49ba83
-production tree:                      73a22952f2f4b09d4411dfa2bfd0e53b6a4bfaa2   (crates/ at HEAD)
-build head (recorded proxy):          89b202c893f95a5d287523692a731e51f88fb438   (newest commit touching crates/)
+env.harness_head (actual run label): 7c083110fd06079ab7688c7a6d3a14116fbfcbc1
+production tree:                      fe899f9f425d40d5db36d13c8400ef3438676879   (crates/ at HEAD)
+build head (recorded proxy):          f5011574383dbe4d65bd2a5995cfff9b2d168b3d   (newest commit touching crates/)
 script sha256:                        a51259070b54bb852e7de5a16bf492fa5ecc8a81672c12292492e53470c0bff2
-binaries:  cowfs f9508d803f5bc3ef4ff993739d44d5a92d5f7ab4ac5b7a7f5d370c22e21af1b4
-           daemon 4a9d420bd69e5ffef96ee54831b2375dd84cb0f77bffb78bb1bf96fc56b266e0
+binaries:  cowfs fcc58209c48cbfc2ea9b3e57dd55b588658992e3c85e406260abf1a40a10217a
+           daemon bbf278481199488bbb03b201a47e1e5d3fb20a83fa201e99eddd4ea07ae92989
 ```
 
 Built from this exact committed crate tree with `cargo build -p cowfs-cli -p cowfs-daemon -p cowfs-gc`
 into the worktree's own `target/` (isolated by worktree, not a borrowed target). The `harness_head`
-label `42e9182` is the commit this script actually ran from; `build head` is a **recorded proxy**, not
+label `7c08311` is the commit this script actually ran from; `build head` is a **recorded proxy**, not
 cryptographic proof the binary came from exactly that tree (rustc embeds build paths). The
-verification applies to the **production tree** id `73a22952`.
+verification applies to the **production tree** id `fe899f9f`. The harness script sha256
+(`a5125907...`) is unchanged across the `4b9044a`, `42e9182`, and `7c08311` runs, so the same harness
+produced all three.
 
-Full evidence: `bench/out/gc-daemon-e2e/run-89b202c/evidence/records.jsonl` (append, flush, fsync per
+Full evidence: `bench/out/gc-daemon-e2e/run-f501157/evidence/records.jsonl` (append, flush, fsync per
 step).
+
+### Prior run (`89b202c`, superseded, kept for provenance)
+
+The same harness was previously run against `89b202c` (`production tree 73a22952`, head label
+`42e9182`), producing the same fixture numbers; evidence at
+`bench/out/gc-daemon-e2e/run-89b202c/evidence/records.jsonl`. That head carried the marks-cache
+version fix (`COWMARK1` -> `COWMARK2`); `f501157` adds the lookup/walk `NoSuchSnapshot` skip and
+retains the cache versioning.
 
 ### Prior run (`69ae448`, superseded, kept for provenance)
 
@@ -119,9 +129,9 @@ The acceptance this task set is a real reclaim: `freed_bytes > 0`, a physical pa
 survivor still byte-identical, driven by the **unmodified** `cowfs-daemon`/`cowfs` binaries with
 their own default options.
 
-All numbers in this section are from the **current run** (`harness_head 42e9182`, production crates
-`89b202c`); the prior `69ae448` run and the historical run6 on `ea958947` produced the same fixture
-numbers.
+All numbers in this section are from the **current run** (`harness_head 7c08311`, production crates
+`f501157`); the prior `89b202c` and `69ae448` runs and the historical run6 on `ea958947` produced the
+same fixture numbers.
 
 The obstacle is that the deployed thresholds (`cowfs_gc::Options::default()`: `min_dead_bytes`
 8 MiB, `dead_ratio` 0.5) and the skip rules (active pack and every pack at or above the mark epoch
@@ -247,7 +257,18 @@ sweep or its cancellation under the core backend. That gap is stated here rather
   daemon still opens with the real default options.
 - No production edits to `cowfs-core`, `cowfs-gc`, `cowfs-daemon`, root manifests, or workflows.
 - No Linux harness run; the harness is macOS-only here.
-- **The `test-hooks` feature is gone and the hazardous gate seam is `cfg(test)`-only on `89b202c`.**
+- **No certification of the `f501157` lookup/walk race.** This harness uses a **quiescent** fixture: it
+  does not remove a snapshot concurrently with a walk. `f501157` adds a skip for `NoSuchSnapshot`
+  raised in the lookup->walk window (and propagates every other error). Verifying that concurrent-vanish
+  counterexample, and the old-cache-poison upgrade path, is the separate source reviewer's scope; this
+  document reports only that the current quiescent run is clean on this head.
+- **No `test-hooks` feature upstream; hook source unchanged across heads.** `grep test-hooks` over the
+  `f501157` tree returns nothing, `crates/cowfs-core/Cargo.toml` has no `[features]`, and `cowfs-gc`
+  depends on `cowfs-core` only as a `[dev-dependencies]` entry. The hook-relevant source (`gate.rs`,
+  `gc_barrier_window.rs`, `fsops.rs`, both `Cargo.toml`s, `store/src/fsio.rs`) is **byte-identical**
+  between `89b202c` and `f501157`, so the earlier external compile proof carries on this head.
+- **The `test-hooks` feature is gone and the hazardous gate seam is `cfg(test)`-only (on `89b202c`
+  and unchanged on `f501157`).**
   The earlier `69ae448` build had the `cowfs-core` `test-hooks` feature unified on (because
   `crates/cowfs-gc/Cargo.toml` depended on `cowfs-core` with that feature and the daemon links
   `cowfs-gc`), so the fail-open barrier-removal seam was compiled into the daemon. On `89b202c` this
@@ -314,9 +335,10 @@ that `Core::set_gate_fault` is not reachable (`E0599`), the gate module is priva
 `test-hooks` feature exists. That review certifies **artifact and end-to-end behavior only**; it
 explicitly does **not** certify production source safety, which remains the separate source critic's
 gate. The review report is a local, untracked artifact (`docs/reviews/gc-daemon-final-source.md`), not
-durable GitHub evidence; it is not linked as a URL.
+durable GitHub evidence; it is not linked as a URL. That review predates `f501157`; a targeted
+re-review of the `f501157` race fix is required and is not claimed here.
 
-## Source fixes this head carries (not exercised by this harness)
+## Source fixes these heads carry (not exercised by this harness)
 
 `89b202c` bumps the marks-cache format magic `COWMARK1` -> `COWMARK2`, so a `mark.bin` written by a
 pre-fix collector is never trusted and every root is walked in full (the fail-open root-walk cache
@@ -324,6 +346,11 @@ hazard). This harness always builds a **fresh** store per run and never reads or
 so a legacy `COWMARK1` file cannot arise here and no harness cache-format compatibility change is
 needed. Verifying the cache-version logic itself is the source critic's scope, not this end-to-end
 harness; this document makes no claim about it beyond recording that the source carries it.
+
+`f501157` adds the lookup/walk `NoSuchSnapshot` skip and its regression tests (bounded race fixtures,
+`Refs #83`). This harness's fixture is **quiescent** and never removes a snapshot during a walk, so it
+does not exercise that window; the skip, its propagation of all other errors, and the bounded race
+fixtures are the source critic's scope.
 
 ## Reproduction
 
@@ -342,17 +369,18 @@ records the missing prerequisite rather than fetching. The python `blake3` modul
 
 ### Clean-checkout proof
 
-Current head `42e9182`: exported the committed tree (`git archive 42e9182 | tar -x`) into
-`bench/out/gc-daemon-e2e/run-89b202c/clean-archive/`, confirmed the seed source is present from
-tracked files only, and built it `--locked --offline` (64s, reusing the local registry cache). The
+Current head `7c08311`: exported the committed tree (`git archive 7c08311 | tar -x`) into
+`bench/out/gc-daemon-e2e/run-f501157/clean-archive/`, confirmed the seed source is present from
+tracked files only, and built it `--locked --offline` (76s, reusing the local registry cache). The
 three tracked seed files hash identically in the archive and the worktree
 (`Cargo.toml` `629b6746...`, `Cargo.lock` `275e7f2c...`, `src/main.rs` `157430268d...`), so the seed
 is reproducible from tracked source alone on this head. Only `scripts/gc-fixture-seed/target/` is
 ignored; there is no ignored seed **source** dependency.
 
-An earlier head `4b9044a` (production crates `69ae448`) was archived into
-`bench/out/gc-daemon-e2e/run-safe-head/clean-archive/` and built `--locked --offline` (36s) with the
-same three source hashes.
+Earlier heads `42e9182` (crates `89b202c`) and `4b9044a` (production crates `69ae448`) were archived
+into `bench/out/gc-daemon-e2e/run-89b202c/clean-archive/` and
+`bench/out/gc-daemon-e2e/run-safe-head/clean-archive/` and built `--locked --offline` (64s, 36s) with
+the same three source hashes.
 
 Two earlier clean-source runs used different scripts:
 
