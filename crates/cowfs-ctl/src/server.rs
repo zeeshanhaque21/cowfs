@@ -268,11 +268,22 @@ fn accept_loop(
             break;
         }
         if shared.abandoned() {
+            // The deadline has passed. Do not run the terminal writes here: `abandon_inflight`
+            // takes the per-connection write lock, which a client that stopped reading holds for
+            // the whole write timeout inside a progress write. Waiting for it here is what made
+            // `wait()` outlive the deadline. A detached thread still tries to deliver each
+            // straggler's `shutting_down` frame, so a client that is (or becomes) reading keeps
+            // its terminal frame, while `wait()` returns at the deadline and the threads die with
+            // the process.
             let stragglers: Vec<Arc<Conn>> = lock(&shared.conns).values().cloned().collect();
-            for conn in stragglers {
-                conn.abandon_inflight();
-                conn.kill();
-            }
+            let _ = thread::Builder::new()
+                .name("cowfs-ctl-abandon".into())
+                .spawn(move || {
+                    for conn in stragglers {
+                        conn.abandon_inflight();
+                        conn.kill();
+                    }
+                });
             break;
         }
         thread::sleep(Duration::from_millis(10));
