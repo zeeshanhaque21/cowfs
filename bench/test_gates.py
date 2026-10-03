@@ -278,6 +278,15 @@ def drop(row, key):
     return row
 
 
+def g1(size=GIB, wall=2.0, gate="g1", **override):
+    row = {**rep(size), "gate": gate, "wall_s": wall, "metrics": {}}
+    row.update(override)
+    return row
+
+
+G1 = [meta(GIB, scale=100), g1()]
+
+
 # name -> rows that compare.py must refuse in any input slot
 INVALID = {
     "legacy boolean only, aligned 1 GiB": [meta(GIB), rep(GIB, written_bytes=None, read_bytes=None)],
@@ -311,6 +320,19 @@ INVALID = {
     "scale is infinite": [meta(GIB, scale=float("inf")), rep(GIB)],
     "empty file": [],
     "meta only": [meta()],
+    "unknown gate g9": [meta(), g1(gate="g9")],
+    "gate missing": [meta(), {k: v for k, v in g1().items() if k != "gate"}],
+    "rep index missing": [meta(), {k: v for k, v in g1().items() if k != "rep"}],
+    "rep index string": [meta(), {**g1(), "rep": "0"}],
+    "rep index bool": [meta(), {**g1(), "rep": True}],
+    "wall_s bool": [meta(), g1(wall=True)],
+    "wall_s string": [meta(), g1(wall="2.0")],
+    "wall_s Infinity": [meta(), g1(wall=float("inf"))],
+    "wall_s missing": [meta(), {k: v for k, v in g1().items() if k != "wall_s"}],
+    "load1_before missing": [meta(), {k: v for k, v in g1().items() if k != "load1_before"}],
+    "load1_before string": [meta(), {**g1(), "load1_before": "0"}],
+    "load1_after bool": [meta(), {**g1(), "load1_after": True}],
+    "load1_after Infinity": [meta(), {**g1(), "load1_after": float("inf")}],
     "g5 rep with no metrics": [meta(), {"kind": "rep", "gate": "g5", "rep": 0}],
     "scale 1e308 overflow": [meta(4 * MIB, scale=1e308), rep()],
     "json list as a record": [meta(), [1, 2, 3], rep()],
@@ -318,7 +340,6 @@ INVALID = {
     "g5 rep wall_s not a number": [meta(), {**rep(), "wall_s": "1.0"}],
     "g5 rep wall_s bool": [meta(), {**rep(), "wall_s": True}],
 }
-G1 = [meta(GIB, scale=100), {**rep(GIB), "gate": "g1", "wall_s": 2.0}]
 VALID = {
     "modern without scale": [meta(), rep()],
     "modern with matching scale 100": [meta(GIB, scale=100), rep(GIB)],
@@ -416,6 +437,39 @@ class CompareRefuses(unittest.TestCase):
                 self.assertEqual(rc, 3, (slot, out))
                 self.assertIn("no g5 reps while other inputs have g5", err, slot)
                 self.assertNotIn("PASS", out + err, slot)
+
+    def test_both_arms_meta_only_is_invalid_not_a_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = self.write(d, "mo.jsonl", [meta()])
+            rc, err, out = self.run_compare([f], f)
+            self.assertEqual(rc, 3, out)
+            self.assertIn("no rep records", err)
+
+    def test_disjoint_gates_are_invalid_not_a_zero_gate_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.write(d, "nat.jsonl", [meta(), g1()])
+            cow = self.write(d, "cow.jsonl", [meta(), g1(gate="g3", wall=2.4)])
+            rc, err, out = self.run_compare([nat], cow)
+            self.assertEqual(rc, 3, out)
+            self.assertIn("no gate is present in both", err)
+            self.assertNotIn("PASS", out + err)
+
+    def test_unknown_gate_only_is_invalid_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = self.write(d, "g9.jsonl", [meta(), g1(gate="g9")])
+            rc, err, out = self.run_compare([f], f)
+            self.assertEqual(rc, 3, out)
+            self.assertIn("not one of", err)
+            self.assertNotIn("PASS", out + err)
+
+    def test_bad_arm_next_to_valid_g5less_peer_is_invalid(self):
+        with tempfile.TemporaryDirectory() as d:
+            peer = self.write(d, "peer.jsonl", [meta(), g1()])
+            for name, rows in (("bad g1", [meta(), g1(wall="x")]), ("meta only", [meta()])):
+                bad = self.write(d, "bad.jsonl", rows)
+                rc, err, out = self.run_compare([bad], peer)
+                self.assertEqual(rc, 3, (name, out))
+                self.assertNotIn("PASS", out + err, name)
 
     def test_empty_and_meta_only_still_fail(self):
         with tempfile.TemporaryDirectory() as d:

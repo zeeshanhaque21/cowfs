@@ -10,20 +10,24 @@ max of the per-rep ratios are printed alongside the rep counts.
 Every input file, the noise-floor file included, is validated first, and any failure
 exits 3 with no comparison printed. A file needs exactly one valid meta record before
 its first rep, whose counts.big_bytes is an integer multiple of 1 MiB, at least 1 MiB,
-and equal to the value its scale implies when the meta records a scale. Every g5 rep
-needs integer (not bool, not float) bytes, written_bytes and read_bytes that all equal
-meta big_bytes; the read_matches flag is not consulted. There is no legacy exemption:
-rows with only a flag, and files whose meta or g5 rows break the rules above, are
-invalid.
+and equal to the value its scale implies when the meta records a scale, and at least
+one rep. Every rep, whatever its gate, needs a recognised gate, an integer rep index,
+a finite non-bool wall_s, and numeric non-bool load1_before and load1_after (NaN is
+allowed, it is what the harness writes when getloadavg fails; Infinity is not). Every
+g5 rep additionally needs integer (not bool, not float) bytes, written_bytes and
+read_bytes that all equal meta big_bytes; the read_matches flag is not consulted. There
+is no legacy exemption: rows with only a flag, and files whose meta or reps break the
+rules above, are invalid, never a performance verdict.
 
 g5 is all or nothing across the inputs. If any input has g5 reps, every input must,
 else exit 3 naming the ones that do not. If no input has g5 reps, a scoped comparison
 still runs and is judged per gate as before, and the output prints `g5   not run (no
 input has g5 reps)` instead of a g5 line, never a g5 pass or a throughput claim. So
 g1/g2/g3-only comparisons keep working, and a g5 result can never be certified without
-its byte counts. This is a byte-accounting check on the harness's own output, not
-provenance: it cannot tell a hand-written but internally consistent file from a real
-run.
+its byte counts. A comparison in which no gate is present in both the native and the
+cowfs arm is refused (exit 3), not printed as a zero-gate pass. This is a
+byte-accounting check on the harness's own output, not provenance: it cannot tell a
+hand-written but internally consistent file from a real run.
 
 Ratios are refused, not printed, when the machine was too loaded for them to
 mean anything: load1 above 30 on either side, or the two arms more than 2x
@@ -137,6 +141,7 @@ def file_problems(path):
     meta_bytes = None
     metas = 0
     g5 = 0
+    reps = 0
     for n, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
@@ -162,8 +167,17 @@ def file_problems(path):
         elif kind == "rep":
             if metas == 0:
                 out.append(f"{path}:{n}: rep before the meta record")
-            if row.get("gate") == "g5" and not is_num(row.get("wall_s")):
+            reps += 1
+            if row.get("gate") not in GATES:
+                out.append(f"{path}:{n}: rep gate {row.get('gate')!r} is not one of {GATES}")
+            if not is_int(row.get("rep")):
+                out.append(f"{path}:{n}: rep index {row.get('rep')!r} is not an integer")
+            if not is_num(row.get("wall_s")):
                 out.append(f"{path}:{n}: rep wall_s {row.get('wall_s')!r} is missing or not a finite number")
+            for k in ("load1_before", "load1_after"):
+                v = row.get(k)
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    out.append(f"{path}:{n}: rep {k} {v!r} is missing or not a number")
             if row.get("gate") == "g5":
                 g5 += 1
                 why = g5_problem(row, meta_bytes) if meta_bytes is not None else "no valid meta to check against"
@@ -171,6 +185,8 @@ def file_problems(path):
                     out.append(f"{path}:{n}: g5 rep {row.get('rep')}: {why}")
     if not metas:
         out.append(f"{path}: no meta record")
+    if not reps:
+        out.append(f"{path}: no rep records")
     return out, g5
 
 
@@ -236,6 +252,11 @@ def main() -> int:
         g5n[path] = n
     if any(g5n.values()):
         bad += [f"{p}: no g5 reps while other inputs have g5" for p, n in g5n.items() if not n]
+    if not bad:
+        native_gates = set().union(*[set(by_gate(load([p])[1])) for p in args.native])
+        cowfs_gates = set(by_gate(load([args.cowfs])[1]))
+        if not native_gates & cowfs_gates:
+            bad.append("inputs: no gate is present in both the native and the cowfs arm, nothing to compare")
     if bad:
         for line in bad:
             print(f"INVALID {line}", file=sys.stderr)
