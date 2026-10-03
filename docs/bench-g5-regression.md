@@ -59,6 +59,8 @@ Same entrypoint, one rep each. Byte counts only.
 | 2 | 20971520 | 20971520 | 20971520 | yes | `bench/out/g5-regression/root-r2` (cowfs slot) |
 | 100 | 1073741824 | 1073741824 | 1073741824 | yes | throwaway dir on local APFS, deleted after (run on the first revision of this PR; the g5 byte path is unchanged for a good run) |
 
+Real tree fixture through the entrypoint, smallest scale: `COWFS_BENCH_SCALE=0.001 bench/gates.py --gates g4 --reps 1` (counts: 10 small-file slots, 10 large files of 1 MiB; the tree is 256 `dNNN` directories of one 256-byte file, `big/` with 10 files, `.git`, `.generated`). The first run needs `cargo fetch` for the g4 corpus and took about 25 minutes of network at load 12 to 20, almost all of it the fetch, so use a warm `COWFS_BENCH_CARGO_HOME` for reruns. With the tree built, a rerun on an intact tree passes the verification. After the same rerun on my own fixture with one change each, the entrypoint exits 1 before any rep: an extra `big/b099`, `big/b003` truncated to 5 bytes, a stray top-level `stray.txt`. Each change was then reverted and the intact tree passes again.
+
 No throughput in this document is a result, and no native-versus-cowfs verdict is made. Host load1 was 10 to 15 during these runs.
 
 Negative controls, all in `bench/test_gates.py`:
