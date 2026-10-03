@@ -7,8 +7,11 @@ Usage: compare.py --native NATIVE.jsonl [NATIVE2.jsonl ...] --cowfs COWFS.jsonl
 Every rep of every gate is read, not just the median, and the median, min and
 max of the per-rep ratios are printed alongside the rep counts.
 
-A g5 rep whose read-back did not match what it wrote, or what counts() asked for,
-makes the whole comparison invalid (exit 3): that throughput is of a short read.
+Every input file, the noise-floor file included, is checked first. A g5 rep whose
+expected, written and read byte counts are not numerically equal (the read_matches
+flag is not trusted), or that disagrees with the meta counts, makes the whole
+comparison invalid (exit 3): that throughput is of a short read. Pre-fix rows with
+no written/read bytes pass only when read_matches is true and the size is a whole MiB.
 
 Ratios are refused, not printed, when the machine was too loaded for them to
 mean anything: load1 above 30 on either side, or the two arms more than 2x
@@ -63,8 +66,44 @@ def load(paths):
     return meta, reps
 
 
-def short_reads(reps):
-    return [r for r in reps if r["gate"] == "g5" and not r["metrics"].get("read_matches")]
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def g5_problem(row, meta_bytes):
+    """Why a g5 rep is not a valid read-back, or None. Numbers decide, never the read_matches flag."""
+    m = row.get("metrics", {})
+    exp, wr, rd = m.get("bytes"), m.get("written_bytes"), m.get("read_bytes")
+    if not is_int(exp):
+        return "no integer expected bytes"
+    if meta_bytes is not None and exp != meta_bytes:
+        return f"expected {exp} differs from meta counts big_bytes {meta_bytes}"
+    if wr is None and rd is None:
+        # pre-fix rows: only the flag exists; believable only when the size is a whole number of the old 1 MiB write unit
+        if m.get("read_matches") is True and exp > 0 and exp % (1 << 20) == 0:
+            return None
+        return "legacy row with no written/read bytes and a false or unaligned count"
+    if not (is_int(wr) and is_int(rd)):
+        return "written/read bytes missing or not integers"
+    if not exp == wr == rd:
+        return f"expected {exp} written {wr} read {rd} are not equal"
+    return None
+
+
+def invalid_reps(path):
+    meta_bytes = None
+    bad = []
+    for line in Path(path).read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("kind") == "meta":
+            meta_bytes = row.get("counts", {}).get("big_bytes")
+        elif row.get("kind") == "rep" and row.get("gate") == "g5":
+            why = g5_problem(row, meta_bytes)
+            if why:
+                bad.append(f"{path}: g5 rep {row.get('rep')}: {why}")
+    return bad
 
 
 def by_gate(reps):
@@ -123,12 +162,12 @@ def main() -> int:
     on_macos = sys.platform == "darwin"
     _, na = load(args.native)
     _, nb = load([args.cowfs])
-    bad = short_reads(na) + short_reads(nb)
+    bad = []
+    for path in [*args.native, args.cowfs, *([args.noise_floor] if args.noise_floor else [])]:
+        bad += invalid_reps(path)
     if bad:
-        for r in bad:
-            m = r["metrics"]
-            print(f"INVALID g5 rep {r['rep']} of {r['label']}: expected {m.get('bytes')} "
-                  f"written {m.get('written_bytes')} read {m.get('read_bytes')}", file=sys.stderr)
+        for line in bad:
+            print(f"INVALID {line}", file=sys.stderr)
         print("RESULT: invalid, g5 did not read back what it wrote", file=sys.stderr)
         return 3
     ga, gb = by_gate(na), by_gate(nb)

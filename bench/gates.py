@@ -57,6 +57,9 @@ FULL = {
 SEED = 0xC0FFEE
 # A byte count is written in whole chunks of this size, so counts() rounds down to it.
 UNIT = {"large_bytes": 1 << 16, "big_bytes": 1 << 20}
+MIN_BYTES = 1 << 20
+SMALL_BYTES = 256
+SMALL_PER_DIR = 256
 GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
 
 # g2 edits this file: it is a leaf of the dependency graph (nothing in the
@@ -81,7 +84,7 @@ def counts() -> dict:
     for key, value in FULL.items():
         if key.endswith("_bytes"):
             unit = UNIT[key]
-            out[key] = max(unit, int(value * scale / 100) // unit * unit)
+            out[key] = max(MIN_BYTES, int(value * scale / 100) // unit * unit)
         else:
             out[key] = max(10, int(value * scale / 100))
     return out
@@ -173,13 +176,14 @@ class Ctx:
         marker = self.tree / ".generated"
         want = f"{self.n['small_files']} {self.n['large_files']} {self.n['large_bytes']} {SEED}"
         if marker.exists() and marker.read_text().strip() == want:
+            self.verify_tree()
             return
         if self.tree.exists():
             shutil.rmtree(self.tree)
         rng = random.Random(SEED)
-        per = 256
+        per = SMALL_PER_DIR
         total = self.n["small_files"]
-        bodies = [bytes(rng.getrandbits(8) for _ in range(256)) for _ in range(64)]
+        bodies = [bytes(rng.getrandbits(8) for _ in range(SMALL_BYTES)) for _ in range(64)]
         for d in range(per):
             sub = self.tree / f"d{d:03d}"
             sub.mkdir(parents=True)
@@ -191,9 +195,6 @@ class Ctx:
         for i in range(self.n["large_files"]):
             with open(big / f"b{i:03d}", "wb") as fh:
                 fh.writelines(chunk for _ in range(self.n["large_bytes"] // len(chunk)))
-            size = (big / f"b{i:03d}").stat().st_size
-            if size != self.n["large_bytes"]:
-                raise SystemExit(f"tree file b{i:03d} is {size} bytes, counts() says {self.n['large_bytes']}")
         git = [
             "git",
             "-c",
@@ -205,10 +206,27 @@ class Ctx:
             "-C",
             str(self.tree),
         ]
+        self.verify_tree()
         checked([*git, "init", "--quiet"])
         checked([*git, "add", "-A"])
         checked([*git, "commit", "--quiet", "--no-verify", "-m", "bench tree"])
         marker.write_text(want)
+
+    def verify_tree(self):
+        """Refuse, never repair: a short fixture file on the cowfs arm may be data loss."""
+        sub = max(1, self.n["small_files"] // SMALL_PER_DIR)
+        try:
+            for d in range(SMALL_PER_DIR):
+                with os.scandir(self.tree / f"d{d:03d}") as it:
+                    sizes = [e.stat().st_size for e in it]
+                if len(sizes) != sub or any(z != SMALL_BYTES for z in sizes):
+                    raise SystemExit(f"tree d{d:03d}: want {sub} files of {SMALL_BYTES} bytes, got {sorted(sizes)[:3]}.. ({len(sizes)} files); remove {self.tree}")
+            for i in range(self.n["large_files"]):
+                size = (self.tree / "big" / f"b{i:03d}").stat().st_size
+                if size != self.n["large_bytes"]:
+                    raise SystemExit(f"tree big/b{i:03d} is {size} bytes, counts() says {self.n['large_bytes']}; remove {self.tree}")
+        except OSError as e:
+            raise SystemExit(f"tree fixture unreadable: {e}; remove {self.tree}")
 
     # --- gates ---------------------------------------------------------------
 
@@ -301,28 +319,36 @@ class Ctx:
         path = d / "seq.bin"
         chunk = os.urandom(UNIT["big_bytes"])
         expected = self.n["big_bytes"]
-        t = time.monotonic()
-        with open(path, "wb") as fh:
-            fh.writelines(chunk for _ in range(expected // len(chunk)))
-            fh.flush()
-            os.fsync(fh.fileno())
-        write = time.monotonic() - t
-        written = path.stat().st_size
-        if written != expected:
-            raise SystemExit(f"g5 wrote {written} bytes, counts() says {expected}")
-        t = time.monotonic()
-        got = 0
-        with open(path, "rb") as fh:
-            while True:
-                b = fh.read(UNIT["big_bytes"])
-                if not b:
-                    break
-                got += len(b)
-        read = time.monotonic() - t
-        fd = os.open(d, os.O_RDONLY)
-        os.fsync(fd)
-        os.close(fd)
-        path.unlink()
+        try:
+            t = time.monotonic()
+            with open(path, "wb") as fh:
+                fh.writelines(chunk for _ in range(expected // len(chunk)))
+                fh.flush()
+                os.fsync(fh.fileno())
+            write = time.monotonic() - t
+            written = path.stat().st_size
+            if written != expected:
+                raise SystemExit(f"g5 wrote {written} bytes, counts() says {expected}")
+            t = time.monotonic()
+            got = 0
+            with open(path, "rb") as fh:
+                while True:
+                    b = fh.read(UNIT["big_bytes"])
+                    if not b:
+                        break
+                    got += len(b)
+            read = time.monotonic() - t
+            if got != written:
+                raise SystemExit(f"g5 read back {got} bytes of the {written} it wrote: invalid run, no rep recorded")
+            fd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        finally:
+            path.unlink(missing_ok=True)
+            if path.exists():
+                raise SystemExit(f"g5 could not remove its own file {path}")
         mib = expected / (1 << 20)
         return {
             "bytes": expected,
@@ -332,7 +358,7 @@ class Ctx:
             "read_s": read,
             "write_mib_s": mib / write if write else 0.0,
             "read_mib_s": mib / read if read else 0.0,
-            "read_matches": got == written == expected,
+            "read_matches": True,
         }
 
     def g6(self):

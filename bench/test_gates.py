@@ -37,7 +37,7 @@ class CountsAlignment(unittest.TestCase):
             n = counts_at(scale)
             for key, unit in gates.UNIT.items():
                 self.assertEqual(n[key] % unit, 0, (scale, key, n[key]))
-                self.assertGreaterEqual(n[key], unit, (scale, key))
+                self.assertGreaterEqual(n[key], MIB, (scale, key))
                 self.assertLessEqual(n[key], max(unit, gates.FULL[key]), (scale, key))
 
     def test_below_at_above_one_unit(self):
@@ -51,6 +51,17 @@ class CountsAlignment(unittest.TestCase):
     def test_issue_55_scale_2(self):
         # 1 GiB * 2% = 21474836.48 used to give 21474836, which no whole-MiB write reaches
         self.assertEqual(counts_at(2)["big_bytes"], 20 * MIB)
+
+    def test_original_one_mib_floor_kept_for_both_byte_keys(self):
+        for scale in (0, 1e-9, 0.001, 2):
+            self.assertEqual(counts_at(scale)["large_bytes"], MIB, scale)
+        self.assertEqual(counts_at(0.001)["big_bytes"], MIB)
+
+    def test_large_bytes_rounds_where_the_old_floor_hid_it(self):
+        # 8 MiB * 13% = 1090519.04; the old code asked for 1090519, the writer makes whole 64 KiB chunks
+        n = counts_at(13)
+        self.assertEqual(n["large_bytes"], 16 * (1 << 16))
+        self.assertEqual(n["large_bytes"] % (1 << 16), 0)
 
     def test_full_scale_unchanged(self):
         n = counts_at(100)
@@ -101,13 +112,13 @@ class G5(unittest.TestCase):
             # truncated before the size check: caught as a write mismatch
             self.run_g5(4 * MIB, corrupt)
 
-    def test_negative_control_read_back_shorter_than_written(self):
+    def short_read_hook(self):
         real_open = open
 
         class ShortFile:
             def __init__(self, fh):
                 self.fh = fh
-                self.left = None
+                self.left = os.fstat(fh.fileno()).st_size - 1
 
             def __enter__(self):
                 return self
@@ -116,8 +127,6 @@ class G5(unittest.TestCase):
                 self.fh.close()
 
             def read(self, n):
-                if self.left is None:
-                    self.left = 4 * MIB - 1
                 b = self.fh.read(min(n, self.left))
                 self.left -= len(b)
                 return b
@@ -131,9 +140,47 @@ class G5(unittest.TestCase):
             with mock.patch("builtins.open", evil_open):
                 yield
 
-        m = self.run_g5(4 * MIB, short)
-        self.assertFalse(m["read_matches"])
-        self.assertEqual((m["bytes"], m["written_bytes"], m["read_bytes"]), (4 * MIB, 4 * MIB, 4 * MIB - 1))
+        return short
+
+    def test_negative_control_short_read_is_refused_not_published(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_g5(4 * MIB, self.short_read_hook())
+        self.assertIn("invalid run", str(cm.exception))
+
+    def test_refusal_removes_only_its_own_file(self):
+        hooks = {"short": self.short_read_hook(), "unaligned": None}
+        for name, hook in hooks.items():
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / "big").mkdir()
+                bystander = root / "big" / "keep.bin"
+                bystander.write_bytes(b"x")
+                ctx = gates.Ctx(root, {"big_bytes": 4 * MIB if hook else 4 * MIB + 1})
+                with self.assertRaises(SystemExit):
+                    if hook:
+                        with hook(root):
+                            ctx.g5()
+                    else:
+                        ctx.g5()
+                self.assertFalse((root / "big" / "seq.bin").exists(), name)
+                self.assertTrue(bystander.exists(), name)
+
+    def test_success_removes_its_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            gates.Ctx(Path(d), {"big_bytes": MIB}).g5()
+            self.assertEqual(list((Path(d) / "big").iterdir()), [])
+
+    def test_main_refuses_short_read_and_records_no_rep(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, out = Path(d) / "root", Path(d) / "out"
+            argv = ["gates.py", "--root", str(root), "--label", "t", "--reps", "1", "--gates", "g5", "--no-resume"]
+            with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {"COWFS_BENCH_SCALE": "0.2"}), \
+                    mock.patch.object(gates, "OUT", out), contextlib.redirect_stdout(io.StringIO()):
+                with self.short_read_hook()(root), self.assertRaises(SystemExit):
+                    gates.main()
+            rows = [json.loads(line) for f in out.glob("t-*.jsonl") for line in f.read_text().splitlines()]
+            self.assertEqual([r for r in rows if r["kind"] == "rep"], [])
+            self.assertFalse((root / "big" / "seq.bin").exists())
 
     def test_main_entrypoint_at_scale_2(self):
         with tempfile.TemporaryDirectory() as d:
@@ -151,33 +198,107 @@ class G5(unittest.TestCase):
 
 
 class TreeSizes(unittest.TestCase):
-    def test_large_files_have_nominal_size(self):
+    def make(self, d):
+        n = {**counts_at(13), "small_files": 256, "large_files": 2}
+        self.assertEqual(n["large_bytes"] % (1 << 16), 0)
+        ctx = gates.Ctx(Path(d), n)
+        ctx.ensure_tree()
+        return ctx, n
+
+    def test_large_files_have_nominal_size_where_baseline_rounding_shows(self):
         with tempfile.TemporaryDirectory() as d:
-            n = {"small_files": 256, "large_files": 2, "large_bytes": counts_at(3.3)["large_bytes"]}
-            self.assertEqual(n["large_bytes"] % (1 << 16), 0)
-            ctx = gates.Ctx(Path(d), n)
-            ctx.ensure_tree()
+            ctx, n = self.make(d)
             for f in (Path(d) / "tree" / "big").iterdir():
                 self.assertEqual(f.stat().st_size, n["large_bytes"])
+
+    def test_marker_hit_accepts_an_intact_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx, _ = self.make(d)
+            ctx.ensure_tree()
+
+    def test_marker_hit_refuses_truncated_large_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx, _ = self.make(d)
+            os.truncate(Path(d) / "tree" / "big" / "b001", 5)
+            with self.assertRaises(SystemExit) as cm:
+                ctx.ensure_tree()
+            self.assertIn("big/b001", str(cm.exception))
+
+    def test_marker_hit_refuses_truncated_or_missing_small_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx, _ = self.make(d)
+            victim = next((Path(d) / "tree" / "d007").iterdir())
+            os.truncate(victim, 10)
+            with self.assertRaises(SystemExit):
+                ctx.ensure_tree()
+            victim.unlink()
+            with self.assertRaises(SystemExit):
+                ctx.ensure_tree()
 
 
 class CompareRefuses(unittest.TestCase):
     def rep(self, **m):
-        return {"kind": "rep", "gate": "g5", "rep": 0, "label": "x", "metrics": m}
+        return {"kind": "rep", "gate": "g5", "rep": 0, "label": "x", "wall_s": 1, "load1_before": 0, "load1_after": 0, "metrics": m}
 
-    def test_short_read_rep_is_invalid(self):
-        self.assertEqual(len(compare.short_reads([self.rep(read_matches=False)])), 1)
-        self.assertEqual(len(compare.short_reads([self.rep()])), 1)
-        self.assertEqual(len(compare.short_reads([self.rep(read_matches=True)])), 0)
+    def good(self, size=4 * MIB):
+        return self.rep(bytes=size, written_bytes=size, read_bytes=size, read_matches=True)
 
-    def test_compare_exits_3_on_pre_fix_file(self):
+    def problem(self, row, meta_bytes=None):
+        return compare.g5_problem(row, meta_bytes)
+
+    def test_numeric_equality_not_the_flag(self):
+        self.assertIsNone(self.problem(self.good()))
+        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=5, read_bytes=7, read_matches=True)))
+        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=4 * MIB, read_bytes=4 * MIB - 1, read_matches=True)))
+        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=4 * MIB - 1, read_bytes=4 * MIB - 1, read_matches=True)))
+        self.assertIsNone(self.problem(self.rep(bytes=4 * MIB, written_bytes=4 * MIB, read_bytes=4 * MIB, read_matches=False)))
+        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes="4194304", read_bytes=4 * MIB, read_matches=True)))
+        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=True, read_bytes=True, read_matches=True)))
+        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=4 * MIB, read_matches=True)))
+
+    def test_meta_counts_must_agree(self):
+        self.assertTrue(self.problem(self.good(4 * MIB), meta_bytes=8 * MIB))
+        self.assertIsNone(self.problem(self.good(4 * MIB), meta_bytes=4 * MIB))
+
+    def test_legacy_rows(self):
+        self.assertIsNone(self.problem(self.rep(bytes=1 << 30, read_matches=True)))
+        self.assertTrue(self.problem(self.rep(bytes=21474836, read_matches=False)))
+        self.assertTrue(self.problem(self.rep(bytes=21474836, read_matches=True)))
+
+    def write(self, d, name, *rows):
+        f = Path(d) / name
+        f.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return str(f)
+
+    def run_compare(self, native, cowfs, noise=None):
+        argv = ["compare.py", "--native", *native, "--cowfs", cowfs] + (["--noise-floor", noise] if noise else [])
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()) as err, \
+                contextlib.redirect_stdout(io.StringIO()):
+            return compare.main(), err.getvalue()
+
+    def test_every_input_file_is_validated(self):
+        forged = self.rep(bytes=4 * MIB, written_bytes=5, read_bytes=7, read_matches=True)
+        short = self.rep(bytes=4 * MIB, written_bytes=4 * MIB, read_bytes=4 * MIB - 1, read_matches=False)
+        meta = {"kind": "meta", "counts": {"big_bytes": 4 * MIB}}
         with tempfile.TemporaryDirectory() as d:
-            f = Path(d) / "a.jsonl"
-            f.write_text(json.dumps({"kind": "meta"}) + "\n" + json.dumps(
-                {**self.rep(bytes=21474836, read_matches=False), "wall_s": 1, "load1_before": 0, "load1_after": 0}) + "\n")
-            argv = ["compare.py", "--native", str(f), "--cowfs", str(f)]
-            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(compare.main(), 3)
+            ok = self.write(d, "ok.jsonl", meta, self.good())
+            ok2 = self.write(d, "ok2.jsonl", meta, self.good())
+            for name, bad_row in (("forged", forged), ("short", short)):
+                bad = self.write(d, f"{name}.jsonl", meta, bad_row)
+                self.assertEqual(self.run_compare([ok], ok, ok2)[0], 0)
+                for placement in ("native", "native2", "cowfs", "noise"):
+                    native = [bad] if placement == "native" else [ok, bad] if placement == "native2" else [ok]
+                    cow = bad if placement == "cowfs" else ok
+                    noise = bad if placement == "noise" else ok2
+                    rc, err = self.run_compare(native, cow, noise)
+                    self.assertEqual(rc, 3, (name, placement))
+                    self.assertIn("INVALID", err)
+                    self.assertIn(bad, err)
+
+    def test_pre_fix_baseline_file_is_invalid(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = self.write(d, "a.jsonl", {"kind": "meta"}, self.rep(bytes=21474836, read_matches=False))
+            self.assertEqual(self.run_compare([f], f)[0], 3)
 
 
 if __name__ == "__main__":
