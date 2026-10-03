@@ -5,6 +5,34 @@ Source contracts: `docs/design.md` ("Garbage collection"), `docs/v1-gc.md` (the 
 This note settles one question the collector left open: what is the reference barrier of the real `cowfs-core`, who owns what, and in which order.
 It does not change the collector's algorithm and it does not remove hash-on-read.
 
+## Status: not production-ready, one critical race caught by review and corrected
+
+An independent adversarial review of the first wiring found a data-loss race in the collector's mark phase.
+It is old `cowfs-gc` logic (PR 39), but nothing over core had ever freed a pack, so this change is what made it reachable: with a real barrier, a pack could be unlinked while a live fork still needed it.
+It is corrected here, with a deterministic regression, and the head is still a draft pending re-review.
+
+The race: step 1 lists `(root, id)` pairs from the durable snapshots.
+Step 2 walks each id through `snapshot_by_id(id).live_blocks(...)`, which reads the snapshot's *current* root, not the listed one.
+A writer that commits to a listed snapshot between the listing and its walk moves it to a new root.
+The walk then yields the new root's blocks but the old code recorded them under the *listed* root key, and a fork still on the listed root was skipped in step 2 and again in step 5 as already covered.
+Blocks only the listed root referenced sat in no live set, became candidates, and their pack was unlinked.
+
+The correction is narrow and keeps the algorithm:
+
+- `cowfs-meta` walks the root it actually read: `Snapshot::live_blocks_with_root` holds the session read lock while it reads the root and opens the node table from the same read transaction, so the root returns and the nodes walked are one epoch.
+- The collector records the root the walk returned (`walked_roots`, the persisted `mark.bin`, and the marker bookkeeping), never the listed key.
+  When a listed key is not the walked root it is left unwalked, so the entries that still resolve to it are walked themselves.
+- A root already walked this cycle is skipped by the walked root, and a persisted mark is honoured by the walked root.
+  A mark recorded under an old, wrong key cannot be reused because the key that names it is the root that was actually walked.
+
+Proof (private stores, this worktree):
+
+- Deterministic regression `a_commit_between_the_freeze_listing_and_a_walks_the_listed_root` in `crates/cowfs-gc/tests/core_reclaim.rs`.
+  A test seam on the collector (`Gc::set_between_list_and_walk`) runs one commit in the exact listing-to-walk window, so the test does not depend on timing.
+  It asserts the fork's block survives a reopen *and* that the cycle still unlinked at least one real dead pack, so a "never free anything" fix cannot pass it.
+- With the old key-recording behaviour restored the deterministic test fails: the fork's block is gone after the cycle (`... named by a file is missing`).
+  With the correction it passes 10/10, and the review's timing-based fixture no longer loses data (10/10).
+
 ## Problem
 
 `cowfs-gc` needs two things from the reference side.
@@ -168,6 +196,12 @@ Negative control: `Core::set_gate_fault(1)` makes `take` return a hold that does
 `negative_control_a_barrier_that_does_not_close_the_gate_loses_data` runs the window test with it and requires that data is lost (the writer's blocks are gone after the reopen).
 The same scenario with the real barrier loses nothing and shows the writer parked at the gate while the barrier is held.
 So the barrier test is sensitive to the thing it tests, and removing the barrier makes a deterministic test fail.
+
+The mark-phase regression is `a_commit_between_the_freeze_listing_and_a_walks_the_listed_root`, described under Status above.
+Its seam, `Gc::set_between_list_and_walk`, is `#[doc(hidden)]` and production never sets it.
+The same applies to the core seams this file already uses (`set_gate_fault`, `gate_waiters`): they are `#[doc(hidden)]` but still reachable by any API user.
+`set_gate_fault` in particular disables the barrier, so it is a fail-open switch that no production path calls; a later change should gate these behind a test-only feature.
+`Core::store()` and `Core::meta()` likewise hand out handles a caller could use to write without the gate; the daemon uses neither, and this note records it rather than widening scope here.
 
 `crates/cowfs-daemon/src/handler.rs` tests: a dry run over a real core changes nothing and reports candidates, a live run frees blocks and bytes, emits `mark` and `sweep` progress and leaves survivors readable and fsck-clean, a cancelled request is `cancelled` and the next one finishes the job, closing the backend after a collection releases the store lock, and the passthrough backend still answers `unsupported`.
 

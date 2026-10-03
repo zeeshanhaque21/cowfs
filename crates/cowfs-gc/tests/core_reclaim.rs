@@ -832,3 +832,86 @@ fn negative_control_a_barrier_that_does_not_close_the_gate_loses_data() {
         "without a real barrier the writer's reference is lost, so this test would catch it: {r:?}"
     );
 }
+
+#[test]
+fn a_commit_between_the_freeze_listing_and_a_walks_the_listed_root() {
+    // The mark phase lists durable `(root, id)` pairs, then walks each snapshot. If a writer commits
+    // to a snapshot in between, `snapshot_by_id` returns the *new* root. Recording the listed root
+    // while walking the new one claims a root the walk never descended, and a fork still on the
+    // listed root is skipped as covered: its blocks sit in no live set and its pack is unlinked.
+    // The hook below puts that commit in the exact window, deterministically, with no timing.
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+
+    // Garbage to reclaim: two snapshots whose blocks interleave, one removed before the cycle.
+    let plan = build(&core);
+
+    // `src` is created before `fork`, so `src` has the smaller id and is listed first. `fork` shares
+    // `src`'s root, so the bytes of `F` live only in that shared root until `src` moves off it.
+    core.create_snapshot("src").unwrap();
+    let sv = core.snapshot_view("src").unwrap();
+    let x = body(40_000, 7001);
+    put_file(&sv, "F", &x);
+    core.sync().unwrap();
+    core.fork_snapshot("src", "fork").unwrap();
+    core.sync().unwrap();
+
+    // A tail after the shared root pushes the durable watermark past the fork's blocks, so a pack
+    // holding them is eligible once the mark says they are dead.
+    let mut keep = plan.keep.clone();
+    add_tail(&core, &mut keep, "tail-src", 6);
+
+    let y = body(40_000, 7002);
+    let y_in = y.clone();
+    let c = core.collector(gc_opts()).unwrap();
+    let sv2 = core.snapshot_view("src").unwrap();
+    let ino = sv2.lookup(ROOT_INO, b"F").unwrap().ino;
+    let wcore = core.clone();
+    let wsv2 = sv2.clone();
+    c.gc().set_between_list_and_walk(Box::new(move || {
+        // Overwrite `F` in the smaller-id snapshot, moving it to a new root. The commit lands
+        // after the freeze listing and before the walk.
+        wsv2.write(ino, 0, &y_in).unwrap();
+        wcore.sync().unwrap();
+    }));
+
+    let r = c.gc().collect(Some(c.roots())).unwrap();
+    clean(&r);
+
+    // The regression: the fork's `F` must still read back as the original bytes.
+    core.drop_caches();
+    let fv = core.snapshot_view("fork").unwrap();
+    assert_eq!(
+        read_file(&fv, "F").expect("fork's F reads"),
+        x,
+        "the fork's block survived the commit race: {r:?}"
+    );
+    assert_eq!(
+        read_file(&sv2, "F").expect("src's F reads"),
+        y,
+        "src sees its own commit"
+    );
+    // And the cycle still reclaimed real garbage: a "never GC" fix would hide the loss.
+    assert!(
+        r.packs_unlinked >= 1 && r.freed_bytes > 0,
+        "the race did not disable reclaim: {r:?}"
+    );
+
+    drop(fv);
+    drop(sv2);
+    drop(sv);
+    drop(c);
+    core.close().unwrap();
+
+    let core = reopen(dir.path());
+    let fv = core.snapshot_view("fork").unwrap();
+    assert_eq!(
+        read_file(&fv, "F").expect("fork's F reads after reopen"),
+        x,
+        "the fork's block survived a reopen"
+    );
+    drop(fv);
+    verify(&core, &keep);
+    fsck_clean(&core);
+    core.close().unwrap();
+}
