@@ -10,9 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cowfs_core::{Collector, Core, CoreRoots, Options as CoreOptions, SnapshotView};
-use cowfs_gc::{
-    Barrier, ExtraRoots, GcReport, Held, Options as GcOptions, RootsError, SkipReason,
-};
+use cowfs_gc::{Barrier, ExtraRoots, GcReport, Held, Options as GcOptions, RootsError, SkipReason};
 use cowfs_store::BlockId;
 use cowfs_vfs::{Vfs, ROOT_INO};
 
@@ -192,7 +190,11 @@ fn a_real_cycle_reclaims_dead_packs_and_survivors_read_after_a_reopen() {
     let plan = build(&core);
     let before = packs(dir.path());
     let blocks_before = core.store().stats().blocks;
-    assert!(before.len() >= 6, "the scenario made several packs: {}", before.len());
+    assert!(
+        before.len() >= 6,
+        "the scenario made several packs: {}",
+        before.len()
+    );
 
     let c = core.collector(gc_opts()).unwrap();
     let r = c.collect().unwrap();
@@ -202,15 +204,28 @@ fn a_real_cycle_reclaims_dead_packs_and_survivors_read_after_a_reopen() {
     assert!(r.freed_bytes > 0);
 
     let after = packs(dir.path());
-    assert!(after.len() < before.len(), "pack files: {} -> {}", before.len(), after.len());
-    assert!(bytes(&after) < bytes(&before), "{} -> {}", bytes(&before), bytes(&after));
+    assert!(
+        after.len() < before.len(),
+        "pack files: {} -> {}",
+        before.len(),
+        after.len()
+    );
+    assert!(
+        bytes(&after) < bytes(&before),
+        "{} -> {}",
+        bytes(&before),
+        bytes(&after)
+    );
     assert!(bytes(&after) + r.freed_bytes >= bytes(&before));
     assert!(core.store().stats().blocks < blocks_before);
     verify(&core, &plan.keep);
 
     let r2 = c.collect().unwrap();
     clean(&r2);
-    assert_eq!(r2.packs_unlinked, 0, "a second cycle has nothing left: {r2:?}");
+    assert_eq!(
+        r2.packs_unlinked, 0,
+        "a second cycle has nothing left: {r2:?}"
+    );
 
     drop(c);
     core.close().expect("close with no collector alive");
@@ -256,7 +271,10 @@ fn a_dedup_that_is_only_queued_keeps_the_block_alive() {
         put_file(&kv, &name, d);
         plan.keep.push((name, d.clone()));
     }
-    assert!(!core.pinned_blocks().unwrap().is_empty(), "the queued chunk lists are pinned");
+    assert!(
+        !core.pinned_blocks().unwrap().is_empty(),
+        "the queued chunk lists are pinned"
+    );
     let dirty = body(20_000, 77);
     put_file(&kv, "dirty", &dirty);
     drop(kv);
@@ -290,23 +308,34 @@ fn an_open_unlinked_file_survives_and_is_reclaimed_after_the_last_close() {
     core.sync().unwrap();
     let mut keep = Vec::new();
     add_tail(&core, &mut keep, "tail", 5);
-    assert!(!core.pinned_blocks().unwrap().is_empty(), "the orphan is pinned");
+    assert!(
+        !core.pinned_blocks().unwrap().is_empty(),
+        "the orphan is pinned"
+    );
 
     let c = core.collector(gc_opts()).unwrap();
     let r = c.collect().unwrap();
     clean(&r);
     assert!(r.pinned > 0);
-    let got = kv.read(a.ino, 0, 60_000).expect("the open file still reads");
+    let got = kv
+        .read(a.ino, 0, 60_000)
+        .expect("the open file still reads");
     assert!(got == orphan);
     verify(&core, &keep);
 
     kv.release(h).unwrap();
     kv.forget(a.ino, 1 << 20);
     core.sync().unwrap();
-    assert!(core.pinned_blocks().unwrap().is_empty(), "nothing pins it any more");
+    assert!(
+        core.pinned_blocks().unwrap().is_empty(),
+        "nothing pins it any more"
+    );
     let r = c.collect().unwrap();
     clean(&r);
-    assert!(r.packs_unlinked > 0, "the orphan's pack is reclaimed once it is closed: {r:?}");
+    assert!(
+        r.packs_unlinked > 0,
+        "the orphan's pack is reclaimed once it is closed: {r:?}"
+    );
     verify(&core, &keep);
     drop(c);
     drop(kv);
@@ -414,11 +443,20 @@ fn a_dry_run_changes_no_store_bytes_and_no_roots() {
     let r = c.collect().unwrap();
     clean(&r);
     assert!(r.dry_run);
-    assert!(r.candidates > 0, "a dry run reports what it would do: {r:?}");
+    assert!(
+        r.candidates > 0,
+        "a dry run reports what it would do: {r:?}"
+    );
     assert_eq!(r.freed_bytes, 0);
     assert_eq!(r.packs_rewritten, 0);
-    assert!(store_before == tree(&dir.path().join("store")), "the store changed");
-    assert!(gc_before == tree(&dir.path().join("gc")), "the collector state changed");
+    assert!(
+        store_before == tree(&dir.path().join("store")),
+        "the store changed"
+    );
+    assert!(
+        gc_before == tree(&dir.path().join("gc")),
+        "the collector state changed"
+    );
     assert_eq!(snaps_before, core.list_snapshots().unwrap());
     verify(&core, &plan.keep);
     drop(c);
@@ -502,7 +540,10 @@ fn the_collector_is_dropped_before_close_and_a_live_one_makes_close_refuse() {
     let core = reopen(dir.path());
     verify(&core, &plan.keep);
     let kv = core.snapshot_view("keep").unwrap();
-    assert_eq!(read_file(&kv, "after-refused-close").unwrap(), b"still writable");
+    assert_eq!(
+        read_file(&kv, "after-refused-close").unwrap(),
+        b"still writable"
+    );
     drop(kv);
     fsck_clean(&core);
     core.close().unwrap();
@@ -605,7 +646,11 @@ fn collections_run_beside_writers_and_forks_without_deadlock_or_loss() {
         }
         std::thread::sleep(RUN);
         stop.store(true, SeqCst);
-        let panicked = handles.into_iter().map(|h| h.join().is_err()).filter(|p| *p).count();
+        let panicked = handles
+            .into_iter()
+            .map(|h| h.join().is_err())
+            .filter(|p| *p)
+            .count();
         finished.store(true, SeqCst);
         assert_eq!(panicked, 0, "{panicked} workers panicked");
     });
@@ -698,7 +743,10 @@ impl ExtraRoots for Window {
             });
             let start = Instant::now();
             while !h.is_finished() && self.core.gate_waiters() == 0 {
-                assert!(start.elapsed() < Duration::from_secs(10), "the writer neither ran nor parked");
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "the writer neither ran nor parked"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
             self.parked.store(!h.is_finished(), SeqCst);
@@ -707,7 +755,10 @@ impl ExtraRoots for Window {
         answer
     }
     fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier>>, RootsError> {
-        let inner = self.inner.reference_barrier()?.expect("core offers a barrier");
+        let inner = self
+            .inner
+            .reference_barrier()?
+            .expect("core offers a barrier");
         Ok(Some(Box::new(WindowBarrier {
             inner,
             holding: self.holding.clone(),
@@ -761,9 +812,15 @@ fn window(fault: bool) -> (usize, bool, GcReport) {
 #[test]
 fn a_writer_that_dedups_inside_the_barrier_window_waits_for_the_unlink() {
     let (failed, parked, r) = window(false);
-    assert!(parked, "the writer must be parked at the gate while the barrier is held");
+    assert!(
+        parked,
+        "the writer must be parked at the gate while the barrier is held"
+    );
     assert_eq!(failed, 0, "no block the writer referenced was lost: {r:?}");
-    assert!(r.packs_unlinked >= 1, "the window really covered an unlink: {r:?}");
+    assert!(
+        r.packs_unlinked >= 1,
+        "the window really covered an unlink: {r:?}"
+    );
 }
 
 #[test]

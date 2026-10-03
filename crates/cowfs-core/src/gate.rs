@@ -236,7 +236,10 @@ mod tests {
         let e = g.enter();
         let g2 = Arc::clone(&g);
         let r = std::thread::spawn(move || g2.take(Duration::from_millis(50)).is_none());
-        assert!(r.join().unwrap(), "take must time out while a reader is inside");
+        assert!(
+            r.join().unwrap(),
+            "take must time out while a reader is inside"
+        );
         drop(e);
         drop(g.try_enter().expect("the gate is open again"));
         assert!(g.take(Duration::from_millis(50)).is_some());
@@ -245,15 +248,23 @@ mod tests {
     #[test]
     fn an_entrant_parks_while_held_and_runs_when_the_hold_drops() {
         let g = Arc::new(Gate::new());
-        let hold = g.take(Duration::from_secs(1)).expect("no reader, so it holds");
-        assert!(g.try_enter().is_none(), "try_enter never blocks and never gets in");
+        let hold = g
+            .take(Duration::from_secs(1))
+            .expect("no reader, so it holds");
+        assert!(
+            g.try_enter().is_none(),
+            "try_enter never blocks and never gets in"
+        );
         let g2 = Arc::clone(&g);
         let t = std::thread::spawn(move || {
             let _e = g2.enter();
         });
         let start = Instant::now();
         while g.waiting() == 0 {
-            assert!(start.elapsed() < Duration::from_secs(10), "the entrant never parked");
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the entrant never parked"
+            );
             std::thread::yield_now();
         }
         drop(hold);
@@ -269,13 +280,22 @@ mod tests {
         let t = std::thread::spawn(move || g2.take(Duration::from_secs(5)).is_some());
         let start = Instant::now();
         while g.st.lk().phase != Phase::Draining {
-            assert!(start.elapsed() < Duration::from_secs(10), "take never started");
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "take never started"
+            );
             std::thread::yield_now();
         }
         drop(g.enter());
-        assert!(g.try_enter().is_some(), "a thread already inside is admitted");
+        assert!(
+            g.try_enter().is_some(),
+            "a thread already inside is admitted"
+        );
         drop(outer);
-        assert!(t.join().unwrap(), "the barrier gets in once the reader leaves");
+        assert!(
+            t.join().unwrap(),
+            "the barrier gets in once the reader leaves"
+        );
     }
 
     #[test]
@@ -289,7 +309,9 @@ mod tests {
     fn the_fault_seam_takes_without_closing() {
         let g = Arc::new(Gate::new());
         g.set_fault(1);
-        let hold = g.take(Duration::from_millis(10)).expect("faulted take succeeds");
+        let hold = g
+            .take(Duration::from_millis(10))
+            .expect("faulted take succeeds");
         assert!(g.try_enter().is_some(), "and the gate stays open");
         drop(hold);
         g.set_fault(0);

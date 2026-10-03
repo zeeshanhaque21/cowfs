@@ -493,7 +493,10 @@ impl Backend for CoreBackend {
         {
             let mut g = self.gc.state.lock().unwrap_or_else(PoisonError::into_inner);
             if g.closing {
-                return Err(CtlError::new(ErrorCode::Busy, "the daemon is shutting down"));
+                return Err(CtlError::new(
+                    ErrorCode::Busy,
+                    "the daemon is shutting down",
+                ));
             }
             if g.running {
                 return Err(CtlError::new(

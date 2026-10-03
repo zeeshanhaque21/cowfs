@@ -690,7 +690,11 @@ mod tests {
             vec![backend.store_path().to_owned()],
             dir.path().join("mnt"),
         );
-        (dir, Handler::new(Arc::clone(&backend), mount, exports), backend)
+        (
+            dir,
+            Handler::new(Arc::clone(&backend), mount, exports),
+            backend,
+        )
     }
 
     fn body(n: usize, seed: u32) -> Vec<u8> {
@@ -704,7 +708,9 @@ mod tests {
     }
 
     fn put(v: &dyn cowfs_vfs::Vfs, name: &str, data: &[u8]) {
-        let a = v.create(cowfs_vfs::ROOT_INO, name.as_bytes(), 0o644).unwrap();
+        let a = v
+            .create(cowfs_vfs::ROOT_INO, name.as_bytes(), 0o644)
+            .unwrap();
         v.write(a.ino, 0, data).unwrap();
     }
 
@@ -725,7 +731,10 @@ mod tests {
             from: None,
         })
         .unwrap();
-        let (k, d) = (backend.snapshot("keep").unwrap(), backend.snapshot("drop").unwrap());
+        let (k, d) = (
+            backend.snapshot("keep").unwrap(),
+            backend.snapshot("drop").unwrap(),
+        );
         let mut keep = Vec::new();
         for i in 0..14u32 {
             let f = (format!("k{i:02}"), body(40_000, i));
@@ -742,7 +751,8 @@ mod tests {
         }
         let held = Arc::new(Lock::new(()));
         let none = |_: &str| Ok(Vec::new());
-        h.remove("drop", &guard("drop", false, held, &none)).unwrap();
+        h.remove("drop", &guard("drop", false, held, &none))
+            .unwrap();
         keep
     }
 
@@ -760,9 +770,16 @@ mod tests {
         });
         let dry = h.gc(GcParams { dry_run: true }, &ctx).unwrap();
         assert!(dry.dry_run);
-        assert!(dry.candidate_blocks > 0 && dry.candidate_bytes > 0, "{dry:?}");
+        assert!(
+            dry.candidate_blocks > 0 && dry.candidate_bytes > 0,
+            "{dry:?}"
+        );
         assert_eq!((dry.freed_blocks, dry.freed_bytes), (0, 0), "{dry:?}");
-        assert_eq!(backend.usage().unwrap().unwrap(), before, "a dry run changes nothing");
+        assert_eq!(
+            backend.usage().unwrap().unwrap(),
+            before,
+            "a dry run changes nothing"
+        );
 
         let live = h.gc(GcParams { dry_run: false }, &ctx).unwrap();
         assert!(!live.dry_run);
@@ -798,7 +815,10 @@ mod tests {
         let again = h
             .gc(GcParams { dry_run: false }, &OpContext::detached())
             .unwrap();
-        assert!(again.freed_bytes > 0, "the next request finishes the job: {again:?}");
+        assert!(
+            again.freed_bytes > 0,
+            "the next request finishes the job: {again:?}"
+        );
     }
 
     #[test]
@@ -807,7 +827,8 @@ mod tests {
         garbage(&h, &backend);
         h.gc(GcParams { dry_run: false }, &OpContext::detached())
             .unwrap();
-        h.close_backend().expect("no collector clone outlives the request");
+        h.close_backend()
+            .expect("no collector clone outlives the request");
         let reopened = crate::backend::CoreBackend::open(
             dir.path().join("store"),
             cowfs_core::Options {
