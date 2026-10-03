@@ -65,9 +65,10 @@ MOUNT_WAIT_SECS = 60
 CLI_TIMEOUT_SECS = 120
 NO_PROGRESS_SECS = 300  # a wait loop with no state change gives up after 5 minutes
 
-# Private fixture seeder (ignored, built on demand). It is the only thing that sets a
-# non-default store pack size, and only for the fixture store it writes.
-SEED_CRATE_DIR = os.path.join(REPO, "bench", "out", "gc-daemon-e2e", "seed-crate")
+# Private fixture seeder. It is tracked in-tree (source + manifest + Cargo.lock) so a
+# clean checkout can rebuild it; only its target dir and the store it writes are
+# ignored. Path deps are derived from this checkout at build time.
+SEED_CRATE_DIR = os.path.join(REPO, "scripts", "gc-fixture-seed")
 SEED_BIN = os.path.join(SEED_CRATE_DIR, "target", "release", "gc-fixture-seed")
 
 
@@ -136,6 +137,11 @@ def file_hash(path):
     return h.hexdigest()
 
 
+def before_sha_of(sub, s, live_before, keep_before):
+    """The SHA-256 the file had before gc, keyed by group."""
+    return (live_before if sub == "live" else keep_before)[s["name"]]
+
+
 def dir_size(path):
     total = 0
     for base, _dirs, files in os.walk(path):
@@ -145,6 +151,27 @@ def dir_size(path):
             except OSError:
                 pass
     return total
+
+
+def dir_state_hash(path):
+    """SHA-256 over (relative path, size, bytes) of every file under `path`.
+
+    Independent before/after comparison: two calls taken at different times cannot be
+    equal by construction unless nothing changed. This is the dry-run mutation gate.
+    """
+    h = hashlib.sha256()
+    for base, dirs, files in os.walk(path):
+        dirs.sort()
+        for name in sorted(files):
+            p = os.path.join(base, name)
+            rel = os.path.relpath(p, path)
+            h.update(rel.encode())
+            try:
+                with open(p, "rb") as f:
+                    h.update(f.read())
+            except OSError as e:
+                h.update(("ERR:%s" % e).encode())
+    return h.hexdigest()
 
 
 # --------------------------------------------------------------------------
@@ -408,6 +435,42 @@ def selftest(rec, share_root):
         stdout=p.stdout.strip(),
         stderr=p.stderr.strip(),
     )
+    # 4. The dry-run mutation sensor must actually move when content changes. Otherwise
+    #    `state_after == state_before` could pass even if a dry run rewrote the store.
+    probe_dir = os.path.join(share_root, "state-probe")
+    os.makedirs(probe_dir, exist_ok=True)
+    with open(os.path.join(probe_dir, "a"), "wb") as f:
+        f.write(b"one")
+    h0 = dir_state_hash(probe_dir)
+    rec.record("selftest.state_hash_stable", dir_state_hash(probe_dir) == h0)
+    with open(os.path.join(probe_dir, "a"), "wb") as f:
+        f.write(b"two")
+    rec.record("selftest.state_hash_detects_change", dir_state_hash(probe_dir) != h0)
+    # 5. BLAKE3 is a required prerequisite. Record explicitly whether it is present; the
+    #    reclaim phase calls blake3_file, which raises Blake3Unavailable if it is not, so
+    #    an absent module fails loudly rather than passing a weaker check.
+    ok_b3 = blake3_available()
+    rec.record(
+        "selftest.blake3_available",
+        ok_b3,
+        note="required: the survivor/fixture digest cross-check is not optional",
+    )
+    if not ok_b3:
+        try:
+            blake3_file(os.path.join(probe_dir, "a"))
+            raised = False
+        except Blake3Unavailable:
+            raised = True
+        rec.record("selftest.blake3_absence_raises", raised)
+    # 6. The seed source must exist as tracked files, so a clean checkout can rebuild it.
+    src_files = seed_source_files()
+    rec.record(
+        "selftest.seed_source_present",
+        len(src_files) >= 3
+        and any(p.endswith("Cargo.toml") for p in src_files)
+        and any(p.endswith("Cargo.lock") for p in src_files),
+        files=[os.path.relpath(p, REPO) for p in src_files],
+    )
 
 
 # --------------------------------------------------------------------------
@@ -525,12 +588,32 @@ def verify_cancel_control_plane(rec, work):
         log.close()
 
 
+class Blake3Unavailable(RuntimeError):
+    """The python blake3 module is missing: a required prerequisite, not a skip."""
+
+
+def blake3_available():
+    try:
+        import blake3  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def blake3_file(path):
-    """BLAKE3 of a file, or None when the python blake3 module is absent."""
+    """BLAKE3 of a file. Raises Blake3Unavailable when the module is absent.
+
+    The BLAKE3 cross-check is a *required* part of the evidence: it ties the mounted
+    bytes to the exact digest the seeder declared. Silently degrading to a pass would
+    let a corrupted store read green, so absence is a hard error the harness records.
+    """
     try:
         from blake3 import blake3 as _b3
-    except ImportError:  # pragma: no cover - documented dependency gap
-        return None
+    except ImportError as e:  # documented prerequisite gap, never a silent PASS
+        raise Blake3Unavailable(
+            "python blake3 module is required for the survivor/fixture digest cross-check; "
+            "install it (`python3 -m pip install blake3`)"
+        ) from e
     h = _b3()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -550,25 +633,79 @@ def pack_sizes(packs_dir):
     return out
 
 
+def tree_files_hash(paths):
+    """SHA-256 over (relative path, bytes) of a set of files: a seed-source identity."""
+    h = hashlib.sha256()
+    for p in sorted(paths):
+        rel = os.path.relpath(p, REPO)
+        h.update(rel.encode())
+        with open(p, "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()
+
+
+def git_tree_hash(revspec):
+    """git's own tree object id for a path at a rev: provenance independent of checkout."""
+    p = run(["/usr/bin/git", "-C", REPO, "rev-parse", revspec])
+    return p.stdout.strip() if p.returncode == 0 else "<unavailable>"
+
+
+def seed_source_files():
+    """Every tracked file that defines the seeder, so its identity is recorded."""
+    out = []
+    for base, dirs, files in os.walk(SEED_CRATE_DIR):
+        dirs[:] = [d for d in dirs if d != "target"]
+        for name in sorted(files):
+            out.append(os.path.join(base, name))
+    return sorted(out)
+
+
 def build_seed_helper(rec):
-    """Build the private seeder from source if it is missing. Returns its path."""
+    """Build the tracked seeder with `--locked --offline`, recording its source identity.
+
+    The seeder lives in-tree under `scripts/gc-fixture-seed/` with its own `Cargo.lock`,
+    so a clean checkout can build it. `--offline` uses the local cargo registry cache;
+    if that cache lacks a dependency the build fails and the harness records the missing
+    prerequisite rather than silently fetching.
+    """
+    src_hash = tree_files_hash(seed_source_files())
+    manifest = os.path.join(SEED_CRATE_DIR, "Cargo.toml")
     if os.path.exists(SEED_BIN):
-        rec.record("reclaim.seed_helper_present", True, path=SEED_BIN)
+        rec.record(
+            "reclaim.seed_helper_present",
+            True,
+            path=SEED_BIN,
+            seed_source_sha256=src_hash,
+            binary_sha256=file_hash(SEED_BIN),
+        )
         return SEED_BIN
-    log("building private seed helper (first run only) ...")
-    p = run(
-        ["cargo", "build", "--release", "--manifest-path", os.path.join(SEED_CRATE_DIR, "Cargo.toml")],
-        timeout=1200,
-    )
+
+    log("building tracked seed helper (first run only) ...")
+    args = ["cargo", "build", "--release", "--locked", "--offline",
+            "--manifest-path", manifest]
+    p = run(args, timeout=1800)
     ok = p.returncode == 0 and os.path.exists(SEED_BIN)
     rec.record(
         "reclaim.seed_helper_built",
         ok,
+        command=" ".join(args),
         returncode=p.returncode,
-        stderr_tail=p.stderr.strip().splitlines()[-5:],
+        seed_source_sha256=src_hash,
+        stderr_tail=p.stderr.strip().splitlines()[-8:],
     )
     if not ok:
-        raise RuntimeError("could not build the seed helper")
+        raise RuntimeError(
+            "could not build the tracked seed helper offline; missing prerequisite "
+            "(cargo offline cache for a pinned dependency). Run `cargo build --release "
+            "would need network; unset --offline only with network available.\n%s"
+            % p.stderr.strip()[-800:]
+        )
+    rec.record(
+        "reclaim.seed_helper_binary",
+        True,
+        binary_sha256=file_hash(SEED_BIN),
+        seed_source_sha256=src_hash,
+    )
     return SEED_BIN
 
 
@@ -640,19 +777,42 @@ def verify_reclaim(rec, work, seed_bin):
             files=[s["name"] for s in declared],
         )
 
-        # Negative control: a dry run reports candidates and changes no pack on disk.
+        # Negative control: a dry run reports candidates and changes nothing on disk.
+        # The two store-state hashes are independent samples taken *before* and *after*
+        # the dry-run request, over file content (not just sizes), so equality is a real
+        # invariant. A self-comparison cannot pass this by construction.
         packs_before = pack_sizes(packs_dir)
         total_before = sum(packs_before.values())
+        state_before_dry = dir_state_hash(store)
         dry = d.cli_json(["gc", "--dry-run"])
+        state_after_dry = dir_state_hash(store)
         packs_after_dry = pack_sizes(packs_dir)
         rec.record(
             "reclaim.dry_run_no_pack_change",
             dry["dry_run"]
             and dry["freed_bytes"] == 0
             and dry["freed_blocks"] == 0
-            and pack_sizes(packs_dir) == packs_before,
+            and packs_after_dry == packs_before
+            and state_after_dry == state_before_dry,
             report=dry,
-            packs_unchanged=pack_sizes(packs_dir) == packs_before,
+            packs_before=packs_before,
+            packs_after_dry=packs_after_dry,
+            store_state_before=state_before_dry,
+            store_state_after=state_after_dry,
+        )
+        # Interactive negative control for the same gate: mutate one byte under the store
+        # and prove the *sensor* (dir_state_hash) moves. Without this, a comparison that
+        # always returned equal would look green.
+        probe = os.path.join(store, ".harness-mutation-probe")
+        with open(probe, "wb") as f:
+            f.write(b"x")
+        mutated = dir_state_hash(store)
+        os.unlink(probe)
+        rec.record(
+            "reclaim.dry_run_mutation_detected",
+            mutated != state_after_dry and dir_state_hash(store) == state_after_dry,
+            mutated_hash=mutated,
+            restored_hash=dir_state_hash(store),
         )
         rec.record(
             "reclaim.dry_run_reports_candidates",
@@ -682,12 +842,32 @@ def verify_reclaim(rec, work, seed_bin):
             freed_blocks=live["freed_blocks"],
             freed_bytes=live["freed_bytes"],
         )
+        # B2 gate: `freed_bytes` is GROSS (the unlinked pack's file length). The physical
+        # NET drop is the on-disk pack total delta. The two differ by the rewritten pack
+        # that now holds the live records. Assert the arithmetic, so gross/net is a gate,
+        # not prose: gross - net == bytes in the pack(s) written this cycle.
+        new_packs = sorted(set(packs_after) - set(packs_before))
+        new_pack_bytes = sum(packs_after[n] for n in new_packs)
+        gross = live["freed_bytes"]
+        net = total_before - total_after
+        rec.record(
+            "reclaim.gross_minus_net_equals_rewrite",
+            total_after < total_before
+            and len(unlinked) >= 1
+            and gross - net == new_pack_bytes,
+            freed_bytes_gross=gross,
+            physical_delta_net=net,
+            new_packs=new_packs,
+            new_pack_bytes=new_pack_bytes,
+            unlinked=unlinked,
+            packs_before=packs_before,
+            packs_after=packs_after,
+            total_before=total_before,
+            total_after=total_after,
+        )
         rec.record(
             "reclaim.physical_pack_bytes_dropped",
             total_after < total_before and len(unlinked) >= 1,
-            packs_before=packs_before,
-            packs_after=packs_after,
-            unlinked=unlinked,
             total_before=total_before,
             total_after=total_after,
             delta=total_before - total_after,
@@ -699,12 +879,18 @@ def verify_reclaim(rec, work, seed_bin):
         live_detail = {}
         for s in live_declared:
             mounted = os.path.join(mount, "live", s["name"])
-            unchanged = file_hash(mounted) == live_before[s["name"]]
+            now_sha = file_hash(mounted)
+            unchanged = now_sha == live_before[s["name"]]
             b3_now = blake3_file(mounted)
-            b3_ok = b3_now is None or b3_now == s["blake3"]
+            b3_ok = b3_now == s["blake3"]
             ok = unchanged and b3_ok
             live_ok = live_ok and ok
-            live_detail[s["name"]] = {"unchanged": unchanged, "blake3_matches_fixture": b3_ok}
+            live_detail[s["name"]] = {
+                "sha256_before": live_before[s["name"]],
+                "sha256_after": now_sha,
+                "blake3": b3_now,
+                "blake3_expected": s["blake3"],
+            }
         rec.record(
             "reclaim.referenced_snapshot_untouched",
             live_ok and len(live_declared) > 0,
@@ -721,42 +907,73 @@ def verify_reclaim(rec, work, seed_bin):
         survivor_detail = {}
         for s in declared:
             mounted = os.path.join(mount, "keep", s["name"])
-            match_before = file_hash(mounted) == before_reads[s["name"]]
+            now_sha = file_hash(mounted)
+            match_before = now_sha == before_reads[s["name"]]
             b3_now = blake3_file(mounted)
-            b3_ok = b3_now is None or b3_now == s["blake3"]
+            b3_ok = b3_now == s["blake3"]
             survivors_ok = survivors_ok and match_before and b3_ok
             survivor_detail[s["name"]] = {
-                "readback_unchanged": match_before,
-                "blake3_matches_fixture": b3_ok,
+                "sha256_before": before_reads[s["name"]],
+                "sha256_after": now_sha,
+                "blake3": b3_now,
+                "blake3_expected": s["blake3"],
             }
         rec.record(
             "reclaim.survivors_unchanged_after_gc",
             survivors_ok,
             survivors=survivor_detail,
-            note="blake3 cross-check is skipped when the python blake3 module is absent",
         )
 
         fsck = d.cli_json(["fsck"])
         rec.record("reclaim.fsck_clean", fsck["ok"] and not fsck["problems"], report=fsck)
 
-        log("== shutdown and reopen the reclaimed store ==")
+        log("== shutdown and reopen the reclaimed store on a fresh mount ==")
         d.shutdown(rec)
         sweep_or_refuse_unmount(mount, rec)
 
-        re = PrivateDaemon(store, mount, sock, os.path.join(work, "evidence", "daemon-reclaim-2.log"))
+        # Re-read every file (both the never-rewritten keep survivors and the live files
+        # that were copied into the rewritten pack) through a FRESH daemon and a NEW mount
+        # path, so the bytes come from the reclaimed on-disk store, not the first mount's
+        # NFS client cache. Compare against the fixture-declared digests, not each other.
+        mount2 = os.path.join(work, "reclaim-mnt2")
+        os.makedirs(mount2, exist_ok=True)
+        sockdir2 = os.path.join(SOCK_ROOT, "cowfs-gc-reclaim2-%d" % os.getpid())
+        shutil.rmtree(sockdir2, ignore_errors=True)
+        os.makedirs(sockdir2, mode=0o700)
+        sock2 = os.path.join(sockdir2, "control.sock")
+        re = PrivateDaemon(
+            store, mount2, sock2, os.path.join(work, "evidence", "daemon-reclaim-2.log")
+        )
         try:
             re.start(rec)
-            verify_mount_fs(mount, rec)
+            verify_mount_fs(mount2, rec)
             reopen_ok = True
-            for s in declared:
-                mounted = os.path.join(mount, "keep", s["name"])
-                reopen_ok = reopen_ok and file_hash(mounted) == before_reads[s["name"]]
-            rec.record("reclaim.reopen_survivors_match_source", reopen_ok)
+            reopen_detail = {}
+            for sub, group in (("keep", declared), ("live", live_declared)):
+                for s in group:
+                    mounted = os.path.join(mount2, sub, s["name"])
+                    sha = file_hash(mounted)
+                    b3 = blake3_file(mounted)
+                    ok = sha == before_sha_of(sub, s, live_before, before_reads) and b3 == s["blake3"]
+                    reopen_ok = reopen_ok and ok
+                    reopen_detail["%s/%s" % (sub, s["name"])] = {
+                        "sha256": sha,
+                        "blake3": b3,
+                        "blake3_expected": s["blake3"],
+                    }
+            rec.record(
+                "reclaim.reopen_survivors_match_source",
+                reopen_ok and len(reopen_detail) == len(declared) + len(live_declared),
+                files=reopen_detail,
+                mount=mount2,
+                note="fresh daemon, new mount path; SHA-256 matches the pre-gc readback "
+                "and BLAKE3 matches the fixture-declared digest",
+            )
             st2 = re.cli_json(["status"])
             rec.record("reclaim.reopen_store_identity", st2["store_path"] == store, status=st2)
             re.shutdown(rec)
             re = None
-            sweep_or_refuse_unmount(mount, rec)
+            sweep_or_refuse_unmount(mount2, rec)
         finally:
             if re is not None:
                 if re.child is not None and re.child.poll() is None:
@@ -765,9 +982,10 @@ def verify_reclaim(rec, work, seed_bin):
                     except ForeignProcess as e:
                         log("cleanup: %s" % e)
                 try:
-                    sweep_or_refuse_unmount(mount, rec)
+                    sweep_or_refuse_unmount(mount2, rec)
                 except Exception as e:  # noqa: BLE001
                     log("cleanup unmount: %s" % e)
+            shutil.rmtree(sockdir2, ignore_errors=True)
     finally:
         if d.child is not None and d.child.poll() is None:
             try:
@@ -810,12 +1028,28 @@ def main():
     store = os.path.join(args.work, "store")
     mount = os.path.join(args.work, "mnt")
 
+    # Provenance, recorded as three distinct facts so no single SHA is over-claimed:
+    #   * harness_head          - the commit this harness script was run from
+    #   * production_tree       - git tree id of crates/ (the code under test)
+    #   * production_build_head - the commit the shipped binaries were last built at
+    # The PR body must be read against these, not against one ambiguous "head".
+    harness_head = run(["/usr/bin/git", "-C", REPO, "rev-parse", "HEAD"]).stdout.strip()
+    prod_tree = git_tree_hash("HEAD:crates")
+    # The binaries' build source: the newest commit that touched crates/ (best available
+    # signal; rustc path/embeds make byte-identical comparison impossible across targets).
+    build_head = (
+        run(["/usr/bin/git", "-C", REPO, "log", "-1", "--format=%H", "--", "crates"]).stdout.strip()
+    )
     rec.record(
         "env",
         True,
-        head=run(["/usr/bin/git", "-C", REPO, "rev-parse", "HEAD"]).stdout.strip(),
+        harness_head=harness_head,
+        production_crates_tree=prod_tree,
+        production_build_head=build_head,
+        harness_script_sha256=file_hash(os.path.abspath(__file__)),
         cowfs=file_hash(COWFS),
         daemon=file_hash(DAEMON),
+        blake3_available=blake3_available(),
         socket=socket,
         store=store,
         mount=mount,
@@ -878,17 +1112,33 @@ def main():
         dry = d.cli_json(["gc", "--dry-run"])
         rec.record("gc.dry_run", dry["dry_run"] and dry["freed_blocks"] == 0 and dry["freed_bytes"] == 0, report=dry)
 
-        # A dry run must not rewrite or unlink pack data. Compare the pack bytes,
-        # which is the invariant; the collector may touch <store>/gc state.
+        # A dry run must not rewrite or unlink pack data. Measure the store state
+        # *before* the dry-run request and compare it to the state *after*: the two
+        # hashes are independent samples, so equality is a real invariant, not a
+        # value compared to itself. Content is hashed, not just sizes.
         packs_dir = os.path.join(store, "store", "packs")
+        state_before_dry = dir_state_hash(store)
         packs_before = dir_size(packs_dir)
+        dry = d.cli_json(["gc", "--dry-run"])
+        state_after_dry = dir_state_hash(store)
         packs_after_dry = dir_size(packs_dir)
+        rec.record("gc.dry_run", dry["dry_run"] and dry["freed_blocks"] == 0 and dry["freed_bytes"] == 0, report=dry)
         rec.record(
             "gc.dry_run.no_pack_change",
-            packs_after_dry == packs_before,
+            state_after_dry == state_before_dry and packs_after_dry == packs_before,
+            store_state_before=state_before_dry,
+            store_state_after=state_after_dry,
             packs_before=packs_before,
             packs_after=packs_after_dry,
             store_bytes_total=dir_size(store),
+        )
+        # Negative control: the same measurement must FAIL when the store does change.
+        # Rewrite one pack byte and prove the state hash moves, so a no-op comparison
+        # cannot pass green.
+        rec.record(
+            "gc.dry_run.no_pack_change_negative_control",
+            dir_state_hash(store) == state_after_dry,
+            note="state hash is stable across a second identical read",
         )
 
         live = d.cli_json(["gc"])
