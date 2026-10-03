@@ -1,8 +1,13 @@
 # Verification: daemon `gc` end to end over the real core
 
 Independent verification of PR #76 (`Refs #10`), production tree `crates/` at
-`961952e19a389a9c60e2c16190dd354e006664ef` (build head `ea958947b437a089c760b7f4ee381c57702c81d8`).
+`961952e19a389a9c60e2c16190dd354e006664ef` (build head `ea958947b437a089c760b7f4ee381c57702c81d8`,
+a recorded proxy for the binary origin, not cryptographic proof).
 This report is produced by `scripts/verify-gc-daemon.py` and is not part of the production change.
+
+This report makes **no claim that the production GC is safe**. Production source `ea958947` still
+carries the PR #76 root-walk identity data-loss race and stays production-blocked; the corrected
+production head must be re-verified before this PR is rebased or merged.
 
 ## What was verified, and by what
 
@@ -21,21 +26,31 @@ whose command line does not carry this run's exact socket and store.
 
 ```
 records: 72   failed: 0
-harness head:     f170dc177e0792e828dca02ef9adddfaf1665750
-production tree:  961952e19a389a9c60e2c16190dd354e006664ef   (crates/ at HEAD)
-build head:       ea958947b437a089c760b7f4ee381c57702c81d8   (newest commit touching crates/)
+env.harness_head (stale label):  f170dc177e0792e828dca02ef9adddfaf1665750
+script sha256 (content identity): a51259070b54bb852e7de5a16bf492fa5ecc8a81672c12292492e53470c0bff2
+committed blob at 8cab23a:        e5e275a550a4f0cfa6de7951dee673d27cb0647c
+production tree:                  961952e19a389a9c60e2c16190dd354e006664ef   (crates/ at HEAD)
+build head:                       ea958947b437a089c760b7f4ee381c57702c81d8   (newest commit touching crates/)
 ```
 
-The three SHAs are recorded separately on purpose. `harness head` is the commit this script ran
-from; `production tree` is the git tree id of `crates/` (the code under test); `build head` is the
-newest commit that touched `crates/`, the best available signal for what the shipped binaries were
-built from (rustc embeds build paths, so binaries are not byte-comparable across target dirs). The
-verification applies to the **production tree** id; it does not claim that any uncommitted working
-tree was tested.
+The `env.harness_head` label inside run6 is `f170dc1`, the **parent** of the commit that carries
+these bytes. The script `sha256` `a5125907...` equals the `8cab23a` blob
+(`git rev-parse 8cab23a:scripts/verify-gc-daemon.py` = `e5e275a5...`), so the run is bound by content
+to the committed script even though the recorded label is stale. The JSONL evidence is historical and
+is **not** rewritten.
 
-Full evidence: `bench/out/gc-daemon-e2e/run6/evidence/records.jsonl` (append, flush, fsync per step),
-and an independent clean-checkout run at `bench/out/gc-daemon-e2e/clean-checkout/` (see
-Reproduction).
+`production tree` is the git tree id of `crates/` (the code under test); `build head` is the newest
+commit that touched `crates/`. `build head` is a **recorded proxy**, not cryptographic proof that the
+binary was built from exactly that tree (rustc embeds build paths, so binaries are not
+byte-comparable across target dirs); the independent reviewer's fresh build from the clean archive is
+the separate source-and-behavior proof. The verification applies to the **production tree** id; it
+does not claim any uncommitted working tree was tested.
+
+Full evidence: `bench/out/gc-daemon-e2e/run6/evidence/records.jsonl` (append, flush, fsync per step).
+An independent reviewer's clean-archive run against the **committed** script is at
+`bench/out/gc-e2e-repairs-critic/archive/bench/out/run-clean/` (72/0); the builder's earlier
+clean-checkout run at `bench/out/gc-daemon-e2e/clean-checkout/` used the `f170dc1` script (71/0). See
+Reproduction.
 
 | Step | Proves |
 |---|---|
@@ -107,8 +122,8 @@ Note this also means `freed_bytes` (16.76 MB) exceeds the documented "most a cyc
 `candidate_bytes` (15.14 MB). Under gross accounting that bound does not hold. This is a
 **semantics defect in the product, not in this fixture**: the control-plane `GcReport` carries no
 `bytes_copied`, so a caller cannot net `freed_bytes` out. It is out of scope here (no production
-change) and should be fixed by reporting net, or adding a `bytes_copied` field, in a follow-up
-against PR #76.
+change) and tracked as issue #81 (fixed by reporting net, or adding a `bytes_copied` field), separate
+from PR #76's blocking root-walk race.
 
 | Check | Evidence |
 |---|---|
@@ -186,7 +201,7 @@ sweep or its cancellation under the core backend. That gap is stated here rather
 - No full-stack crash injection. The daemon was never SIGKILLed in this pass.
 - No real-core `gc` cancellation. The cancel path above is control-plane only.
 - No fix for the gross `freed_bytes` accounting (`candidate_bytes` bound and missing `bytes_copied`);
-  recorded here as a product semantics gap, fixed in a follow-up, not in this verification.
+  tracked as issue #81, separate from PR #76's blocking race, not fixed in this verification.
 - No organic growth to the production 256 MiB default pack size. The fixture seals 16 MiB packs; the
   daemon still opens with the real default options.
 - No production edits to `cowfs-core`, `cowfs-gc`, `cowfs-daemon`, root manifests, or workflows.
@@ -208,12 +223,23 @@ records the missing prerequisite rather than fetching. The python `blake3` modul
 
 ### Clean-checkout proof
 
-Exported the committed tree (`git archive <head> | tar -x`) into a fresh directory, confirmed the seed
-source is present from tracked files only, and built it `--locked --offline` (49s). Running the
-harness from that clean tree against the same production binaries gave `72/72 (0 failed)` with
-identical reclaim numbers (`gross 16,759,743 - net 15,136,450 = 1,623,293`; `pack-00000000.cpk`
-unlinked; all four reopen files matching). Artifacts under
-`bench/out/gc-daemon-e2e/clean-checkout/` (gitignored).
+There are two clean-source runs, and they are different scripts:
+
+- **Builder run (71 records).** Exported `f170dc1` (`git archive f170dc1 | tar -x`) into a fresh
+  directory, confirmed the seed source is present from tracked files only, and built it
+  `--locked --offline` (49s). Running the harness from that tree gave **71 records, 0 failed** with
+  the reclaim numbers below. Its script `sha256` is `05ca05d5...` (`f170dc1`), which predates the
+  `selftest.digest_detects_corruption` check. Artifacts under
+  `bench/out/gc-daemon-e2e/clean-checkout/` (gitignored).
+- **Independent reviewer run (72 records).** A fresh native reviewer exported the committed `8cab23a`
+  tree, rebuilt the binaries from the byte-identical `crates/`, and ran the **committed** script
+  (blob `e5e275a5...`, `sha256` `a5125907...`, identical in the archive and `git show 8cab23a:`) to
+  **72 records, 0 failed**. This is the first 72/72 clean-source run of the committed script.
+  Artifacts under `bench/out/gc-e2e-repairs-critic/archive/bench/out/run-clean/` (gitignored).
+
+Both runs give identical reclaim numbers (`gross 16,759,743 - net 15,136,450 = 1,623,293`;
+`pack-00000000.cpk` unlinked; all four reopen files matching fixture digests). The builder did not
+produce a 72-record clean-checkout run; that result belongs to the independent reviewer.
 
 Expected output ends with `"failed": 0`. Evidence is written under
 `bench/out/gc-daemon-e2e/run/evidence/`.
