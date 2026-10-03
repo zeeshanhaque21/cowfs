@@ -471,6 +471,26 @@ def selftest(rec, share_root):
         and any(p.endswith("Cargo.lock") for p in src_files),
         files=[os.path.relpath(p, REPO) for p in src_files],
     )
+    # 7. The file-digest predicates must FAIL on corrupted content, not pass. Write a
+    #    file, take its SHA-256 and BLAKE3, flip one bit, and prove both move. This is
+    #    the negative control for every survivor/fixture comparison above.
+    corrupt = os.path.join(share_root, "corrupt-probe")
+    os.makedirs(corrupt, exist_ok=True)
+    cp = os.path.join(corrupt, "f")
+    with open(cp, "wb") as f:
+        f.write(b"clean contents")
+    sha_good, b3_good = file_hash(cp), blake3_file(cp)
+    with open(cp, "r+b") as f:
+        f.seek(0)
+        f.write(b"x")
+    rec.record(
+        "selftest.digest_detects_corruption",
+        file_hash(cp) != sha_good and blake3_file(cp) != b3_good,
+        sha256_before=sha_good,
+        sha256_after=file_hash(cp),
+        blake3_before=b3_good,
+        blake3_after=blake3_file(cp),
+    )
 
 
 # --------------------------------------------------------------------------
