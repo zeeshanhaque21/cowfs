@@ -8,6 +8,7 @@ use cowfs_store::{chunks, BlockId, ChunkRef, MAX_CHUNK_LEN};
 use cowfs_vfs::{Error, Result};
 
 use crate::blocks::Blocks;
+use crate::gate::Entry;
 
 /// Chunk refs with this id are holes: zeros that are never stored.
 pub(crate) const HOLE: BlockId = BlockId::from_bytes([0; 32]);
@@ -205,13 +206,13 @@ impl FileData {
     /// Moves every dirty extent into the chunk list: reads the (at most two) boundary chunks
     /// per extent, re-chunks the modified region with the store's FastCDC and puts the pieces.
     /// On error nothing changes.
-    pub(crate) fn flush(&mut self, blocks: &Blocks) -> Result<()> {
+    pub(crate) fn flush(&mut self, blocks: &Blocks, entry: &Entry<'_>) -> Result<()> {
         if self.dirty.is_empty() {
             return Ok(());
         }
         let mut list = (*self.chunks).clone();
         for (&a, data) in &self.dirty {
-            flush_extent(&mut list, blocks, a, data)?;
+            flush_extent(&mut list, blocks, entry, a, data)?;
         }
         self.chunks = Arc::new(list);
         self.dirty.clear();
@@ -220,7 +221,7 @@ impl FileData {
     }
 
     /// Cuts the chunk list at `size`. The caller has flushed, so there are no dirty extents.
-    pub(crate) fn truncate(&mut self, blocks: &Blocks, size: u64) -> Result<()> {
+    pub(crate) fn truncate(&mut self, blocks: &Blocks, entry: &Entry<'_>, size: u64) -> Result<()> {
         if !self.dirty.is_empty() {
             return Err(Error::Io("truncate with unflushed data".into()));
         }
@@ -240,7 +241,7 @@ impl FileData {
                 let bytes = blocks.get(c.id)?;
                 check_len(&bytes, c)?;
                 for piece in chunks(&bytes[..(size - start) as usize]) {
-                    tail.push(put_piece(blocks, piece)?);
+                    tail.push(put_piece(blocks, entry, piece)?);
                 }
             }
         }
@@ -264,14 +265,20 @@ fn check_len(bytes: &[u8], c: ChunkRef) -> Result<()> {
     }
 }
 
-fn put_piece(blocks: &Blocks, piece: &[u8]) -> Result<ChunkRef> {
+fn put_piece(blocks: &Blocks, entry: &Entry<'_>, piece: &[u8]) -> Result<ChunkRef> {
     Ok(ChunkRef {
-        id: blocks.put(piece)?,
+        id: blocks.put(entry, piece)?,
         len: piece.len() as u32,
     })
 }
 
-fn flush_extent(list: &mut Chunks, blocks: &Blocks, a: u64, data: &[u8]) -> Result<()> {
+fn flush_extent(
+    list: &mut Chunks,
+    blocks: &Blocks,
+    entry: &Entry<'_>,
+    a: u64,
+    data: &[u8],
+) -> Result<()> {
     let b = a + data.len() as u64;
     let total = list.total();
     let n = list.refs.len();
@@ -335,7 +342,7 @@ fn flush_extent(list: &mut Chunks, blocks: &Blocks, a: u64, data: &[u8]) -> Resu
     region.extend_from_slice(&tail);
     let mut new = prefix;
     for piece in chunks(&region) {
-        new.push(put_piece(blocks, piece)?);
+        new.push(put_piece(blocks, entry, piece)?);
     }
     new.extend(suffix);
     list.replace(first..last_excl, new);
@@ -450,6 +457,7 @@ mod tests {
     #[test]
     fn flush_and_read_match_model_across_chunk_sizes() {
         let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
         let mut f = FileData::default();
         let mut m: Vec<u8> = Vec::new();
         let mut x = 0x2545_F491_4F6C_DD1Du64;
@@ -466,13 +474,13 @@ mod tests {
             f.write(off as u64, &data);
             model_write(&mut m, off, &data);
             if i % 3 == 0 {
-                f.flush(&b).unwrap();
+                f.flush(&b, &gate.enter()).unwrap();
                 assert!(f.is_clean());
                 assert!(f.chunks.total() <= m.len() as u64);
             }
             assert_eq!(full(&b, &f, m.len() as u64), m, "after write {i}");
         }
-        f.flush(&b).unwrap();
+        f.flush(&b, &gate.enter()).unwrap();
         assert_eq!(full(&b, &f, m.len() as u64), m);
         assert!(f.chunks.refs.iter().all(|r| !is_hole(r) || r.len > 0));
     }
@@ -480,16 +488,17 @@ mod tests {
     #[test]
     fn holes_are_not_materialised() {
         let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
         let mut f = FileData::default();
         let far = 1u64 << 40;
         f.write(far, b"end");
-        f.flush(&b).unwrap();
+        f.flush(&b, &gate.enter()).unwrap();
         assert!(f.chunks.refs.len() <= 1100, "{}", f.chunks.refs.len());
         assert_eq!(f.chunks.stored_bytes(), 3);
         let r = read_range(&b, &f.chunks, &[], far - 2, far + 3).unwrap();
         assert_eq!(r, b"\0\0end");
         f.write(far / 2, b"mid");
-        f.flush(&b).unwrap();
+        f.flush(&b, &gate.enter()).unwrap();
         let r = read_range(&b, &f.chunks, &[], far / 2 - 1, far / 2 + 4).unwrap();
         assert_eq!(r, b"\0mid\0");
         assert_eq!(f.chunks.total(), far + 3);
@@ -499,25 +508,26 @@ mod tests {
     #[test]
     fn truncate_cuts_inside_a_chunk_and_inside_a_hole() {
         let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
         let mut f = FileData::default();
         let data = pattern(300_000, 4);
         f.write(0, &data);
-        f.flush(&b).unwrap();
-        f.truncate(&b, 123_457).unwrap();
+        f.flush(&b, &gate.enter()).unwrap();
+        f.truncate(&b, &gate.enter(), 123_457).unwrap();
         assert_eq!(f.chunks.total(), 123_457);
         assert_eq!(
             read_range(&b, &f.chunks, &[], 0, 123_457).unwrap(),
             data[..123_457]
         );
         f.write(5_000_000, b"x");
-        f.flush(&b).unwrap();
-        f.truncate(&b, 2_000_000).unwrap();
+        f.flush(&b, &gate.enter()).unwrap();
+        f.truncate(&b, &gate.enter(), 2_000_000).unwrap();
         assert_eq!(f.chunks.total(), 2_000_000);
         assert_eq!(
             read_range(&b, &f.chunks, &[], 123_457, 123_460).unwrap(),
             vec![0u8; 3]
         );
-        f.truncate(&b, 0).unwrap();
+        f.truncate(&b, &gate.enter(), 0).unwrap();
         assert_eq!(f.chunks.total(), 0);
         assert!(f.chunks.refs.is_empty());
     }
@@ -525,10 +535,11 @@ mod tests {
     #[test]
     fn reads_match_the_model_at_every_chunk_boundary_alignment() {
         let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
         let data = pattern(3 << 20, 21);
         let mut f = FileData::default();
         f.write(0, &data);
-        f.flush(&b).unwrap();
+        f.flush(&b, &gate.enter()).unwrap();
         let ends: Vec<u64> = f.chunks.ends.clone();
         assert!(ends.len() > 8, "the file must span many chunks");
         for &e in ends.iter().step_by(ends.len() / 8 + 1) {
@@ -555,12 +566,13 @@ mod tests {
     #[test]
     fn reads_over_a_hole_match_the_model_and_keep_the_ref_valid() {
         let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
         let mid = pattern(200_000, 22);
         let mut f = FileData::default();
         f.write(0, b"head");
         f.write(3 << 20, &mid);
         f.write(9 << 20, b"tail");
-        f.flush(&b).unwrap();
+        f.flush(&b, &gate.enter()).unwrap();
         let holes: Vec<&ChunkRef> = f.chunks.refs.iter().filter(|r| is_hole(r)).collect();
         assert!(
             !holes.is_empty(),
@@ -601,10 +613,11 @@ mod tests {
     #[test]
     fn reads_over_a_flushed_chunk_and_its_dirty_overlay_match_the_model() {
         let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
         let base = pattern(1 << 20, 23);
         let mut f = FileData::default();
         f.write(0, &base);
-        f.flush(&b).unwrap();
+        f.flush(&b, &gate.enter()).unwrap();
         let mut model = base.clone();
         // one dirty byte inside a flushed chunk, one just past its end, one out in a fresh hole
         for (off, patch) in [
@@ -637,14 +650,15 @@ mod tests {
     #[test]
     fn sequential_appends_chunk_like_a_single_write() {
         let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
         let data = pattern(3 << 20, 9);
         let mut one = FileData::default();
         one.write(0, &data);
-        one.flush(&b).unwrap();
+        one.flush(&b, &gate.enter()).unwrap();
         let mut many = FileData::default();
         for (i, piece) in data.chunks(700_001).enumerate() {
             many.write((i * 700_001) as u64, piece);
-            many.flush(&b).unwrap();
+            many.flush(&b, &gate.enter()).unwrap();
         }
         let ids = |f: &FileData| f.chunks.refs.iter().map(|r| r.id).collect::<Vec<_>>();
         assert_eq!(ids(&one), ids(&many));

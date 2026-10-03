@@ -1,0 +1,777 @@
+//! The collector over the real core: real packs reclaimed, real reads after a reopen.
+//!
+//! Design: `docs/gc-core-integration.md`. Every test uses a private temp directory.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use cowfs_core::{Collector, Core, CoreRoots, Options as CoreOptions, SnapshotView};
+use cowfs_gc::{
+    Barrier, ExtraRoots, GcReport, Held, Options as GcOptions, RootsError, SkipReason,
+};
+use cowfs_store::BlockId;
+use cowfs_vfs::{Vfs, ROOT_INO};
+
+fn core_opts(background: bool) -> CoreOptions {
+    CoreOptions {
+        background,
+        store: cowfs_store::Options {
+            max_pack_size: 96 << 10,
+            ..cowfs_store::Options::default()
+        },
+        file_flush_bytes: 32 << 10,
+        flush_interval: Duration::from_millis(20),
+        sync_interval: Duration::from_millis(50),
+        ..CoreOptions::default()
+    }
+}
+
+fn gc_opts() -> GcOptions {
+    GcOptions {
+        dead_ratio: 0.0,
+        min_dead_bytes: 1,
+        io_budget_bytes: 0,
+        batch_bytes: 4096,
+        ..GcOptions::default()
+    }
+}
+
+fn body(n: usize, seed: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    let mut h = seed.wrapping_mul(2654435761).wrapping_add(1);
+    for _ in 0..n {
+        h = h.wrapping_mul(1664525).wrapping_add(1013904223);
+        out.push((h >> 16) as u8);
+    }
+    out
+}
+
+fn seeded(seed: u32) -> Vec<u8> {
+    body(20_000 + 7_000 * (seed as usize % 4), seed)
+}
+
+fn put_file(v: &SnapshotView, name: &str, data: &[u8]) {
+    let a = v.create(ROOT_INO, name.as_bytes(), 0o644).expect("create");
+    assert_eq!(v.write(a.ino, 0, data).expect("write") as usize, data.len());
+    v.forget(a.ino, 1);
+}
+
+fn read_file(v: &SnapshotView, name: &str) -> Result<Vec<u8>, cowfs_vfs::Error> {
+    let a = v.lookup(ROOT_INO, name.as_bytes())?;
+    let mut out = Vec::new();
+    let mut err = None;
+    while (out.len() as u64) < a.size {
+        match v.read(a.ino, out.len() as u64, 1 << 20) {
+            Ok(part) if part.is_empty() => break,
+            Ok(part) => out.extend(part),
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    v.forget(a.ino, 1);
+    err.map_or(Ok(out), Err)
+}
+
+type Files = Vec<(String, Vec<u8>)>;
+
+struct Plan {
+    keep: Files,
+    dropped: Files,
+}
+
+/// Two snapshots whose files interleave in the packs, then one is removed. Some packs are mixed,
+/// some are all dead, and a tail pushes the durable watermark past all of them.
+fn build(core: &Core) -> Plan {
+    core.create_snapshot("keep").expect("keep");
+    core.create_snapshot("drop").expect("drop");
+    let kv = core.snapshot_view("keep").expect("view");
+    let dv = core.snapshot_view("drop").expect("view");
+    let mut keep = Vec::new();
+    let mut dropped = Vec::new();
+    for i in 0..16u32 {
+        let k = (format!("k{i:02}"), body(40_000, i));
+        let d = (format!("d{i:02}"), body(40_000, 1000 + i));
+        put_file(&kv, &k.0, &k.1);
+        put_file(&dv, &d.0, &d.1);
+        keep.push(k);
+        dropped.push(d);
+        core.sync().expect("sync");
+    }
+    for i in 16..26u32 {
+        let d = (format!("d{i:02}"), body(40_000, 1000 + i));
+        put_file(&dv, &d.0, &d.1);
+        dropped.push(d);
+        core.sync().expect("sync");
+    }
+    add_tail(core, &mut keep, "tail", 5);
+    core.remove_snapshot("drop").expect("remove drop");
+    core.sync().expect("sync");
+    Plan { keep, dropped }
+}
+
+fn add_tail(core: &Core, keep: &mut Files, prefix: &str, n: u32) {
+    let kv = core.snapshot_view("keep").expect("view");
+    for i in 0..n {
+        let k = (format!("{prefix}{i:02}"), body(40_000, 5000 + i));
+        put_file(&kv, &k.0, &k.1);
+        keep.push(k);
+        core.sync().expect("sync");
+    }
+}
+
+fn verify(core: &Core, files: &Files) {
+    core.drop_caches();
+    let v = core.snapshot_view("keep").expect("view");
+    for (n, d) in files {
+        let got = read_file(&v, n).unwrap_or_else(|e| panic!("{n} does not read: {e}"));
+        assert!(got == *d, "{n} reads back different bytes");
+    }
+}
+
+fn fsck_clean(core: &Core) {
+    let r = core.fsck().expect("fsck");
+    assert!(r.damage.is_empty(), "fsck found damage: {:?}", r.damage);
+}
+
+fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else if let Ok(b) = std::fs::read(&p) {
+                out.insert(p.strip_prefix(root).unwrap().display().to_string(), b);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+fn packs(dir: &Path) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for e in std::fs::read_dir(dir.join("store").join("packs"))
+        .expect("packs dir")
+        .flatten()
+    {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.starts_with("pack-") && n.ends_with(".cpk") {
+            out.insert(n, e.metadata().unwrap().len());
+        }
+    }
+    out
+}
+
+fn bytes(p: &BTreeMap<String, u64>) -> u64 {
+    p.values().sum()
+}
+
+fn clean(r: &GcReport) {
+    assert!(r.errors.is_empty(), "cycle errors: {:?}", r.errors);
+    assert!(r.roots_error.is_none(), "roots error: {:?}", r.roots_error);
+}
+
+fn reopen(dir: &Path) -> Core {
+    Core::open(dir, core_opts(false)).expect("reopen")
+}
+
+#[test]
+fn a_real_cycle_reclaims_dead_packs_and_survivors_read_after_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+    let before = packs(dir.path());
+    let blocks_before = core.store().stats().blocks;
+    assert!(before.len() >= 6, "the scenario made several packs: {}", before.len());
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.barrier, "core offers a barrier");
+    assert!(r.packs_unlinked > 0, "dead packs were reclaimed: {r:?}");
+    assert!(r.freed_bytes > 0);
+
+    let after = packs(dir.path());
+    assert!(after.len() < before.len(), "pack files: {} -> {}", before.len(), after.len());
+    assert!(bytes(&after) < bytes(&before), "{} -> {}", bytes(&before), bytes(&after));
+    assert!(bytes(&after) + r.freed_bytes >= bytes(&before));
+    assert!(core.store().stats().blocks < blocks_before);
+    verify(&core, &plan.keep);
+
+    let r2 = c.collect().unwrap();
+    clean(&r2);
+    assert_eq!(r2.packs_unlinked, 0, "a second cycle has nothing left: {r2:?}");
+
+    drop(c);
+    core.close().expect("close with no collector alive");
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
+    core.close().unwrap();
+}
+
+#[test]
+fn writing_a_dead_block_again_revives_it_before_the_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let mut plan = build(&core);
+    let kv = core.snapshot_view("keep").unwrap();
+    for (n, d) in plan.dropped.iter().take(6) {
+        let name = format!("again-{n}");
+        put_file(&kv, &name, d);
+        plan.keep.push((name, d.clone()));
+    }
+    core.sync().unwrap();
+    drop(kv);
+    let c = core.collector(gc_opts()).unwrap();
+    clean(&c.collect().unwrap());
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
+}
+
+#[test]
+fn a_dedup_that_is_only_queued_keeps_the_block_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let mut plan = build(&core);
+    let kv = core.snapshot_view("keep").unwrap();
+    // 40 KB is past `file_flush_bytes`, so the chunks are stored now and the chunk list is queued,
+    // but nothing is committed: only the node in memory names the block.
+    for (n, d) in plan.dropped.iter().take(6) {
+        let name = format!("queued-{n}");
+        put_file(&kv, &name, d);
+        plan.keep.push((name, d.clone()));
+    }
+    assert!(!core.pinned_blocks().unwrap().is_empty(), "the queued chunk lists are pinned");
+    let dirty = body(20_000, 77);
+    put_file(&kv, "dirty", &dirty);
+    drop(kv);
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.pinned > 0, "{r:?}");
+    core.sync().unwrap();
+    plan.keep.push(("dirty".into(), dirty));
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
+}
+
+#[test]
+fn an_open_unlinked_file_survives_and_is_reclaimed_after_the_last_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    core.create_snapshot("keep").unwrap();
+    let kv = core.snapshot_view("keep").unwrap();
+    let orphan = body(60_000, 9);
+    put_file(&kv, "orphan", &orphan);
+    core.sync().unwrap();
+    let a = kv.lookup(ROOT_INO, b"orphan").unwrap();
+    let h = kv.open(a.ino).unwrap();
+    kv.unlink(ROOT_INO, b"orphan").unwrap();
+    core.sync().unwrap();
+    let mut keep = Vec::new();
+    add_tail(&core, &mut keep, "tail", 5);
+    assert!(!core.pinned_blocks().unwrap().is_empty(), "the orphan is pinned");
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.pinned > 0);
+    let got = kv.read(a.ino, 0, 60_000).expect("the open file still reads");
+    assert!(got == orphan);
+    verify(&core, &keep);
+
+    kv.release(h).unwrap();
+    kv.forget(a.ino, 1 << 20);
+    core.sync().unwrap();
+    assert!(core.pinned_blocks().unwrap().is_empty(), "nothing pins it any more");
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.packs_unlinked > 0, "the orphan's pack is reclaimed once it is closed: {r:?}");
+    verify(&core, &keep);
+    drop(c);
+    drop(kv);
+    core.close().unwrap();
+}
+
+enum Mode {
+    NoRoots,
+    NoBarrier,
+    BusyPins,
+    BarrierError,
+    TakeFails,
+}
+
+struct NoTake;
+impl Barrier for NoTake {
+    fn take(&mut self) -> Option<Box<dyn Held>> {
+        None
+    }
+}
+
+struct Wrapped {
+    inner: CoreRoots,
+    mode: Mode,
+}
+
+impl ExtraRoots for Wrapped {
+    fn pinned_blocks(&self) -> Result<Vec<BlockId>, RootsError> {
+        match self.mode {
+            Mode::BusyPins => Err(RootsError::Busy),
+            _ => self.inner.pinned_blocks(),
+        }
+    }
+    fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier>>, RootsError> {
+        match self.mode {
+            Mode::NoBarrier => Ok(None),
+            Mode::BarrierError => Err(RootsError::Unavailable),
+            Mode::TakeFails => Ok(Some(Box::new(NoTake))),
+            _ => self.inner.reference_barrier(),
+        }
+    }
+}
+
+#[test]
+fn no_barrier_busy_or_an_error_keeps_every_block() {
+    for (label, mode) in [
+        ("no roots at all", Mode::NoRoots),
+        ("no barrier", Mode::NoBarrier),
+        ("busy pins", Mode::BusyPins),
+        ("barrier error", Mode::BarrierError),
+        ("take fails", Mode::TakeFails),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path(), core_opts(false)).unwrap();
+        let plan = build(&core);
+        let before = packs(dir.path());
+        let before_tree = tree(&dir.path().join("store").join("packs"));
+        let c = core.collector(gc_opts()).unwrap();
+        let wrapped = Wrapped {
+            inner: c.roots().clone(),
+            mode,
+        };
+        let r = match wrapped.mode {
+            Mode::NoRoots => c.gc().collect(None),
+            _ => c.gc().collect(Some(&wrapped)),
+        }
+        .unwrap();
+        assert_eq!(r.freed_bytes, 0, "{label}: {r:?}");
+        assert_eq!(r.packs_unlinked, 0, "{label}: {r:?}");
+        let after = packs(dir.path());
+        for name in before.keys() {
+            assert!(after.contains_key(name), "{label}: {name} was removed");
+        }
+        if !matches!(wrapped.mode, Mode::TakeFails) {
+            assert_eq!(
+                before_tree,
+                tree(&dir.path().join("store").join("packs")),
+                "{label}: nothing is copied when nothing can be freed"
+            );
+        }
+        verify(&core, &plan.keep);
+        drop(wrapped);
+        drop(c);
+        core.close().unwrap();
+        let core = reopen(dir.path());
+        verify(&core, &plan.keep);
+        fsck_clean(&core);
+    }
+}
+
+#[test]
+fn a_dry_run_changes_no_store_bytes_and_no_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+    let c = core
+        .collector(GcOptions {
+            dry_run: true,
+            ..gc_opts()
+        })
+        .unwrap();
+    let store_before = tree(&dir.path().join("store"));
+    let gc_before = tree(&dir.path().join("gc"));
+    let snaps_before = core.list_snapshots().unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.dry_run);
+    assert!(r.candidates > 0, "a dry run reports what it would do: {r:?}");
+    assert_eq!(r.freed_bytes, 0);
+    assert_eq!(r.packs_rewritten, 0);
+    assert!(store_before == tree(&dir.path().join("store")), "the store changed");
+    assert!(gc_before == tree(&dir.path().join("gc")), "the collector state changed");
+    assert_eq!(snaps_before, core.list_snapshots().unwrap());
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+}
+
+#[test]
+fn a_cancel_before_the_cycle_copies_nothing_and_resume_finishes_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+    let before = packs(dir.path());
+    let c = core.collector(gc_opts()).unwrap();
+    c.gc().cancel();
+    let r = c.collect().unwrap();
+    assert_eq!(r.packs_rewritten, 0, "{r:?}");
+    assert_eq!(packs(dir.path()), before);
+    verify(&core, &plan.keep);
+    c.gc().resume();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.packs_unlinked > 0);
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+}
+
+#[test]
+fn a_cancel_mid_cycle_stops_new_work_and_leaves_the_store_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+    let c = Arc::new(core.collector(gc_opts()).unwrap());
+    let weak: Weak<Collector> = Arc::downgrade(&c);
+    c.gc().set_progress(move |_| {
+        if let Some(c) = weak.upgrade() {
+            c.gc().cancel();
+        }
+    });
+    let r = c.collect().unwrap();
+    assert!(
+        r.skipped.iter().any(|s| s.reason == SkipReason::NotReached),
+        "the cancel left candidates unstarted: {r:?}"
+    );
+    assert_eq!(
+        r.packs_unlinked, r.packs_rewritten,
+        "what was copied is finished: {r:?}"
+    );
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
+    c.gc().resume();
+    c.gc().set_progress(|_| {});
+    let r2 = c.collect().unwrap();
+    clean(&r2);
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
+}
+
+#[test]
+fn the_collector_is_dropped_before_close_and_a_live_one_makes_close_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+    let c = core.collector(gc_opts()).unwrap();
+    clean(&c.collect().unwrap());
+    let err = core.close().expect_err("a live collector holds the mount");
+    assert_eq!(err, cowfs_vfs::Error::Stale);
+    // nothing was closed: the collector's mount still works
+    let live = c.roots().core().clone();
+    verify(&live, &plan.keep);
+    let kv = live.snapshot_view("keep").unwrap();
+    put_file(&kv, "after-refused-close", b"still writable");
+    live.sync().unwrap();
+    drop(kv);
+    drop(live);
+    drop(c);
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    let kv = core.snapshot_view("keep").unwrap();
+    assert_eq!(read_file(&kv, "after-refused-close").unwrap(), b"still writable");
+    drop(kv);
+    fsck_clean(&core);
+    core.close().unwrap();
+}
+
+#[test]
+fn collections_run_beside_writers_and_forks_without_deadlock_or_loss() {
+    const RUN: Duration = Duration::from_secs(6);
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(true)).unwrap();
+    core.create_snapshot("main").unwrap();
+    let main = core.snapshot_view("main").unwrap();
+    let expected: Arc<Mutex<BTreeMap<String, u32>>> = Arc::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let beat = Arc::new(AtomicUsize::new(0));
+    let cycles = Arc::new(AtomicUsize::new(0));
+    let unlinked = Arc::new(AtomicUsize::new(0));
+    let c = core.collector(gc_opts()).unwrap();
+
+    std::thread::scope(|s| {
+        {
+            let (finished, beat) = (finished.clone(), beat.clone());
+            s.spawn(move || {
+                let mut last = (beat.load(SeqCst), Instant::now());
+                while !finished.load(SeqCst) {
+                    std::thread::sleep(Duration::from_millis(250));
+                    let now = beat.load(SeqCst);
+                    if now != last.0 {
+                        last = (now, Instant::now());
+                    } else if last.1.elapsed() > Duration::from_secs(60) {
+                        eprintln!("DEADLOCK: no operation completed for 60 s");
+                        std::process::exit(101);
+                    }
+                }
+            });
+        }
+        let mut handles = Vec::new();
+        for t in 0..3u32 {
+            let (main, expected, stop, beat, core) = (
+                main.clone(),
+                expected.clone(),
+                stop.clone(),
+                beat.clone(),
+                core.clone(),
+            );
+            handles.push(s.spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(SeqCst) {
+                    let name = format!("w{t}_{}", i % 6);
+                    // every fourth write repeats the content of one that was overwritten by now, so
+                    // it deduplicates onto a block that is garbage or about to be reclaimed
+                    let seed = if i % 4 == 3 {
+                        (t * 10_000 + i).saturating_sub(8).max(t * 10_000)
+                    } else {
+                        t * 10_000 + i
+                    };
+                    if read_file(&main, &name).is_ok() {
+                        main.unlink(ROOT_INO, name.as_bytes()).expect("unlink");
+                        expected.lock().unwrap().remove(&name);
+                    }
+                    put_file(&main, &name, &seeded(seed));
+                    expected.lock().unwrap().insert(name, seed);
+                    if i.is_multiple_of(3) {
+                        core.sync().expect("sync");
+                    }
+                    beat.fetch_add(1, SeqCst);
+                    i += 1;
+                }
+            }));
+        }
+        {
+            let (core, stop, beat) = (core.clone(), stop.clone(), beat.clone());
+            handles.push(s.spawn(move || {
+                let mut i = 0;
+                while !stop.load(SeqCst) {
+                    let n = format!("t{}", i % 3);
+                    core.fork_snapshot("main", &n).expect("fork");
+                    core.remove_snapshot(&n).expect("remove");
+                    beat.fetch_add(1, SeqCst);
+                    i += 1;
+                }
+            }));
+        }
+        {
+            let (stop, beat, cycles, unlinked) =
+                (stop.clone(), beat.clone(), cycles.clone(), unlinked.clone());
+            let c = &c;
+            handles.push(s.spawn(move || {
+                while !stop.load(SeqCst) {
+                    let r = c.collect().expect("collect");
+                    if r.roots_error.is_none() {
+                        assert!(r.errors.is_empty(), "cycle errors: {:?}", r.errors);
+                    }
+                    cycles.fetch_add(1, SeqCst);
+                    unlinked.fetch_add(r.packs_unlinked as usize, SeqCst);
+                    beat.fetch_add(1, SeqCst);
+                }
+            }));
+        }
+        std::thread::sleep(RUN);
+        stop.store(true, SeqCst);
+        let panicked = handles.into_iter().map(|h| h.join().is_err()).filter(|p| *p).count();
+        finished.store(true, SeqCst);
+        assert_eq!(panicked, 0, "{panicked} workers panicked");
+    });
+    eprintln!(
+        "concurrent: {} cycles, {} packs unlinked, {} operations",
+        cycles.load(SeqCst),
+        unlinked.load(SeqCst),
+        beat.load(SeqCst)
+    );
+    assert!(cycles.load(SeqCst) > 0);
+    drop(c);
+    drop(main);
+    core.sync().unwrap();
+    let want: Vec<(String, u32)> = expected
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(n, s)| (n.clone(), *s))
+        .collect();
+    assert!(!want.is_empty());
+    let check = |core: &Core, label: &str| {
+        core.drop_caches();
+        let v = core.snapshot_view("main").unwrap();
+        for (n, seed) in &want {
+            let got = read_file(&v, n).unwrap_or_else(|e| panic!("{n} lost {label}: {e}"));
+            assert!(got == seeded(*seed), "{n} changed {label}");
+        }
+    };
+    check(&core, "before the reopen");
+    fsck_clean(&core);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    check(&core, "after the reopen");
+    fsck_clean(&core);
+}
+
+/// The roots of a real core, plus a writer that runs exactly while the barrier is held.
+struct Window {
+    inner: CoreRoots,
+    core: Core,
+    late: Files,
+    holding: Arc<AtomicBool>,
+    fired: AtomicBool,
+    writer: Mutex<Option<JoinHandle<()>>>,
+    parked: AtomicBool,
+}
+
+struct WindowBarrier {
+    inner: Box<dyn Barrier>,
+    holding: Arc<AtomicBool>,
+}
+
+struct WindowHeld {
+    _inner: Box<dyn Held>,
+    holding: Arc<AtomicBool>,
+}
+
+impl Held for WindowHeld {}
+impl Drop for WindowHeld {
+    fn drop(&mut self) {
+        self.holding.store(false, SeqCst);
+    }
+}
+
+impl Barrier for WindowBarrier {
+    fn take(&mut self) -> Option<Box<dyn Held>> {
+        let inner = self.inner.take()?;
+        self.holding.store(true, SeqCst);
+        Some(Box::new(WindowHeld {
+            _inner: inner,
+            holding: self.holding.clone(),
+        }))
+    }
+}
+
+impl ExtraRoots for Window {
+    fn pinned_blocks(&self) -> Result<Vec<BlockId>, RootsError> {
+        let answer = self.inner.pinned_blocks();
+        // This is the last read of the reference side before the pack is unlinked. A writer that
+        // starts here has to be kept out by the barrier, or its blocks are in no answer.
+        if self.holding.load(SeqCst) && !self.fired.swap(true, SeqCst) {
+            let core = self.core.clone();
+            let late = self.late.clone();
+            let h = std::thread::spawn(move || {
+                let v = core.snapshot_view("late").expect("late view");
+                for (n, d) in &late {
+                    put_file(&v, n, d);
+                }
+                core.sync().expect("sync");
+            });
+            let start = Instant::now();
+            while !h.is_finished() && self.core.gate_waiters() == 0 {
+                assert!(start.elapsed() < Duration::from_secs(10), "the writer neither ran nor parked");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.parked.store(!h.is_finished(), SeqCst);
+            *self.writer.lock().unwrap() = Some(h);
+        }
+        answer
+    }
+    fn reference_barrier(&self) -> Result<Option<Box<dyn Barrier>>, RootsError> {
+        let inner = self.inner.reference_barrier()?.expect("core offers a barrier");
+        Ok(Some(Box::new(WindowBarrier {
+            inner,
+            holding: self.holding.clone(),
+        })))
+    }
+}
+
+/// Runs one cycle with a writer that re-writes every dead block inside the barrier window.
+/// Returns how many of the writer's files fail to read after a reopen, and whether the writer
+/// was kept out of the window.
+fn window(fault: bool) -> (usize, bool, GcReport) {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+    core.create_snapshot("late").unwrap();
+    core.sync().unwrap();
+    let c = core.collector(gc_opts()).unwrap();
+    let w = Window {
+        inner: c.roots().clone(),
+        core: core.clone(),
+        late: plan.dropped.clone(),
+        holding: Arc::default(),
+        fired: AtomicBool::new(false),
+        writer: Mutex::new(None),
+        parked: AtomicBool::new(false),
+    };
+    core.set_gate_fault(u8::from(fault));
+    let r = c.gc().collect(Some(&w)).unwrap();
+    core.set_gate_fault(0);
+    if let Some(h) = w.writer.lock().unwrap().take() {
+        h.join().expect("writer");
+    }
+    let parked = w.parked.load(SeqCst);
+    drop(w);
+    drop(c);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    let v = core.snapshot_view("late").unwrap();
+    let failed = plan
+        .dropped
+        .iter()
+        .filter(|(n, d)| read_file(&v, n).map_or(true, |got| got != *d))
+        .count();
+    if !fault {
+        fsck_clean(&core);
+    }
+    (failed, parked, r)
+}
+
+#[test]
+fn a_writer_that_dedups_inside_the_barrier_window_waits_for_the_unlink() {
+    let (failed, parked, r) = window(false);
+    assert!(parked, "the writer must be parked at the gate while the barrier is held");
+    assert_eq!(failed, 0, "no block the writer referenced was lost: {r:?}");
+    assert!(r.packs_unlinked >= 1, "the window really covered an unlink: {r:?}");
+}
+
+#[test]
+fn negative_control_a_barrier_that_does_not_close_the_gate_loses_data() {
+    let (failed, parked, r) = window(true);
+    assert!(!parked, "with the fault the writer is not held back");
+    assert!(
+        failed > 0,
+        "without a real barrier the writer's reference is lost, so this test would catch it: {r:?}"
+    );
+}

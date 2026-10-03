@@ -15,7 +15,9 @@ use cowfs_vfs::Vfs;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// The snapshot namespace a daemon serves.
 pub trait Snapshots: Send + Sync + fmt::Debug {
@@ -79,6 +81,19 @@ pub trait Backend: Send + Sync + fmt::Debug {
         Ok(None)
     }
 
+    /// One garbage-collection cycle, or `None` when the backend has no block store to collect.
+    ///
+    /// `progress` returns false to ask the cycle to stop, and `cancelled` is polled while the cycle
+    /// is quiet, so a cancel does not wait for the next event. A dry run changes nothing.
+    fn collect_garbage(
+        &self,
+        _dry_run: bool,
+        _progress: GcProgress<'_>,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> CtlResult<Option<GcOutcome>> {
+        Ok(None)
+    }
+
     /// Ingests `from` as a new snapshot `name` through the backend's own writer, then verifies it
     /// byte for byte and only then makes the name visible. `None` when this backend has no writer
     /// for a directory, which is the passthrough backend: it copies the directory itself instead.
@@ -91,6 +106,21 @@ pub trait Backend: Send + Sync + fmt::Debug {
         Ok(None)
     }
 }
+
+/// What one garbage-collection cycle did, with the block counts around it.
+#[derive(Clone, Debug)]
+pub struct GcOutcome {
+    /// What the collector reported.
+    pub report: cowfs_gc::GcReport,
+    /// Blocks the store held before the cycle.
+    pub blocks_before: u64,
+    /// Blocks the store held after it.
+    pub blocks_after: u64,
+}
+
+/// What one garbage-collection cycle is told by its caller: `progress` gets every event and says
+/// whether to go on, `cancelled` is polled between events.
+pub type GcProgress<'a> = &'a mut dyn FnMut(&cowfs_gc::Progress) -> bool;
 
 /// What a block store holds, for `status`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +145,42 @@ pub struct CoreBackend {
     core: CoreSlot,
     snaps: CoreSnapshots,
     store: PathBuf,
+    gc_opts: cowfs_gc::Options,
+    gc: GcSlot,
+}
+
+/// The one running collection, so `close` can stop it and wait for it before it takes the core.
+#[derive(Default)]
+struct GcSlot {
+    state: Mutex<GcState>,
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct GcState {
+    running: bool,
+    closing: bool,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+/// Marks the collection finished, whatever way it ends. Declared before the collector's `Core`
+/// clone is moved away, so the clone is gone by the time `close` is woken.
+struct GcRun<'a>(&'a GcSlot);
+
+impl Drop for GcRun<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        g.running = false;
+        g.cancel = None;
+        self.0.idle.notify_all();
+    }
+}
+
+/// How long `close` waits for a cancelled collection to stop.
+const GC_STOP_PATIENCE: Duration = Duration::from_secs(120);
+
+fn gc_error(e: cowfs_gc::Error) -> CtlError {
+    CtlError::new(ErrorCode::IoError, format!("garbage collection: {e}"))
 }
 
 impl fmt::Debug for CoreBackend {
@@ -132,6 +198,15 @@ impl CoreBackend {
     /// durable. That refusal is surfaced as it stands: the loss is not acknowledged for the
     /// operator, because accepting it is their decision.
     pub fn open(store: impl AsRef<Path>, opts: cowfs_core::Options) -> io::Result<Self> {
+        Self::open_with_gc(store, opts, cowfs_gc::Options::default())
+    }
+
+    /// Like [`CoreBackend::open`], with the collector's thresholds chosen by the caller.
+    pub fn open_with_gc(
+        store: impl AsRef<Path>,
+        opts: cowfs_core::Options,
+        gc_opts: cowfs_gc::Options,
+    ) -> io::Result<Self> {
         let store = store.as_ref().to_owned();
         let core = Arc::new(Mutex::new(Some(Core::open(&store, opts).map_err(|e| {
             io::Error::other(format!(
@@ -147,6 +222,68 @@ impl CoreBackend {
             },
             core,
             store,
+            gc_opts,
+            gc: GcSlot::default(),
+        })
+    }
+
+    fn run_gc(
+        &self,
+        core: Core,
+        cancel: &AtomicBool,
+        dry_run: bool,
+        progress: GcProgress<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> CtlResult<GcOutcome> {
+        let blocks_before = core.store().stats().blocks;
+        let collector = core
+            .collector(cowfs_gc::Options {
+                dry_run,
+                ..self.gc_opts
+            })
+            .map_err(gc_error)?;
+        let (tx, rx) = mpsc::channel::<cowfs_gc::Progress>();
+        collector.gc().set_progress(move |p| {
+            let _ = tx.send(*p);
+        });
+        progress(&cowfs_gc::Progress::default());
+        let report = std::thread::scope(|s| {
+            let worker = s.spawn(|| collector.collect());
+            let mut stopping = false;
+            loop {
+                if !stopping && (cancelled() || cancel.load(Ordering::Acquire)) {
+                    collector.gc().cancel();
+                    stopping = true;
+                }
+                if let Ok(p) = rx.recv_timeout(Duration::from_millis(50)) {
+                    if !progress(&p) && !stopping {
+                        collector.gc().cancel();
+                        stopping = true;
+                    }
+                }
+                if worker.is_finished() {
+                    break;
+                }
+            }
+            while let Ok(p) = rx.try_recv() {
+                progress(&p);
+            }
+            worker.join()
+        });
+        let report = match report {
+            Ok(r) => r.map_err(gc_error)?,
+            Err(_) => {
+                return Err(CtlError::new(
+                    ErrorCode::IoError,
+                    "garbage collection: the collector panicked",
+                ))
+            }
+        };
+        let blocks_after = core.store().stats().blocks;
+        Ok(GcOutcome {
+            report,
+            blocks_before,
+            blocks_after,
         })
     }
 }
@@ -346,6 +483,37 @@ impl Backend for CoreBackend {
         out.map(Some)
     }
 
+    fn collect_garbage(
+        &self,
+        dry_run: bool,
+        progress: GcProgress<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> CtlResult<Option<GcOutcome>> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut g = self.gc.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if g.closing {
+                return Err(CtlError::new(ErrorCode::Busy, "the daemon is shutting down"));
+            }
+            if g.running {
+                return Err(CtlError::new(
+                    ErrorCode::Busy,
+                    "a garbage collection is already running",
+                ));
+            }
+            g.running = true;
+            g.cancel = Some(Arc::clone(&cancel));
+        }
+        let _run = GcRun(&self.gc);
+        // A clone, so the slot lock is not held for the length of a sweep. It is moved into
+        // `run_gc` and dropped there, before `GcRun` wakes a waiting `close`. It is taken after the
+        // registration above, so a `close` that does not see this run cannot take the core first.
+        let core = with_core(&self.core, |c| Ok(c.clone()))
+            .map_err(|e| CtlError::new(ErrorCode::IoError, e.to_string()))?;
+        self.run_gc(core, &cancel, dry_run, progress, cancelled)
+            .map(Some)
+    }
+
     fn fsck(&self) -> io::Result<Option<cowfs_store::FsckReport>> {
         with_core(&self.core, |c| {
             c.fsck()
@@ -355,6 +523,27 @@ impl Backend for CoreBackend {
     }
 
     fn close(&self) -> io::Result<()> {
+        {
+            let mut g = self.gc.state.lock().unwrap_or_else(PoisonError::into_inner);
+            g.closing = true;
+            if let Some(c) = &g.cancel {
+                c.store(true, Ordering::Release);
+            }
+            let deadline = Instant::now() + GC_STOP_PATIENCE;
+            while g.running {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other(
+                        "a garbage collection did not stop when it was asked to",
+                    ));
+                }
+                g = self
+                    .gc
+                    .idle
+                    .wait_timeout(g, Duration::from_secs(1))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
         let taken = self
             .core
             .lock()

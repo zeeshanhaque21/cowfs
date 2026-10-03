@@ -8,6 +8,8 @@ mod blocks;
 mod dcache;
 mod error;
 mod file;
+mod gate;
+mod gc;
 mod import;
 mod inner;
 mod ino;
@@ -36,6 +38,7 @@ use cowfs_vfs::{Error, Ino, Timestamp};
 use crate::blocks::Blocks;
 use crate::dcache::DCache;
 use crate::error::{from_io, from_meta, from_store};
+use crate::gate::Gate;
 use crate::inner::{Counters, Inner, Snaps};
 use crate::ino::{pack, Aliases, MAX_SNAP};
 use crate::queue::SnapCtx;
@@ -44,6 +47,7 @@ use crate::util::{MutexExt, RwExt, ShardMap};
 /// Test seams for the durability calls the design argument depends on. Not a stable API.
 #[doc(hidden)]
 pub mod fsops;
+pub use crate::gc::{Collector, CoreRoots};
 pub use crate::import::{ingest, Hooks, ImportError, Ingested};
 pub use crate::inner::{FileHealth, Health, LaneHealth};
 pub use crate::inner::{Options, Stats};
@@ -223,6 +227,7 @@ impl Core {
         let inner = Arc::new(Inner {
             meta,
             blocks: Blocks::new(store, opts.block_cache_bytes),
+            gate: Arc::new(Gate::new()),
             snaps: RwLock::new(Snaps::default()),
             nodes: ShardMap::new(),
             dents: DCache::new(opts.dentry_cache),
@@ -474,6 +479,19 @@ impl Core {
     #[doc(hidden)]
     pub fn set_load_node_contention(&self, ino: Ino, tries: usize) {
         *self.inner.load_node_contention.lk() = (tries > 0).then_some((ino, tries));
+    }
+
+    /// Test seam: 1 makes the collector's barrier succeed without closing the reference gate, which
+    /// is the negative control for the barrier. 0 restores it. Never set outside `tests/`.
+    #[doc(hidden)]
+    pub fn set_gate_fault(&self, kind: u8) {
+        self.inner.gate.set_fault(kind);
+    }
+
+    /// Test seam: threads parked at the reference gate right now.
+    #[doc(hidden)]
+    pub fn gate_waiters(&self) -> usize {
+        self.inner.gate.waiting()
     }
 
     /// Test seam: make the next `times` flushes of `ino` fail, `kind` 1 transient (out of space),

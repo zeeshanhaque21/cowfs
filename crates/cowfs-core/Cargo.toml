@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 cowfs-store = { path = "../cowfs-store" }
+cowfs-gc = { path = "../cowfs-gc" }
 cowfs-meta = { path = "../cowfs-meta" }
 cowfs-vfs = { path = "../cowfs-vfs" }
 fs2 = "0.4"

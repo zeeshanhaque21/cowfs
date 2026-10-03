@@ -115,8 +115,13 @@ impl Inner {
                     q.touch(&node);
                 }
             }
-            if after >= self.opts.file_flush_bytes {
-                if let Err(e) = self.flush_locked(&sc, &node, &mut st) {
+            // A node lock is held, so this must not park at the gate: with a barrier held the
+            // bytes stay dirty and the next write or the background flusher stores them.
+            let entry = (after >= self.opts.file_flush_bytes)
+                .then(|| self.gate.try_enter())
+                .flatten();
+            if let Some(entry) = entry {
+                if let Err(e) = self.flush_locked(&sc, &node, &mut st, &entry) {
                     // the write is reported as failed either way; only a corruption is permanent
                     let err = if Node::classify(&e) {
                         let err = node.poison(format!("{e} (file {ino:#x})"));
@@ -165,8 +170,11 @@ impl Inner {
             SetTime::Now => now,
             SetTime::At(x) => x,
         };
+        // truncating stores chunks, so the gate is entered before the node lock is taken
+        let entry = ch.size.map(|size| (size, self.gate.enter()));
         let mut st = node.st.wr();
-        if let Some(size) = ch.size {
+        if let Some((size, entry)) = &entry {
+            let size = *size;
             let cur = st.attr.size;
             let NodeState { attr, file, .. } = &mut *st;
             let Some(f) = file.as_mut() else {
@@ -174,9 +182,9 @@ impl Inner {
             };
             if size < cur {
                 let n0 = f.dirty_bytes();
-                f.flush(&self.blocks)?;
+                f.flush(&self.blocks, entry)?;
                 self.dirty_bytes.fetch_sub(n0, Ordering::AcqRel);
-                f.truncate(&self.blocks, size)?;
+                f.truncate(&self.blocks, entry, size)?;
             }
             attr.size = size;
             attr.mtime = now;

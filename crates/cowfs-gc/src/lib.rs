@@ -391,6 +391,7 @@ impl Gc {
                 }
                 r.candidates += 1;
                 r.candidate_bytes += plan.record_bytes();
+                r.candidate_dead_bytes += plan.dead_bytes;
                 // A hint only orders the work. Coldest first, so a run that gets cut short
                 // reclaims cold bytes.
                 let cold = hints.coldness(&ids, plan.live_bytes);
