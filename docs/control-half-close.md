@@ -35,5 +35,10 @@ The changed body was restored afterwards.
 cargo test --locked -p cowfs-ctl --lib terminal_write
 ```
 
-Full crate tests, clippy, repeated changed socket regression, and independent review remain pending at this WIP checkpoint.
+Full `cargo test --locked -p cowfs-ctl` passed 86 tests across six test binaries.
+`cargo clippy --locked -p cowfs-ctl --all-targets -- -D warnings` passed.
+`cargo fmt --all -- --check` passed.
+The changed real socket regression passed 100 consecutive runs through the compiled regression binary.
+The direct-binary repetition excludes Cargo startup overhead but exercises the identical test and server/client path.
+Independent review remains pending at this checkpoint.
 No shared daemon, mount, store, active lease, or runner was restarted or modified by these tests.
