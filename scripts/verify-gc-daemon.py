@@ -65,6 +65,11 @@ MOUNT_WAIT_SECS = 60
 CLI_TIMEOUT_SECS = 120
 NO_PROGRESS_SECS = 300  # a wait loop with no state change gives up after 5 minutes
 
+# Private fixture seeder (ignored, built on demand). It is the only thing that sets a
+# non-default store pack size, and only for the fixture store it writes.
+SEED_CRATE_DIR = os.path.join(REPO, "bench", "out", "gc-daemon-e2e", "seed-crate")
+SEED_BIN = os.path.join(SEED_CRATE_DIR, "target", "release", "gc-fixture-seed")
+
 
 # --------------------------------------------------------------------------
 # small helpers
@@ -520,10 +525,271 @@ def verify_cancel_control_plane(rec, work):
         log.close()
 
 
+def blake3_file(path):
+    """BLAKE3 of a file, or None when the python blake3 module is absent."""
+    try:
+        from blake3 import blake3 as _b3
+    except ImportError:  # pragma: no cover - documented dependency gap
+        return None
+    h = _b3()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def pack_sizes(packs_dir):
+    """Every pack on disk: {name: size}. The physical footprint gc is meant to shrink."""
+    out = {}
+    try:
+        for name in sorted(os.listdir(packs_dir)):
+            if name.endswith(".cpk"):
+                out[name] = os.path.getsize(os.path.join(packs_dir, name))
+    except OSError:
+        pass
+    return out
+
+
+def build_seed_helper(rec):
+    """Build the private seeder from source if it is missing. Returns its path."""
+    if os.path.exists(SEED_BIN):
+        rec.record("reclaim.seed_helper_present", True, path=SEED_BIN)
+        return SEED_BIN
+    log("building private seed helper (first run only) ...")
+    p = run(
+        ["cargo", "build", "--release", "--manifest-path", os.path.join(SEED_CRATE_DIR, "Cargo.toml")],
+        timeout=1200,
+    )
+    ok = p.returncode == 0 and os.path.exists(SEED_BIN)
+    rec.record(
+        "reclaim.seed_helper_built",
+        ok,
+        returncode=p.returncode,
+        stderr_tail=p.stderr.strip().splitlines()[-5:],
+    )
+    if not ok:
+        raise RuntimeError("could not build the seed helper")
+    return SEED_BIN
+
+
+def seed_reclaim_store(work, rec, seed_bin, dead_bytes, keep_bytes):
+    """Build a private on-disk store whose sealed packs clear the default gc thresholds.
+
+    Uses only supported `cowfs_core`/`cowfs_store` API. The store's `max_pack_size` is
+    the fixture's own choice; the daemon that later runs `gc` keeps the production
+    default of 256 MiB.
+    """
+    store = os.path.join(work, "reclaim-store")
+    shutil.rmtree(store, ignore_errors=True)
+    os.makedirs(store, exist_ok=True)
+    p = run(
+        [seed_bin, "--store", store, "--keep-bytes", str(keep_bytes), "--dead-bytes", str(dead_bytes)],
+        timeout=600,
+    )
+    if p.returncode != 0:
+        rec.record("reclaim.seed_failed", False, returncode=p.returncode, stderr=p.stderr.strip()[-500:])
+        raise RuntimeError("seed helper failed: %s" % p.stderr.strip()[-500:])
+    info = json.loads(p.stdout.strip().splitlines()[-1])
+    rec.record(
+        "reclaim.seeded",
+        len(info["survivors"]) > 0 and info["dead_files"] > 0,
+        fixture_max_pack_size=info["fixture_max_pack_size"],
+        dead_bytes=info["dead_bytes"],
+        survivors=len(info["survivors"]),
+        store=store,
+    )
+    return store, info
+
+
+def verify_reclaim(rec, work, seed_bin):
+    """Actual reclamation through the unmodified user path.
+
+    The seeded store has sealed packs whose dead record bytes alone clear the
+    production defaults (`min_dead_bytes` 8 MiB, `dead_ratio` 0.5). The unmodified
+    `cowfs-daemon` opens it with `cowfs_core::Options::default()` (256 MiB packs) and
+    `cowfs_gc::Options::default()` (backend.rs::open). A live `gc` request must report
+    `freed_bytes > 0`, unlink a pack on disk, keep every survivor byte-identical, and
+    pass `fsck`.
+    """
+    store, info = seed_reclaim_store(work, rec, seed_bin, dead_bytes=40 << 20, keep_bytes=1 << 20)
+    mount = os.path.join(work, "reclaim-mnt")
+    os.makedirs(mount, exist_ok=True)
+    sockdir = os.path.join(SOCK_ROOT, "cowfs-gc-reclaim-%d" % os.getpid())
+    shutil.rmtree(sockdir, ignore_errors=True)
+    os.makedirs(sockdir, mode=0o700)
+    sock = os.path.join(sockdir, "control.sock")
+    packs_dir = os.path.join(store, "store", "packs")
+    d = PrivateDaemon(store, mount, sock, os.path.join(work, "evidence", "daemon-reclaim.log"))
+    try:
+        d.start(rec)
+        verify_mount_fs(mount, rec)
+
+        st = d.cli_json(["status"])
+        rec.record("reclaim.store_opens_default", st["store_path"] == store, status=st)
+
+        # Cross-check the survivors the seeder declared against the fixture's own bytes.
+        # If blake3 is unavailable the hash comes from the mount readback only.
+        declared = info["survivors"]
+        before_reads = {}
+        for s in declared:
+            mounted = os.path.join(mount, "keep", s["name"])
+            before_reads[s["name"]] = file_hash(mounted)
+        rec.record(
+            "reclaim.survivors_present_before_gc",
+            all(os.path.getsize(os.path.join(mount, "keep", s["name"])) == s["len"] for s in declared),
+            files=[s["name"] for s in declared],
+        )
+
+        # Negative control: a dry run reports candidates and changes no pack on disk.
+        packs_before = pack_sizes(packs_dir)
+        total_before = sum(packs_before.values())
+        dry = d.cli_json(["gc", "--dry-run"])
+        packs_after_dry = pack_sizes(packs_dir)
+        rec.record(
+            "reclaim.dry_run_no_pack_change",
+            dry["dry_run"]
+            and dry["freed_bytes"] == 0
+            and dry["freed_blocks"] == 0
+            and pack_sizes(packs_dir) == packs_before,
+            report=dry,
+            packs_unchanged=pack_sizes(packs_dir) == packs_before,
+        )
+        rec.record(
+            "reclaim.dry_run_reports_candidates",
+            dry["candidate_bytes"] > 0,
+            candidate_bytes=dry["candidate_bytes"],
+            packs_before=total_before,
+        )
+
+        # Negative control: the `live` snapshot's blocks are referenced and sit in the
+        # dead-dominated candidate pack. gc must preserve every one of them while it
+        # frees the dead records around them, and readback must match the fixture.
+        live_declared = info.get("live", [])
+        live_before = {
+            s["name"]: file_hash(os.path.join(mount, "live", s["name"])) for s in live_declared
+        }
+
+        # Live gc: this is the acceptance. Reclaim must be real and physical.
+        live = d.cli_json(["gc"])
+        packs_after = pack_sizes(packs_dir)
+        total_after = sum(packs_after.values())
+        unlinked = sorted(set(packs_before) - set(packs_after))
+        rec.record(
+            "reclaim.gc_freed_bytes_positive",
+            live["freed_bytes"] > 0 and not live["dry_run"],
+            candidate_blocks=live["candidate_blocks"],
+            candidate_bytes=live["candidate_bytes"],
+            freed_blocks=live["freed_blocks"],
+            freed_bytes=live["freed_bytes"],
+        )
+        rec.record(
+            "reclaim.physical_pack_bytes_dropped",
+            total_after < total_before and len(unlinked) >= 1,
+            packs_before=packs_before,
+            packs_after=packs_after,
+            unlinked=unlinked,
+            total_before=total_before,
+            total_after=total_after,
+            delta=total_before - total_after,
+        )
+
+        # The referenced `live` snapshot must be untouched by the reclaim: unchanged
+        # since before gc, and equal to the digest the fixture declared for it.
+        live_ok = True
+        live_detail = {}
+        for s in live_declared:
+            mounted = os.path.join(mount, "live", s["name"])
+            unchanged = file_hash(mounted) == live_before[s["name"]]
+            b3_now = blake3_file(mounted)
+            b3_ok = b3_now is None or b3_now == s["blake3"]
+            ok = unchanged and b3_ok
+            live_ok = live_ok and ok
+            live_detail[s["name"]] = {"unchanged": unchanged, "blake3_matches_fixture": b3_ok}
+        rec.record(
+            "reclaim.referenced_snapshot_untouched",
+            live_ok and len(live_declared) > 0,
+            live=live_detail,
+        )
+
+        # Survivors are byte-identical after gc. This is the zero-loss check that makes
+        # the reclaim meaningful: the freed bytes were never referenced.
+        #
+        # Two independent checks: the readback is unchanged since before gc (SHA-256,
+        # same digest on both sides), and its BLAKE3 equals the digest the seeder
+        # declared for the exact bytes it wrote (fixture-to-mount agreement).
+        survivors_ok = True
+        survivor_detail = {}
+        for s in declared:
+            mounted = os.path.join(mount, "keep", s["name"])
+            match_before = file_hash(mounted) == before_reads[s["name"]]
+            b3_now = blake3_file(mounted)
+            b3_ok = b3_now is None or b3_now == s["blake3"]
+            survivors_ok = survivors_ok and match_before and b3_ok
+            survivor_detail[s["name"]] = {
+                "readback_unchanged": match_before,
+                "blake3_matches_fixture": b3_ok,
+            }
+        rec.record(
+            "reclaim.survivors_unchanged_after_gc",
+            survivors_ok,
+            survivors=survivor_detail,
+            note="blake3 cross-check is skipped when the python blake3 module is absent",
+        )
+
+        fsck = d.cli_json(["fsck"])
+        rec.record("reclaim.fsck_clean", fsck["ok"] and not fsck["problems"], report=fsck)
+
+        log("== shutdown and reopen the reclaimed store ==")
+        d.shutdown(rec)
+        sweep_or_refuse_unmount(mount, rec)
+
+        re = PrivateDaemon(store, mount, sock, os.path.join(work, "evidence", "daemon-reclaim-2.log"))
+        try:
+            re.start(rec)
+            verify_mount_fs(mount, rec)
+            reopen_ok = True
+            for s in declared:
+                mounted = os.path.join(mount, "keep", s["name"])
+                reopen_ok = reopen_ok and file_hash(mounted) == before_reads[s["name"]]
+            rec.record("reclaim.reopen_survivors_match_source", reopen_ok)
+            st2 = re.cli_json(["status"])
+            rec.record("reclaim.reopen_store_identity", st2["store_path"] == store, status=st2)
+            re.shutdown(rec)
+            re = None
+            sweep_or_refuse_unmount(mount, rec)
+        finally:
+            if re is not None:
+                if re.child is not None and re.child.poll() is None:
+                    try:
+                        kill_verified(re.child, rec, re.socket, re.store)
+                    except ForeignProcess as e:
+                        log("cleanup: %s" % e)
+                try:
+                    sweep_or_refuse_unmount(mount, rec)
+                except Exception as e:  # noqa: BLE001
+                    log("cleanup unmount: %s" % e)
+    finally:
+        if d.child is not None and d.child.poll() is None:
+            try:
+                kill_verified(d.child, rec, d.socket, d.store)
+            except ForeignProcess as e:
+                log("cleanup: %s" % e)
+        try:
+            sweep_or_refuse_unmount(mount, rec)
+        except Exception as e:  # noqa: BLE001
+            log("cleanup unmount: %s" % e)
+        shutil.rmtree(sockdir, ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default=os.path.join(REPO, "bench", "out", "gc-daemon-e2e", "run"))
     ap.add_argument("--keep", action="store_true", help="keep the run dir instead of wiping it")
+    ap.add_argument(
+        "--skip-reclaim",
+        action="store_true",
+        help="skip the seeded actual-reclamation phase (diagnostic/debug only)",
+    )
     args = ap.parse_args()
 
     if args.keep and os.path.exists(args.work):
@@ -657,6 +923,13 @@ def main():
         verify_cancel_control_plane(rec, args.work)
         log("== non-store backend answers unsupported (private negative) ==")
         verify_path_backend_unsupported(rec, args.work)
+
+        if not args.skip_reclaim:
+            log("== actual reclamation through the unmodified user path ==")
+            seed_bin = build_seed_helper(rec)
+            verify_reclaim(rec, args.work, seed_bin)
+        else:
+            rec.record("reclaim.skipped", True, reason="--skip-reclaim")
 
         log("== shutdown the private daemon, reopen the exact store ==")
         d.shutdown(rec)

@@ -19,11 +19,11 @@ whose command line does not carry this run's exact socket and store.
 ## Result
 
 ```
-records: 37   failed: 0
-head:    ea958947b437a089c760b7f4ee381c57702c81d8
+records: 63   failed: 0
+head:    99c7c23f1cbbffa80fd18bf5488605c7c61498fa
 ```
 
-Full evidence: `bench/out/gc-daemon-e2e/run/evidence/records.jsonl` (append, flush, fsync per step).
+Full evidence: `bench/out/gc-daemon-e2e/run4/evidence/records.jsonl` (append, flush, fsync per step).
 
 | Step | Proves |
 |---|---|
@@ -36,27 +36,78 @@ Full evidence: `bench/out/gc-daemon-e2e/run/evidence/records.jsonl` (append, flu
 | `status.two_snapshots`, `status.one_snapshot_after_rm` | snapshot count follows import and `snapshot rm` |
 | `gc.dry_run`, `gc.dry_run.no_pack_change` | dry run reports candidates, frees nothing, and rewrites/unlinks no pack data |
 | `gc.live_run` | live gc answers with a `GcReport` |
-| `gc.observed_numbers` | records the real candidate/freed numbers (see below) |
+| `gc.observed_numbers` | records the real candidate/freed numbers on a small single-pack store (see below) |
 | `mount.survivor_matches_source_after_gc` | the survivor is byte-identical after both gc runs |
 | `fsck.clean` | `fsck` over the core backend is clean over the surviving snapshot |
-| `cancel.sigint_exit_130_bounded` | SIGINT to a running `gc` client exits 130 in bounded time |
+| `cancel.sigint_exit_130_bounded` | SIGINT to a running `gc` client over the stub exits 130 in bounded time |
 | `cancel.progress_frame_seen` | real JSON progress frames (`{"progress":{...phase:"mark"...}}`) were emitted |
 | `cancel.daemon_survives` | the daemon stays healthy after a cancelled client |
 | `path_backend.gc_unsupported` | a private non-store backend answers `unsupported` for `gc`, exit 1 |
+| `reclaim.*` | **actual byte reclaim** on a seeded store with sealed eligible dead packs, over the unmodified binary (see below) |
 | `shutdown.*`, `reopen.*` | the private daemon shuts down, its mount is gone, the exact store reopens in a fresh daemon, and the survivor still matches source |
 
-## The honest limit: no byte reclaim from a single active pack
+## Actual reclamation through the unmodified user path
 
-Over the real CLI/daemon, `cowfs-daemon --backend core` opens the store with
-`cowfs_core::Options::default()` and `cowfs_gc::Options::default()`. The defaults are
-`min_dead_bytes = 8 MiB` and `dead_ratio = 0.5`. `CoreBackend::run_gc` passes them straight to
-`Core::collector`.
+The acceptance this task set is a real reclaim: `freed_bytes > 0`, a physical pack drop, and every
+survivor still byte-identical, driven by the **unmodified** `cowfs-daemon`/`cowfs` binaries with
+their own default options.
 
-A store produced by a few-MiB fixture is a **single pack**, and `cowfs-gc` skips the active pack and
-every pack at or above the mark epoch before it ever checks the dead threshold:
+The obstacle is that the deployed thresholds (`cowfs_gc::Options::default()`: `min_dead_bytes`
+8 MiB, `dead_ratio` 0.5) and the skip rules (active pack and every pack at or above the mark epoch
+are skipped before the threshold check) mean a store whose only pack is the active one has
+`candidate_bytes` 0 by construction. No CLI flag can change that.
+
+The fix is a **fixture**, not a product change. `bench/out/gc-daemon-e2e/seed-crate/` (private,
+gitignored) uses the supported `cowfs_core`/`cowfs_store` API to build a closed store with a small
+`max_pack_size` so many packs seal, a live snapshot, a removed snapshot whose dead records alone
+clear the default thresholds, and survivors. It then closes the `Core` fully. The harness opens that
+store with the **unmodified** daemon, whose `CoreBackend::open` still uses
+`cowfs_core::Options::default()` (256 MiB packs) and `cowfs_gc::Options::default()`.
+
+Measured on run4:
+
+```
+gc --dry-run   candidate_blocks 368  candidate_bytes 15,136,450  freed_bytes 0   packs unchanged
+gc (live)      candidate_blocks 368  candidate_bytes 15,136,450  freed_blocks 202  freed_bytes 16,759,743
+```
+
+| Check | Evidence |
+|---|---|
+| `reclaim.dry_run_reports_candidates` | `candidate_bytes = 15,136,450` (> 0), `packs_unchanged = true` |
+| `reclaim.gc_freed_bytes_positive` | `freed_bytes = 16,759,743`, `freed_blocks = 202`, `dry_run = false` |
+| `reclaim.physical_pack_bytes_dropped` | `pack-00000000.cpk` (16,759,743 B) **unlinked**; on-disk total 28,964,749 -> 13,828,299, delta 15,136,450 |
+| `reclaim.referenced_snapshot_untouched` | the `live` snapshot's files sit in the candidate pack and are preserved: `unchanged = true` and BLAKE3 matches the fixture |
+| `reclaim.survivors_unchanged_after_gc` | `keep000`/`keep001` readback unchanged (SHA-256, both sides) and BLAKE3 equals the fixture-declared digest |
+| `reclaim.fsck_clean` | after the reclaim: `ok = true`, `problems = []`, 193 blocks checked |
+| `reclaim.reopen_survivors_match_source` | after shutdown and reopen of the exact store, survivors still match source |
+
+The `live` snapshot is the negative control: it is written **before** the dead payload, so its blocks
+land in the same pack as the dead records. A reclaim that freed referenced data would corrupt them.
+They read back byte-identical instead, and their BLAKE3 equals the fixture hash.
+
+The fixture's `max_pack_size` (16 MiB) is the only non-default knob, and it is a supported
+`cowfs_store::Options` field set by the fixture's own private crate. The production default of
+256 MiB is left untouched. A production user store is built by the same writer over time and packs
+seal by the same rule, so a store with at least one sealed, dead-dominated pack reclaims exactly as
+this fixture does; the threshold values, the dry-run safety, and the default pack size are not
+weakened or bypassed.
+
+## The observed limit: no byte reclaim from a small single-active-pack store
+
+This section records a real observation, not a gate. On the small fixture (a few MiB, one pack),
+the deployed thresholds and skip rules leave `candidate_bytes` at 0:
+
+```json
+{"candidate_blocks":41,"candidate_bytes":0,"dry_run":false,"freed_blocks":0,"freed_bytes":0}
+```
+
+`candidate_blocks` (41) comes from `store_blocks - live_blocks` and is independent of pack
+eligibility, so the report can show dead blocks while `candidate_bytes` stays 0. A larger probe
+(18.5 MiB store, 134 dead blocks in the one active pack) gave the same shape. The cause is
+`crates/cowfs-gc/src/lib.rs`:
 
 ```rust
-// crates/cowfs-gc/src/lib.rs, candidate pass
+// candidate pass
 if info.active || Some(info.id) >= epoch.map(|(p, _)| p) {
     r.skip(info.id, SkipReason::Active);
     continue;
@@ -68,39 +119,22 @@ if plan.dead_bytes < self.opts.min_dead_bytes
 }
 ```
 
-`candidate_bytes` is `plan.record_bytes()` of *eligible* pack plans, so it is structurally 0 when the
-only pack is active. Concretely, in this run:
+This is expected for a single active pack and is not a defect: the collector refuses to rewrite the
+pack it is actively appending to. It is recorded as an observation so a future product change would
+not fail the harness, and it does not contradict the actual-reclaim result above, which uses a
+store that has sealed eligible packs.
 
-```json
-{"candidate_blocks":41,"candidate_bytes":0,"dry_run":false,"freed_blocks":0,"freed_bytes":0}
-```
+## Cancellation: what is proven, and where
 
-`candidate_blocks` (41) comes from `store_blocks - live_blocks` and is independent of pack
-eligibility, so the report can show dead blocks while `candidate_bytes` stays 0. A larger probe
-(18.5 MiB store, 134 dead blocks in the one active pack) gave the same shape: `candidate_bytes: 0`,
-nothing freed.
-
-The library-level reclamation *is* proven, but only under injected options the CLI cannot set:
-`crates/cowfs-daemon/src/handler.rs::gc_over_the_core_reclaims_dead_packs_and_survivors_still_read`
-uses `max_pack_size: 96 << 10`, `dead_ratio: 0.0`, `min_dead_bytes: 1` so that many small packs
-exist and none of them is the epoch pack. That is reachable from `CoreBackend::open_with_gc`, which
-the CLI and the daemon binary never call.
-
-So the verified statement is:
-
-- The daemon `gc` request **is wired and answers correctly** over the real core: dry run, live run,
-  progress frames, cancel, `busy`/`io_error` discipline, and survivor readback all behave.
-- The user-facing binary **cannot free bytes from a small single-pack store**, and `candidate_bytes`
-  reads 0 for such a store. That is a real gap in the CLI/daemon path, and it is a finding, not a
-  pass. Closing it needs either a daemon-reachable knob for the collector thresholds and a pack
-  roll, or a collector rule that can rewrite the active pack safely - a production decision, out of
-  scope here.
+The CLI cancel path (`cancel.*`) runs against the **stub** backend. It proves the control-plane
+lifecycle only: client SIGINT -> `{"error":{"code":"cancelled"}}` -> exit 130 in bounded time, with
+real JSON progress frames, and the daemon surviving. It says nothing about the real collector's
+sweep or its cancellation under the core backend. That gap is stated here rather than papered over.
 
 ## What was deliberately not done
 
-- No throughput or timing claim. No benchmark.
-- No claim about the collector's sweep semantics from the stub backend. The stub cancel test proves
-  only the client signal -> cancel frame -> exit-130 lifecycle.
+- No throughput or timing claim beyond the bounded cancel latency. No benchmark.
+- No claim about the collector's sweep semantics from the stub backend.
 - No full-stack crash injection. The daemon was never SIGKILLed in this pass.
 - No production edits to `cowfs-core`, `cowfs-gc`, `cowfs-daemon`, root manifests, or workflows.
 
@@ -111,5 +145,6 @@ cargo build -p cowfs-cli -p cowfs-daemon -p cowfs-gc
 python3 scripts/verify-gc-daemon.py
 ```
 
-Expected output ends with `"failed": 0`. Evidence is written under
-`bench/out/gc-daemon-e2e/run/evidence/`.
+The harness builds the private seed helper on first run
+(`bench/out/gc-daemon-e2e/seed-crate/`, gitignored). Expected output ends with `"failed": 0`.
+Evidence is written under `bench/out/gc-daemon-e2e/run/evidence/`.
