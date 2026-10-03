@@ -12,8 +12,10 @@ exits 3 with no comparison printed. A file needs exactly one valid meta record b
 its first rep, whose counts.big_bytes is an integer multiple of 1 MiB, at least 1 MiB,
 and equal to the value its scale implies when the meta records a scale, and at least
 one rep. Every rep, whatever its gate, needs a recognised gate, an integer rep index,
-a finite non-bool wall_s, and numeric non-bool load1_before and load1_after (NaN is
-allowed, it is what the harness writes when getloadavg fails; Infinity is not). Every
+a finite non-bool non-negative wall_s, and a load1_before and load1_after that are
+numeric, non-bool, and either NaN (what the harness writes when getloadavg fails) or
+finite and non-negative. Infinity, -Infinity and finite negative values are all
+refused, in every input slot. Every
 g5 rep additionally needs integer (not bool, not float) bytes, written_bytes and
 read_bytes that all equal meta big_bytes; the read_matches flag is not consulted. There
 is no legacy exemption: rows with only a flag, and files whose meta or reps break the
@@ -92,7 +94,20 @@ def is_int(v):
 
 
 def is_num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    try:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    except OverflowError:
+        return False
+
+
+def is_nonneg_load(v):
+    """NaN (getloadavg failed) or a finite value >= 0; a number too large for a float is not a load."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isnan(v) or (math.isfinite(v) and v >= 0)
+    except OverflowError:
+        return False
 
 
 def meta_problem(meta):
@@ -172,12 +187,12 @@ def file_problems(path):
                 out.append(f"{path}:{n}: rep gate {row.get('gate')!r} is not one of {GATES}")
             if not is_int(row.get("rep")):
                 out.append(f"{path}:{n}: rep index {row.get('rep')!r} is not an integer")
-            if not is_num(row.get("wall_s")):
-                out.append(f"{path}:{n}: rep wall_s {row.get('wall_s')!r} is missing or not a finite number")
+            if not is_num(row.get("wall_s")) or row["wall_s"] < 0:
+                out.append(f"{path}:{n}: rep wall_s {row.get('wall_s')!r} is missing, not a finite number, or negative")
             for k in ("load1_before", "load1_after"):
                 v = row.get(k)
-                if isinstance(v, bool) or not isinstance(v, (int, float)):
-                    out.append(f"{path}:{n}: rep {k} {v!r} is missing or not a number")
+                if not is_nonneg_load(v):
+                    out.append(f"{path}:{n}: rep {k} {v!r} is missing, not a number, or out of range (NaN or finite >= 0)")
             if row.get("gate") == "g5":
                 g5 += 1
                 why = g5_problem(row, meta_bytes) if meta_bytes is not None else "no valid meta to check against"

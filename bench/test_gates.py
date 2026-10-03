@@ -328,6 +328,13 @@ INVALID = {
     "wall_s bool": [meta(), g1(wall=True)],
     "wall_s string": [meta(), g1(wall="2.0")],
     "wall_s Infinity": [meta(), g1(wall=float("inf"))],
+    "wall_s negative": [meta(), g1(wall=-1.0)],
+    "wall_s negative small": [meta(), g1(wall=-0.5)],
+    "g5 wall_s negative": [meta(), {**rep(), "wall_s": -0.5}],
+    "load1_before -Infinity": [meta(), {**g1(), "load1_before": float("-inf")}],
+    "load1_before negative": [meta(), {**g1(), "load1_before": -5.0}],
+    "load1_after negative": [meta(), {**g1(), "load1_after": -0.5}],
+    "load1 untrusted large int overflows float": [meta(), {**g1(), "load1_before": 10 ** 400}],
     "wall_s missing": [meta(), {k: v for k, v in g1().items() if k != "wall_s"}],
     "load1_before missing": [meta(), {k: v for k, v in g1().items() if k != "load1_before"}],
     "load1_before string": [meta(), {**g1(), "load1_before": "0"}],
@@ -483,6 +490,26 @@ class CompareRefuses(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             f = self.write(d, "a.jsonl", [{"kind": "meta", "counts": {"big_bytes": 21474836}}, rep(21474836, written_bytes=None, read_bytes=None, read_matches=False)])
             self.assertEqual(self.run_compare([f], f)[0], 3)
+
+    def test_nan_load_is_allowed_but_zero_wall_is_unmeasurable(self):
+        nan = float("nan")
+        with tempfile.TemporaryDirectory() as d:
+            ok = self.write(d, "ok.jsonl", [meta(), {**g1(), "load1_before": nan, "load1_after": nan}])
+            self.assertEqual(self.run_compare([ok], ok)[0], 0)
+            zero = self.write(d, "zero.jsonl", [meta(), g1(wall=0.0)])
+            rc, err, out = self.run_compare([zero], zero)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("unmeasurable", out)
+            self.assertNotIn("PASS", out)
+
+    def test_genuine_performance_failure_is_exit_1_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.write(d, "nat.jsonl", [meta()] + [g1(wall=1.0, rep=i) for i in range(3)])
+            cow = self.write(d, "cow.jsonl", [meta()] + [g1(wall=2.0, rep=i) for i in range(3)])
+            rc, err, out = self.run_compare([nat], cow)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("FAIL", out)
+            self.assertNotIn("PASS", out)
 
     def test_gates_writes_scale_into_meta_that_compare_accepts(self):
         with tempfile.TemporaryDirectory() as d:
