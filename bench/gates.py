@@ -78,13 +78,16 @@ def load1() -> float:
         return float("nan")
 
 
+def scaled_bytes(key: str, scale: float) -> int:
+    return max(MIN_BYTES, int(FULL[key] * scale / 100) // UNIT[key] * UNIT[key])
+
+
 def counts() -> dict:
     scale = float(os.environ.get("COWFS_BENCH_SCALE", "100"))
     out = {}
     for key, value in FULL.items():
         if key.endswith("_bytes"):
-            unit = UNIT[key]
-            out[key] = max(MIN_BYTES, int(value * scale / 100) // unit * unit)
+            out[key] = scaled_bytes(key, scale)
         else:
             out[key] = max(10, int(value * scale / 100))
     return out
@@ -213,20 +216,33 @@ class Ctx:
         marker.write_text(want)
 
     def verify_tree(self):
-        """Refuse, never repair: a short fixture file on the cowfs arm may be data loss."""
+        """Refuse, never repair: a short or stray fixture file on the cowfs arm may be data loss.
+
+        Checks the exact entry set and file lengths, not contents: a same-length corruption is not detected,
+        because hashing 100k files on every run would dominate setup.
+        """
         sub = max(1, self.n["small_files"] // SMALL_PER_DIR)
+        fix = f"remove {self.tree}"
+        want_dirs = {f"d{d:03d}" for d in range(SMALL_PER_DIR)}
+        want_small = {f"f{i:05d}" for i in range(sub)}
+        want_large = {f"b{i:03d}" for i in range(self.n["large_files"])}
         try:
-            for d in range(SMALL_PER_DIR):
-                with os.scandir(self.tree / f"d{d:03d}") as it:
-                    sizes = [e.stat().st_size for e in it]
-                if len(sizes) != sub or any(z != SMALL_BYTES for z in sizes):
-                    raise SystemExit(f"tree d{d:03d}: want {sub} files of {SMALL_BYTES} bytes, got {sorted(sizes)[:3]}.. ({len(sizes)} files); remove {self.tree}")
-            for i in range(self.n["large_files"]):
-                size = (self.tree / "big" / f"b{i:03d}").stat().st_size
-                if size != self.n["large_bytes"]:
-                    raise SystemExit(f"tree big/b{i:03d} is {size} bytes, counts() says {self.n['large_bytes']}; remove {self.tree}")
+            with os.scandir(self.tree) as it:
+                top = {e.name for e in it}
+            extra = top - want_dirs - {"big", ".git", ".generated"}
+            if extra or not (want_dirs | {"big"}) <= top:
+                raise SystemExit(f"tree top level differs: stray {sorted(extra)[:3]} missing {sorted((want_dirs | {'big'}) - top)[:3]}; {fix}")
+            for d in sorted(want_dirs):
+                with os.scandir(self.tree / d) as it:
+                    ents = [(e.name, e.is_file(follow_symlinks=False) and e.stat().st_size) for e in it]
+                if {n for n, _ in ents} != want_small or any(z != SMALL_BYTES for _, z in ents):
+                    raise SystemExit(f"tree {d}: want exactly {sub} files of {SMALL_BYTES} bytes, got {sorted(ents)[:3]}.. ({len(ents)} entries); {fix}")
+            with os.scandir(self.tree / "big") as it:
+                big = {e.name: e.is_file(follow_symlinks=False) and e.stat().st_size for e in it}
+            if set(big) != want_large or any(z != self.n["large_bytes"] for z in big.values()):
+                raise SystemExit(f"tree big: want exactly {len(want_large)} files of {self.n['large_bytes']} bytes, got {sorted(big.items())[:3]}.. ({len(big)} entries); {fix}")
         except OSError as e:
-            raise SystemExit(f"tree fixture unreadable: {e}; remove {self.tree}")
+            raise SystemExit(f"tree fixture unreadable: {e}; {fix}")
 
     # --- gates ---------------------------------------------------------------
 
@@ -408,6 +424,7 @@ def meta(root: Path, label: str, reps: int, gates: list, n: dict) -> dict:
         "reps": reps,
         "gates": gates,
         "counts": n,
+        "scale": float(os.environ.get("COWFS_BENCH_SCALE", "100")),
         "corpus_sha": os.environ.get("COWFS_BENCH_CORPUS_SHA", DEFAULT_SHA),
         "cargo_home": ctx_env_cargo_home(),
         "cargo_jobs": os.environ.get("COWFS_BENCH_CARGO_JOBS", "4"),

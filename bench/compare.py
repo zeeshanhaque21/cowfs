@@ -7,11 +7,16 @@ Usage: compare.py --native NATIVE.jsonl [NATIVE2.jsonl ...] --cowfs COWFS.jsonl
 Every rep of every gate is read, not just the median, and the median, min and
 max of the per-rep ratios are printed alongside the rep counts.
 
-Every input file, the noise-floor file included, is checked first. A g5 rep whose
-expected, written and read byte counts are not numerically equal (the read_matches
-flag is not trusted), or that disagrees with the meta counts, makes the whole
-comparison invalid (exit 3): that throughput is of a short read. Pre-fix rows with
-no written/read bytes pass only when read_matches is true and the size is a whole MiB.
+Every input file, the noise-floor file included, is validated first, and any failure
+exits 3 with no comparison printed. A file needs exactly one valid meta record before
+its first rep, whose counts.big_bytes is an integer multiple of 1 MiB, at least 1 MiB,
+and equal to the value its scale implies when the meta records a scale. It needs at
+least one g5 rep, and every g5 rep needs integer (not bool, not float) bytes,
+written_bytes and read_bytes that all equal meta big_bytes. The read_matches flag is
+not consulted. There is no legacy exemption: rows with only a flag, files without a
+meta record, and files without g5 reps are all invalid, so every comparison needs g5.
+This is a byte-accounting check on the harness's own output, not provenance: it cannot
+tell a hand-written but internally consistent file from a real run.
 
 Ratios are refused, not printed, when the machine was too loaded for them to
 mean anything: load1 above 30 on either side, or the two arms more than 2x
@@ -42,6 +47,9 @@ import statistics
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gates  # noqa: E402
+
 RATIO_BAR = 1.5
 LOAD_CEILING = 30.0
 LOAD_SKEW = 2.0
@@ -70,40 +78,85 @@ def is_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def g5_problem(row, meta_bytes):
-    """Why a g5 rep is not a valid read-back, or None. Numbers decide, never the read_matches flag."""
-    m = row.get("metrics", {})
-    exp, wr, rd = m.get("bytes"), m.get("written_bytes"), m.get("read_bytes")
-    if not is_int(exp):
-        return "no integer expected bytes"
-    if meta_bytes is not None and exp != meta_bytes:
-        return f"expected {exp} differs from meta counts big_bytes {meta_bytes}"
-    if wr is None and rd is None:
-        # pre-fix rows: only the flag exists; believable only when the size is a whole number of the old 1 MiB write unit
-        if m.get("read_matches") is True and exp > 0 and exp % (1 << 20) == 0:
-            return None
-        return "legacy row with no written/read bytes and a false or unaligned count"
-    if not (is_int(wr) and is_int(rd)):
-        return "written/read bytes missing or not integers"
-    if not exp == wr == rd:
-        return f"expected {exp} written {wr} read {rd} are not equal"
+def is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def meta_problem(meta):
+    """Why a meta record cannot anchor g5 byte counts, or None."""
+    counts = meta.get("counts")
+    if not isinstance(counts, dict):
+        return "meta has no counts"
+    big = counts.get("big_bytes")
+    unit = gates.UNIT["big_bytes"]
+    if not is_int(big) or big < gates.MIN_BYTES or big % unit:
+        return f"meta counts big_bytes {big!r} is not an integer multiple of {unit} that is at least {gates.MIN_BYTES}"
+    if "scale" in meta:
+        scale = meta["scale"]
+        if not is_num(scale):
+            return f"meta scale {scale!r} is not a finite number"
+        want = gates.scaled_bytes("big_bytes", scale)
+        if big != want:
+            return f"meta scale {scale} implies big_bytes {want}, meta says {big}"
     return None
 
 
-def invalid_reps(path):
+def g5_problem(row, meta_bytes):
+    """Why a g5 rep is not a valid read-back, or None. Integers decide; read_matches is never consulted."""
+    m = row.get("metrics")
+    if not isinstance(m, dict):
+        return "no metrics"
+    got = {k: m.get(k) for k in ("bytes", "written_bytes", "read_bytes")}
+    for k, v in got.items():
+        if not is_int(v):
+            return f"{k} {v!r} is missing or not an integer"
+    if not all(v == meta_bytes for v in got.values()):
+        return f"expected {got['bytes']} written {got['written_bytes']} read {got['read_bytes']} are not all meta big_bytes {meta_bytes}"
+    return None
+
+
+def file_problems(path):
+    """Every reason this result file cannot be trusted for g5, empty list when it can."""
+    try:
+        text = Path(path).read_text()
+    except OSError as e:
+        return [f"{path}: unreadable: {e}"]
+    out = []
     meta_bytes = None
-    bad = []
-    for line in Path(path).read_text().splitlines():
+    metas = 0
+    g5 = 0
+    for n, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
-        row = json.loads(line)
-        if row.get("kind") == "meta":
-            meta_bytes = row.get("counts", {}).get("big_bytes")
-        elif row.get("kind") == "rep" and row.get("gate") == "g5":
-            why = g5_problem(row, meta_bytes)
+        try:
+            row = json.loads(line)
+        except ValueError:
+            out.append(f"{path}:{n}: not JSON")
+            continue
+        kind = row.get("kind") if isinstance(row, dict) else None
+        if kind == "meta":
+            metas += 1
+            if metas > 1:
+                out.append(f"{path}:{n}: more than one meta record")
+                continue
+            why = meta_problem(row)
             if why:
-                bad.append(f"{path}: g5 rep {row.get('rep')}: {why}")
-    return bad
+                out.append(f"{path}:{n}: {why}")
+            else:
+                meta_bytes = row["counts"]["big_bytes"]
+        elif kind == "rep":
+            if metas == 0:
+                out.append(f"{path}:{n}: rep before the meta record")
+            if row.get("gate") == "g5":
+                g5 += 1
+                why = g5_problem(row, meta_bytes) if meta_bytes is not None else "no valid meta to check against"
+                if why:
+                    out.append(f"{path}:{n}: g5 rep {row.get('rep')}: {why}")
+    if not metas:
+        out.append(f"{path}: no meta record")
+    if not g5:
+        out.append(f"{path}: no g5 reps")
+    return out
 
 
 def by_gate(reps):
@@ -160,16 +213,16 @@ def main() -> int:
     args = ap.parse_args()
 
     on_macos = sys.platform == "darwin"
-    _, na = load(args.native)
-    _, nb = load([args.cowfs])
     bad = []
     for path in [*args.native, args.cowfs, *([args.noise_floor] if args.noise_floor else [])]:
-        bad += invalid_reps(path)
+        bad += file_problems(path)
     if bad:
         for line in bad:
             print(f"INVALID {line}", file=sys.stderr)
-        print("RESULT: invalid, g5 did not read back what it wrote", file=sys.stderr)
+        print("RESULT: invalid, g5 byte accounting is not verifiable", file=sys.stderr)
         return 3
+    _, na = load(args.native)
+    _, nb = load([args.cowfs])
     ga, gb = by_gate(na), by_gate(nb)
 
     print(f"platform      {platform.platform()}")

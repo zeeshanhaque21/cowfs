@@ -222,7 +222,31 @@ class TreeSizes(unittest.TestCase):
             os.truncate(Path(d) / "tree" / "big" / "b001", 5)
             with self.assertRaises(SystemExit) as cm:
                 ctx.ensure_tree()
-            self.assertIn("big/b001", str(cm.exception))
+            self.assertIn("tree big", str(cm.exception))
+
+    def test_marker_hit_refuses_stray_entries(self):
+        for rel, kind in (("tree/big/b099", "file"), ("tree/stray.txt", "file"), ("tree/d300", "dir"),
+                          ("tree/d002/extra", "file"), ("tree/d002/sub", "dir"), ("tree/big/sub", "dir")):
+            with tempfile.TemporaryDirectory() as d:
+                ctx, _ = self.make(d)
+                target = Path(d) / rel
+                target.mkdir() if kind == "dir" else target.write_bytes(b"x")
+                with self.assertRaises(SystemExit, msg=rel):
+                    ctx.ensure_tree()
+
+    def test_marker_hit_refuses_missing_large_file_and_missing_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx, _ = self.make(d)
+            (Path(d) / "tree" / "big" / "b001").unlink()
+            with self.assertRaises(SystemExit):
+                ctx.ensure_tree()
+        with tempfile.TemporaryDirectory() as d:
+            ctx, _ = self.make(d)
+            for f in (Path(d) / "tree" / "d010").iterdir():
+                f.unlink()
+            (Path(d) / "tree" / "d010").rmdir()
+            with self.assertRaises(SystemExit):
+                ctx.ensure_tree()
 
     def test_marker_hit_refuses_truncated_or_missing_small_file(self):
         with tempfile.TemporaryDirectory() as d:
@@ -236,36 +260,72 @@ class TreeSizes(unittest.TestCase):
                 ctx.ensure_tree()
 
 
+GIB = 1 << 30
+
+
+def meta(big=4 * MIB, **extra):
+    return {"kind": "meta", "counts": {"big_bytes": big}, **extra}
+
+
+def rep(size=4 * MIB, gate="g5", **override):
+    m = {"bytes": size, "written_bytes": size, "read_bytes": size, "read_matches": True}
+    m.update(override)
+    return {"kind": "rep", "gate": gate, "rep": 0, "label": "x", "wall_s": 1, "load1_before": 0, "load1_after": 0, "metrics": m}
+
+
+def drop(row, key):
+    del row["metrics"][key]
+    return row
+
+
+# name -> rows that compare.py must refuse in any input slot
+INVALID = {
+    "legacy boolean only, aligned 1 GiB": [meta(GIB), rep(GIB, written_bytes=None, read_bytes=None)],
+    "legacy boolean only without byte fields": [meta(GIB), drop(drop(rep(GIB), "written_bytes"), "read_bytes")],
+    "no meta record": [rep()],
+    "rep before meta": [rep(), meta()],
+    "duplicate meta": [meta(), meta(), rep()],
+    "conflicting meta": [meta(4 * MIB), meta(8 * MIB), rep()],
+    "meta without counts": [{"kind": "meta"}, rep()],
+    "counts without big_bytes": [{"kind": "meta", "counts": {}}, rep()],
+    "meta big_bytes bool": [meta(True), rep(1)],
+    "meta big_bytes float": [meta(4.0 * MIB), rep()],
+    "meta big_bytes zero": [meta(0), rep(0)],
+    "meta big_bytes negative": [meta(-MIB), rep(-MIB)],
+    "meta big_bytes below 1 MiB": [meta(1 << 16), rep(1 << 16)],
+    "meta big_bytes unaligned": [meta(MIB + 1), rep(MIB + 1)],
+    "expected is bool": [meta(1), rep(True, written_bytes=True, read_bytes=True)],
+    "expected float": [meta(), rep(4.0 * MIB)],
+    "expected zero": [meta(), rep(0)],
+    "expected negative": [meta(), rep(-4 * MIB)],
+    "written missing": [meta(), drop(rep(), "written_bytes")],
+    "read missing": [meta(), drop(rep(), "read_bytes")],
+    "written string": [meta(), rep(written_bytes=str(4 * MIB))],
+    "forged flag, 5 written 7 read": [meta(), rep(written_bytes=5, read_bytes=7)],
+    "one byte short read, flag true": [meta(), rep(read_bytes=4 * MIB - 1)],
+    "forged aligned 3 MiB under 4 MiB meta": [meta(4 * MIB), rep(3 * MIB)],
+    "all counts equal but differ from meta": [meta(4 * MIB), rep(8 * MIB)],
+    "3 MiB meta at scale 100": [meta(3 * MIB, scale=100), rep(3 * MIB)],
+    "scale is a string": [meta(GIB, scale="100"), rep(GIB)],
+    "scale is bool": [meta(GIB, scale=True), rep(GIB)],
+    "scale is infinite": [meta(GIB, scale=float("inf")), rep(GIB)],
+    "empty file": [],
+    "meta only": [meta()],
+    "no g5 reps": [meta(), rep(gate="g1")],
+    "g5 rep with no metrics": [meta(), {"kind": "rep", "gate": "g5", "rep": 0}],
+}
+VALID = {
+    "modern without scale": [meta(), rep()],
+    "modern with matching scale 100": [meta(GIB, scale=100), rep(GIB)],
+    "modern 3 MiB at scale 0.3": [meta(3 * MIB, scale=0.3), rep(3 * MIB)],
+    "modern 20 MiB at scale 2": [meta(20 * MIB, scale=2.0), rep(20 * MIB)],
+    "flag false but all numbers agree": [meta(), rep(read_matches=False)],
+    "floor 1 MiB at tiny scale": [meta(MIB, scale=0.001), rep(MIB)],
+}
+
+
 class CompareRefuses(unittest.TestCase):
-    def rep(self, **m):
-        return {"kind": "rep", "gate": "g5", "rep": 0, "label": "x", "wall_s": 1, "load1_before": 0, "load1_after": 0, "metrics": m}
-
-    def good(self, size=4 * MIB):
-        return self.rep(bytes=size, written_bytes=size, read_bytes=size, read_matches=True)
-
-    def problem(self, row, meta_bytes=None):
-        return compare.g5_problem(row, meta_bytes)
-
-    def test_numeric_equality_not_the_flag(self):
-        self.assertIsNone(self.problem(self.good()))
-        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=5, read_bytes=7, read_matches=True)))
-        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=4 * MIB, read_bytes=4 * MIB - 1, read_matches=True)))
-        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=4 * MIB - 1, read_bytes=4 * MIB - 1, read_matches=True)))
-        self.assertIsNone(self.problem(self.rep(bytes=4 * MIB, written_bytes=4 * MIB, read_bytes=4 * MIB, read_matches=False)))
-        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes="4194304", read_bytes=4 * MIB, read_matches=True)))
-        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=True, read_bytes=True, read_matches=True)))
-        self.assertTrue(self.problem(self.rep(bytes=4 * MIB, written_bytes=4 * MIB, read_matches=True)))
-
-    def test_meta_counts_must_agree(self):
-        self.assertTrue(self.problem(self.good(4 * MIB), meta_bytes=8 * MIB))
-        self.assertIsNone(self.problem(self.good(4 * MIB), meta_bytes=4 * MIB))
-
-    def test_legacy_rows(self):
-        self.assertIsNone(self.problem(self.rep(bytes=1 << 30, read_matches=True)))
-        self.assertTrue(self.problem(self.rep(bytes=21474836, read_matches=False)))
-        self.assertTrue(self.problem(self.rep(bytes=21474836, read_matches=True)))
-
-    def write(self, d, name, *rows):
+    def write(self, d, name, rows):
         f = Path(d) / name
         f.write_text("".join(json.dumps(r) + "\n" for r in rows))
         return str(f)
@@ -273,32 +333,64 @@ class CompareRefuses(unittest.TestCase):
     def run_compare(self, native, cowfs, noise=None):
         argv = ["compare.py", "--native", *native, "--cowfs", cowfs] + (["--noise-floor", noise] if noise else [])
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()) as err, \
-                contextlib.redirect_stdout(io.StringIO()):
-            return compare.main(), err.getvalue()
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            return compare.main(), err.getvalue(), out.getvalue()
 
-    def test_every_input_file_is_validated(self):
-        forged = self.rep(bytes=4 * MIB, written_bytes=5, read_bytes=7, read_matches=True)
-        short = self.rep(bytes=4 * MIB, written_bytes=4 * MIB, read_bytes=4 * MIB - 1, read_matches=False)
-        meta = {"kind": "meta", "counts": {"big_bytes": 4 * MIB}}
+    def slots(self, ok, ok2, test):
+        return {
+            "native": ([test], ok, ok2),
+            "second native": ([ok, test], ok, ok2),
+            "cowfs": ([ok], test, ok2),
+            "noise floor": ([ok], ok, test),
+        }
+
+    def test_valid_modern_files_pass_in_every_slot(self):
         with tempfile.TemporaryDirectory() as d:
-            ok = self.write(d, "ok.jsonl", meta, self.good())
-            ok2 = self.write(d, "ok2.jsonl", meta, self.good())
-            for name, bad_row in (("forged", forged), ("short", short)):
-                bad = self.write(d, f"{name}.jsonl", meta, bad_row)
-                self.assertEqual(self.run_compare([ok], ok, ok2)[0], 0)
-                for placement in ("native", "native2", "cowfs", "noise"):
-                    native = [bad] if placement == "native" else [ok, bad] if placement == "native2" else [ok]
-                    cow = bad if placement == "cowfs" else ok
-                    noise = bad if placement == "noise" else ok2
-                    rc, err = self.run_compare(native, cow, noise)
-                    self.assertEqual(rc, 3, (name, placement))
-                    self.assertIn("INVALID", err)
-                    self.assertIn(bad, err)
+            for name, rows in VALID.items():
+                f = self.write(d, "v.jsonl", rows)
+                ok = self.write(d, "ok.jsonl", [meta(), rep()])
+                for slot, (nat, cow, noise) in self.slots(ok, ok, f).items():
+                    rc, err, _ = self.run_compare(nat, cow, noise)
+                    self.assertEqual(rc, 0, (name, slot, err))
+
+    def test_invalid_matrix_is_refused_in_every_slot_with_no_verdict(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = self.write(d, "ok.jsonl", [meta(), rep()])
+            ok2 = self.write(d, "ok2.jsonl", [meta(), rep()])
+            self.assertEqual(self.run_compare([ok], ok, ok2)[0], 0)
+            for name, rows in INVALID.items():
+                bad = self.write(d, "bad.jsonl", rows)
+                for slot, (nat, cow, noise) in self.slots(ok, ok2, bad).items():
+                    rc, err, out = self.run_compare(nat, cow, noise)
+                    self.assertEqual(rc, 3, (name, slot))
+                    self.assertIn("INVALID", err, (name, slot))
+                    self.assertIn(bad, err, (name, slot))
+                    self.assertNotIn("PASS", out + err, (name, slot))
+
+    def test_not_json_and_missing_file_are_invalid_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = self.write(d, "ok.jsonl", [meta(), rep()])
+            junk = Path(d) / "junk.jsonl"
+            junk.write_text("{not json\n" + json.dumps(meta()) + "\n" + json.dumps(rep()) + "\n")
+            self.assertEqual(self.run_compare([ok], str(junk))[0], 3)
+            self.assertEqual(self.run_compare([ok], str(Path(d) / "absent.jsonl"))[0], 3)
 
     def test_pre_fix_baseline_file_is_invalid(self):
         with tempfile.TemporaryDirectory() as d:
-            f = self.write(d, "a.jsonl", {"kind": "meta"}, self.rep(bytes=21474836, read_matches=False))
+            f = self.write(d, "a.jsonl", [{"kind": "meta", "counts": {"big_bytes": 21474836}}, rep(21474836, written_bytes=None, read_bytes=None, read_matches=False)])
             self.assertEqual(self.run_compare([f], f)[0], 3)
+
+    def test_gates_writes_scale_into_meta_that_compare_accepts(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, out = Path(d) / "root", Path(d) / "out"
+            argv = ["gates.py", "--root", str(root), "--label", "t", "--reps", "1", "--gates", "g5", "--no-resume"]
+            with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {"COWFS_BENCH_SCALE": "0.3"}), \
+                    mock.patch.object(gates, "OUT", out), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gates.main(), 0)
+            f = str(next(out.glob("t-*.jsonl")))
+            first = json.loads(Path(f).read_text().splitlines()[0])
+            self.assertEqual((first["scale"], first["counts"]["big_bytes"]), (0.3, 3 * MIB))
+            self.assertEqual(self.run_compare([f], f, f)[0], 0)
 
 
 if __name__ == "__main__":
