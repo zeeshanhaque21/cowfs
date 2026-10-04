@@ -27,11 +27,10 @@ struct Tmp(PathBuf);
 
 impl Tmp {
     fn new(tag: &str) -> Tmp {
-        let base = std::env::temp_dir().join(format!(
-            "cowfs-canon-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        // Shell-safe by construction: these paths are interpolated into the stub scripts below, and
+        // `{:?}` on a ThreadId renders `ThreadId(9)`, whose parenthesis was a syntax error inside
+        // those scripts. The tag is unique per test, so the pid alone is enough to separate runs.
+        let base = std::env::temp_dir().join(format!("cowfs-canon-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("the temp dir");
         Tmp(base)
@@ -56,7 +55,7 @@ fn recording_helper(t: &Tmp, exit: i32, stderr: &str) -> PathBuf {
     let dir = t.dir("bin");
     let path = dir.join("ns-stub");
     let body = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {out}\nexit {exit}\n{stderr}",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{out}\"\nexit {exit}\n{stderr}",
         out = dir.join("argv.txt").display(),
         exit = exit,
         stderr = stderr
@@ -297,8 +296,8 @@ fn a_working_namespace_lets_a_failing_build_stay_a_failure() {
         let dir = t.dir("bin");
         let p = dir.join("ns-payload77");
         let body = format!(
-            "#!/bin/sh\nn=$(cat {m} 2>/dev/null || echo 0)\necho $((n+1)) > {m}\n\
-             printf '%s\\n' \"$@\" > {a}\n\
+            "#!/bin/sh\nn=$(cat \"{m}\" 2>/dev/null || echo 0)\necho $((n+1)) > \"{m}\"\n\
+             printf '%s\\n' \"$@\" > \"{a}\"\n\
              if [ \"$n\" = 0 ]; then exit 0; fi\nexit 77\n",
             m = probe_marker.display(),
             a = dir.join("argv.txt").display(),
