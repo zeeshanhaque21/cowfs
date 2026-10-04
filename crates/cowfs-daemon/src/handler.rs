@@ -282,7 +282,27 @@ impl ControlHandler for Handler {
                 "snapshot {snapshot:?} does not exist"
             )));
         }
-        Ok(holders::scan(&dir))
+        // The name is resolved against the mount, so it may name a directory inside it and not
+        // only a snapshot: a mode (a) treehouse slot is a worktree directory inside a snapshot, and
+        // issue #20 needs a scan of exactly that directory. Which directories this daemon may be
+        // asked about is still a server-side rule, so a name that climbs out with `..` is refused
+        // rather than followed.
+        let canonical = std::fs::canonicalize(&dir).map_err(|e| io(e, &format!("cannot resolve {snapshot:?}")))?;
+        if !canonical.starts_with(&self.mount_path) {
+            return Err(CtlError::new(
+                ErrorCode::InvalidParams,
+                format!("{snapshot:?} is not a directory inside the mount"),
+            ));
+        }
+        // A platform that cannot answer is not a clear slot: reporting no holders because lsof is
+        // missing or wedged is how a reset lands under a live writer.
+        match holders::scan_checked(&canonical) {
+            holders::Scan::Holders(found) => Ok(found),
+            holders::Scan::Unavailable(why) => Err(CtlError::new(
+                ErrorCode::Unsupported,
+                format!("cannot say who holds {snapshot:?}: {why}"),
+            )),
+        }
     }
 
     fn snapshot_rename(&self, from: &str, to: &str) -> CtlResult<SnapshotInfo> {

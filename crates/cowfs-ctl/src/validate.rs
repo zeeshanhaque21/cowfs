@@ -48,6 +48,41 @@ pub fn validate_snapshot_name(name: &str) -> CtlResult<()> {
     Ok(())
 }
 
+/// A directory named relative to the daemon's mount, which is what `ps` accepts for a treehouse
+/// slot in mode (a): such a slot is a directory inside a snapshot, not a snapshot.
+///
+/// Unlike a snapshot name this may contain `/` and may start with a dot, because `.treehouse` is a
+/// real directory in a pool and a slot is three levels below it. What it may not do is leave the
+/// mount: an absolute path or a `..` component is refused here, and the daemon re-checks the
+/// resolved path against its own mount before it scans anything.
+pub fn validate_mount_relative(name: &str) -> CtlResult<()> {
+    let bad = |why: &str| {
+        Err(CtlError::invalid(format!(
+            "invalid mount-relative name {name:?}: {why}"
+        )))
+    };
+    if name.is_empty() {
+        return bad("empty");
+    }
+    if name.len() > MAX_PATH_BYTES {
+        return bad("longer than 4096 bytes");
+    }
+    if name.starts_with('/') {
+        return bad("must be relative to the mount");
+    }
+    if name.chars().any(char::is_control) {
+        return bad("must not contain control characters");
+    }
+    // A component of `..` is the only way out, and a trailing slash would name a directory twice.
+    if name.split('/').any(|c| c == "..") {
+        return bad("must not contain a `..` component");
+    }
+    if name.ends_with('/') {
+        return bad("must not end with a slash");
+    }
+    Ok(())
+}
+
 /// The collision key of a snapshot name: NFC, lowercased, NFC again. Two names with the same key
 /// alias each other on a case-insensitive or normalising mount, so a backend must refuse to hold
 /// both.
@@ -143,6 +178,33 @@ mod tests {
             &"x".repeat(256),
         ] {
             assert!(validate_snapshot_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A mode (a) slot is `.treehouse/{pool}/{slot}/{repo}` below the mount, so the name has to
+    /// carry a dot directory, three levels and slashes, and still be unable to leave the mount.
+    #[test]
+    fn mount_relative_names() {
+        for ok in [
+            "snap",
+            ".treehouse/repo-abc123/1/repo",
+            "base/.treehouse/cowfs-7c1bf8/2/cowfs",
+            "a/./b",
+        ] {
+            assert!(validate_mount_relative(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "/snap",
+            "../snap",
+            ".treehouse/../../elsewhere",
+            "a/../b",
+            ".treehouse/repo/1/repo/",
+            "a\0b",
+            "a\nb",
+            &"x".repeat(4097),
+        ] {
+            assert!(validate_mount_relative(bad).is_err(), "{bad:?}");
         }
     }
 

@@ -30,9 +30,12 @@ pub struct PoolEntry {
     /// Absolute worktree path.
     #[serde(default)]
     pub path: String,
-    /// True while a lease or owner reservation protects the slot.
+    /// The state treehouse prints in its `status` column: `available`, `leased`, `dirty` and so on.
+    ///
+    /// This is a string field in treehouse v3.1.0's JSON, not a boolean, which is why it is read
+    /// here instead of through a `leased` flag that would always have deserialised as false.
     #[serde(default)]
-    pub leased: bool,
+    pub status: String,
     /// Lease identity, when leased.
     #[serde(default)]
     pub lease_id: String,
@@ -42,6 +45,13 @@ pub struct PoolEntry {
     /// Why an automatic recovery quarantined the slot.
     #[serde(default)]
     pub recovery_reason: String,
+}
+
+impl PoolEntry {
+    /// True while a lease or owner reservation protects the slot.
+    pub fn leased(&self) -> bool {
+        self.status == "leased"
+    }
 }
 
 /// The `treehouse` binary, always driven with an explicit pool root.

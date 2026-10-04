@@ -489,6 +489,8 @@ pub struct ReturnOutcome {
     pub snapshot: Option<String>,
     /// Holders found by `ps` before anything was destroyed.
     pub holders: Vec<String>,
+    /// What the holder scan could actually establish, so a clean outcome is never read as proof.
+    pub holder_scan: String,
     /// Pids that were signalled, when `--force` was given and holders existed.
     pub terminated: Vec<u32>,
     /// Pids that needed SIGKILL.
@@ -532,8 +534,11 @@ pub struct ReturnOptions {
 /// The authoritative holder check is the daemon's, inside `snapshot_reset`, under the same lock as
 /// the swap. `ps` only ever names who to blame, so a holder that appears between the scan and the
 /// reset produces `busy` with nothing changed instead of a reset under a live writer.
-/// The daemon is optional: mode (a) reports holders and hands the slot back, and needs no cowfs at
-/// all. Only mode (b), which swaps the slot's snapshot, needs one.
+///
+/// A mode (a) slot has no snapshot to swap, so the daemon's `ps` on the slot's own directory is the
+/// only holder check there is. The daemon is optional: mode (a) on a pool that is not on a mount
+/// reports holders and hands the slot back, and needs no cowfs at all. Only a slot the daemon can
+/// see, and mode (b), which swaps the slot's snapshot, need one.
 pub fn return_slot(
     mut daemon: Option<&mut Daemon>,
     th: &Treehouse,
@@ -543,6 +548,7 @@ pub fn return_slot(
         slot: opts.slot.clone(),
         snapshot: opts.snapshot.clone(),
         holders: Vec::new(),
+        holder_scan: String::new(),
         terminated: Vec::new(),
         killed: Vec::new(),
         skipped: Vec::new(),
@@ -573,32 +579,79 @@ pub fn return_slot(
             .filter(|id| !id.is_empty());
     }
 
-    if let Some(snapshot) = &opts.snapshot {
+    // Issue #20: `treehouse return` finds lingering processes by working directory only, so a
+    // process that has chdir'd out of the slot and still holds a file or a flock inside it is
+    // missed. Off the mount that leaves an orphan; on the mount the reset unlinks the held file,
+    // the NFS client silly-renames it to `.nfs*`, and the slot reads dirty while the return still
+    // exits 0. cowfs can see those holds, so the scan runs before the reset and refuses.
+    let targets = holder_targets(daemon.as_deref_mut(), opts)?;
+    outcome.holder_scan = describe_scan(&targets);
+    let mut found: Vec<ProcessInfo> = Vec::new();
+    for target in &targets {
         let Some(daemon) = daemon.as_deref_mut() else {
             return Err(Error::Usage(
-                "this slot has a snapshot, so its return needs a cowfs daemon".to_owned(),
+                "this slot is on a cowfs mount, so its return needs the daemon that serves it"
+                    .to_owned(),
             ));
         };
-        match daemon.ps(snapshot) {
-            Ok(processes) => {
-                outcome.holders = holders::describe(&processes);
-                if opts.force && !processes.is_empty() {
-                    let pids: Vec<u32> = dedup_pids(&processes);
-                    let done = holders::terminate(&pids, holders::GRACE);
-                    outcome.terminated = done.signalled;
-                    outcome.killed = done.killed;
-                    outcome.skipped = done.skipped;
-                    if !done.survivors.is_empty() {
-                        return Err(Error::Busy(format!(
-                            "{} is still held after termination by {}; the slot was left in place",
-                            opts.slot.display(),
-                            holders::describe(&survivors_as_info(&done.survivors)).join(", ")
-                        )));
-                    }
-                }
+        match daemon.ps(target) {
+            Ok(processes) => found.extend(processes),
+            // A directory cowfs cannot scan is not a quiet slot. Blocking is the whole point, so
+            // an unanswered scan stops the return rather than resetting under an unknown writer.
+            Err(e) => {
+                return Err(Error::Unsupported(format!(
+                    "cannot scan holders of {target} in {}: {e}",
+                    opts.slot.display()
+                )))
             }
-            // A mode (b) return without `ps` support cannot claim the slot is quiet.
-            Err(e) => return Err(Error::Unsupported(format!("cannot scan holders: {e}"))),
+        }
+    }
+    outcome.holders = holders::describe(&found);
+    if !opts.force {
+        // Only a hold treehouse's own cwd check cannot see stops the return here. A cwd holder is
+        // treehouse's own case and it refuses in its own words, below, through the reset; an open
+        // file or a lock is the issue #20 gap, and there is no later check to catch it in mode (a).
+        let unseen: Vec<&ProcessInfo> = found.iter().filter(|p| only_unseen_holds(p)).collect();
+        if !unseen.is_empty() {
+            outcome.refused_busy = true;
+            return Err(Error::Busy(format!(
+                "{} holds {} that treehouse cannot see, and --force was not given; returning it \
+                 now would unlink a file a live process still has open",
+                opts.slot.display(),
+                holders::describe(
+                    &unseen
+                        .into_iter()
+                        .map(|p| (*p).clone())
+                        .collect::<Vec<_>>()
+                )
+                .join(", ")
+            )));
+        }
+    }
+    if opts.force && !found.is_empty() {
+        let pids: Vec<u32> = dedup_pids(&found);
+        let done = holders::terminate(&pids, holders::GRACE);
+        outcome.terminated = done.signalled;
+        outcome.killed = done.killed;
+        outcome.skipped = done.skipped.clone();
+        if !done.survivors.is_empty() {
+            return Err(Error::Busy(format!(
+                "{} is still held after termination by {}; the slot was left in place",
+                opts.slot.display(),
+                holders::describe(&survivors_as_info(&done.survivors)).join(", ")
+            )));
+        }
+        // A pid this process may not signal, such as the shell that invoked the return, is still
+        // holding the slot. Mode (b) would meet it again at the reset; mode (a) has no second gate,
+        // so it is refused here rather than returned under.
+        if !done.skipped.is_empty() {
+            outcome.refused_busy = true;
+            return Err(Error::Busy(format!(
+                "{} is held by {} and this process may not signal them; the slot was left in place \
+                 rather than reset under a live holder",
+                opts.slot.display(),
+                pids_of(&done.skipped).join(", ")
+            )));
         }
     }
 
@@ -657,6 +710,61 @@ pub fn return_slot(
     Ok(outcome)
 }
 
+/// What the daemon can be asked to scan for this slot.
+///
+/// The snapshot in mode (b), plus the slot's own directory when it is inside the mount, which is
+/// what makes a mode (a) slot checkable at all. Both sides are canonical before the prefix is
+/// taken: a caller on macOS spells the slot with the `/var` symlink the mount does not use, and a
+/// prefix that fails to match would silently skip the scan issue #20 depends on.
+fn holder_targets(daemon: Option<&mut Daemon>, opts: &ReturnOptions) -> Result<Vec<String>> {
+    let Some(daemon) = daemon else {
+        return match &opts.snapshot {
+            Some(_) => Err(Error::Usage(
+                "this slot has a snapshot, so its return needs a cowfs daemon".to_owned(),
+            )),
+            // A pool that is not on a mount needs no cowfs, and has no silly-rename either.
+            None => Ok(Vec::new()),
+        };
+    };
+    let mut out: Vec<String> = opts.snapshot.iter().cloned().collect();
+    let mount = naming::canonical(std::path::Path::new(&daemon.mount_info()?.mount_path));
+    if let Ok(rel) = naming::canonical(&opts.slot).strip_prefix(&mount) {
+        let rel = rel.display().to_string();
+        if !rel.is_empty() && !out.contains(&rel) {
+            out.push(rel);
+        }
+    }
+    Ok(out)
+}
+
+/// What the scan established, said plainly: an empty target list means cowfs did not look, and a
+/// clean return must never read as proof that nothing holds the slot.
+fn describe_scan(targets: &[String]) -> String {
+    match targets {
+        [] => "not scanned: the slot is not inside the daemon's mount and treehouse's own \
+               working-directory check is all that ran"
+            .to_owned(),
+        [one] => format!("scanned {one}"),
+        many => format!("scanned {}: {}", many.len(), many.join(", ")),
+    }
+}
+
+/// True when this process holds something in the slot that a working-directory check cannot see.
+///
+/// A process that also has its working directory inside the slot is excluded: treehouse finds that
+/// one itself and refuses in its own words, so intercepting it here would only change the message.
+fn only_unseen_holds(p: &ProcessInfo) -> bool {
+    let mut cwd = false;
+    let mut other = false;
+    for hold in &p.holds {
+        match hold.kind {
+            cowfs_ctl::HoldKind::Cwd => cwd = true,
+            _ => other = true,
+        }
+    }
+    other && !cwd
+}
+
 fn dedup_pids(processes: &[ProcessInfo]) -> Vec<u32> {
     let mut seen = std::collections::BTreeSet::new();
     processes
@@ -676,9 +784,58 @@ fn survivors_as_info(pids: &[u32]) -> Vec<ProcessInfo> {
         .collect()
 }
 
+/// `pid 123, pid 456`, which is what an unsignalable holder can still be named by.
+fn pids_of(pids: &[u32]) -> Vec<String> {
+    pids.iter().map(|p| format!("pid {p}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowfs_ctl::{Hold, HoldKind};
+
+    fn holds(p: &[(HoldKind, &str)]) -> ProcessInfo {
+        ProcessInfo {
+            pid: 42,
+            command: "sleep 600".into(),
+            holds: p
+                .iter()
+                .map(|(kind, path)| Hold {
+                    kind: *kind,
+                    path: (*path).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn only_a_hold_treehouse_cannot_see_stops_the_return_before_treehouse_is_asked() {
+        // Case c of spike 5: chdir'd out, still has the file open. Nothing but the descriptor gives
+        // it away, so this is the one the return must intercept.
+        assert!(only_unseen_holds(&holds(&[(HoldKind::Fd, "/slot/held.txt")])));
+        assert!(only_unseen_holds(&holds(&[(HoldKind::Lock, "/slot/l")])));
+        // A working-directory holder is treehouse's own case and it refuses in its own words.
+        assert!(!only_unseen_holds(&holds(&[(HoldKind::Cwd, "/slot")])));
+        // Both together: treehouse sees the working directory, so it will refuse by itself.
+        assert!(!only_unseen_holds(&holds(&[
+            (HoldKind::Cwd, "/slot"),
+            (HoldKind::Fd, "/slot/held.txt")
+        ])));
+        assert!(!only_unseen_holds(&holds(&[])));
+    }
+
+    #[test]
+    fn an_unscanned_slot_says_so_and_never_reads_as_proof() {
+        assert!(
+            describe_scan(&[]).contains("not scanned"),
+            "{}",
+            describe_scan(&[])
+        );
+        assert_eq!(describe_scan(&["snap".into()]), "scanned snap");
+        let two = describe_scan(&["a".into(), "b".into()]);
+        assert!(two.contains("scanned 2"), "{two}");
+        assert!(two.contains('a') && two.contains('b'), "{two}");
+    }
 
     #[test]
     fn doctor_probes_the_pool_root_not_the_namespace_root() {
