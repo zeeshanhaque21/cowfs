@@ -13,25 +13,52 @@ This report makes **no claim that the production GC is safe**, and no claim abou
 lookup/walk race beyond what is recorded here. Source safety is separately and independently reviewed;
 this document reports only the end-to-end behavior it measured.
 
-## Dependency landed and source identity carry
+## Dependency landed, source identity, and current-transport proof
 
 PR #76 landed as merge `9906819f4e7806ff9e359ea315ec717b87b2724e` (reviewed head `7dd1c29`), so
 `f501157` is now an ancestor of `main`. Landed `main` adds test-only and control-plane commits on top
-of `f501157`. The GC-relevant production source is **byte-identical** between the tested `f501157`
-and landed `main`:
+of `f501157`. Two distinct identities must be kept apart:
 
-- `crates/cowfs-gc/src`, `crates/cowfs-core/src`, `crates/cowfs-store/src`, `crates/cowfs-daemon/src`
-  and their `Cargo.toml`s all hash the same at `f501157` and at landed `main`.
-- The only non-test `src` file that differs `f501157` -> landed `main` is
-  `crates/cowfs-ctl/src/server.rs` (PR #73's half-close admission fix), which is outside the GC path
-  this harness drives.
-- The `crates/` tree id of landed `main` is `f57af086b063c9563392fcd9bc0da441a61d2b53`; the tested
-  tree id was `fe899f9f425d40d5db36d13c8400ef3438676879`.
+- **GC algorithm / storage source is byte-identical.** `crates/cowfs-gc/src`, `crates/cowfs-core/src`,
+  `crates/cowfs-store/src`, `crates/cowfs-daemon/src` and their `Cargo.toml`s all hash the same at
+  `f501157` and at landed `main`. The `crates/` tree id of landed `main` is
+  `f57af086b063c9563392fcd9bc0da441a61d2b53`; the tested tree id was
+  `fe899f9f425d40d5db36d13c8400ef3438676879`.
+- **The integrated binary and its control transport are NOT byte-identical.** The only non-test `src`
+  file that differs `f501157` -> landed `main` is `crates/cowfs-ctl/src/server.rs` (PR #73's
+  half-close admission fix). That file is the control-plane transport every `cowfs` CLI call uses,
+  including the `gc` terminal frame and its progress frames, so the byte-identical-source argument
+  alone does **not** carry the earlier proof to the current integrated binary.
 
-Because the GC production source is unchanged, the 14-record and 72-record daemon proofs recorded
-below carry to landed `main`; no redundant re-run was performed and none is claimed. This document
-reports behavior measured on `f501157` (`harness_head 7c08311`); it makes no claim of a new binary run
-on the merge head. A coordinator final gate is required before this PR merges.
+The earlier proof and the current proof are therefore labeled by transport generation:
+
+- **Historical, pre-PR-#73 transport (measured on `f501157`, `harness_head 7c08311`).** The builder's
+  14-record and 72-record runs below, and the separate reviewer's 14 and 72, were taken before the
+  `cowfs-ctl` transport change.
+- **Current transport (`main` after PR #73).** A separate reviewer ran the harness against a fresh
+  archive of the reviewed head `e3df413` (runtime byte-identical to `main`), own target dir, default
+  unmodified daemon, private store, 16 MiB-pack preseed, NFS loopback. This is the current-transport
+  proof:
+
+  ```
+  records: 14   failed: 0   (fresh archive of e3df413; archive crates tree f57af086)
+  binaries: cowfs 36808952f675...   daemon 59f887e3d62a...   seed 95e983132d15...
+  env.archive_crates_tree             f57af086b063c9563392fcd9bc0da441a61d2b53
+  dry run                             candidate_bytes 15,136,450; freed 0; 0 store files changed; control detected
+  live gc (through new ctl path)      202 blocks, gross freed_bytes 16,759,743; pack-00000000.cpk unlinked
+  net                                 28,964,749 -> 13,828,299 = 15,136,450;  gross - net = 1,623,293 (new pack)
+  fsck                                ok, 0 problems, 193 blocks (and 193 again on the fresh daemon)
+  fresh daemon + new NFS mount        keep000/keep001/live000/live001 all BLAKE3-match independent expected
+  teardown                            both daemons exit 0; mounts and sockets gone
+  ```
+
+  Every number equals the `f501157` numbers, so PR #73's transport change did not alter observed
+  behavior on this path. The reviewer did **not** run the full 72-record harness on the current
+  transport (harness and fixture unchanged; no concrete changed behavior identified in the harness
+  path). This document makes no claim of a fresh 72-record run on the current head, and no claim of a
+  binary built from any future commit.
+
+A coordinator final gate is required before this PR merges.
 
 ## What was verified, and by what
 
@@ -46,9 +73,22 @@ worktree path exceeds macOS `sun_path`. No shared socket, store, mount, lease, o
 touched. The shared daemon on `~/.cowfs` is never addressed; the harness refuses to signal any pid
 whose command line does not carry this run's exact socket and store.
 
+**Known caveat in the reviewer's sampled run (documented, not fixed here).** The harness
+`scripts/verify-gc-daemon.py` itself has **no** shared-daemon check. The separate reviewer's sampled
+run (`bench/out/gc-landed-critic/critic_run.py`) added a `shared.daemon_untouched` record pinned to
+the then-current shared-daemon pid. That pid has since been replaced (the current shared daemon is a
+different pid, verified alive and addressed by nothing of that run), so that reviewer-side record is
+**vacuous** in the reviewer's own words: it compares an empty "before" to an empty "after". It does
+not itself protect the current daemon, and is not claimed to. Isolation rests on the private store,
+mount, and socket, and on the harness refusing to signal a pid that does not carry this run's exact
+socket and store; that refusal check is `selftest.kill_refuses_foreign_pid` (asserted, passing) and is
+unaffected by any pinned pid. Correcting the reviewer-side pinned-pid record is out of scope for this
+docs-only pass and touches no harness source.
+
 ## Result
 
-Current run (head `7c08311`, production crates `f501157`):
+Current 72-record run (head `7c08311`, production crates `f501157`, **pre-PR-#73 transport**; the
+current-transport proof is the 14-record run in "Dependency landed" above):
 
 ```
 records: 72   failed: 0
@@ -353,9 +393,16 @@ matching independently regenerated fixture digests on a fresh NFS mount, plus co
 that `Core::set_gate_fault` is not reachable (`E0599`), the gate module is private (`E0603`), and no
 `test-hooks` feature exists. That review certifies **artifact and end-to-end behavior only**; it
 explicitly does **not** certify production source safety, which remains the separate source critic's
-gate. The review report is a local, untracked artifact (`docs/reviews/gc-daemon-final-source.md`), not
-durable GitHub evidence; it is not linked as a URL. That review predates `f501157`; a targeted
-re-review of the `f501157` race fix is required and is not claimed here.
+gate. The review report is a local, untracked artifact (a critic report), not durable GitHub evidence;
+it is not linked as a URL. That review predates `f501157`; the targeted `f501157` race re-review is
+the source critic's own scope and is not claimed here.
+
+A later integration reviewer re-checked the post-PR-#73 head `e3df413`: the verification-only diff,
+the byte-identical GC/storage source versus landed `main`, and a **fresh 14-record current-transport
+run** (see "Dependency landed" above). That reviewer judged **artifact: PASS with wording caveat C1**
+(now corrected here), and **current-main control transport: PASS** on the sampled 14 records. The
+reviewer did **not** run the full 72-record harness on the current transport and did not certify
+source safety. Reports are local, untracked critic artifacts, not durable GitHub evidence.
 
 ## Source fixes these heads carry (not exercised by this harness)
 
