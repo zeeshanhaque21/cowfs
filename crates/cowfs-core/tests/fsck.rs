@@ -32,11 +32,7 @@ fn pack_files(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir.join("store/packs"))
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e == "cpk" || e == "pack")
-        })
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("cpk"))
         .collect();
     v.sort();
     v
@@ -59,16 +55,20 @@ fn missing_live_block_is_not_reported_clean() {
         c.close().unwrap();
     }
 
-    // Fixture-owned corruption: remove the pack that holds the block. Verify before mutation that
-    // the pack exists and is non-empty.
+    // Fixture-owned corruption: remove every pack, so the file's block is gone whatever pack it
+    // landed in. Verify before mutation that each victim exists and is non-empty.
     let packs = pack_files(dir.path());
     assert!(!packs.is_empty(), "no pack to remove");
-    let victim = packs.last().unwrap().clone();
-    assert!(
-        std::fs::metadata(&victim).unwrap().len() > 0,
-        "victim pack is empty"
-    );
-    std::fs::remove_file(&victim).unwrap();
+    for victim in &packs {
+        assert!(
+            std::fs::metadata(victim).unwrap().len() > 0,
+            "victim pack is empty: {}",
+            victim.display()
+        );
+    }
+    for victim in &packs {
+        std::fs::remove_file(victim).unwrap();
+    }
 
     // Acknowledge the loss as the old reader's cache upgrade did, so the store stops reporting
     // corruption. This is what made `Store::fsck` say clean while a live file was unreadable.

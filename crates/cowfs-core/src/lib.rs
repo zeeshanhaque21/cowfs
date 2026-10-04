@@ -450,6 +450,7 @@ impl Core {
     fn missing_live_refs(&self, report: &mut FsckReport) -> Result<(), Error> {
         let store = self.inner.blocks.store();
         let mut marker = cowfs_meta::Marker::new();
+        let mut listed = 0usize;
         for info in self.inner.meta.durable_snapshots().map_err(from_meta)? {
             let snap = match self.inner.meta.snapshot_by_id(info.id) {
                 Ok(s) => s,
@@ -459,16 +460,15 @@ impl Core {
             let walk = snap.live_blocks(&mut marker).map_err(from_meta)?;
             for id in walk {
                 let id = id.map_err(from_meta)?;
-                if id == file::HOLE {
+                if id == file::HOLE || store.contains(id) {
                     continue;
                 }
-                if !store.contains(id) {
-                    report
-                        .damage
-                        .push(cowfs_store::Damage::MissingLiveBlock { id });
-                    if report.damage.len() >= MAX_MISSING_LIVE_REFS {
-                        return Ok(());
-                    }
+                report
+                    .damage
+                    .push(cowfs_store::Damage::MissingLiveBlock { id });
+                listed += 1;
+                if listed >= MAX_MISSING_LIVE_REFS {
+                    return Ok(());
                 }
             }
         }
