@@ -1,0 +1,111 @@
+{
+  "gate": "ready-g4",
+  "title": "Matched fsx acceptance on a real mounted cowfs against a native control",
+  "note": "This is the wave g4 gate (fsx). It is not docs/v1-benchmarks.md's g4, which is the tree-walk gate.",
+
+  "tool": {
+    "name": "fsx",
+    "upstream": "https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git",
+    "ref": "v2026.09.22",
+    "tag_object": "3ea00236e9ce5bb7770a67e078de770ddc0315a0",
+    "commit": "22348afe338c0f6d540c0d7ef0db749eaa51b218",
+    "path": "ltp/fsx.c",
+    "files": {
+      "ltp/fsx.c": "871575069de4dd749c69779e850c66fa9dfcaa56d3c8f1a1b49ff8de13aa735f",
+      "src/global.h": "7513204113b9d256e87922ad884dc27843f1504828095281374c87f969c6c1a9",
+      "src/statx.h": "3e1d287ab9c45dce4db06a7dd5318b76456a1278e55ea4b50ea0654a8945d3d0"
+    },
+    "config_header": "fsx-config-linux.h",
+    "compile": ["cc", "-std=gnu11", "-funsigned-char", "-fno-strict-aliasing", "-Wall",
+                "-D_GNU_SOURCE", "-D_FILE_OFFSET_BITS=64", "-O2", "-I", "src",
+                "-include", "getopt.h", "-include", "linux/kernel.h",
+                "-o", "fsx", "ltp/fsx.c", "-lpthread"],
+    "compile_notes": [
+      "-D_GNU_SOURCE, -D_FILE_OFFSET_BITS=64, -std=gnu11, -funsigned-char, -fno-strict-aliasing and -Wall are the flags xfstests' own include/builddefs.in puts on every C file.",
+      "-include getopt.h and -include linux/kernel.h are needed because ltp/fsx.c calls getopt_long and roundup without including their headers. The source stays unmodified.",
+      "-DXFS is deliberately not defined: without xfsprogs headers it turns the -x preallocation block into a compile error. It gates only that block, and this gate never passes -x."
+    ],
+    "why_this_source": "fsx/ was removed from xfstests before the oldest tag this gate could pin; ltp/fsx.c is the surviving upstream file, unchanged since the xfstests 4.x era.",
+    "declared_not_covered": [
+      "AIO (-A): libaio is not linked, so the binary's usage text omits the flag",
+      "io_uring (-U): liburing is not linked, so the binary's usage text omits the flag",
+      "copy_file_range (-E): HAVE_COPY_FILE_RANGE is undefined in fsx-config-linux.h",
+      "xattrs, xfsprealloc, atomic writes, dontcache io: the corresponding macros and flags are compiled out"
+    ]
+  },
+
+  "caps": {
+    "max_file_bytes": 262144,
+    "max_op_bytes": 16384,
+    "max_bytes_written_per_arm": 2621440,
+    "comment": "fsx's own defaults are a 256 KiB file and a 64 KiB operation; the op cap is lowered to 16 KiB so a seed stays modest. Byte caps are enforced by the runner, which refuses a data file over max_file_bytes and reports the total written per arm."
+  },
+
+  "arms": ["native", "cowfs"],
+
+  "matched_flags_note": "-f flushes and invalidates the cache after every I/O, so the arms read through the filesystem rather than through the page cache. -F -H -z -Y -C -I -u disable fsx's fallocate-based operations: allocate, punch hole, zero range, write zeroes, collapse range, insert range and unshare range. They are disabled on BOTH arms so the operation mix stays matched, and they are disabled because the cowfs FUSE mount answers ENOTSUP to every fallocate mode, measured by bench/fsx-gate/fallocate-matrix.py. Disabling them on both arms keeps the arms comparable; disabling them on the cowfs arm alone would make the result look worse than it is.",
+
+  "modes": [
+    {
+      "name": "smoke",
+      "flags": ["-f", "-F", "-H", "-z", "-Y", "-C", "-I", "-u"],
+      "require_identical_op_stream": true,
+      "seeds": [1],
+      "ops": 200,
+      "why": "The first real run: one fixed seed, small op count, one operation mix on both arms, before any batch."
+    },
+    {
+      "name": "matched",
+      "flags": ["-f", "-F", "-H", "-z", "-Y", "-C", "-I", "-u"],
+      "require_identical_op_stream": true,
+      "seeds": [1, 2, 3, 5, 8, 13, 21, 34, 55, 89],
+      "ops": 20000,
+      "why": "The declared batch: ten seeds, one operation mix on both arms, so the two files must end byte-identical. 20,000 operations is the measured cost of one seed on this mount, about 21 s on the cowfs arm against 8 s native; it is a correctness measurement, not a throughput one."
+    },
+    {
+      "name": "sync",
+      "flags": ["-f", "-F", "-H", "-z", "-Y", "-C", "-I", "-u", "-y"],
+      "require_identical_op_stream": true,
+      "seeds": [7],
+      "ops": 10000,
+      "why": "One seed with -y so every change is synchronized: the durable write path rather than the page-cache path. fsx's random operation stream never emits an fsync operation of its own, because op = rv % OP_MAX_FULL and OP_FSYNC == OP_MAX_FULL, so -y is how this gate covers synchronization; the fsync_readback probe and the post-restart readback cover it a second way."
+    },
+    {
+      "name": "full",
+      "flags": ["-f"],
+      "require_identical_op_stream": false,
+      "seeds": [1, 2, 3],
+      "ops": 20000,
+      "why": "fsx's own default mix with every capability it finds, which is how the hole coverage of this mount is measured rather than assumed. The two arms may record different streams here, so the bytes are not compared; fsx's exit status is, and every stream difference has to trace to a capability the mount is recorded as lacking."
+    }
+  ],
+
+  "required_op_types": {
+    "smoke": ["read", "write", "mapread", "mapwrite", "truncate"],
+    "matched": ["read", "write", "mapread", "mapwrite", "truncate"],
+    "sync": ["read", "write", "mapread", "mapwrite", "truncate"],
+    "full": ["read", "write", "mapread", "mapwrite", "truncate", "punch_hole", "zero_range"]
+  },
+  "required_op_types_note": "fsync is not listed anywhere: fsx selects op = rv % OP_MAX_FULL and OP_FSYNC == OP_MAX_FULL, so no random run can ever record an fsync operation. The gate found that out by failing on it, and the coverage moved to the sync mode's -y flag and to the fsync_readback probe.",
+
+  "probe": {
+    "why": "fsx probes fallocate modes itself and prints one line per mode it disables. The runner probes the same operations directly as well, so an unsupported hole operation carries its own errno evidence instead of only fsx's stderr.",
+    "ops": ["fallocate", "punch_hole", "zero_range", "keep_size", "truncate_shrink", "truncate_grow", "truncate_to_hole", "mmap_rw", "fsync_readback"]
+  },
+
+  "accept": {
+    "why": "g4 is 'mounted fsx no worse than native'. Native is the control, so the bar is that the cowfs mount produces exactly what native produces for the same declared inputs, and that fsx itself finds nothing wrong on the mount.",
+    "rules": [
+      "the two arms are on different filesystems, verified by st_dev, so the cowfs arm really is the mount",
+      "both arms exit 0",
+      "executed operations equal the declared op count on both arms",
+      "in a mode with one operation mix, the recorded stream (.fsxops) is byte-identical across arms",
+      "in a mode with one operation mix, the data file is byte-identical across arms (size and sha256)",
+      "in a mode that lets fsx use every capability, every stream difference traces to a capability the mount is recorded as lacking",
+      "a fresh process that opens the file after fsx exits reads the same sha256",
+      "after the daemon restarts on the same store, every cowfs data file still hashes the same",
+      "no mode was skipped, truncated or reduced without an explicit unsupported reason recorded",
+      "an empty or missing result never passes"
+    ]
+  }
+}
