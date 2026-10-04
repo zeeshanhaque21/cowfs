@@ -140,8 +140,7 @@ impl Run {
         fs::create_dir_all(&mount).expect("the mount point");
         // `sun_path` is 104 bytes, so the socket lives on the short TMPDIR, not under the long
         // worktree path.
-        let socket =
-            std::env::temp_dir().join(format!("d90-{}-{tag}.sock", std::process::id()));
+        let socket = std::env::temp_dir().join(format!("d90-{}-{tag}.sock", std::process::id()));
         Run {
             dir,
             socket,
@@ -324,7 +323,11 @@ impl Outcome {
             self.rep,
             self.pid,
             if self.after.is_some() { "kept" } else { "LOST" },
-            if self.old_back.is_some() { "CAME BACK" } else { "gone" },
+            if self.old_back.is_some() {
+                "CAME BACK"
+            } else {
+                "gone"
+            },
             self.after.as_deref().map(digest).unwrap_or("-".into()),
             self.old_back.as_deref().map(digest).unwrap_or("-".into()),
             self.fsck.trim(),
@@ -338,7 +341,8 @@ fn rep(case: After, rep: usize) -> Outcome {
     let mut run = Run::new(case.name(), rep);
     private(&run.dir.join("pool"));
     run.start();
-    run.cli(&["snapshot", "create", SNAP]).expect("snapshot create");
+    run.cli(&["snapshot", "create", SNAP])
+        .expect("snapshot create");
     let dir = run.snap();
 
     let old = dir.join(OLD);
@@ -365,11 +369,18 @@ fn rep(case: After, rep: usize) -> Outcome {
         rep,
         pid,
         after: fs::read(dir.join(NEW)).ok(),
-        old_back: fs::read(&dir.join(OLD)).ok(),
-        fsck: run.cli(&["fsck"]).unwrap_or_else(|e| format!("fsck failed: {e}")),
+        old_back: fs::read(dir.join(OLD)).ok(),
+        fsck: run
+            .cli(&["fsck"])
+            .unwrap_or_else(|e| format!("fsck failed: {e}")),
     };
     if let Some(body) = &out.after {
-        assert_eq!(body, &before, "{}: the new name came back with other bytes", case.name());
+        assert_eq!(
+            body,
+            &before,
+            "{}: the new name came back with other bytes",
+            case.name()
+        );
     }
     eprintln!("durability90 {}", out.line());
     out
@@ -415,7 +426,10 @@ fn a_synced_namespace_survives_a_killed_daemon() {
         }
     }
     for case in After::CASES {
-        let kept = outcomes.iter().filter(|o| o.case == case.name() && o.survived()).count();
+        let kept = outcomes
+            .iter()
+            .filter(|o| o.case == case.name() && o.survived())
+            .count();
         let total = outcomes.iter().filter(|o| o.case == case.name()).count();
         if total == 0 {
             continue;
@@ -490,7 +504,11 @@ fn native_apfs_survives_the_same_recipe() {
             }
         }
     }
-    assert_eq!(said.trim(), "renamed", "the helper never reported the rename");
+    assert_eq!(
+        said.trim(),
+        "renamed",
+        "the helper never reported the rename"
+    );
     assert!(
         Command::new("/bin/kill")
             .arg("-9")

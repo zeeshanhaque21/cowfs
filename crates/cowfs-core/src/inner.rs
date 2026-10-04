@@ -991,11 +991,18 @@ impl Inner {
         self.finish_sync()
     }
 
-    /// Makes everything applied to the metadata durable and clears the unsynced mark.
+    /// Makes everything applied to the metadata durable and clears the unsynced mark. A failure is
+    /// recorded where [`Core::health`] reports it, so a caller that is told the sync worked is
+    /// never the only thing that knows it did not.
     fn finish_sync(&self) -> Result<()> {
-        self.meta.sync().map_err(from_meta)?;
-        *self.unsynced.lk() = None;
-        Ok(())
+        let r = self.meta.sync().map_err(from_meta);
+        if let Err(e) = &r {
+            self.ctr.flush_errors.fetch_add(1, Ordering::Relaxed);
+            *self.last_error.lk() = Some(e.to_string());
+        } else {
+            *self.unsynced.lk() = None;
+        }
+        r
     }
 
     /// Commits the snapshot's namespace so an operation that needs meta to be current can go on.
