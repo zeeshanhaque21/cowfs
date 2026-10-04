@@ -326,7 +326,19 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
     }
 }
 
+/// `EMFILE`. `ErrorKind::TooManyOpenFiles` is still unstable, so the number is spelled out; it is
+/// the same on Linux and macOS, the only targets.
+const EMFILE: i32 = 24;
+
 fn is_transient_accept_error(e: &io::Error) -> bool {
+    if e.raw_os_error() == Some(EMFILE) {
+        // No descriptor left for the accepted socket. The flood that caused it is finite, and
+        // returning here drops the listening socket, so the server stops accepting for good
+        // instead of recovering once the flood stops (#57).
+        // ponytail: a sustained flood with a full queue retries accept at syscall speed. Add a
+        // short pause on EMFILE if that ever shows up as CPU burn.
+        return true;
+    }
     matches!(
         e.kind(),
         io::ErrorKind::ConnectionAborted
