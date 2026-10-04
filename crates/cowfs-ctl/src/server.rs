@@ -342,7 +342,10 @@ fn accept_loop(
             // exit in `cowfs serve` ends it.
             for worker in workers {
                 while !worker.is_finished() && Instant::now() < grace_end {
-                    std::thread::sleep(Duration::from_millis(1));
+                    // Yield rather than sleep: a one-millisecond sleep is a floor, not a ceiling, and
+                    // on a loaded runner it can stretch far enough to miss a worker that is already
+                    // runnable. The wait is bounded by `grace_end` either way.
+                    std::thread::yield_now();
                 }
             }
             // The connection threads own the sockets, and each request worker owns a handler. A worker
@@ -356,7 +359,7 @@ fn accept_loop(
             while Instant::now() < grace_end
                 && (!lock(&shared.conns).is_empty() || stragglers.iter().any(|c| !c.released()))
             {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
             }
             break;
         }
