@@ -608,14 +608,16 @@ impl Canonical {
         Ok(())
     }
 
-    /// The full argv for a build, without running it.
+    /// The arguments for a build, without the program name and without running anything.
+    ///
+    /// The helper is the program, so it is not repeated here: `Command::new` already supplies it,
+    /// and passing it again would make the helper read its own path as the first argument.
     ///
     /// `sh -c` is kept for the build command itself, because that command is user configuration and
     /// has always been a shell string. It is passed as one argv element, so nothing in it is ever
     /// re-split, and the canonical directory is a separate argv element rather than part of it.
-    pub fn argv(&self, dir: &Path, command: &str) -> Vec<std::ffi::OsString> {
+    pub fn args(&self, dir: &Path, command: &str) -> Vec<std::ffi::OsString> {
         vec![
-            self.helper.clone().into_os_string(),
             "--src".into(),
             dir.as_os_str().to_owned(),
             "--canonical".into(),
@@ -647,7 +649,7 @@ pub fn run_build(dir: &Path, command: &str, canonical: Option<&Canonical>) -> Re
             // apart, so a namespace this host cannot create is reported as unmeasurable and a real
             // build failure stays a failure. Never the other way round.
             let probe = Command::new(&c.helper)
-                .args(c.argv(dir, "exit 0"))
+                .args(c.args(dir, "exit 0"))
                 .output()
                 .map_err(|e| {
                     Error::Io(format!(
@@ -661,7 +663,7 @@ pub fn run_build(dir: &Path, command: &str, canonical: Option<&Canonical>) -> Re
                     crate::th::tail(&String::from_utf8_lossy(&probe.stderr))
                 )));
             }
-            let argv = c.argv(dir, command);
+            let argv = c.args(dir, command);
             let mut child = Command::new(&c.helper);
             child.args(argv).current_dir(dir);
             child

@@ -163,9 +163,12 @@ companion_run() { HOME=$thhome "$companion" --socket "$sock" "$@"; }
 # The warm base, built through the seam. This is the delivery run: a real repo, a real git commit, a
 # real companion invocation with --canonical, and a real warm base snapshot afterwards.
 repo_dir=$out/repo
+# Recreated every run, so a second run in the same directory starts from nothing rather than
+# inheriting the last run's commit.
+rm -rf "$repo_dir"
 mkdir -p "$repo_dir"
 cp "$out/fixture/main.rs" "$repo_dir/main.rs"
-git -C "$repo_dir" init -q -b main
+git -C "$repo_dir" init -q -b main 2>/dev/null
 git -C "$repo_dir" config user.email ns17@example.invalid
 git -C "$repo_dir" config user.name ns17
 git -C "$repo_dir" add main.rs
@@ -177,34 +180,42 @@ say "warm base: importing the repo into the store"
 cowfs import "$repo_dir" --name base >>"$out/import.log" 2>&1 ||
   fail "import failed, see $out/import.log"
 
+# The build runs in the snapshot itself, through --slot, because this host has no treehouse binary to
+# lease a slot with. That is the same run_build call site a leased slot takes, so the seam under test
+# is identical; only the slot provider differs, and the doc says so.
+refresh() { # refresh SLOT_DIR OUT_NAME
+  companion_run --json base refresh --repo "$repo_dir" --ref main --slot "$1" --build \
+    'rustc -g --edition 2021 main.rs -o app' --canonical "$canonical" --ns-helper "$helper" \
+    >"$2" 2>&1
+}
+
+classify_refresh() { # classify_refresh OUT_NAME RC
+  if grep -q UNMEASURABLE "$2"; then
+    tail -5 "$2" | tee -a "$out/run.log"
+    unmeasurable "the companion reported no namespace: $(tail -1 "$2")"
+  fi
+  fail "cowfs-treehouse base refresh exited $3: $(tail -3 "$2" | tr '\n' ' ')"
+}
+
 say "warm base: building through cowfs-treehouse base refresh --canonical $canonical"
-if companion_run base refresh --repo "$repo_dir" --ref main --build \
-  'rustc -g --edition 2021 main.rs -o app' --canonical "$canonical" \
-  --ns-helper "$helper" >"$out/refresh.log" 2>&1; then
+if refresh "$mnt/base" "$out/refresh.log"; then
   say "warm base: refresh succeeded, the build ran through the namespace seam"
 else
-  rc=$?
-  # 77 from the helper means no namespace, but the companion reports that as Unsupported, which is
-  # exit 1. The message decides, not the code, because the code cannot.
-  if grep -q UNMEASURABLE "$out/refresh.log"; then
-    tail -5 "$out/refresh.log" | tee -a "$out/run.log"
-    unmeasurable "the companion reported no namespace: $(tail -1 "$out/refresh.log")"
-  fi
-  fail "cowfs-treehouse base refresh exited $rc: $(tail -3 "$out/refresh.log" | tr '\n' ' ')"
+  classify_refresh refresh "$out/refresh.log" $?
 fi
 
-pool_id=$(basename "$(dirname "$repo_dir")")
-base_snap="base-${pool_id}"
-say "warm base: expected base snapshot $base_snap"
+# The base snapshot name is derived by the companion, so it is read back rather than guessed.
+base_snap=$(python3 -c "import json,sys; print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])['snapshot'])" "$out/refresh.log")
+say "warm base: the companion reported snapshot $base_snap"
 cowfs snapshot list | tee -a "$out/run.log"
 
-# The warm base must have kept the artifact the build produced at the canonical path.
-if [ -f "$mnt/$base_snap/app" ]; then
-  cp "$mnt/$base_snap/app" "$out/app-base"
-  say "warm base: the artifact is in the base snapshot at the store level"
-else
-  fail "the warm base snapshot $base_snap has no app, so the build did not land in the store"
-fi
+# The build ran in the imported `base` snapshot, so that is where its artifact must be, and the
+# derived snapshot $base_snap is what a slot will be cloned from.
+[ -f "$mnt/base/app" ] || fail "the base snapshot has no app, so the build did not land in the store"
+cp "$mnt/base/app" "$out/app-base"
+say "warm base: the artifact landed in the base snapshot at the store level"
+[ -d "$mnt/$base_snap" ] || fail "the derived warm base snapshot $base_snap does not exist"
+say "warm base: the derived warm base $base_snap exists, ready to be cloned"
 
 # Two fresh slots cloned from that warm base, each built through the same seam at the same canonical
 # path. These are the two artifacts the issue is about.
@@ -214,10 +225,11 @@ for name in slotA slotB; do
   cowfs snapshot create "$name" --from "$base_snap" >"$out/snapshot-$name.log" 2>&1 ||
     fail "snapshot create $name failed, see $out/snapshot-$name.log"
   say "slot: building $name through the companion at the canonical path"
-  companion_run base refresh --repo "$repo_dir" --ref main --build \
-    "rustc -g --edition 2021 main.rs -o app" --canonical "$canonical" \
-    --ns-helper "$helper" >"$out/build-$name.log" 2>&1 ||
-    fail "the $name build failed: $(tail -3 "$out/build-$name.log" | tr '\n' ' ')"
+  if refresh "$mnt/$name" "$out/build-$name.log"; then
+    say "slot: the $name build ran through the namespace seam"
+  else
+    classify_refresh "$name" "$out/build-$name.log" $?
+  fi
   [ -f "$mnt/$name/app" ] || fail "$name has no app after the build"
   cp "$mnt/$name/app" "$out/app-$name"
 done

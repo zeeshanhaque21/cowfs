@@ -168,6 +168,8 @@ fn the_argv_keeps_the_build_command_as_one_element() {
     c.validate().expect("a valid canonical");
     run_build(&slot, command, Some(&c)).expect("the stub exits 0");
 
+    // No element may repeat the helper's own path: the helper is the program, and Command::new
+    // already supplies it. A repeat here made the helper read its own path as --src's value.
     let argv = recorded(&helper);
     assert_eq!(
         argv,
@@ -230,6 +232,30 @@ fn off_linux_a_valid_canonical_pair_is_unsupported_and_never_ignored() {
     assert!(
         !slot.join("SHOULD_NOT_EXIST").exists(),
         "the build must not run"
+    );
+}
+
+/// The regression that mattered: the helper path used to be repeated as the first argument, so the
+/// helper read its own path where `--src`'s value belonged and refused. `args` is pure, so this is
+/// checked on every platform, namespace or not.
+#[test]
+fn the_helper_path_is_never_repeated_as_an_argument() {
+    let t = Tmp::new("no-repeat");
+    let slot = t.dir("slot");
+    let helper = recording_helper(&t, 0, "");
+    let c = Canonical {
+        dir: t.dir("canonical"),
+        helper: helper.clone(),
+    };
+    let argv = c.args(&slot, "exit 0");
+    assert_eq!(
+        argv.first().map(|a| a.to_string_lossy().into_owned()),
+        Some("--src".to_owned()),
+        "the arguments start at --src, not at the helper's own path"
+    );
+    assert!(
+        !argv.iter().any(|a| a == helper.as_os_str()),
+        "the program must not also appear as an argument: {argv:?}"
     );
 }
 
