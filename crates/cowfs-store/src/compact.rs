@@ -107,6 +107,8 @@ pub struct Rewrite {
     pub records: u64,
     /// Bytes written to the new pack, excluding its 16 byte header.
     pub bytes: u64,
+    /// File length of the new pack, header included, or 0 when nothing was written.
+    pub file_bytes: u64,
     /// Block ids the new pack does not hold, for [`Store::discard_pack`].
     pub condemned: Vec<BlockId>,
 }
@@ -154,6 +156,11 @@ impl Compaction {
     /// Bytes the new pack holds, excluding its header.
     pub fn written(&self) -> u64 {
         self.len - PACK_HEADER_LEN
+    }
+
+    /// True once the copy has created its target pack on disk.
+    pub fn target_created(&self) -> bool {
+        self.target.is_some()
     }
 
     /// Bytes the remaining records will add to the new pack.
@@ -404,8 +411,15 @@ impl Store {
             } else {
                 0
             },
+            file_bytes: if c.target.is_some() { c.len } else { 0 },
             condemned: c.condemned.clone(),
         })
+    }
+
+    /// On-disk file length of a pack by id, or 0 when it is not there. Used to account a partial
+    /// copy whose target pack was created and never finished.
+    pub fn pack_file_len(&self, id: u32) -> u64 {
+        fs::metadata(pack::pack_path(self.guts().dir, id)).map_or(0, |m| m.len())
     }
 
     /// Unlink a pack whose live records were copied, and drop the index entries of the ids it no
@@ -415,6 +429,25 @@ impl Store {
     /// before it is unlinked, so a crash in the middle is never mistaken for lost data, and the
     /// watermark base is lowered so the gap is not reported as a missing pack.
     pub fn discard_pack(&self, id: u32, condemned: &[BlockId]) -> Result<u64> {
+        let d = self.discard(id, condemned)?;
+        match d.durability_error {
+            Some(e) => Err(e),
+            None => Ok(d.removed_bytes),
+        }
+    }
+
+    /// Discard a pack, reporting what it really did even when it failed after the unlink.
+    ///
+    /// [`Self::discard_pack`] cannot express that: it returns only `Err` once the pack is gone,
+    /// which loses the file length of a pack the store has already unlinked. A caller that only
+    /// credits bytes on `Ok` then reports no removal for a removal that happened, and a pack the
+    /// unlink removed stays named in the writer's in-memory map.
+    ///
+    /// So the effect and the failure are separate fields: `Err` means the unlink did not happen and
+    /// nothing changed on disk, while `Ok` means it did, with `removed_bytes` its file length.
+    /// `durability_error` then carries a step that failed *after* the pack was gone, which the
+    /// caller must still surface: the bytes are freed, but the unlink is not confirmed durable.
+    pub fn discard(&self, id: u32, condemned: &[BlockId]) -> Result<Discarded> {
         self.sync()?;
         let g = self.guts();
         for b in condemned {
@@ -429,7 +462,7 @@ impl Store {
         // and fails forever.
         let Ok(meta) = fs::metadata(&path) else {
             self.forget_pack(id);
-            return Ok(0);
+            return Ok(Discarded::default());
         };
         let len = meta.len();
         // The watermark floor goes above this pack before the file is unlinked, and durably. A crash
@@ -452,11 +485,22 @@ impl Store {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 self.forget_pack(id);
-                return Ok(0);
+                return Ok(Discarded::default());
             }
             Err(e) => return Err(e.into()),
         }
-        g.io.sync_dir(&pack::pack_dir(g.dir))?;
+        // The pack is gone from disk from here on, so the writer's map must stop naming it even if a
+        // later step fails: `fsck` walks that map, and an id whose file is gone fails the check
+        // permanently rather than only until the next cycle.
+        self.forget_pack(id);
+        let mut out = Discarded {
+            removed_bytes: len,
+            durability_error: None,
+        };
+        if let Err(e) = g.io.sync_dir(&pack::pack_dir(g.dir)) {
+            out.durability_error = Some(e.into());
+            return Ok(out);
+        }
         fsio::oplog_marker(MARK_AFTER_DIRSYNC);
         // Only now, with the file really gone, is a whole-pack acceptance true. Written while the
         // pack was still there it would be a wildcard: `find` treats a zero nonce as matching any,
@@ -471,8 +515,26 @@ impl Store {
             len: ack::WHOLE_PACK.1,
             id: None,
         });
-        ack::save(g.io, g.dir, entries)?;
-        self.forget_pack(id);
-        Ok(len)
+        if let Err(e) = ack::save(g.io, g.dir, entries) {
+            out.durability_error = Some(e.into());
+        }
+        Ok(out)
     }
+}
+
+/// What one [`Store::discard`] actually did.
+///
+/// The effect and the failure are separate because they answer different questions: `removed_bytes`
+/// is what the store really freed, and `durability_error` is a step that failed after the pack was
+/// already gone, so the removal happened but is not confirmed durable. A caller that drops
+/// `removed_bytes` when `durability_error` is set under-reports a reclaim that happened; a caller
+/// that drops `durability_error` reports a removal it cannot vouch for.
+#[derive(Debug, Default)]
+pub struct Discarded {
+    /// The pack file's length, which the unlink removed. Zero when the pack was already gone, so a
+    /// caller credits exactly one removal per pack that actually left the store.
+    pub removed_bytes: u64,
+    /// A failure that happened after the unlink. The pack is gone; its removal is not confirmed
+    /// durable and the acceptance record that says so was not written.
+    pub durability_error: Option<Error>,
 }

@@ -341,10 +341,35 @@ impl ControlHandler for Handler {
                  was freed: try again when the mount is quieter",
             ));
         }
-        if let (Some(first), 0) = (r.errors.first(), r.freed_bytes) {
+        // A pack whose unlink could not be made durable is counted in the figures, because the file is
+        // really gone, but the cycle is not a clean success: the removal is unconfirmed. The message
+        // carries the real gross, rewrite and net so the caller sees the actual numbers rather than
+        // reading an unexplained success.
+        if r.unlink_durability_errors > 0 {
             return Err(CtlError::new(
                 ErrorCode::IoError,
-                format!("garbage collection freed nothing: {first}"),
+                format!(
+                    "garbage collection could not confirm {} unlink(s) as durable; {} removed \
+                     (gross), {} rewritten, net {} reclaimed; first failure: {}",
+                    r.unlink_durability_errors,
+                    r.gross_removed_bytes,
+                    r.rewrite_bytes,
+                    r.net_reclaimed_bytes,
+                    r.errors.first().map_or("none", String::as_str),
+                ),
+            ));
+        }
+        if let (Some(first), 0) = (r.errors.first(), r.freed_bytes) {
+            // The cycle failed before it unlinked any pack, but it may still have written bytes
+            // into a new pack. The message carries the real gross, rewrite and net so the caller
+            // sees the actual cost instead of a bare "freed nothing" that hides a rewrite.
+            return Err(CtlError::new(
+                ErrorCode::IoError,
+                format!(
+                    "garbage collection freed nothing: {first}; {} removed (gross), {} rewritten, \
+                     net {} reclaimed",
+                    r.gross_removed_bytes, r.rewrite_bytes, r.net_reclaimed_bytes
+                ),
             ));
         }
         Ok(GcReport {
@@ -353,6 +378,9 @@ impl ControlHandler for Handler {
             candidate_bytes: r.candidate_dead_bytes,
             freed_blocks: out.blocks_before.saturating_sub(out.blocks_after),
             freed_bytes: r.freed_bytes,
+            gross_removed_bytes: r.gross_removed_bytes,
+            rewrite_bytes: Some(r.rewrite_bytes),
+            net_reclaimed_bytes: Some(r.net_reclaimed_bytes),
         })
     }
 
@@ -780,6 +808,15 @@ mod tests {
         );
         assert_eq!((dry.freed_blocks, dry.freed_bytes), (0, 0), "{dry:?}");
         assert_eq!(
+            (
+                dry.gross_removed_bytes,
+                dry.rewrite_bytes,
+                dry.net_reclaimed_bytes
+            ),
+            (0, Some(0), Some(0)),
+            "a dry run reports no actual gross, rewrite or net: {dry:?}"
+        );
+        assert_eq!(
             backend.usage().unwrap().unwrap(),
             before,
             "a dry run changes nothing"
@@ -788,6 +825,15 @@ mod tests {
         let live = h.gc(GcParams { dry_run: false }, &ctx).unwrap();
         assert!(!live.dry_run);
         assert!(live.freed_bytes > 0 && live.freed_blocks > 0, "{live:?}");
+        assert_eq!(
+            live.gross_removed_bytes, live.freed_bytes,
+            "the explicit gross field agrees with the legacy one: {live:?}"
+        );
+        assert_eq!(
+            live.net_reclaimed_bytes,
+            Some(live.gross_removed_bytes as i64 - live.rewrite_bytes.unwrap() as i64),
+            "net is gross minus rewrite, signed: {live:?}"
+        );
         let after = backend.usage().unwrap().unwrap();
         assert!(after.blocks < before.blocks, "{before:?} -> {after:?}");
         assert_eq!(before.blocks - after.blocks, live.freed_blocks);
@@ -800,6 +846,132 @@ mod tests {
             assert!(get(k.as_ref(), n) == *data, "{n}");
         }
         assert!(backend.fsck().unwrap().unwrap().damage.is_empty());
+    }
+
+    /// A backend that reports a GC cycle which failed but still wrote bytes into a new pack: an
+    /// error, zero unlinked packs, and a positive rewrite. Used to check the daemon surfaces the
+    /// real cost rather than dropping the report behind a bare "freed nothing".
+    #[derive(Debug)]
+    struct FailingGc {
+        inner: PathBackend,
+        report: cowfs_gc::GcReport,
+    }
+
+    impl Backend for FailingGc {
+        fn ingests_directories(&self) -> bool {
+            self.inner.ingests_directories()
+        }
+
+        fn root(&self) -> std::io::Result<Arc<dyn cowfs_vfs::Vfs>> {
+            self.inner.root()
+        }
+
+        fn snapshot(&self, name: &str) -> std::io::Result<Arc<dyn cowfs_vfs::Vfs>> {
+            self.inner.snapshot(name)
+        }
+
+        fn store_path(&self) -> &std::path::Path {
+            self.inner.store_path()
+        }
+
+        fn snapshots(&self) -> &dyn crate::backend::Snapshots {
+            self.inner.snapshots()
+        }
+
+        fn collect_garbage(
+            &self,
+            _dry_run: bool,
+            _progress: crate::backend::GcProgress<'_>,
+            _cancelled: &dyn Fn() -> bool,
+        ) -> CtlResult<Option<crate::backend::GcOutcome>> {
+            Ok(Some(crate::backend::GcOutcome {
+                report: self.report.clone(),
+                blocks_before: 10,
+                blocks_after: 10,
+            }))
+        }
+    }
+
+    fn gc_handler_with_report(report: cowfs_gc::GcReport) -> (tempfile::TempDir, Arc<Handler>) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(FailingGc {
+            inner: PathBackend::open(dir.path().join("store")).unwrap(),
+            report,
+        });
+        backend.snapshots().create("base", None).unwrap();
+        let mount = Arc::new(
+            Mounted::no_mount(dir.path().join("mnt")).expect("the placeholder is always there"),
+        );
+        let exports = Exports::new(
+            Arc::clone(&backend),
+            vec![dir.path().join("pool")],
+            vec![backend.store_path().to_owned()],
+            dir.path().join("mnt"),
+        );
+        (dir, Handler::new(backend, mount, exports))
+    }
+
+    /// A pack the store unlinked but could not make durable is a terminal failure, not a quiet
+    /// success: the bytes are gone, so the figures are real, but the cycle could not confirm the
+    /// removal and the caller has to be told.
+    #[test]
+    fn an_unconfirmed_unlink_is_a_terminal_failure_carrying_the_real_figures() {
+        let (_d, h) = gc_handler_with_report(cowfs_gc::GcReport {
+            freed_bytes: 8192,
+            gross_removed_bytes: 8192,
+            rewrite_bytes: 2048,
+            net_reclaimed_bytes: 6144,
+            packs_unlinked: 2,
+            unlink_durability_errors: 2,
+            errors: vec!["i/o error: Is a directory (os error 21)".into()],
+            ..Default::default()
+        });
+        let ctx = OpContext::new(cowfs_ctl::CancelToken::new(), |_| true);
+        let e = h.gc(GcParams { dry_run: false }, &ctx).unwrap_err();
+        assert_eq!(e.code, ErrorCode::IoError, "{e}");
+        let msg = e.message.clone();
+        assert!(msg.contains("durable"), "{msg}");
+        // The real numbers, not zeros: the unlink happened.
+        assert!(msg.contains("8192") && msg.contains("2048"), "{msg}");
+        assert!(msg.contains("6144"), "the signed net is carried: {msg}");
+    }
+
+    #[test]
+    fn a_failed_gc_that_wrote_bytes_reports_the_cost_not_a_bare_freed_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = cowfs_gc::GcReport {
+            rewrite_bytes: 4096,
+            net_reclaimed_bytes: -4096,
+            errors: vec!["corrupt record in pack 5".into()],
+            ..Default::default()
+        };
+        let backend: Arc<dyn Backend> = Arc::new(FailingGc {
+            inner: PathBackend::open(dir.path().join("store")).unwrap(),
+            report,
+        });
+        backend.snapshots().create("base", None).unwrap();
+        let mount = Arc::new(
+            Mounted::no_mount(dir.path().join("mnt")).expect("the placeholder is always there"),
+        );
+        let exports = Exports::new(
+            Arc::clone(&backend),
+            vec![dir.path().join("pool")],
+            vec![backend.store_path().to_owned()],
+            dir.path().join("mnt"),
+        );
+        let h = Handler::new(backend, mount, exports);
+        let ctx = OpContext::new(cowfs_ctl::CancelToken::new(), |_| true);
+        let e = h.gc(GcParams { dry_run: false }, &ctx).unwrap_err();
+        assert_eq!(e.code, ErrorCode::IoError, "{e}");
+        let msg = e.message.clone();
+        assert!(
+            msg.contains("4096") && msg.contains("rewritten"),
+            "the failure must carry the real rewrite cost, not a bare 'freed nothing': {msg}"
+        );
+        assert!(
+            msg.contains("-4096") || msg.contains("net -"),
+            "the failure must show the signed net: {msg}"
+        );
     }
 
     #[test]

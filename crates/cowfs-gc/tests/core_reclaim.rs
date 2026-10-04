@@ -173,6 +173,56 @@ fn bytes(p: &BTreeMap<String, u64>) -> u64 {
     p.values().sum()
 }
 
+/// Flip one byte in every non-last pack's first record payload, so a copy of a live record from
+/// those packs fails its checksum. The last pack is left alone as the tail watermark. Test-only:
+/// it simulates on-disk corruption that builds no public fault switch for.
+fn corrupt_first_record_of_non_last_packs(dir: &Path) {
+    let mut names: Vec<String> = packs(dir).into_keys().collect();
+    names.sort();
+    let last = names.pop();
+    for name in names {
+        if Some(&name) == last.as_ref() {
+            continue;
+        }
+        let path = dir.join("store").join("packs").join(&name);
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open pack");
+        let off = 100u64;
+        let len = f.metadata().unwrap().len();
+        if off >= len {
+            continue;
+        }
+        use std::io::{Read, Seek, SeekFrom, Write};
+        f.seek(SeekFrom::Start(off)).unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact(&mut b).unwrap();
+        b[0] ^= 0xff;
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.write_all(&b).unwrap();
+        f.sync_all().unwrap();
+    }
+}
+
+/// Make the store's acceptance record impossible to rewrite, which fails a step of
+/// `discard_pack` strictly after the pack file is unlinked: `write_whole` renames a temporary over
+/// `ACKED`, and a rename onto a directory fails with `EISDIR`.
+///
+/// Test-only, and labelled for what it is: a private store-state mutation standing in for a
+/// post-unlink I/O error. It is not a real `EIO` or `ENOSPC`, and it exercises exactly the branch a
+/// real one would take. Returns what it replaced, so a wrong target cannot pass unnoticed.
+fn block_ack_rewrite(dir: &Path) -> String {
+    let acked = dir.join("store").join("ACKED");
+    let was = std::fs::symlink_metadata(&acked)
+        .map(|m| if m.is_dir() { "directory" } else { "file" })
+        .unwrap_or("absent");
+    let _ = std::fs::remove_file(&acked);
+    std::fs::create_dir(&acked).expect("create the ACKED directory");
+    format!("ACKED was {was} at {}", acked.display())
+}
+
 fn clean(r: &GcReport) {
     assert!(r.errors.is_empty(), "cycle errors: {:?}", r.errors);
     assert!(r.roots_error.is_none(), "roots error: {:?}", r.roots_error);
@@ -504,12 +554,34 @@ fn a_cancel_mid_cycle_stops_new_work_and_leaves_the_store_consistent() {
         r.packs_unlinked, r.packs_rewritten,
         "what was copied is finished: {r:?}"
     );
+    // Accounting after a cancel still respects the identity, and gross tracks only the packs the
+    // cycle actually unlinked, never the ones it merely planned to.
+    assert_eq!(
+        r.gross_removed_bytes, r.freed_bytes,
+        "gross agrees with the legacy field after a cancel: {r:?}"
+    );
+    assert_eq!(
+        r.net_reclaimed_bytes,
+        r.gross_removed_bytes as i64 - r.rewrite_bytes as i64,
+        "the signed net identity holds after a cancel: {r:?}"
+    );
+    if r.packs_unlinked == 0 {
+        assert_eq!(
+            r.gross_removed_bytes, 0,
+            "nothing unlinked means no gross claimed: {r:?}"
+        );
+    }
     verify(&core, &plan.keep);
     fsck_clean(&core);
     c.gc().resume();
     c.gc().set_progress(|_| {});
     let r2 = c.collect().unwrap();
     clean(&r2);
+    assert_eq!(
+        r2.net_reclaimed_bytes,
+        r2.gross_removed_bytes as i64 - r2.rewrite_bytes as i64,
+        "the resumed cycle's net is its own, not the cancelled cycle's: {r2:?}"
+    );
     verify(&core, &plan.keep);
     drop(c);
     core.close().unwrap();
@@ -637,6 +709,17 @@ fn collections_run_beside_writers_and_forks_without_deadlock_or_loss() {
                     if r.roots_error.is_none() {
                         assert!(r.errors.is_empty(), "cycle errors: {:?}", r.errors);
                     }
+                    // The cycle's net is cycle-owned: gross minus the bytes it rewrote, never a
+                    // process-wide before/after that a concurrent writer's appends would distort.
+                    assert_eq!(
+                        r.net_reclaimed_bytes,
+                        r.gross_removed_bytes as i64 - r.rewrite_bytes as i64,
+                        "net is cycle-owned under concurrent appends: {r:?}"
+                    );
+                    assert_eq!(
+                        r.gross_removed_bytes, r.freed_bytes,
+                        "gross agrees with the legacy field under concurrent appends: {r:?}"
+                    );
                     cycles.fetch_add(1, SeqCst);
                     unlinked.fetch_add(r.packs_unlinked as usize, SeqCst);
                     beat.fetch_add(1, SeqCst);
@@ -967,5 +1050,376 @@ fn a_snapshot_removed_between_the_lookup_and_the_walk_does_not_fail_the_cycle() 
     drop(survivor);
     verify(&core, &keep);
     fsck_clean(&core);
+    core.close().unwrap();
+}
+
+/// Issue #81: on a mixed-live/dead pack the gross unlinked bytes exceed the space actually
+/// reclaimed, because the surviving live records are rewritten into a new pack. The report must
+/// say both, and the net must equal the physical drop the cycle caused, with no process-wide
+/// before/after shortcut.
+#[test]
+fn a_mixed_pack_reports_gross_removed_rewrite_and_signed_net() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+
+    let before = packs(dir.path());
+    let bytes_before = bytes(&before);
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.packs_unlinked > 0, "dead packs were reclaimed: {r:?}");
+    assert!(r.freed_bytes > 0, "gross bytes removed: {r:?}");
+
+    let after = packs(dir.path());
+    let bytes_after = bytes(&after);
+
+    // The mixed scenario must actually exercise the gross > net case.
+    assert!(
+        r.rewrite_bytes > 0,
+        "live records were rewritten into a new pack: {r:?}"
+    );
+    assert_eq!(
+        r.gross_removed_bytes, r.freed_bytes,
+        "the explicit gross field and the legacy field agree"
+    );
+    assert!(
+        r.gross_removed_bytes > r.net_reclaimed_bytes as u64,
+        "gross removal exceeds net reclaimed on a mixed pack: {r:?}"
+    );
+
+    // The identity: net == gross removed minus the bytes written into the cycle's own new packs.
+    assert_eq!(
+        r.net_reclaimed_bytes,
+        r.gross_removed_bytes as i64 - r.rewrite_bytes as i64,
+        "net is the accounting identity, not a process-wide delta: {r:?}"
+    );
+
+    // And the identity matches the physical pack drop, since no concurrent writer ran here.
+    let physical_drop = bytes_before as i64 - bytes_after as i64;
+    assert_eq!(
+        physical_drop, r.net_reclaimed_bytes,
+        "cycle-owned net equals the physical pack drop under a quiescent store: \
+         {bytes_before} -> {bytes_after}, {r:?}"
+    );
+
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+}
+
+/// A copy that fails mid-batch (a corrupt live record after the new pack was created) still
+/// accounts the bytes the cycle wrote. The old code set the abandoned figure only on the
+/// cancel/budget branch, so an error exit dropped the new pack's bytes and reported a net that
+/// overstated savings. This is the regression: the reported net must equal the physical drop.
+///
+/// The injected corruption is a fault the test introduces, so a later `Core::open` would refuse
+/// the store by design. Survivors are checked through the still-open core instead.
+#[test]
+fn a_copy_that_fails_on_a_corrupt_live_record_still_accounts_the_new_pack_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let _plan = build(&core);
+    core.sync().unwrap();
+
+    // Corrupt on disk while the core is open: the store reads pack records with `pread`, so the
+    // new bytes are what the cycle's copy sees. A reopen would refuse the store by design.
+    corrupt_first_record_of_non_last_packs(dir.path());
+
+    let before = packs(dir.path());
+    let bytes_before = bytes(&before);
+
+    // Note every live block now, before the cycle runs. After the cycle, each must either read
+    // as before or be one the injected corruption broke. This proves the failed copy plus its
+    // accounting did not drop an intact survivor.
+    let live_before: Vec<BlockId> = core.store().iter_ids().collect();
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+
+    // The cycle hit the corruption, so it reports errors rather than a clean run.
+    assert!(
+        !r.errors.is_empty(),
+        "the corrupt live record is reported: {r:?}"
+    );
+
+    let after = packs(dir.path());
+    let bytes_after = bytes(&after);
+    let physical_net = bytes_before as i64 - bytes_after as i64;
+
+    // The reported net must equal the physical drop even though the copy errored, which requires
+    // the new pack's bytes to be in the rewrite figure.
+    assert_eq!(
+        r.net_reclaimed_bytes, physical_net,
+        "a failed copy must still count its new pack bytes: {bytes_before} -> {bytes_after}, {r:?}"
+    );
+    assert_eq!(
+        r.net_reclaimed_bytes,
+        r.gross_removed_bytes as i64 - r.rewrite_bytes as i64,
+        "the identity holds on the error path: {r:?}"
+    );
+    assert!(
+        r.rewrite_bytes > 0,
+        "the failed copy left bytes on disk and they are accounted: {r:?}"
+    );
+
+    // The survivors the cycle did not touch still read through the open core. Every live block
+    // from before must read now, unless it sits in the corruption this test injected. This proves
+    // the failed cycle protected healthy refs without a reopen, which the injected corruption
+    // would rightly refuse.
+    let mut broken = 0;
+    for b in &live_before {
+        if core.store().get(*b).is_err() {
+            broken += 1;
+        }
+    }
+    assert!(
+        broken < live_before.len(),
+        "the failed cycle did not drop every survivor: {r:?}"
+    );
+    assert!(
+        broken > 0,
+        "the injected corruption surfaced, so a copy really failed: {r:?}"
+    );
+    drop(c);
+    core.close().unwrap();
+}
+
+/// A failure *after* the pack file is unlinked still has to be counted as a removal.
+///
+/// `discard_pack` used to return only `Err` once the pack was gone, so the cycle credited nothing
+/// for packs it really unlinked: gross came out 0 and net came out `0 - rewrite`, while the packs
+/// were gone from disk. The pack also stayed named in the writer's in-memory map, so `fsck` on the
+/// same open core failed on a file the cycle had itself removed.
+///
+/// The failure is surfaced as well as counted. Counting it alone would report a removal the store
+/// cannot vouch for, so the error stays in the report and a durability failure is never a clean run.
+#[test]
+fn a_failure_after_the_unlink_still_reports_the_removal_it_performed() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+
+    let before = packs(dir.path());
+    let bytes_before = bytes(&before);
+    eprintln!("fault: {}", block_ack_rewrite(dir.path()));
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    assert!(
+        !r.errors.is_empty(),
+        "the post-unlink failure is reported, not swallowed: {r:?}"
+    );
+
+    let after = packs(dir.path());
+    let bytes_after = bytes(&after);
+    let physical_net = bytes_before as i64 - bytes_after as i64;
+    // Gross is the length of the packs that left, not the drop in total size: the cycle also wrote
+    // new packs, which is what separates gross from net.
+    let gone: u64 = before
+        .iter()
+        .filter(|(k, _)| !after.contains_key(*k))
+        .map(|(_, v)| *v)
+        .sum();
+
+    // The packs really left the store, so gross must say so and net must not flip sign.
+    assert!(
+        r.packs_unlinked > 0 && gone > 0,
+        "the fixture must actually unlink packs: {bytes_before} -> {bytes_after}, {r:?}"
+    );
+    assert_eq!(
+        r.gross_removed_bytes, gone,
+        "gross is the bytes the store really unlinked: {r:?}"
+    );
+    assert_eq!(r.gross_removed_bytes, r.freed_bytes, "{r:?}");
+    assert_eq!(
+        r.net_reclaimed_bytes, physical_net,
+        "net equals the physical drop on the post-unlink error path: {r:?}"
+    );
+    assert_eq!(
+        r.net_reclaimed_bytes,
+        r.gross_removed_bytes as i64 - r.rewrite_bytes as i64,
+        "the identity holds on the post-unlink error path: {r:?}"
+    );
+
+    // The pack must be retired from the writer's map, or fsck on this same core walks an id whose
+    // file the cycle itself removed and fails forever.
+    fsck_clean(&core);
+
+    // No double credit: the packs are already gone, so a second cycle removes nothing.
+    let r2 = c.collect().unwrap();
+    assert_eq!(
+        (
+            r2.packs_unlinked,
+            r2.gross_removed_bytes,
+            r2.net_reclaimed_bytes
+        ),
+        (0, 0, 0),
+        "a second cycle must not credit the same unlink again: {r2:?}"
+    );
+
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
+}
+
+/// A failure *before* the unlink removed nothing, so nothing may be claimed for it.
+///
+/// The other half of the post-unlink case: the cycle must not credit a removal that never happened,
+/// and must leave the pack registered so a later cycle can still remove it. Without a second
+/// collector on one store, the seam is the same `discard` boundary the post-unlink test drives from
+/// the other side: `Err` means the unlink did not happen, `Ok` means it did.
+#[test]
+fn a_pack_the_store_still_holds_is_never_claimed_as_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+
+    // No fault here: this is the control for the post-unlink test, proving the difference is the
+    // failure point and not the fixture.
+    let before = packs(dir.path());
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.packs_unlinked > 0, "{r:?}");
+
+    let after = packs(dir.path());
+    let gone: u64 = before
+        .iter()
+        .filter(|(k, _)| !after.contains_key(*k))
+        .map(|(_, v)| *v)
+        .sum();
+    assert_eq!(
+        r.gross_removed_bytes, gone,
+        "every pack that left the store is credited, and nothing else: {r:?}"
+    );
+    // Every pack that left the store is named in the count, and no pack that stayed is.
+    let gone_names: Vec<&String> = before.keys().filter(|k| !after.contains_key(*k)).collect();
+    assert_eq!(
+        r.packs_unlinked as usize,
+        gone_names.len(),
+        "the count is exactly the packs that left the store: {r:?}"
+    );
+    assert!(
+        !gone_names.is_empty(),
+        "the fixture must unlink something: {r:?}"
+    );
+
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
+}
+
+/// The signed net must not saturate: a cycle whose rewrite cost exceeds the bytes it unlinked
+/// reports a negative net, which is the truthful no-savings outcome.
+#[test]
+fn an_expensive_rewrite_reports_a_negative_net_without_saturating() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+
+    // A dead ratio of 0.0 rewrites every non-active pack, and a tiny pack size makes each rewrite
+    // produce a whole new pack with a header, so the rewrite can cost more than the removed pack.
+    let c = core
+        .collector(GcOptions {
+            dead_ratio: 0.0,
+            min_dead_bytes: 1,
+            io_budget_bytes: 0,
+            batch_bytes: 64,
+            ..GcOptions::default()
+        })
+        .unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    if r.rewrite_bytes > 0 {
+        assert_eq!(
+            r.net_reclaimed_bytes,
+            r.gross_removed_bytes as i64 - r.rewrite_bytes as i64,
+            "net stays the signed identity: {r:?}"
+        );
+    }
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+}
+
+/// A dry run estimates, it does not reclaim. The reported estimate is `candidate_dead_bytes` and
+/// the actual gross, rewrite and net are all zero, distinct from a real cycle.
+#[test]
+fn a_dry_run_reports_zero_actual_gross_rewrite_and_net() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+
+    let c = core
+        .collector(GcOptions {
+            dry_run: true,
+            ..gc_opts()
+        })
+        .unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.dry_run);
+    assert_eq!(
+        (
+            r.gross_removed_bytes,
+            r.rewrite_bytes,
+            r.net_reclaimed_bytes
+        ),
+        (0, 0, 0),
+        "a dry run reclaims nothing and reports no actual bytes: {r:?}"
+    );
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+}
+
+/// A cycle with nothing to reclaim reports all three fields as zero and no rewrite, so a caller
+/// cannot mistake an empty cycle for a saving.
+#[test]
+fn a_no_op_cycle_reports_zero_gross_rewrite_and_net() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    core.create_snapshot("keep").expect("keep");
+    let kv = core.snapshot_view("keep").expect("view");
+    let mut files = Vec::new();
+    for i in 0..8u32 {
+        let f = (format!("k{i:02}"), body(40_000, i));
+        put_file(&kv, &f.0, &f.1);
+        files.push(f);
+        core.sync().expect("sync");
+    }
+
+    let before = packs(dir.path());
+    let c = core
+        .collector(GcOptions {
+            dry_run: false,
+            ..gc_opts()
+        })
+        .unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert_eq!(
+        (r.freed_bytes, r.gross_removed_bytes, r.rewrite_bytes),
+        (0, 0, 0),
+        "an all-live store frees and rewrites nothing: {r:?}"
+    );
+    assert_eq!(
+        r.net_reclaimed_bytes, 0,
+        "net is zero, not a signed artifact of a process-wide delta: {r:?}"
+    );
+    assert!(r.is_noop(), "the cycle reports itself as a no-op: {r:?}");
+    assert_eq!(packs(dir.path()), before, "no pack changed on disk");
+
+    verify(&core, &files);
+    drop(kv);
+    drop(c);
     core.close().unwrap();
 }

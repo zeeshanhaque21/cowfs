@@ -885,6 +885,23 @@ def verify_reclaim(rec, work, seed_bin):
             total_before=total_before,
             total_after=total_after,
         )
+        # Issue #81: the report now carries the cycle-owned gross, rewrite and signed net
+        # directly. On a quiescent store these must agree with the physical pack delta, and the
+        # explicit gross must equal the legacy `freed_bytes`. Gate on the reported fields, not
+        # only on the inferred delta, so the accounting cannot regress behind a stale name.
+        rec.record(
+            "reclaim.reported_gross_rewrite_net_agree_with_physical",
+            live.get("gross_removed_bytes") == gross
+            and live.get("rewrite_bytes") == new_pack_bytes
+            and live.get("net_reclaimed_bytes") == gross - new_pack_bytes
+            and live.get("net_reclaimed_bytes") == net,
+            gross_removed_bytes=live.get("gross_removed_bytes"),
+            rewrite_bytes=live.get("rewrite_bytes"),
+            net_reclaimed_bytes=live.get("net_reclaimed_bytes"),
+            freed_bytes_gross=gross,
+            new_pack_bytes=new_pack_bytes,
+            physical_delta_net=net,
+        )
         rec.record(
             "reclaim.physical_pack_bytes_dropped",
             total_after < total_before and len(unlinked) >= 1,

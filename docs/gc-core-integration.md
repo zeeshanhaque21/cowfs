@@ -199,10 +199,17 @@ The fields of `GcReport` map as follows.
 | `candidate_blocks` | blocks the store holds that no snapshot root and no pin reaches (`store_blocks - live_blocks`) |
 | `candidate_bytes` | record bytes in the candidate packs that no root reaches (`GcReport::candidate_dead_bytes`): the most a cycle can free from them |
 | `freed_blocks` | the drop in `Store::stats().blocks` across the cycle |
-| `freed_bytes` | bytes on disk freed by unlinked packs |
+| `freed_bytes` | **gross** bytes on disk freed by unlinked packs, under the legacy name |
+| `gross_removed_bytes` | the same gross figure under its explicit name, equal to `freed_bytes` |
+| `rewrite_bytes` | bytes written into the packs this cycle created, file headers included: committed rewrites plus any abandoned partial copy |
+| `net_reclaimed_bytes` | `gross_removed_bytes - rewrite_bytes`, signed, so a cycle that cost more than it removed reads negative instead of a saturated zero |
 
 Candidate figures are an upper bound: a pack below the dead-ratio threshold is not rewritten, so its dead blocks are counted in `candidate_blocks` and not in `candidate_bytes`.
+The gross and net figures are cycle-owned: they come from the packs this cycle actually unlinked and the packs it actually wrote, not from a process-wide before/after of the store size, which a concurrent writer would corrupt.
+See `docs/gc-space-accounting.md` for the full accounting rule.
 A live request that freed nothing because the reference side would not hold still answers `busy`, and one that freed nothing because of a cycle error answers `io_error`, so a quiet success is never a silent failure.
+That `io_error` message carries the cycle's actual gross, rewrite and signed net, because a cycle that errored after writing a new pack but before unlinking anything still spent those bytes and a bare "freed nothing" would hide the cost.
+A pack whose unlink could not be made durable is counted in those figures, since the file is really gone, and the request still answers `io_error` rather than a quiet success: the removal is real but unconfirmed, so the caller is told.
 A cancelled request answers `cancelled`; what the collector had already copied is finished and unlinked (the collector's rule), so the store is consistent and the next request does the rest.
 
 ## Failure behaviour
