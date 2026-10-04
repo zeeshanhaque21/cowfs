@@ -33,6 +33,8 @@ The result is a `cowfs_store::FsckReport` whose `damage` may hold both record-le
   A block named only by an uncommitted tree is not reported; it becomes reportable once its snapshot commits.
 - The report is bounded: at most `MAX_MISSING_LIVE_REFS` (256) `MissingLiveBlock` entries are listed, so a wholesale store loss cannot turn the answer into an unbounded enumeration.
   The walk itself still visits every live id; the bound is on what is listed, not on what is checked.
+- The bound is per reference, not per distinct id: several files naming the same absent block produce several entries, and reaching 256 stops the listing even if more absent ids exist.
+  A truncated list is never reported as clean, but the reported count is a floor on the damage, not a total.
 - Nothing is repaired, reaped, freed, or moved.
   The traversal is read-only over the committed trees.
   `Meta::live_blocks` syncs metadata before the walk, the same operation `Meta::check` performs, so the walk sees exactly the durable state.
@@ -44,6 +46,13 @@ The result is a `cowfs_store::FsckReport` whose `damage` may hold both record-le
   `FsckReport::ok` is false whenever `problems` is non-empty.
 - CLI: `cowfs fsck` prints `PROBLEMS FOUND` and the problems, and **exits 1** when `ok` is false, so a script gating on the exit code cannot mistake a missing live block for a clean filesystem.
   A clean check exits 0.
+
+## How the regression reaches the damaged state
+
+The test fixture removes a pack, then calls `Store::acknowledge_corruption`, a library API no CLI or daemon command exposes.
+It does not reproduce the original #84 cause, an old reader unlinking a block a fork still needed.
+It reaches the same committed state that cause left behind: a durable tree names a block the store lacks and the store no longer reports corruption.
+`Core::open` refuses a store with unacknowledged corruption, so the acknowledgement runs before the reopen the fixture tests through.
 
 ## Contracts preserved
 

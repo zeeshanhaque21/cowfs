@@ -484,6 +484,7 @@ that takes a lock is not listed here.
 | `lib::set_load_node_contention` | leaf | 1 |
 | `lib::set_flush_fault` | leaf | 1 |
 | `lib::live_blocks` | snap. | 3 |
+| `lib::missing_live_refs` | none of this crate's locks | 1 |
 | `lib::add_snap` | leaf | 1 |
 | `lib::snap_by_name_raw` | leaf | 1 |
 | `lib::check_new_name_except` | leaf | 1 |
