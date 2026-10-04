@@ -160,6 +160,41 @@ impl ControlHandler for FloodAndCpu {
     }
 }
 
+/// True once the peer has closed this socket.
+///
+/// Read EOF (`Ok(0)`) or a connection error is the signal. `set_read_timeout` is not: it only fails
+/// with EINVAL when the local descriptor is shut down, which is not the case here, so on the hosted
+/// runners it succeeded on an already-closed peer and the probe reported "still open".
+///
+/// Only call this after `wait()` has returned. Reading before that would drain the peer's receive
+/// buffer and unblock the very parked write under test.
+fn peer_closed(stream: &UnixStream) -> bool {
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .is_err()
+    {
+        return true;
+    }
+    let until = Instant::now() + Duration::from_millis(500);
+    let mut buf = [0u8; 8192];
+    while Instant::now() < until {
+        match (&*stream).read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return false
+            }
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 /// Descriptors this process holds. Sampled around a shutdown cycle to prove the abandoned
 /// connections' sockets are released, not just half-closed.
 fn open_fds() -> usize {
@@ -698,7 +733,7 @@ fn staggered_stalled_writers_stay_within_the_deadline_plus_grace() {
             ..ServerOptions::default()
         },
     );
-    let mut clients = Vec::new();
+    let mut clients: Vec<Raw> = Vec::new();
     for i in 0..4 {
         let c = blocked_hello(&fx.path);
         clients.push(c);
@@ -770,11 +805,7 @@ fn abandoned_blocked_connection_is_released_before_wait_returns() {
 
         // Sampled here, at the return instant, with no grace period of its own.
         let handler_alive_at_return = !dropped.load(Ordering::SeqCst);
-        let closed_at_return = clients.iter_mut().all(|c| {
-            c.stream
-                .set_read_timeout(Some(Duration::from_millis(1)))
-                .is_err()
-        });
+        let closed_at_return = clients.iter().all(|c| peer_closed(&c.stream));
         let fds_at_return = open_fds();
         eprintln!(
             "PROGRESS77 release {label} wait_ms={} handler_alive_at_return={} \
@@ -902,10 +933,7 @@ fn shutdown_budget_is_the_deadline_plus_one_grace_with_a_parked_writer_and_a_cpu
     let elapsed = t0.elapsed();
 
     let handler_alive_at_return = !dropped.load(Ordering::SeqCst);
-    let parked_closed_at_return = parked
-        .stream
-        .set_read_timeout(Some(Duration::from_millis(1)))
-        .is_err();
+    let parked_closed_at_return = peer_closed(&parked.stream);
     let cpu_alive_at_return = !cpu_done.load(Ordering::SeqCst);
 
     eprintln!(
@@ -977,10 +1005,7 @@ fn shutdown_budget_with_only_a_parked_writer() {
     server.wait();
     let elapsed = t0.elapsed();
     let alive = !dropped.load(Ordering::SeqCst);
-    let closed = parked
-        .stream
-        .set_read_timeout(Some(Duration::from_millis(1)))
-        .is_err();
+    let closed = peer_closed(&parked.stream);
     eprintln!(
         "PROGRESS77 budget parked_only wait_ms={} handler_alive_at_return={alive} \
          socket_closed_at_return={closed} budget_ms={}",
