@@ -185,16 +185,30 @@ fn every_subcommand_works_with_json_output() {
             "candidate_bytes",
             "dry_run",
             "freed_blocks",
-            "freed_bytes"
+            "freed_bytes",
+            "gross_removed_bytes",
+            "net_reclaimed_bytes",
+            "rewrite_bytes"
         ]
     );
     assert_eq!(
         (&dry["dry_run"], &dry["freed_blocks"]),
         (&Value::Bool(true), &Value::from(0))
     );
+    // A dry run reports a candidate estimate and no actual gross, rewrite or net.
+    assert_eq!(dry["gross_removed_bytes"], 0);
+    assert_eq!(dry["rewrite_bytes"], 0);
+    assert_eq!(dry["net_reclaimed_bytes"], 0);
     let gc = d.json(&["gc"]);
     assert_eq!(gc["dry_run"], false);
     assert!(gc["freed_blocks"].as_u64().unwrap() > 0);
+    // `freed_bytes` stays the gross figure and the explicit gross name agrees with it.
+    assert_eq!(gc["freed_bytes"], gc["gross_removed_bytes"]);
+    // Net is signed and equals gross minus rewrite.
+    let gross = gc["gross_removed_bytes"].as_i64().unwrap();
+    let rewrite = gc["rewrite_bytes"].as_i64().unwrap();
+    let net = gc["net_reclaimed_bytes"].as_i64().unwrap();
+    assert_eq!(net, gross - rewrite, "gross {gross}, rewrite {rewrite}");
 
     let fsck = d.json(&["fsck"]);
     assert_eq!(

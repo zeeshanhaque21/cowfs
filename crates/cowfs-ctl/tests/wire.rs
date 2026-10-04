@@ -188,6 +188,9 @@ fn server_frames() -> Vec<(&'static str, ServerFrame)> {
                 candidate_bytes: 196_608,
                 freed_blocks: 0,
                 freed_bytes: 0,
+                gross_removed_bytes: 0,
+                rewrite_bytes: 0,
+                net_reclaimed_bytes: 0,
             })),
         ),
         (
@@ -480,6 +483,44 @@ fn unknown_response_kind_decodes_to_unknown_with_raw_data() {
     let bad =
         ServerFrame::decode(br#"{"type":"response","id":1,"result":{"kind":"gc","data":{}}}"#);
     assert!(bad.is_err(), "a known kind with bad data is still an error");
+}
+
+#[test]
+fn an_old_gc_report_without_the_gross_fields_still_decodes() {
+    // A pre-#81 server sends the five original fields; the new gross, rewrite and net fields
+    // must default so an old client and an old fixture keep working.
+    let f = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608}}}"#,
+    );
+    let Ok(ServerFrame::Response { result, .. }) = f else {
+        panic!("{f:?}")
+    };
+    let Response::Gc(g) = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(g.freed_bytes, 196_608, "the legacy gross field is intact");
+    assert_eq!(
+        g.gross_removed_bytes, 196_608,
+        "an absent explicit gross falls back to freed_bytes, not zero"
+    );
+    assert_eq!(g.rewrite_bytes, 0);
+    assert_eq!(g.net_reclaimed_bytes, 0);
+}
+
+#[test]
+fn a_gc_report_that_carries_the_gross_fields_keeps_them() {
+    let f = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608,"rewrite_bytes":1024,"net_reclaimed_bytes":195584}}}"#,
+    );
+    let Ok(ServerFrame::Response { result, .. }) = f else {
+        panic!("{f:?}")
+    };
+    let Response::Gc(g) = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(g.gross_removed_bytes, 196_608);
+    assert_eq!(g.rewrite_bytes, 1024);
+    assert_eq!(g.net_reclaimed_bytes, 195_584);
 }
 
 #[test]

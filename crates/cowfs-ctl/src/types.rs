@@ -163,13 +163,61 @@ pub struct SnapshotList {
 }
 
 /// Result of `gc`.
+///
+/// `freed_bytes` is the **gross** file length of every pack the cycle unlinked, kept under its
+/// original name for compatibility. It is not the space saved: surviving live records are
+/// rewritten into a new pack. `gross_removed_bytes` is the same number under an explicit gross
+/// name, `rewrite_bytes` is the bytes written into the cycle's new packs (headers included), and
+/// `net_reclaimed_bytes` is `gross_removed_bytes - rewrite_bytes`, signed. A dry run reports the
+/// estimate in `candidate_bytes` and zero actual gross, rewrite and net.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "GcReportWire")]
 pub struct GcReport {
     pub dry_run: bool,
     pub candidate_blocks: u64,
     pub candidate_bytes: u64,
     pub freed_blocks: u64,
     pub freed_bytes: u64,
+    /// Bytes removed by unlinking packs, explicit gross name. Equal to `freed_bytes`.
+    /// A payload from before #81 has no such field, so it falls back to `freed_bytes` rather
+    /// than zero, which would read as "nothing removed".
+    pub gross_removed_bytes: u64,
+    /// Bytes written into the packs this cycle created, file headers included.
+    pub rewrite_bytes: u64,
+    /// Net space reclaimed: `gross_removed_bytes - rewrite_bytes`, signed.
+    pub net_reclaimed_bytes: i64,
+}
+
+/// The wire shape of [`GcReport`], where the post-#81 fields are optional.
+#[derive(Deserialize)]
+struct GcReportWire {
+    dry_run: bool,
+    candidate_blocks: u64,
+    candidate_bytes: u64,
+    freed_blocks: u64,
+    freed_bytes: u64,
+    #[serde(default)]
+    gross_removed_bytes: Option<u64>,
+    #[serde(default)]
+    rewrite_bytes: u64,
+    #[serde(default)]
+    net_reclaimed_bytes: i64,
+}
+
+impl From<GcReportWire> for GcReport {
+    fn from(w: GcReportWire) -> Self {
+        let gross_removed_bytes = w.gross_removed_bytes.unwrap_or(w.freed_bytes);
+        GcReport {
+            dry_run: w.dry_run,
+            candidate_blocks: w.candidate_blocks,
+            candidate_bytes: w.candidate_bytes,
+            freed_blocks: w.freed_blocks,
+            freed_bytes: w.freed_bytes,
+            gross_removed_bytes,
+            rewrite_bytes: w.rewrite_bytes,
+            net_reclaimed_bytes: w.net_reclaimed_bytes,
+        }
+    }
 }
 
 /// One problem found by `fsck`.

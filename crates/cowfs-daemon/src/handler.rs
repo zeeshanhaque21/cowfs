@@ -353,6 +353,9 @@ impl ControlHandler for Handler {
             candidate_bytes: r.candidate_dead_bytes,
             freed_blocks: out.blocks_before.saturating_sub(out.blocks_after),
             freed_bytes: r.freed_bytes,
+            gross_removed_bytes: r.gross_removed_bytes,
+            rewrite_bytes: r.rewrite_bytes,
+            net_reclaimed_bytes: r.net_reclaimed_bytes,
         })
     }
 
@@ -776,6 +779,15 @@ mod tests {
         );
         assert_eq!((dry.freed_blocks, dry.freed_bytes), (0, 0), "{dry:?}");
         assert_eq!(
+            (
+                dry.gross_removed_bytes,
+                dry.rewrite_bytes,
+                dry.net_reclaimed_bytes
+            ),
+            (0, 0, 0),
+            "a dry run reports no actual gross, rewrite or net: {dry:?}"
+        );
+        assert_eq!(
             backend.usage().unwrap().unwrap(),
             before,
             "a dry run changes nothing"
@@ -784,6 +796,15 @@ mod tests {
         let live = h.gc(GcParams { dry_run: false }, &ctx).unwrap();
         assert!(!live.dry_run);
         assert!(live.freed_bytes > 0 && live.freed_blocks > 0, "{live:?}");
+        assert_eq!(
+            live.gross_removed_bytes, live.freed_bytes,
+            "the explicit gross field agrees with the legacy one: {live:?}"
+        );
+        assert_eq!(
+            live.net_reclaimed_bytes,
+            live.gross_removed_bytes as i64 - live.rewrite_bytes as i64,
+            "net is gross minus rewrite, signed: {live:?}"
+        );
         let after = backend.usage().unwrap().unwrap();
         assert!(after.blocks < before.blocks, "{before:?} -> {after:?}");
         assert_eq!(before.blocks - after.blocks, live.freed_blocks);

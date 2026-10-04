@@ -28,7 +28,7 @@ res status	{"id":7,"result":{"data":{"block_count":10,"logical_bytes":1000,"moun
 res snapshot_list	{"id":7,"result":{"data":{"snapshots":[{"base":null,"created_unix_ms":1700000000000,"name":"a","parent":"main"}]},"kind":"snapshot_list"},"type":"response"}
 res snapshot base	{"id":7,"result":{"data":{"base":{"commit":"abc123","git_ref":"main","repo":"/srv/repo"},"created_unix_ms":1700000000000,"name":"b","parent":"main"},"kind":"snapshot"},"type":"response"}
 res ok	{"id":7,"result":{"data":{},"kind":"ok"},"type":"response"}
-res gc	{"id":7,"result":{"data":{"candidate_blocks":3,"candidate_bytes":196608,"dry_run":true,"freed_blocks":0,"freed_bytes":0},"kind":"gc"},"type":"response"}
+res gc	{"id":7,"result":{"data":{"candidate_blocks":3,"candidate_bytes":196608,"dry_run":true,"freed_blocks":0,"freed_bytes":0,"gross_removed_bytes":0,"net_reclaimed_bytes":0,"rewrite_bytes":0},"kind":"gc"},"type":"response"}
 res fsck	{"id":7,"result":{"data":{"blocks_checked":9,"bytes_checked":900,"ok":false,"problems":[{"detail":"block 00ff","kind":"bad_hash"}],"snapshots_checked":2},"kind":"fsck"},"type":"response"}
 res import	{"id":7,"result":{"data":{"bytes":3456,"files":12,"hash_algorithm":"blake3","imported_root_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","mismatches":[{"path":"src/a.rs","reason":"content"}],"mismatches_truncated":true,"name":"slot1","source_root_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stored_bytes":1728,"verified":false},"kind":"import"},"type":"response"}
 res base_refresh	{"id":7,"result":{"data":{"previous_commit":"abc123","snapshot":{"base":null,"created_unix_ms":1700000000000,"name":"repo-base","parent":"main"}},"kind":"base_refresh"},"type":"response"}
