@@ -515,7 +515,10 @@ class CompareRefuses(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root, out = Path(d) / "root", Path(d) / "out"
             argv = ["gates.py", "--root", str(root), "--label", "t", "--reps", "1", "--gates", "g5", "--no-resume"]
-            with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {"COWFS_BENCH_SCALE": "0.3"}), \
+            # gates.py records the real load1 and compare.py refuses a ratio above its
+            # ceiling, so pin the harness's own documented hook rather than relax that.
+            with mock.patch.object(sys, "argv", argv), mock.patch.dict(
+                    os.environ, {"COWFS_BENCH_SCALE": "0.3", "COWFS_BENCH_FAKE_LOAD1": "1"}), \
                     mock.patch.object(gates, "OUT", out), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(gates.main(), 0)
             f = str(next(out.glob("t-*.jsonl")))
