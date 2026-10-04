@@ -81,6 +81,17 @@ fn wait_blocked(entered: &AtomicBool, steps: &AtomicU64) {
     );
 }
 
+/// Descriptors this process holds. Sampled around a shutdown cycle to prove the abandoned
+/// connections' sockets are released, not just half-closed.
+fn open_fds() -> usize {
+    std::fs::read_dir(if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    })
+    .map_or(0, Iterator::count)
+}
+
 fn flood() -> (ProgressFlood, Arc<AtomicBool>, Arc<AtomicU64>) {
     let entered = Arc::new(AtomicBool::new(false));
     let steps = Arc::new(AtomicU64::new(0));
@@ -203,6 +214,13 @@ fn an_unblocked_client_still_receives_a_terminal_frame_at_shutdown() {
         ServerOptions {
             write_timeout: Duration::from_secs(4),
             shutdown_deadline: Duration::from_millis(300),
+            // The frame is only promised to a client that reads inside the delivery grace, and this
+            // handler emits 1 MiB per event, so a client draining the backlog needs room. The grace
+            // is set generously on purpose: this test measures delivery to a reading client, not how
+            // fast a loaded scheduler drains a socket. The beyond-grace boundary is asserted
+            // separately by `abandoned_blocked_connection_is_released_before_wait_returns` and by
+            // `admission.rs::a4_a_terminal_frame_is_not_guaranteed_past_the_grace`.
+            drain_deadline: Duration::from_millis(1500),
             ..ServerOptions::default()
         },
     );
@@ -546,7 +564,7 @@ fn healthy_reader_behind_a_stalled_writer_is_not_delayed() {
         .set_read_timeout(Some(Duration::from_millis(50)));
     let until = Instant::now() + Duration::from_secs(3);
     let mut buf = Vec::new();
-    let mut frame_at = None;
+    let mut frame = None;
     while Instant::now() < until {
         buf.clear();
         match healthy.reader.read_until(b'\n', &mut buf) {
@@ -557,22 +575,27 @@ fn healthy_reader_behind_a_stalled_writer_is_not_delayed() {
                 if matches!(v["type"].as_str(), Some("response") | Some("error"))
                     && v["id"].as_u64() == Some(1)
                 {
-                    assert_ne!(
-                        v["error"]["code"].as_str(),
-                        Some("unsupported"),
-                        "the healthy handler returned unsupported; the test would be vacuous"
-                    );
-                    frame_at = Some(t0.elapsed());
+                    frame = Some(v);
                     break;
                 }
             }
             Err(_) => {}
         }
     }
-    let at = frame_at.expect("healthy reader must get its terminal frame");
+    let at = t0.elapsed();
+    let v = frame.expect("the healthy reader must get a terminal frame within the budget");
     eprintln!(
-        "PROGRESS77 healthy_behind_stalled_frame_ms={}",
-        at.as_millis()
+        "PROGRESS77 healthy_behind_stalled_frame_ms={} code={:?}",
+        at.as_millis(),
+        v["error"]["code"]
+    );
+    // Not `unsupported`: that would mean the trait default answered instantly and the whole
+    // assertion about the abandon path is vacuous.
+    assert_eq!(
+        v["error"]["code"].as_str(),
+        Some("shutting_down"),
+        "the healthy reader must get `shutting_down`, got {:?}",
+        v["error"]["code"]
     );
     assert!(
         at < Duration::from_millis(1200),
@@ -620,91 +643,96 @@ fn staggered_stalled_writers_stay_within_the_deadline_plus_grace() {
     drop(clients);
 }
 
-/// The Shutdown contract (`docs/v1-control-api.md`) says abandoned handlers have "their
-/// connections closed and the server returns". A non-reading client with a blocked progress write
-/// cannot observe its cancel token until the write returns, so without an explicit close the
-/// connection, socket and handler outlive `wait()` by up to `write_timeout`. This asserts the
-/// server side is released within the deadline plus a bounded grace, not the write timeout.
+/// The Shutdown contract (`docs/v1-control-api.md:397-399`) says abandoned handlers have "their
+/// connections are closed and the server returns". #77 makes that true for a client that stopped
+/// reading while a request streamed progress: its connection, socket and handler must be released
+/// by the time `wait()` returns, not left to unwind against `write_timeout`.
 ///
-/// Fails on the detached-worker version without the post-grace `kill` (handler alive and socket
-/// open at ~4.5 s with a 3 s `write_timeout`); passes once the stragglers are killed after grace.
+/// Everything is sampled at the return instant, before waiting for anything, because ownership
+/// retained after the return is the defect. A blocked socket write cannot finish while the handler
+/// runs, so the handler being dropped is also the server-side release, and `set_read_timeout`
+/// failing on the peer (macOS EINVAL) is the client-side release.
+///
+/// Fails on the detached-worker version without the post-grace close: measured on `89c271e` over a
+/// real private socket, `wait()` returned at 557 ms with the handler alive and the connection open,
+/// and the peer only saw the close at 6562 ms.
 #[test]
-fn abandoned_blocked_connection_is_closed_by_the_deadline_plus_grace() {
-    let _w = Watchdog::start(240);
-    let (handler, entered, steps, dropped) = flood_with_drop();
-    let mut fx = start_with(
-        handler,
-        ServerOptions {
-            write_timeout: Duration::from_secs(3),
-            shutdown_deadline: Duration::from_millis(300),
-            ..ServerOptions::default()
-        },
-    );
-    let mut client = blocked_hello(&fx.path);
-    wait_blocked(&entered, &steps);
-
-    let server = fx.server.take().unwrap();
-    let t0 = Instant::now();
-    server.handle().shutdown();
-    server.wait();
-    let wait_ms = t0.elapsed();
-
-    // Server-side ownership proxy: a blocked socket write cannot finish while the handler runs, so
-    // the handler is dropped only once the socket write has unwound. Sample the drop.
-    let mut handler_drop_ms = None;
-    let until = Instant::now() + Duration::from_secs(4);
-    while Instant::now() < until {
-        if dropped.load(Ordering::SeqCst) {
-            handler_drop_ms = Some(t0.elapsed().as_millis());
-            break;
+fn abandoned_blocked_connection_is_released_before_wait_returns() {
+    for (label, n) in [("n1", 1usize), ("n6", 6usize)] {
+        let _w = Watchdog::start(240);
+        let (handler, entered, steps, dropped) = flood_with_drop();
+        let mut fx = start_with(
+            handler,
+            ServerOptions {
+                write_timeout: Duration::from_secs(3),
+                shutdown_deadline: Duration::from_millis(300),
+                ..ServerOptions::default()
+            },
+        );
+        let fds0 = open_fds();
+        let mut clients = Vec::new();
+        for _ in 0..n {
+            clients.push(blocked_hello(&fx.path));
         }
-        thread::sleep(Duration::from_millis(5));
+        wait_blocked(&entered, &steps);
+        // Sampled with every descriptor live: the listener, the accepted connections (two each,
+        // because `Conn` keeps a clone) and this test's own client sockets.
+        let fds_busy = open_fds();
+
+        let server = fx.server.take().unwrap();
+        let t0 = Instant::now();
+        server.handle().shutdown();
+        server.wait();
+        let wait_ms = t0.elapsed();
+
+        // Sampled here, at the return instant, with no grace period of its own.
+        let handler_alive_at_return = !dropped.load(Ordering::SeqCst);
+        let closed_at_return = clients.iter_mut().all(|c| {
+            c.stream
+                .set_read_timeout(Some(Duration::from_millis(1)))
+                .is_err()
+        });
+        let fds_at_return = open_fds();
+        eprintln!(
+            "PROGRESS77 release {label} wait_ms={} handler_alive_at_return={} \
+             connection_closed_at_return={closed_at_return} fds_busy={fds_busy} \
+             fds_at_return={fds_at_return}",
+            wait_ms.as_millis(),
+            handler_alive_at_return
+        );
+
+        // Deadline 300 + grace 250 = 550 ms, with room for a loaded machine. `write_timeout` is 3 s,
+        // so this still fails an implementation that waits the write out decisively.
+        let bound = Duration::from_millis(1200);
+        assert!(
+            wait_ms < bound,
+            "{label}: wait() took {wait_ms:?}, past the deadline plus the grace"
+        );
+        assert!(
+            !handler_alive_at_return,
+            "{label}: the server still owns the abandoned handler when wait() returns"
+        );
+        assert!(
+            closed_at_return,
+            "{label}: an abandoned connection is still open when wait() returns"
+        );
+        // The server's share is already gone at the return instant; only this test's own client
+        // sockets are left, which is why the count is lower than while everything was live.
+        assert!(
+            fds_at_return < fds_busy,
+            "{label}: no descriptor was released by the return: {fds_at_return} vs {fds_busy}"
+        );
+        drop(clients);
+        // With the peers dropped too, the process is back where it started: no leak across cycles.
+        let until = Instant::now() + Duration::from_secs(2);
+        while open_fds() > fds0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let fds_after = open_fds();
+        eprintln!("PROGRESS77 release {label} fds0={fds0} fds_after={fds_after}");
+        assert!(
+            fds_after <= fds0,
+            "{label}: {fds_after} descriptors open after the cycle, baseline {fds0}"
+        );
     }
-
-    // Client-side socket release: a closed peer makes `set_read_timeout` fail (macOS EINVAL),
-    // which is proof the server-side descriptor is gone; then a read must see EOF.
-    let eof_ms = if client
-        .stream
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .is_err()
-    {
-        Some(t0.elapsed().as_millis())
-    } else {
-        None
-    };
-    let eof_ms = eof_ms.or_else(|| {
-        let mut buf = [0u8; 65536];
-        let until = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < until {
-            match client.stream.read(&mut buf) {
-                Ok(0) => return Some(t0.elapsed().as_millis()),
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => return Some(t0.elapsed().as_millis()),
-            }
-        }
-        None
-    });
-
-    eprintln!(
-        "PROGRESS77 cleanup wait_ms={} handler_drop_ms={handler_drop_ms:?} client_eof_ms={eof_ms:?}",
-        wait_ms.as_millis()
-    );
-    // Deadline 300 + grace 250 = 550 ms; the release lands a little after that. `write_timeout`
-    // is 3 s, so a bound near 2 s still fails the un-killed variant decisively.
-    let bound = Duration::from_millis(2000);
-    assert!(
-        wait_ms < bound,
-        "wait() took {wait_ms:?}, past deadline plus grace"
-    );
-    let drop_ms = handler_drop_ms.expect("handler was never dropped; connection left open");
-    assert!(
-        drop_ms < bound.as_millis(),
-        "handler dropped at {drop_ms} ms, past deadline plus grace"
-    );
-    let eof_ms = eof_ms.expect("client never saw the connection close");
-    assert!(
-        eof_ms < bound.as_millis(),
-        "client saw close at {eof_ms} ms, past deadline plus grace"
-    );
 }

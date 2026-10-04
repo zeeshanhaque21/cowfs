@@ -171,3 +171,96 @@ two are the same socket in the same state; no bounded cleanup satisfies both.
 comment states the intent ("the terminal frame write is still in flight when the server gives up on
 the connection"). The contract's "connections are closed and the server returns" is the binding
 behaviour; `a4`'s stronger "must be whole" is the pre-#77 behaviour that #77 removes.
+
+## Contract change: what is guaranteed, and what is not
+
+The Shutdown contract (`docs/v1-control-api.md:397-399`) says abandoned handlers have "their
+requests get `shutting_down`, their connections are closed and the server returns". #77 makes the
+close real. The guarantee is now explicitly two-sided, and the second side is a relaxation of what
+`a4` previously asserted:
+
+- **Inside the delivery grace** (`shutdown_deadline` plus `drain_deadline`), a client that reads
+  gets its complete terminal frame, and `wait()` does not return before that frame is on the wire.
+  Asserted by `an_unblocked_client_still_receives_a_terminal_frame_at_shutdown`,
+  `healthy_reader_behind_a_stalled_writer_is_not_delayed` (frame at 307 ms, code `shutting_down`)
+  and `admission.rs::a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace`.
+- **Past the delivery grace**, the connection is closed before `wait()` returns. A peer that is
+  still not reading then gets no promise for a frame: it may see a partial frame followed by EOF.
+  A complete terminal frame cannot be promised to a peer that resumes reading only after the close.
+  Asserted by `abandoned_blocked_connection_is_released_before_wait_returns` and
+  `admission.rs::a4_a_terminal_frame_is_not_guaranteed_past_the_grace`.
+
+This is the whole of the relaxation. A peer never receives a fabricated or duplicated terminal:
+`classify` and the frame readers only accept a terminal parsed out of a complete line, and
+`a4_a_terminal_frame_is_not_guaranteed_past_the_grace` rejects both `NoHello` and `TwoTerminals`.
+
+## Counterexample on the pre-fix baseline, then on the fix
+
+`counterexample.rs`, real private Unix socket, `write_timeout` 3 s, `shutdown_deadline` 300 ms.
+Sampled at the instant `wait()` returned, before waiting for anything.
+
+| source | `wait()` ms | handler alive at return | connection open at return | handler dropped | peer saw close |
+|---|---|---|---|---|---|
+| `89c271e` (sha256 `7ec25ae6…`) n=1 | 557 | **true** | **true** | never, within 6 s | 6562 ms |
+| `89c271e` n=6 | 552 | **true** | **true** | never, within 6 s | 6555 ms |
+| fix n=1 | 597 | false | false | 597 ms | 597 ms |
+| fix n=6 | 603 | false | false | 603 ms | 603 ms |
+
+The baseline identity was checked with `shasum -a 256` against `git show 89c271e:…/server.rs`
+(`7ec25ae6fe72ad9bde2cdd38476246fd4504addac0ca42339a3f05b22ac9b4ba`) on the extracted copy, so the
+counterexample was measured on that source and not on the working tree.
+
+## Why three changes, not one
+
+1. **Kill every straggler after the shared grace.** Half-closing the write side aborts the parked
+   `write_all`. Without it nothing interrupts that write, so the connection, socket and handler
+   outlive `wait()` by up to `write_timeout`, which is the reported defect.
+2. **Join the abandon workers, and wait for each straggler to be released, before returning.** The
+   workers own the only writes this server still makes to a control client, and a request worker owns
+   the handler, so both must be finished at the return for nothing of an abandoned connection is
+   retained. `Conn::workers` counts the request workers: a connection thread dropping out of `conns`
+   does not mean its handler is gone, which the spawn-failure variant demonstrated
+   (`handler_alive_at_return=true`, `connection_closed_at_return=false`, `fds_at_return` 10 of 12).
+   `Conn::released` is the predicate the accept loop waits on, bounded by the same grace.
+3. **Close without draining when the connection was already killed.** `drain_and_close` read away
+   what the peer sent, for up to `drain_deadline`. Past the grace there is nobody left to be polite
+   to, and that read is what held the socket open after `wait()` returned.
+
+## Spawn-failure and full-buffer fallback
+
+The abandon-worker spawn can fail under thread exhaustion. That path runs on the accept thread, so
+its write is bounded by the delivery grace: a peer whose receive queue is completely full would
+otherwise park that `write_all` for a whole `write_timeout`, which is the deadline this path exists
+to protect.
+
+Verified with a private patch that forces the spawn to fail
+(`bench/out/progress-shutdown/inject_spawnfail.py`, not shipped source), full buffer, same tests:
+
+| case | `wait()` ms | handler alive at return | connection closed at return | fds after cycle |
+|---|---|---|---|---|
+| n=1 | 378 | false | true | 4 of 4 |
+| n=6 | 396 | false | true | 4 of 4 |
+
+All 9 `progress_shutdown` tests pass on that variant, `admission` 14 of 15, `regress` 19 of 19, no
+panic, no unbounded write, no descriptor leak across cycles.
+
+**Known limitation of the degraded path.** When the abandon worker cannot be spawned, the terminal
+write is best effort and is skipped while a progress write holds the write lock. A client that
+resumes reading inside the grace therefore gets no frame on that path:
+`a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace` fails under the injected
+patch (`ending=NoFrame`) and passes on the shipped source. This is not fixable inside the constraint:
+the lock is held until `kill` aborts the write, and `kill` half-closes the write side, so no write
+can follow it. Delivering the frame would mean waiting on the accept thread for the write timeout,
+which is the defect this issue is about. The within-grace delivery guarantee therefore holds for the
+normal path, and the close-within-the-bound guarantee holds for both.
+
+## Not done
+
+- No dedicated Linux host was used for the local reproduction. The hosted CI job runs
+  `cargo test --workspace`, which includes `progress_shutdown`, so the fix and the new tests are
+  exercised on Linux there; a local Linux run was not performed.
+- The fix is not a throughput claim. It bounds `wait()` at the deadline plus the delivery grace.
+- A detached handler that ignores cancellation and never touches its socket is still allowed to
+  outlive `wait()`; the contract already says handler threads are detached and die with the
+  process. What is guaranteed here is that no handler blocked in socket IO, no control-client buffer
+  writer, and no connection survive the return.

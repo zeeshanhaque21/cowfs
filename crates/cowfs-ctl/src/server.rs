@@ -331,6 +331,19 @@ fn accept_loop(
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
+            // The connection threads own the sockets, and each request worker owns a handler. A worker parked
+            // behind a blocked write cannot observe its cancel token, so both the socket and the
+            // handler would outlive `wait()` by up to `write_timeout` without this wait, which the
+            // Shutdown contract forbids ("their connections are closed"). The workers were already
+            // killed above, so this normally completes at once. Bounded by the same grace: past it
+            // the connections are half-closed and the process exit in `cowfs serve` ends the rest,
+            // so a thread that is merely descheduled cannot stretch the deadline.
+            let release_until = Instant::now() + opts.drain_deadline;
+            while Instant::now() < release_until
+                && (!lock(&shared.conns).is_empty() || stragglers.iter().any(|c| !c.released()))
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             break;
         }
         thread::sleep(Duration::from_millis(10));
@@ -579,6 +592,11 @@ struct Conn {
     /// Terminal frames whose write is in progress. Counted outside the inflight map so a slow
     /// write never holds the map lock, yet teardown still sees the request as unfinished.
     finishing: AtomicU64,
+    /// Request worker threads this connection still owns. A worker parks in whatever the handler
+    /// is doing, which a blocked progress write makes up to a whole `write_timeout`, so the
+    /// connection thread dropping out of `conns` does not mean the handler is gone. Shutdown waits on
+    /// this count so `wait()` returns with no handler of an abandoned connection still running.
+    workers: AtomicU64,
 }
 
 impl Conn {
@@ -591,7 +609,13 @@ impl Conn {
             last_active: AtomicU64::new(0),
             inflight: Mutex::new(HashMap::new()),
             finishing: AtomicU64::new(0),
+            workers: AtomicU64::new(0),
         })
+    }
+
+    /// True once this connection owns no request worker, no terminal write and no live request.
+    fn released(&self) -> bool {
+        self.workers.load(Ordering::SeqCst) == 0 && self.inflight_empty()
     }
 
     fn send(&self, frame: &ServerFrame) -> bool {
@@ -721,9 +745,14 @@ impl Conn {
         let _ = reader
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(50)));
+        // A connection that was already killed has had its delivery grace: the write side is closed
+        // and the peer either got its terminal frame or never will. Reading away what the peer sent
+        // is politeness for a peer that is still there, and it is what would otherwise hold this
+        // socket, and the handler behind it, open for the whole drain deadline after `wait()`
+        // returned. Close now instead; the contract only promises the close.
         let until = Instant::now() + deadline;
         let mut sink = [0u8; 8192];
-        while Instant::now() < until {
+        while !self.dead.load(Ordering::SeqCst) && Instant::now() < until {
             match reader.read(&mut sink) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
@@ -955,6 +984,7 @@ fn start_request(
         return;
     }
     let slot = RequestSlot(Arc::clone(shared));
+    conn.workers.fetch_add(1, Ordering::SeqCst);
     let spawned = thread::Builder::new().name("cowfs-ctl-req".into()).spawn({
         let (conn, handler, opts, shared) = (
             Arc::clone(conn),
@@ -972,10 +1002,12 @@ fn start_request(
                 request,
                 token,
                 slot,
-            )
+            );
+            conn.workers.fetch_sub(1, Ordering::SeqCst);
         }
     });
     if spawned.is_err() {
+        conn.workers.fetch_sub(1, Ordering::SeqCst);
         conn.finish(
             id,
             &ServerFrame::Error {
