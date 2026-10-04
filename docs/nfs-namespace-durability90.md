@@ -37,8 +37,10 @@ mattered.
 Only a machine crash distinguishes `fsync` from no `fsync` on APFS, which is why the cowfs numbers
 above are the load-bearing ones.
 
-Evidence, gitignored: `bench/out/durability90/results-baseline.jsonl`, `results.jsonl`,
-`baseline.log`, `fixed.log`.
+Tracked evidence, readable on a fresh checkout:
+`docs/verification/evidence/namespace90/README.md`, with the per-rep receipts beside it.
+The raw logs stay gitignored under `bench/out/` and are named there as paths, not quoted as
+though they were public.
 
 ## Why the caller's own sync could not be enough
 
@@ -72,6 +74,28 @@ It is never reported as success, and nothing is flushed to paper over it: the ap
 visible, so the caller's retry finds its own work rather than having to undo it, and
 `Core::health` reports the failed sync rather than swallowing it.
 
+### An error reply does not get to skip the barrier
+
+The barrier is owed as soon as the change exists, not when the reply is a success.
+`Vfs::create` has made the name before the attribute step runs, so an attribute step that fails
+must not return early and leave that name queued and unacknowledged: the caller could not tell
+whether the name was there, and if the daemon then died it was not.
+Both `create` arms therefore yield a value rather than propagating with `?`, and
+`Adapter::durable_or` decides the status when the change's own step and the barrier both fail.
+
+The barrier's `NFS3ERR_IO` wins that case, and the reason is what the status would otherwise mean.
+The attribute error reads as "that did not happen", which is a lie about a name that does exist, so
+the caller would have no way to learn what state the namespace is in.
+The applied change is still not rolled back: a rollback is a second mutation that can fail the same
+way, and the reply says plainly that it did not.
+A refused mutation, by contrast, owes no barrier, because nothing changed.
+`setattr` uses the same helper so a refused `setattr`, which changed nothing, does not pay for one.
+
+`a_created_name_is_barriered_even_when_the_attribute_step_fails` in
+`crates/cowfs-nfs/tests/ns_durability.rs` records the names the fake `Vfs` was told to create, so it
+can tell an error reply from a name that is not there, and counts barriers across all three routes.
+It was checked against the old shape, which fails it.
+
 `WRITE` is untouched.
 A stable write still gets the `fsync` of that file that the client asked for, an unstable write
 still gets none, and `READ`, `LOOKUP` and `READDIR` are still cheap.
@@ -97,6 +121,31 @@ A durable name therefore never names a block the store has not written.
 `crates/cowfs-core/tests/ns_durability.rs` reads a dirty file back through a barrier and then
 through a reopen, so this is checked rather than argued.
 
+## Interaction with the issue 94 elide
+
+A barrier now commits the queue at every namespace acknowledgement, so the queue commits far more
+often than it used to.
+That changes the window in which an unlink can cancel a queued create, because the elide only
+applies to a create the store has not seen yet.
+PR #95 fixed that elide and did not merge this branch; this branch did not see that fix, and
+neither diff settles the interaction by reading.
+
+It is settled by running both shapes on the integrated tree in
+`crates/cowfs-core/tests/ns_durability_elide.rs`:
+
+- The #94 sequence with no barrier between the steps, where the elide fires, followed by a barrier,
+  a create and a reopen.
+  The name has to be free afterwards, and not reserved by the elided create.
+- The same sequence with a barrier after every step, which is what a mount now does.
+  The elide cannot fire, because the create has already been committed, and that is the correct
+  outcome rather than a regression: the elide only cancels a create the store never saw.
+  What matters is that the names and the bytes are right in both snapshots after a cache drop and a
+  reopen, and they are.
+- An elided `rmdir` under the same pattern, with the barrier after each step.
+
+The elide regression seed `9aa30bfa` from `model.proptest-regressions` is untouched and still
+re-run by `cargo test -p cowfs-core --test model`, which passes.
+
 ## What is still not promised
 
 - **WRITE data is unstable until the client sends COMMIT.** That is NFSv3, and the repair does not
@@ -115,10 +164,16 @@ through a reopen, so this is checked rather than argued.
   | a barrier with nothing pending, the floor | 0.007 |
   | one 4 MiB write, for scale | 254.7 |
 
-  The barrier is not dearer than the protocol's own price for the same guarantee, and it is free
-  when there is nothing to commit. What has **not** been re-measured is the mount-level build
-  overhead of `docs/design.md` success criterion 2, because a `cargo build` on the mount was not
-  run here. That is the number a critic should ask for before this merges.
+  This is one observed distribution from one busy host in a debug build.
+  It is **not** an upper bound and not a benchmark: a busy host neither establishes nor refutes a
+  limit, and 200 reps of one operation is a sample.
+  What it does support is the direction, the barrier is not dearer than the protocol's own price
+  for the same guarantee and is nearly free when there is nothing to commit.
+  An independent critic measured the same shape on a different host at 0.005 / 4.63 / 4.64 / 0.006
+  / 108.4 ms, same order of magnitude difference between hosts.
+  What has **not** been re-measured is the mount-level build overhead of `docs/design.md` success
+  criterion 2, because a `cargo build` on the mount was not run here.
+  That is the number a critic should ask for before this merges.
 - **A failed barrier leaves the namespace applied in memory but not durable.** The caller is told
   `NFS3ERR_IO` and the name is still visible, so a retry is safe. It is not rolled back, because the
   rollback would be a second mutation that could fail the same way.
@@ -131,13 +186,34 @@ through a reopen, so this is checked rather than argued.
 |---|---|
 | `cowfs-daemon` `namespace_durability.rs` | the crash: real mount, private store, `SIGKILL`, fresh daemon, both names and the bytes, 3 reps per case, plus the native control |
 | `cowfs-core` `ns_durability_cost.rs` | labels the price of a barrier against the price of a COMMIT and against a barrier with nothing pending |
+| `cowfs-daemon` `namespace_durability_gate.rs` | the CI gate: one non-ignored macOS rep of the two variants the issue measured as lost, with no skip path |
+| `cowfs-core` `ns_durability_elide.rs` | the issue 94 elide on the integrated tree, with and without a barrier between the steps |
 | `cowfs-nfs` `ns_durability.rs` | the barrier follows the mutation and names the source directory; every namespace RPC barriers exactly once; `WRITE` and `READ` do not; a failed barrier is `NFS3ERR_IO` and nothing else was flushed |
 | `cowfs-core` `ns_durability.rs` | the name survives a reopen after only a namespace barrier; unrelated dirty data is neither flushed nor lost; a handle reaches one snapshot and the root reaches all; a failing sync reports and a retry commits one name |
 
 Run:
 
 ```text
+cargo test -p cowfs-daemon --test namespace_durability_gate
 cargo test -p cowfs-core --test ns_durability
+cargo test -p cowfs-core --test ns_durability_elide
 cargo test -p cowfs-nfs --test ns_durability
 cargo test -p cowfs-daemon --test namespace_durability -- --ignored --test-threads=1 --nocapture
 ```
+
+The first four are not ignored and run in `cargo test --workspace`.
+The last is the wide matrix and stays manual: 12 reps, each one a daemon start, mount, kill and
+mount again.
+
+## CI
+
+The gate is `crates/cowfs-daemon/tests/namespace_durability_gate.rs`, macOS only and not ignored,
+so `cargo test --workspace` runs it on the macOS runner.
+It has no skip path.
+A host with no NFS client fails naming `mount_nfs` rather than reporting a green run that never
+mounted, because a gate that reports success without having mounted is the failure this issue was
+about.
+It is bounded to one rep of the two variants the issue measured as lost, so it does not turn every
+`cargo test` into twelve daemon lifetimes.
+It is mutation-checked: with `rename`'s barrier removed it fails on "the new name must survive the
+kill".
