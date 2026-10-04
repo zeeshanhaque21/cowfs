@@ -12,6 +12,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "crates/cowfs-core/src"
+
+
+def src_of(f):
+    # a mutant may name a file outside cowfs-core/src (the shared snapshot-name crate), given
+    # relative to the repository root
+    return ROOT / f if "/" in f else SRC / f
+
 MUT_ROOT = ROOT / "target/mutants"
 OUT = ROOT / "target/mutants.out"
 
@@ -73,8 +80,8 @@ M = {
  "n15_staging_name_visible": ("ns.rs",
    ".filter(|(n, id)| **id > cookie && !swap::is_staging(n))",
    ".filter(|(n, id)| **id > cookie && (swap::is_staging(n) || true))"),
- "n16_name_rule_allows_staging": ("snapname.rs",
-   "    if name.contains(crate::swap::STAGING) {",
+ "n16_name_rule_allows_staging": ("crates/cowfs-snapname/src/lib.rs",
+   "    if is_reserved(name) {",
    "    if false {"),
  "b01_fsync_root_noop": ("io.rs",
    "        if ino == ROOT_INO {\n            // the trait defines this as the whole-mount barrier\n            return self.sync_all();\n        }",
@@ -198,7 +205,7 @@ def seed_target(name):
 
 def run(name):
     f, old, new = M[name]
-    p = SRC / f
+    p = src_of(f)
     orig = p.read_text()
     if orig.count(old) != 1:
         return name, f"PATCH-FAILED count={orig.count(old)}", ""

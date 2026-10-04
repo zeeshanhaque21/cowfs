@@ -1,8 +1,7 @@
 use crate::error::{CtlError, CtlResult};
-use unicode_normalization::UnicodeNormalization;
 
 /// Longest snapshot name in bytes.
-pub const MAX_NAME_BYTES: usize = 255;
+pub const MAX_NAME_BYTES: usize = cowfs_snapname::NAME_MAX;
 /// Longest path in bytes.
 pub const MAX_PATH_BYTES: usize = 4096;
 /// Longest git ref in bytes.
@@ -24,28 +23,12 @@ pub fn escape_control(s: &str) -> String {
 /// The API-level snapshot name rule: non-empty, at most 255 bytes, no `/`, no control characters
 /// (NUL, newline and ESC included), and no leading `.` (which also rules out `.`, `..`, `._*`
 /// and `.nfs*`). Names are UTF-8 by construction, since the wire format is JSON.
+///
+/// The rule lives in `cowfs-snapname`, which the backend depends on too, so the API cannot accept
+/// a snapshot name the backend refuses.
 pub fn validate_snapshot_name(name: &str) -> CtlResult<()> {
-    let bad = |why: &str| {
-        Err(CtlError::invalid(format!(
-            "invalid snapshot name {name:?}: {why}"
-        )))
-    };
-    if name.is_empty() {
-        return bad("empty");
-    }
-    if name.len() > MAX_NAME_BYTES {
-        return bad("longer than 255 bytes");
-    }
-    if name.starts_with('.') {
-        return bad("must not start with a dot");
-    }
-    if name.contains('/') {
-        return bad("must not contain a slash");
-    }
-    if name.chars().any(char::is_control) {
-        return bad("must not contain control characters");
-    }
-    Ok(())
+    cowfs_snapname::validate_snapshot_name(name)
+        .map_err(|e| CtlError::invalid(format!("invalid snapshot name {name:?}: {}", e.why())))
 }
 
 /// The collision key of a snapshot name: NFC, lowercased, NFC again. Two names with the same key
@@ -56,17 +39,7 @@ pub fn validate_snapshot_name(name: &str) -> CtlResult<()> {
 /// bytes), so a key longer than the bound is replaced by a hash of the folded form. That keeps
 /// the key a valid, bounded snapshot name, at the cost of a theoretical hash collision.
 pub fn name_key(name: &str) -> String {
-    let folded: String = name
-        .nfc()
-        .collect::<String>()
-        .to_lowercase()
-        .nfc()
-        .collect();
-    if folded.len() <= MAX_NAME_BYTES {
-        return folded;
-    }
-    let digest = blake3::hash(folded.as_bytes()).to_hex().to_string();
-    format!("#{digest}")
+    cowfs_snapname::name_key(name)
 }
 
 /// An absolute path with no control characters, at most 4096 bytes. `what` names the field in the error.
@@ -141,6 +114,7 @@ mod tests {
             "a\u{1b}b",
             "\u{85}",
             &"x".repeat(256),
+            "slot.cowfs-swap0",
         ] {
             assert!(validate_snapshot_name(bad).is_err(), "{bad:?}");
         }
