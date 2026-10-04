@@ -1898,7 +1898,7 @@ def main():
         if failures:
             log("failing cases:")
             for k, v in sorted(failures.items()):
-                why = KNOWN_FAILING.get(k.split("-r")[0], "")
+                why = next((w for n, w in KNOWN_FAILING.items() if n in k), "")
                 log("  %-38s %s%s" % (k, v, ("  <- " + why) if why else ""))
         if not fresh:
             log("")
