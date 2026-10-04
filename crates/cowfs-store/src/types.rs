@@ -188,6 +188,15 @@ pub enum Damage {
         /// The indexed id.
         id: crate::BlockId,
     },
+    /// A live filesystem reference names a block the store does not have.
+    ///
+    /// `Store::fsck` cannot produce this: it only sees records that are present. A filesystem-level
+    /// check that walks the snapshot trees adds it for an id that is referenced by a durable
+    /// snapshot but absent from the store.
+    MissingLiveBlock {
+        /// The id a live reference names.
+        id: crate::BlockId,
+    },
 }
 
 /// Result of [`crate::Store::fsck`].

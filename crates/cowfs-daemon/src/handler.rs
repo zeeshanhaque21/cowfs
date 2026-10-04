@@ -479,6 +479,10 @@ fn damage(d: &cowfs_store::Damage) -> cowfs_ctl::FsckProblem {
             kind: "index_entry".into(),
             detail: format!("block {id}"),
         },
+        Damage::MissingLiveBlock { id } => cowfs_ctl::FsckProblem {
+            kind: "missing_live_block".into(),
+            detail: format!("live reference to absent block {id}"),
+        },
     }
 }
 
