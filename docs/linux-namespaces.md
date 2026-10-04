@@ -152,10 +152,9 @@ So this run used `rustc` directly, and a canonical path says nothing about a car
   It is the backend that supports the operation under test, serving the same store over the same
   FUSE mount.
   Block-level verification is the core backend's, and belongs to the helper run.
-- On git 2.39, `base_refresh` fails after the build with `git worktree add did not report where it
-  worked`, because 2.39 puts `HEAD is now at <sha>` on stdout where 2.56 puts the path.
-  That is `crates/cowfs-daemon/src/import.rs`, outside this change.
-  The integration run reports it and judges the refresh by whether its artifact landed.
+- `base_refresh` no longer depends on what git prints: the checkout path is passed as an argument and
+  nothing is read from stdout. That removes the version question entirely rather than answering it, and
+  nothing here claims what 2.56 prints.
 - Verified on one kernel (6.12) and one filesystem (ext4 under the mount, `fuse.cowfs` for the source).
   Not verified on btrfs, XFS, or an older kernel.
 
@@ -200,9 +199,11 @@ It starts a real `cowfs-daemon` over a real FUSE mount, makes a real git repo, a
 companion through `base refresh --build --canonical --ns-helper`.
 `crates/cowfs-treehouse/tests/canonical.rs` covers the rest: default compatibility, the refusals, the
 flag pairing, argv integrity, the refused-namespace case and the payload-77 collision.
-It holds 13 tests on Linux and 10 on macOS, because 3 are behind `cfg(target_os = "linux")`.
-Those 3 are the ones that exercise a live namespace decision, and they are exactly the ones macOS
-cannot run, which is why the first version of them passed locally and then failed on the CI ubuntu
+It holds 14 tests: 9 unconditional, 4 behind `cfg(target_os = "linux")`, and 1 behind
+`cfg(not(target_os = "linux"))`.
+That is 13 on Linux and 10 on macOS, and the net is 3 because four minus one is three.
+The Linux-only tests are the ones that exercise a live namespace decision, and they are exactly the ones
+macOS cannot run, which is why their first version passed locally and then failed on the CI ubuntu
 runner: the stubs wrote to an unquoted path in a shell script, and the temp directory name carried a
 parenthesis from Rust's `ThreadId` formatting.
 A path in a generated script is quoted, and the temp directory name is shell-safe.
@@ -241,24 +242,105 @@ failure.
 The probe is why the ambiguous code is harmless here, and
 `a_passing_payload_seventy_seven_stays_a_failure` is what pins it.
 
-## Measured through the wiring
+## Through the wiring: the seam works, the warm base does not
 
-Run on moonscape, path backend, real FUSE mount, real daemon, real companion.
-Artifacts: `bench/out/namespaces17-treehouse/`.
+**Retracted.** An earlier version of this document reported `VERDICT: PASS` here, from
+`scripts/namespaces17-treehouse-linux.sh`, and quoted five artifact hashes as proof.
+That verdict was wrong and the run behind it did not do what it claimed.
 
-| Artifact | Built at | SHA-256 | Bytes |
-|---|---|---|---|
-| base | canonical, the warm base | `90c90a2c7e1428c3bc8fcb3804de65c3113f2bd7884ed49fbaa1ee43e3c7aba7` | 4370032 |
-| slotA | canonical, fresh clone of base | `90c90a2c7e1428c3bc8fcb3804de65c3113f2bd7884ed49fbaa1ee43e3c7aba7` | 4370032 |
-| slotB | canonical, fresh clone of base | `90c90a2c7e1428c3bc8fcb3804de65c3113f2bd7884ed49fbaa1ee43e3c7aba7` | 4370032 |
-| N-slotA | its own path, do-nothing baseline | `b6fa6424206ce8daf6ba5e3a9cd658173ae146073586bdfe85b75e08b5c88b81` | 4370032 |
-| N-slotB | its own path, do-nothing baseline | `42f1926fe7c5d1e8ad969bf460e7d47bfd14ba25f77a3296bbbc688360b05a45` | 4370032 |
+The script judged a failed `base refresh` by whether the build's artifact had landed, and `base refresh`
+runs the build first and publishes the base second, so on a host where publication fails the artifact is
+always there and the verdict is always PASS.
+An independent review ran the committed script and got exit 0 with all three refreshes at exit 1, a
+`base status` of `base_commit: null` and `fresh: false`, and slots cloned from a directory `import` had
+copied in rather than from a published warm base.
+An artifact is not the postcondition it was supposed to establish.
 
-The warm base and both fresh slots came out as one artifact, and each native control at its own slot
-path came out different, so the control really built elsewhere.
-`embedded-paths.txt` reads the path strings back out of all five binaries.
+The acceptance now asserts the postcondition: a nonzero refresh fails the run, and before anything is
+cloned `base status` must report a non-null `base_commit`, the derived snapshot name and `fresh: true`.
+Run against that on moonscape it fails, which is correct:
 
-The store was then reloaded from disk: the daemon was stopped, the same store mounted again, and
-`base`, `slotA` and `slotB` all served `main.rs` at
-`7fa626e8bff724acfb0ed8b61a8cc21ec2720db1ff08da4a6746b8db6826813d`, with every artifact present.
-That is a restart readback, not crash injection, and no no-data-loss claim is made from it.
+```
+seed: imported as 'seed'; no base is claimed from it
+warm base: refreshing through cowfs-treehouse base refresh --canonical ...
+refresh: seed published its base and exited 0
+VERDICT: FAIL: the control API does not report a published warm base:
+  {"pool_id":"repo-65b7fe","snapshot":"repo-65b7fe-base","base_commit":null,
+   "fresh":false,"reason":"no warm base repo-65b7fe-base for this repository"}
+```
+
+`base refresh` exits 0. `base status` then reports no base. Both are true, and together they are the bug.
+
+### What is fixed, and verified
+
+`crates/cowfs-daemon/src/import.rs` called `git worktree add --detach <sha>` with no path argument, so git
+read the commit as the path and created a directory named after the commit inside the user's repository.
+`git_worktree` then read the last non-empty line of stdout and required it to be a directory, but git
+prints a human progress line there, so the call failed and the cleanup removed nothing, and every later
+refresh of that repository then failed with `already exists`.
+
+Both defects are version-independent and both are fixed: the checkout path is chosen here and passed as
+an argument, and nothing reads a path out of stdout any more.
+Verified on the same host, after the fix: the run's repository contains only `.git` and `main.rs`, no
+directory named after a commit, and `git worktree list` shows exactly one worktree, the repository itself.
+`base refresh` exits 0, where before it exited 1.
+
+### What is still broken, and where
+
+`base status` cannot report a base, on either backend.
+
+`base_refresh` writes `repo`, `git_ref` and `commit` into the `SnapshotInfo` it returns
+(`import.rs:293`), and nothing persists them.
+Both backends rebuild `BaseMeta` from an in-memory set of promoted names, with all three fields `None`:
+
+- `PathSnapshots::info` at `crates/cowfs-daemon/src/backend.rs:711`
+- `CoreBackend::info` at `crates/cowfs-daemon/src/backend.rs:402`
+
+So `find_base`, which matches on `b.repo == canonical(repo)`, can never match, and `base_commit` is always
+null.
+The write is in `import.rs`; the missing setter is a `Snapshots` trait method in `backend.rs`, which is
+outside this change's scope and is reported rather than fixed here.
+
+### What the seam itself does
+
+The canonical build seam is real and was measured, on a run whose publication step was broken.
+Two different slot paths, one canonical path, byte-identical artifacts, each recording the canonical
+absolute path and not its own; two native controls at their own paths, different from each other and from
+the canonical builds, each recording its own path.
+The caller's mount table was byte identical before and after, and the canonical directory was empty
+throughout.
+
+That evidence stands for the mechanism and for nothing else.
+It is not evidence that a warm base was published, because none was, and it is not offered as such.
+
+### Not established
+
+- No warm base is published, so no dedup or warm-base benefit is measured.
+  The path backend stored 20.9 MiB for 20.9 MiB logical in the earlier run.
+- No Core backend result, because the core backend refuses `base_refresh` by design: it ingests trees, not
+  directories.
+- No `fsck` result: the path backend has no block store and says so.
+- No crash safety and no no-data-loss claim. The readback is a daemon restart, not crash injection.
+- No leased-slot result: moonscape has no `treehouse` binary, so the run uses `--slot`, the same
+  `run_build` call site with a different slot provider.
+- No `cargo`-level canonical build, no btrfs or XFS, no kernel older than 6.12.
+
+## A flake in the wiring tests, measured and not fixed
+
+`crates/cowfs-treehouse/tests/canonical.rs` fails intermittently on Linux: running that binary at 8 test
+threads, 4 of 150 runs, always in the four tests that exec a stub this process just wrote, always with
+`Text file busy (os error 26)` from `execve`, and never in any other test.
+It is on the critical path for `check (ubuntu-latest)`.
+
+Five candidate fixes were measured on the Linux host and none held: publishing the stub with `rename`
+11 failures in 120 runs; serialising the four stub tests 4 in 150; serialising every spawn in the file
+1 in 150; moving the fixture off the shared tmpfs into the build directory, which was worse at 16 in 200.
+A standalone probe reproduces the same failure with no test harness, and the most failures occur in a mode
+that writes the script once and exec's it with no write at all, which rules the write handle out as the
+cause and rules intra-binary concurrency out as the whole story.
+
+The kernel mechanism is not established and no claim is made about it.
+The flake is not `#[ignore]`d, not retried, not given a longer timeout, and not worked around with a
+serial harness; all four would hide an unexplained kernel answer rather than address it.
+It is recorded here and in the test file instead, with the numbers, because saying it is fixed would be
+false.
