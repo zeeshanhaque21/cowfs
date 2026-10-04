@@ -209,6 +209,7 @@ The gross and net figures are cycle-owned: they come from the packs this cycle a
 See `docs/gc-space-accounting.md` for the full accounting rule.
 A live request that freed nothing because the reference side would not hold still answers `busy`, and one that freed nothing because of a cycle error answers `io_error`, so a quiet success is never a silent failure.
 That `io_error` message carries the cycle's actual gross, rewrite and signed net, because a cycle that errored after writing a new pack but before unlinking anything still spent those bytes and a bare "freed nothing" would hide the cost.
+A pack whose unlink could not be made durable is counted in those figures, since the file is really gone, and the request still answers `io_error` rather than a quiet success: the removal is real but unconfirmed, so the caller is told.
 A cancelled request answers `cancelled`; what the collector had already copied is finished and unlinked (the collector's rule), so the store is consistent and the next request does the rest.
 
 ## Failure behaviour

@@ -56,6 +56,34 @@ The counts follow what the cycle really finished, never what it planned:
 - A copy abandoned part way is not committed and its pack is not unlinked, but the bytes it wrote to the abandoned target file are counted in `rewrite_bytes`, so net never overstates savings.
 - A pack left in place because a condemned block became live again is counted in neither gross nor rewrite for that attempt.
 
+## A failure after the unlink still counts as a removal
+
+Removing a pack is several steps, and only the first one decides whether the bytes left.
+The unlink is the point of no return: after it the file is gone, and a later failure cannot undo that.
+
+So the store reports the effect and the failure separately.
+`Store::discard` returns `Err` when the unlink itself did not happen, meaning nothing changed on disk and nothing is claimed.
+It returns `Ok` when the unlink did happen, carrying the pack's file length in `removed_bytes` and, if a later step failed, that failure in `durability_error`.
+
+The collector credits `removed_bytes` and reports `durability_error`. Both, not either:
+counting alone would report a removal the store cannot vouch for, and reporting alone would claim no removal for packs that are really gone.
+
+Before this, `discard_pack` returned only `Err` once the pack was gone, so the cycle credited nothing for packs it had unlinked.
+Gross came out zero and net came out `0 - rewrite`, flipping the sign of a reclaim that had happened.
+The pack also stayed named in the writer's in-memory map, so `fsck` on the same open core failed on a file the cycle had itself removed.
+
+Two limits, stated rather than papered over:
+
+- These figures describe the current physical store, not what survives a crash.
+  A pack counted here whose unlink could not be made durable is a real removal right now that is unconfirmed for durability, and the daemon answers `io_error` rather than a quiet success.
+  `GcReport::unlink_durability_errors` counts them.
+- The error is not fixed by the counting.
+  The acceptance record that says the pack was whole was not written, so the removal needs re-checking on the next open; `fsck` is what checks it.
+
+Regression coverage is `a_failure_after_the_unlink_still_reports_the_removal_it_performed`, with `a_pack_the_store_still_holds_is_never_claimed_as_removed` as its control on the same fixture.
+The fault is a private store-state mutation that makes the acceptance record impossible to rewrite, which fails a step strictly after the unlink.
+It stands in for a post-unlink I/O error and is labelled as such: it is not a real `EIO` or `ENOSPC`, and it exercises the same branch one would take.
+
 The abandoned figure is read from the target file's real on-disk length at the moment the copy stopped, and that happens on **every** exit from a copy, not only on a cancel or an exhausted budget.
 A copy that fails part way through a batch (a corrupt source record, a short write, a failed sync, a failed commit) has still put bytes on disk, so those bytes belong in `rewrite_bytes` whatever ended the copy.
 The on-disk length is the exact figure rather than the compaction's in-memory write cursor: a write that fails part way leaves the file longer than the cursor ever advanced, so the cursor would undercount.
