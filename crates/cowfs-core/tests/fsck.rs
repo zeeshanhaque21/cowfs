@@ -73,7 +73,8 @@ fn missing_live_block_is_not_reported_clean() {
     // Acknowledge the loss as the old reader's cache upgrade did, so the store stops reporting
     // corruption. This is what made `Store::fsck` say clean while a live file was unreadable.
     {
-        let s = cowfs_store::Store::open(dir.path().join("store"), small_pack_opts().store).unwrap();
+        let s =
+            cowfs_store::Store::open(dir.path().join("store"), small_pack_opts().store).unwrap();
         assert!(
             s.recovery().has_corruption(),
             "removing the pack was not seen as a loss"
@@ -119,9 +120,16 @@ fn clean_store_with_live_files_is_clean() {
     c.sync().unwrap();
     assert_eq!(read_all(&c, a), data, "readback differs from source");
     let report = c.fsck().unwrap();
-    assert!(report.is_clean(), "false positive on a clean store: {report:?}");
+    assert!(
+        report.is_clean(),
+        "false positive on a clean store: {report:?}"
+    );
     assert_eq!(
-        report.damage.iter().filter(|d| matches!(d, Damage::MissingLiveBlock { .. })).count(),
+        report
+            .damage
+            .iter()
+            .filter(|d| matches!(d, Damage::MissingLiveBlock { .. }))
+            .count(),
         0
     );
 }

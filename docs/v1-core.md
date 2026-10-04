@@ -186,7 +186,8 @@ Tests: `a_damaged_chunk_fails_its_own_file_and_nothing_else`, `a_damaged_chunk_f
 | `list_snapshots()` | one read | |
 | `merkle_root(name)` | flush of that snapshot, then one read | root only covers committed state, so it flushes first |
 | `sync()` | flush of everything, then `Meta::sync` | |
-| `check()`, `fsck()` | scan | pass-through to `Meta::check` and `Store::fsck` after a flush |
+| `check()` | scan | pass-through to `Meta::check` after a flush |
+| `fsck()` | scan | `Store::fsck`, then a walk of every durable snapshot root for live references to absent blocks |
 
 Snapshot create is O(1) because meta's is.
 `Core` adds a flush of the source's pending operations, which is proportional to what is pending and bounded by the write-back limits, never to tree size.

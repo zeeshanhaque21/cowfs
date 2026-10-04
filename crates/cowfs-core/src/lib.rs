@@ -463,7 +463,9 @@ impl Core {
                     continue;
                 }
                 if !store.contains(id) {
-                    report.damage.push(cowfs_store::Damage::MissingLiveBlock { id });
+                    report
+                        .damage
+                        .push(cowfs_store::Damage::MissingLiveBlock { id });
                     if report.damage.len() >= MAX_MISSING_LIVE_REFS {
                         return Ok(());
                     }
