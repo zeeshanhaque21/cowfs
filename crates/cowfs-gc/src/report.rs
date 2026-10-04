@@ -64,8 +64,21 @@ pub struct GcReport {
     pub candidate_bytes: u64,
     /// Bytes of records in those packs that no root reaches: the most a cycle can free from them.
     pub candidate_dead_bytes: u64,
-    /// Bytes on disk freed by unlinking packs.
+    /// Bytes on disk freed by unlinking packs. **Gross**: the file length of each unlinked pack.
+    /// This is not the space saved, because surviving live records are rewritten into a new pack.
+    /// Kept for compatibility; [`GcReport::gross_removed_bytes`] is the same number under its
+    /// explicit name.
     pub freed_bytes: u64,
+    /// Bytes on disk removed by unlinking packs, under an explicit gross name. Equal to
+    /// [`GcReport::freed_bytes`].
+    pub gross_removed_bytes: u64,
+    /// Bytes written into the packs this cycle created, file headers included. Counts committed
+    /// rewrites and any abandoned partial copy, so it is real new bytes this cycle put on disk.
+    pub rewrite_bytes: u64,
+    /// Net space this cycle reclaimed: [`GcReport::gross_removed_bytes`] minus
+    /// [`GcReport::rewrite_bytes`], signed. Negative when the rewrite cost exceeds the removed
+    /// bytes, which is a truthful no-savings outcome rather than a saturated zero.
+    pub net_reclaimed_bytes: i64,
     /// Packs whose live records were copied into a new pack.
     pub packs_rewritten: u64,
     /// Packs unlinked. Equal to `packs_rewritten` unless something became live again.
@@ -112,9 +125,16 @@ impl GcReport {
         }
     }
 
-    /// Bytes the cycle would free, from a dry run or a real one.
+    /// Bytes the cycle would free, from a dry run or a real one. This is the gross removal; for
+    /// the net space reclaimed use [`GcReport::net`].
     pub fn reclaimed(&self) -> u64 {
         self.freed_bytes
+    }
+
+    /// Net space the cycle reclaimed: gross removed minus the bytes written into new packs,
+    /// signed.
+    pub fn net(&self) -> i64 {
+        self.net_reclaimed_bytes
     }
 
     /// True when the cycle freed nothing and reported no failure.

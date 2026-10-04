@@ -107,6 +107,8 @@ pub struct Rewrite {
     pub records: u64,
     /// Bytes written to the new pack, excluding its 16 byte header.
     pub bytes: u64,
+    /// File length of the new pack, header included, or 0 when nothing was written.
+    pub file_bytes: u64,
     /// Block ids the new pack does not hold, for [`Store::discard_pack`].
     pub condemned: Vec<BlockId>,
 }
@@ -154,6 +156,15 @@ impl Compaction {
     /// Bytes the new pack holds, excluding its header.
     pub fn written(&self) -> u64 {
         self.len - PACK_HEADER_LEN
+    }
+
+    /// File length of the new pack so far, header included, or 0 before the first record is copied.
+    pub fn target_file_bytes(&self) -> u64 {
+        if self.target.is_some() {
+            self.len
+        } else {
+            0
+        }
     }
 
     /// Bytes the remaining records will add to the new pack.
@@ -404,8 +415,15 @@ impl Store {
             } else {
                 0
             },
+            file_bytes: if c.target.is_some() { c.len } else { 0 },
             condemned: c.condemned.clone(),
         })
+    }
+
+    /// On-disk file length of a pack by id, or 0 when it is not there. Used to account a partial
+    /// copy whose target pack was created and never finished.
+    pub fn pack_file_len(&self, id: u32) -> u64 {
+        fs::metadata(pack::pack_path(self.guts().dir, id)).map_or(0, |m| m.len())
     }
 
     /// Unlink a pack whose live records were copied, and drop the index entries of the ids it no

@@ -501,17 +501,27 @@ impl Gc {
                 self.emit(&progress);
                 continue;
             }
-            match self.copy_one(plan, &live, &mut budget, &mut progress) {
+            let mut abandoned = 0;
+            match self.copy_one(plan, &live, &mut budget, &mut progress, &mut abandoned) {
                 // `None` means the copy was abandoned part way: the pack is left whole and the
                 // next cycle starts it again.
                 Ok(Some(rw)) => {
                     r.packs_rewritten += 1;
                     r.records_copied += rw.records;
                     r.bytes_copied += rw.bytes;
+                    r.rewrite_bytes += rw.file_bytes;
                     copied.push(rw);
                 }
-                Ok(None) => r.skip(plan.id, SkipReason::NotReached),
-                Err(e) => r.error(e),
+                Ok(None) => {
+                    // A partial copy left real bytes on disk this cycle wrote, so net never
+                    // overstates savings even though the pack was not committed.
+                    r.rewrite_bytes += abandoned;
+                    r.skip(plan.id, SkipReason::NotReached);
+                }
+                Err(e) => {
+                    r.rewrite_bytes += abandoned;
+                    r.error(e);
+                }
             }
             progress.packs_done += 1;
             self.emit(&progress);
@@ -714,13 +724,16 @@ impl Gc {
     }
 
     /// Copy one candidate. `Ok(None)` means the copy was abandoned: the budget ran out or the
-    /// cycle was cancelled, and the pack is left whole for the next cycle.
+    /// cycle was cancelled, and the pack is left whole for the next cycle. `abandoned` receives
+    /// the file length of any target pack the abandoned copy created, header included, so the
+    /// caller can account bytes actually written.
     fn copy_one(
         &self,
         plan: &PackPlan,
         live: &HashSet<BlockId>,
         budget: &mut u64,
         progress: &mut Progress,
+        abandoned: &mut u64,
     ) -> Result<Option<Rewrite>> {
         let is_live = |b: BlockId| live.contains(&b);
         let mut c = self.store.begin_compaction(plan, &is_live)?;
@@ -732,6 +745,7 @@ impl Gc {
             let owed = c.outstanding_bytes();
             progress.bytes_copied += c.written();
             if self.is_cancelled() || (*budget > 0 && owed > *budget) {
+                *abandoned += c.target_file_bytes();
                 return Ok(None);
             }
             *budget = budget.saturating_sub(owed);
@@ -749,6 +763,8 @@ impl Gc {
     /// the store holds that this cycle found unreachable is dropped, so the set shrinks as
     /// snapshots go away instead of pinning garbage forever.
     fn finish(&self, r: &mut GcReport, live: &HashSet<BlockId>, pinned: &[BlockId]) {
+        r.gross_removed_bytes = r.freed_bytes;
+        r.net_reclaimed_bytes = r.gross_removed_bytes as i64 - r.rewrite_bytes as i64;
         {
             let h = self.hints.lock().unwrap_or_else(PoisonError::into_inner);
             r.hints_tracked = h.tracked();
