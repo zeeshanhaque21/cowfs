@@ -257,8 +257,14 @@ if status["snapshot"] != f"{status['pool_id']}-base":
     raise SystemExit(f"the base snapshot name is not the derived one: {status}")
 if not status["fresh"]:
     raise SystemExit(f"the base is not fresh for this ref: {status}")
+print(f'commit={status["base_commit"]}')
 print(status["snapshot"])
 PYCHECK
+}
+
+# The commit the control API reports, which is what a reopen has to report again.
+reported_commit() { # reported_commit STATUS_LOG
+  sed -n 's/^commit=//p' "$1" | tail -1
 }
 
 say "warm base: refreshing through cowfs-treehouse base refresh --canonical $canonical"
@@ -268,6 +274,25 @@ refresh_ok seed "$out/refresh.log"
 base_snap=$(published_base "$out/base-status.log") ||
   fail "the control API does not report a published warm base: $(tail -1 "$out/base-status.log")"
 say "warm base: the control API reports it published and fresh; snapshot $base_snap"
+base_commit=$(reported_commit "$out/base-status.log")
+[ -n "$base_commit" ] || fail "base status printed no commit to compare"
+say "warm base: the reported commit is $base_commit"
+
+# Publishing a base must not leave the caller's repository changed. This is where the provenance is
+# checked to be a record and not a side effect: the record is written to the store, never into the
+# repository the refresh read.
+say "warm base: the repository still holds only its own worktree"
+git -C "$repo_dir" worktree list --porcelain >"$out/worktrees-after-refresh.txt" 2>&1 ||
+  fail "git worktree list failed after the refresh"
+if [ "$(grep -c '^worktree ' "$out/worktrees-after-refresh.txt")" -ne 1 ]; then
+  cat "$out/worktrees-after-refresh.txt" | tee -a "$out/run.log"
+  fail "the refresh left extra worktrees registered: $(grep '^worktree ' "$out/worktrees-after-refresh.txt" | tr '\n' ' ')"
+fi
+[ -z "$(git -C "$repo_dir" status --porcelain)" ] ||
+  fail "the refresh dirtied the repository: $(git -C "$repo_dir" status --porcelain | tr '\n' ' ')"
+[ "$(git -C "$repo_dir" rev-parse HEAD)" = "$commit" ] ||
+  fail "the refresh moved the repository's HEAD"
+say "warm base: one worktree, a clean tree, HEAD still $commit"
 
 [ -f "$mnt/$base_snap/app" ] || fail "the published warm base $base_snap has no app"
 cp "$mnt/$base_snap/app" "$out/app-base"
@@ -377,6 +402,19 @@ say "readback: fsck (the path backend has no block store, so this is expected to
 cowfs fsck >"$out/fsck.log" 2>&1 || say "readback: fsck says: $(tail -1 "$out/fsck.log")"
 cat "$out/fsck.log" | tee -a "$out/run.log"
 
+# The record was written to the store, so a daemon that has never seen this refresh in memory must
+# still find the base and report the same commit. Before the fix the tree survived this restart and
+# the provenance did not, which is why the readback has to ask the API again rather than trust it.
+say "readback: asking the control API for the base again, from a daemon that never saw the refresh"
+reopen_snap=$(published_base "$out/base-status-reopened.log") ||
+  fail "the reopened daemon does not report a published warm base: $(tail -1 "$out/base-status-reopened.log")"
+reopen_commit=$(reported_commit "$out/base-status-reopened.log")
+[ "$reopen_commit" = "$base_commit" ] ||
+  fail "the reopened daemon reports commit $reopen_commit, the refresh published $base_commit"
+[ "$reopen_snap" = "$base_snap" ] ||
+  fail "the reopened daemon reports base $reopen_snap, the refresh published $base_snap"
+say "readback: the reopened daemon reports $reopen_snap at the same commit $reopen_commit"
+
 say "readback: per-snapshot main.rs and app, read back through the mount after a reload"
 for name in base slotA slotB; do
   [ -f "$mnt/$name/main.rs" ] || fail "$name has no main.rs after the reload"
@@ -404,5 +442,59 @@ grep -q "^N-slotA: .*slot_path_embedded=True" "$out/embedded-paths.txt" ||
   fail "the native control does not record its own path, so the control proved nothing"
 say "check: the canonical artifacts record the canonical path and the native controls record their own"
 
-say "VERDICT: PASS: warm base and two fresh slots built through cowfs-treehouse at one canonical path over a real cowfs FUSE mount"
+# The counterexample a stored commit has to survive: a base whose repository has moved on is stale.
+# Without this, a base that merely records a commit would look exactly as good as one that is
+# compared against the repository, and "fresh" would be a word rather than a check.
+say "control: moving the repository forward must make the recorded base stale"
+printf '// moved on\n' >>"$repo_dir/main.rs"
+git -C "$repo_dir" add main.rs
+git -C "$repo_dir" commit -q -m "moved on after the base was published"
+new_commit=$(git -C "$repo_dir" rev-parse HEAD)
+[ "$new_commit" != "$commit" ] || fail "the control commit did not move the repository"
+companion_run --json base status --repo "$repo_dir" --ref main >"$out/base-status-stale.log" 2>&1 || true
+python3 - "$out/base-status-stale.log" "$base_commit" <<'PYSTALE'
+import json, sys
+
+last = [l for l in open(sys.argv[1]).read().splitlines() if l.strip()]
+status = json.loads(last[-1])
+print(
+    f"base status after the repository moved: base_commit={status['base_commit']} "
+    f"fresh={status['fresh']} reason={status.get('reason')!r}"
+)
+if status["base_commit"] != sys.argv[2]:
+    raise SystemExit(f"the stored commit changed: {status}")
+if status["fresh"]:
+    raise SystemExit(f"a base whose repository moved on still reports fresh: {status}")
+PYSTALE
+say "control: the same base, the same commit, and fresh=false because the repository moved"
+
+# And a repository that was never refreshed must not borrow another repository's base.
+say "control: a repository that was never refreshed has no base"
+other=$out/other-repo
+rm -rf "$other"
+mkdir -p "$other"
+cp "$out/fixture/main.rs" "$other/main.rs"
+git -C "$other" init -q -b main 2>/dev/null
+git -C "$other" config user.email ns17@example.invalid
+git -C "$other" config user.name ns17
+git -C "$other" add main.rs
+git -C "$other" commit -q -m "a different repository"
+companion_run --json base status --repo "$other" --ref main >"$out/base-status-other.log" 2>&1 || true
+python3 - "$out/base-status-other.log" <<'PYOTHER'
+import json, sys
+
+last = [l for l in open(sys.argv[1]).read().splitlines() if l.strip()]
+status = json.loads(last[-1])
+print(
+    f"base status for an unrefreshed repository: snapshot={status['snapshot']} "
+    f"base_commit={status['base_commit']} fresh={status['fresh']}"
+)
+if status["base_commit"] is not None:
+    raise SystemExit(f"an unrefreshed repository reported a commit: {status}")
+if status["fresh"]:
+    raise SystemExit(f"an unrefreshed repository reported fresh: {status}")
+PYOTHER
+say "control: an unrefreshed repository has no commit and is not fresh"
+
+say "VERDICT: PASS: warm base published with durable provenance, surviving a daemon reopen, and two fresh slots built through cowfs-treehouse at one canonical path over a real cowfs FUSE mount"
 say "artifacts: $out"
