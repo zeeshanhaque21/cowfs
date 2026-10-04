@@ -189,8 +189,8 @@ fn server_frames() -> Vec<(&'static str, ServerFrame)> {
                 freed_blocks: 0,
                 freed_bytes: 0,
                 gross_removed_bytes: 0,
-                rewrite_bytes: 0,
-                net_reclaimed_bytes: 0,
+                rewrite_bytes: Some(0),
+                net_reclaimed_bytes: Some(0),
             })),
         ),
         (
@@ -487,8 +487,9 @@ fn unknown_response_kind_decodes_to_unknown_with_raw_data() {
 
 #[test]
 fn an_old_gc_report_without_the_gross_fields_still_decodes() {
-    // A pre-#81 server sends the five original fields; the new gross, rewrite and net fields
-    // must default so an old client and an old fixture keep working.
+    // A pre-#81 server sends the five original fields. The gross is real, but the rewrite cost
+    // was never measured, so the net is unknown, not zero: a legacy cycle may have rewritten a
+    // pack. Deriving net = gross would report a saving nobody measured.
     let f = ServerFrame::decode(
         br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608}}}"#,
     );
@@ -503,8 +504,11 @@ fn an_old_gc_report_without_the_gross_fields_still_decodes() {
         g.gross_removed_bytes, 196_608,
         "an absent explicit gross falls back to freed_bytes, not zero"
     );
-    assert_eq!(g.rewrite_bytes, 0);
-    assert_eq!(g.net_reclaimed_bytes, 0);
+    assert_eq!(g.rewrite_bytes, None, "legacy rewrite is unknown, not zero");
+    assert_eq!(
+        g.net_reclaimed_bytes, None,
+        "legacy net is unknown, not a false zero and not gross"
+    );
 }
 
 #[test]
@@ -519,8 +523,45 @@ fn a_gc_report_that_carries_the_gross_fields_keeps_them() {
         panic!("{result:?}")
     };
     assert_eq!(g.gross_removed_bytes, 196_608);
-    assert_eq!(g.rewrite_bytes, 1024);
-    assert_eq!(g.net_reclaimed_bytes, 195_584);
+    assert_eq!(g.rewrite_bytes, Some(1024));
+    assert_eq!(g.net_reclaimed_bytes, Some(195_584));
+}
+
+#[test]
+fn a_gc_report_with_only_some_gross_fields_is_rejected() {
+    // Present together or absent together. A half-written report cannot be repaired without
+    // guessing, so it is an error rather than a quiet wrong default.
+    for data in [
+        r#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608}}}"#,
+        r#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"rewrite_bytes":1024,"net_reclaimed_bytes":195584}}}"#,
+        r#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608,"rewrite_bytes":1024}}}"#,
+    ] {
+        let err = ServerFrame::decode(data.as_bytes());
+        assert!(
+            err.is_err(),
+            "partial gross fields must be rejected: {data}"
+        );
+    }
+}
+
+#[test]
+fn a_gc_report_with_inconsistent_gross_fields_is_rejected() {
+    // An explicit gross that disagrees with freed_bytes, or a net that is not gross minus
+    // rewrite, is a corrupt report. Accepting it would print a number that never happened.
+    let mismatched_gross = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":100,"rewrite_bytes":0,"net_reclaimed_bytes":100}}}"#,
+    );
+    assert!(mismatched_gross.is_err(), "gross != freed_bytes");
+
+    let mismatched_net = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608,"rewrite_bytes":1024,"net_reclaimed_bytes":999}}}"#,
+    );
+    assert!(mismatched_net.is_err(), "net != gross - rewrite");
+
+    let out_of_range = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":18446744073709551615,"gross_removed_bytes":18446744073709551615,"rewrite_bytes":0,"net_reclaimed_bytes":0}}}"#,
+    );
+    assert!(out_of_range.is_err(), "gross - rewrite out of i64 range");
 }
 
 #[test]

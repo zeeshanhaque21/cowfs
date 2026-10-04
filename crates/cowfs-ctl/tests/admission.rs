@@ -48,8 +48,8 @@ impl ControlHandler for Streamer {
             freed_blocks: 0,
             freed_bytes: 0,
             gross_removed_bytes: 0,
-            rewrite_bytes: 0,
-            net_reclaimed_bytes: 0,
+            rewrite_bytes: Some(0),
+            net_reclaimed_bytes: Some(0),
         })
     }
 }

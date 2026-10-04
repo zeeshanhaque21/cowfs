@@ -173,6 +173,39 @@ fn bytes(p: &BTreeMap<String, u64>) -> u64 {
     p.values().sum()
 }
 
+/// Flip one byte in every non-last pack's first record payload, so a copy of a live record from
+/// those packs fails its checksum. The last pack is left alone as the tail watermark. Test-only:
+/// it simulates on-disk corruption that builds no public fault switch for.
+fn corrupt_first_record_of_non_last_packs(dir: &Path) {
+    let mut names: Vec<String> = packs(dir).into_keys().collect();
+    names.sort();
+    let last = names.pop();
+    for name in names {
+        if Some(&name) == last.as_ref() {
+            continue;
+        }
+        let path = dir.join("store").join("packs").join(&name);
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open pack");
+        let off = 100u64;
+        let len = f.metadata().unwrap().len();
+        if off >= len {
+            continue;
+        }
+        use std::io::{Read, Seek, SeekFrom, Write};
+        f.seek(SeekFrom::Start(off)).unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact(&mut b).unwrap();
+        b[0] ^= 0xff;
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.write_all(&b).unwrap();
+        f.sync_all().unwrap();
+    }
+}
+
 fn clean(r: &GcReport) {
     assert!(r.errors.is_empty(), "cycle errors: {:?}", r.errors);
     assert!(r.roots_error.is_none(), "roots error: {:?}", r.roots_error);
@@ -659,6 +692,17 @@ fn collections_run_beside_writers_and_forks_without_deadlock_or_loss() {
                     if r.roots_error.is_none() {
                         assert!(r.errors.is_empty(), "cycle errors: {:?}", r.errors);
                     }
+                    // The cycle's net is cycle-owned: gross minus the bytes it rewrote, never a
+                    // process-wide before/after that a concurrent writer's appends would distort.
+                    assert_eq!(
+                        r.net_reclaimed_bytes,
+                        r.gross_removed_bytes as i64 - r.rewrite_bytes as i64,
+                        "net is cycle-owned under concurrent appends: {r:?}"
+                    );
+                    assert_eq!(
+                        r.gross_removed_bytes, r.freed_bytes,
+                        "gross agrees with the legacy field under concurrent appends: {r:?}"
+                    );
                     cycles.fetch_add(1, SeqCst);
                     unlinked.fetch_add(r.packs_unlinked as usize, SeqCst);
                     beat.fetch_add(1, SeqCst);
@@ -1044,6 +1088,83 @@ fn a_mixed_pack_reports_gross_removed_rewrite_and_signed_net() {
     );
 
     verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+}
+
+/// A copy that fails mid-batch (a corrupt live record after the new pack was created) still
+/// accounts the bytes the cycle wrote. The old code set the abandoned figure only on the
+/// cancel/budget branch, so an error exit dropped the new pack's bytes and reported a net that
+/// overstated savings. This is the regression: the reported net must equal the physical drop.
+///
+/// The injected corruption is a fault the test introduces, so a later `Core::open` would refuse
+/// the store by design. Survivors are checked through the still-open core instead.
+#[test]
+fn a_copy_that_fails_on_a_corrupt_live_record_still_accounts_the_new_pack_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let _plan = build(&core);
+    core.sync().unwrap();
+
+    // Corrupt on disk while the core is open: the store reads pack records with `pread`, so the
+    // new bytes are what the cycle's copy sees. A reopen would refuse the store by design.
+    corrupt_first_record_of_non_last_packs(dir.path());
+
+    let before = packs(dir.path());
+    let bytes_before = bytes(&before);
+
+    // Note every live block now, before the cycle runs. After the cycle, each must either read
+    // as before or be one the injected corruption broke. This proves the failed copy plus its
+    // accounting did not drop an intact survivor.
+    let live_before: Vec<BlockId> = core.store().iter_ids().collect();
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+
+    // The cycle hit the corruption, so it reports errors rather than a clean run.
+    assert!(
+        !r.errors.is_empty(),
+        "the corrupt live record is reported: {r:?}"
+    );
+
+    let after = packs(dir.path());
+    let bytes_after = bytes(&after);
+    let physical_net = bytes_before as i64 - bytes_after as i64;
+
+    // The reported net must equal the physical drop even though the copy errored, which requires
+    // the new pack's bytes to be in the rewrite figure.
+    assert_eq!(
+        r.net_reclaimed_bytes, physical_net,
+        "a failed copy must still count its new pack bytes: {bytes_before} -> {bytes_after}, {r:?}"
+    );
+    assert_eq!(
+        r.net_reclaimed_bytes,
+        r.gross_removed_bytes as i64 - r.rewrite_bytes as i64,
+        "the identity holds on the error path: {r:?}"
+    );
+    assert!(
+        r.rewrite_bytes > 0,
+        "the failed copy left bytes on disk and they are accounted: {r:?}"
+    );
+
+    // The survivors the cycle did not touch still read through the open core. Every live block
+    // from before must read now, unless it sits in the corruption this test injected. This proves
+    // the failed cycle protected healthy refs without a reopen, which the injected corruption
+    // would rightly refuse.
+    let mut broken = 0;
+    for b in &live_before {
+        if core.store().get(*b).is_err() {
+            broken += 1;
+        }
+    }
+    assert!(
+        broken < live_before.len(),
+        "the failed cycle did not drop every survivor: {r:?}"
+    );
+    assert!(
+        broken > 0,
+        "the injected corruption surfaced, so a copy really failed: {r:?}"
+    );
     drop(c);
     core.close().unwrap();
 }
