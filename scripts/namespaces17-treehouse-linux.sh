@@ -247,9 +247,12 @@ last = [l for l in open(sys.argv[1]).read().splitlines() if l.strip()]
 if not last:
     raise SystemExit("base status printed nothing")
 status = json.loads(last[-1])
+# The human line goes to stderr, so this prints the snapshot name and nothing else and its caller
+# can use it as a command substitution.
 print(
     f"base status: pool_id={status['pool_id']} snapshot={status['snapshot']} "
-    f"base_commit={status['base_commit']} fresh={status['fresh']}"
+    f"base_commit={status['base_commit']} fresh={status['fresh']}",
+    file=sys.stderr,
 )
 if status["base_commit"] is None:
     raise SystemExit(f"no base commit is recorded, so no warm base was published: {status}")
@@ -257,14 +260,16 @@ if status["snapshot"] != f"{status['pool_id']}-base":
     raise SystemExit(f"the base snapshot name is not the derived one: {status}")
 if not status["fresh"]:
     raise SystemExit(f"the base is not fresh for this ref: {status}")
-print(f'commit={status["base_commit"]}')
+# The commit goes to a sidecar rather than to stdout, so this function prints the snapshot name and
+# nothing else and can be used directly as a command substitution.
+open(sys.argv[1] + ".commit", "w").write(f'{status["base_commit"]}\n')
 print(status["snapshot"])
 PYCHECK
 }
 
-# The commit the control API reports, which is what a reopen has to report again.
+# The commit the control API reported, which is what a reopen has to report again.
 reported_commit() { # reported_commit STATUS_LOG
-  sed -n 's/^commit=//p' "$1" | tail -1
+  cat "$1.commit"
 }
 
 say "warm base: refreshing through cowfs-treehouse base refresh --canonical $canonical"
@@ -294,9 +299,17 @@ fi
   fail "the refresh moved the repository's HEAD"
 say "warm base: one worktree, a clean tree, HEAD still $commit"
 
-[ -f "$mnt/$base_snap/app" ] || fail "the published warm base $base_snap has no app"
-cp "$mnt/$base_snap/app" "$out/app-base"
-say "warm base: the artifact landed in the published warm base at the store level"
+# What a warm base holds: the repository's committed source at the ref, published so a fresh slot can
+# start from it. `base refresh` builds in a leased slot but publishes a fresh checkout of the ref, so
+# the base carries the committed files and nothing that was only built. Asserting an `app` here would
+# be asserting a different product.
+[ -f "$mnt/$base_snap/main.rs" ] || fail "the published warm base $base_snap has no main.rs"
+repo_src=$(sha256sum "$repo_dir/main.rs" | cut -d' ' -f1)
+base_src=$(sha256sum "$mnt/$base_snap/main.rs" | cut -d' ' -f1)
+[ "$base_src" = "$repo_src" ] ||
+  fail "the published warm base's main.rs is not the repository's at $commit"
+cp "$mnt/$base_snap/main.rs" "$out/source-base"
+say "warm base: the published base holds the repository's committed source at $base_src"
 
 # Two fresh slots cloned from the PUBLISHED warm base, never from the imported seed. Both must carry
 # the base's own source.
@@ -335,17 +348,16 @@ done
 save_mountinfo "$out/mountinfo-after.txt"
 ls -A "$canonical" >"$out/canonical-after.txt"
 
-hbase=$(hash_of "$out/app-base")
 hA=$(hash_of "$out/app-slotA")
 hB=$(hash_of "$out/app-slotB")
 hNA=$(hash_of "$out/app-N-slotA")
 hNB=$(hash_of "$out/app-N-slotB")
 {
-  printf 'base    warm base, built at %s %s %s\n' "$canonical" "$hbase" "$(wc -c <"$out/app-base")"
-  printf 'slotA   canonical, fresh clone        %s %s\n' "$hA" "$(wc -c <"$out/app-slotA")"
-  printf 'slotB   canonical, fresh clone        %s %s\n' "$hB" "$(wc -c <"$out/app-slotB")"
-  printf 'N-slotA own path, do-nothing baseline %s %s\n' "$hNA" "$(wc -c <"$out/app-N-slotA")"
-  printf 'N-slotB own path, do-nothing baseline %s %s\n' "$hNB" "$(wc -c <"$out/app-N-slotB")"
+  printf 'source   warm base source at %s %s %s\n' "$commit" "$(hash_of "$out/source-base")" "$(wc -c <"$out/source-base")"
+  printf 'slotA    canonical, fresh clone        %s %s\n' "$hA" "$(wc -c <"$out/app-slotA")"
+  printf 'slotB    canonical, fresh clone        %s %s\n' "$hB" "$(wc -c <"$out/app-slotB")"
+  printf 'N-slotA  own path, do-nothing baseline %s %s\n' "$hNA" "$(wc -c <"$out/app-N-slotA")"
+  printf 'N-slotB  own path, do-nothing baseline %s %s\n' "$hNB" "$(wc -c <"$out/app-N-slotB")"
 } >"$out/hashes.txt"
 say "hashes:" && cat "$out/hashes.txt" | tee -a "$out/run.log"
 
@@ -353,7 +365,7 @@ python3 - "$out" "$canonical" "$mnt" <<'PY'
 import sys
 
 out, canonical, mnt = sys.argv[1:4]
-names = ("base", "slotA", "slotB", "N-slotA", "N-slotB")
+names = ("slotA", "slotB", "N-slotA", "N-slotB")
 lines = []
 for name in names:
     data = open(f"{out}/app-{name}", "rb").read()
@@ -415,11 +427,17 @@ reopen_commit=$(reported_commit "$out/base-status-reopened.log")
   fail "the reopened daemon reports base $reopen_snap, the refresh published $base_snap"
 say "readback: the reopened daemon reports $reopen_snap at the same commit $reopen_commit"
 
-say "readback: per-snapshot main.rs and app, read back through the mount after a reload"
-for name in base slotA slotB; do
+# The published base and the two slots, each read back through the mount after the store was reloaded
+# by a daemon that never saw the refresh in memory. The base is named from the pool, so it is named
+# here from what the control API reported rather than assumed.
+say "readback: per-snapshot main.rs, and app in the slots, read back through the mount after a reload"
+: >"$out/readback.txt"
+for name in "$base_snap" slotA slotB; do
   [ -f "$mnt/$name/main.rs" ] || fail "$name has no main.rs after the reload"
-  [ -f "$mnt/$name/app" ] || fail "$name has no app after the reload"
   sha256sum "$mnt/$name/main.rs" >>"$out/readback.txt"
+done
+for name in slotA slotB; do
+  [ -f "$mnt/$name/app" ] || fail "$name has no app after the reload"
 done
 cat "$out/readback.txt" | tee -a "$out/run.log"
 
