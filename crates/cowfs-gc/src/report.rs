@@ -83,6 +83,11 @@ pub struct GcReport {
     pub packs_rewritten: u64,
     /// Packs unlinked. Equal to `packs_rewritten` unless something became live again.
     pub packs_unlinked: u64,
+    /// Packs that were unlinked but whose removal could not be made durable, because a step after
+    /// the unlink failed. Those bytes are still counted in the gross and net figures, because the
+    /// files really are gone, but the store cannot vouch for the unlink surviving a crash, so this
+    /// count is what tells a caller a cycle's removals need re-checking.
+    pub unlink_durability_errors: u64,
     /// Records copied into new packs.
     pub records_copied: u64,
     /// Bytes written into new packs, headers excluded.
@@ -137,6 +142,10 @@ impl GcReport {
     }
 
     /// True when the cycle freed nothing and reported no failure.
+    ///
+    /// A cycle that unlinked a pack whose removal it could not make durable freed something and
+    /// reported a failure, so it is not a no-op; it is a removal that needs re-checking, which
+    /// [`GcReport::unlink_durability_errors`] counts.
     pub fn is_noop(&self) -> bool {
         self.freed_bytes == 0 && self.errors.is_empty()
     }

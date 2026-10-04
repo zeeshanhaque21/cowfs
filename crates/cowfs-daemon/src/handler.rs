@@ -341,6 +341,24 @@ impl ControlHandler for Handler {
                  was freed: try again when the mount is quieter",
             ));
         }
+        // A pack whose unlink could not be made durable is counted in the figures, because the file is
+        // really gone, but the cycle is not a clean success: the removal is unconfirmed. The message
+        // carries the real gross, rewrite and net so the caller sees the actual numbers rather than
+        // reading an unexplained success.
+        if r.unlink_durability_errors > 0 {
+            return Err(CtlError::new(
+                ErrorCode::IoError,
+                format!(
+                    "garbage collection could not confirm {} unlink(s) as durable; {} removed \
+                     (gross), {} rewritten, net {} reclaimed; first failure: {}",
+                    r.unlink_durability_errors,
+                    r.gross_removed_bytes,
+                    r.rewrite_bytes,
+                    r.net_reclaimed_bytes,
+                    r.errors.first().map_or("none", String::as_str),
+                ),
+            ));
+        }
         if let (Some(first), 0) = (r.errors.first(), r.freed_bytes) {
             // The cycle failed before it unlinked any pack, but it may still have written bytes
             // into a new pack. The message carries the real gross, rewrite and net so the caller
@@ -872,6 +890,50 @@ mod tests {
                 blocks_after: 10,
             }))
         }
+    }
+
+    fn gc_handler_with_report(report: cowfs_gc::GcReport) -> (tempfile::TempDir, Arc<Handler>) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(FailingGc {
+            inner: PathBackend::open(dir.path().join("store")).unwrap(),
+            report,
+        });
+        backend.snapshots().create("base", None).unwrap();
+        let mount = Arc::new(
+            Mounted::no_mount(dir.path().join("mnt")).expect("the placeholder is always there"),
+        );
+        let exports = Exports::new(
+            Arc::clone(&backend),
+            vec![dir.path().join("pool")],
+            vec![backend.store_path().to_owned()],
+            dir.path().join("mnt"),
+        );
+        (dir, Handler::new(backend, mount, exports))
+    }
+
+    /// A pack the store unlinked but could not make durable is a terminal failure, not a quiet
+    /// success: the bytes are gone, so the figures are real, but the cycle could not confirm the
+    /// removal and the caller has to be told.
+    #[test]
+    fn an_unconfirmed_unlink_is_a_terminal_failure_carrying_the_real_figures() {
+        let (_d, h) = gc_handler_with_report(cowfs_gc::GcReport {
+            freed_bytes: 8192,
+            gross_removed_bytes: 8192,
+            rewrite_bytes: 2048,
+            net_reclaimed_bytes: 6144,
+            packs_unlinked: 2,
+            unlink_durability_errors: 2,
+            errors: vec!["i/o error: Is a directory (os error 21)".into()],
+            ..Default::default()
+        });
+        let ctx = OpContext::new(cowfs_ctl::CancelToken::new(), |_| true);
+        let e = h.gc(GcParams { dry_run: false }, &ctx).unwrap_err();
+        assert_eq!(e.code, ErrorCode::IoError, "{e}");
+        let msg = e.message.clone();
+        assert!(msg.contains("durable"), "{msg}");
+        // The real numbers, not zeros: the unlink happened.
+        assert!(msg.contains("8192") && msg.contains("2048"), "{msg}");
+        assert!(msg.contains("6144"), "the signed net is carried: {msg}");
     }
 
     #[test]
