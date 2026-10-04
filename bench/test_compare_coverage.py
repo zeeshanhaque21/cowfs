@@ -121,6 +121,23 @@ class OneSidedGates(CliCase):
             self.assertIn("RESULT: PASS  scope: compared 1 of 6 (g1), not compared g2 g3 g4 g5 g6", out)
             self.assertNotIn("g3 ", out.split("gate coverage")[0].split("gate  n_nat")[1])
 
+    def test_two_native_files_sharing_a_label_report_their_combined_reps(self):
+        """gates.py stamps the file name, so --no-resume twice yields one label, two files."""
+        with tempfile.TemporaryDirectory() as d:
+            nat1 = self.arm(d, "n1.jsonl", "native1", ["g1", "g3"],
+                            [rep("g1", 0, 8.0), rep("g3", 0, 2.0), rep("g3", 1, 2.2)])
+            nat2 = self.arm(d, "n2.jsonl", "native1", ["g1", "g3"], [rep("g1", 0, 8.2), rep("g3", 0, 2.1)])
+            cow = self.arm(d, "c.jsonl", "cowfs1", ["g1", "g3"], [rep("g1", 0, 9.6)])
+            rc, out, err = self.cli([nat1, nat2], cow)
+            self.assertEqual(rc, 0, err)
+            line = gap(out, "g3")
+            self.assertIsNotNone(line, out)
+            self.assertIn("native has 3 reps", line)
+            self.assertIn("native1 requested it and recorded 3 reps", line)
+            g3 = next(g for g in coverage_line(out)["not_compared"] if g["gate"] == "g3")
+            self.assertEqual(g3["reps"], {"native": 3, "cowfs": 0})
+            self.assertEqual(g3["requested_by"], {"native1": 3, "cowfs1": 0})
+
     def test_gate_missing_from_the_native_arm_names_that_arm(self):
         with tempfile.TemporaryDirectory() as d:
             nat = self.arm(d, "n.jsonl", "native1", ["g1"], [rep("g1", 0, 8.0)])
@@ -308,7 +325,11 @@ class RealHarnessOutput(CliCase):
 
     def test_real_gates_output_reports_a_gate_the_cowfs_arm_never_ran(self):
         with tempfile.TemporaryDirectory() as d:
-            env = dict(os.environ, COWFS_BENCH_SCALE="0.001", COWFS_BENCH_CARGO_HOME=str(Path(d) / "cargo-home"))
+            # gates.py records real load1 and the comparator refuses a ratio above its
+            # ceiling, so an ambient load over 30 turns this into an exit-2 run. Pin the
+            # harness's own documented hook instead of relaxing the production policy.
+            env = dict(os.environ, COWFS_BENCH_SCALE="0.001", COWFS_BENCH_CARGO_HOME=str(Path(d) / "cargo-home"),
+                       COWFS_BENCH_FAKE_LOAD1="1")
             arms = {}
             for label, gates in (("native1", "g5,g6"), ("native2", "g5,g6"), ("cowfs1", "g5")):
                 root = Path(d) / label

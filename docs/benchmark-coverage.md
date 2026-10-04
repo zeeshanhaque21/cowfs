@@ -37,8 +37,12 @@ coverage {"compared": ["g1"], "gates_known": 6, "not_compared": [...]}
 Three parts, one set of facts each.
 
 - `gate coverage` counts what was compared out of the six gates the harness knows.
-- One indented line per gate that some input requested or that has reps in one arm only, naming the arm with no data for it, how many reps the other arm recorded, and every input that asked for the gate together with how many reps that input recorded.
+- One indented line per gate that some input requested or that has reps in one arm only, naming the arm with no data for it, how many reps the other arm recorded, and every compared-arm input that asked for the gate together with how many reps that input recorded.
 - One `coverage {...}` line, the same facts as JSON, with a `not_compared` entry for every gate that produced no comparison, not only the in-scope ones. Each entry carries `missing_in` (`cowfs`, `native` or `any input`), `reps` per arm, and `requested_by` mapping each input that asked for the gate to the reps it recorded.
+
+Attribution is read from the compared arms' input metadata only: the `--native` files and the `--cowfs` file.
+A `--noise-floor` file that is not also passed as a native input is validated and counted in the noise-floor table, but its meta is not consulted for `requested_by`, so a gate only that file recorded can print no human line and an empty `requested_by`.
+In the `run-pair.sh` workflow the noise floor is the second native run and is also a native input, so this is invisible in normal use.
 
 The aggregate verdict carries its own scope, so a partial result cannot read as a whole-criterion verdict:
 
@@ -64,7 +68,9 @@ The noise-floor table gains one line when the noise-floor file lacks a gate the 
 ## What this does not establish
 
 A scoped `PASS` is a statement about the gates it compared and about nothing else.
-`compared 1 of 6 (g1)` means one gate cleared its bar and the other five are unmeasured, not that the filesystem is fast.
+Under a `PASS`, `compared 1 of 6 (g1)` means one gate cleared its bar and the other five were not compared.
+The same suffix on an `UNMEASURABLE` line counts gates that were attempted in both arms, including one that could not be measured, so it is not a count of gates that passed.
+Coverage is counted from reps present in both arms, so a gate whose native side recorded a `wall_s` of zero still counts as compared even though no ratio could be formed.
 No result in this change is a performance measurement, and none of it is evidence about any production gate.
 The coverage report reads the harness's own output.
 It cannot tell a hand-written but internally consistent file from a real run, exactly as `docs/bench-g5-regression.md` already records for byte accounting.
@@ -94,14 +100,30 @@ Nine scenarios each: the reported one-sided `g1,g3` case, the same case on real 
 | g5 in one arm only, where every supplied input has g5 | rc 0, the other gate dropped | rc 0, the other gate named |
 | g5 in one arm and absent from another supplied input | rc 3 | rc 3, no coverage block |
 | meta with no gate list | rc 0 | rc 0, nobody named as having asked |
+| two native files sharing one label, 2 `g6` reps and 1 | rc 0, `g6` absent | rc 0, `native has 3 reps` and `native1 requested it and recorded 3 reps` |
 
 ## Tests
 
 `python3 -m unittest discover -s bench`, the command CI runs.
 
 `bench/test_compare_coverage.py` drives `python3 bench/compare.py` as a subprocess in every case, because the defect was silent output from the real entrypoint and an in-process `main()` call sees neither the exit code nor the stdout and stderr split a caller sees.
-It covers one-sided gates in both directions, all three shapes of a two-gate pair, partial verdicts at exit 0, 1 and 2, matched scoped comparisons, a meta with no gate list, gates neither arm requested, the preserved refusals (g5 all or nothing, disjoint gates, malformed and missing files), a noise floor that is missing a gate and one that is not, and one case that builds its arms with the real `gates.py` CLI at `COWFS_BENCH_SCALE=0.001` so the gate list the report reads is the one the harness writes.
+It covers one-sided gates in both directions, all three shapes of a two-gate pair, partial verdicts at exit 0, 1 and 2, matched scoped comparisons, a meta with no gate list, gates neither arm requested, two native files sharing one label, the preserved refusals (g5 all or nothing, disjoint gates, malformed and missing files), a noise floor that is missing a gate and one that is not, and one case that builds its arms with the real `gates.py` CLI at `COWFS_BENCH_SCALE=0.001` so the gate list the report reads is the one the harness writes.
+That real-harness case pins `COWFS_BENCH_FAKE_LOAD1=1`, so it does not depend on how busy the machine is.
+`gates.py` records the real load1, and the comparator refuses a ratio above its ceiling, so without the pin an ambient load over 30 turns that case into an exit-2 run.
+The pin is the harness's own documented test hook; no production load policy was changed.
 
-Against the baseline comparator, 10 of those 15 fail.
-The 5 that pass are the pins on behaviour that must not change: the three refusals, the preserved exit-0 scoped comparison, and the two cases that must print nothing.
-Against the changed comparator all 15 pass, and the 36 tests already in `bench/test_gates.py` still pass.
+Against the baseline comparator `ceb96c6`, 11 of those 16 fail.
+The 5 that pass are the pins on behaviour that must not change, and they are exactly these five:
+
+- `RefusalsUnchanged.test_g5_all_or_nothing_is_still_refused_with_no_coverage_printed`
+- `RefusalsUnchanged.test_disjoint_gates_are_still_refused_and_print_no_coverage`
+- `RefusalsUnchanged.test_malformed_input_is_still_refused_and_names_the_file`
+- `NoiseFloorCoverage.test_a_noise_floor_covering_every_compared_gate_says_nothing`
+- `ScopedComparisonsPreserved.test_gates_neither_arm_requested_are_not_reported_as_gaps`
+
+There is no sixth.
+`ScopedComparisonsPreserved.test_matched_g1_only_and_g1_g3_only_still_pass` does not pass on the baseline, because it asserts that the new `gate coverage` line exists, so it is one of the 11 that prove the change.
+Against the changed comparator all 16 pass, and the 36 tests already in `bench/test_gates.py` still pass, for 52 in total.
+
+`test_two_native_files_sharing_a_label_report_their_combined_reps` pins the duplicate-label fix.
+It fails on the baseline, and it also fails on a mutant of the head that restores per-input keying while keeping everything else, so it isolates that one behaviour.

@@ -125,6 +125,23 @@ def inputs_of(paths):
     return out
 
 
+def requested_by(inputs, gate):
+    """Reps recorded under each label that asked for the gate, summed over inputs sharing a label.
+
+    gates.py appends a timestamp to a label rather than uniquifying it, so one label can be
+    two files. Keyed per file that would report one file's count as the label's; summing
+    keeps the number equal to the reps those inputs actually recorded. Only inputs whose own
+    meta asked for the gate are counted, so a file that merely shares the label is never
+    named as a requester.
+    """
+    out = {}
+    for i in inputs:
+        if i["requested"] is None or gate not in i["requested"]:
+            continue
+        out[i["label"]] = out.get(i["label"], 0) + i["counts"].get(gate, 0)
+    return out
+
+
 def coverage_gaps(native_inputs, cowfs_inputs):
     """Every known gate with no comparison: the arm missing its data, and who asked for it."""
     out = []
@@ -137,11 +154,7 @@ def coverage_gaps(native_inputs, cowfs_inputs):
             "gate": gate,
             "missing_in": "cowfs" if n else ("native" if c else "any input"),
             "reps": {"native": n, "cowfs": c},
-            "requested_by": {
-                i["label"]: i["counts"].get(gate, 0)
-                for i in [*native_inputs, *cowfs_inputs]
-                if i["requested"] is not None and gate in i["requested"]
-            },
+            "requested_by": requested_by([*native_inputs, *cowfs_inputs], gate),
         })
     return out
 
