@@ -28,6 +28,17 @@ const FSCK_REQUEST: &str = r#"{"type":"request","id":1,"method":"fsck","params":
 struct ProgressFlood {
     entered: Arc<AtomicBool>,
     steps: Arc<AtomicU64>,
+    /// Set when the handler is dropped, so a test can prove the server released the blocked
+    /// connection by the deadline instead of leaving it to unwind against `write_timeout`.
+    dropped: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for ProgressFlood {
+    fn drop(&mut self) {
+        if let Some(d) = &self.dropped {
+            d.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl ControlHandler for ProgressFlood {
@@ -77,9 +88,31 @@ fn flood() -> (ProgressFlood, Arc<AtomicBool>, Arc<AtomicU64>) {
         ProgressFlood {
             entered: Arc::clone(&entered),
             steps: Arc::clone(&steps),
+            dropped: None,
         },
         entered,
         steps,
+    )
+}
+
+fn flood_with_drop() -> (
+    ProgressFlood,
+    Arc<AtomicBool>,
+    Arc<AtomicU64>,
+    Arc<AtomicBool>,
+) {
+    let entered = Arc::new(AtomicBool::new(false));
+    let steps = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    (
+        ProgressFlood {
+            entered: Arc::clone(&entered),
+            steps: Arc::clone(&steps),
+            dropped: Some(Arc::clone(&dropped)),
+        },
+        entered,
+        steps,
+        dropped,
     )
 }
 
@@ -190,9 +223,11 @@ fn an_unblocked_client_still_receives_a_terminal_frame_at_shutdown() {
 
     let t0 = Instant::now();
     fx.server().handle().shutdown();
-    // Keep reading so the abandoned request's terminal frame is not lost to a full buffer.
+    // Keep reading so the abandoned request's terminal frame is not lost to a full buffer. The
+    // frame now lands at the deadline plus grace, well under 2 s; a 5 s window would mask a
+    // regression back to the write timeout.
     let mut terminal = false;
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + Duration::from_secs(2);
     let mut pending = Vec::new();
     let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
     while Instant::now() < until {
@@ -286,11 +321,11 @@ fn pending_requests_are_abandoned_together_when_one_progress_write_is_blocked() 
 
     let t0 = Instant::now();
     fx.server().handle().shutdown();
-    // Read both terminal frames. The connection is abandoned at the deadline, but the client is
-    // reading, so the detached abandon thread can still land both `shutting_down` frames.
+    // Read both terminal frames. The connection is abandoned at the deadline; the frames land at
+    // the deadline plus grace, and the 2 s window fails a regression to the write timeout.
     let mut seen: std::collections::BTreeSet<u64> = Default::default();
     let _ = r.stream.set_read_timeout(Some(Duration::from_millis(50)));
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + Duration::from_secs(2);
     let mut buf = Vec::new();
     while Instant::now() < until && seen.len() < 2 {
         buf.clear();
@@ -428,15 +463,64 @@ fn terminal_frame_survives_process_exit_after_wait() {
     );
 }
 
+/// A handler whose `gc` floods progress (to stall a non-reading client) and whose `fsck` does real
+/// pending work until its cancel token fires. One handler serves both connections, so a healthy
+/// `fsck` reader can sit behind a stalled `gc` writer and must still get its terminal frame at the
+/// deadline. The trait default `fsck` would return `unsupported` instantly and make the assertion
+/// vacuous.
+struct FloodAndStuckFsck {
+    entered: Arc<AtomicBool>,
+    steps: Arc<AtomicU64>,
+    fsck_entered: Arc<AtomicBool>,
+    /// The `fsck` body ignores its cancel token and loops until this is set, so its terminal frame
+    /// can only come from the shutdown abandon path. That is what makes the test discriminate:
+    /// a serial abandon path delays the frame to `write_timeout`; a parallel one lands it at the
+    /// deadline. The test sets it at the end to release the handler.
+    release: Arc<AtomicBool>,
+}
+
+impl ControlHandler for FloodAndStuckFsck {
+    fn gc(&self, _: GcParams, ctx: &OpContext<'_>) -> CtlResult<GcReport> {
+        self.entered.store(true, Ordering::SeqCst);
+        loop {
+            self.steps.fetch_add(1, Ordering::SeqCst);
+            ctx.progress(ProgressEvent {
+                phase: "mark".into(),
+                done: 0,
+                total: None,
+                unit: Unit::Items,
+                message: Some("x".repeat(1 << 20)),
+            })?;
+        }
+    }
+
+    fn fsck(&self, _: &OpContext<'_>) -> CtlResult<FsckReport> {
+        self.fsck_entered.store(true, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(2));
+        }
+        Err(CtlError::cancelled())
+    }
+}
+
 /// A healthy reader behind a stalled progress writer must receive its terminal frame near the
 /// deadline, not after the stalled write times out. The serial abandon thread delayed it to
-/// `write_timeout` in most runs.
+/// `write_timeout` in most runs. The reader's `fsck` does pending work until cancellation, so its
+/// frame is a real `shutting_down`/`cancelled` terminal, not an instant `unsupported`.
 #[test]
 fn healthy_reader_behind_a_stalled_writer_is_not_delayed() {
     let _w = Watchdog::start(240);
-    let (handler, entered, steps) = flood();
+    let entered = Arc::new(AtomicBool::new(false));
+    let steps = Arc::new(AtomicU64::new(0));
+    let fsck_entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
     let fx = start_with(
-        handler,
+        FloodAndStuckFsck {
+            entered: Arc::clone(&entered),
+            steps: Arc::clone(&steps),
+            fsck_entered: Arc::clone(&fsck_entered),
+            release: Arc::clone(&release),
+        },
         ServerOptions {
             write_timeout: Duration::from_secs(3),
             shutdown_deadline: Duration::from_millis(300),
@@ -448,7 +532,12 @@ fn healthy_reader_behind_a_stalled_writer_is_not_delayed() {
 
     let mut healthy = Raw::hello(&fx.path);
     healthy.send(FSCK_REQUEST);
-    thread::sleep(Duration::from_millis(300));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !fsck_entered.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "fsck handler never entered");
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::sleep(Duration::from_millis(200));
 
     let t0 = Instant::now();
     fx.server().handle().shutdown();
@@ -468,6 +557,11 @@ fn healthy_reader_behind_a_stalled_writer_is_not_delayed() {
                 if matches!(v["type"].as_str(), Some("response") | Some("error"))
                     && v["id"].as_u64() == Some(1)
                 {
+                    assert_ne!(
+                        v["error"]["code"].as_str(),
+                        Some("unsupported"),
+                        "the healthy handler returned unsupported; the test would be vacuous"
+                    );
                     frame_at = Some(t0.elapsed());
                     break;
                 }
@@ -484,6 +578,8 @@ fn healthy_reader_behind_a_stalled_writer_is_not_delayed() {
         at < Duration::from_millis(1200),
         "healthy reader waited {at:?}, behind the stalled writer's timeout"
     );
+    // Release the cancel-ignoring handler so it does not leak into later tests.
+    release.store(true, Ordering::SeqCst);
 }
 
 /// Staggered stalls must not stack: the workers run in parallel and the grace is finite, so
@@ -522,4 +618,93 @@ fn staggered_stalled_writers_stay_within_the_deadline_plus_grace() {
         "staggered stalls stacked to {elapsed:?}"
     );
     drop(clients);
+}
+
+/// The Shutdown contract (`docs/v1-control-api.md`) says abandoned handlers have "their
+/// connections closed and the server returns". A non-reading client with a blocked progress write
+/// cannot observe its cancel token until the write returns, so without an explicit close the
+/// connection, socket and handler outlive `wait()` by up to `write_timeout`. This asserts the
+/// server side is released within the deadline plus a bounded grace, not the write timeout.
+///
+/// Fails on the detached-worker version without the post-grace `kill` (handler alive and socket
+/// open at ~4.5 s with a 3 s `write_timeout`); passes once the stragglers are killed after grace.
+#[test]
+fn abandoned_blocked_connection_is_closed_by_the_deadline_plus_grace() {
+    let _w = Watchdog::start(240);
+    let (handler, entered, steps, dropped) = flood_with_drop();
+    let mut fx = start_with(
+        handler,
+        ServerOptions {
+            write_timeout: Duration::from_secs(3),
+            shutdown_deadline: Duration::from_millis(300),
+            ..ServerOptions::default()
+        },
+    );
+    let mut client = blocked_hello(&fx.path);
+    wait_blocked(&entered, &steps);
+
+    let server = fx.server.take().unwrap();
+    let t0 = Instant::now();
+    server.handle().shutdown();
+    server.wait();
+    let wait_ms = t0.elapsed();
+
+    // Server-side ownership proxy: a blocked socket write cannot finish while the handler runs, so
+    // the handler is dropped only once the socket write has unwound. Sample the drop.
+    let mut handler_drop_ms = None;
+    let until = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < until {
+        if dropped.load(Ordering::SeqCst) {
+            handler_drop_ms = Some(t0.elapsed().as_millis());
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    // Client-side socket release: a closed peer makes `set_read_timeout` fail (macOS EINVAL),
+    // which is proof the server-side descriptor is gone; then a read must see EOF.
+    let eof_ms = if client
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .is_err()
+    {
+        Some(t0.elapsed().as_millis())
+    } else {
+        None
+    };
+    let eof_ms = eof_ms.or_else(|| {
+        let mut buf = [0u8; 65536];
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until {
+            match client.stream.read(&mut buf) {
+                Ok(0) => return Some(t0.elapsed().as_millis()),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return Some(t0.elapsed().as_millis()),
+            }
+        }
+        None
+    });
+
+    eprintln!(
+        "PROGRESS77 cleanup wait_ms={} handler_drop_ms={handler_drop_ms:?} client_eof_ms={eof_ms:?}",
+        wait_ms.as_millis()
+    );
+    // Deadline 300 + grace 250 = 550 ms; the release lands a little after that. `write_timeout`
+    // is 3 s, so a bound near 2 s still fails the un-killed variant decisively.
+    let bound = Duration::from_millis(2000);
+    assert!(
+        wait_ms < bound,
+        "wait() took {wait_ms:?}, past deadline plus grace"
+    );
+    let drop_ms = handler_drop_ms.expect("handler was never dropped; connection left open");
+    assert!(
+        drop_ms < bound.as_millis(),
+        "handler dropped at {drop_ms} ms, past deadline plus grace"
+    );
+    let eof_ms = eof_ms.expect("client never saw the connection close");
+    assert!(
+        eof_ms < bound.as_millis(),
+        "client saw close at {eof_ms} ms, past deadline plus grace"
+    );
 }

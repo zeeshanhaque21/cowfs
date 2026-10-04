@@ -291,9 +291,11 @@ fn accept_loop(
                     Ok(worker) => workers.push(worker),
                     // No worker: deliver the frame best-effort without blocking on a held write
                     // lock, then close, so a readable peer still gets `shutting_down` and no
-                    // connection is left open past the return.
+                    // connection is left open past the return. The write itself is bounded by the
+                    // same grace, so a peer whose receive queue is completely full cannot park the
+                    // accept thread for a whole `write_timeout` here.
                     Err(_) => {
-                        conn.best_effort_abandon();
+                        conn.best_effort_abandon(opts.drain_deadline);
                         conn.kill();
                     }
                 }
@@ -306,11 +308,29 @@ fn accept_loop(
                     break;
                 }
             }
-            // A worker that has not finished is parked behind a blocked progress write. Its peer
-            // is not reading, so no frame can reach it; the worker still runs and the connection's
-            // reader side is closed by `drain_and_close` once the write unwinds. `wait()` does not
-            // join the workers, so a blocked write cannot stretch it past the grace above.
-            drop(workers);
+            // A worker that has not finished is parked behind a progress write that a non-reading
+            // peer is holding open. `abandon_inflight` cannot observe the cancel token until that
+            // write returns, so without this the connection, socket and handler would outlive
+            // `wait()` by up to `write_timeout`, which the Shutdown contract forbids ("their
+            // connections are closed"). `kill` takes no lock, so it cannot block: half-closing the
+            // write side aborts the parked `write_all`, so the worker returns. This truncates any
+            // frame still being written to a very slow but reading peer, which is the "abandoned"
+            // semantics.
+            for conn in &stragglers {
+                conn.kill();
+            }
+            // The workers own the only writes this server still makes to a control client, so join
+            // them before returning: no control-client buffer writer outlives `wait()`. `kill`
+            // already aborted their blocked writes, so this normally completes at once. The bound
+            // keeps a worker that is descheduled past the grace from stretching the deadline;
+            // such a worker only has to finish a write that can no longer reach a peer, and the
+            // process exit in `cowfs serve` ends it.
+            let join_until = Instant::now() + opts.drain_deadline;
+            for worker in workers {
+                while !worker.is_finished() && Instant::now() < join_until {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             break;
         }
         thread::sleep(Duration::from_millis(10));
@@ -647,7 +667,12 @@ impl Conn {
     /// Same as `abandon_inflight`, but the terminal write is skipped when the write lock is held.
     /// Used on the shutdown deadline when no helper thread could be spawned, so the deadline path
     /// never blocks behind a peer that stopped reading, while a readable peer still gets its frame.
-    fn best_effort_abandon(&self) {
+    ///
+    /// `budget` bounds the write itself. A peer whose receive queue is completely full would
+    /// otherwise park this `write_all` for the whole `write_timeout` on the accept thread, which is
+    /// the same deadline this path exists to protect. On timeout the connection is marked dead and
+    /// closed by `kill`, which is the abandoned outcome.
+    fn best_effort_abandon(&self, budget: Duration) {
         let ids: Vec<u64> = lock(&self.inflight).keys().copied().collect();
         for id in ids {
             let frame = ServerFrame::Error {
@@ -663,9 +688,11 @@ impl Conn {
                     if self.dead.load(Ordering::SeqCst) {
                         continue;
                     }
+                    let _ = self.stream.set_write_timeout(Some(budget));
                     if (&self.stream).write_all(&frame.encode()).is_err() {
                         self.dead.store(true, Ordering::SeqCst);
                     }
+                    let _ = self.stream.set_write_timeout(None);
                 }
             }
         }

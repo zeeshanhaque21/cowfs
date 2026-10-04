@@ -143,3 +143,31 @@ PR #73 behaviour preserved on the changed variant:
 - A client that only becomes readable after `wait()` returns is not guaranteed its frame on the
   process-exit path, because the process is gone; the frame is guaranteed for a client readable at
   the deadline, which is the contract's case.
+
+## `a4` vs the Shutdown contract: mutually exclusive cleanup (spike)
+
+`reconcile_spike.rs` (real `Server` API, isolated sockets, `write_timeout=5s`,
+`shutdown_deadline=200ms`, flood handler holding the write lock in a blocked progress write) ran two
+client behaviours under the same code: resume reading at 900ms (`admission.rs::a4`) and never read
+(#77). Three cleanup variants:
+
+| variant | client | `wait()` ms | whole terminal |
+|---|---|---|---|
+| baseline `89c271e` (no kill) | resume 900ms | 463 | true |
+| baseline `89c271e` (no kill) | never reads | 459 | true |
+| kill after grace (reviewer `alt`) | resume 900ms | 464 | false |
+| kill after grace (reviewer `alt`) | never reads | 463 | false |
+| `best_effort_abandon` + kill, no lock wait | resume 900ms | 200 | false |
+| `best_effort_abandon` + kill, no lock wait | never reads | 206 | false |
+
+On the kill variants the client that resumes at 900ms sees a truncated tail and then EOF
+(`tail_len=0` after the partial frame is consumed): the close lands while a progress frame is
+mid-write, so the terminal frame never gets a turn. `a4` asserts the terminal "must be whole" for a
+client the server has already given up on, which requires waiting out the flood's blocked write (up
+to `write_timeout`, 5s). #77 requires the connection closed by `deadline` plus a bounded grace. The
+two are the same socket in the same state; no bounded cleanup satisfies both.
+
+`a4` was added by `9aec638` (#13), the same commit that introduced the Shutdown contract text. Its
+comment states the intent ("the terminal frame write is still in flight when the server gives up on
+the connection"). The contract's "connections are closed and the server returns" is the binding
+behaviour; `a4`'s stronger "must be whole" is the pre-#77 behaviour that #77 removes.
