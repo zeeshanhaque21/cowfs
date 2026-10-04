@@ -474,6 +474,8 @@ Within major version 1:
   With `--json` it is one `{"progress": {phase, done, total, unit, message}}` line per event.
 - Failing to write to stdout (disk full, `/dev/full`) is an error: exit 1.
   A closed pipe (`cowfs snapshot list | head -1`) exits 0, because the reader left on purpose.
+- `cowfs fsck` exits 1 when the report is not ok, so a script gating on the exit code cannot mistake a missing live block or damaged record for a clean filesystem (see `docs/fsck-reference-integrity.md`).
+  A clean check exits 0.
 - Ctrl-C (SIGINT) sends `cancel`, then waits up to 2 s for the daemon's final frame, then exits 130 either way.
   A second Ctrl-C exits 130 at once.
   SIGTERM ends the process and the daemon cancels the request when it sees the connection close.

@@ -307,7 +307,22 @@ fn print_response(json: bool, response: &Response) -> i32 {
     } else {
         human(response)
     };
-    write_line(&mut io::stdout(), &text)
+    let wrote = write_line(&mut io::stdout(), &text);
+    if wrote == EXIT_OK {
+        return response_exit(response);
+    }
+    wrote
+}
+
+/// The exit code a printed response implies, if the write succeeded.
+///
+/// A `fsck` that found problems must not look like a clean run to a script: exit 1 so a caller
+/// gating on the exit code cannot mistake damage, including a missing live block, for success.
+fn response_exit(response: &Response) -> i32 {
+    match response {
+        Response::Fsck(f) if !f.ok => EXIT_ERROR,
+        _ => EXIT_OK,
+    }
 }
 
 fn client_failure(json: bool, socket: &Path, err: &ClientError) -> i32 {
@@ -436,6 +451,30 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::from(self.0))
         }
+    }
+
+    fn fsck(ok: bool) -> Response {
+        Response::Fsck(cowfs_ctl::FsckReport {
+            ok,
+            blocks_checked: 1,
+            bytes_checked: 1,
+            snapshots_checked: 1,
+            problems: if ok {
+                Vec::new()
+            } else {
+                vec![cowfs_ctl::FsckProblem {
+                    kind: "missing_live_block".into(),
+                    detail: "block deadbeef".into(),
+                }]
+            },
+        })
+    }
+
+    #[test]
+    fn a_fsck_with_problems_exits_nonzero() {
+        assert_eq!(response_exit(&fsck(true)), EXIT_OK);
+        assert_eq!(response_exit(&fsck(false)), EXIT_ERROR);
+        assert_eq!(response_exit(&Response::Ok(cowfs_ctl::Empty {})), EXIT_OK);
     }
 
     #[test]
