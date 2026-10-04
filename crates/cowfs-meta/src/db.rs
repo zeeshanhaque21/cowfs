@@ -1422,18 +1422,37 @@ impl Snapshot {
     /// Subtrees whose root is already in `marker` are skipped, and each subtree is added to
     /// `marker` once fully walked. A block may be yielded more than once.
     pub fn live_blocks<'m>(&self, marker: &'m mut Marker) -> Result<LiveBlocks<'m>> {
+        Ok(self.live_blocks_with_root(marker)?.1)
+    }
+
+    /// Like [`Snapshot::live_blocks`], but also reports the Merkle root the walk actually read.
+    ///
+    /// The root and the walked nodes come from one epoch: the session read lock is held while the
+    /// root is read and the node table is opened, so a commit that changes this snapshot's root
+    /// either finishes before both or after both. A caller that must record which root a walk
+    /// covered (the collector's incremental marks) has to use the root returned here, not a root
+    /// it read earlier: reading the root separately could name a root the walk never descended.
+    pub fn live_blocks_with_root<'m>(
+        &self,
+        marker: &'m mut Marker,
+    ) -> Result<(NodeId, LiveBlocks<'m>)> {
         let inner = &self.h.inner;
         inner.sync()?;
         guard(|| {
-            let root = inner
-                .rlock()?
+            // Hold the session read lock across both the root read and the read transaction, so
+            // the root and the node table are the same epoch. A writer needs the write lock and
+            // cannot slip a new root in between.
+            let s = inner.rlock()?;
+            let root = s
                 .snaps
                 .get(&self.id)
                 .ok_or(Error::NoSuchSnapshot)?
                 .info
                 .root;
             let rtx = inner.db.begin_read()?;
-            LiveBlocks::new(rtx.open_table(NODES)?, root, marker)
+            let walk = LiveBlocks::new(rtx.open_table(NODES)?, root, marker)?;
+            drop(s);
+            Ok((root, walk))
         })
     }
 

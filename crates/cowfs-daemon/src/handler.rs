@@ -309,15 +309,51 @@ impl ControlHandler for Handler {
         Ok(info)
     }
 
-    fn gc(&self, params: GcParams, _ctx: &OpContext<'_>) -> CtlResult<GcReport> {
-        Err(CtlError::new(
-            ErrorCode::Unsupported,
-            format!(
-                "garbage collection is not wired to the core's mark-and-sweep yet, and this \
-                 backend has no block store to sweep (dry_run: {})",
-                params.dry_run
-            ),
-        ))
+    fn gc(&self, params: GcParams, ctx: &OpContext<'_>) -> CtlResult<GcReport> {
+        let mut progress = |p: &cowfs_gc::Progress| {
+            ctx.progress(ProgressEvent {
+                phase: if p.sweeping { "sweep" } else { "mark" }.into(),
+                done: p.packs_done,
+                total: Some(p.packs_total),
+                unit: Unit::Items,
+                message: Some(format!(
+                    "{} bytes copied, {} bytes freed",
+                    p.bytes_copied, p.freed_bytes
+                )),
+            })
+            .is_ok()
+        };
+        let out = self
+            .backend
+            .collect_garbage(params.dry_run, &mut progress, &|| ctx.is_cancelled())?
+            .ok_or_else(|| {
+                CtlError::new(
+                    ErrorCode::Unsupported,
+                    "garbage collection needs the block store, which this backend does not have",
+                )
+            })?;
+        ctx.check()?;
+        let r = &out.report;
+        if r.roots_error.is_some() && (params.dry_run || r.freed_bytes == 0) {
+            return Err(CtlError::new(
+                ErrorCode::Busy,
+                "the writers did not let the collector hold the reference side still, so nothing \
+                 was freed: try again when the mount is quieter",
+            ));
+        }
+        if let (Some(first), 0) = (r.errors.first(), r.freed_bytes) {
+            return Err(CtlError::new(
+                ErrorCode::IoError,
+                format!("garbage collection freed nothing: {first}"),
+            ));
+        }
+        Ok(GcReport {
+            dry_run: params.dry_run,
+            candidate_blocks: r.store_blocks.saturating_sub(r.live_blocks as u64),
+            candidate_bytes: r.candidate_dead_bytes,
+            freed_blocks: out.blocks_before.saturating_sub(out.blocks_after),
+            freed_bytes: r.freed_bytes,
+        })
     }
 
     fn fsck(&self, ctx: &OpContext<'_>) -> CtlResult<FsckReport> {
@@ -621,6 +657,187 @@ mod tests {
         assert_eq!(e.code, ErrorCode::Unsupported, "{e}");
         let e = h.fsck(&OpContext::detached()).unwrap_err();
         assert_eq!(e.code, ErrorCode::Unsupported, "{e}");
+    }
+
+    fn core_handler() -> (tempfile::TempDir, Arc<Handler>, Arc<dyn Backend>) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(
+            crate::backend::CoreBackend::open_with_gc(
+                dir.path().join("store"),
+                cowfs_core::Options {
+                    background: false,
+                    store: cowfs_store::Options {
+                        max_pack_size: 96 << 10,
+                        ..cowfs_store::Options::default()
+                    },
+                    file_flush_bytes: 32 << 10,
+                    ..cowfs_core::Options::default()
+                },
+                cowfs_gc::Options {
+                    dead_ratio: 0.0,
+                    min_dead_bytes: 1,
+                    io_budget_bytes: 0,
+                    batch_bytes: 4096,
+                    ..cowfs_gc::Options::default()
+                },
+            )
+            .unwrap(),
+        );
+        let mount = Arc::new(Mounted::no_mount(dir.path().join("mnt")).unwrap());
+        let exports = Exports::new(
+            Arc::clone(&backend),
+            vec![dir.path().join("pool")],
+            vec![backend.store_path().to_owned()],
+            dir.path().join("mnt"),
+        );
+        (
+            dir,
+            Handler::new(Arc::clone(&backend), mount, exports),
+            backend,
+        )
+    }
+
+    fn body(n: usize, seed: u32) -> Vec<u8> {
+        let mut h = seed.wrapping_mul(2654435761).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                h = h.wrapping_mul(1664525).wrapping_add(1013904223);
+                (h >> 16) as u8
+            })
+            .collect()
+    }
+
+    fn put(v: &dyn cowfs_vfs::Vfs, name: &str, data: &[u8]) {
+        let a = v
+            .create(cowfs_vfs::ROOT_INO, name.as_bytes(), 0o644)
+            .unwrap();
+        v.write(a.ino, 0, data).unwrap();
+    }
+
+    fn get(v: &dyn cowfs_vfs::Vfs, name: &str) -> Vec<u8> {
+        let a = v.lookup(cowfs_vfs::ROOT_INO, name.as_bytes()).unwrap();
+        v.read(a.ino, 0, a.size as u32).unwrap()
+    }
+
+    /// Two snapshots whose files share packs, then one removed. Returns the survivors.
+    fn garbage(h: &Handler, backend: &Arc<dyn Backend>) -> Vec<(String, Vec<u8>)> {
+        h.snapshot_create(SnapshotCreate {
+            name: "keep".into(),
+            from: None,
+        })
+        .unwrap();
+        h.snapshot_create(SnapshotCreate {
+            name: "drop".into(),
+            from: None,
+        })
+        .unwrap();
+        let (k, d) = (
+            backend.snapshot("keep").unwrap(),
+            backend.snapshot("drop").unwrap(),
+        );
+        let mut keep = Vec::new();
+        for i in 0..14u32 {
+            let f = (format!("k{i:02}"), body(40_000, i));
+            put(k.as_ref(), &f.0, &f.1);
+            put(d.as_ref(), &format!("d{i:02}"), &body(40_000, 900 + i));
+            keep.push(f);
+            k.fsync(cowfs_vfs::ROOT_INO, false).unwrap();
+        }
+        for i in 0..4u32 {
+            let f = (format!("t{i:02}"), body(40_000, 700 + i));
+            put(k.as_ref(), &f.0, &f.1);
+            keep.push(f);
+            k.fsync(cowfs_vfs::ROOT_INO, false).unwrap();
+        }
+        let held = Arc::new(Lock::new(()));
+        let none = |_: &str| Ok(Vec::new());
+        h.remove("drop", &guard("drop", false, held, &none))
+            .unwrap();
+        keep
+    }
+
+    #[test]
+    fn gc_over_the_core_reclaims_dead_packs_and_survivors_still_read() {
+        let (_d, h, backend) = core_handler();
+        let keep = garbage(&h, &backend);
+        let before = backend.usage().unwrap().unwrap();
+
+        let events = Arc::new(Lock::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let ctx = OpContext::new(cowfs_ctl::CancelToken::new(), move |e| {
+            sink.lock().unwrap().push(e);
+            true
+        });
+        let dry = h.gc(GcParams { dry_run: true }, &ctx).unwrap();
+        assert!(dry.dry_run);
+        assert!(
+            dry.candidate_blocks > 0 && dry.candidate_bytes > 0,
+            "{dry:?}"
+        );
+        assert_eq!((dry.freed_blocks, dry.freed_bytes), (0, 0), "{dry:?}");
+        assert_eq!(
+            backend.usage().unwrap().unwrap(),
+            before,
+            "a dry run changes nothing"
+        );
+
+        let live = h.gc(GcParams { dry_run: false }, &ctx).unwrap();
+        assert!(!live.dry_run);
+        assert!(live.freed_bytes > 0 && live.freed_blocks > 0, "{live:?}");
+        let after = backend.usage().unwrap().unwrap();
+        assert!(after.blocks < before.blocks, "{before:?} -> {after:?}");
+        assert_eq!(before.blocks - after.blocks, live.freed_blocks);
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|e| e.phase == "mark"), "{events:?}");
+        assert!(events.iter().any(|e| e.phase == "sweep"), "{events:?}");
+
+        let k = backend.snapshot("keep").unwrap();
+        for (n, data) in &keep {
+            assert!(get(k.as_ref(), n) == *data, "{n}");
+        }
+        assert!(backend.fsck().unwrap().unwrap().damage.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_gc_is_cancelled_and_leaves_the_store_readable() {
+        let (_d, h, backend) = core_handler();
+        let keep = garbage(&h, &backend);
+        let token = cowfs_ctl::CancelToken::new();
+        token.cancel();
+        let ctx = OpContext::new(token, |_| true);
+        let e = h.gc(GcParams { dry_run: false }, &ctx).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Cancelled, "{e}");
+        let k = backend.snapshot("keep").unwrap();
+        for (n, data) in &keep {
+            assert!(get(k.as_ref(), n) == *data, "{n}");
+        }
+        assert!(backend.fsck().unwrap().unwrap().damage.is_empty());
+        let again = h
+            .gc(GcParams { dry_run: false }, &OpContext::detached())
+            .unwrap();
+        assert!(
+            again.freed_bytes > 0,
+            "the next request finishes the job: {again:?}"
+        );
+    }
+
+    #[test]
+    fn closing_the_backend_after_a_gc_releases_the_store() {
+        let (dir, h, backend) = core_handler();
+        garbage(&h, &backend);
+        h.gc(GcParams { dry_run: false }, &OpContext::detached())
+            .unwrap();
+        h.close_backend()
+            .expect("no collector clone outlives the request");
+        let reopened = crate::backend::CoreBackend::open(
+            dir.path().join("store"),
+            cowfs_core::Options {
+                background: false,
+                ..cowfs_core::Options::default()
+            },
+        )
+        .expect("the store lock was released");
+        reopened.close().unwrap();
     }
 
     /// The handler plus injected holders, so the framework suite can hold one without a real

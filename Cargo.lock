@@ -239,6 +239,7 @@ dependencies = [
 name = "cowfs-core"
 version = "0.0.0"
 dependencies = [
+ "cowfs-gc",
  "cowfs-meta",
  "cowfs-store",
  "cowfs-vfs",
@@ -276,6 +277,7 @@ dependencies = [
  "cowfs-core",
  "cowfs-ctl",
  "cowfs-fuse",
+ "cowfs-gc",
  "cowfs-nfs",
  "cowfs-store",
  "cowfs-vfs",
