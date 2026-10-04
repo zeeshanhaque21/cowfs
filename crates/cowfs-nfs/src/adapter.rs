@@ -528,11 +528,12 @@ impl Adapter {
         not_side(d)?;
         if self.side_of(d.ino, name) {
             let (id, attr) = self.side_create_exclusive(d.ino, name)?;
+            self.durable(d.ino)?;
             return Ok((self.id_of(id), attr));
         }
         new_name(name)?;
         let (atime, mtime) = verifier_times(verf);
-        match self.vfs.create(d.ino, name, 0o600) {
+        let made = match self.vfs.create(d.ino, name, 0o600) {
             Ok(a) => {
                 self.handed_out(Some(d.ino), &a);
                 let changes = SetAttr {
@@ -554,7 +555,9 @@ impl Adapter {
                 }
             }
             Err(e) => Err(stat(e)),
-        }
+        };
+        self.durable(d.ino)?;
+        made
     }
 
     pub fn mkdir(&self, dir: fileid3, name: &[u8], attr: &sattr3) -> NfsResult<(fileid3, fattr3)> {

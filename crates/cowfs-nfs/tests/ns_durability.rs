@@ -15,6 +15,7 @@ use cowfs_vfs::{
     Attr, Error, FileHandle, ReadDir, ReadDirPlus, Result, SetAttr, StatFs, Vfs, XattrFlags,
 };
 use cowfs_vfs_test::MemVfs;
+use nfsserve::nfs::sattr3;
 
 /// One event the server asked the `Vfs` for, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,6 +234,13 @@ fn every_namespace_rpc_is_durable_before_it_is_acknowledged() {
             "create",
             Box::new(|c| {
                 c.create_file(&root, "n1");
+            }),
+        ),
+        (
+            "create exclusive",
+            Box::new(|c| {
+                let (st, _, _) = c.create(&root, "n1x", 2, sattr3::default(), [7; 8]);
+                assert_eq!(st, OK, "exclusive create");
             }),
         ),
         (
