@@ -10,9 +10,28 @@ replaced `ea958947` (the head that carried the PR #76 root-walk identity data-lo
 verification below was re-run against `f501157` on the actual committed crate tree.
 
 This report makes **no claim that the production GC is safe**, and no claim about the `f501157`
-lookup/walk race beyond what is recorded here. Source safety is separately and independently reviewed
-(in parallel, native, pending); this document reports only the end-to-end behavior it measured. The
-`f501157` head must pass that source review before this PR is rebased or merged.
+lookup/walk race beyond what is recorded here. Source safety is separately and independently reviewed;
+this document reports only the end-to-end behavior it measured.
+
+## Dependency landed and source identity carry
+
+PR #76 landed as merge `9906819f4e7806ff9e359ea315ec717b87b2724e` (reviewed head `7dd1c29`), so
+`f501157` is now an ancestor of `main`. Landed `main` adds test-only and control-plane commits on top
+of `f501157`. The GC-relevant production source is **byte-identical** between the tested `f501157`
+and landed `main`:
+
+- `crates/cowfs-gc/src`, `crates/cowfs-core/src`, `crates/cowfs-store/src`, `crates/cowfs-daemon/src`
+  and their `Cargo.toml`s all hash the same at `f501157` and at landed `main`.
+- The only non-test `src` file that differs `f501157` -> landed `main` is
+  `crates/cowfs-ctl/src/server.rs` (PR #73's half-close admission fix), which is outside the GC path
+  this harness drives.
+- The `crates/` tree id of landed `main` is `f57af086b063c9563392fcd9bc0da441a61d2b53`; the tested
+  tree id was `fe899f9f425d40d5db36d13c8400ef3438676879`.
+
+Because the GC production source is unchanged, the 14-record and 72-record daemon proofs recorded
+below carry to landed `main`; no redundant re-run was performed and none is claimed. This document
+reports behavior measured on `f501157` (`harness_head 7c08311`); it makes no claim of a new binary run
+on the merge head. A coordinator final gate is required before this PR merges.
 
 ## What was verified, and by what
 
