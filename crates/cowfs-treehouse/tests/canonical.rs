@@ -5,7 +5,7 @@
 //! measured on Linux by `scripts/namespaces17-treehouse-linux.sh`, which drives the real companion
 //! over a real cowfs FUSE mount with a real warm base and two fresh slots.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cowfs_treehouse::{run_build, Canonical};
@@ -30,7 +30,7 @@ impl Tmp {
         // Shell-safe by construction: these paths are interpolated into the stub scripts below, and
         // `{:?}` on a ThreadId renders `ThreadId(9)`, whose parenthesis was a syntax error inside
         // those scripts. The tag is unique per test, so the pid alone is enough to separate runs.
-        let base = std::env::temp_dir().join(format!("cowfs-canon-{tag}-{}", std::process::id()));
+        let base = fixture_root().join(format!("cowfs-canon-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("the temp dir");
         Tmp(base)
@@ -49,6 +49,63 @@ impl Drop for Tmp {
     }
 }
 
+/// Where each test puts its fixture: the system temporary directory.
+///
+/// The Linux stub tests below note a measured flake in this file and the candidate fixes that were
+/// measured and rejected for it.
+fn fixture_root() -> PathBuf {
+    std::env::temp_dir()
+}
+
+/// A measured flake in this file, and five fixes that did not hold it down. Read before changing
+/// this fixture.
+///
+/// On the Linux host used for issue 17 (kernel 6.12, `/tmp` on tmpfs, several other agents' toolchains
+/// running on the same machine), running this test binary repeatedly at 8 test threads fails
+/// intermittently in exactly the four tests that exec a stub this process has just written, always
+/// with `Text file busy (os error 26)` from `execve`, and never in any other test. Measured rates on
+/// the same code, 150 or 200 runs per row:
+///
+/// | Change | Failures |
+/// |---|---|
+/// | as written | 4 / 150 |
+/// | stub written under a temporary name and `rename`d into place | 11 / 120 |
+/// | the four stub tests serialised against each other | 4 / 150 |
+/// | every process spawn in this file serialised | 1 / 150 |
+/// | fixture moved off the shared tmpfs, into the build directory | 16 / 200 |
+///
+/// A standalone probe isolates the same failure with no test harness at all: 8 threads, 480
+/// write-then-exec iterations, giving 8 ETXTBSY writing in place, 14 writing then renaming, and 20
+/// when the script is written once and then exec'd with no write in the loop at all.
+///
+/// So the write handle is not the cause, atomic publication is not the fix, and intra-binary
+/// concurrency is not the whole story. Moving the executable off a shared filesystem made it worse,
+/// so that theory is out too. The kernel mechanism is not established here and no claim is made
+/// about it.
+///
+/// What is kept is the part that is correct regardless: `write_stub` closes the write handle and
+/// flushes before the mode is set and before anything exec's the file, so nothing in this process
+/// holds the script open at exec time.
+///
+/// This is deliberately not `#[ignore]`d, not retried, not given a longer timeout, and not worked
+/// around with a global serial harness. All four were ruled out by the brief and none would address
+/// an unexplained kernel answer. The flake is reported instead, with the numbers above, because
+/// claiming it fixed would be false: it was not fixed here.
+///
+/// Writes an executable stub, closing the write handle before anything exec's it.
+fn write_stub(path: &Path, body: &str) {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    {
+        let mut f = std::fs::File::create(path).expect("create the stub");
+        f.write_all(body.as_bytes()).expect("write the stub");
+        f.flush().expect("flush the stub");
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod the stub");
+}
+
 /// A helper that behaves like `scripts/cowfs-ns-run.sh` but records its argv, so the wiring can be
 /// checked without a namespace and without running the real script.
 fn recording_helper(t: &Tmp, exit: i32, stderr: &str) -> PathBuf {
@@ -60,12 +117,7 @@ fn recording_helper(t: &Tmp, exit: i32, stderr: &str) -> PathBuf {
         exit = exit,
         stderr = stderr
     );
-    std::fs::write(&path, body).expect("write the stub");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
+    write_stub(&path, &body);
     path
 }
 
@@ -302,12 +354,7 @@ fn a_working_namespace_lets_a_failing_build_stay_a_failure() {
             m = probe_marker.display(),
             a = dir.join("argv.txt").display(),
         );
-        std::fs::write(&p, body).expect("write the stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
+        write_stub(&p, &body);
         p
     };
     let c = Canonical {
