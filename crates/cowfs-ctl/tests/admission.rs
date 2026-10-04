@@ -403,6 +403,11 @@ fn a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace() 
         },
         ServerOptions {
             shutdown_deadline: Duration::from_millis(200),
+            // The grace is split: delivery takes the front, the close the back half, because the close
+            // is what the contract requires and a frame is best effort. With the 250 ms default the
+            // delivery half would end before this client resumes, so the test declares a grace it can
+            // actually be served inside rather than implying delivery works at any budget.
+            drain_deadline: Duration::from_millis(500),
             write_timeout: Duration::from_secs(5),
             ..ServerOptions::default()
         },
@@ -415,7 +420,7 @@ fn a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace() 
     w.write_all(b"\n").unwrap();
     thread::sleep(Duration::from_millis(300));
     fx.server().handle().shutdown();
-    // Resume inside the grace: 400 ms after shutdown, against a close at about 450 ms.
+    // Resume inside the delivery half: 400 ms after shutdown, against a delivery cut at about 550 ms.
     thread::sleep(Duration::from_millis(400));
     drop(w);
     let e = classify(&s, Duration::from_millis(2500));

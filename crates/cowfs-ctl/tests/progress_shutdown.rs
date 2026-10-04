@@ -81,6 +81,85 @@ fn wait_blocked(entered: &AtomicBool, steps: &AtomicU64) {
     );
 }
 
+/// Proves the flood handler's progress write is genuinely parked on the socket, not merely slow.
+///
+/// Two consecutive windows in which `steps` does not move. A handler that is still running advances
+/// it; a handler parked in a blocked `write_all` cannot, because the next increment only happens
+/// after that write returns. Requiring two in a row rules out a single unlucky window. This observes
+/// only the atomic counter: it never reads the socket, because reading would drain the buffer and
+/// unpark the very write under test.
+fn assert_parked(steps: &AtomicU64, window: Duration) {
+    for attempt in 0..2 {
+        let before = steps.load(Ordering::SeqCst);
+        thread::sleep(window);
+        let after = steps.load(Ordering::SeqCst);
+        assert_eq!(
+            before, after,
+            "still-window {attempt} advanced {before} -> {after}; the progress write was not parked"
+        );
+        assert!(
+            after > 0,
+            "the handler never attempted a progress write, so nothing could park"
+        );
+    }
+}
+
+/// One handler serving both connections of the budget test: `gc` floods progress (parking a writer),
+/// `fsck` burns CPU with no socket at all.
+struct FloodAndCpu {
+    entered: Arc<AtomicBool>,
+    steps: Arc<AtomicU64>,
+    dropped: Arc<AtomicBool>,
+    cpu_entered: Arc<AtomicBool>,
+    cpu_ticks: Arc<AtomicU64>,
+    cpu_release: Arc<AtomicBool>,
+    cpu_done: Arc<AtomicBool>,
+}
+
+/// Sets a flag when the `gc` call it guards returns, so the parked writer's release can be observed
+/// independently of the CPU handler, which keeps the whole handler alive for the whole test.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl ControlHandler for FloodAndCpu {
+    fn gc(&self, _: GcParams, ctx: &OpContext<'_>) -> CtlResult<GcReport> {
+        let _guard = DropFlag(Arc::clone(&self.dropped));
+        self.entered.store(true, Ordering::SeqCst);
+        loop {
+            self.steps.fetch_add(1, Ordering::SeqCst);
+            ctx.progress(ProgressEvent {
+                phase: "mark".into(),
+                done: 0,
+                total: None,
+                unit: Unit::Items,
+                message: Some("x".repeat(1 << 20)),
+            })?;
+        }
+    }
+
+    fn fsck(&self, _: &OpContext<'_>) -> CtlResult<FsckReport> {
+        // No socket, no progress event, and the cancel token is ignored on purpose. The guard flips
+        // only when this call returns, so "alive at the return" is observed, not inferred.
+        let _guard = DropFlag(Arc::clone(&self.cpu_done));
+        self.cpu_entered.store(true, Ordering::SeqCst);
+        let mut spins: u64 = 0;
+        while !self.cpu_release.load(Ordering::SeqCst) {
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(4096) {
+                self.cpu_ticks.fetch_add(1, Ordering::SeqCst);
+            }
+            std::hint::spin_loop();
+        }
+        self.cpu_ticks.fetch_add(1, Ordering::SeqCst);
+        Err(CtlError::cancelled())
+    }
+}
+
 /// Descriptors this process holds. Sampled around a shutdown cycle to prove the abandoned
 /// connections' sockets are released, not just half-closed.
 fn open_fds() -> usize {
@@ -666,6 +745,10 @@ fn abandoned_blocked_connection_is_released_before_wait_returns() {
             ServerOptions {
                 write_timeout: Duration::from_secs(3),
                 shutdown_deadline: Duration::from_millis(300),
+                // The single grace is split between delivering a frame and closing, and this test
+                // only needs the close. It declares a grace with enough room for the close to land
+                // inside the budget it asserts, rather than relying on the 250 ms default.
+                drain_deadline: Duration::from_millis(500),
                 ..ServerOptions::default()
             },
         );
@@ -701,9 +784,9 @@ fn abandoned_blocked_connection_is_released_before_wait_returns() {
             handler_alive_at_return
         );
 
-        // Deadline 300 + grace 250 = 550 ms, with room for a loaded machine. `write_timeout` is 3 s,
-        // so this still fails an implementation that waits the write out decisively.
-        let bound = Duration::from_millis(1200);
+        // Deadline 300 + grace 500 = 800 ms, plus scheduling. `write_timeout` is 3 s, so this still
+        // fails an implementation that waits the write out decisively.
+        let bound = Duration::from_millis(1050);
         assert!(
             wait_ms < bound,
             "{label}: wait() took {wait_ms:?}, past the deadline plus the grace"
@@ -735,4 +818,253 @@ fn abandoned_blocked_connection_is_released_before_wait_returns() {
             "{label}: {fds_after} descriptors open after the cycle, baseline {fds0}"
         );
     }
+}
+
+/// The shutdown budget is the deadline plus ONE grace, not the deadline plus three.
+///
+/// Three waits run after the deadline: waiting for the abandon workers' completion signals, joining
+/// those workers, and waiting for every straggler connection to be released. Each was bounded by a
+/// fresh `Instant::now() + drain_deadline`, so a straggler that finished nothing could stretch
+/// `wait()` to the deadline plus three graces. `drain_deadline = 500 ms` gave a real 1309 ms; at
+/// 1000 ms it gave 2312 ms. The budget below is `shutdown_deadline + drain_deadline` plus a modest
+/// explicit allowance for the accept loop's poll interval and thread scheduling, which is far below
+/// the extra grace being removed.
+///
+/// The two connections are the two ways a handler can be stuck. The flood client stops reading, so
+/// its progress write parks in the kernel and only half-closing can free it. The `fsck` client runs a
+/// handler with no socket at all, which half-closing cannot help: that request worker stays occupied
+/// for as long as its computation runs. Together they hold the release wait open for the whole grace,
+/// which is the case a per-wait budget hides.
+///
+/// Nothing here reads the socket before `wait()` returns: a read would drain the buffer and unpark
+/// the write under test. Parked-ness is proven by the handler's own step counter going still in two
+/// consecutive windows, and the close is proven afterwards.
+#[test]
+fn shutdown_budget_is_the_deadline_plus_one_grace_with_a_parked_writer_and_a_cpu_handler() {
+    let shutdown_deadline = Duration::from_millis(300);
+    let drain_deadline = Duration::from_millis(500);
+    // Poll interval plus thread scheduling. The extra grace being removed is 2 x 500 ms, so this
+    // allowance is about a fifth of what it distinguishes.
+    let scheduling = Duration::from_millis(250);
+    let budget = shutdown_deadline + drain_deadline + scheduling;
+
+    let _w = Watchdog::start(240);
+    let entered = Arc::new(AtomicBool::new(false));
+    let steps = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let cpu_entered = Arc::new(AtomicBool::new(false));
+    let cpu_ticks = Arc::new(AtomicU64::new(0));
+    let cpu_release = Arc::new(AtomicBool::new(false));
+    let cpu_done = Arc::new(AtomicBool::new(false));
+    let mut fx = start_with(
+        FloodAndCpu {
+            entered: Arc::clone(&entered),
+            steps: Arc::clone(&steps),
+            dropped: Arc::clone(&dropped),
+            cpu_entered: Arc::clone(&cpu_entered),
+            cpu_ticks: Arc::clone(&cpu_ticks),
+            cpu_release: Arc::clone(&cpu_release),
+            cpu_done: Arc::clone(&cpu_done),
+        },
+        ServerOptions {
+            // Long enough that an implementation which waits the write out fails loudly instead of
+            // accidentally passing.
+            write_timeout: Duration::from_secs(4),
+            shutdown_deadline,
+            drain_deadline,
+            ..ServerOptions::default()
+        },
+    );
+
+    // Connection 1: reads the handshake, then stops reading so the flood's write parks.
+    let parked = blocked_hello(&fx.path);
+    wait_blocked(&entered, &steps);
+    // Connection 2: a handler with no socket at all.
+    let mut cpu = Raw::hello(&fx.path);
+    cpu.send(FSCK_REQUEST);
+    let until = Instant::now() + Duration::from_secs(3);
+    while !cpu_entered.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < until,
+            "the CPU-bound handler never entered"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    // Real park proof, before anything is measured or shut down.
+    assert_parked(&steps, Duration::from_millis(250));
+    let parked_steps = steps.load(Ordering::SeqCst);
+
+    let server = fx.server.take().unwrap();
+    let t0 = Instant::now();
+    server.handle().shutdown();
+    server.wait();
+    let elapsed = t0.elapsed();
+
+    let handler_alive_at_return = !dropped.load(Ordering::SeqCst);
+    let parked_closed_at_return = parked
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(1)))
+        .is_err();
+    let cpu_alive_at_return = !cpu_done.load(Ordering::SeqCst);
+
+    eprintln!(
+        "PROGRESS77 budget mixed wait_ms={} parked_steps={parked_steps} \
+         parked_handler_alive_at_return={handler_alive_at_return} \
+         parked_socket_closed_at_return={parked_closed_at_return} \
+         cpu_alive_at_return={cpu_alive_at_return} budget_ms={}",
+        elapsed.as_millis(),
+        budget.as_millis()
+    );
+
+    assert!(
+        elapsed < budget,
+        "wait() took {elapsed:?}, past the deadline plus one grace ({budget:?})"
+    );
+    // The parked connection is the one the contract is about: closed before the return.
+    assert!(
+        parked_closed_at_return,
+        "the parked writer's connection was still open when wait() returned"
+    );
+    assert!(
+        !handler_alive_at_return,
+        "the parked handler was still alive when wait() returned"
+    );
+    // The CPU-bound handler has no socket, so nothing can force it out. It is expected to be alive
+    // and that is documented, not asserted as a failure: the contract detaches handler threads.
+    assert!(
+        cpu_alive_at_return,
+        "the CPU-bound handler finished too early to exercise the case it exists for"
+    );
+
+    // Private cleanup, after the measurement: release the CPU handler so it does not outlive the
+    // test binary. This is a test-owned flag, not part of the user-visible contract.
+    cpu_release.store(true, Ordering::SeqCst);
+    let until = Instant::now() + Duration::from_secs(5);
+    while cpu_ticks.load(Ordering::SeqCst) == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(5));
+    }
+    drop(parked);
+    drop(cpu);
+}
+
+/// Negative control: a parked writer alone. Same budget, so the mixed case's bound is not carrying a
+/// cost that a single parked connection does not have on its own.
+#[test]
+fn shutdown_budget_with_only_a_parked_writer() {
+    let shutdown_deadline = Duration::from_millis(300);
+    let drain_deadline = Duration::from_millis(500);
+    let budget = shutdown_deadline + drain_deadline + Duration::from_millis(250);
+
+    let _w = Watchdog::start(240);
+    let (handler, entered, steps, dropped) = flood_with_drop();
+    let mut fx = start_with(
+        handler,
+        ServerOptions {
+            write_timeout: Duration::from_secs(4),
+            shutdown_deadline,
+            drain_deadline,
+            ..ServerOptions::default()
+        },
+    );
+    let parked = blocked_hello(&fx.path);
+    wait_blocked(&entered, &steps);
+    assert_parked(&steps, Duration::from_millis(250));
+
+    let server = fx.server.take().unwrap();
+    let t0 = Instant::now();
+    server.handle().shutdown();
+    server.wait();
+    let elapsed = t0.elapsed();
+    let alive = !dropped.load(Ordering::SeqCst);
+    let closed = parked
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(1)))
+        .is_err();
+    eprintln!(
+        "PROGRESS77 budget parked_only wait_ms={} handler_alive_at_return={alive} \
+         socket_closed_at_return={closed} budget_ms={}",
+        elapsed.as_millis(),
+        budget.as_millis()
+    );
+    assert!(
+        elapsed < budget,
+        "wait() took {elapsed:?} for one parked writer"
+    );
+    assert!(closed, "the parked connection was still open at the return");
+    assert!(!alive, "the parked handler was still alive at the return");
+    drop(parked);
+}
+
+/// Negative control: a CPU-bound handler alone, with no socket anywhere in the picture.
+#[test]
+fn shutdown_budget_with_only_a_cpu_handler() {
+    let shutdown_deadline = Duration::from_millis(300);
+    let drain_deadline = Duration::from_millis(500);
+    let budget = shutdown_deadline + drain_deadline + Duration::from_millis(250);
+
+    let _w = Watchdog::start(240);
+    let cpu_entered = Arc::new(AtomicBool::new(false));
+    let cpu_ticks = Arc::new(AtomicU64::new(0));
+    let cpu_release = Arc::new(AtomicBool::new(false));
+    let cpu_done = Arc::new(AtomicBool::new(false));
+    let mut fx = start_with(
+        FloodAndCpu {
+            entered: Arc::new(AtomicBool::new(false)),
+            steps: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicBool::new(false)),
+            cpu_entered: Arc::clone(&cpu_entered),
+            cpu_ticks: Arc::clone(&cpu_ticks),
+            cpu_release: Arc::clone(&cpu_release),
+            cpu_done: Arc::clone(&cpu_done),
+        },
+        ServerOptions {
+            shutdown_deadline,
+            drain_deadline,
+            ..ServerOptions::default()
+        },
+    );
+    let mut cpu = Raw::hello(&fx.path);
+    cpu.send(FSCK_REQUEST);
+    let until = Instant::now() + Duration::from_secs(3);
+    while !cpu_entered.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < until,
+            "the CPU-bound handler never entered"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Confirm it really is computing, so the case is not an instant return wearing its name.
+    let before = cpu_ticks.load(Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        cpu_ticks.load(Ordering::SeqCst) > before,
+        "the CPU-bound handler is not advancing"
+    );
+
+    let server = fx.server.take().unwrap();
+    let t0 = Instant::now();
+    server.handle().shutdown();
+    server.wait();
+    let elapsed = t0.elapsed();
+    let alive = !cpu_done.load(Ordering::SeqCst);
+    eprintln!(
+        "PROGRESS77 budget cpu_only wait_ms={} cpu_alive_at_return={alive} budget_ms={}",
+        elapsed.as_millis(),
+        budget.as_millis()
+    );
+    assert!(
+        elapsed < budget,
+        "wait() took {elapsed:?} for one CPU-bound handler"
+    );
+    assert!(
+        alive,
+        "the CPU-bound handler finished too early to exercise the case it exists for"
+    );
+    cpu_release.store(true, Ordering::SeqCst);
+    let until = Instant::now() + Duration::from_secs(5);
+    while cpu_ticks.load(Ordering::SeqCst) == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(5));
+    }
+    drop(cpu);
 }

@@ -268,13 +268,29 @@ fn accept_loop(
             break;
         }
         if shared.abandoned() {
-            // The deadline has passed. Deliver each straggler's `shutting_down` frame from its own
-            // worker, then wait a bounded grace for those workers. A readable client's frame is
-            // written before `wait()` returns, so `cowfs serve` can exit right after it without
-            // dropping the frame. A worker for a client that stopped reading blocks on the write
-            // lock a progress write holds for the whole `write_timeout`; the grace expires and
-            // `wait()` returns without joining it, so a blocked write cannot stretch the deadline.
-            // The worker count is bounded by `max_connections`.
+            // The deadline has passed. Everything from here to the return shares ONE grace, so the
+            // budget is `shutdown_deadline + drain_deadline` and not a multiple of it. The end
+            // instant is computed once, here, and every wait below is bounded by that same instant.
+            // A per-wait budget looked equivalent but was not: each wait started its own
+            // `drain_deadline`, so a straggler that finished nothing could stretch the return to the
+            // deadline plus three graces. The accept loop polls this branch every 10 ms, so this
+            // instant is at most one poll interval after the real deadline.
+            let grace_end = Instant::now() + opts.drain_deadline;
+            // Delivery takes the front of the one grace and the close the back half, so waiting for a
+            // frame can never starve the release. The halves are slices of the same grace, so both
+            // phases together still cost exactly one `drain_deadline`.
+            let release_start = grace_end - opts.drain_deadline / 2;
+            let left = |now: Instant, end: Instant| {
+                end.saturating_duration_since(now)
+                    .max(Duration::from_millis(1))
+            };
+            // Deliver each straggler's `shutting_down` frame from its own worker, then wait for those
+            // workers within the grace. A readable client's frame is written before `wait()` returns,
+            // so `cowfs serve` can exit right after it without dropping the frame. A worker for a
+            // client that stopped reading blocks on the write lock a progress write holds for the
+            // whole `write_timeout`; the grace expires and `wait()` returns without joining it, so a
+            // blocked write cannot stretch the budget. The worker count is bounded by
+            // `max_connections`.
             let stragglers: Vec<Arc<Conn>> = lock(&shared.conns).values().cloned().collect();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let mut workers = Vec::with_capacity(stragglers.len());
@@ -291,20 +307,19 @@ fn accept_loop(
                     Ok(worker) => workers.push(worker),
                     // No worker: deliver the frame best-effort without blocking on a held write
                     // lock, then close, so a readable peer still gets `shutting_down` and no
-                    // connection is left open past the return. The write itself is bounded by the
-                    // same grace, so a peer whose receive queue is completely full cannot park the
+                    // connection is left open past the return. The write gets only what is left of the
+                    // one grace, so a peer whose receive queue is completely full cannot park the
                     // accept thread for a whole `write_timeout` here.
                     Err(_) => {
-                        conn.best_effort_abandon(opts.drain_deadline);
+                        conn.best_effort_abandon(left(Instant::now(), release_start));
                         conn.kill();
                     }
                 }
             }
             drop(done_tx);
-            let grace = Instant::now() + opts.drain_deadline;
             for _ in 0..workers.len() {
-                let left = grace.saturating_duration_since(Instant::now());
-                if done_rx.recv_timeout(left).is_err() {
+                let remaining = left(Instant::now(), release_start);
+                if done_rx.recv_timeout(remaining).is_err() {
                     break;
                 }
             }
@@ -321,25 +336,24 @@ fn accept_loop(
             }
             // The workers own the only writes this server still makes to a control client, so join
             // them before returning: no control-client buffer writer outlives `wait()`. `kill`
-            // already aborted their blocked writes, so this normally completes at once. The bound
-            // keeps a worker that is descheduled past the grace from stretching the deadline;
-            // such a worker only has to finish a write that can no longer reach a peer, and the
-            // process exit in `cowfs serve` ends it.
-            let join_until = Instant::now() + opts.drain_deadline;
+            // already aborted their blocked writes, so this normally completes at once. Bounded by the
+            // same `grace_end`, so a worker descheduled past the grace cannot stretch the budget; such
+            // a worker only has to finish a write that can no longer reach a peer, and the process
+            // exit in `cowfs serve` ends it.
             for worker in workers {
-                while !worker.is_finished() && Instant::now() < join_until {
+                while !worker.is_finished() && Instant::now() < grace_end {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
-            // The connection threads own the sockets, and each request worker owns a handler. A worker parked
-            // behind a blocked write cannot observe its cancel token, so both the socket and the
-            // handler would outlive `wait()` by up to `write_timeout` without this wait, which the
+            // The connection threads own the sockets, and each request worker owns a handler. A worker
+            // parked behind a blocked write cannot observe its cancel token, so both the socket and
+            // the handler would outlive `wait()` by up to `write_timeout` without this wait, which the
             // Shutdown contract forbids ("their connections are closed"). The workers were already
-            // killed above, so this normally completes at once. Bounded by the same grace: past it
-            // the connections are half-closed and the process exit in `cowfs serve` ends the rest,
-            // so a thread that is merely descheduled cannot stretch the deadline.
-            let release_until = Instant::now() + opts.drain_deadline;
-            while Instant::now() < release_until
+            // killed above, so a parked writer is released at once. Still bounded by the same
+            // `grace_end`: a handler that is stuck on the CPU instead of a socket cannot be forced
+            // out by half-closing, so it is detached and dies with the process, exactly as the
+            // contract says of handler threads. It never costs a second grace.
+            while Instant::now() < grace_end
                 && (!lock(&shared.conns).is_empty() || stragglers.iter().any(|c| !c.released()))
             {
                 std::thread::sleep(Duration::from_millis(1));
