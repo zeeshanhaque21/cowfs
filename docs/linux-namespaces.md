@@ -144,8 +144,18 @@ So this run used `rustc` directly, and a canonical path says nothing about a car
   The helper sets nothing and removes nothing, so `TMPDIR`, `CARGO_TARGET_DIR` and friends reach the command as the caller set them.
 - The namespace is per command, not per session.
   A shell started inside one keeps it; a new command gets a new one.
-- Nothing here is wired into `cowfs-treehouse` yet.
-  The execution seam is `crates/cowfs-treehouse/src/mode_b.rs:550` `run_build`, which currently runs a build command through `sh -c` in the slot directory. Wrapping that one call site is the natural integration, and it is deliberately not in this change: the canonical directory has to be chosen by whoever owns the pool, and that choice does not belong in a helper.
+- The treehouse wiring uses `--slot`, not a treehouse lease.
+  moonscape has no `treehouse` binary, so the integration run builds in the snapshot itself.
+  That is the same `run_build` call site a leased slot takes; only the slot provider differs.
+- The integration run uses the path backend, not the core backend, because `base_refresh` copies a
+  directory into the store and the core backend refuses that by design.
+  It is the backend that supports the operation under test, serving the same store over the same
+  FUSE mount.
+  Block-level verification is the core backend's, and belongs to the helper run.
+- On git 2.39, `base_refresh` fails after the build with `git worktree add did not report where it
+  worked`, because 2.39 puts `HEAD is now at <sha>` on stdout where 2.56 puts the path.
+  That is `crates/cowfs-daemon/src/import.rs`, outside this change.
+  The integration run reports it and judges the refresh by whether its artifact landed.
 - Verified on one kernel (6.12) and one filesystem (ext4 under the mount, `fuse.cowfs` for the source).
   Not verified on btrfs, XFS, or an older kernel.
 
@@ -158,8 +168,19 @@ The contract tests, which run everywhere including macOS and report which branch
 On a host without namespaces, the isolation tests are skipped with the reason, and the refusal tests run.
 That is a pass for the refusal path, not for isolation, and the run says so in its first line.
 
-The GitHub `ubuntu-latest` runner is such a host: its kernel refuses `CLONE_NEWUSER` for an unconfined process, so CI runs the refusal matrix there and reports `OK (skipped=10)`.
-That is the honest outcome and not a CI gap in the tests.
+`bench/test_namespaces.py` holds 17 tests: 8 refusals that run everywhere, and 9 isolation tests
+that need a namespace.
+On macOS: `Ran 17 tests`, `OK (skipped=10)`, the 8 refusals pass and the 9 isolation tests plus
+`test_both_routes_refused_names_both_in_the_message` are skipped.
+On real Linux with a namespace: `Ran 17 tests`, `OK (skipped=1)`, all 9 isolation tests run and the
+two-route check passes.
+The full `bench/` suite reports 53 tests on macOS, 10 of them skipped, and the rest of them belong to
+`bench/test_gates.py`.
+
+The GitHub `ubuntu-latest` runner denies namespaces, so CI takes the macOS branch and reports
+`OK (skipped=10)` there.
+That is the honest outcome and not a CI gap in the tests: a refusal pass is not an isolation pass, and
+the run's first line says which branch it took.
 The isolation matrix was run on `moonscape` instead, and the measurements above are from there.
 `test_both_routes_refused_names_both_in_the_message` puts a refusing `unshare` stub first on `PATH`, so the two-route refusal message is still checked everywhere, including on a host where a namespace does work.
 
@@ -168,5 +189,70 @@ The end-to-end run, on a Linux host with `/dev/fuse` and a Rust toolchain:
     scripts/namespaces17-linux.sh
 
 It builds `cowfs-cli` into its own output directory, starts a daemon it owns, ingests a fixture, clones two snapshots, runs the three canonical builds and the native control, and rules.
-Its verdict is only ever PASS or UNMEASURABLE.
+Its verdict is PASS, FAIL or UNMEASURABLE: a real failure of the product is FAIL, and only a missing prerequisite is UNMEASURABLE.
 It signals only the daemon it started, and only after checking that process's command line names its own store.
+
+The wiring run, the acceptance for the treehouse integration rather than for the helper:
+
+    scripts/namespaces17-treehouse-linux.sh
+
+It starts a real `cowfs-daemon` over a real FUSE mount, makes a real git repo, and drives the real
+companion through `base refresh --build --canonical --ns-helper`.
+`crates/cowfs-treehouse/tests/canonical.rs` covers the rest: default compatibility, the refusals, the
+flag pairing, argv integrity, the refused-namespace case and the payload-77 collision.
+Those are stub-only and prove the wiring rules, not the namespace.
+The stub-only tests run in CI; the namespace integration does not, because CI's runner refuses
+`CLONE_NEWUSER`.
+
+## The treehouse wiring
+
+`run_build` at `crates/cowfs-treehouse/src/mode_b.rs:638` takes an optional `Canonical`.
+Both existing call sites pass it, and there is no third code path.
+
+    cowfs-treehouse base refresh --repo R --build CMD --canonical DIR --ns-helper scripts/cowfs-ns-run.sh
+
+Absent, the build runs at the slot's own path exactly as before, so existing macOS and Linux behaviour
+and every existing config file are unchanged.
+Present and Linux, the launch becomes the helper with `--src <slot> --canonical DIR -- /bin/sh -c CMD`.
+
+`/bin/sh -c` is kept for the command, because that command is user configuration and has always been
+a shell string.
+It is passed as one argv element, and the canonical directory is a separate argv element, so neither is
+re-split or concatenated.
+A canonical directory containing a space or a quote cannot reach a shell, which
+`the_canonical_path_is_never_pasted_into_the_command_string` pins.
+
+`--canonical` and `--ns-helper` go together; either alone is exit 2.
+The helper path is given explicitly because a distributed binary cannot assume a working directory.
+`validate` refuses, as usage errors, a relative canonical path, a canonical directory that does not
+exist, and a helper that is not a file, then refuses a non-Linux platform as Unsupported.
+The companion never creates the canonical directory and never guesses a system path for one.
+
+One probe runs before each build, with a command that must succeed, because 77 is the helper's own
+refusal code and also a payload's own exit code.
+A failed probe is Unsupported carrying the UNMEASURABLE text; a payload that exits 77 stays an Io
+failure.
+The probe is why the ambiguous code is harmless here, and
+`a_passing_payload_seventy_seven_stays_a_failure` is what pins it.
+
+## Measured through the wiring
+
+Run on moonscape, path backend, real FUSE mount, real daemon, real companion.
+Artifacts: `bench/out/namespaces17-treehouse/`.
+
+| Artifact | Built at | SHA-256 | Bytes |
+|---|---|---|---|
+| base | canonical, the warm base | `90c90a2c7e1428c3bc8fcb3804de65c3113f2bd7884ed49fbaa1ee43e3c7aba7` | 4370032 |
+| slotA | canonical, fresh clone of base | `90c90a2c7e1428c3bc8fcb3804de65c3113f2bd7884ed49fbaa1ee43e3c7aba7` | 4370032 |
+| slotB | canonical, fresh clone of base | `90c90a2c7e1428c3bc8fcb3804de65c3113f2bd7884ed49fbaa1ee43e3c7aba7` | 4370032 |
+| N-slotA | its own path, do-nothing baseline | `b6fa6424206ce8daf6ba5e3a9cd658173ae146073586bdfe85b75e08b5c88b81` | 4370032 |
+| N-slotB | its own path, do-nothing baseline | `42f1926fe7c5d1e8ad969bf460e7d47bfd14ba25f77a3296bbbc688360b05a45` | 4370032 |
+
+The warm base and both fresh slots came out as one artifact, and each native control at its own slot
+path came out different, so the control really built elsewhere.
+`embedded-paths.txt` reads the path strings back out of all five binaries.
+
+The store was then reloaded from disk: the daemon was stopped, the same store mounted again, and
+`base`, `slotA` and `slotB` all served `main.rs` at
+`7fa626e8bff724acfb0ed8b61a8cc21ec2720db1ff08da4a6746b8db6826813d`, with every artifact present.
+That is a restart readback, not crash injection, and no no-data-loss claim is made from it.
