@@ -9,3 +9,4 @@ cc dd0ff1bb5eca7cc19f68d4d9912e955b6b7cd659d9c83ef6c0fadca3b5563338 # shrinks to
 cc 4a5e174768f5e5feab96056df60a826b8d23646952c6e94f3c171971a10a09fe # shrinks to ops = [Mkdir([2], 0), Rename([2], [0], false)]
 cc 2aca1cfbc7135f54cb2fa0378bdea3fb5e12aa879c0b9005ab41d273f13f8566 # shrinks to ops = [Mkdir([1], 0), Symlink([1, 0], 0), Rmdir([1])]
 cc 1c48a6cc89f048ec82c8cb1bbf2662c233ccba3169af4d2793b2c975f815e253 # shrinks to ops = [Create([0], 0), Hold([0]), Fork(0), HeldWrite(19, 0, 1, 0), Fork(73)]
+cc 9aa30bfa88a2438194d3b5ae7af55c7e2a59ff8a233abfe1cd0ddbec9d213900 # shrinks to ops = [Create([2], 0), Fork(0), Unlink([2]), Create([2], 0), Unlink([2]), DropCaches, Create([2], 0)]
