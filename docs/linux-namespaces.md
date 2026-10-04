@@ -200,6 +200,12 @@ It starts a real `cowfs-daemon` over a real FUSE mount, makes a real git repo, a
 companion through `base refresh --build --canonical --ns-helper`.
 `crates/cowfs-treehouse/tests/canonical.rs` covers the rest: default compatibility, the refusals, the
 flag pairing, argv integrity, the refused-namespace case and the payload-77 collision.
+It holds 13 tests on Linux and 10 on macOS, because 3 are behind `cfg(target_os = "linux")`.
+Those 3 are the ones that exercise a live namespace decision, and they are exactly the ones macOS
+cannot run, which is why the first version of them passed locally and then failed on the CI ubuntu
+runner: the stubs wrote to an unquoted path in a shell script, and the temp directory name carried a
+parenthesis from Rust's `ThreadId` formatting.
+A path in a generated script is quoted, and the temp directory name is shell-safe.
 Those are stub-only and prove the wiring rules, not the namespace.
 The stub-only tests run in CI; the namespace integration does not, because CI's runner refuses
 `CLONE_NEWUSER`.
