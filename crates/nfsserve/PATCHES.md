@@ -28,6 +28,7 @@ Everything below is ours.
   MKNOD answers NFS3ERR_NOTSUPP.
 - Replies leave in one write (header and body together) so TCP_NODELAY does not split them.
 - No panics on network data: bounded XDR lengths and RPC message size, `unwrap` and `assert` removed, `accept` errors do not end the server loop.
+  Including `EMFILE`: a descriptor-table flood is finite, and treating it as fatal dropped the listening socket, so the server stopped accepting new connections for good instead of recovering once the flood stopped.
 - Security and bounds (`tcp.rs`, `rpcwire.rs`, `reply_cache.rs`):
   - `MountGate`: the first connection to send MNT gets the root handle, other connections are refused until `rearm`.
   - `PeerCheck` hook for MNT callers.
