@@ -287,16 +287,37 @@ pub fn base_refresh(
         return Err(e);
     }
     let result = replace(&dir, &name, backend, snaps, ctx).and_then(|()| {
-        let mut info = snaps.promote(&name).map_err(|e| {
+        snaps.promote(&name).map_err(|e| {
             CtlError::new(ErrorCode::IoError, format!("cannot promote {name:?}: {e}"))
         })?;
-        info.base = Some(BaseMeta {
-            repo: Some(params.repo.clone()),
-            git_ref: Some(params.git_ref.clone()),
-            commit: Some(commit.clone()),
-        });
+        // Publication is the record being durable, not the response carrying it: a caller that
+        // reconnects, or a daemon that restarts, has to find this base again and be told the same
+        // commit. So the provenance is written before the report exists, and a write that fails
+        // fails the refresh instead of leaving a base that looks published and cannot be found.
+        snaps
+            .set_base_meta(
+                &name,
+                &BaseMeta {
+                    repo: Some(params.repo.clone()),
+                    git_ref: Some(params.git_ref.clone()),
+                    commit: Some(commit.clone()),
+                },
+            )
+            .map_err(|e| {
+                CtlError::new(
+                    ErrorCode::IoError,
+                    format!("cannot record where {name:?} was built from: {e}"),
+                )
+            })?;
+        // Re-read rather than reporting what was just written, so the report can only say "fresh"
+        // if a later caller reading the same store would agree.
         Ok(BaseRefreshReport {
-            snapshot: info,
+            snapshot: snaps.create_meta(&name).map_err(|e| {
+                CtlError::new(
+                    ErrorCode::IoError,
+                    format!("cannot read back the base record for {name:?}: {e}"),
+                )
+            })?,
             previous_commit: previous,
         })
     });
@@ -600,6 +621,61 @@ mod tests {
             .unwrap_or_else(|_| p.to_path_buf())
             .display()
             .to_string()
+    }
+
+    /// The defect #98 reported: the refresh returned a commit but wrote none, so the next caller
+    /// was told the base had no provenance and `base status` could not find it.
+    #[test]
+    fn a_refresh_is_still_a_published_base_after_the_daemon_reopens_the_store() {
+        let (_d, b) = backend();
+        let (_rd, repo) = repo("reopened");
+        let store = b.store_path().to_owned();
+        let commit = refresh(b.as_ref(), &repo, "warm")
+            .unwrap()
+            .snapshot
+            .base
+            .expect("the refresh reports a base")
+            .commit;
+        drop(b);
+
+        let reopened = PathBackend::open(&store).expect("the same store opens again");
+        let info = reopened.snapshots().create_meta("warm").unwrap();
+        assert_eq!(
+            info.base
+                .expect("the base is still a base after a reopen")
+                .commit,
+            commit,
+            "the published commit did not survive the daemon"
+        );
+    }
+
+    /// A refresh that cannot record where the base came from fails. It does not return success, and
+    /// it does not leave something behind that reports itself fresh.
+    #[test]
+    fn a_refresh_that_cannot_record_its_provenance_fails_and_leaves_no_fresh_base() {
+        let (_d, b) = backend();
+        let (_rd, repo) = repo("unrecordable");
+        // The provenance directory cannot be created, so no write can ever land.
+        std::fs::write(b.store_path().join(".cowfs-base-meta"), b"not a directory").unwrap();
+
+        let e = refresh(b.as_ref(), &repo, "warm").unwrap_err();
+        assert!(
+            e.to_string().contains("warm"),
+            "the refusal names the base: {e}"
+        );
+        let info = b
+            .snapshots()
+            .create_meta("warm")
+            .expect("the tree is there");
+        assert_eq!(
+            info.base, None,
+            "nothing reports itself fresh after a failed publication"
+        );
+        assert_eq!(
+            worktree_paths(&repo),
+            vec![resolved(&repo)],
+            "the failed refresh left no checkout behind"
+        );
     }
 
     #[test]

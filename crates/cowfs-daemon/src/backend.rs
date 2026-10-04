@@ -39,6 +39,14 @@ pub trait Snapshots: Send + Sync + fmt::Debug {
     /// Turns a clone into a base. Idempotent.
     fn promote(&self, name: &str) -> io::Result<SnapshotInfo>;
 
+    /// Records where the base `name` was built from, durably, before this returns.
+    ///
+    /// Separate from [`Snapshots::promote`] because the two answer different questions: `promote`
+    /// says how a snapshot is used, this says what is in it. A refresh publishes a base by calling
+    /// both, and a caller that reconnects must be told the same commit, so this cannot be
+    /// satisfied by returning the record in a response.
+    fn set_base_meta(&self, name: &str, meta: &BaseMeta) -> io::Result<()>;
+
     /// The `SnapshotInfo` of an existing snapshot, without changing anything.
     fn create_meta(&self, name: &str) -> io::Result<SnapshotInfo>;
 }
@@ -215,10 +223,18 @@ impl CoreBackend {
                 store.display()
             ))
         })?)));
+        // Same rule as the path backend: a store whose base records cannot be read is not one
+        // this backend may serve.
+        let bases = crate::base_meta::BaseMetaStore::open(&store).map_err(|e| {
+            io::Error::other(format!(
+                "cannot read the base records in {}: {e}",
+                store.display()
+            ))
+        })?;
         Ok(Self {
             snaps: CoreSnapshots {
                 core: Arc::clone(&core),
-                bases: Mutex::new(Default::default()),
+                bases,
             },
             core,
             store,
@@ -296,7 +312,7 @@ impl CoreBackend {
 #[derive(Debug)]
 pub struct CoreSnapshots {
     core: CoreSlot,
-    bases: Mutex<std::collections::BTreeSet<String>>,
+    bases: crate::base_meta::BaseMetaStore,
 }
 
 /// Runs `f` against the core in `slot`, or fails once the backend has been closed.
@@ -321,22 +337,15 @@ impl CoreSnapshots {
     }
 
     fn info(&self, name: &str) -> io::Result<SnapshotInfo> {
-        let is_base = self.is_base(name);
+        let base = self.bases.get(name);
         self.with(|c| {
             let all = CoreSnapshots::names(c)?;
             let entry = all
                 .iter()
                 .find(|e| e.name == name)
                 .ok_or_else(|| missing(name))?;
-            Ok(core_info(entry, &all, is_base))
+            Ok(core_info(entry, &all, base))
         })
-    }
-
-    fn is_base(&self, name: &str) -> bool {
-        self.bases
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(name)
     }
 
     /// The core's `list_snapshots`.
@@ -391,7 +400,7 @@ fn control_io(e: cowfs_core::ControlError) -> io::Error {
 fn core_info(
     entry: &cowfs_core::SnapshotEntry,
     all: &[cowfs_core::SnapshotEntry],
-    is_base: bool,
+    base: Option<BaseMeta>,
 ) -> SnapshotInfo {
     SnapshotInfo {
         name: entry.name.clone(),
@@ -399,11 +408,7 @@ fn core_info(
             .parent
             .and_then(|id| all.iter().find(|n| n.id == id))
             .map(|n| n.name.clone()),
-        base: is_base.then_some(BaseMeta {
-            repo: None,
-            git_ref: None,
-            commit: None,
-        }),
+        base,
         created_unix_ms: u64::try_from(entry.created.secs)
             .unwrap_or(0)
             .saturating_mul(1000)
@@ -578,7 +583,9 @@ impl Snapshots for CoreSnapshots {
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
-        self.with(|c| c.remove_snapshot(name).map_err(control_io).map(|_| ()))
+        self.with(|c| c.remove_snapshot(name).map_err(control_io).map(|_| ()))?;
+        self.bases.remove(name);
+        Ok(())
     }
 
     fn swap(&self, name: &str, from: &str) -> io::Result<SnapshotInfo> {
@@ -607,7 +614,8 @@ impl Snapshots for CoreSnapshots {
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        self.with(|c| c.rename_snapshot(from, to).map_err(control_io).map(|_| ()))
+        self.with(|c| c.rename_snapshot(from, to).map_err(control_io).map(|_| ()))?;
+        self.bases.rename(from, to)
     }
 
     fn promote(&self, name: &str) -> io::Result<SnapshotInfo> {
@@ -618,11 +626,17 @@ impl Snapshots for CoreSnapshots {
                 .then_some(())
                 .ok_or_else(|| missing(name))
         })?;
-        self.bases
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(name.to_owned());
+        if self.bases.get(name).is_none() {
+            self.bases.promote(name)?;
+        }
         self.info(name)
+    }
+
+    fn set_base_meta(&self, name: &str, meta: &BaseMeta) -> io::Result<()> {
+        if self.info(name).is_err() {
+            return Err(missing(name));
+        }
+        self.bases.set(name, meta)
     }
 
     fn create_meta(&self, name: &str) -> io::Result<SnapshotInfo> {
@@ -644,7 +658,7 @@ impl PathBackend {
         std::fs::create_dir_all(store.as_ref())?;
         let store = std::fs::canonicalize(store.as_ref())?;
         Ok(Self {
-            snaps: PathSnapshots::new(store.clone()),
+            snaps: PathSnapshots::new(store.clone())?,
             store,
         })
     }
@@ -683,15 +697,23 @@ impl Backend for PathBackend {
 #[derive(Clone, Debug)]
 pub struct PathSnapshots {
     store: PathBuf,
-    bases: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    bases: crate::base_meta::BaseMetaStore,
 }
 
 impl PathSnapshots {
-    fn new(store: PathBuf) -> Self {
-        Self {
+    fn new(store: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            // A store whose base records cannot be read is not a store this backend may serve:
+            // it would report every base as unknown and let a refresh publish a second base
+            // under a name that already has one.
+            bases: crate::base_meta::BaseMetaStore::open(&store).map_err(|e| {
+                io::Error::other(format!(
+                    "cannot read the base records in {}: {e}",
+                    store.display()
+                ))
+            })?,
             store,
-            bases: Arc::default(),
-        }
+        })
     }
 
     fn dir(&self, name: &str) -> PathBuf {
@@ -703,20 +725,10 @@ impl PathSnapshots {
     }
 
     fn info(&self, name: &str, parent: Option<String>) -> SnapshotInfo {
-        let base = self
-            .bases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(name)
-            .then_some(BaseMeta {
-                repo: None,
-                git_ref: None,
-                commit: None,
-            });
         SnapshotInfo {
             name: name.to_owned(),
             parent,
-            base,
+            base: self.bases.get(name),
             created_unix_ms: now_ms(),
         }
     }
@@ -796,6 +808,7 @@ impl Snapshots for PathSnapshots {
             ));
         }
         cowfs_vfs_path::force_remove_dir_all(&self.dir(name));
+        self.bases.remove(name);
         Ok(())
     }
 
@@ -839,7 +852,8 @@ impl Snapshots for PathSnapshots {
                 "name is taken",
             ));
         }
-        std::fs::rename(self.dir(from), self.dir(to))
+        std::fs::rename(self.dir(from), self.dir(to))?;
+        self.bases.rename(from, to)
     }
 
     fn promote(&self, name: &str) -> io::Result<SnapshotInfo> {
@@ -849,11 +863,17 @@ impl Snapshots for PathSnapshots {
                 format!("snapshot {name:?} does not exist"),
             ));
         }
-        self.bases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(name.to_owned());
+        if self.bases.get(name).is_none() {
+            self.bases.promote(name)?;
+        }
         Ok(self.info(name, None))
+    }
+
+    fn set_base_meta(&self, name: &str, meta: &BaseMeta) -> io::Result<()> {
+        if !self.exists(name) {
+            return Err(missing(name));
+        }
+        self.bases.set(name, meta)
     }
 
     fn create_meta(&self, name: &str) -> io::Result<SnapshotInfo> {
@@ -929,6 +949,170 @@ mod tests {
         let backend = CoreBackend::open(dir.path(), cowfs_core::Options::default())
             .expect("a core over a fresh store");
         (dir, backend)
+    }
+
+    /// A path backend over a temp dir, closed by the end of the test whatever happens.
+    fn path() -> (tempfile::TempDir, PathBackend) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = PathBackend::open(dir.path().join("store")).expect("a path backend");
+        (dir, backend)
+    }
+
+    fn meta(repo: &str, git_ref: &str, commit: &str) -> BaseMeta {
+        BaseMeta {
+            repo: Some(repo.to_owned()),
+            git_ref: Some(git_ref.to_owned()),
+            commit: Some(commit.to_owned()),
+        }
+    }
+
+    fn commit_of(info: &SnapshotInfo) -> Option<&str> {
+        info.base.as_ref().and_then(|b| b.commit.as_deref())
+    }
+
+    /// The defect this is the regression for: the provenance was only ever in memory, so every
+    /// caller after a reconnect or a restart was told the base had no commit and could not find it.
+    #[test]
+    fn a_core_base_keeps_its_provenance_across_a_reopen() {
+        let (d, b) = core();
+        let store = d.path().to_owned();
+        let s = b.snapshots();
+        s.create("warm", None).unwrap();
+        s.promote("warm").unwrap();
+        s.set_base_meta("warm", &meta("/r", "main", "c0ffee"))
+            .unwrap();
+        drop(b);
+
+        let reopened = CoreBackend::open(&store, cowfs_core::Options::default())
+            .expect("the same store opens again");
+        let info = reopened.snapshots().create_meta("warm").unwrap();
+        assert_eq!(commit_of(&info), Some("c0ffee"));
+        assert_eq!(info.base.as_ref().unwrap().git_ref.as_deref(), Some("main"));
+        assert_eq!(info.base.as_ref().unwrap().repo.as_deref(), Some("/r"));
+    }
+
+    #[test]
+    fn a_path_base_keeps_its_provenance_across_a_reopen() {
+        let (_d, b) = path();
+        let store = b.store.clone();
+        let s = b.snapshots();
+        s.create("warm", None).unwrap();
+        s.promote("warm").unwrap();
+        s.set_base_meta("warm", &meta("/r", "main", "c0ffee"))
+            .unwrap();
+        drop(b);
+
+        let reopened = PathBackend::open(&store).expect("the same store opens again");
+        assert_eq!(
+            commit_of(&reopened.snapshots().create_meta("warm").unwrap()),
+            Some("c0ffee")
+        );
+    }
+
+    /// A base whose provenance was never written is a base, and it is not fresh: the commit is
+    /// unknown, not absent because nothing is built.
+    #[test]
+    fn a_promoted_base_with_no_provenance_reports_itself_unknown_not_fresh() {
+        let (d, b) = core();
+        let store = d.path().to_owned();
+        b.snapshots().create("warm", None).unwrap();
+        b.snapshots().promote("warm").unwrap();
+        drop(b);
+
+        let reopened = CoreBackend::open(&store, cowfs_core::Options::default()).unwrap();
+        let info = reopened.snapshots().create_meta("warm").unwrap();
+        assert!(info.base.is_some(), "still a base: {info:?}");
+        assert_eq!(commit_of(&info), None, "and its commit is unknown");
+    }
+
+    #[test]
+    fn provenance_follows_a_rename_and_is_forgotten_by_a_remove() {
+        let (_d, b) = path();
+        let s = b.snapshots();
+        s.create("warm", None).unwrap();
+        s.promote("warm").unwrap();
+        s.set_base_meta("warm", &meta("/r", "main", "c0ffee"))
+            .unwrap();
+
+        s.rename("warm", "warmer").unwrap();
+        assert_eq!(
+            commit_of(&s.create_meta("warmer").unwrap()),
+            Some("c0ffee"),
+            "a rename must not lose where the base came from"
+        );
+        assert_eq!(
+            s.create_meta("warm").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        s.remove("warmer").unwrap();
+        assert!(!s.create_meta("warmer").is_ok());
+        let store = b.store.clone();
+        let reopened = PathBackend::open(&store).unwrap();
+        assert!(
+            crate::base_meta::BaseMetaStore::open(&reopened.store)
+                .unwrap()
+                .get("warmer")
+                .is_none(),
+            "and it stays forgotten after a reopen"
+        );
+    }
+
+    /// A store whose records cannot be read is refused. Serving it would report every base as
+    /// unknown and let a refresh publish a second base under a name that already has one.
+    #[test]
+    fn a_store_with_an_unreadable_base_record_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let record = store.join(".cowfs-base-meta").join("warm");
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::write(record.join("base.json"), b"{ not json").unwrap();
+        assert!(PathBackend::open(&store).is_err(), "opened anyway");
+    }
+
+    /// The setter fails closed: an error leaves the previous record in place rather than a base
+    /// that claims a commit nobody can read back.
+    #[test]
+    fn a_provenance_write_that_fails_leaves_the_old_record_and_no_claim() {
+        let (_d, b) = path();
+        let s = b.snapshots();
+        s.create("warm", None).unwrap();
+        s.promote("warm").unwrap();
+        // The record's own directory is now an ordinary file, so the write cannot land.
+        let record = b.store.join(".cowfs-base-meta").join("warm");
+        std::fs::remove_dir_all(&record).unwrap();
+        std::fs::write(&record, b"not a directory").unwrap();
+
+        let e = s
+            .set_base_meta("warm", &meta("/r", "main", "c0ffee"))
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(
+            commit_of(&s.create_meta("warm").unwrap()),
+            None,
+            "a failed write must not look like a published commit"
+        );
+    }
+
+    #[test]
+    fn provenance_cannot_be_recorded_for_a_snapshot_that_does_not_exist() {
+        let (_d, b) = path();
+        assert_eq!(
+            b.snapshots()
+                .set_base_meta("nosuch", &meta("/r", "main", "c"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let (_d2, c) = core();
+        c.snapshots().create("warm", None).unwrap();
+        assert_eq!(
+            c.snapshots()
+                .set_base_meta("nosuch", &meta("/r", "main", "c"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
@@ -1090,6 +1274,9 @@ impl Snapshots for MemSnapshots {
         Err(unsupported("the in-memory backend has no snapshots"))
     }
     fn promote(&self, _name: &str) -> io::Result<SnapshotInfo> {
+        Err(unsupported("the in-memory backend has no snapshots"))
+    }
+    fn set_base_meta(&self, _name: &str, _meta: &BaseMeta) -> io::Result<()> {
         Err(unsupported("the in-memory backend has no snapshots"))
     }
     fn create_meta(&self, _name: &str) -> io::Result<SnapshotInfo> {

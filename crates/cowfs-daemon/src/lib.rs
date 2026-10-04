@@ -35,6 +35,7 @@
 #![deny(unsafe_code)]
 
 pub mod backend;
+mod base_meta;
 pub mod daemon;
 pub mod exports;
 mod handler;
