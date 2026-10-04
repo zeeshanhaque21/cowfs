@@ -176,7 +176,13 @@ impl Server {
             listener.set_peer_check(Arc::new(same_user));
         }
         runtime.spawn(async move {
-            let _ = listener.handle_forever().await;
+            // A recoverable accept error is looped over inside the listener, so anything arriving
+            // here is fatal and the port is about to stop accepting. Say so instead of dropping it.
+            if let Err(e) = listener.handle_forever().await {
+                eprintln!(
+                    "cowfs-nfs: the NFS accept loop stopped, the port no longer accepts: {e}"
+                );
+            }
         });
         if opts.stats_on_sigusr1 {
             runtime.spawn(async {
