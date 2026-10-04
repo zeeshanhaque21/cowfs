@@ -56,6 +56,12 @@ fn open_fds() -> usize {
     std::fs::read_dir("/dev/fd").expect("list /dev/fd").count()
 }
 
+/// Descriptors in use, or 0 when the table is too full to open `/dev/fd` to count them. For
+/// measuring at the moment of exhaustion, where counting is exactly what is not possible.
+fn open_fds_best_effort() -> usize {
+    std::fs::read_dir("/dev/fd").map_or(0, |d| d.count())
+}
+
 /// How many in-process connections (a client and a server descriptor each) fit in the descriptors
 /// that are still free, up to `want`.
 fn affordable(want: usize) -> usize {
@@ -228,4 +234,90 @@ fn the_reply_cache_stays_small_under_a_long_run() {
     let grown = rss_bytes().saturating_sub(before);
     println!("20000 cached calls: RSS grew {} MiB", grown >> 20);
     assert!(grown < 40 << 20);
+}
+
+/// The soft descriptor limit the child runs under. Low enough to reach exhaustion in one bounded
+/// run, high enough that the server, the client and the flood all fit while it happens.
+const CHILD_FD_LIMIT: usize = 512;
+
+/// `accept` reports EMFILE once the descriptor table is full. Treating that as fatal dropped the
+/// listening socket, so after an exhausting flood the server served the connection it already had
+/// and refused every new one, for good (#57).
+///
+/// The exhaustion needs a descriptor limit far below the machine's, and lowering this process's own
+/// limit would move the ground under every other test in the binary. So the work runs in a private
+/// child: `ulimit -n` inside that one shell affects nothing outside it.
+#[test]
+fn an_exhausting_flood_does_not_end_the_accept_loop() {
+    let _x = exclusive();
+    if std::env::var_os("COWFS_FD_EXHAUST_CHILD").is_none() {
+        let exe = std::env::current_exe().expect("this test binary");
+        let script = format!(
+            "ulimit -n {CHILD_FD_LIMIT}; COWFS_FD_EXHAUST_CHILD=1 exec \"$0\" \
+             --exact an_exhausting_flood_does_not_end_the_accept_loop --test-threads=1 --nocapture"
+        );
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .arg(exe)
+            .output()
+            .expect("run the child under a lowered descriptor limit");
+        assert!(
+            out.status.success(),
+            "the child under ulimit -n {CHILD_FD_LIMIT} failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    assert_eq!(
+        fd_limit(),
+        CHILD_FD_LIMIT,
+        "the child did not get the descriptor limit it was asked for, so the rest proves nothing"
+    );
+    let (s, mut c) = serve(memfs(), MountOptions::default());
+    let root = c.root.clone();
+    assert_eq!(c.getattr(&root).0, OK, "the client starts served");
+
+    let mut socks: Vec<TcpStream> = Vec::new();
+    let mut stop = None;
+    for _ in 0..CHILD_FD_LIMIT * 2 {
+        match TcpStream::connect(("127.0.0.1", s.port())) {
+            Ok(x) => socks.push(x),
+            Err(e) => {
+                stop = Some(e.raw_os_error());
+                break;
+            }
+        }
+    }
+    let in_use = open_fds_best_effort();
+    println!(
+        "flood opened {} sockets and stopped on errno {stop:?}, {in_use} of {CHILD_FD_LIMIT} descriptors in use",
+        socks.len()
+    );
+    assert!(
+        socks.len() > Limits::default().max_connections,
+        "only {} sockets opened, so the cap was never reached",
+        socks.len()
+    );
+    assert_eq!(
+        c.getattr(&root).0,
+        OK,
+        "the established client survives the flood"
+    );
+
+    drop(socks);
+    // Long enough for the server to release the connections it was holding and for the accept loop
+    // to have retried if it is going to.
+    std::thread::sleep(Duration::from_millis(2000));
+    let released = open_fds_best_effort();
+    println!("after the flood subsides: {released} descriptors in use");
+    let mut fresh = Nfs::attach(s.port(), root.clone());
+    assert_eq!(
+        fresh.getattr(&root).0,
+        OK,
+        "a new client is served after a flood that exhausted the descriptor table"
+    );
+    assert_eq!(c.getattr(&root).0, OK, "the original client still works");
 }

@@ -348,10 +348,14 @@ impl Inner {
         }
         let mut q = sc.q.lk();
         if last && q.try_elide(&cn) {
-            q.touch(&pn);
+            let seq = q.touch(&pn);
             drop(q);
             self.ctr.elided.fetch_add(1, Ordering::Relaxed);
-            self.dents.put(parent, name, None, 0);
+            // `seq`, not 0: eliding the create says nothing about an earlier queued unlink of the
+            // same name, which meta has not seen yet. Marking the entry clean would let a cache
+            // drop lose the only record that the name is gone, and the next create would read the
+            // name back out of meta and answer Exists.
+            self.dents.put(parent, name, None, seq);
             return Ok(());
         }
         let seq = q.push(
@@ -418,10 +422,11 @@ impl Inner {
         self.ctr.inodes_net.fetch_sub(1, Ordering::Relaxed);
         let mut q = sc.q.lk();
         if q.try_elide(&cn) {
-            q.touch(&pn);
+            let seq = q.touch(&pn);
             drop(q);
             self.ctr.elided.fetch_add(1, Ordering::Relaxed);
-            self.dents.put(parent, name, None, 0);
+            // the same reason as the unlink above: the queued removal meta has not seen yet
+            self.dents.put(parent, name, None, seq);
             return Ok(());
         }
         let seq = q.push(
