@@ -413,8 +413,11 @@ impl Adapter {
         if i.is_side() {
             return self.side_setattr(i.ino, s);
         }
-        self.apply(i.ino, set_attr(s))
-            .and_then(|a| self.fa(&a, Kind::Plain))
+        let out = self
+            .apply(i.ino, set_attr(s))
+            .and_then(|a| self.fa(&a, Kind::Plain));
+        self.durable(i.ino)?;
+        out
     }
 
     pub fn readlink(&self, id: fileid3) -> NfsResult<Vec<u8>> {
@@ -458,6 +461,17 @@ impl Adapter {
         self.vfs.fsync(i.ino, false).map_err(stat)
     }
 
+    /// Makes a name or attribute change durable before it is acknowledged.
+    ///
+    /// macOS sends no COMMIT for a directory `fsync`, nor for an `fsync` of a descriptor with no
+    /// dirty pages, so a caller that renamed and then synced the parent directory, the whole
+    /// POSIX dance, was told `NFS3_OK` about a name that was still only in memory and was back at
+    /// its old name after the daemon died. The reply is the one chance to fix that, and it costs
+    /// file data nothing: a dirty file stays unstable until its own COMMIT.
+    fn durable(&self, ino: Ino) -> NfsResult<()> {
+        self.vfs.sync_namespace(ino).map_err(stat)
+    }
+
     pub fn create(
         &self,
         dir: fileid3,
@@ -469,6 +483,7 @@ impl Adapter {
         not_side(d)?;
         if self.side_of(d.ino, name) {
             let (id, attr) = self.side_create(d.ino, name, attr, guarded)?;
+            self.durable(d.ino)?;
             return Ok((self.id_of(id), attr));
         }
         new_name(name)?;
@@ -477,7 +492,7 @@ impl Adapter {
             set_mode3::Void => 0o644,
         };
         let mut changes = set_attr(attr);
-        match self.vfs.create(d.ino, name, mode) {
+        let made = match self.vfs.create(d.ino, name, mode) {
             Ok(a) => {
                 self.handed_out(Some(d.ino), &a);
                 changes.mode = None;
@@ -498,7 +513,9 @@ impl Adapter {
                 Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
             }
             Err(e) => Err(stat(e)),
-        }
+        };
+        self.durable(d.ino)?;
+        made
     }
 
     pub fn create_exclusive(
@@ -550,6 +567,7 @@ impl Adapter {
         };
         let a = self.vfs.mkdir(d.ino, name, mode).map_err(stat)?;
         self.handed_out(Some(d.ino), &a);
+        self.durable(d.ino)?;
         Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
     }
 
@@ -570,6 +588,7 @@ impl Adapter {
         }
         let a = self.vfs.symlink(d.ino, name, target).map_err(stat)?;
         self.handed_out(Some(d.ino), &a);
+        self.durable(d.ino)?;
         Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
     }
 
@@ -583,6 +602,7 @@ impl Adapter {
         new_name(name)?;
         let a = self.vfs.link(f.ino, d.ino, name).map_err(stat)?;
         self.handed_out(None, &a);
+        self.durable(d.ino)?;
         self.fa(&a, Kind::Plain)
     }
 
@@ -615,6 +635,7 @@ impl Adapter {
         ) {
             let _ = self.remove_one(d.ino, &side);
         }
+        self.durable(d.ino)?;
         Ok(())
     }
 
@@ -657,6 +678,7 @@ impl Adapter {
             r => r.map_err(stat)?,
         }
         self.reap_if_last(target.ino);
+        self.durable(d.ino)?;
         Ok(())
     }
 
@@ -712,6 +734,7 @@ impl Adapter {
                 }
             }
         }
+        self.durable(fd.ino)?;
         Ok(())
     }
 

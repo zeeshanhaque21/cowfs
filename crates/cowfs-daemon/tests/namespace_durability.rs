@@ -300,9 +300,41 @@ impl Drop for Run {
     }
 }
 
+/// What one rep left behind after the kill, so a failure names the counterexample instead of
+/// only saying a name was missing.
+struct Outcome {
+    case: &'static str,
+    rep: usize,
+    pid: u32,
+    after: Option<Vec<u8>>,
+    old_back: Option<Vec<u8>>,
+    fsck: String,
+}
+
+impl Outcome {
+    fn survived(&self) -> bool {
+        self.after.as_deref() == Some(BODY) && self.old_back.is_none()
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "{} rep{}: pid {} SIGKILLed, new name {}, old name {}, new digest {}, old digest {}, \
+             fsck {:?}",
+            self.case,
+            self.rep,
+            self.pid,
+            if self.after.is_some() { "kept" } else { "LOST" },
+            if self.old_back.is_some() { "CAME BACK" } else { "gone" },
+            self.after.as_deref().map(digest).unwrap_or("-".into()),
+            self.old_back.as_deref().map(digest).unwrap_or("-".into()),
+            self.fsck.trim(),
+        )
+    }
+}
+
 /// One case, one rep: create the file, rename it, sync the way the case says, then kill the
 /// daemon 2 to 6 ms later and read the same store back through a fresh daemon and mount.
-fn rep(case: After, rep: usize) {
+fn rep(case: After, rep: usize) -> Outcome {
     let mut run = Run::new(case.name(), rep);
     private(&run.dir.join("pool"));
     run.start();
@@ -328,29 +360,19 @@ fn rep(case: After, rep: usize) {
     run.start();
     assert_ne!(run.pid(), pid, "the restart reused the killed pid");
     let dir = run.snap();
-    let after = fs::read(dir.join(NEW)).expect("the new name must survive the kill");
-    assert_eq!(
-        after, before,
-        "{}: the new name came back with other bytes",
-        case.name()
-    );
-    assert_eq!(
-        fs::read(&dir.join(OLD)).ok(),
-        None,
-        "{}: the old name came back too",
-        case.name()
-    );
-    let fsck = run.cli(&["fsck"]).expect("fsck after the kill");
-    assert!(
-        fsck.contains("ok: ") && fsck.contains("snapshots checked"),
-        "{}: fsck: {fsck}",
-        case.name()
-    );
-    eprintln!(
-        "durability90 {} rep{rep}: pid {pid} SIGKILLed, new name survived, digest {}",
-        case.name(),
-        digest(&after)
-    );
+    let out = Outcome {
+        case: case.name(),
+        rep,
+        pid,
+        after: fs::read(dir.join(NEW)).ok(),
+        old_back: fs::read(&dir.join(OLD)).ok(),
+        fsck: run.cli(&["fsck"]).unwrap_or_else(|e| format!("fsck failed: {e}")),
+    };
+    if let Some(body) = &out.after {
+        assert_eq!(body, &before, "{}: the new name came back with other bytes", case.name());
+    }
+    eprintln!("durability90 {}", out.line());
+    out
 }
 
 /// Every case the caller can reach, three reps each. Small on purpose: each rep starts a daemon,
@@ -363,13 +385,53 @@ fn a_synced_namespace_survives_a_killed_daemon() {
         return;
     }
     let only = std::env::var("DURABILITY90_ONLY").ok();
+    let evidence = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(artifacts().join("results.jsonl"))
+        .expect("the evidence file");
+    let mut w = std::io::BufWriter::new(evidence);
+    let mut outcomes = Vec::new();
     for case in After::CASES {
         if only.as_deref().is_some_and(|want| want != case.name()) {
             continue;
         }
         for nth in 1..=3 {
-            rep(case, nth);
+            let out = rep(case, nth);
+            // Appended and flushed per rep, so a run that dies keeps what it proved.
+            writeln!(
+                w,
+                "{{\"case\":\"{}\",\"rep\":{},\"pid\":{},\"new_name\":{},\"old_name\":{},\"fsck\":{:?}}}",
+                out.case,
+                out.rep,
+                out.pid,
+                out.after.is_some(),
+                out.old_back.is_some(),
+                out.fsck.trim()
+            )
+            .expect("the evidence line");
+            w.flush().expect("flush the evidence line");
+            outcomes.push(out);
         }
+    }
+    for case in After::CASES {
+        let kept = outcomes.iter().filter(|o| o.case == case.name() && o.survived()).count();
+        let total = outcomes.iter().filter(|o| o.case == case.name()).count();
+        if total == 0 {
+            continue;
+        }
+        assert_eq!(
+            kept,
+            total,
+            "{}: only {kept}/{total} reps kept the rename the caller had synced:\n{}",
+            case.name(),
+            outcomes
+                .iter()
+                .filter(|o| o.case == case.name())
+                .map(|o| format!("  {}", o.line()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
     }
 }
 

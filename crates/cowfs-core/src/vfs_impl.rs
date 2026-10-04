@@ -88,6 +88,10 @@ impl Vfs for Core {
         self.inner.op_fsync(ino)
     }
 
+    fn sync_namespace(&self, ino: Ino) -> Result<()> {
+        self.inner.op_sync_namespace(ino)
+    }
+
     fn readdir(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDir> {
         self.inner.op_readdir(dir, cookie, max)
     }

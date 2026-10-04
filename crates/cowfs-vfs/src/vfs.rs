@@ -119,6 +119,21 @@ pub trait Vfs: Send + Sync {
     /// `fsync(ROOT_INO, false)` is the whole-mount barrier.
     fn fsync(&self, ino: Ino, data_only: bool) -> Result<()>;
 
+    /// Makes the name and attribute changes already applied in `ino`'s snapshot durable,
+    /// without writing file data that is still dirty: a file's unflushed bytes stay unstable,
+    /// exactly as after `write`, until its own `fsync`.
+    ///
+    /// This is for a transport that gets no second chance. A caller that renames a file and then
+    /// `fsync`s the parent directory has done the whole POSIX dance, and on a client that sends
+    /// no COMMIT for a directory `fsync` the name is still only in memory when that `fsync`
+    /// returns. Such a transport calls this before it answers, so the answer means what the
+    /// caller was told it means. It is deliberately not a per-`lookup` or per-`write` cost.
+    ///
+    /// The default is `fsync(ino, false)`, which is at least as strong.
+    fn sync_namespace(&self, ino: Ino) -> Result<()> {
+        self.fsync(ino, false)
+    }
+
     /// Lists a directory in a stable order, starting after `cookie` (0 means from the start).
     /// Returns at most `max` entries, excluding `.` and `..`; `max == 0` is
     /// `Error::InvalidArgument`. Cookies stay valid while entries are added or removed: an
