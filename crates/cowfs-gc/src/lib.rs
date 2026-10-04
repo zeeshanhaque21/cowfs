@@ -33,9 +33,10 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use cowfs_meta::{Marker, Meta};
-use cowfs_store::{BlockId, PackPlan, Rewrite, Store};
+use cowfs_store::{BlockId, Compaction, PackPlan, Rewrite, Store};
 
 pub use error::{Error, Result, RootsError};
+use report::net_reclaimed;
 pub use report::{GcReport, Progress, SkipReason, Skipped};
 use state::{Hints, Marks};
 
@@ -725,8 +726,10 @@ impl Gc {
 
     /// Copy one candidate. `Ok(None)` means the copy was abandoned: the budget ran out or the
     /// cycle was cancelled, and the pack is left whole for the next cycle. `abandoned` receives
-    /// the file length of any target pack the abandoned copy created, header included, so the
-    /// caller can account bytes actually written.
+    /// the on-disk length of any target pack the abandoned copy created, header included, so the
+    /// caller can account bytes actually written. It is set on every exit after the target may
+    /// exist, including an I/O or corruption error, not only a cancel, because a target the copy
+    /// created is real bytes on disk whatever ended the copy.
     fn copy_one(
         &self,
         plan: &PackPlan,
@@ -741,20 +744,59 @@ impl Gc {
             // The whole copy does not fit in what is left of the budget, so do not start it.
             return Ok(None);
         }
-        while !self.store.copy_batch(&mut c, self.opts.batch_bytes)? {
-            let owed = c.outstanding_bytes();
-            progress.bytes_copied += c.written();
-            if self.is_cancelled() || (*budget > 0 && owed > *budget) {
-                *abandoned += c.target_file_bytes();
+        // Every step after `begin_compaction` can fail once the target pack exists, and the
+        // target's bytes are this cycle's own writes whatever ended the copy. On any failure,
+        // account the target's real on-disk length. A short write that errored leaves `c.len`
+        // behind the file length, so the on-disk length is the exact figure, not `c.len`.
+        let mut run = |c: &mut Compaction, budget: &mut u64| -> Result<bool> {
+            loop {
+                let done = self.store.copy_batch(c, self.opts.batch_bytes)?;
+                if done {
+                    return Ok(true);
+                }
+                let owed = c.outstanding_bytes();
+                progress.bytes_copied += c.written();
+                if self.is_cancelled() {
+                    return Ok(false);
+                }
+                if *budget > 0 && owed > *budget {
+                    return Ok(false);
+                }
+                *budget = budget.saturating_sub(owed);
+            }
+        };
+        match run(&mut c, budget) {
+            Ok(true) => {}
+            Ok(false) => {
+                *abandoned += self.target_bytes(&c);
                 return Ok(None);
             }
-            *budget = budget.saturating_sub(owed);
+            Err(e) => {
+                *abandoned += self.target_bytes(&c);
+                return Err(e);
+            }
         }
         progress.bytes_copied += c.written();
         if *budget > 0 {
             *budget = budget.saturating_sub(c.written());
         }
-        Ok(Some(self.store.finish_compaction(&c)?))
+        match self.store.finish_compaction(&c) {
+            Ok(rw) => Ok(Some(rw)),
+            Err(e) => {
+                *abandoned += self.target_bytes(&c);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// On-disk length of a compaction's target pack, header included. Zero when the copy has not
+    /// created a target yet, so an abandoned copy that wrote nothing is not counted twice.
+    fn target_bytes(&self, c: &Compaction) -> u64 {
+        if c.target_created() {
+            self.store.pack_file_len(c.to())
+        } else {
+            0
+        }
     }
 
     /// Flush the hints, then drop every persisted block nothing references any more.
@@ -764,7 +806,7 @@ impl Gc {
     /// snapshots go away instead of pinning garbage forever.
     fn finish(&self, r: &mut GcReport, live: &HashSet<BlockId>, pinned: &[BlockId]) {
         r.gross_removed_bytes = r.freed_bytes;
-        r.net_reclaimed_bytes = r.gross_removed_bytes as i64 - r.rewrite_bytes as i64;
+        r.net_reclaimed_bytes = net_reclaimed(r.gross_removed_bytes, r.rewrite_bytes);
         {
             let h = self.hints.lock().unwrap_or_else(PoisonError::into_inner);
             r.hints_tracked = h.tracked();

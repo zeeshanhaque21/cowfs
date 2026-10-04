@@ -158,13 +158,9 @@ impl Compaction {
         self.len - PACK_HEADER_LEN
     }
 
-    /// File length of the new pack so far, header included, or 0 before the first record is copied.
-    pub fn target_file_bytes(&self) -> u64 {
-        if self.target.is_some() {
-            self.len
-        } else {
-            0
-        }
+    /// True once the copy has created its target pack on disk.
+    pub fn target_created(&self) -> bool {
+        self.target.is_some()
     }
 
     /// Bytes the remaining records will add to the new pack.

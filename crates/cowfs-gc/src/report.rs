@@ -117,7 +117,6 @@ impl GcReport {
     pub fn skip(&mut self, pack: u32, reason: SkipReason) {
         self.skipped.push(Skipped { pack, reason });
     }
-
     /// Record a failure that did not stop the cycle.
     pub fn error(&mut self, e: impl fmt::Display) {
         if self.errors.len() < MAX_ERRORS {
@@ -146,6 +145,16 @@ impl GcReport {
 /// Most failures a cycle reports. A cycle that hits this many has a systemic problem and the rest
 /// would only bury it.
 const MAX_ERRORS: usize = 32;
+
+/// Net reclaimed, `gross - rewrite`, exactly.
+///
+/// Computed in `i128` so neither operand can wrap: a store whose gross or rewrite exceeded
+/// `i64::MAX` would produce a wrapped, bogus net from a plain cast. A net that does not fit `i64`
+/// is clamped to the representable bounds, which only a store past 8 EiB could reach.
+pub(crate) fn net_reclaimed(gross: u64, rewrite: u64) -> i64 {
+    let n = i128::from(gross) - i128::from(rewrite);
+    i64::try_from(n).unwrap_or(if n < 0 { i64::MIN } else { i64::MAX })
+}
 
 /// Progress of one cycle, handed to the caller's callback.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
