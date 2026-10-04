@@ -175,6 +175,11 @@ pub struct SnapshotList {
 /// `net = gross` or `net = gross - 0` would report a saving that was never measured. `None` is
 /// that unknown, and the human output says so rather than printing a false zero.
 ///
+/// A report serializes an unknown figure by omitting the field, so a legacy report round-trips
+/// through this type unchanged and the JSON the CLI prints is always accepted by the decoder that
+/// reads it. `gross_removed_bytes` is always serialized, because a legacy report knows its gross
+/// even though it does not know its net.
+///
 /// A dry run reports the estimate in `candidate_bytes` and zero actual gross, rewrite and net.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "GcReportWire")]
@@ -190,17 +195,29 @@ pub struct GcReport {
     pub gross_removed_bytes: u64,
     /// Bytes written into the packs this cycle created, file headers included.
     /// `None` when the report predates the field, so the figure is unknown.
+    ///
+    /// Skipped when `None`, so an unknown figure is absent from the JSON rather than `null`.
+    /// A legacy report then serializes exactly as it arrived and decodes back to the same value,
+    /// so the CLI's own output is never rejected by its own decoder.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rewrite_bytes: Option<u64>,
     /// Net space reclaimed: `gross_removed_bytes - rewrite_bytes`, signed.
     /// `None` when the report predates the field, so the figure is unknown.
+    ///
+    /// Skipped when `None`, for the same round-trip reason as [`Self::rewrite_bytes`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub net_reclaimed_bytes: Option<i64>,
 }
 
-/// The wire shape of [`GcReport`], where the post-#81 fields are optional together.
+/// The wire shape of [`GcReport`], where the post-#81 fields are optional.
 ///
-/// The three fields are one unit: present means a new report, absent means a legacy one.
-/// A payload that carries some but not all of them is inconsistent and is rejected, so a
-/// half-written report can never default into a wrong number.
+/// `rewrite_bytes` and `net_reclaimed_bytes` are one unit: both present means a new report with
+/// measured figures, both absent means the net is unknown. Exactly one of them is a half-written
+/// report and is rejected, so it can never default into a wrong number.
+///
+/// `gross_removed_bytes` is separate, because it is only a restatement of `freed_bytes` and an
+/// explicit gross that disagrees with it is rejected. A payload may carry it alone: that is what
+/// serializing a legacy report produces, since gross is known while the rewrite and net are not.
 #[derive(Deserialize)]
 struct GcReportWire {
     dry_run: bool,
@@ -230,18 +247,25 @@ impl TryFrom<GcReportWire> for GcReport {
             rewrite_bytes,
             net_reclaimed_bytes,
         } = w;
-        let (gross_removed_bytes, rewrite_bytes, net_reclaimed_bytes) =
-            match (gross_removed_bytes, rewrite_bytes, net_reclaimed_bytes) {
-                // A legacy report: gross is `freed_bytes`, net is unknown.
-                (None, None, None) => (freed_bytes, None, None),
-                // A new report: the explicit fields must be internally consistent.
-                (Some(gross), Some(rewrite), Some(net)) => {
-                    check_new_fields(freed_bytes, gross, rewrite, net)?;
-                    (gross, Some(rewrite), Some(net))
-                }
-                // A partially present report cannot be repaired without guessing.
-                _ => return Err(PARTIAL_FIELDS.to_owned()),
-            };
+        // An explicit gross is checked against `freed_bytes` whether or not the other two are
+        // present, because it must never restate a different number.
+        let gross_removed_bytes = match gross_removed_bytes {
+            Some(g) if g != freed_bytes => return Err(gross_mismatch(g, freed_bytes)),
+            Some(g) => g,
+            None => freed_bytes,
+        };
+        let (rewrite_bytes, net_reclaimed_bytes) = match (rewrite_bytes, net_reclaimed_bytes) {
+            // Both absent: a legacy report, so the net was never measured and stays unknown.
+            (None, None) => (None, None),
+            // Both present: a new report, whose figures must be internally consistent.
+            (Some(rewrite), Some(net)) => {
+                check_new_figures(gross_removed_bytes, rewrite, net)?;
+                (Some(rewrite), Some(net))
+            }
+            // Exactly one of the pair is a half-written report, which cannot be repaired without
+            // guessing: the missing half would have to be invented.
+            _ => return Err(PAIRED_FIELDS.to_owned()),
+        };
         Ok(GcReport {
             dry_run,
             candidate_blocks,
@@ -255,17 +279,16 @@ impl TryFrom<GcReportWire> for GcReport {
     }
 }
 
-const PARTIAL_FIELDS: &str = "gc report carries only some of gross_removed_bytes, \
-     rewrite_bytes, net_reclaimed_bytes; they are present together or absent together";
+const PAIRED_FIELDS: &str = "gc report carries only one of rewrite_bytes and net_reclaimed_bytes; \
+     they are present together or absent together";
 
-/// Check a report that claims the post-#81 fields: the explicit gross must agree with the legacy
-/// `freed_bytes`, and the net must be gross minus rewrite exactly.
-fn check_new_fields(freed_bytes: u64, gross: u64, rewrite: u64, net: i64) -> Result<(), String> {
-    if gross != freed_bytes {
-        return Err(format!(
-            "gc report gross {gross} disagrees with freed_bytes {freed_bytes}"
-        ));
-    }
+fn gross_mismatch(gross: u64, freed_bytes: u64) -> String {
+    format!("gc report gross {gross} disagrees with freed_bytes {freed_bytes}")
+}
+
+/// Check a report whose rewrite and net are both present: the net must be gross minus rewrite
+/// exactly. The gross has already been checked against `freed_bytes`.
+fn check_new_figures(gross: u64, rewrite: u64, net: i64) -> Result<(), String> {
     let expected = i128::from(gross) - i128::from(rewrite);
     match i64::try_from(expected) {
         Ok(v) if v == net => Ok(()),
