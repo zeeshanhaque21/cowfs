@@ -74,18 +74,35 @@ fn fixture_root() -> PathBuf {
 /// | every process spawn in this file serialised | 1 / 150 |
 /// | fixture moved off the shared tmpfs, into the build directory | 16 / 200 |
 ///
-/// A standalone probe isolates the same failure with no test harness at all: 8 threads, 480
-/// write-then-exec iterations, giving 8 ETXTBSY writing in place, 14 writing then renaming, and 20
-/// when the script is written once and then exec'd with no write in the loop at all.
+/// A standalone probe reproduces the same failure with no test harness at all, and after five
+/// rejected theories it says something narrower and truer than the table above. Probe source:
+/// `scripts/namespaces17-etxtbsy-spike.rs`. Host: Linux 6.12.109+rpt-rpi-2712 aarch64. 1600 execs per
+/// row unless stated:
 ///
-/// So the write handle is not the cause, atomic publication is not the fix, and intra-binary
-/// concurrency is not the whole story. Moving the executable off a shared filesystem made it worse,
-/// so that theory is out too. The kernel mechanism is not established here and no claim is made
-/// about it.
+/// | Configuration | ETXTBSY |
+/// |---|---|
+/// | write then exec, `posix_spawn`, 8 threads, on tmpfs | 40 / 1600 |
+/// | write then exec, `posix_spawn`, 8 threads, on ext4 | 73 / 1600 |
+/// | write then exec, `fork` + `exec`, 8 threads | 1 / 1600 |
+/// | exec only, no write at all, `posix_spawn`, 8 threads | 0 / 1600 |
+/// | exec only, no write at all, `posix_spawn`, 1 thread | 0 / 400 |
 ///
-/// What is kept is the part that is correct regardless: `write_stub` closes the write handle and
-/// flushes before the mode is set and before anything exec's the file, so nothing in this process
-/// holds the script open at exec time.
+/// So it needs all three: a write to the file, concurrency, and the `posix_spawn` path glibc uses
+/// when Rust's `Command` has nothing to intercept. It is not the filesystem, it is not the shebang,
+/// and it is not the loader: a statically linked binary with no interpreter or libraries fails the
+/// same way and a differently shaped one fails more often.
+///
+/// Two earlier claims in this comment were wrong and are withdrawn. The write handle was not ruled
+/// out, because the probe mode labelled "no write in the loop" created a fresh directory and wrote
+/// before every exec. And the scan that "found nobody holding the file" was looking at the file
+/// under test while the writing thread had already closed it, so it answered its own question. At
+/// the moment of each failure no process holds the file open and no write-mode descriptor on the box
+/// is a library or an executable.
+///
+/// What is left is a characterisation, not a mechanism. The layer the evidence points at is the spawn
+/// call, `CLONE_VM|CLONE_VFORK` under concurrent spawns on this kernel, and this file's tests and the
+/// product's `run_build` both go through it. Nothing here establishes that as the kernel's reason, so
+/// no fix is claimed.
 ///
 /// This is deliberately not `#[ignore]`d, not retried, not given a longer timeout, and not worked
 /// around with a global serial harness. All four were ruled out by the brief and none would address
