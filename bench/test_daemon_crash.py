@@ -997,6 +997,79 @@ class TestAttemptDirsNeverCollideOrWipe(unittest.TestCase):
         )
 
 
+class TestStaleMountCannotWedgeTheHarness(unittest.TestCase):
+    """A dead NFS mount must not be able to hang teardown.
+
+    Two defects showed up together in a real run that exceeded 40 minutes:
+    `is_our_mount` called `os.path.realpath` on a path that had just become a
+    stale mount, which blocks indefinitely, and the umount ran unbounded, so a
+    command stuck in uninterruptible sleep could never be reaped. Both are pinned
+    here without touching a real mount.
+    """
+
+    def test_mount_keys_are_computed_without_touching_a_live_path(self):
+        tmp = tempfile.mkdtemp(prefix="cowfs-crash88-test-")
+        try:
+            target = os.path.join(tmp, "mnt")
+            keys = h._mount_keys(target)
+            self.assertEqual(keys[0], os.path.normpath(os.path.abspath(target)))
+            self.assertTrue(all(k for k in keys))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_is_our_mount_does_not_resolve_the_path_it_is_asked_about(self):
+        """The resolved form must come from the cached keys, never a fresh realpath."""
+        calls = []
+        real_realpath = os.path.realpath
+
+        def spy(path, *a, **k):
+            calls.append(path)
+            return real_realpath(path, *a, **k)
+
+        os.path.realpath = spy
+        try:
+            h.is_our_mount("/definitely/not/a/mount", keys=["/cached/key"])
+        finally:
+            os.path.realpath = real_realpath
+        self.assertEqual(calls, [], "is_our_mount must not call realpath")
+
+    def test_is_our_mount_matches_either_cached_form(self):
+        with mock.patch.object(h, "run_bounded") as rb:
+            rb.return_value = h.Proc.Result(
+                0, "localhost:/cowfs-abc on /cached/key (nfs, nodev)\n", ""
+            )
+            self.assertTrue(h.is_our_mount("/ignored", keys=["/literal", "/cached/key"]))
+            rb.return_value = h.Proc.Result(0, "nothing here\n", "")
+            self.assertFalse(h.is_our_mount("/ignored", keys=["/literal", "/cached/key"]))
+
+    def test_an_unreachable_mount_table_reads_as_not_ours(self):
+        def boom(argv, timeout):
+            raise h.BoundedTimeout("mount table unreadable")
+
+        with mock.patch.object(h, "run_bounded", boom):
+            self.assertFalse(h.is_our_mount("/whatever", keys=["/k"]))
+
+    def test_run_bounded_returns_a_result(self):
+        r = h.run_bounded(["/bin/echo", "hello"], timeout=20)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("hello", r.stdout)
+
+    def test_run_bounded_raises_rather_than_blocking_on_a_stuck_child(self):
+        """The whole point: a child that ignores the kill must not block the caller."""
+        with self.assertRaises(h.BoundedTimeout):
+            h.run_bounded(["/bin/sleep", "120"], timeout=1)
+
+    def test_run_bounded_kills_the_child_group(self):
+        with self.assertRaises(h.BoundedTimeout):
+            h.run_bounded(["/bin/sleep", "120"], timeout=1)
+        # Give the orphan a moment, then confirm it is not still running.
+        time.sleep(0.5)
+        out = subprocess.run(
+            ["/bin/ps", "-o", "command="], capture_output=True, text=True
+        ).stdout
+        self.assertNotIn("sleep 120", out)
+
+
 class TestNativeControlMatchesTheCowfsOperations(unittest.TestCase):
     def test_the_native_writer_performs_the_same_rename_and_syncs(self):
         import inspect

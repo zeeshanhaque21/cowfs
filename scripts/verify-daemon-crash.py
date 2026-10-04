@@ -138,6 +138,12 @@ class CaseFailure(Exception):
 
 
 class Proc:
+    class Result:
+        def __init__(self, returncode, stdout, stderr):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
     def __init__(self, argv, timeout=CLI_TIMEOUT_SECS, cwd=None):
         self.argv = argv
         try:
@@ -753,33 +759,100 @@ def kill_verified(child, rec, sock, store, expect=None, sig=signal.SIGKILL):
     return rec
 
 
-def is_our_mount(mount):
-    """True only if the mount table lists exactly this path as a mount point."""
-    resolved = os.path.realpath(mount)
-    table = Proc(["/sbin/mount"], timeout=30).stdout
-    return any((" on %s " % resolved) in line for line in table.splitlines())
+class BoundedTimeout(Exception):
+    """A command did not finish in its budget and was abandoned."""
 
 
-def unmount_private(mount, rec, note):
-    """Unmount only a path that is verifiably one of our own mounts."""
-    if not os.path.exists(mount) and not is_our_mount(mount):
-        rec.record("unmount.absent", True, mount=mount)
-        return
-    if not is_our_mount(mount):
+def run_bounded(argv, timeout, check=False):
+    """Run a command with a hard wall-clock bound that is actually enforceable.
+
+    `subprocess.run(timeout=...)` is not enough: it signals the child and then
+    blocks in `wait()`, and a command stuck in uninterruptible sleep (an
+    `umount` against a dead NFS mount) never dies, so the caller blocks forever
+    anyway. This polls instead, and on timeout kills the child's process group and
+    returns without reaping it. The child may survive as a zombie-free orphan; it is
+    reported, not waited on.
+    """
+    p = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if p.poll() is not None:
+            out, err = p.communicate()
+            return Proc.Result(p.returncode, out, err)
+        time.sleep(0.2)
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+    raise BoundedTimeout("`%s` exceeded %ds and was abandoned" % (argv[0], timeout))
+
+
+def _mount_keys(mount):
+    """Literal and resolved forms of `mount`, computed while it is safe to do so.
+
+    Resolving a path that is currently a stale NFS mount can block indefinitely,
+    so the resolved form is cached at construction time, before the mount exists,
+    and only the literal form is used afterwards.
+    """
+    literal = os.path.normpath(os.path.abspath(mount))
+    try:
+        resolved = os.path.realpath(mount)
+    except OSError:
+        resolved = literal
+    return [k for k in (literal, resolved) if k]
+
+
+def is_our_mount(mount, keys=None):
+    """True only if the mount table lists this path as a mount point.
+
+    `keys` lets a caller pass forms cached earlier, avoiding realpath on a path
+    that may now be a dead mount.
+    """
+    candidates = keys or _mount_keys(mount)
+    try:
+        table = run_bounded(["/sbin/mount"], timeout=20).stdout
+    except BoundedTimeout:
+        return False
+    return any((" on %s " % k) in line for k in candidates for line in table.splitlines())
+
+
+def unmount_private(mount, rec, note, keys=None):
+    """Unmount only a path that is verifiably one of our own mounts.
+
+    Uses `keys` resolved earlier and a bounded umount, because this runs right
+    after a SIGKILL when the mount may be a dead NFS mount: resolving the path then
+    can block forever, and an unbounded umount can block in uninterruptible sleep.
+    """
+    if not is_our_mount(mount, keys):
         rec.record(
             "unmount.refused_not_our_mount",
             True,
             mount=mount,
-            reason="not in the mount table; leaving it alone",
+            reason=("not in the mount table; leaving it alone"
+                    if os.path.lexists(mount) else "no such path"),
         )
         return
-    p = Proc(["/sbin/umount", "-f", mount], timeout=60)
+    # The server is dead, so the client mount is stale: -f is required here, and
+    # bounded, because a stale NFS mount can leave umount uninterruptible.
+    try:
+        p = run_bounded(["/sbin/umount", "-f", mount], timeout=30)
+        rc, err, abandoned = p.returncode, p.stderr.strip()[:400], False
+    except BoundedTimeout as e:
+        rc, err, abandoned = None, str(e), True
     rec.record(
         "unmount." + note,
-        p.returncode == 0 and not is_our_mount(mount),
+        not is_our_mount(mount, keys),
         mount=mount,
-        rc=p.returncode,
-        stderr=p.stderr.strip()[:400],
+        rc=rc,
+        abandoned=abandoned,
+        stderr=err,
     )
 
 
@@ -792,6 +865,9 @@ class PrivateDaemon:
     def __init__(self, store, mount, socket, log_path):
         self.store = store
         self.mount = mount
+        # Resolved before the mount exists. Doing it later, once the path may be a
+        # dead NFS mount, can block forever.
+        self.mount_keys = _mount_keys(mount)
         self.socket = socket
         self.log_path = log_path
         self.log = None
@@ -853,7 +929,7 @@ class PrivateDaemon:
             if "FATAL" in text or "panicked at" in text:
                 rec.record("daemon.fatal", False, log=text[-2000:])
                 raise RuntimeError("daemon log shows a fatal error")
-            if is_our_mount(self.mount) and self.answer():
+            if is_our_mount(self.mount, self.mount_keys) and self.answer():
                 rec.record(
                     "daemon.ready",
                     True,
@@ -1150,7 +1226,7 @@ def run_case(identity, ops, run_dir, parent_rec, case_dir=None):
             d1.child, rec, sock1, store, expect=d1.identity, sig=signal.SIGKILL
         )
         d1.close_log()
-        unmount_private(mount1, rec, "after_kill")
+        unmount_private(mount1, rec, "after_kill", d1.mount_keys)
 
         d2 = PrivateDaemon(store, mount2, sock2, log2)
         d2.start(rec)
@@ -1185,7 +1261,7 @@ def run_case(identity, ops, run_dir, parent_rec, case_dir=None):
             except Exception:  # noqa: BLE001
                 pass
             d.close_log()
-            unmount_private(mnt, rec, "teardown")
+            unmount_private(mnt, rec, "teardown", d.mount_keys)
             for victim in (d.socket, d.socket + ".lock"):
                 if os.path.exists(victim):
                     try:
