@@ -1018,7 +1018,12 @@ class TestStaleMountCannotWedgeTheHarness(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_is_our_mount_does_not_resolve_the_path_it_is_asked_about(self):
-        """The resolved form must come from the cached keys, never a fresh realpath."""
+        """The resolved form must come from the cached keys, never a fresh realpath.
+
+        Mocks the mount-table runner, as its siblings do. Calling the real
+        `run_bounded` here is what made the ubuntu job red: `/sbin/mount` does not
+        exist on that runner and Popen's FileNotFoundError escaped.
+        """
         calls = []
         real_realpath = os.path.realpath
 
@@ -1026,28 +1031,224 @@ class TestStaleMountCannotWedgeTheHarness(unittest.TestCase):
             calls.append(path)
             return real_realpath(path, *a, **k)
 
-        os.path.realpath = spy
-        try:
-            h.is_our_mount("/definitely/not/a/mount", keys=["/cached/key"])
-        finally:
-            os.path.realpath = real_realpath
-        self.assertEqual(calls, [], "is_our_mount must not call realpath")
-
-    def test_is_our_mount_matches_either_cached_form(self):
         with mock.patch.object(h, "run_bounded") as rb:
             rb.return_value = h.Proc.Result(
                 0, "localhost:/cowfs-abc on /cached/key (nfs, nodev)\n", ""
             )
-            self.assertTrue(h.is_our_mount("/ignored", keys=["/literal", "/cached/key"]))
-            rb.return_value = h.Proc.Result(0, "nothing here\n", "")
-            self.assertFalse(h.is_our_mount("/ignored", keys=["/literal", "/cached/key"]))
+            with mock.patch.object(h.shutil, "which", return_value="/sbin/mount"):
+                os.path.realpath = spy
+                try:
+                    self.assertTrue(h.is_our_mount("/ignored", keys=["/cached/key"]))
+                finally:
+                    os.path.realpath = real_realpath
+        self.assertEqual(calls, [], "is_our_mount must not call realpath")
 
-    def test_an_unreachable_mount_table_reads_as_not_ours(self):
-        def boom(argv, timeout):
-            raise h.BoundedTimeout("mount table unreadable")
 
-        with mock.patch.object(h, "run_bounded", boom):
-            self.assertFalse(h.is_our_mount("/whatever", keys=["/k"]))
+class TestMountStateTriState(unittest.TestCase):
+    """Discovery, and the distinction between "not mounted" and "could not tell"."""
+
+    TABLE = (
+        "localhost:/cowfs-abc on /private/tmp/m (nfs, nodev, nosuid)\n"
+        "localhost:/cowfs-def on /private/tmp/n (nfs, nodev, nosuid)\n"
+    )
+
+    def _state(self, argv0, result=None, raises=None, keys=("/private/tmp/m",)):
+        def runner(argv, timeout):
+            if raises is not None:
+                raise raises
+            return result
+
+        with mock.patch.object(h, "run_bounded", runner), \
+                mock.patch.object(h.shutil, "which", return_value=argv0):
+            return h.mount_state("/private/tmp/m", keys=keys)
+
+    def test_discovery_prefers_path_then_falls_back(self):
+        with mock.patch.object(h.shutil, "which", return_value="/usr/bin/mount"):
+            self.assertEqual(h.mount_command(), "/usr/bin/mount")
+
+    def test_discovery_falls_back_when_not_on_path(self):
+        with mock.patch.object(h.shutil, "which", return_value=None), \
+                mock.patch.object(h.os.path, "isfile",
+                                  lambda p: p == "/sbin/mount"), \
+                mock.patch.object(h.os, "access", lambda p, m: True):
+            self.assertEqual(h.mount_command(), "/sbin/mount")
+
+    def test_missing_binary_is_unknown_not_not_mounted(self):
+        with mock.patch.object(h.shutil, "which", return_value=None), \
+                mock.patch.object(h.os.path, "isfile", lambda p: False):
+            state, reason = h.mount_state("/m", keys=["/m"])
+        self.assertEqual(state, h.UNKNOWN)
+        self.assertIn("no mount binary", reason)
+
+    def test_matching_entry_is_mounted(self):
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, self.TABLE, ""))
+        self.assertEqual(state, h.MOUNTED)
+
+    def test_absent_from_a_readable_table_is_not_mounted(self):
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, self.TABLE, ""),
+                               keys=("/private/tmp/zzz",))
+        self.assertEqual(state, h.NOT_MOUNTED)
+
+    def test_reader_failure_is_unknown(self):
+        state, reason = self._state("/sbin/mount", raises=OSError("EIO"))
+        self.assertEqual(state, h.UNKNOWN)
+        self.assertIn("unreadable", reason)
+
+    def test_timeout_is_unknown(self):
+        state, reason = self._state(
+            "/sbin/mount",
+            raises=h.BoundedTimeout("timed out", argv=["/sbin/mount"], pid=1, pgid=1),
+        )
+        self.assertEqual(state, h.UNKNOWN)
+        self.assertIn("timed out", reason)
+
+    def test_malformed_output_is_unknown_not_not_mounted(self):
+        # No parenthesised type, so it is not a mount entry. A truncated table must
+        # not be read as "definitely not mounted".
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, "garbage\n", ""))
+        self.assertEqual(state, h.NOT_MOUNTED)
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, "   \n", ""))
+        self.assertEqual(state, h.UNKNOWN)
+
+    def test_empty_output_is_unknown(self):
+        state, reason = self._state("/sbin/mount", result=h.Proc.Result(0, "", ""))
+        self.assertEqual(state, h.UNKNOWN)
+        self.assertIn("no output", reason)
+
+    def test_nonzero_exit_is_unknown(self):
+        state, reason = self._state("/sbin/mount", result=h.Proc.Result(1, "", "boom"))
+        self.assertEqual(state, h.UNKNOWN)
+        self.assertIn("exited 1", reason)
+
+    def test_foreign_path_is_never_mounted(self):
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, self.TABLE, ""),
+                               keys=("/private/tmp/someone-elses",))
+        self.assertEqual(state, h.NOT_MOUNTED)
+
+    def test_unknown_blocks_cleanup_rather_than_permitting_it(self):
+        tmp = tempfile.mkdtemp(prefix="cowfs-crash88-test-")
+        try:
+            rec = h.Recorder(tmp)
+            with mock.patch.object(h.shutil, "which", return_value=None), \
+                    mock.patch.object(h.os.path, "isfile", lambda p: False):
+                h.unmount_private("/private/tmp/m", rec, "spike", keys=["/private/tmp/m"])
+            rec.close()
+            with open(os.path.join(tmp, "records.jsonl")) as f:
+                rows = [json.loads(l) for l in f if l.strip()]
+            names = [r["name"] for r in rows]
+            self.assertIn("unmount.blocked_unknown_mount_state", names)
+            self.assertNotIn("unmount.spike", names)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_is_our_mount_is_false_for_unknown(self):
+        with mock.patch.object(h.shutil, "which", return_value=None), \
+                mock.patch.object(h.os.path, "isfile", lambda p: False):
+            self.assertFalse(h.is_our_mount("/m", keys=["/m"]))
+
+
+class TestAbandonedChildIsIdentifiable(unittest.TestCase):
+    """An abandoned process must be findable from the evidence alone."""
+
+    def test_the_exception_carries_pid_pgid_and_argv(self):
+        with self.assertRaises(h.BoundedTimeout) as ctx:
+            h.run_bounded(["/bin/sleep", "120"], timeout=1)
+        e = ctx.exception
+        self.assertIsNotNone(e.pid)
+        self.assertIsNotNone(e.pgid)
+        self.assertEqual(e.argv, ["/bin/sleep", "120"])
+        d = e.as_dict()
+        self.assertEqual(d["pid"], e.pid)
+        self.assertIn("not covered", d["note"])
+
+    def test_the_killed_group_is_the_childs_own_session(self):
+        """Containment: never this harness's group, never a wildcard."""
+        mine = os.getpgid(0)
+        with self.assertRaises(h.BoundedTimeout) as ctx:
+            h.run_bounded(["/bin/sleep", "120"], timeout=1)
+        self.assertNotEqual(ctx.exception.pgid, mine,
+                            "the kill must not reach the harness's own process group")
+
+    def test_the_child_is_dead_or_a_zombie_never_running(self):
+        with self.assertRaises(h.BoundedTimeout) as ctx:
+            h.run_bounded(["/bin/sleep", "120"], timeout=1)
+        pid = ctx.exception.pid
+        time.sleep(0.5)
+        out = subprocess.run(
+            ["/bin/ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout.strip()
+        self.assertTrue(out == "" or out.startswith("Z"),
+                        "ps state was %r; only gone or zombie is acceptable" % out)
+
+    def test_reap_nowait_never_blocks_on_a_live_child(self):
+        p = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            t0 = time.time()
+            self.assertEqual(h.reap_nowait(p), "still_running")
+            self.assertLess(time.time() - t0, 2.0)
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_reap_nowait_collects_an_exited_child(self):
+        p = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+        p.wait()
+        self.assertIn(h.reap_nowait(p), ("reaped", "already_reaped"))
+
+    def test_reap_nowait_on_an_unknown_pid_does_not_raise(self):
+        class Fake:
+            pid = 999999
+
+        self.assertIn(h.reap_nowait(Fake()),
+                      ("reaped", "already_reaped", "still_running",
+                       "error: ChildProcessError"))
+
+    def test_the_record_names_the_abandoned_process_and_disclaims_cleanup(self):
+        tmp = tempfile.mkdtemp(prefix="cowfs-crash88-test-")
+        try:
+            rec = h.Recorder(tmp)
+            captured = {}
+
+            def runner(argv, timeout):
+                if argv[0].endswith("umount"):
+                    raise h.BoundedTimeout(
+                        "umount abandoned", argv=argv, pid=4242, pgid=4242,
+                        reaped="still_running",
+                    )
+                # the mount table read still says /m is mounted afterwards
+                return h.Proc.Result(0, "localhost:/x on /m (nfs, nodev)\n", "")
+
+            def which(cmd):
+                return "/sbin/" + cmd
+
+            with mock.patch.object(h, "run_bounded", runner), \
+                    mock.patch.object(h.shutil, "which", which):
+                h.unmount_private("/m", rec, "spike", keys=["/m"])
+            rec.close()
+            with open(os.path.join(tmp, "records.jsonl")) as f:
+                rows = [json.loads(l) for l in f if l.strip()]
+            row = next(r for r in rows if r["name"] == "unmount.spike")
+            captured["row"] = row
+            self.assertTrue(row["abandoned"])
+            self.assertEqual(row["abandoned_process"]["pid"], 4242)
+            self.assertEqual(row["abandoned_process"]["pgid"], 4242)
+            self.assertFalse(row["abandoned_process"]["cleanup_complete"])
+            self.assertIn("does NOT claim", row["cleanup_claim"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_repeated_abandonments_do_not_accumulate_children(self):
+        """Bounded per attempt: many abandonments must not leave a growing pile."""
+        before = len(os.listdir("/proc")) if os.path.isdir("/proc") else None
+        for _ in range(5):
+            with self.assertRaises(h.BoundedTimeout):
+                h.run_bounded(["/bin/sleep", "60"], timeout=1)
+        time.sleep(1.0)
+        if before is None:
+            self.skipTest("no /proc on this platform")
+        after = len(os.listdir("/proc"))
+        self.assertLess(after - before, 40,
+                        "descriptor or process growth should not track abandonments")
 
     def test_run_bounded_returns_a_result(self):
         r = h.run_bounded(["/bin/echo", "hello"], timeout=20)

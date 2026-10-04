@@ -760,7 +760,57 @@ def kill_verified(child, rec, sock, store, expect=None, sig=signal.SIGKILL):
 
 
 class BoundedTimeout(Exception):
-    """A command did not finish in its budget and was abandoned."""
+    """A command did not finish in its budget and its process group was signalled.
+
+    Carries the identity of what was abandoned, so an operator can find it from
+    the evidence alone: pid, pgid, the argv this harness owned, and whether the
+    child was reaped afterwards. A grandchild that left the group on its own is
+    explicitly *not* covered: the kill is the child's group and nothing wider, so
+    such a process can outlive this call. The design does not depend on the kill
+    for containment; it depends on never reusing or removing an attempt path.
+    """
+
+    def __init__(self, message, argv, pid=None, pgid=None, reaped=None, cleanup_complete=False):
+        super().__init__(message)
+        self.argv = list(argv)
+        self.pid = pid
+        self.pgid = pgid
+        self.reaped = reaped
+        self.cleanup_complete = cleanup_complete
+
+    def as_dict(self):
+        return {
+            "argv": self.argv,
+            "pid": self.pid,
+            "pgid": self.pgid,
+            "reaped": self.reaped,
+            "cleanup_complete": self.cleanup_complete,
+            "note": (
+                "the signal went to this child's own process group only; a process "
+                "that left the group is not covered and may outlive the call"
+            ),
+        }
+
+
+def reap_nowait(child):
+    """Reap an already-exited child without ever waiting on a live one.
+
+    `waitpid(WNOHANG)` returns immediately for a child that has not exited, so
+    this cannot block on an uninterruptible process, unlike `wait()`.
+    """
+    import errno
+
+    try:
+        pid, _status = os.waitpid(child.pid, os.WNOHANG)
+    except ChildProcessError:
+        return "already_reaped"
+    except OSError as e:
+        if e.errno == errno.EINTR:
+            return "interrupted"
+        return "error: %s" % e
+    if pid == 0:
+        return "still_running"
+    return "reaped"
 
 
 def run_bounded(argv, timeout, check=False):
@@ -769,9 +819,8 @@ def run_bounded(argv, timeout, check=False):
     `subprocess.run(timeout=...)` is not enough: it signals the child and then
     blocks in `wait()`, and a command stuck in uninterruptible sleep (an
     `umount` against a dead NFS mount) never dies, so the caller blocks forever
-    anyway. This polls instead, and on timeout kills the child's process group and
-    returns without reaping it. The child may survive as a zombie-free orphan; it is
-    reported, not waited on.
+    anyway. This polls instead, and on expiry signals the child's own process
+    group, records who was abandoned, and returns without ever waiting on it.
     """
     p = subprocess.Popen(
         argv,
@@ -781,17 +830,66 @@ def run_bounded(argv, timeout, check=False):
         stdin=subprocess.DEVNULL,
         start_new_session=True,
     )
+    pgid = None
+    try:
+        pgid = os.getpgid(p.pid)
+    except OSError:
+        pass
     deadline = time.time() + timeout
     while time.time() < deadline:
         if p.poll() is not None:
             out, err = p.communicate()
             return Proc.Result(p.returncode, out, err)
         time.sleep(0.2)
-    try:
-        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-    except (OSError, ProcessLookupError):
-        pass
-    raise BoundedTimeout("`%s` exceeded %ds and was abandoned" % (argv[0], timeout))
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    # Reap only if it has already exited. Never wait on it.
+    reaped = reap_nowait(p)
+    raise BoundedTimeout(
+        "`%s` exceeded %ds and was abandoned" % (argv[0], timeout),
+        argv=argv,
+        pid=p.pid,
+        pgid=pgid,
+        reaped=reaped,
+    )
+
+
+# Where the mount table can be read from, most specific first. macOS keeps it at
+# /sbin/mount; Linux distributions put it on PATH as /bin/mount or /usr/bin/mount,
+# and a container may have neither at a fixed location. The binary is executed
+# directly from a discovered path, never through a shell.
+def umount_binary():
+    """The umount binary, discovered the same way as mount.
+
+    Returns the discovered path, or the conventional one so the failure surfaces
+    as a BoundedTimeout with the real reason rather than a bare ENOENT.
+    """
+    found = shutil.which("umount")
+    for cand in ("/sbin/umount", "/bin/umount", "/usr/bin/umount"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return found or "/sbin/umount"
+
+
+MOUNT_CMD_CANDIDATES = ("/sbin/mount", "/bin/mount", "/usr/bin/mount")
+
+
+def mount_command():
+    """The mount binary to run, or None when none can be found.
+
+    Discovery is `shutil.which` first so a PATH-provided mount is found, then the
+    fixed locations as a fallback for a stripped PATH.
+    """
+    found = shutil.which("mount")
+    if found:
+        return found
+    for cand in MOUNT_CMD_CANDIDATES:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
 
 
 def _mount_keys(mount):
@@ -809,18 +907,56 @@ def _mount_keys(mount):
     return [k for k in (literal, resolved) if k]
 
 
-def is_our_mount(mount, keys=None):
-    """True only if the mount table lists this path as a mount point.
+# Tri-state mount inspection. `unknown` is not `no`: a table that could not be
+# read must never be read as permission to remove, reuse or unmount anything.
+MOUNTED = "mounted"
+NOT_MOUNTED = "not_mounted"
+UNKNOWN = "unknown"
 
-    `keys` lets a caller pass forms cached earlier, avoiding realpath on a path
-    that may now be a dead mount.
+
+def mount_state(mount, keys=None):
+    """One of MOUNTED, NOT_MOUNTED or UNKNOWN, with a reason when not conclusive.
+
+    A missing binary, an unreadable table, a timeout or output that does not parse
+    all yield UNKNOWN. Callers must treat UNKNOWN as blocking.
     """
+    cmd = mount_command()
+    if cmd is None:
+        return UNKNOWN, "no mount binary found in PATH or %s" % (MOUNT_CMD_CANDIDATES,)
     candidates = keys or _mount_keys(mount)
     try:
-        table = run_bounded(["/sbin/mount"], timeout=20).stdout
-    except BoundedTimeout:
-        return False
-    return any((" on %s " % k) in line for k in candidates for line in table.splitlines())
+        result = run_bounded([cmd], timeout=20)
+    except BoundedTimeout as e:
+        return UNKNOWN, "mount table read timed out: %s" % e
+    except OSError as e:
+        return UNKNOWN, "mount table unreadable: %s: %s" % (type(e).__name__, e)
+    if result.returncode != 0:
+        return UNKNOWN, "mount exited %d: %s" % (
+            result.returncode, (result.stderr or "").strip()[:200],
+        )
+    text = result.stdout or ""
+    if not text.strip():
+        return UNKNOWN, "mount produced no output"
+    # A mount table line is "<device> on <path> (<type>, <options>)". Anything
+    # without a parenthesised type is not a mount entry, so a truncated or
+    # unexpected format yields UNKNOWN rather than a confident "not mounted".
+    for line in text.splitlines():
+        if " on " not in line or "(" not in line:
+            continue
+        for k in candidates:
+            if (" on %s " % k) in line:
+                return MOUNTED, line.strip()[:200]
+    return NOT_MOUNTED, "%d mount entries, none matching" % len(text.splitlines())
+
+
+def is_our_mount(mount, keys=None):
+    """True only when the mount table positively lists this path.
+
+    An inconclusive inspection is False, so no caller unmounts on the strength of a
+    failed read. Callers that must distinguish the reasons use `mount_state`.
+    """
+    state, _reason = mount_state(mount, keys)
+    return state == MOUNTED
 
 
 def unmount_private(mount, rec, note, keys=None):
@@ -830,29 +966,53 @@ def unmount_private(mount, rec, note, keys=None):
     after a SIGKILL when the mount may be a dead NFS mount: resolving the path then
     can block forever, and an unbounded umount can block in uninterruptible sleep.
     """
-    if not is_our_mount(mount, keys):
+    state, reason = mount_state(mount, keys)
+    if state == UNKNOWN:
+        # An unreadable table is not permission to touch anything. Refuse and say
+        # why, so the evidence shows a blocked cleanup rather than a clean one.
+        rec.record(
+            "unmount.blocked_unknown_mount_state",
+            True,
+            mount=mount,
+            state=state,
+            reason=reason,
+            detail="mount state unknown; nothing unmounted, nothing removed",
+        )
+        return
+    if state != MOUNTED:
         rec.record(
             "unmount.refused_not_our_mount",
             True,
             mount=mount,
-            reason=("not in the mount table; leaving it alone"
-                    if os.path.lexists(mount) else "no such path"),
+            state=state,
+            reason=reason,
         )
         return
     # The server is dead, so the client mount is stale: -f is required here, and
     # bounded, because a stale NFS mount can leave umount uninterruptible.
     try:
-        p = run_bounded(["/sbin/umount", "-f", mount], timeout=30)
-        rc, err, abandoned = p.returncode, p.stderr.strip()[:400], False
+        p = run_bounded([umount_binary(), "-f", mount], timeout=30)
+        rc, err, abandoned, who = p.returncode, p.stderr.strip()[:400], False, None
     except BoundedTimeout as e:
-        rc, err, abandoned = None, str(e), True
+        rc, err, abandoned, who = None, str(e), True, e.as_dict()
+    after, after_reason = mount_state(mount, keys)
     rec.record(
         "unmount." + note,
-        not is_our_mount(mount, keys),
+        after == NOT_MOUNTED,
         mount=mount,
         rc=rc,
         abandoned=abandoned,
+        abandoned_process=who,
         stderr=err,
+        state_after=after,
+        reason_after=after_reason,
+        manual_cleanup_required=abandoned and after == MOUNTED,
+        cleanup_claim=(
+            "the umount command was abandoned and this record does NOT claim the "
+            "mount was removed; an operator must inspect abandoned_process"
+            if abandoned
+            else "umount returned and the path is no longer in the mount table"
+        ),
     )
 
 

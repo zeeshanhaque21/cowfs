@@ -31,17 +31,26 @@ passed / failed   : 23 / 6
 The run is identified by a tuple. The harness refuses to reuse a cached verdict unless all of it
 matches, so these fields are the run's identity rather than decoration.
 
+The 29-execution run below was measured on this exact harness, identified by digest. The git
+revision is named as the revision that revision was run at, not as "this branch's head", because
+the head moves whenever this document is edited and the run does not:
+
 | | |
 |---|---|
-| git rev | `90c9a8f8eed9ac5d21fa098d97ee020e23c6a059` (this branch's head) |
-| harness digest | `047cf9750bcfa98d7659ee0d4ecd90f2e2b3e325cb5a95b38473f50beb772840` |
+| git rev the run was executed at | `90c9a8f8eed9ac5d21fa098d97ee020e23c6a059` |
+| harness digest, which is the run's real identity | `047cf9750bcfa98d7659ee0d4ecd90f2e2b3e325cb5a95b38473f50beb772840` |
 | `cowfs-daemon` | `4f29fab15f09ac2754c8ee0d4b7b9b0c515b620fbf10b89c6c010c99844085d8` |
 | `cowfs` | `9567bded815291568a523c6d7a5772e9fd997d797da19cd9d628bee56ca0c5b5` |
-| evidence | `bench/out/crash88/accept-final/` (gitignored) |
+| evidence | `bench/out/crash88/accept-final/` (gitignored, so not readable from the repository) |
 | transport | real in-process NFSv3 loopback, `cowfs-daemon --backend core` |
 
-The harness does not exist at the base commit `ceb96c6`, and no row here claims it does. The
-revision of this report that cited `ceb96c6` was wrong.
+An independent reviewer reproduced every count below at a later revision, `1a2b4f5`, whose harness
+digest is identical, because that revision only touched this document. The correctness of a run
+does not depend on the revision number; it depends on the harness digest and the two binary
+digests, which is exactly what the harness refuses to reuse a cached verdict without.
+
+The harness does not exist at the base commit `ceb96c6`, and no row here claims it does. An
+earlier revision of this report cited `ceb96c6` and was wrong.
 
 ## The receipt model, and why nothing is reclassified
 
@@ -266,12 +275,45 @@ that runs immediately after a `SIGKILL`, which is exactly when the mount is stal
 Verified: the wedged case's stale mount unmounted by hand in 1.6 s once `realpath` was avoided,
 and the full matrix then completed 29 of 29 with no orphan daemon and no leftover mount.
 
+### What actually contains a survivor, and what is not claimed
+
+The group signal is exactly as narrow as the contract allows and no wider. It is the child's own
+process group, created with `start_new_session`, which cannot be this harness's group, the
+reviewing shell's group, the shared daemon's group, or an unrelated sibling. That is the whole of
+its reach.
+
+It does **not** contain a process that starts its own session. A grandchild launched that way
+survives the group signal and can keep writing after `run_bounded` has returned, which was
+measured rather than assumed, in `bench/out/crash88-portability-repair/quarantine.py`. An
+`umount` in uninterruptible sleep is the same shape: still running, still holding its descriptors,
+against a mount path, after the harness has moved on.
+
+So the containment is **not** the kill. It is the path allocation: `next_case_dir` always hands
+out a fresh attempt directory, and nothing in the harness ever reuses or removes an attempt path,
+a store, or a mount. A survivor can only ever hold a path nobody will use again. The quarantine
+control records this distinction explicitly, and records `claims_all_children_killed: false` and
+`claims_cleanup_complete: false`.
+
+When a command is abandoned, `run_bounded` now carries the identity on the exception and into the
+ledger: pid, pgid, the argv this harness owned, and the outcome of a non-blocking reap. The
+`umount` record says `abandoned: true`, names `abandoned_process`, and its `cleanup_claim` field
+states that the record does not claim the mount was removed. An operator can find the holder from
+the evidence alone. Reaping uses `waitpid(WNOHANG)` and never waits on a live child, so the
+bounded return cannot be undone by a reap.
+
+Three things remain unproven, in both directions, and are not claimed:
+
+- whether an uninterruptible `umount` keeps its cwd pinned to the mount path. Proving it needs a
+  real long-lived `D` state on a shared host, which this work will not create.
+- that every descendant is killed. One that leaves the group is not, by construction.
+- that cleanup completed after an abandonment. The record says it did not claim that.
+
 A related hazard, stated rather than fixed: the harness starts each daemon with
 `start_new_session`, so a harness killed by a tool timeout leaves those daemons orphaned, exactly
 as `environment-traps` describes in the other direction. Each is recorded in its case ledger as
 `daemon.spawned` with pid, start time and command line, so an orphan is attributable to a run.
 During this work 25 orphaned daemons were found on the machine; all 25 belonged to another
-worker's tree and none were touched.
+worker's tree, none were mine, and none were touched.
 
 ## CI
 
@@ -283,7 +325,22 @@ The counter reader is injectable, so the available path is tested deterministica
 explicit reading list and runs identically on Linux and macOS. The `nfsstat`-missing path is a
 separate class asserting `available: false`, `commit_delta: None` and an explicit error. Nothing
 is skipped or conditionally dropped, and a reader that raises is treated as unavailable rather
-than as a zero. This was the ubuntu job's only failure and it is gone.
+than as a zero.
+
+The mount-table read is portable for the same reason. `/sbin/mount` is no longer hardcoded: the
+binary is found with `shutil.which("mount")` and falls back to the known locations, `umount` is
+discovered the same way, and each is executed directly from its discovered path rather than
+through a shell. Inspection is tri-state, `mounted` / `not_mounted` / `unknown`, and a missing
+binary, an unreadable table, a non-zero exit, a timeout, empty output or output with no
+parenthesised mount entry all yield `unknown`. `unknown` is not `not_mounted`: it blocks cleanup
+and records `unmount.blocked_unknown_mount_state`, because a table that could not be read is
+never permission to remove, reuse or unmount anything. The whole matrix is a unit test with
+fixture output, including a foreign path that must never match.
+
+One test in the previous revision called the real mount runner instead of mocking it, which is
+what kept the ubuntu job red: `/sbin/mount` does not exist on that runner and the resulting
+`FileNotFoundError` escaped. It now mocks the runner, as its siblings do, and a missing binary is
+handled by the runtime rather than by the test.
 
 Coverage: the nfsstat parser against recorded output including the NLM column; ledger
 immutability; identity sensitivity per bound field; every cache-rejection path above; the
