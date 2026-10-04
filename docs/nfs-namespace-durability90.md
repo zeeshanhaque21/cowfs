@@ -103,10 +103,22 @@ through a reopen, so this is checked rather than argued.
   change it. A caller that wants the bytes durable asks for a stable write or sends COMMIT.
 - **A barrier is per snapshot.** `sync_namespace` on a handle makes that snapshot's namespace
   durable and no other, which is what the isolation test asserts from the queue.
-- **The cost is one metadata sync and one store sync per namespace RPC.** That is what NFSv3 asks
-  for, and every correct NFS server pays it, but it is a real cost for a workload of many small
-  metadata operations on one snapshot. Not measured here: this is a correctness repair and the
-  machine was busy with other agents' mounts.
+- **The cost is one metadata sync and one store sync per mutating namespace RPC.** Measured by
+  `crates/cowfs-core/tests/ns_durability_cost.rs`, 200 reps, debug build, on a host that had other
+  agents' NFS mounts busy, so treat these as an upper bound and not as a benchmark:
+
+  | | ms |
+  |---|---|
+  | rename queued into memory, what it cost before | 0.005 |
+  | rename plus the barrier, after | 10.99 |
+  | rename plus a COMMIT of a file, what a client that emitted one already paid | 11.97 |
+  | a barrier with nothing pending, the floor | 0.007 |
+  | one 4 MiB write, for scale | 254.7 |
+
+  The barrier is not dearer than the protocol's own price for the same guarantee, and it is free
+  when there is nothing to commit. What has **not** been re-measured is the mount-level build
+  overhead of `docs/design.md` success criterion 2, because a `cargo build` on the mount was not
+  run here. That is the number a critic should ask for before this merges.
 - **A failed barrier leaves the namespace applied in memory but not durable.** The caller is told
   `NFS3ERR_IO` and the name is still visible, so a retry is safe. It is not rolled back, because the
   rollback would be a second mutation that could fail the same way.
@@ -118,6 +130,7 @@ through a reopen, so this is checked rather than argued.
 | test | what it pins |
 |---|---|
 | `cowfs-daemon` `namespace_durability.rs` | the crash: real mount, private store, `SIGKILL`, fresh daemon, both names and the bytes, 3 reps per case, plus the native control |
+| `cowfs-core` `ns_durability_cost.rs` | labels the price of a barrier against the price of a COMMIT and against a barrier with nothing pending |
 | `cowfs-nfs` `ns_durability.rs` | the barrier follows the mutation and names the source directory; every namespace RPC barriers exactly once; `WRITE` and `READ` do not; a failed barrier is `NFS3ERR_IO` and nothing else was flushed |
 | `cowfs-core` `ns_durability.rs` | the name survives a reopen after only a namespace barrier; unrelated dirty data is neither flushed nor lost; a handle reaches one snapshot and the root reaches all; a failing sync reports and a retry commits one name |
 
