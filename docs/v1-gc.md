@@ -174,9 +174,11 @@ A cycle is these steps.
    When the walked root differs from the listed key, the listed key is left unwalked so the entries
    that still resolve to it are walked themselves.
    The persisted `mark.bin` carries a format version (`MAGIC_MARKS`).
-   The current version is `COWMARK2`; it was bumped from `COWMARK1` because a collector before this
-   correction could record a listed root key beside a different, newly committed root's blocks.
-   A `COWMARK1` file is not trusted: it loads as empty and every root is walked in full.
+   The current version is `COWMARK3`, which records one block list per walked root; `COWMARK2` and
+   `COWMARK1` stored a flat block list, which cannot say whose blocks a removed snapshot had, and
+   `COWMARK1` could also record a listed root key beside a different, newly committed root's blocks.
+   Neither older file is trusted: it loads as empty and every root is walked in full.
+   `docs/gc-root-mark-retention.md` has the format and the recording rules.
    The cache is derived data, so discarding it costs one walk and deletes no user block or snapshot.
 3. **Choose candidates, no barrier.** For every pack, one scan counts its live and dead record
    bytes with respect to the live set.
