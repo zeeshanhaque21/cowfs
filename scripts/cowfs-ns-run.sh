@@ -166,29 +166,27 @@ auto) candidates="unprivileged privileged" ;;
 esac
 
 chosen=
-note=
+notes=
 for candidate in $candidates; do
   # unshare's own error and the probe's id share one stream, so a refusal keeps its reason.
-  note=$(ns_run run "$candidate" unshare -- "$self" __probe 2>&1) || true
-  case $note in
+  probe=$(ns_run run "$candidate" unshare -- "$self" __probe 2>&1) || true
+  case $probe in
   'mnt:['*)
-    if [ "$note" != "$parent_ns" ]; then
+    if [ "$probe" != "$parent_ns" ]; then
       chosen=$candidate
       break
     fi
-    note="ns-mode $candidate reported the caller's own mount namespace, so no isolation"
+    probe="reported the caller's own mount namespace, so no isolation"
     ;;
-  '')
-    note="ns-mode $candidate produced no mount namespace id"
-    ;;
-  *)
-    note="ns-mode $candidate: $note"
-    ;;
+  '') probe="produced no mount namespace id" ;;
   esac
+  # Every route's reason is kept, because the first one tried is usually the informative one and the
+  # last one tried is usually just "Operation not permitted".
+  notes="${notes:+$notes; }ns-mode $candidate: $probe"
 done
 
 [ -n "$chosen" ] ||
-  unmeasurable "no private mount namespace, nothing was run. ${note:-no reason reported}"
+  unmeasurable "no private mount namespace, nothing was run. ${notes:-no reason reported}"
 
 printf '%s: mount namespace ready (%s), %s at %s\n' "$prog" "$chosen" "$src" "$canonical" >&2
 

@@ -73,6 +73,8 @@ Off Linux the same refusal happens, with the platform named in the message.
 | The canonical directory stays empty outside the namespace | Only the namespace binds onto it | `test_source_is_visible_through_the_canonical_path_only` |
 | Files written inside stay owned by the real user | The kernel maps uid 0 in the user namespace back to the caller's uid | `test_writes_inside_the_namespace_land_as_the_real_user` |
 | No argument is reinterpreted | argv throughout, no `sh -c`, no string built from input | `test_arguments_are_never_reinterpreted` |
+| No raw-path fallback when a namespace is refused | Probe failure exits 77 with the command unrun | `test_no_namespace_never_falls_back_to_the_raw_path` |
+| Both refused routes named in the message | Every candidate's reason is kept, not just the last | `test_both_routes_refused_names_both_in_the_message` |
 | No capability, sysctl, or package change | `unshare` and `mount` only | read of the helper |
 
 The three mount checks each mount a tmpfs inside the namespace first and assert the child's own mount count went up, so "the caller's mounts did not change" cannot pass because the child failed to mount anything.
@@ -134,6 +136,11 @@ The contract tests, which run everywhere including macOS and report which branch
 
 On a host without namespaces, the isolation tests are skipped with the reason, and the refusal tests run.
 That is a pass for the refusal path, not for isolation, and the run says so in its first line.
+
+The GitHub `ubuntu-latest` runner is such a host: its kernel refuses `CLONE_NEWUSER` for an unconfined process, so CI runs the refusal matrix there and reports `OK (skipped=10)`.
+That is the honest outcome and not a CI gap in the tests.
+The isolation matrix was run on `moonscape` instead, and the measurements above are from there.
+`test_both_routes_refused_names_both_in_the_message` puts a refusing `unshare` stub first on `PATH`, so the two-route refusal message is still checked everywhere, including on a host where a namespace does work.
 
 The end-to-end run, on a Linux host with `/dev/fuse` and a Rust toolchain:
 

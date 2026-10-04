@@ -85,6 +85,22 @@ def run(src, canonical, argv, ns_mode=None):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
 
+def run_without_unshare(src, canonical, argv, stub_dir):
+    """Run the helper with a PATH holding an `unshare` that always refuses.
+
+    This is how the "both routes refused" message is checked on a host where a namespace is in fact
+    available, without depending on a host that denies one.
+    """
+    stub_dir.mkdir(exist_ok=True)
+    stub = stub_dir / "unshare"
+    stub.write_text('#!/bin/sh\necho "unshare: stub refused" >&2\nexit 1\n')
+    stub.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{stub_dir}:{env['PATH']}"
+    cmd = [str(HELPER), "--src", str(src), "--canonical", str(canonical), "--"] + list(argv)
+    return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+
+
 class NsCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -180,6 +196,19 @@ class Refusals(NsCase):
         out = run(self.src, self.canonical, self.child("print('RAN')"), ns_mode="container")
         self.assertEqual(out.returncode, EXIT_USAGE)
         self.assertEqual(out.stdout, "")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "auto mode has two routes only on Linux")
+    def test_both_routes_refused_names_both_in_the_message(self):
+        # Auto mode tries two routes, and the second refusal ("Operation not permitted") is the
+        # useless one. Reporting only the last reason would hide why the first did not work either.
+        out = run_without_unshare(
+            self.src, self.canonical, self.child("print('RAN')"), self.root / "stub"
+        )
+        self.assertEqual(out.returncode, EXIT_UNMEASURABLE)
+        self.assertIn("UNMEASURABLE", out.stderr)
+        self.assertIn("ns-mode unprivileged", out.stderr)
+        self.assertIn("ns-mode privileged", out.stderr)
+        self.assertNotIn("RAN", out.stdout)
 
 
 @unittest.skipUnless(os.name == "posix", "the helper under test is a POSIX shell script")
