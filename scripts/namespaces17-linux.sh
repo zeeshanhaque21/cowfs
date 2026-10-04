@@ -8,9 +8,10 @@
 # own control socket, its own daemon. Nothing outside that directory is created or removed, and the
 # only process this script ever signals is the daemon it started itself.
 #
-# The verdict is only ever PASS or UNMEASURABLE. Every claim is checked against a control: the two
-# canonical builds are compared with each other, with a same-path rebuild of one of them, and with
-# a native build at the snapshot's own path.
+# The verdict is PASS, FAIL or UNMEASURABLE. A real failure of the product under test is FAIL; only a
+# missing prerequisite is UNMEASURABLE. Every claim is checked against a control: the two canonical
+# builds are compared with each other, with a same-path rebuild of one of them, and with a native
+# build at the snapshot's own path.
 set -eu
 
 repo=${1:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -37,6 +38,32 @@ unmeasurable() {
 fail() {
   say "VERDICT: FAIL: $*"
   exit 1
+}
+
+# The helper forwards the command's own exit code, and 77 is also the code it uses for its own
+# refusal, so the code alone cannot classify a failure. probe_namespace settles it once: after the
+# probe has said a namespace exists, every later nonzero exit from the helper is the payload's own,
+# and must fail loudly rather than be filed as unmeasurable.
+ns_available=unknown
+ns_refusal=
+probe_namespace() {
+  if ns_err=$("$helper" --src "$mnt" --canonical "$canonical" -- /bin/true 2>&1); then
+    ns_available=yes
+    say "probe: a mount namespace is available, so a nonzero helper exit from here is the payload's own"
+    return 0
+  fi
+  ns_available=no
+  ns_refusal=$ns_err
+  say "probe: no mount namespace: $ns_refusal"
+  return 1
+}
+
+# classify RC DESCRIPTION
+classify() {
+  if [ "$ns_available" = no ]; then
+    unmeasurable "no mount namespace on this host: $ns_refusal"
+  fi
+  fail "$2 exited $1"
 }
 
 # Only ever signals the daemon this script started, and only after proving its command line names
@@ -107,9 +134,8 @@ export CARGO_TARGET_DIR="$out/target"
 bin=$CARGO_TARGET_DIR/debug/cowfs
 say "build: cargo build -p cowfs-cli (target $CARGO_TARGET_DIR)"
 cargo build -p cowfs-cli -j 4 >>"$out/build.log" 2>&1 ||
-  unmeasurable "cargo build -p cowfs-cli failed, see $out/build.log"
-bin=$CARGO_TARGET_DIR/debug/cowfs
-[ -x "$bin" ] || unmeasurable "cargo build produced no $bin"
+  fail "cargo build -p cowfs-cli failed, see $out/build.log"
+[ -x "$bin" ] || fail "cargo build produced no $bin"
 say "build: $("$bin" --version 2>&1 | head -1)"
 
 mkdir -p "$store" "$mnt" "$canonical"
@@ -147,6 +173,10 @@ say "host: $(grep -c . /proc/self/mountinfo) mounts after the daemon started"
 save_mountinfo "$out/mountinfo-before.txt"
 ls -A "$canonical" >"$out/canonical-before.txt"
 
+# Once this has run, a nonzero helper exit is the payload's own code, so the checks below classify
+# against the probe rather than against 77.
+probe_namespace || true
+
 mkdir -p "$out/fixture"
 cat >"$out/fixture/main.rs" <<'RS'
 pub fn add(a: i64, b: i64) -> i64 {
@@ -162,11 +192,11 @@ cowfs() { "$bin" --socket "$sock" "$@"; }
 
 say "store: importing the fixture into a base snapshot"
 cowfs import "$out/fixture" --name base >"$out/import.log" 2>&1 ||
-  unmeasurable "import failed, see $out/import.log"
+  fail "import failed, see $out/import.log"
 for slot in slotA slotB; do
   say "store: creating $slot as a fresh clone of base"
   cowfs snapshot create "$slot" --from base >"$out/snapshot-$slot.log" 2>&1 ||
-    unmeasurable "snapshot create $slot failed, see $out/snapshot-$slot.log"
+    fail "snapshot create $slot failed, see $out/snapshot-$slot.log"
 done
 cowfs snapshot list | tee -a "$out/run.log"
 
@@ -182,14 +212,16 @@ for name in A1 A2 B1; do
   B1) slot=slotB ;;
   esac
   say "canonical: building $name in $slot at $canonical"
-  build "$mnt/$slot" app || unmeasurable "the canonical build $name did not run"
+  # The helper's own code is captured before classify runs, because $? inside the guard would be
+  # the classify call's own status.
+  build "$mnt/$slot" app || { rc=$?; classify "$rc" "the canonical build $name"; }
   canonical_builds=$((canonical_builds + 1))
   cp "$mnt/$slot/app" "$out/app-$name"
 done
 
 say "native: building the control in slotA at its own path $mnt/slotA"
 (cd "$mnt/slotA" && rustc -g --edition 2021 main.rs -o app-native) ||
-  unmeasurable "the native control build did not run"
+  fail "the native control build did not run, see $out/run.log"
 cp "$mnt/slotA/app-native" "$out/app-N1"
 
 save_mountinfo "$out/mountinfo-after.txt"
@@ -247,7 +279,6 @@ say "check: two snapshots built at one canonical path are byte-identical, and a 
   fail "the native build at its own path is identical to the canonical build, so the control did not run"
 say "check: the native build at $mnt/slotA differs from the canonical build"
 
-{
-  say "VERDICT: PASS: $canonical_builds canonical builds over a private cowfs FUSE mount, two fresh snapshots, one canonical path"
-  say "artifacts: $out"
-} | tee -a "$out/run.log"
+# say already appends to run.log, so this block is not piped again: one verdict, one line.
+say "VERDICT: PASS: $canonical_builds canonical builds over a private cowfs FUSE mount, two fresh snapshots, one canonical path"
+say "artifacts: $out"

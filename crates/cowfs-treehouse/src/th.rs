@@ -208,7 +208,7 @@ fn stderr_of(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-fn tail(s: &str) -> String {
+pub(crate) fn tail(s: &str) -> String {
     const MAX: usize = 400;
     let t = s.trim();
     if t.chars().count() <= MAX {

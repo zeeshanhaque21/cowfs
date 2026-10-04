@@ -33,6 +33,10 @@ Exit codes:
 
 Anything other than 0 or the command's own code means the command did not run.
 
+Exit code 77 is ambiguous by design: a command whose own exit code is 77 is byte-identical, from the outside, to the helper's refusal.
+Do not classify on the code alone.
+Probe the helper once with a command you expect to succeed, and use that to tell the two apart; `scripts/namespaces17-linux.sh` does exactly this in `probe_namespace`.
+
 ## How the isolation is obtained
 
 `unshare` does all of it.
@@ -63,6 +67,21 @@ If no route produces one, the helper prints a line containing `UNMEASURABLE`, ex
 There is no fallback path that runs the command at its raw path, because a build that quietly ran unwrapped produces artifacts that look comparable and are not.
 
 Off Linux the same refusal happens, with the platform named in the message.
+
+## What the canonical directory does and does not contain
+
+The namespace makes one directory point at the snapshot.
+It does not make the command's filesystem private.
+
+Inside the namespace the command still shares the caller's `/tmp`, `/usr`, `/home` and every other absolute path outside the snapshot, so a write there reaches the real filesystem exactly as it would without the helper.
+Only the snapshot's own path is redirected.
+That is inherent to a mount namespace, and it is not what "nothing else changed" in the contract means: read that as "nothing else about the mounts changed".
+
+Any existing directory is accepted as `--canonical`, including a system path: `--canonical /sys` succeeds, and inside the namespace the snapshot shadows `/sys`.
+Nothing on the host changes, but a caller who passes `/usr` gets a build whose `/usr` is the snapshot, with no warning and no nonzero exit.
+There is no list of refused prefixes, because any such list is wrong somewhere and a caller who needs one should not be relying on a helper for it.
+
+The safe rule is the caller's: pass an existing, empty, per-pool directory that belongs to that pool.
 
 ## Security properties
 
@@ -100,7 +119,9 @@ Three claims, each against its own control:
 
 - A1 and B1 are byte-identical, so two different snapshots at one canonical path produced one artifact.
 - A1 and A2 are byte-identical, so the equality is not luck about rebuilds: a same-path rebuild is identical too, which is what makes the cross-snapshot equality meaningful.
-- N1 differs from A1 in 29 bytes out of 4370016, and it records its own slot path where A1 records the canonical one, so the native control really did build somewhere else.
+- N1 differs from A1, and it records its own slot path where A1 records the canonical one, so the native control really did build somewhere else.
+  The byte count is a property of this path pair, not of the mechanism: A1 and N1 are the same size (4370016 bytes each) only because `canonical` and `mnt/slotA` are both 9 characters, and the 29 differing bytes are where those two equal-length strings sit.
+  Pick suffixes of different lengths and the sizes differ too.
 
 `bench/out/namespaces17/embedded-paths.txt` shows the path strings read back out of each binary: `canonical_path_embedded=True` for A1, A2 and B1, `slot_path_embedded=True` for N1.
 
