@@ -77,6 +77,7 @@ import hashlib
 import json
 import mmap
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -913,6 +914,63 @@ MOUNTED = "mounted"
 NOT_MOUNTED = "not_mounted"
 UNKNOWN = "unknown"
 
+# The four escapes mount(8) documents for a path field. Nothing else is a
+# sequence: an unrecognised backslash is data, and a decoded backslash is never
+# re-examined, so `\134040` is a literal backslash followed by 040, not a space.
+MOUNT_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+
+# mount(8) emits `<device> on <point> (<type>, <options>)`, and the util-linux
+# form inserts `type <type>` before the option group. Only that trailing group is
+# used to find the boundary.
+MOUNT_TYPE_SUFFIX = re.compile(r"\stype\s+\S+$")
+
+
+def decode_mount_field(field):
+    """Decode the documented mount escapes in one left-to-right pass.
+
+    Deliberately not `unicode_escape`: that would interpret arbitrary backslash
+    sequences a path may legitimately contain. A recognised escape consumes its
+    four characters, so a decoded `\\` is never rescanned.
+    """
+    out = []
+    i, n = 0, len(field)
+    while i < n:
+        ch = field[i]
+        if ch == "\\" and i + 3 < n and field[i + 1:i + 4] in MOUNT_ESCAPES:
+            out.append(MOUNT_ESCAPES[field[i + 1:i + 4]])
+            i += 4
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def parse_mount_entry(line):
+    """The decoded mount point of one mount table line, or None if unreadable.
+
+    None means "not an entry I can read", never "not mounted". The split is at the
+    FIRST " on " because the device is a single token in every form this harness
+    produces, and a device containing " on " would then lengthen the point rather
+    than shorten it to something that could match a foreign key by accident.
+    """
+    line = line.strip()
+    if not line.endswith(")"):
+        return None
+    open_at = line.rfind("(")
+    if open_at <= 0:
+        return None
+    head = line[:open_at].rstrip()
+    marker = head.find(" on ")
+    if marker < 0:
+        return None
+    point = head[marker + 4:].strip()
+    stripped = MOUNT_TYPE_SUFFIX.sub("", point)
+    if stripped != point:
+        point = stripped
+    if not point:
+        return None
+    return decode_mount_field(point)
+
 
 def mount_state(mount, keys=None):
     """One of MOUNTED, NOT_MOUNTED or UNKNOWN, with a reason when not conclusive.
@@ -937,16 +995,31 @@ def mount_state(mount, keys=None):
     text = result.stdout or ""
     if not text.strip():
         return UNKNOWN, "mount produced no output"
-    # A mount table line is "<device> on <path> (<type>, <options>)". Anything
-    # without a parenthesised type is not a mount entry, so a truncated or
-    # unexpected format yields UNKNOWN rather than a confident "not mounted".
+
+    matched, entries, unparsed = None, 0, []
     for line in text.splitlines():
-        if " on " not in line or "(" not in line:
+        if not line.strip():
             continue
-        for k in candidates:
-            if (" on %s " % k) in line:
-                return MOUNTED, line.strip()[:200]
-    return NOT_MOUNTED, "%d mount entries, none matching" % len(text.splitlines())
+        point = parse_mount_entry(line)
+        if point is None:
+            # A line carrying " on " is an entry we could not read, so a truncated
+            # copy of our own entry cannot be told apart from a foreign one.
+            if " on " in line:
+                unparsed.append(line.strip()[:120])
+            continue
+        entries += 1
+        if matched is None and point in candidates:
+            matched = line.strip()[:200]
+
+    if matched is not None:
+        # A positive identification. Neighbours that failed to parse cannot
+        # retract it: we know this exact path is in the table.
+        return MOUNTED, matched
+    if unparsed:
+        return UNKNOWN, "%d entries read, %d unparseable, none matching: %s" % (
+            entries, len(unparsed), "; ".join(unparsed[:3]),
+        )
+    return NOT_MOUNTED, "%d mount entries, none matching" % entries
 
 
 def is_our_mount(mount, keys=None):

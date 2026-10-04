@@ -1110,6 +1110,120 @@ class TestMountStateTriState(unittest.TestCase):
         state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, "   \n", ""))
         self.assertEqual(state, h.UNKNOWN)
 
+    def test_an_unparseable_entry_is_unknown_not_a_confident_absence(self):
+        # A truncated copy of our own entry is indistinguishable from a foreign
+        # one, so a table that cannot be fully read must not report an absence.
+        table = (
+            "/dev/disk3s1s1 on / (apfs, sealed, local)\n"
+            "localhost:/cowfs-abc on /private/tmp/m\n"
+            "devfs on /dev (devfs, local)\n"
+        )
+        state, reason = self._state("/sbin/mount", result=h.Proc.Result(0, table, ""),
+                                    keys=("/private/tmp/m",))
+        self.assertEqual(state, h.UNKNOWN)
+        self.assertIn("unparseable", reason)
+
+    def test_our_own_entry_is_found_off_the_first_line(self):
+        table = (
+            "/dev/disk3s1s1 on / (apfs, sealed, local)\n"
+            "devfs on /dev (devfs, local)\n"
+            "localhost:/cowfs-abc on /private/tmp/m (nfs, nodev, nosuid)\n"
+            "OrbStack:/OrbStack on /Users/z/OrbStack (nfs, nodev)\n"
+        )
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, table, ""))
+        self.assertEqual(state, h.MOUNTED)
+
+    def test_an_exact_match_survives_unparseable_neighbours(self):
+        # A positive identification cannot be retracted by a line we cannot read.
+        table = (
+            "/dev/disk3s1s1 on / (apfs, sealed, local)\n"
+            "localhost:/cowfs-abc on /private/tmp/m (nfs, nodev)\n"
+            "truncated line on /private/tmp/zz\n"
+        )
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, table, ""))
+        self.assertEqual(state, h.MOUNTED)
+
+    def test_a_fully_readable_table_with_no_match_is_not_mounted(self):
+        table = "/dev/disk3s1s1 on / (apfs)\ndevfs on /dev (devfs)\n"
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, table, ""))
+        self.assertEqual(state, h.NOT_MOUNTED)
+
+    def test_an_escaped_space_in_the_table_matches_the_real_path(self):
+        table = ("/dev/disk3s1s1 on / (apfs)\n"
+                 "localhost:/cowfs-abc on /private/tmp/cowfs\\040crash (nfs)\n")
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, table, ""),
+                               keys=("/private/tmp/cowfs crash",))
+        self.assertEqual(state, h.MOUNTED)
+
+    def test_a_literal_space_still_matches_an_unescaped_host(self):
+        table = ("/dev/disk3s1s1 on / (apfs)\n"
+                 "localhost:/cowfs-abc on /private/tmp/cowfs crash (nfs)\n")
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, table, ""),
+                               keys=("/private/tmp/cowfs crash",))
+        self.assertEqual(state, h.MOUNTED)
+
+    def test_a_decoded_path_matches_only_itself(self):
+        table = ("/dev/disk3s1s1 on / (apfs)\n"
+                 "localhost:/cowfs-abc on /private/tmp/cowfs\\040crash (nfs)\n")
+        for key in ("/private/tmp/cowfs", "/private/tmp/cowfs crashextra",
+                    "/private/tmp/cowfs cras", "/private/tmp"):
+            state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, table, ""),
+                                   keys=(key,))
+            self.assertEqual(state, h.NOT_MOUNTED, "%r must not match" % key)
+
+    def test_the_util_linux_type_suffix_is_stripped(self):
+        table = "/dev/sda1 on /private/tmp/m type ext4 (rw,relatime)\n"
+        state, _ = self._state("/sbin/mount", result=h.Proc.Result(0, table, ""))
+        self.assertEqual(state, h.MOUNTED)
+
+    def test_only_the_documented_escapes_are_decoded(self):
+        d = h.decode_mount_field
+        self.assertEqual(d("a\\040b"), "a b")
+        self.assertEqual(d("a\\011b"), "a\tb")
+        self.assertEqual(d("a\\012b"), "a\nb")
+        self.assertEqual(d("a\\134b"), "a\\b")
+        self.assertEqual(d("/tmp/plain"), "/tmp/plain")
+        # an undocumented sequence is data, not an escape
+        self.assertEqual(d("\\043"), "\\043")
+        self.assertEqual(d("a\\"), "a\\")
+        self.assertEqual(d("a\\04"), "a\\04")
+
+    def test_a_decoded_backslash_is_never_decoded_again(self):
+        # `\134040` is one literal backslash then the digits 040, not a space.
+        self.assertEqual(h.decode_mount_field("\\134040"), "\\040")
+
+    def test_an_escaped_run_decodes_as_one_escape_plus_a_literal(self):
+        self.assertEqual(h.decode_mount_field("a\\0400"), "a 0")
+
+    def test_an_incomplete_table_blocks_cleanup_and_runs_no_umount(self):
+        tmp = tempfile.mkdtemp(prefix="cowfs-crash88-test-")
+        try:
+            rec = h.Recorder(tmp)
+            ran = []
+
+            def runner(argv, timeout):
+                ran.append(argv[0])
+                if argv[0].endswith("umount"):
+                    return h.Proc.Result(0, "", "")
+                return h.Proc.Result(
+                    0, "/dev/disk3s1s1 on / (apfs)\nlocalhost:/x on /private/tmp/m\n", "")
+
+            def which(cmd):
+                return "/sbin/" + cmd
+
+            with mock.patch.object(h, "run_bounded", runner), \
+                    mock.patch.object(h.shutil, "which", which):
+                h.unmount_private("/private/tmp/m", rec, "spike",
+                                  keys=["/private/tmp/m"])
+            rec.close()
+            self.assertFalse([a for a in ran if a.endswith("umount")],
+                             "umount must not run against an incomplete table")
+            with open(os.path.join(tmp, "records.jsonl")) as f:
+                names = [json.loads(l)["name"] for l in f if l.strip()]
+            self.assertIn("unmount.blocked_unknown_mount_state", names)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_empty_output_is_unknown(self):
         state, reason = self._state("/sbin/mount", result=h.Proc.Result(0, "", ""))
         self.assertEqual(state, h.UNKNOWN)
