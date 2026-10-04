@@ -95,7 +95,7 @@ Every snapshot operation is the core's own control plane. No tree is ever copied
 | `snapshot_rename` | `rename_snapshot`, staged the same way |
 | `snapshot_promote` | a set in the daemon, because the core does not record base-ness |
 | `fsck` | `Core::fsck`, mapped to the protocol's report |
-| `gc` | not wired: the core's mark-and-sweep needs the reference barrier first (#10) |
+| `gc` | `Core::collector` through the reference gate: a mark-and-sweep over the real store that reclaims packs. See below |
 | `import` | `import::ingest`: a reserved staging snapshot, a durable read-back compared byte for byte with the source, then one fork into the name. See below |
 | `base_refresh` | refused, see below |
 
@@ -162,9 +162,14 @@ already stored, and the report's `stored_bytes` says so (0 for a repeat of ident
   which means nothing for a backend whose snapshots are trees. The handler answers `unsupported`
   and says to copy the source through the mount instead.
 
-`gc` is not wired. The core has `pinned_blocks` and the reference barrier, and mark-and-sweep is
-#10; until that lands the handler answers `unsupported` rather than reporting a number it cannot
-compute.
+`gc` is wired over the real core: `CoreBackend` registers the run, clones the `Core` out of its
+slot, builds a `Collector` with `Core::collector`, and runs the cycle on a scoped thread while the
+calling thread forwards progress and polls the client's cancel every 50 ms.
+Design, lock order and failure behaviour are in `docs/gc-core-integration.md`.
+`CtlResult` is `ok` with a `GcReport` whose `candidate_blocks`/`candidate_bytes` are an upper bound;
+a live request that frees nothing because the reference side would not hold still is `busy`, and a
+cycle error is `io_error`, so a quiet success is never a silent failure.
+`fsck` maps to `Core::fsck` on this backend too.
 
 ### What `PathBackend` is not
 
