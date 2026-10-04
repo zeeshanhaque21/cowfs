@@ -51,6 +51,12 @@ fn seeded(seed: u32) -> Vec<u8> {
     body(20_000 + 7_000 * (seed as usize % 4), seed)
 }
 
+fn put_file_in(v: &SnapshotView, dir: cowfs_vfs::Ino, name: &str, data: &[u8]) {
+    let a = v.create(dir, name.as_bytes(), 0o644).expect("create");
+    assert_eq!(v.write(a.ino, 0, data).expect("write") as usize, data.len());
+    v.forget(a.ino, 1);
+}
+
 fn put_file(v: &SnapshotView, name: &str, data: &[u8]) {
     let a = v.create(ROOT_INO, name.as_bytes(), 0o644).expect("create");
     assert_eq!(v.write(a.ino, 0, data).expect("write") as usize, data.len());
@@ -123,11 +129,17 @@ fn add_tail(core: &Core, keep: &mut Files, prefix: &str, n: u32) {
 }
 
 fn verify(core: &Core, files: &Files) {
+    verify_in(core, "keep", files);
+}
+
+/// `verify` for a snapshot whose name the test chose, so a scenario that does not know which of two
+/// snapshots will survive can still check the survivor.
+fn verify_in(core: &Core, snapshot: &str, files: &Files) {
     core.drop_caches();
-    let v = core.snapshot_view("keep").expect("view");
+    let v = core.snapshot_view(snapshot).expect("view");
     for (n, d) in files {
-        let got = read_file(&v, n).unwrap_or_else(|e| panic!("{n} does not read: {e}"));
-        assert!(got == *d, "{n} reads back different bytes");
+        let got = read_file(&v, n).unwrap_or_else(|e| panic!("{snapshot}:{n} does not read: {e}"));
+        assert!(got == *d, "{snapshot}:{n} reads back different bytes");
     }
 }
 
@@ -1528,6 +1540,337 @@ fn a_removed_base_is_reclaimed_by_the_next_fresh_collector() {
     core.close().unwrap();
     let core = reopen(dir.path());
     verify(&core, &keep);
+    fsck_clean(&core);
+    core.close().unwrap();
+}
+
+/// A fork keeps most of what its parent held, so its walk shares subtrees with an earlier root's
+/// and yields only what that walk did not reach.
+/// Recording that delta as the fork's own block set is the way to lose data: once the parent is gone
+/// nothing else names those inherited blocks, a later cycle trusts the fork's record, skips its walk
+/// and reclaims the packs holding them.
+///
+/// So this runs the two halves in order.
+/// First one cycle only, then the parent is removed: that is the window where a delta record would be
+/// the fork's only record, so the next cycle must free nothing at all, because the fork still
+/// references every inherited file.
+/// Then the cycles run to convergence and the garbage snapshot goes: that is where the collector has
+/// to do real work, or the first half would pass on a collector that frees nothing.
+#[test]
+fn a_fork_keeps_the_subtree_it_inherited_from_a_deleted_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    core.create_snapshot("parent").unwrap();
+    core.create_snapshot("junk").unwrap();
+    let pv = core.snapshot_view("parent").unwrap();
+    let jv = core.snapshot_view("junk").unwrap();
+    let mut keep = Vec::new();
+    for i in 0..8u32 {
+        let p = (format!("p{i:02}"), body(40_000, 2000 + i));
+        put_file(&pv, &p.0, &p.1);
+        keep.push(p);
+        core.sync().unwrap();
+        let j = (format!("j{i:02}"), body(40_000, 3000 + i));
+        put_file(&jv, &j.0, &j.1);
+        core.sync().unwrap();
+    }
+    drop(pv);
+    drop(jv);
+    core.fork_snapshot("parent", "keep").unwrap();
+    core.sync().unwrap();
+
+    let cv = core.snapshot_view("keep").unwrap();
+    for i in 0..4u32 {
+        let c = (format!("c{i:02}"), body(40_000, 4000 + i));
+        put_file(&cv, &c.0, &c.1);
+        keep.push(c);
+        core.sync().unwrap();
+    }
+    // The tail is the watermark barrier, and it goes to the survivor so it is never garbage.
+    for i in 0..5u32 {
+        let t = (format!("t{i:02}"), body(40_000, 5000 + i));
+        put_file(&cv, &t.0, &t.1);
+        keep.push(t);
+        core.sync().unwrap();
+    }
+    drop(cv);
+    core.sync().unwrap();
+
+    // One cycle, so the only records on disk are the ones the first cycle wrote.
+    let c = core.collector(gc_opts()).unwrap();
+    let first = c.collect().unwrap();
+    clean(&first);
+    assert!(
+        first.marked > 0,
+        "the first cycle walks from cold: {first:?}"
+    );
+    drop(c);
+
+    let before_parent = packs(dir.path());
+    core.remove_snapshot("parent").unwrap();
+    core.sync().unwrap();
+    let c = core.collector(gc_opts()).unwrap();
+    let after_parent = c.collect().unwrap();
+    clean(&after_parent);
+    assert_eq!(
+        after_parent.packs_unlinked, 0,
+        "the fork still references every file it inherited: {after_parent:?}"
+    );
+    assert_eq!(packs(dir.path()), before_parent, "no pack moved");
+    drop(c);
+    // Read every inherited file now, so a cycle that freed one is caught while the core is still open
+    // and names it.
+    verify(&core, &keep);
+
+    let converged = cycles_until_the_marks_are_trusted(&core);
+    let before = packs(dir.path());
+    core.remove_snapshot("junk").unwrap();
+    core.sync().unwrap();
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(
+        r.packs_unlinked >= 1 && r.freed_bytes > 0,
+        "cycle {converged} plus this one reclaimed the garbage snapshot: {r:?}"
+    );
+    assert!(bytes(&packs(dir.path())) < bytes(&before));
+    drop(c);
+    core.close().unwrap();
+
+    let core = reopen(dir.path());
+    verify(&core, &keep);
+    fsck_clean(&core);
+    core.close().unwrap();
+}
+
+/// A torn marks file must be walked in full, and that changes nothing else about the cycle.
+///
+/// `marked` is the observable that says the file was not trusted: a trusted cache skips every root's
+/// walk and reports no marked blocks. The first cycle here reclaims real packs, so a collector that
+/// simply stopped working would fail on the reclaim rather than pass this quietly, and the
+/// survivors are read after a reopen so a collector that seeded live from a partial cache fails too.
+#[test]
+fn a_torn_marks_file_is_walked_in_full_and_the_cycle_still_reclaims() {
+    use std::fs;
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+
+    let c = core.collector(gc_opts()).unwrap();
+    let first = c.collect().unwrap();
+    clean(&first);
+    assert!(
+        first.packs_unlinked >= 1 && first.freed_bytes > 0,
+        "the first cycle reclaims real dead packs: {first:?}"
+    );
+    drop(c);
+
+    let path = dir.path().join("gc").join("mark.bin");
+    let whole = fs::read(&path).expect("the first cycle wrote a marks file");
+    assert_eq!(
+        &whole[..8],
+        b"COWMARK3",
+        "the file under test is the format this change writes"
+    );
+    // Keep one whole group and cut the next one short, so a loader that only checked the first group
+    // would accept a file that is missing the roots after it.
+    let mut torn = whole.clone();
+    torn.truncate(8 + 8 + 32 + 8 + 32);
+    fs::write(&path, &torn).unwrap();
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(
+        r.marked > 0,
+        "a torn cache is not trusted, so every root is walked: {r:?}"
+    );
+    drop(c);
+    core.close().unwrap();
+
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
+    core.close().unwrap();
+}
+
+/// The roots a marks file names, in file order.
+///
+/// Test-only, and deliberately coupled to the format: the point of this test is that a root whose
+/// walk shared a subtree is *not* written, and the only observable for that is the file itself.
+fn recorded_roots(path: &Path) -> Vec<[u8; 32]> {
+    let bytes = std::fs::read(path).expect("marks file");
+    assert_eq!(&bytes[..8], b"COWMARK3", "unexpected marks format");
+    let n = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let mut rest = &bytes[16..];
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let key: [u8; 32] = rest[..32].try_into().unwrap();
+        let blocks = u64::from_le_bytes(rest[32..40].try_into().unwrap()) as usize;
+        out.push(key);
+        rest = &rest[40 + blocks * 32..];
+    }
+    out
+}
+
+/// Two snapshots that share a subtree *node*, which is what makes the marker skip part of the second
+/// walk.
+///
+/// A fork that adds a file shares its blocks with its parent but no nodes, because the leaf holding
+/// a file's chunk list is rebuilt when another entry joins it, so the marker gives no reuse and no
+/// delta. A shared directory is different: a directory holding exactly one file has the same node id
+/// in both trees, so the second walk descends to it, finds it marked, and yields only what is left.
+///
+/// That delta is not the second root's reachable set. Recording it, and then losing the root whose
+/// walk covered the shared subtree, leaves the survivor trusted on a record that is missing exactly
+/// the blocks only the departed root's walk found.
+///
+/// The test does not assume which of the two is walked first. It reads the file to find out which
+/// root was recorded, removes that snapshot, and requires the survivor to still reference the shared
+/// file. Under one that records only complete walks, the survivor holds no record at all, is walked
+/// again, and the shared file is found.
+///
+/// Two claims, in this order, because the second needs the first to name a survivor.
+/// The first is that a walk which shared a subtree is not recorded at all; that is what fails first
+/// if the recording rule is loosened to record every walk, and it fails before the data-loss phase
+/// below is reached.
+/// The second is the consequence: with that root gone, the survivor's shared file is still there and
+/// the cycle frees nothing.
+#[test]
+fn a_root_whose_walk_shared_a_subtree_is_not_recorded_and_not_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    core.create_snapshot("one").unwrap();
+    core.create_snapshot("junk").unwrap();
+
+    let shared = body(40_000, 6001);
+    let ov = core.snapshot_view("one").unwrap();
+    let d = ov.mkdir(ROOT_INO, b"shared", 0o755).expect("mkdir");
+    put_file_in(&ov, d.ino, "same.bin", &shared);
+    core.sync().unwrap();
+    drop(ov);
+    core.fork_snapshot("one", "two").unwrap();
+    core.sync().unwrap();
+    // A second root over the same shared directory: different root, same subtree node.
+    let tv = core.snapshot_view("two").unwrap();
+    let extra = body(40_000, 6002);
+    put_file(&tv, "extra", &extra);
+    core.sync().unwrap();
+    drop(tv);
+    let jv = core.snapshot_view("junk").unwrap();
+    for i in 0..6u32 {
+        let j = (format!("j{i:02}"), body(40_000, 7000 + i));
+        put_file(&jv, &j.0, &j.1);
+        core.sync().unwrap();
+    }
+    drop(jv);
+    // The tail is the watermark barrier.
+    let tv = core.snapshot_view("two").unwrap();
+    for i in 0..5u32 {
+        let t = (format!("t{i:02}"), body(40_000, 8000 + i));
+        put_file(&tv, &t.0, &t.1);
+        core.sync().unwrap();
+    }
+    drop(tv);
+    core.sync().unwrap();
+
+    let c = core.collector(gc_opts()).unwrap();
+    let first = c.collect().unwrap();
+    clean(&first);
+    assert!(
+        first.marked > 0,
+        "the first cycle walks from cold: {first:?}"
+    );
+    drop(c);
+
+    let path = dir.path().join("gc").join("mark.bin");
+    let recorded = recorded_roots(&path);
+    let roots: BTreeMap<String, [u8; 32]> = core
+        .list_snapshots()
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.name, *s.root.as_bytes()))
+        .collect();
+    assert_eq!(
+        roots.len(),
+        3,
+        "one snapshot each for the pair and the garbage: {roots:?}"
+    );
+    assert!(
+        recorded.len() < roots.len(),
+        "a walk that shared a subtree was not recorded: {} of {} roots",
+        recorded.len(),
+        roots.len()
+    );
+    // Of the sharing pair, the one whose walk was recorded is the one that covered the shared
+    // subtree. The garbage root is recorded too, since nothing overlaps it, and it stays for the
+    // reclaim below.
+    let pair = ["one", "two"];
+    let dropped: Vec<&String> = roots
+        .iter()
+        .filter(|(n, r)| pair.contains(&n.as_str()) && recorded.contains(r))
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        dropped.len(),
+        1,
+        "one of the pair was recorded and the other was not: {roots:?}"
+    );
+    let survivor = pair
+        .iter()
+        .find(|n| **n != dropped[0])
+        .copied()
+        .expect("a survivor");
+    let survivor_files: Files = vec![("extra".to_string(), extra.clone())];
+    // The shared file is the one at risk, and it needs the directory hop the flat helpers do not do.
+    let read_shared = |core: &Core| {
+        let v = core.snapshot_view(&survivor).expect("view");
+        let dir = v.lookup(ROOT_INO, b"shared").expect("shared directory");
+        let f = v.lookup(dir.ino, b"same.bin").expect("shared file");
+        v.read(f.ino, 0, 1 << 20).expect("the shared file reads")
+    };
+
+    core.remove_snapshot(dropped[0]).unwrap();
+    core.sync().unwrap();
+    let before = packs(dir.path());
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert_eq!(
+        r.packs_unlinked, 0,
+        "{survivor} still references the shared directory: {r:?}"
+    );
+    assert_eq!(packs(dir.path()), before, "no pack moved");
+    drop(c);
+    verify_in(&core, &survivor, &survivor_files);
+    assert_eq!(read_shared(&core), shared, "the shared file still reads");
+
+    // The garbage snapshot is what makes the collector do real work, so the reclaim has to be there
+    // too: without it this test would pass on a collector that frees nothing.
+    cycles_until_the_marks_are_trusted(&core);
+    let before = packs(dir.path());
+    core.remove_snapshot("junk").unwrap();
+    core.sync().unwrap();
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(
+        r.packs_unlinked >= 1 && r.freed_bytes > 0,
+        "the garbage snapshot was reclaimed: {r:?}"
+    );
+    assert!(bytes(&packs(dir.path())) < bytes(&before));
+    drop(c);
+    core.close().unwrap();
+
+    let core = reopen(dir.path());
+    verify_in(&core, &survivor, &survivor_files);
+    assert_eq!(
+        read_shared(&core),
+        shared,
+        "the shared file reads after reopen"
+    );
     fsck_clean(&core);
     core.close().unwrap();
 }
