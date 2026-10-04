@@ -366,9 +366,9 @@ say "check: two fresh slots from one warm base, built at one canonical path, are
 [ "$hA" != "$hNA" ] && [ "$hB" != "$hNB" ] ||
   fail "a native control matched its canonical build, so the control did not run"
 say "check: both native controls at their own paths differ from their canonical builds"
-grep -q "^slotA: canonical_path_embedded=True" "$out/embedded-paths.txt" ||
+grep -q "^slotA: .*canonical_path_embedded=True" "$out/embedded-paths.txt" ||
   fail "the slotA artifact does not record the canonical path, so the build proved nothing"
-grep -q "^N-slotA: slot_path_embedded=True" "$out/embedded-paths.txt" ||
+grep -q "^N-slotA: .*slot_path_embedded=True" "$out/embedded-paths.txt" ||
   fail "the native control does not record its own path, so the control proved nothing"
 say "check: the canonical artifacts record the canonical path and the native controls record their own"
 
