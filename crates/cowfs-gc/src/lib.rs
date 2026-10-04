@@ -137,6 +137,8 @@ impl Default for Options {
 }
 
 type ProgressFn = Box<dyn FnMut(&Progress) + Send + Sync>;
+/// A test seam that runs inside the mark walk. See [`Gc::set_between_lookup_and_walk`].
+type LookupHookFn = Box<dyn FnMut(cowfs_meta::SnapshotId) + Send>;
 
 /// A collector over one store and one metadata database.
 pub struct Gc {
@@ -153,6 +155,14 @@ pub struct Gc {
     /// one has just decided to keep. Serialising the cycle removes that whole class of race, and
     /// a real deployment runs one collect at a time anyway.
     cycle: Mutex<()>,
+    /// Test seam: run once per cycle between the freeze listing and the mark walk, so a test can
+    /// drive a commit into that exact window deterministically. `None` in production.
+    #[doc(hidden)]
+    pub between_list_and_walk: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test seam: run once per listed snapshot between its lookup and its walk, so a test can place
+    /// a removal in that exact window deterministically. `None` in production.
+    #[doc(hidden)]
+    pub between_lookup_and_walk: Mutex<Option<LookupHookFn>>,
 }
 
 impl Gc {
@@ -184,6 +194,8 @@ impl Gc {
             progress: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             cycle: Mutex::new(()),
+            between_list_and_walk: Mutex::new(None),
+            between_lookup_and_walk: Mutex::new(None),
         })
     }
 
@@ -256,6 +268,33 @@ impl Gc {
         *self.progress.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
     }
 
+    /// Test seam: run `f` once, between the freeze listing and the mark walk of the next cycle.
+    ///
+    /// The window is the one where a commit to a listed snapshot changes its root after the
+    /// listing read it; a test uses this to place such a commit deterministically, without
+    /// timing. Never set outside `tests/`.
+    #[doc(hidden)]
+    pub fn set_between_list_and_walk(&self, f: Box<dyn FnMut() + Send>) {
+        *self
+            .between_list_and_walk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// Test seam: run `f(id)` once per listed snapshot, between the collector's lookup of a listed
+    /// snapshot and the walk that reads its root.
+    ///
+    /// The window is the one where a snapshot removed after the lookup but before the walk makes the
+    /// walk report `NoSuchSnapshot`; a test uses this to place that removal deterministically,
+    /// without timing. Never set outside `tests/`.
+    #[doc(hidden)]
+    pub fn set_between_lookup_and_walk(&self, f: LookupHookFn) {
+        *self
+            .between_lookup_and_walk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
     /// One cycle: freeze, mark, choose candidates, copy, then verify and unlink under a barrier.
     ///
     /// One cycle runs at a time per collector: a second call waits. Two overlapping cycles would
@@ -320,6 +359,15 @@ impl Gc {
             .iter()
             .map(|i| (*i.root.as_bytes(), i.id))
             .collect();
+
+        if let Some(f) = self
+            .between_list_and_walk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            f();
+        }
 
         // 2. Mark. No barrier: a root captured above is immutable, so a write during the walk
         // cannot change what it yields.
@@ -391,6 +439,7 @@ impl Gc {
                 }
                 r.candidates += 1;
                 r.candidate_bytes += plan.record_bytes();
+                r.candidate_dead_bytes += plan.dead_bytes;
                 // A hint only orders the work. Coldest first, so a run that gets cut short
                 // reclaims cold bytes.
                 let cold = hints.coldness(&ids, plan.live_bytes);
@@ -574,21 +623,55 @@ impl Gc {
                 // blocks are in the set and the marker holds its subtrees.
                 continue;
             }
-            if record && self.marks().has_root(&key) {
-                // An earlier cycle walked this exact root, so its recorded blocks are its blocks.
-                if let Some(bs) = persisted.get(&key) {
-                    live.extend(bs.iter().copied());
-                }
-                r.marked_skipped_roots += 1;
-                walked.insert(key);
-                continue;
-            }
             // A snapshot removed between the listing and the lookup is gone, so its blocks are
             // not live. That is not an error: a collect runs while snapshots come and go.
             let Ok(snap) = self.meta.snapshot_by_id(id) else {
                 continue;
             };
-            for b in snap.live_blocks(marker)? {
+            if let Some(f) = self
+                .between_lookup_and_walk
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                f(id);
+            }
+            // The root read here and the nodes it walks are one epoch (`live_blocks_with_root`).
+            // The root can differ from the listed `key`: a writer committed to this snapshot after
+            // the freeze listing. Recording the listed key then would claim a root this walk never
+            // descended, and a fork still on the listed root would be skipped as covered while its
+            // blocks sat in no live set. So the walked root is what gets recorded, and the listed
+            // key is left unwalked for the entries that still resolve to it.
+            //
+            // The lookup above held the session read lock only for its own call, so a removal can
+            // land in the gap before this one. `live_blocks_with_root` re-reads the namespace under
+            // the lock and reports `NoSuchSnapshot` for a id removed in that gap. That id names no
+            // root in the durable table any more, and a fork of it recorded its own root before the
+            // removal committed, so no snapshot this cycle keeps is reached through it: it has no
+            // addressable root entry, and skipping it keeps nothing alive. Only that one error is
+            // skipped. Every other error is a real failure and stops the cycle, still fail-closed.
+            let (root, walk) = match snap.live_blocks_with_root(marker) {
+                Ok(v) => v,
+                Err(cowfs_meta::Error::NoSuchSnapshot) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let walked_root = *root.as_bytes();
+            if walked.contains(&walked_root) {
+                // Another entry this cycle already walked exactly this root. Its blocks and the
+                // marker's subtrees are in hand, so descending again would only repeat work.
+                r.marked_skipped_roots += 1;
+                continue;
+            }
+            if record && self.marks().has_root(&walked_root) {
+                // An earlier cycle walked this exact root, so its recorded blocks are its blocks.
+                if let Some(bs) = persisted.get(&walked_root) {
+                    live.extend(bs.iter().copied());
+                }
+                r.marked_skipped_roots += 1;
+                walked.insert(walked_root);
+                continue;
+            }
+            for b in walk {
                 let b = b?;
                 if b == HOLE {
                     continue;
@@ -596,12 +679,12 @@ impl Gc {
                 r.marked += 1;
                 live.insert(b);
                 if record {
-                    self.marks().add_block(&key, b);
+                    self.marks().add_block(&walked_root, b);
                 }
             }
-            walked.insert(key);
+            walked.insert(walked_root);
             if record {
-                self.marks().add_root(&key);
+                self.marks().add_root(&walked_root);
             }
         }
         Ok(live)

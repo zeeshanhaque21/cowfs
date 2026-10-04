@@ -8,51 +8,11 @@ use std::time::{Duration, Instant};
 use common::reuse::ReusingVfs;
 use common::*;
 use cowfs_nfs::{MountOptions, HANDLE_LEN};
-use nfsserve::nfs::{nfs_fh3, nfsstat3};
+use nfsserve::nfs::nfs_fh3;
 use nfsserve::tcp::Limits;
 
 const MNT_ACCES: u32 = 13;
 const MNT_NOENT: u32 = 2;
-
-fn opts(limits: Limits) -> MountOptions {
-    MountOptions {
-        limits,
-        ..MountOptions::default()
-    }
-}
-
-fn connect_raw(port: u16) -> TcpStream {
-    let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    s
-}
-
-/// True if the server closes `s` within `secs`.
-fn closed_within(s: &mut TcpStream, secs: u64) -> bool {
-    let t = Instant::now();
-    // A socket that was reset refuses a new timeout, which is itself proof that it is gone.
-    let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
-    let mut b = [0u8; 16];
-    while t.elapsed() < Duration::from_secs(secs) {
-        match s.read(&mut b) {
-            Ok(0) => return true,
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return true,
-            Ok(_) | Err(_) => {}
-        }
-    }
-    false
-}
-
-fn fd_limit() -> usize {
-    let out = std::process::Command::new("/bin/sh")
-        .args(["-c", "ulimit -n"])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(256)
-}
 
 // ---- mount gate and handle MACs -------------------------------------------------------------
 
@@ -267,106 +227,10 @@ fn a_hardlinked_file_keeps_its_handle_until_the_last_name_goes() {
     assert_eq!(c.getattr(&f).0, STALE);
 }
 
-// ---- resource bounds -------------------------------------------------------------------------
-
-#[test]
-fn oversized_frames_close_the_connection_before_any_allocation() {
-    let (s, mut c) = serve(memfs(), MountOptions::default());
-    let root = c.root.clone();
-    let before = rss_bytes();
-    let mut socks: Vec<TcpStream> = (0..20)
-        .map(|_| {
-            let mut b = connect_raw(s.port());
-            b.write_all(&((8u32 << 20) | 1 << 31).to_be_bytes())
-                .unwrap();
-            b
-        })
-        .collect();
-    for b in &mut socks {
-        assert!(closed_within(b, 5), "an 8 MiB frame is refused");
-    }
-    assert!(rss_bytes().saturating_sub(before) < 30 << 20);
-    assert_eq!(c.getattr(&root).0, OK);
-}
-
-#[test]
-fn half_sent_frames_keep_memory_bounded() {
-    let want = 200usize;
-    let n = want.min((fd_limit().saturating_sub(120)) / 2);
-    let limits = Limits {
-        max_connections: 1000,
-        frame_timeout: Duration::from_secs(60),
-        ..Limits::default()
-    };
-    let (s, mut c) = serve(memfs(), opts(limits));
-    let root = c.root.clone();
-    let before = rss_bytes();
-    let socks: Vec<TcpStream> = (0..n)
-        .map(|_| {
-            let mut b = connect_raw(s.port());
-            b.write_all(&((1u32 << 20) | 1 << 31).to_be_bytes())
-                .unwrap();
-            b.write_all(&[0; 8]).unwrap();
-            b
-        })
-        .collect();
-    std::thread::sleep(Duration::from_millis(500));
-    let grown = rss_bytes().saturating_sub(before);
-    println!("{n} half-sent 1 MiB frames: RSS grew {} MiB", grown >> 20);
-    assert!(grown < 60 << 20, "RSS grew by {} MiB", grown >> 20);
-    assert_eq!(c.getattr(&root).0, OK, "the server still answers");
-    drop(socks);
-}
-
-#[test]
-fn a_connection_flood_is_capped_and_the_server_recovers() {
-    let n = 10_000usize.min(fd_limit().saturating_sub(120) / 2);
-    let (s, mut c) = serve(memfs(), MountOptions::default());
-    let root = c.root.clone();
-    let mut socks = Vec::new();
-    for _ in 0..n {
-        match TcpStream::connect(("127.0.0.1", s.port())) {
-            Ok(x) => socks.push(x),
-            Err(_) => break,
-        }
-    }
-    println!(
-        "flood: {} connections opened (fd limit {}), cap {}",
-        socks.len(),
-        fd_limit(),
-        Limits::default().max_connections
-    );
-    std::thread::sleep(Duration::from_millis(500));
-    let mut open = 0;
-    for x in &mut socks {
-        let _ = x.set_read_timeout(Some(Duration::from_millis(1)));
-        let mut b = [0u8; 1];
-        // A kicked connection is closed or reset, both of which count as not open.
-        let alive = match x.read(&mut b) {
-            Ok(0) => false,
-            Err(e)
-                if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::BrokenPipe =>
-            {
-                false
-            }
-            Ok(_) | Err(_) => true,
-        };
-        open += usize::from(alive);
-    }
-    assert!(
-        open <= Limits::default().max_connections,
-        "{open} connections held open"
-    );
-    drop(socks);
-    std::thread::sleep(Duration::from_millis(300));
-    let mut c2 = Nfs::attach(s.port(), root.clone());
-    assert_eq!(
-        c2.getattr(&root).0,
-        OK,
-        "a new client is served after the flood"
-    );
-    assert_eq!(c.getattr(&root).0, OK);
-}
+// ---- resource bounds and deadlines ------------------------------------------------------------
+//
+// Tests that measure a process-wide resource (the fd table or RSS) are in resource_bounds.rs, which
+// runs them one at a time in a process of their own.
 
 #[test]
 fn slow_and_idle_connections_time_out() {
@@ -552,21 +416,6 @@ fn every_non_idempotent_procedure_replays() {
         &mut |c| c.setattr(&f, sattr_mode(0o600)).0,
         "SETATTR",
     );
-}
-
-#[test]
-fn the_reply_cache_stays_small_under_a_long_run() {
-    let (_s, mut c) = serve(memfs(), MountOptions::default());
-    let root = c.root.clone();
-    let before = rss_bytes();
-    for i in 0..20_000u32 {
-        c.set_next_xid(i + 1);
-        c.create(&root, "f", 0, sattr_mode(0o644), [0; 8]);
-    }
-    let grown = rss_bytes().saturating_sub(before);
-    println!("20000 cached calls: RSS grew {} MiB", grown >> 20);
-    assert!(grown < 40 << 20);
-    let _ = nfsstat3::NFS3_OK;
 }
 
 // ---- connection budget and record deadlines (round 2) ----------------------------------------

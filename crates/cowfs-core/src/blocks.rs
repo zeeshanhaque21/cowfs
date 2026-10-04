@@ -7,6 +7,7 @@ use cowfs_store::{BlockId, Store, MAX_BLOCK_LEN};
 use cowfs_vfs::Result;
 
 use crate::error::from_store;
+use crate::gate::Entry;
 use crate::util::MutexExt;
 
 #[derive(Debug, Default)]
@@ -40,6 +41,15 @@ impl Blocks {
         self.store
             .as_deref()
             .expect("the store is gone: the mount is closed")
+    }
+
+    /// A shared handle on the store, for the collector.
+    pub(crate) fn store_arc(&self) -> Arc<Store> {
+        Arc::clone(
+            self.store
+                .as_ref()
+                .expect("the store is gone: the mount is closed"),
+        )
     }
 
     /// Hands the store over so it can be closed with its own error reporting.
@@ -76,7 +86,10 @@ impl Blocks {
     }
 
     /// Stores `data` (at most 256 KiB) and remembers it for reads.
-    pub(crate) fn put(&self, data: &[u8]) -> Result<BlockId> {
+    ///
+    /// A put can deduplicate onto a block the collector is about to free, so it takes the gate
+    /// entry as proof that no barrier is held.
+    pub(crate) fn put(&self, _entry: &Entry<'_>, data: &[u8]) -> Result<BlockId> {
         let id = self.store().put(data).map_err(from_store)?;
         self.insert(id, Arc::new(data.to_vec()));
         Ok(id)

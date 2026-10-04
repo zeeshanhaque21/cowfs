@@ -12,6 +12,7 @@ use crate::blocks::Blocks;
 use crate::dcache::{DCache, Target};
 use crate::error::{from_meta, stale};
 use crate::file::FileData;
+use crate::gate::{Entry, Gate};
 use crate::ino::{classify, pack, snap_of, Aliases, Id};
 use crate::node::{Node, NodeState};
 use crate::queue::{Batch, Create, Op, SnapCtx};
@@ -168,6 +169,8 @@ pub(crate) struct Snaps {
 pub(crate) struct Inner {
     pub(crate) meta: Meta,
     pub(crate) blocks: Blocks,
+    /// The reference gate; see `docs/gc-core-integration.md`. The outermost lock.
+    pub(crate) gate: Arc<Gate>,
     pub(crate) opts: Options,
     pub(crate) snaps: RwLock<Snaps>,
     pub(crate) nodes: ShardMap<Ino, Arc<Node>>,
@@ -635,7 +638,13 @@ impl Inner {
     }
 
     /// Flushes one file's dirty bytes to the store and queues its chunk list.
-    pub(crate) fn flush_locked(&self, sc: &SnapCtx, node: &Node, st: &mut NodeState) -> Result<()> {
+    pub(crate) fn flush_locked(
+        &self,
+        sc: &SnapCtx,
+        node: &Node,
+        st: &mut NodeState,
+        entry: &Entry<'_>,
+    ) -> Result<()> {
         let Some(f) = st.file.as_mut() else {
             return Ok(());
         };
@@ -646,15 +655,15 @@ impl Inner {
             return Err(e);
         }
         let n = f.dirty_bytes();
-        f.flush(&self.blocks)?;
+        f.flush(&self.blocks, entry)?;
         self.dirty_bytes.fetch_sub(n, Ordering::AcqRel);
         self.queue_content(sc, node, st);
         Ok(())
     }
 
-    fn flush_node(&self, sc: &SnapCtx, node: &Node) -> Result<()> {
+    fn flush_node(&self, sc: &SnapCtx, node: &Node, entry: &Entry<'_>) -> Result<()> {
         let mut st = node.st.wr();
-        self.flush_locked(sc, node, &mut st)
+        self.flush_locked(sc, node, &mut st, entry)
     }
 
     /// How often a transient flush failure is retried inside one flush, with a short backoff.
@@ -669,7 +678,7 @@ impl Inner {
     /// A transient failure (out of space, too many descriptors, a retryable I/O error) is retried a
     /// few times, then leaves the file dirty and in the dirty set: nothing is lost, the next flush
     /// tries again, and only `fsync` of that file reports `EIO`.
-    pub(crate) fn flush_data(&self, sc: &SnapCtx) -> Result<()> {
+    pub(crate) fn flush_data(&self, sc: &SnapCtx, entry: &Entry<'_>) -> Result<()> {
         let files = sc.q.lk().take_dirty_files();
         let mut poison: Option<Error> = None;
         let mut transient: Option<String> = None;
@@ -680,7 +689,7 @@ impl Inner {
             };
             let mut err = None;
             for _ in 0..=Self::FLUSH_RETRIES {
-                match self.flush_node(sc, &node) {
+                match self.flush_node(sc, &node, entry) {
                     Ok(()) => {
                         err = None;
                         node.clear_degraded();
@@ -745,12 +754,17 @@ impl Inner {
     }
 
     /// Commits everything queued for `sc`: data to the store, then one meta batch.
+    ///
+    /// The gate is entered first, before the queue is drained: a drained batch holds chunk lists
+    /// that no node and no snapshot root names, so a barrier must not be able to close between
+    /// the drain and the commit.
     pub(crate) fn flush_snapshot(&self, sc: &SnapCtx) -> Result<()> {
+        let entry = self.gate.enter();
         let _g = sc.flush.lk();
         if sc.removed.load(Ordering::Acquire) {
             return Ok(());
         }
-        let r = self.flush_locked_snapshot(sc);
+        let r = self.flush_locked_snapshot(sc, &entry);
         if let Err(e) = &r {
             self.ctr.flush_errors.fetch_add(1, Ordering::Relaxed);
             *self.last_error.lk() = Some(e.to_string());
@@ -758,8 +772,8 @@ impl Inner {
         r
     }
 
-    fn flush_locked_snapshot(&self, sc: &SnapCtx) -> Result<()> {
-        self.flush_data(sc)?;
+    fn flush_locked_snapshot(&self, sc: &SnapCtx, entry: &Entry<'_>) -> Result<()> {
+        self.flush_data(sc, entry)?;
         let batch = {
             let mut q = sc.q.lk();
             if !q.pending() {
@@ -977,6 +991,7 @@ impl Inner {
     /// [`Inner::flush_snapshot`].
     pub(crate) fn barrier(&self, sc: &SnapCtx) -> Result<()> {
         self.ctr.barriers.fetch_add(1, Ordering::Relaxed);
+        let _entry = self.gate.enter();
         let _g = sc.flush.lk();
         if sc.removed.load(Ordering::Acquire) {
             return Ok(());
@@ -1035,11 +1050,15 @@ impl Inner {
         if self.dirty_bytes.load(Ordering::Acquire) <= self.opts.max_dirty_bytes {
             return;
         }
+        // best effort: while a collector holds the barrier the bytes stay dirty
+        let Some(entry) = self.gate.try_enter() else {
+            return;
+        };
         let Ok(_g) = self.pressure.try_lock() else {
             return;
         };
         for sc in self.all_snaps() {
-            let _ = self.flush_data(&sc);
+            let _ = self.flush_data(&sc, &entry);
         }
     }
 }

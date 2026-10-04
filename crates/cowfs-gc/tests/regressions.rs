@@ -1010,3 +1010,87 @@ fn a_snapshot_forked_during_the_cycle_keeps_its_blocks() {
         );
     }
 }
+
+/// Issue 83: a non-`NoSuchSnapshot` error from the walk must stop the cycle, not be skipped the way
+/// a snapshot that came and went is.
+///
+/// The metadata hook is armed inside the collector's lookup/walk window, so the `sync()` that
+/// `live_blocks_with_root` runs before reading the root fails with `Error::Hook`. The collector must
+/// return that error. Skipping it would treat a real metadata failure as "the snapshot is gone" and
+/// go on to sweep packs whose blocks it never confirmed. This is the negative control for the
+/// `NoSuchSnapshot`-only skip.
+#[test]
+fn a_non_nosuchsnapshot_error_in_the_walk_window_fails_the_cycle_and_frees_nothing() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let armed_hook = Arc::clone(&armed);
+    let f = Fixture::with_hook(
+        96 << 10,
+        Arc::new(move || {
+            if armed_hook.load(SeqCst) {
+                Err(std::io::Error::other("injected metadata failure"))
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    let parts = f.parts();
+    let roots = Roots::new();
+
+    let base = parts.meta.new_snapshot("base").expect("base");
+    for i in 0..4u8 {
+        parts.write(
+            &base,
+            format!("b{i}").as_bytes(),
+            &body(30_000, u32::from(i)),
+        );
+    }
+    let victim = base.fork("victim").expect("victim");
+    parts.write(&victim, b"only-in-victim", &body(30_000, 999));
+    parts.meta.sync().expect("sync");
+    parts.store.sync().expect("store sync");
+    let victim_id = victim.id();
+
+    let armed2 = Arc::clone(&armed);
+    parts.gc.set_between_lookup_and_walk(Box::new(move |id| {
+        if id != victim_id {
+            return;
+        }
+        // Arm the hook: the walk's own `sync()` fails with `Error::Hook`, which is not
+        // `NoSuchSnapshot`, so the whole cycle must stop instead of skipping this snapshot.
+        armed2.store(true, SeqCst);
+    }));
+
+    let packs_before = parts.store.packs().expect("packs").len();
+    let err = parts
+        .gc
+        .collect(Some(&*roots))
+        .expect_err("a metadata failure in the walk must fail the cycle");
+    assert!(armed.load(SeqCst), "the hook was armed in the window");
+    // Disarm so the post-checks (which sync) do not fail on the injected fault.
+    armed.store(false, SeqCst);
+    assert!(
+        !matches!(
+            err,
+            cowfs_gc::Error::Meta(cowfs_meta::Error::NoSuchSnapshot)
+        ),
+        "the injected failure is not a vanished snapshot: {err:?}"
+    );
+    assert!(
+        matches!(err, cowfs_gc::Error::Meta(cowfs_meta::Error::Hook(_))),
+        "the walk's own sync error is surfaced: {err:?}"
+    );
+    // Nothing was freed: the cycle stopped at the walk, before the copy/sweep step.
+    let packs_after = parts.store.packs().expect("packs").len();
+    assert_eq!(
+        packs_after, packs_before,
+        "the failure stopped the cycle before any pack was unlinked"
+    );
+    for b in parts.live() {
+        assert!(
+            parts.store.get(b).is_ok(),
+            "a live block was freed despite the failure: {b:?}"
+        );
+    }
+}

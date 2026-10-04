@@ -15,7 +15,12 @@ use cowfs_store::BlockId;
 
 const MAGIC: &[u8] = b"COWAT01";
 const ENTRY: usize = 36;
-const MAGIC_MARKS: &[u8] = b"COWMARK1";
+/// Marks cache format version. Bumped from `COWMARK1` because a collector before the walked-root
+/// fix could write a listed root key paired with a different, newly committed root's blocks.
+/// Such a file is a wrong association that would make a later cycle skip a root's walk and free
+/// the blocks only that root referenced, so an old file must be ignored and walked in full.
+/// The cache is derived data: discarding it costs a walk and nothing else.
+const MAGIC_MARKS: &[u8] = b"COWMARK2";
 const ROOT_ENTRY: usize = 32;
 
 /// Seconds since the Unix epoch, 0 when the clock is before it or unreadable.
@@ -418,6 +423,47 @@ mod tests {
         let m = Marks::load(d.path(), 16);
         assert!(m.n_blocks() == 0);
         assert!(!m.dropped);
+    }
+
+    /// B2: an old-format marks file (a collector before the walked-root fix) may pair a listed root
+    /// with a different root's blocks. It carries no version apart from a magic that says which
+    /// collector wrote it, so the loader must reject the whole old format and walk in full rather
+    /// than trust the wrong association.
+    #[test]
+    fn an_old_format_marks_file_is_not_reused() {
+        let d = tempfile::tempdir().unwrap();
+        // Build a well-formed COWMARK1 file by hand: one root K1, one block B, exactly the shape the
+        // old collector wrote after the walked-root race (the listed key with the new root's blocks).
+        let k1 = root(1);
+        let b = BlockId::of(b"b");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"COWMARK1");
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&k1);
+        buf.extend_from_slice(b.as_bytes());
+        fs::write(d.path().join("mark.bin"), &buf).unwrap();
+
+        let m = Marks::load(d.path(), 16);
+        assert!(
+            !m.has_root(&k1),
+            "an old-format cache must not be trusted: the root is walked again"
+        );
+        assert_eq!(m.n_blocks(), 0, "no old block association is honoured");
+        assert!(!m.dropped);
+
+        // The same shape written under the current magic does round-trip, so the rejection is the
+        // format version and not the payload.
+        let mut cur = Vec::new();
+        cur.extend_from_slice(MAGIC_MARKS);
+        cur.extend_from_slice(&1u64.to_le_bytes());
+        cur.extend_from_slice(&1u64.to_le_bytes());
+        cur.extend_from_slice(&k1);
+        cur.extend_from_slice(b.as_bytes());
+        fs::write(d.path().join("mark.bin"), &cur).unwrap();
+        let m = Marks::load(d.path(), 16);
+        assert!(m.has_root(&k1), "the current format is reused");
+        assert!(m.blocks_of(&k1).unwrap().contains(&b));
     }
 
     #[test]

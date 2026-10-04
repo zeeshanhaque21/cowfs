@@ -62,6 +62,8 @@ pub struct GcReport {
     pub candidates: u64,
     /// Bytes of records in those packs.
     pub candidate_bytes: u64,
+    /// Bytes of records in those packs that no root reaches: the most a cycle can free from them.
+    pub candidate_dead_bytes: u64,
     /// Bytes on disk freed by unlinking packs.
     pub freed_bytes: u64,
     /// Packs whose live records were copied into a new pack.
