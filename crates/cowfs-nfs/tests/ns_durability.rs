@@ -33,8 +33,12 @@ enum Call {
 struct Watched {
     inner: Arc<MemVfs>,
     calls: Mutex<Vec<Call>>,
+    /// Names `create` was told to make, whether or not the RPC that followed succeeded.
+    created: Mutex<Vec<String>>,
     fail_ns: AtomicBool,
     fail_mutation: AtomicBool,
+    /// Fail `setattr`, which is the step after a name exists, without failing the create.
+    fail_setattr: AtomicBool,
 }
 
 impl Watched {
@@ -42,8 +46,10 @@ impl Watched {
         Arc::new(Watched {
             inner: Arc::new(MemVfs::new()),
             calls: Mutex::new(Vec::new()),
+            created: Mutex::new(Vec::new()),
             fail_ns: AtomicBool::new(false),
             fail_mutation: AtomicBool::new(false),
+            fail_setattr: AtomicBool::new(false),
         })
     }
 
@@ -57,6 +63,12 @@ impl Watched {
 
     fn forget(&self) {
         self.calls.lock().unwrap().clear();
+    }
+
+    /// The names `create` was told to make, so a test can tell an error reply from a name that
+    /// does not exist.
+    fn created(&self) -> Vec<String> {
+        self.created.lock().unwrap().clone()
     }
 
     /// Every barrier seen since the last `forget`.
@@ -76,6 +88,9 @@ impl Vfs for Watched {
         self.inner.getattr(i)
     }
     fn setattr(&self, i: u64, c: SetAttr) -> Result<Attr> {
+        if self.fail_setattr.load(Ordering::Relaxed) {
+            return Err(Error::Io("injected setattr fault".into()));
+        }
         self.inner.setattr(i, c)
     }
     fn readlink(&self, i: u64) -> Result<Vec<u8>> {
@@ -86,6 +101,10 @@ impl Vfs for Watched {
             return Err(Error::PermissionDenied);
         }
         self.note(Call::Create);
+        self.created
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(n).into_owned());
         self.inner.create(p, n, m)
     }
     fn mkdir(&self, p: u64, n: &[u8], m: u32) -> Result<Attr> {
@@ -371,6 +390,69 @@ fn a_failed_barrier_is_an_error_not_a_success() {
         vfs.barriers(),
         Vec::new(),
         "a refused rename needs no barrier"
+    );
+}
+
+/// A name exists as soon as `Vfs::create` returned, so an error reply must not leave it
+/// unbarriered. This is the regression for the gap where a `?` in the match arm returned before
+/// `durable`, which the old head does: remove the barrier and this test fails.
+///
+/// The three routes are the ones a caller can hit. The attribute step succeeds and the barrier
+/// succeeds: one barrier, the attributes reported. The attribute step fails: the barrier still
+/// runs, so the name it already created is not left queued and unacknowledged. The barrier fails:
+/// `NFS3ERR_IO` wins over the attribute error, because a status that reads as "that did not
+/// happen" would be a lie about a name that exists.
+#[test]
+fn a_created_name_is_barriered_even_when_the_attribute_step_fails() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start(vfs.clone());
+    let root = c.root.clone();
+
+    // The route where nothing goes wrong: exactly one barrier.
+    vfs.forget();
+    assert_eq!(c.create(&root, "ok", 1, sattr_mode(0o644), [0; 8]).0, OK);
+    assert_eq!(vfs.created(), vec!["ok".to_string()]);
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&root).fileid)],
+        "a successful create barriers exactly once"
+    );
+
+    // The attribute step fails after the name exists. The barrier is still owed.
+    vfs.forget();
+    vfs.fail_setattr.store(true, Ordering::Relaxed);
+    let st = c.create(&root, "attrfail", 1, sattr_mtime(7, 0), [0; 8]).0;
+    vfs.fail_setattr.store(false, Ordering::Relaxed);
+    assert_eq!(
+        vfs.created(),
+        vec!["ok".to_string(), "attrfail".to_string()]
+    );
+    assert_eq!(
+        st, IO,
+        "the caller is told the attribute step failed, not that the create did not happen"
+    );
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&root).fileid)],
+        "a name that exists must be barriered even when the RPC answers with an error"
+    );
+    assert!(
+        c.lookup(&root, "attrfail").0 == OK,
+        "the name the server created is real, which is why the barrier was owed"
+    );
+
+    // Both fail at once: the barrier's IO is the honest status.
+    vfs.forget();
+    vfs.fail_setattr.store(true, Ordering::Relaxed);
+    vfs.fail_ns.store(true, Ordering::Relaxed);
+    let st = c.create(&root, "both", 1, sattr_mtime(7, 0), [0; 8]).0;
+    vfs.fail_ns.store(false, Ordering::Relaxed);
+    vfs.fail_setattr.store(false, Ordering::Relaxed);
+    assert_eq!(vfs.created().last().map(String::as_str), Some("both"));
+    assert_eq!(vfs.barriers(), vec![Call::SyncNs(c.attrs(&root).fileid)]);
+    assert_eq!(
+        st, IO,
+        "when the barrier fails the status must not read as if the create had not happened"
     );
 }
 
