@@ -643,7 +643,7 @@ mod tests {
         let mut b = fs::read(&path).unwrap();
         b.truncate(b.len() - 3);
         fs::write(&path, &b).unwrap();
-        let m = Marks::load(&d.path(), 16);
+        let m = Marks::load(d.path(), 16);
         assert_eq!(m.n_blocks(), 0);
         assert!(!m.has_root(&root(3)), "a torn tail leaves no trusted root");
     }

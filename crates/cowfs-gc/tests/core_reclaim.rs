@@ -1826,7 +1826,7 @@ fn a_root_whose_walk_shared_a_subtree_is_not_recorded_and_not_trusted() {
     let survivor_files: Files = vec![("extra".to_string(), extra.clone())];
     // The shared file is the one at risk, and it needs the directory hop the flat helpers do not do.
     let read_shared = |core: &Core| {
-        let v = core.snapshot_view(&survivor).expect("view");
+        let v = core.snapshot_view(survivor).expect("view");
         let dir = v.lookup(ROOT_INO, b"shared").expect("shared directory");
         let f = v.lookup(dir.ino, b"same.bin").expect("shared file");
         v.read(f.ino, 0, 1 << 20).expect("the shared file reads")
@@ -1844,7 +1844,7 @@ fn a_root_whose_walk_shared_a_subtree_is_not_recorded_and_not_trusted() {
     );
     assert_eq!(packs(dir.path()), before, "no pack moved");
     drop(c);
-    verify_in(&core, &survivor, &survivor_files);
+    verify_in(&core, survivor, &survivor_files);
     assert_eq!(read_shared(&core), shared, "the shared file still reads");
 
     // The garbage snapshot is what makes the collector do real work, so the reclaim has to be there
@@ -1865,7 +1865,7 @@ fn a_root_whose_walk_shared_a_subtree_is_not_recorded_and_not_trusted() {
     core.close().unwrap();
 
     let core = reopen(dir.path());
-    verify_in(&core, &survivor, &survivor_files);
+    verify_in(&core, survivor, &survivor_files);
     assert_eq!(
         read_shared(&core),
         shared,

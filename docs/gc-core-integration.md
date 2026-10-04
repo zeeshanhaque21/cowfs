@@ -28,6 +28,18 @@ The correction is narrow and keeps the algorithm:
   The marks file therefore carries a format version (`MAGIC_MARKS`), and this correction bumped it from `COWMARK1` to `COWMARK2`.
   A file in the old format is treated as empty and every root is walked in full, which is always correct because the cache is derived data; no user block or snapshot root is deleted.
 
+### The marks cache records which blocks belong to which root
+
+`COWMARK2` stored one flat block list under the whole root list, so the loader credited every recorded block to every recorded root.
+Inside one cycle that is the safe direction.
+Across cycles it is not: a removed snapshot's blocks stay in the list and the surviving roots' records keep naming them, so a per-request collector that trusts the file finds nothing dead and reclaims nothing (issue 82).
+
+`COWMARK3` stores one block list per walked root, and only a walk that started with an empty marker is recorded, because a walk sharing `cowfs-meta`'s node marker with an earlier root yields a delta rather than that root's complete reachable set.
+A root reached only as a delta is walked again next cycle.
+`COWMARK1` and `COWMARK2` are both rejected, since neither carries a per-root association and neither can be reconstructed into one.
+
+`docs/gc-root-mark-retention.md` is the format, the two recording rules, what makes a record unusable, and the regressions over the real core.
+
 Proof (private stores, this worktree):
 
 - Deterministic regression `a_commit_between_the_freeze_listing_and_a_walks_the_listed_root` in `crates/cowfs-gc/tests/core_reclaim.rs`.

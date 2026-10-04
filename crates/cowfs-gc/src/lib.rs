@@ -114,7 +114,9 @@ pub struct Options {
     pub batch_bytes: u64,
     /// Most access-time hints held in memory. Past this, new ids are not recorded.
     pub max_hints: usize,
-    /// Most persisted marked roots and blocks. Past this the persistent set is dropped.
+    /// Most persisted (root, block) pairs and roots. Past this the persistent set is dropped.
+    /// Counting pairs rather than distinct blocks is what bounds the file, since a block two roots
+    /// share is written under both.
     pub max_persisted_blocks: usize,
     /// Report and change nothing.
     pub dry_run: bool,
