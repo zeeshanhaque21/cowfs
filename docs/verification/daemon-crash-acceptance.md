@@ -28,46 +28,86 @@ passed / failed   : 23 / 6
 
 ## Provenance
 
-The run is identified by a tuple. The harness refuses to reuse a cached verdict unless all of it
-matches, so these fields are the run's identity rather than decoration.
+The run is identified by a tuple, and the harness refuses to reuse a cached verdict unless all of it
+matches. The fields are not all the same kind of thing, and conflating them was a defect an
+independent reviewer found in an earlier revision of this section, so the distinction is stated here.
 
-The 29-execution run below was measured on this exact harness, identified by digest. The git
-revision is named as the revision that revision was run at, not as "this branch's head", because
-the head moves whenever this document is edited and the run does not:
+**Source identity, reproducible.** These identify the inputs, and a reader who checks out the same
+revision gets the same values:
 
 | | |
 |---|---|
 | git rev the run was executed at | `90c9a8f8eed9ac5d21fa098d97ee020e23c6a059` |
-| harness digest, which is the run's real identity | `047cf9750bcfa98d7659ee0d4ecd90f2e2b3e325cb5a95b38473f50beb772840` |
-| `cowfs-daemon` | `4f29fab15f09ac2754c8ee0d4b7b9b0c515b620fbf10b89c6c010c99844085d8` |
-| `cowfs` | `9567bded815291568a523c6d7a5772e9fd997d797da19cd9d628bee56ca0c5b5` |
+| harness digest, sha256 of `scripts/verify-daemon-crash.py` | `047cf9750bcfa98d7659ee0d4ecd90f2e2b3e325cb5a95b38473f50beb772840` |
+
+**Build-artifact identity, not reproducible.** A dev-profile build of one fixed source tree is not
+byte-reproducible, so these identify *one particular build* and nothing about the source it came
+from:
+
+| | |
+|---|---|
+| `cowfs-daemon`, this run's artifact | `4f29fab15f09ac2754c8ee0d4b7b9b0c515b620fbf10b89c6c010c99844085d8` |
+| `cowfs`, this run's artifact | `9567bded815291568a523c6d7a5772e9fd997d797da19cd9d628bee56ca0c5b5` |
+
+Measured, not assumed: rebuilding `cowfs-daemon` three times from unchanged source on this tree, with
+no edit between builds and no absolute build path embedded, produced three distinct digests. An
+independent reviewer got five distinct digests from five builds of the same tree, and could not
+reproduce this report's integrated digests from that tree at all. Both observations are the same
+fact: a differing digest is evidence that two *artifacts* differ, and is not evidence about source.
+
+The cache consequence is fail-safe and worth stating: because the two artifact digests are part of the
+match key, a rebuilt binary invalidates a cached verdict and the case re-executes. That is
+over-rejection, not under-rejection. No verdict has ever been reused across differing inputs.
+
+Also part of the record, neither of them source identity:
+
+| | |
+|---|---|
 | evidence | `bench/out/crash88/accept-final/` (gitignored, so not readable from the repository) |
 | transport | real in-process NFSv3 loopback, `cowfs-daemon --backend core` |
 
-An independent reviewer reproduced every count below at a later revision, `1a2b4f5`, whose harness
-digest is identical, because that revision only touched this document. The correctness of a run
-does not depend on the revision number; it depends on the harness digest and the two binary
-digests, which is exactly what the harness refuses to reuse a cached verdict without.
+The harness digest is the field that actually pins the instrument, and it is reproducible: it reads
+`047cf9750bcfa98d` at both `90c9a8f` and `1a2b4f5`, `d328d411` at `2db2f7f` and `1c400c5e` at
+`7d9380a`. An independent reviewer reproduced every count below at `1a2b4f5`, whose harness digest
+is identical, because that revision only touched this document.
 
 The harness does not exist at the base commit `ceb96c6`, and no row here claims it does. An
 earlier revision of this report cited `ceb96c6` and was wrong.
 
-### The binary changed after that run, so the counts above are not re-asserted for current main
+### The binary's source inputs changed after that run, so the counts above are not re-asserted for current main
 
 This branch has since merged main at `46b0f269d5bef4a2c204c25f5b3015da601d3beb`, which carries #93
-and #95. The 29-execution run above was measured against a binary built at `90c9a8f`, **before**
-both. Its digests are not the digests of the integrated binary:
+and #95. The 29-execution run above was measured at `90c9a8f`, **before** both.
 
-| | 29-execution run at `90c9a8f` | integrated binary after the merge |
-|---|---|---|
-| `cowfs-daemon` | `4f29fab1...` | `eb48f336d56c7632e15a12481a6e4cee5a2eadf88f104fcd80db98db69c39e0a` |
-| `cowfs` | `9567bded...` | `e0cc963bb66d897f4b0567ebe8c3966f748f81cdead5e6a447fddd6c7936029d` |
+The evidence that the inputs changed is the tracked source, not the artifact digests. An earlier
+revision of this document argued it from differing digests, which does not follow for the reason
+given above. The source evidence:
 
-So the six losses, the 46-of-52 durability match and every other count above are properties of the
-**pre-merge binary**. They are carried forward as that run's record and nothing more. Re-running all
-29 cases purely to restate unchanged numbers was not done: eleven other workers hold the shared
+| tracked file | at `90c9a8f` | at main `46b0f26` | changed by |
+|---|---|---|---|
+| `crates/cowfs-core/src/ns.rs` | blob `84088323fb5798c129d1f3454bce88d60ca0bfbc` | blob `5a1024c115d51806131c6f6cc9ff99f5f20e6588` | `2d00743`, #94 |
+| `crates/nfsserve/src/tcp.rs` | blob `c92d50e07fd4532fa423fd89cd17b2e018d13542` | blob `97e3ecd7363995d6b178509dbefd417ec7524184` | `af1d113`, #93 |
+
+Five tracked `.rs` files differ between the two revisions in total: those two, plus
+`crates/cowfs-core/tests/elide_dentry.rs`, `crates/cowfs-nfs/src/mount.rs` and
+`crates/cowfs-nfs/tests/resource_bounds.rs`. The `ns.rs` change is a correctness fix to the dentry
+cache: an elided create now marks the entry dirty with the queued `seq` instead of `0`, so a
+queued unlink the cache has not seen cannot be lost. The `tcp.rs` change makes `EMFILE` from `accept`
+recoverable rather than fatal.
+
+Both are in the shipped code paths this harness exercises: `ns.rs` is the namespace dentry cache
+behind the metadata layer, and `tcp.rs` is the NFS listener. So the binary the run above measured
+was built from genuinely different source.
+
+Therefore the six losses, the 46-of-52 durability match and every other count above are properties of
+the **pre-merge source**. They are carried forward as that run's record and nothing more. Re-running
+all 29 cases purely to restate unchanged numbers was not done: eleven other workers hold the shared
 heavy lane, and the brief for this revision scopes the re-measurement. What is needed instead is a
-scoped re-measurement of the failing boundary on the integrated binary, which is the next section.
+scoped re-measurement of the failing boundary on the integrated source, which is the next section.
+
+The integrated build's digests, `eb48f336` for the daemon and `e0cc963b` for the CLI, are recorded
+below as the artifacts that particular run used. They are build-specific, they are not reproducible,
+and they are not offered as evidence of anything about source.
 
 ### Scoped re-measurement on the integrated binary
 
@@ -85,19 +125,31 @@ store, SIGKILL and reopen:
 | run exit | 1, `executed_with_failures` |
 | receipt | one `durable` receipt, `nfs_commit` boundary, seq 1, on `live/moved.bin` |
 | teardown | `unmount.after_kill` and `unmount.teardown` both `not_mounted`, `abandoned: false` |
+| harness digest, source identity | `1c400c5edd34208eaf1d1c0a205cea4156e35ef534a553186aef36289aee3e10` |
+| `cowfs-daemon` artifact, build-specific | `eb48f336d56c7632e15a12481a6e4cee5a2eadf88f104fcd80db98db69c39e0a` |
+| `cowfs` artifact, build-specific | `e0cc963bb66d897f4b0567ebe8c3966f748f81cdead5e6a447fddd6c7936029d` |
 | evidence | `bench/out/crash88/integrated-sample/` (gitignored) |
 
-The finding is therefore **unchanged on the integrated binary**: a successful POSIX parent-directory
-`fsync` after `rename` still emits no COMMIT on this client, and the promised name is still lost.
-That is the same defect issue #90 owns, and it is still not fixed here. Receipt classification is
-unchanged: nothing was downgraded to make the run read better.
+The two artifact digests identify the binaries that particular run executed. They are not
+reproducible from the source and are not evidence of it; the source identity for this run is the
+harness digest and the merged revision.
+
+The finding is therefore **unchanged on the integrated source**: a successful POSIX
+parent-directory `fsync` after `rename` still emits no COMMIT on this client, and the promised name
+is still lost. That is the same defect issue #90 owns, and it is still not fixed here. Receipt
+classification is unchanged: nothing was downgraded to make the run read better.
+
+This is a deliberate scope boundary. Neither #93 nor #95 touches the `fsync`-after-`rename` COMMIT
+path: #94 changes the dentry cache's dirty marking on an elided create, and #93 changes accept-loop
+error handling. Re-running the full 29-case matrix on the merged source would restate numbers this
+revision has no reason to restate, while the shared heavy lane is held by eleven other workers.
 
 The teardown records are the first real-run evidence for the tri-state mount inspection. Both real
 unmounts returned `not_mounted` after the fact with no abandonment, and the pre-existing
 `unmount.refused_not_our_mount` still records a genuine absence when nothing is mounted. No
 `unmount.blocked_unknown_mount_state` appeared, because the table was readable on this host.
 
-What this run does **not** establish: the 29-case matrix on the integrated binary. Only the failing
+What this run does **not** establish: the 29-case matrix on the merged source. Only the failing
 boundary and its passing neighbour were re-measured. The other counts above remain the `90c9a8f`
 run's and are labelled as such.
 
@@ -366,8 +418,22 @@ worker's tree, none were mine, and none were touched.
 
 ## CI
 
-`bench/test_daemon_crash.py`, now 154 tests, discovered by the step CI already runs,
-`python3 -m unittest discover -s bench`. No workflow change. Synthetic ledgers, fake fixtures and
+The CI step runs `python3 -m unittest discover -s bench`, which discovers **154 tests** at this
+revision. That total is not one file:
+
+| | |
+|---|---|
+| `python3 -m unittest discover -s bench` | 154 |
+| `bench/test_daemon_crash.py` | 118 |
+| `bench/test_gates.py` | 36 |
+| skips | 1, `no /proc on this platform`, at `bench/test_daemon_crash.py:1362` |
+
+An earlier revision of this document attributed 154 to `bench/test_daemon_crash.py`. That file has
+118; the other 36 are `test_gates.py`, which this work did not add and does not own. The distinction
+matters because 154 is the number to re-run, while 118 is the number attributable to this harness.
+
+Locally on this Mac the run is `OK (skipped=1)`, exit 0. The skip is the only platform-dependent case
+and it is a genuine skip, not a silent pass. No workflow change. Synthetic ledgers, fake fixtures and
 short-lived private processes only: no daemon, no mount, no cargo, nothing under `~/.cowfs`.
 
 The counter reader is injectable, so the available path is tested deterministically with an
