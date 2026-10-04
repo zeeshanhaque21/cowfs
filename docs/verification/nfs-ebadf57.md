@@ -159,7 +159,7 @@ need `accept`, and after the flood none of them succeeded.
 
 Two changes, both minimal, neither relaxing a limit or a timeout.
 
-**`crates/nfsserve/src/tcp.rs`** — `EMFILE` is a recoverable accept error:
+**`crates/nfsserve/src/tcp.rs`**: `EMFILE` is a recoverable accept error:
 
 ```rust
 const EMFILE: i32 = 24;
@@ -175,7 +175,7 @@ fn is_transient_accept_error(e: &io::Error) -> bool {
 `io::ErrorKind::TooManyOpenFiles` is still unstable on stable Rust, so the number is spelled out.
 It is 24 on Linux and macOS, the only targets.
 
-**`crates/cowfs-nfs/src/mount.rs`** — a fatal accept-loop exit is now reported instead of dropped.
+**`crates/cowfs-nfs/src/mount.rs`**: a fatal accept-loop exit is now reported instead of dropped.
 Recoverable errors are looped over inside the listener, so anything arriving at that `await` is
 fatal and about to stop the port accepting. Silently swallowing it is what made this class of
 failure invisible.
