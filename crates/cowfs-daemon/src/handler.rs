@@ -489,6 +489,10 @@ fn damage(d: &cowfs_store::Damage) -> cowfs_ctl::FsckProblem {
             kind: "index_entry".into(),
             detail: format!("block {id}"),
         },
+        Damage::MissingLiveBlock { id } => cowfs_ctl::FsckProblem {
+            kind: "missing_live_block".into(),
+            detail: format!("live reference to absent block {id}"),
+        },
     }
 }
 
@@ -928,6 +932,92 @@ mod tests {
         assert!(
             again.freed_bytes > 0,
             "the next request finishes the job: {again:?}"
+        );
+    }
+
+    /// A durable snapshot references a block the store acknowledged as lost: `fsck` over the
+    /// control path must report it, not clean. This is the way an operator hits #84.
+    #[test]
+    fn fsck_reports_a_missing_live_block_over_the_control_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let core_opts = || cowfs_core::Options {
+            background: false,
+            store: cowfs_store::Options {
+                max_pack_size: 96 << 10,
+                checkpoint_on_drop: true,
+                ..cowfs_store::Options::default()
+            },
+            file_flush_bytes: 32 << 10,
+            ..cowfs_core::Options::default()
+        };
+
+        // Build a durable snapshot with one file, then close the backend cleanly.
+        {
+            let backend: Arc<dyn Backend> =
+                Arc::new(crate::backend::CoreBackend::open(&store, core_opts()).unwrap());
+            let mount = Arc::new(Mounted::no_mount(dir.path().join("mnt")).unwrap());
+            let exports = Exports::new(
+                Arc::clone(&backend),
+                vec![dir.path().join("pool")],
+                vec![backend.store_path().to_owned()],
+                dir.path().join("mnt"),
+            );
+            let h = Handler::new(Arc::clone(&backend), mount, exports);
+            h.snapshot_create(SnapshotCreate {
+                name: "s".into(),
+                from: None,
+            })
+            .unwrap();
+            {
+                let s = backend.snapshot("s").unwrap();
+                put(s.as_ref(), "f", &body(300_000, 5));
+                s.fsync(cowfs_vfs::ROOT_INO, false).unwrap();
+            }
+            backend.close().unwrap();
+            drop(h);
+        }
+
+        // Fixture-owned corruption: remove the pack, acknowledge the loss as the old reader did.
+        let block_store = store.join("store");
+        let mut victims: Vec<std::path::PathBuf> = std::fs::read_dir(block_store.join("packs"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "cpk"))
+            .collect();
+        victims.sort();
+        let victim = victims.pop().expect("a pack to remove");
+        assert!(std::fs::metadata(&victim).unwrap().len() > 0, "empty pack");
+        std::fs::remove_file(&victim).unwrap();
+        {
+            let s = cowfs_store::Store::open(&block_store, core_opts().store).unwrap();
+            assert!(s.recovery().has_corruption(), "loss not seen");
+            s.acknowledge_corruption().unwrap();
+        }
+
+        // Reopen over the control path and run fsck the way a client does.
+        let backend: Arc<dyn Backend> =
+            Arc::new(crate::backend::CoreBackend::open(&store, core_opts()).unwrap());
+        let mount = Arc::new(Mounted::no_mount(dir.path().join("mnt")).unwrap());
+        let exports = Exports::new(
+            Arc::clone(&backend),
+            vec![dir.path().join("pool")],
+            vec![backend.store_path().to_owned()],
+            dir.path().join("mnt"),
+        );
+        let h = Handler::new(Arc::clone(&backend), mount, exports);
+        let report = h.fsck(&OpContext::detached()).unwrap();
+        assert!(
+            !report.ok,
+            "fsck reported ok while a live file referenced a missing block"
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.kind == "missing_live_block"),
+            "fsck did not name the missing live block: {:?}",
+            report.problems
         );
     }
 

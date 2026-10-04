@@ -514,6 +514,11 @@ It reports records, verified unique blocks, duplicate records, damaged regions (
 It is safe to run while other threads use the store.
 It only reads.
 
+`Store::fsck` checks record integrity, not filesystem-reference integrity: it only sees records that are still on disk.
+A durable snapshot can name a block that is gone while every extant record verifies, which is a clean store and a broken filesystem.
+The filesystem-level check belongs to `Core::fsck`, which walks the snapshot trees and reports `Damage::MissingLiveBlock` for a live id the store does not contain.
+See `docs/fsck-reference-integrity.md`.
+
 ## Packs
 
 `Options::max_pack_size` defaults to 256 MiB and is clamped to 2 GiB, so record offsets fit in 32 bits.
