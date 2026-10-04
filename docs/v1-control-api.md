@@ -280,7 +280,9 @@ otherwise) and it is `busy` with nothing changed while anything holds it.
 `rewrite_bytes` is the bytes written into the packs the cycle created, file headers included.
 `net_reclaimed_bytes` is `gross_removed_bytes - rewrite_bytes`, signed.
 A payload from before these fields existed carries none of the three: `gross_removed_bytes` is taken from `freed_bytes`, and `rewrite_bytes` and `net_reclaimed_bytes` are **unknown**, not zero, because a legacy cycle may have rewritten a pack. A client must treat their absence as unknown and must not report a net of zero.
-The three are present together or absent together; a payload carrying only some of them is rejected, as is one whose `gross_removed_bytes` disagrees with `freed_bytes` or whose `net_reclaimed_bytes` is not exactly `gross_removed_bytes - rewrite_bytes`.
+`rewrite_bytes` and `net_reclaimed_bytes` are present together or absent together; a payload carrying only one of them is rejected, as is one whose `net_reclaimed_bytes` is not exactly `gross_removed_bytes - rewrite_bytes`.
+`gross_removed_bytes` is separate, because it only restates `freed_bytes`: absent falls back to it, a present value that disagrees is rejected, and it may appear alone, which is what serializing a legacy report produces.
+An unknown `rewrite_bytes` or `net_reclaimed_bytes` is omitted from the JSON rather than written as `null`, so a decoded report round-trips through `cowfs --json` and the CLI's own output always decodes again.
 
 `FsckReport`: `{ok, blocks_checked, bytes_checked, snapshots_checked, problems: [{kind, detail}]}`.
 

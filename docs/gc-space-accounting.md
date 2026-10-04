@@ -77,9 +77,20 @@ Its gross is real and is taken from `freed_bytes`, but its **net is unknown**, a
 A legacy cycle may well have rewritten a pack; deriving `net = gross` or `net = gross - 0` would report a saving that was never measured.
 So `rewrite_bytes` and `net_reclaimed_bytes` are `Option` on the control side, `None` meaning unknown, and the CLI human line for such a report says `rewrite and net unknown (legacy report)` instead of printing a false zero.
 
-The three new fields are one unit on the wire: present together or absent together.
-A payload carrying only some of them is rejected, as is one whose explicit `gross_removed_bytes` disagrees with `freed_bytes`, or whose `net_reclaimed_bytes` is not exactly `gross - rewrite`, or whose difference does not fit an `i64`.
-Both checks exist so a malformed report surfaces as an error instead of decoding into a wrong number.
+On the wire, `rewrite_bytes` and `net_reclaimed_bytes` are one unit: both present means a new report with measured figures, both absent means the net is unknown, and exactly one of them is a half-written report and is rejected.
+
+`gross_removed_bytes` is separate, because it only restates `freed_bytes`: an absent one falls back to it, and a present one that disagrees is rejected.
+A payload may carry the gross alone, which is what serializing a legacy report produces, since a legacy report knows its gross even though it does not know its net.
+A `net_reclaimed_bytes` that is not exactly `gross - rewrite`, or whose difference does not fit an `i64`, is rejected.
+Every one of those checks exists so a malformed report surfaces as an error instead of decoding into a wrong number.
+
+### An unknown figure is omitted, not null
+
+A report serializes an unknown `rewrite_bytes` or `net_reclaimed_bytes` by leaving the field out, rather than writing `null`.
+So a legacy report serializes to the shape a pre-#81 server would have sent, and decodes back to the same value.
+
+This matters because the CLI prints a decoded report straight back out: `cowfs --json gc` writes `response.data_json()`. When the two unknown figures were written as `null` while the gross stayed present, that JSON was the shape the decoder called a half-written report, so the CLI emitted output its own protocol layer rejected, and any consumer that piped `cowfs --json gc` into a cowfs-protocol parser or stored the JSON to replay it got a hard error on output the tool had just produced.
+The regression test `a_legacy_gc_report_round_trips_through_the_json_the_client_prints` decodes, prints through `data_json()`, and decodes again, asserting equality, and it fails against the `null` form.
 
 The CLI human line for a real cycle reads `freed N blocks; X removed (gross), Y rewritten, net Z reclaimed`, and the dry-run line labels its number an estimate.
 
