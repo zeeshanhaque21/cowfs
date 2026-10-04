@@ -188,6 +188,9 @@ fn server_frames() -> Vec<(&'static str, ServerFrame)> {
                 candidate_bytes: 196_608,
                 freed_blocks: 0,
                 freed_bytes: 0,
+                gross_removed_bytes: 0,
+                rewrite_bytes: Some(0),
+                net_reclaimed_bytes: Some(0),
             })),
         ),
         (
@@ -480,6 +483,189 @@ fn unknown_response_kind_decodes_to_unknown_with_raw_data() {
     let bad =
         ServerFrame::decode(br#"{"type":"response","id":1,"result":{"kind":"gc","data":{}}}"#);
     assert!(bad.is_err(), "a known kind with bad data is still an error");
+}
+
+#[test]
+fn an_old_gc_report_without_the_gross_fields_still_decodes() {
+    // A pre-#81 server sends the five original fields. The gross is real, but the rewrite cost
+    // was never measured, so the net is unknown, not zero: a legacy cycle may have rewritten a
+    // pack. Deriving net = gross would report a saving nobody measured.
+    let f = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608}}}"#,
+    );
+    let Ok(ServerFrame::Response { result, .. }) = f else {
+        panic!("{f:?}")
+    };
+    let Response::Gc(g) = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(g.freed_bytes, 196_608, "the legacy gross field is intact");
+    assert_eq!(
+        g.gross_removed_bytes, 196_608,
+        "an absent explicit gross falls back to freed_bytes, not zero"
+    );
+    assert_eq!(g.rewrite_bytes, None, "legacy rewrite is unknown, not zero");
+    assert_eq!(
+        g.net_reclaimed_bytes, None,
+        "legacy net is unknown, not a false zero and not gross"
+    );
+}
+
+#[test]
+fn a_gc_report_that_carries_the_gross_fields_keeps_them() {
+    let f = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608,"rewrite_bytes":1024,"net_reclaimed_bytes":195584}}}"#,
+    );
+    let Ok(ServerFrame::Response { result, .. }) = f else {
+        panic!("{f:?}")
+    };
+    let Response::Gc(g) = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(g.gross_removed_bytes, 196_608);
+    assert_eq!(g.rewrite_bytes, Some(1024));
+    assert_eq!(g.net_reclaimed_bytes, Some(195_584));
+}
+
+#[test]
+fn a_gc_report_with_half_the_rewrite_and_net_pair_is_rejected() {
+    // Rewrite and net are one unit: exactly one of them means a half-written report, which cannot
+    // be repaired without inventing the missing half, so it is an error rather than a quiet
+    // default.
+    for data in [
+        r#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"rewrite_bytes":1024}}}"#,
+        r#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"net_reclaimed_bytes":195584}}}"#,
+        r#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608,"rewrite_bytes":1024}}}"#,
+        r#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608,"net_reclaimed_bytes":195584}}}"#,
+    ] {
+        assert!(
+            ServerFrame::decode(data.as_bytes()).is_err(),
+            "half of the rewrite/net pair must be rejected: {data}"
+        );
+    }
+}
+
+#[test]
+fn a_gc_report_may_carry_gross_alone_because_serialize_writes_it_that_way() {
+    // `gross_removed_bytes` is only a restatement of `freed_bytes`, and a legacy report knows its
+    // gross even though it does not know its net. Serializing a legacy report therefore produces
+    // exactly this shape, so accepting it is what makes the round trip work.
+    let f = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608}}}"#,
+    );
+    let Ok(ServerFrame::Response { result, .. }) = f else {
+        panic!("{f:?}")
+    };
+    let Response::Gc(g) = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(g.gross_removed_bytes, 196_608);
+    assert_eq!(g.rewrite_bytes, None);
+    assert_eq!(
+        g.net_reclaimed_bytes, None,
+        "gross alone is still an unknown net"
+    );
+}
+
+/// The CLI prints a decoded report back as JSON, so the JSON it prints must decode again to the
+/// same value. This is the regression for the tool rejecting its own output: a legacy report
+/// serialized its two unknown figures as `null` while gross stayed present, which the decoder then
+/// classified as a half-written report.
+#[test]
+fn a_legacy_gc_report_round_trips_through_the_json_the_client_prints() {
+    for payload in [
+        // A pre-#81 payload: no gross, no rewrite, no net.
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608}}}"#.to_vec(),
+        // The shape that shape serializes back to.
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608}}}"#.to_vec(),
+        // A new report with all the figures measured.
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608,"rewrite_bytes":1024,"net_reclaimed_bytes":195584}}}"#.to_vec(),
+        // A negative net, the signed case.
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":0,"gross_removed_bytes":0,"rewrite_bytes":4096,"net_reclaimed_bytes":-4096}}}"#.to_vec(),
+    ] {
+        let f = ServerFrame::decode(&payload).unwrap_or_else(|e| panic!("{e:?}: {payload:?}"));
+        let ServerFrame::Response { result, .. } = f else {
+            panic!("{f:?}")
+        };
+        let first = result.clone();
+
+        // Exactly what `cowfs --json gc` writes for this response: the CLI prints
+        // `response.data_json()`, so this is the output a user pipes onward.
+        let printed = serde_json::to_string(&result.data_json()).expect("serialize");
+
+        let again = format!(
+            r#"{{"type":"response","id":1,"result":{{"kind":"gc","data":{printed}}}}}"#
+        );
+        let f2 = ServerFrame::decode(again.as_bytes())
+            .unwrap_or_else(|e| panic!("the client's own output was rejected: {e:?}\n{printed}"));
+        let ServerFrame::Response { result: second, .. } = f2 else {
+            panic!("{f2:?}")
+        };
+
+        assert_eq!(
+            second, first,
+            "the printed JSON does not decode back to the same report\n{printed}"
+        );
+        // And the arithmetic a new report claims survives the trip.
+        let Response::Gc(g) = &second else {
+            panic!("{second:?}")
+        };
+        match (g.rewrite_bytes, g.net_reclaimed_bytes) {
+            (Some(rewrite), Some(net)) => assert_eq!(
+                net,
+                g.gross_removed_bytes as i64 - rewrite as i64,
+                "gross minus rewrite after a round trip: {printed}"
+            ),
+            (None, None) => assert_eq!(
+                g.gross_removed_bytes, g.freed_bytes,
+                "an unknown net still reports the real gross: {printed}"
+            ),
+            pair => panic!("a half-known report came back: {pair:?}"),
+        }
+    }
+}
+
+/// The unknown figures are omitted from the JSON, not written as `null`, so a legacy report
+/// serializes to the shape a legacy server would have sent.
+#[test]
+fn an_unknown_gc_figure_is_omitted_from_json_not_written_as_null() {
+    let f = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608}}}"#,
+    )
+    .expect("decode");
+    let ServerFrame::Response { result, .. } = f else {
+        panic!("not a response")
+    };
+    let v = result.data_json();
+    assert_eq!(v["gross_removed_bytes"], 196_608, "the gross is known: {v}");
+    assert!(
+        v.get("rewrite_bytes").is_none(),
+        "an unknown rewrite is absent, not null: {v}"
+    );
+    assert!(
+        v.get("net_reclaimed_bytes").is_none(),
+        "an unknown net is absent, not null: {v}"
+    );
+}
+
+#[test]
+fn a_gc_report_with_inconsistent_gross_fields_is_rejected() {
+    // An explicit gross that disagrees with freed_bytes, or a net that is not gross minus
+    // rewrite, is a corrupt report. Accepting it would print a number that never happened.
+    let mismatched_gross = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":100,"rewrite_bytes":0,"net_reclaimed_bytes":100}}}"#,
+    );
+    assert!(mismatched_gross.is_err(), "gross != freed_bytes");
+
+    let mismatched_net = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":196608,"gross_removed_bytes":196608,"rewrite_bytes":1024,"net_reclaimed_bytes":999}}}"#,
+    );
+    assert!(mismatched_net.is_err(), "net != gross - rewrite");
+
+    let out_of_range = ServerFrame::decode(
+        br#"{"type":"response","id":1,"result":{"kind":"gc","data":{"dry_run":false,"candidate_blocks":3,"candidate_bytes":196608,"freed_blocks":3,"freed_bytes":18446744073709551615,"gross_removed_bytes":18446744073709551615,"rewrite_bytes":0,"net_reclaimed_bytes":0}}}"#,
+    );
+    assert!(out_of_range.is_err(), "gross - rewrite out of i64 range");
 }
 
 #[test]

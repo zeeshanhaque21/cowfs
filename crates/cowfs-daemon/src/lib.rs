@@ -42,7 +42,9 @@ pub mod holders;
 pub mod import;
 pub mod mounts;
 
-pub use backend::{Backend, CoreBackend, MemBackend, PathBackend, Snapshots, Usage};
+pub use backend::{
+    Backend, CoreBackend, GcOutcome, GcProgress, MemBackend, PathBackend, Snapshots, Usage,
+};
 pub use daemon::{
     install_backstop_signal_cleanup, open_handler, prepare_platform, BackendKind, Daemon,
     DaemonConfig, DaemonError,

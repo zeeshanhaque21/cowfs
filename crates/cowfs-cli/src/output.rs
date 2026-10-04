@@ -18,6 +18,16 @@ fn bytes(n: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+/// Like [`bytes`], with a leading sign, so a negative net (a cycle that cost more than it
+/// removed) reads truthfully instead of saturating to zero.
+fn signed_bytes(n: i64) -> String {
+    if n < 0 {
+        format!("-{}", bytes(n.unsigned_abs()))
+    } else {
+        bytes(n as u64)
+    }
+}
+
 /// `part` as a percentage of `whole`, or `all of it` when the store holds nothing new.
 fn percent(whole: u64, part: u64) -> String {
     if whole == 0 {
@@ -103,11 +113,26 @@ pub fn human(response: &Response) -> String {
         Response::Snapshot(s) => snapshot_line(s),
         Response::Ok(_) => "ok".into(),
         Response::Gc(g) if g.dry_run => format!(
-            "dry run: {} blocks ({}) would be freed",
+            "dry run: {} blocks ({} estimated dead bytes); no packs unlinked, nothing rewritten",
             g.candidate_blocks,
             bytes(g.candidate_bytes)
         ),
-        Response::Gc(g) => format!("freed {} blocks ({})", g.freed_blocks, bytes(g.freed_bytes)),
+        Response::Gc(g) => match (g.rewrite_bytes, g.net_reclaimed_bytes) {
+            (Some(rewrite), Some(net)) => format!(
+                "freed {} blocks; {} removed (gross), {} rewritten, net {} reclaimed",
+                g.freed_blocks,
+                bytes(g.gross_removed_bytes),
+                bytes(rewrite),
+                signed_bytes(net)
+            ),
+            // A report from before the rewrite and net fields: gross is real, but the rewrite
+            // cost was never measured, so the net is unknown rather than zero.
+            _ => format!(
+                "freed {} blocks; {} removed (gross); rewrite and net unknown (legacy report)",
+                g.freed_blocks,
+                bytes(g.gross_removed_bytes)
+            ),
+        },
         Response::Fsck(f) => {
             let mut out = format!(
                 "{}: {} blocks ({}), {} snapshots checked",
@@ -310,6 +335,54 @@ mod tests {
         assert_eq!(bytes(1536), "1.5 KiB");
         assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
         assert_eq!(bytes(u64::MAX), "16777216.0 TiB");
+    }
+
+    #[test]
+    fn signed_bytes_keeps_a_negative_net_visible() {
+        assert_eq!(signed_bytes(0), "0 B");
+        assert_eq!(signed_bytes(1536), "1.5 KiB");
+        assert_eq!(signed_bytes(-1536), "-1.5 KiB");
+        assert_eq!(signed_bytes(-1), "-1 B");
+    }
+
+    #[test]
+    fn gc_human_line_separates_gross_rewrite_and_net() {
+        use cowfs_ctl::GcReport;
+        let g = GcReport {
+            dry_run: false,
+            candidate_blocks: 7,
+            candidate_bytes: 4096,
+            freed_blocks: 7,
+            freed_bytes: 4096,
+            gross_removed_bytes: 4096,
+            rewrite_bytes: Some(1024),
+            net_reclaimed_bytes: Some(3072),
+        };
+        let text = human(&Response::Gc(g));
+        assert!(text.contains("removed (gross)"), "{text}");
+        assert!(text.contains("rewritten"), "{text}");
+        assert!(text.contains("net 3.0 KiB reclaimed"), "{text}");
+    }
+
+    #[test]
+    fn gc_human_line_says_unknown_for_a_legacy_report() {
+        use cowfs_ctl::GcReport;
+        let g = GcReport {
+            dry_run: false,
+            candidate_blocks: 7,
+            candidate_bytes: 4096,
+            freed_blocks: 7,
+            freed_bytes: 4096,
+            gross_removed_bytes: 4096,
+            rewrite_bytes: None,
+            net_reclaimed_bytes: None,
+        };
+        let text = human(&Response::Gc(g));
+        assert!(text.contains("removed (gross)"), "{text}");
+        assert!(
+            text.contains("unknown") && text.contains("legacy"),
+            "a legacy report must not print a false net: {text}"
+        );
     }
 
     #[test]

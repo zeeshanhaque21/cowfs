@@ -15,8 +15,20 @@ use cowfs_store::BlockId;
 
 const MAGIC: &[u8] = b"COWAT01";
 const ENTRY: usize = 36;
-const MAGIC_MARKS: &[u8] = b"COWMARK1";
+/// Marks cache format version.
+///
+/// `COWMARK3` records which blocks belong to which walked root.
+/// `COWMARK2` stored one flat block list under the whole root list, so every block was credited to
+/// every root, and a removed root's blocks stayed live under a surviving root's key forever.
+/// `COWMARK1` was worse: a collector before the walked-root fix could pair a listed root key with a
+/// different, newly committed root's blocks.
+/// Neither older layout carries the per-root association, so neither can be reconstructed into one
+/// and both are rejected: every root is walked in full, which is always correct.
+/// The cache is derived data: discarding it costs a walk and nothing else.
+const MAGIC_MARKS: &[u8] = b"COWMARK3";
 const ROOT_ENTRY: usize = 32;
+/// A root key and its block count, ahead of that root's own block list.
+const GROUP_ENTRY: usize = ROOT_ENTRY + 8;
 
 /// Seconds since the Unix epoch, 0 when the clock is before it or unreadable.
 pub fn now() -> u32 {
@@ -175,12 +187,20 @@ impl Hints {
 /// This is the persistent half of the incremental marking: a snapshot whose root is already here
 /// is skipped whole, and the blocks its earlier walk yielded are still known live, so a block is
 /// never condemned because the walk that found it did not run again.
+///
+/// Each root keeps its own block list, and a root is only ever recorded from a walk that started
+/// with an empty marker, so a recorded list is that root's complete reachable set. A flat union
+/// would not do: it cannot say whose blocks a removed snapshot had, so those blocks stay live under
+/// a survivor's key and no cycle can free them.
 #[derive(Debug)]
 pub struct Marks {
     path: PathBuf,
     /// Which blocks each walked root contributed. Per root, not one flat set: a flat set cannot
     /// drop a removed snapshot's blocks, because it cannot tell whose they were.
     roots: BTreeMap<[u8; 32], HashSet<BlockId>>,
+    /// Recorded (root, block) pairs, which is what the cap bounds and what the file size is made of.
+    /// Counted as it changes so `add_block` does not rebuild a union set per block.
+    assoc: usize,
     cap: usize,
     /// Set when the file held more ids than the cap. The set is then dropped, and the next cycle
     /// does a full walk, which is always correct.
@@ -195,52 +215,71 @@ impl Marks {
         let mut out = Self {
             path,
             cap,
+            assoc: 0,
             dropped: false,
             roots: BTreeMap::new(),
         };
         let Ok(bytes) = fs::read(&out.path) else {
             return out;
         };
-        let Some(body) = bytes.strip_prefix(MAGIC_MARKS) else {
-            return out;
-        };
-        let Some((n_roots, rest)) = split_u64(body) else {
-            return out;
-        };
-        let Some((n_blocks, rest)) = split_u64(rest) else {
-            return out;
-        };
-        let (Some(root_bytes), Some(block_bytes)) = (
-            n_roots.checked_mul(ROOT_ENTRY),
-            n_blocks.checked_mul(ROOT_ENTRY),
-        ) else {
-            return out;
-        };
-        if rest.len() < root_bytes + block_bytes {
-            return out;
-        }
-        let (roots, blocks) = rest.split_at(root_bytes);
-        for c in roots.as_chunks::<ROOT_ENTRY>().0 {
-            if out.roots.len() >= cap {
-                out.dropped = true;
-                break;
-            }
-            out.roots.insert(*c, HashSet::new());
-        }
-        for c in blocks.as_chunks::<ROOT_ENTRY>().0 {
-            if out.roots.is_empty() || out.n_blocks() >= cap {
-                out.dropped = true;
-                break;
-            }
-            let id = BlockId::from_bytes(*c);
-            // The file does not say which root a block came from, so it is credited to every root
-            // that was walked. Over-crediting only costs a walk later; under-crediting would free a
-            // live block, so this errs the safe way.
-            for set in out.roots.values_mut() {
-                set.insert(id);
-            }
-        }
+        out.parse(&bytes);
         out
+    }
+
+    /// Fill in the associations a well-formed file carries, or leave the set empty.
+    ///
+    /// The file is walked as a strict sequence of `[root][count][blocks]` groups and must end exactly
+    /// where the last group ends. Anything else - an old format, a torn tail, a count that runs past
+    /// the end, a repeated root - leaves the set empty, so every root is walked in full. Nothing is
+    /// committed until the whole file parses: a partial read trimmed into a smaller valid-looking set
+    /// would leave a root credited with only some of its blocks, and a later cycle would skip that
+    /// root's walk and free the rest.
+    fn parse(&mut self, bytes: &[u8]) {
+        let Some(body) = bytes.strip_prefix(MAGIC_MARKS) else {
+            return;
+        };
+        let Some((n_roots, mut rest)) = split_u64(body) else {
+            return;
+        };
+        let mut roots: BTreeMap<[u8; 32], HashSet<BlockId>> = BTreeMap::new();
+        let mut assoc = 0usize;
+        for _ in 0..n_roots {
+            if rest.len() < GROUP_ENTRY {
+                return;
+            }
+            let (key_bytes, tail) = rest.split_at(ROOT_ENTRY);
+            let Some((n_blocks, tail)) = split_u64(tail) else {
+                return;
+            };
+            let Some(wanted) = n_blocks.checked_mul(ROOT_ENTRY) else {
+                return;
+            };
+            if tail.len() < wanted {
+                return;
+            }
+            let (block_bytes, tail) = tail.split_at(wanted);
+            rest = tail;
+            // A recorded root with no blocks is never written, because it carries nothing a later
+            // cycle could seed from, so one here is a malformed file and not an empty tree.
+            if n_blocks == 0 || roots.len() >= self.cap || assoc + n_blocks > self.cap {
+                return;
+            }
+            let mut set = HashSet::with_capacity(n_blocks);
+            for b in block_bytes.as_chunks::<ROOT_ENTRY>().0 {
+                set.insert(BlockId::from_bytes(*b));
+            }
+            let key: [u8; ROOT_ENTRY] = key_bytes.try_into().unwrap_or([0; ROOT_ENTRY]);
+            if roots.insert(key, set).is_some() {
+                return;
+            }
+            assoc += n_blocks;
+        }
+        // Trailing bytes mean the root count and the body disagree about what was written.
+        if !rest.is_empty() {
+            return;
+        }
+        self.roots = roots;
+        self.assoc = assoc;
     }
 
     pub fn n_blocks(&self) -> usize {
@@ -251,13 +290,17 @@ impl Marks {
         seen.len()
     }
 
-    /// True when an earlier cycle already walked this root *and* its recorded blocks survived.
+    /// True when an earlier cycle already walked this root and its recorded blocks survived.
+    ///
+    /// A root with no recorded blocks is never true. Trusting one would skip its walk and seed live
+    /// from nothing, which frees exactly what it should have protected, and an empty set here can
+    /// only come from a malformed file: a walk that legitimately reaches no blocks is not recorded.
     ///
     /// Never true once anything was dropped: a walk can record a root and then overflow the cap
     /// before recording its blocks, and a cycle that trusted that root would skip the walk and seed
     /// live from an empty set, which frees exactly what it should have protected.
     pub fn has_root(&self, root: &[u8; ROOT_ENTRY]) -> bool {
-        !self.dropped && self.roots.contains_key(root)
+        !self.dropped && self.roots.get(root).is_some_and(|s| !s.is_empty())
     }
 
     /// The blocks an earlier cycle yielded for this root, so a skipped root's blocks stay live.
@@ -265,7 +308,7 @@ impl Marks {
         self.roots.get(root)
     }
 
-    /// Record a root an earlier cycle walked.
+    /// Record a root an earlier cycle walked, with nothing to seed from yet.
     pub fn add_root(&mut self, root: &[u8; ROOT_ENTRY]) {
         if self.roots.len() >= self.cap {
             self.dropped = true;
@@ -276,52 +319,68 @@ impl Marks {
 
     /// Record a block a walk yielded for this root.
     pub fn add_block(&mut self, root: &[u8; ROOT_ENTRY], id: BlockId) {
-        if self.n_blocks() >= self.cap {
+        if self.assoc >= self.cap {
             self.dropped = true;
             return;
         }
-        self.roots.entry(*root).or_default().insert(id);
+        if self.roots.entry(*root).or_default().insert(id) {
+            self.assoc += 1;
+        }
     }
 
     /// Drop the roots `keep` rejects, and the blocks only they held.
     pub fn retain_roots(&mut self, keep: &dyn Fn(&[u8; 32]) -> bool) {
-        self.roots.retain(|r, _| keep(r));
+        let mut gone = 0usize;
+        self.roots.retain(|r, s| {
+            if keep(r) {
+                true
+            } else {
+                gone += s.len();
+                false
+            }
+        });
+        self.assoc -= gone;
     }
 
     /// Replace the file with the current set, dropping `dead` first.
     ///
     /// Written whole through a temporary name, fsynced and renamed, so a crash leaves the previous
     /// set or the new one, never a half-written mix that would let a later cycle condemn a block
-    /// whose root it is about to skip.
+    /// whose root it is about to skip. A block two roots share is written under both: what is
+    /// recorded has to be each root's own set, not the union, which is the whole point.
     pub fn save(&mut self, dead: &HashSet<BlockId>) -> io::Result<()> {
         if !dead.is_empty() {
+            let mut gone = 0usize;
             for set in self.roots.values_mut() {
+                let before = set.len();
                 set.retain(|b| !dead.contains(b));
+                gone += before - set.len();
             }
-            self.roots.retain(|_, s| !s.is_empty());
+            self.assoc -= gone;
         }
+        // A root that recorded nothing cannot seed a later cycle, so it is not written and the
+        // next cycle walks it again. That also keeps every written root non-empty, which is what
+        // makes an empty set in a file mean corruption rather than an empty tree.
+        self.roots.retain(|_, s| !s.is_empty());
         if self.dropped {
             let _ = fs::remove_file(&self.path);
             self.roots.clear();
+            self.assoc = 0;
             return Ok(());
         }
-        let mut all: HashSet<BlockId> = HashSet::new();
-        for set in self.roots.values() {
-            all.extend(set.iter().copied());
-        }
         let mut buf = Vec::with_capacity(
-            MAGIC_MARKS.len() + 16 + (self.roots.len() + all.len()) * ROOT_ENTRY,
+            MAGIC_MARKS.len() + 8 + self.roots.len() * GROUP_ENTRY + self.assoc * 32,
         );
         buf.extend_from_slice(MAGIC_MARKS);
         buf.extend_from_slice(&(self.roots.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&(all.len() as u64).to_le_bytes());
-        for r in self.roots.keys() {
+        for (r, set) in &self.roots {
             buf.extend_from_slice(r);
-        }
-        let mut blocks: Vec<&BlockId> = all.iter().collect();
-        blocks.sort_unstable();
-        for b in blocks {
-            buf.extend_from_slice(b.as_bytes());
+            buf.extend_from_slice(&(set.len() as u64).to_le_bytes());
+            let mut blocks: Vec<&BlockId> = set.iter().collect();
+            blocks.sort_unstable();
+            for b in blocks {
+                buf.extend_from_slice(b.as_bytes());
+            }
         }
         let tmp = self.path.with_extension("tmp");
         {
@@ -374,6 +433,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut m = Marks::load(d.path(), 16);
         m.add_root(&root(1));
+        m.add_block(&root(1), BlockId::of(b"a"));
         assert!(!m.has_root(&root(2)), "a changed root is walked again");
         assert!(m.has_root(&root(1)), "the same root is skipped");
     }
@@ -396,6 +456,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut m = Marks::load(d.path(), 16);
         m.add_root(&bytes);
+        m.add_block(&bytes, BlockId::of(b"x"));
         m.save(&HashSet::new()).unwrap();
         assert!(Marks::load(d.path(), 16).has_root(&bytes));
     }
@@ -420,6 +481,157 @@ mod tests {
         assert!(!m.dropped);
     }
 
+    /// Build a marks file by hand, so a test can state a byte shape no writer produces.
+    fn file(groups: &[(&[u8; ROOT_ENTRY], &[&BlockId])], magic: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(magic);
+        buf.extend_from_slice(&(groups.len() as u64).to_le_bytes());
+        for (root, blocks) in groups {
+            buf.extend_from_slice(*root);
+            buf.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+            for b in *blocks {
+                buf.extend_from_slice(b.as_bytes());
+            }
+        }
+        buf
+    }
+
+    /// B2: an old-format marks file (a collector before the walked-root fix) may pair a listed root
+    /// with a different root's blocks. It carries no version apart from a magic that says which
+    /// collector wrote it, so the loader must reject the whole old format and walk in full rather
+    /// than trust the wrong association.
+    #[test]
+    fn an_old_format_marks_file_is_not_reused() {
+        let d = tempfile::tempdir().unwrap();
+        let k1 = root(1);
+        let b = BlockId::of(b"b");
+        // `COWMARK1` is the shape the old collector wrote after the walked-root race: one root key,
+        // then one flat block list of the union. `COWMARK2` is the same shape, and it is the one this
+        // issue is about: every block credited to every root, so a removed root's blocks stayed live.
+        for magic in [&b"COWMARK1"[..], &b"COWMARK2"[..]] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(magic);
+            buf.extend_from_slice(&1u64.to_le_bytes());
+            buf.extend_from_slice(&1u64.to_le_bytes());
+            buf.extend_from_slice(&k1);
+            buf.extend_from_slice(b.as_bytes());
+            fs::write(d.path().join("mark.bin"), &buf).unwrap();
+
+            let m = Marks::load(d.path(), 16);
+            assert!(
+                !m.has_root(&k1),
+                "an old-format cache must not be trusted: the root is walked again"
+            );
+            assert_eq!(m.n_blocks(), 0, "no old block association is honoured");
+            assert!(!m.dropped);
+        }
+
+        // The current format carries the per-root group and does round-trip, so the rejection is the
+        // format version and not the payload.
+        fs::write(
+            d.path().join("mark.bin"),
+            file(&[(&k1, &[&b])], MAGIC_MARKS),
+        )
+        .unwrap();
+        let m = Marks::load(d.path(), 16);
+        assert!(m.has_root(&k1), "the current format is reused");
+        assert!(m.blocks_of(&k1).unwrap().contains(&b));
+    }
+
+    /// Issue 82: two roots, and each keeps its own blocks. A flat union credited to both would make
+    /// dropping one root keep the other's blocks alive.
+    #[test]
+    fn each_root_keeps_only_its_own_blocks_across_a_reload() {
+        let d = tempfile::tempdir().unwrap();
+        let (k1, k2) = (root(1), root(2));
+        let (a, b, shared) = (BlockId::of(b"a"), BlockId::of(b"b"), BlockId::of(b"shared"));
+        let mut m = Marks::load(d.path(), 16);
+        m.add_root(&k1);
+        m.add_block(&k1, a);
+        m.add_block(&k1, shared);
+        m.add_root(&k2);
+        m.add_block(&k2, b);
+        m.add_block(&k2, shared);
+        m.save(&HashSet::new()).unwrap();
+
+        let back = Marks::load(d.path(), 16);
+        let one = back.blocks_of(&k1).unwrap();
+        let two = back.blocks_of(&k2).unwrap();
+        assert!(
+            one.contains(&a) && !one.contains(&b),
+            "root 1 kept its own block"
+        );
+        assert!(
+            two.contains(&b) && !two.contains(&a),
+            "root 2 kept its own block"
+        );
+        assert!(
+            one.contains(&shared) && two.contains(&shared),
+            "a block two roots share is credited to both"
+        );
+
+        // Dropping one root takes only that root's exclusive blocks with it.
+        let mut m = back;
+        m.retain_roots(&|r| *r == k2);
+        assert!(m.blocks_of(&k1).is_none());
+        let left = m.blocks_of(&k2).unwrap();
+        assert!(
+            left.contains(&shared),
+            "the shared block stays for the root that kept it"
+        );
+        assert_eq!(left.len(), 2);
+    }
+
+    /// A malformed file is a full walk, never a smaller set that looks valid. Trimming a partial
+    /// read would leave a root credited with only some of its blocks, and trusting that root would
+    /// skip its walk and free the rest.
+    #[test]
+    fn a_malformed_file_is_never_a_smaller_valid_set() {
+        let d = tempfile::tempdir().unwrap();
+        let (k1, k2) = (root(1), root(2));
+        let (a, b) = (BlockId::of(b"a"), BlockId::of(b"b"));
+        let good = file(&[(&k1, &[&a]), (&k2, &[&b])], MAGIC_MARKS);
+
+        // A count that runs past the end of the file, which is what a torn write looks like.
+        let mut over = good.clone();
+        let n_at = MAGIC_MARKS.len();
+        over[n_at..n_at + 8].copy_from_slice(&9u64.to_le_bytes());
+        // Trailing bytes the root count does not account for.
+        let mut extra = good.clone();
+        extra.extend_from_slice(b"tail");
+        // The same root twice, where the second group would silently overwrite the first.
+        let mut twice = good.clone();
+        let mut second = Vec::new();
+        second.extend_from_slice(&k1);
+        second.extend_from_slice(&1u64.to_le_bytes());
+        second.extend_from_slice(b.as_bytes());
+        twice.extend_from_slice(&second);
+        // A root with no blocks, which no writer emits and which would seed a skipped walk with
+        // nothing.
+        let mut empty_group = good.clone();
+        empty_group.extend_from_slice(&k1);
+        empty_group.extend_from_slice(&0u64.to_le_bytes());
+
+        for (what, bytes) in [
+            ("a count past the end", over),
+            ("trailing bytes", extra),
+            ("a repeated root", twice),
+            ("a root with no blocks", empty_group),
+        ] {
+            fs::write(d.path().join("mark.bin"), &bytes).unwrap();
+            let m = Marks::load(d.path(), 16);
+            assert_eq!(m.n_blocks(), 0, "{what} must not yield a partial set");
+            assert!(!m.has_root(&k1), "{what} must not leave a trusted root");
+            assert!(!m.dropped, "{what} is an empty set, not a dropped one");
+        }
+
+        // The intact file is the control: it is the same bytes with nothing wrong.
+        fs::write(d.path().join("mark.bin"), &good).unwrap();
+        let m = Marks::load(d.path(), 16);
+        assert_eq!(m.n_blocks(), 2);
+        assert!(m.has_root(&k1) && m.has_root(&k2));
+    }
+
     #[test]
     fn a_truncated_file_is_an_empty_set() {
         let d = tempfile::tempdir().unwrap();
@@ -431,7 +643,9 @@ mod tests {
         let mut b = fs::read(&path).unwrap();
         b.truncate(b.len() - 3);
         fs::write(&path, &b).unwrap();
-        assert!(Marks::load(d.path(), 16).n_blocks() == 0);
+        let m = Marks::load(d.path(), 16);
+        assert_eq!(m.n_blocks(), 0);
+        assert!(!m.has_root(&root(3)), "a torn tail leaves no trusted root");
     }
 
     #[test]

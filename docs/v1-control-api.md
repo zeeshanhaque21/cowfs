@@ -274,7 +274,15 @@ otherwise) and it is `busy` with nothing changed while anything holds it.
 - `base`: null, or `{repo, git_ref, commit}` where each field is a string or null.
 - `created_unix_ms`: integer.
 
-`GcReport`: `{dry_run, candidate_blocks, candidate_bytes, freed_blocks, freed_bytes}`.
+`GcReport`: `{dry_run, candidate_blocks, candidate_bytes, freed_blocks, freed_bytes, gross_removed_bytes, rewrite_bytes, net_reclaimed_bytes}`.
+`freed_bytes` is the gross file length of every pack the cycle unlinked, kept under its original name.
+`gross_removed_bytes` is the same figure under an explicit gross name.
+`rewrite_bytes` is the bytes written into the packs the cycle created, file headers included.
+`net_reclaimed_bytes` is `gross_removed_bytes - rewrite_bytes`, signed.
+A payload from before these fields existed carries none of the three: `gross_removed_bytes` is taken from `freed_bytes`, and `rewrite_bytes` and `net_reclaimed_bytes` are **unknown**, not zero, because a legacy cycle may have rewritten a pack. A client must treat their absence as unknown and must not report a net of zero.
+`rewrite_bytes` and `net_reclaimed_bytes` are present together or absent together; a payload carrying only one of them is rejected, as is one whose `net_reclaimed_bytes` is not exactly `gross_removed_bytes - rewrite_bytes`.
+`gross_removed_bytes` is separate, because it only restates `freed_bytes`: absent falls back to it, a present value that disagrees is rejected, and it may appear alone, which is what serializing a legacy report produces.
+An unknown `rewrite_bytes` or `net_reclaimed_bytes` is omitted from the JSON rather than written as `null`, so a decoded report round-trips through `cowfs --json` and the CLI's own output always decodes again.
 
 `FsckReport`: `{ok, blocks_checked, bytes_checked, snapshots_checked, problems: [{kind, detail}]}`.
 
@@ -474,6 +482,8 @@ Within major version 1:
   With `--json` it is one `{"progress": {phase, done, total, unit, message}}` line per event.
 - Failing to write to stdout (disk full, `/dev/full`) is an error: exit 1.
   A closed pipe (`cowfs snapshot list | head -1`) exits 0, because the reader left on purpose.
+- `cowfs fsck` exits 1 when the report is not ok, so a script gating on the exit code cannot mistake a missing live block or damaged record for a clean filesystem (see `docs/fsck-reference-integrity.md`).
+  A clean check exits 0.
 - Ctrl-C (SIGINT) sends `cancel`, then waits up to 2 s for the daemon's final frame, then exits 130 either way.
   A second Ctrl-C exits 130 at once.
   SIGTERM ends the process and the daemon cancels the request when it sees the connection close.

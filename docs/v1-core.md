@@ -186,7 +186,8 @@ Tests: `a_damaged_chunk_fails_its_own_file_and_nothing_else`, `a_damaged_chunk_f
 | `list_snapshots()` | one read | |
 | `merkle_root(name)` | flush of that snapshot, then one read | root only covers committed state, so it flushes first |
 | `sync()` | flush of everything, then `Meta::sync` | |
-| `check()`, `fsck()` | scan | pass-through to `Meta::check` and `Store::fsck` after a flush |
+| `check()` | scan | pass-through to `Meta::check` after a flush |
+| `fsck()` | scan | `Store::fsck`, then a walk of every durable snapshot root for live references to absent blocks |
 
 Snapshot create is O(1) because meta's is.
 `Core` adds a flush of the source's pending operations, which is proportional to what is pending and bounded by the write-back limits, never to tree size.
@@ -384,6 +385,11 @@ One table, `error::from_meta` and `error::from_store`, tested case by case.
 
 There is ONE global order, and it is enforced by construction rather than by inspection:
 
+0. **The reference gate** (`src/gate.rs`) is outermost.
+   A thread enters it before it takes `SnapCtx::ns`, `SnapCtx::flush`, a node lock or meta's lock, and only while it may store a chunk or commit a chunk list: `flush_snapshot`, `barrier`, and `setattr` with a size.
+   `Blocks::put` takes the gate's `Entry`, so a store write outside the gate does not compile.
+   A caller that already holds a node write lock (`op_write`'s threshold flush, `relieve`) uses `try_enter` and leaves its bytes dirty when the gate is closed, so nothing parks at the gate while holding a node lock.
+   The garbage collector's barrier closes the gate (`docs/gc-core-integration.md`).
 1. `SnapCtx::ns` (namespace), then `SnapCtx::flush`, then `SnapCtx::q`.
 2. The node write lock of the file being written (`Node::st`), then the queue mutex, then a cache shard mutex (`nodes`, `dents`, `blocks`).
 3. **The meta lock is a leaf.** No lock of ours is taken while a meta read or write transaction is open, and no lock of ours is held while a meta transaction is opened.
@@ -417,6 +423,12 @@ that takes a lock is not listed here.
 | `file::flush_extent` | blocks | ? |
 | `file::verify_partial` | blocks | ? |
 | `file::read_range` | blocks | ? |
+| `gate::enter` | leaf | 1 |
+| `gate::try_enter` | leaf | 1 |
+| `gate::take` | leaf | 1 |
+| `gate::waiting` | leaf | 1 |
+| `gate::drop` | leaf | 1 |
+| `gate::a_nested_enter_is_admitted_while_a_barrier_drains` | leaf | 1 |
 | `inner::snapctx_id` | leaf | 1 |
 | `inner::all_snaps` | leaf | 1 |
 | `inner::alloc_virt` | aliases, last_error | leaf |
@@ -472,6 +484,7 @@ that takes a lock is not listed here.
 | `lib::set_load_node_contention` | leaf | 1 |
 | `lib::set_flush_fault` | leaf | 1 |
 | `lib::live_blocks` | snap. | 3 |
+| `lib::missing_live_refs` | none of this crate's locks | 1 |
 | `lib::add_snap` | leaf | 1 |
 | `lib::snap_by_name_raw` | leaf | 1 |
 | `lib::check_new_name_except` | leaf | 1 |
@@ -682,7 +695,7 @@ This was not pursued further, per the instruction not to spend long on it.
 ## Known gaps
 
 - Chunk lists are loaded whole and committed whole (see "Requests of store and meta").
-- Blocks of deleted data are only reclaimed by GC (#10), so `statfs` free space does not grow after a flushed file is deleted.
+- Blocks of deleted data are reclaimed by GC (#10, `Core::collector`), so `statfs` free space does not grow after a flushed file is deleted until a collection runs.
 - Only `fsync` and the timers make data durable; `flush` does nothing.
 - Virtual inode numbers use `<root>/virt.ino.a` and `<root>/virt.ino.b` reservations until meta can allocate durable inode numbers ahead of a transaction.
 - `Core::unpoison` requeues retained bytes after the cause is repaired; it cannot reconstruct bytes lost outside the mount.

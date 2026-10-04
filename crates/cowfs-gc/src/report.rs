@@ -62,12 +62,32 @@ pub struct GcReport {
     pub candidates: u64,
     /// Bytes of records in those packs.
     pub candidate_bytes: u64,
-    /// Bytes on disk freed by unlinking packs.
+    /// Bytes of records in those packs that no root reaches: the most a cycle can free from them.
+    pub candidate_dead_bytes: u64,
+    /// Bytes on disk freed by unlinking packs. **Gross**: the file length of each unlinked pack.
+    /// This is not the space saved, because surviving live records are rewritten into a new pack.
+    /// Kept for compatibility; [`GcReport::gross_removed_bytes`] is the same number under its
+    /// explicit name.
     pub freed_bytes: u64,
+    /// Bytes on disk removed by unlinking packs, under an explicit gross name. Equal to
+    /// [`GcReport::freed_bytes`].
+    pub gross_removed_bytes: u64,
+    /// Bytes written into the packs this cycle created, file headers included. Counts committed
+    /// rewrites and any abandoned partial copy, so it is real new bytes this cycle put on disk.
+    pub rewrite_bytes: u64,
+    /// Net space this cycle reclaimed: [`GcReport::gross_removed_bytes`] minus
+    /// [`GcReport::rewrite_bytes`], signed. Negative when the rewrite cost exceeds the removed
+    /// bytes, which is a truthful no-savings outcome rather than a saturated zero.
+    pub net_reclaimed_bytes: i64,
     /// Packs whose live records were copied into a new pack.
     pub packs_rewritten: u64,
     /// Packs unlinked. Equal to `packs_rewritten` unless something became live again.
     pub packs_unlinked: u64,
+    /// Packs that were unlinked but whose removal could not be made durable, because a step after
+    /// the unlink failed. Those bytes are still counted in the gross and net figures, because the
+    /// files really are gone, but the store cannot vouch for the unlink surviving a crash, so this
+    /// count is what tells a caller a cycle's removals need re-checking.
+    pub unlink_durability_errors: u64,
     /// Records copied into new packs.
     pub records_copied: u64,
     /// Bytes written into new packs, headers excluded.
@@ -102,7 +122,6 @@ impl GcReport {
     pub fn skip(&mut self, pack: u32, reason: SkipReason) {
         self.skipped.push(Skipped { pack, reason });
     }
-
     /// Record a failure that did not stop the cycle.
     pub fn error(&mut self, e: impl fmt::Display) {
         if self.errors.len() < MAX_ERRORS {
@@ -110,12 +129,23 @@ impl GcReport {
         }
     }
 
-    /// Bytes the cycle would free, from a dry run or a real one.
+    /// Bytes the cycle would free, from a dry run or a real one. This is the gross removal; for
+    /// the net space reclaimed use [`GcReport::net`].
     pub fn reclaimed(&self) -> u64 {
         self.freed_bytes
     }
 
+    /// Net space the cycle reclaimed: gross removed minus the bytes written into new packs,
+    /// signed.
+    pub fn net(&self) -> i64 {
+        self.net_reclaimed_bytes
+    }
+
     /// True when the cycle freed nothing and reported no failure.
+    ///
+    /// A cycle that unlinked a pack whose removal it could not make durable freed something and
+    /// reported a failure, so it is not a no-op; it is a removal that needs re-checking, which
+    /// [`GcReport::unlink_durability_errors`] counts.
     pub fn is_noop(&self) -> bool {
         self.freed_bytes == 0 && self.errors.is_empty()
     }
@@ -124,6 +154,16 @@ impl GcReport {
 /// Most failures a cycle reports. A cycle that hits this many has a systemic problem and the rest
 /// would only bury it.
 const MAX_ERRORS: usize = 32;
+
+/// Net reclaimed, `gross - rewrite`, exactly.
+///
+/// Computed in `i128` so neither operand can wrap: a store whose gross or rewrite exceeded
+/// `i64::MAX` would produce a wrapped, bogus net from a plain cast. A net that does not fit `i64`
+/// is clamped to the representable bounds, which only a store past 8 EiB could reach.
+pub(crate) fn net_reclaimed(gross: u64, rewrite: u64) -> i64 {
+    let n = i128::from(gross) - i128::from(rewrite);
+    i64::try_from(n).unwrap_or(if n < 0 { i64::MIN } else { i64::MAX })
+}
 
 /// Progress of one cycle, handed to the caller's callback.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -55,6 +55,11 @@ FULL = {
     "meta_files": 50_000,
 }
 SEED = 0xC0FFEE
+# A byte count is written in whole chunks of this size, so counts() rounds down to it.
+UNIT = {"large_bytes": 1 << 16, "big_bytes": 1 << 20}
+MIN_BYTES = 1 << 20
+SMALL_BYTES = 256
+SMALL_PER_DIR = 256
 GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
 
 # g2 edits this file: it is a leaf of the dependency graph (nothing in the
@@ -73,12 +78,19 @@ def load1() -> float:
         return float("nan")
 
 
+def scaled_bytes(key: str, scale: float) -> int:
+    want = int(FULL[key] * (scale / 100)) if -1e300 < scale < 1e300 else None  # a huge scale overflows int() on the product
+    if want is None:
+        raise OverflowError(f"scale {scale} has no representable byte count")
+    return max(MIN_BYTES, want // UNIT[key] * UNIT[key])
+
+
 def counts() -> dict:
     scale = float(os.environ.get("COWFS_BENCH_SCALE", "100"))
     out = {}
     for key, value in FULL.items():
         if key.endswith("_bytes"):
-            out[key] = max(1 << 20, int(value * scale / 100))
+            out[key] = scaled_bytes(key, scale)
         else:
             out[key] = max(10, int(value * scale / 100))
     return out
@@ -168,15 +180,16 @@ class Ctx:
 
     def ensure_tree(self):
         marker = self.tree / ".generated"
-        want = f"{self.n['small_files']} {self.n['large_files']} {SEED}"
+        want = f"{self.n['small_files']} {self.n['large_files']} {self.n['large_bytes']} {SEED}"
         if marker.exists() and marker.read_text().strip() == want:
+            self.verify_tree()
             return
         if self.tree.exists():
             shutil.rmtree(self.tree)
         rng = random.Random(SEED)
-        per = 256
+        per = SMALL_PER_DIR
         total = self.n["small_files"]
-        bodies = [bytes(rng.getrandbits(8) for _ in range(256)) for _ in range(64)]
+        bodies = [bytes(rng.getrandbits(8) for _ in range(SMALL_BYTES)) for _ in range(64)]
         for d in range(per):
             sub = self.tree / f"d{d:03d}"
             sub.mkdir(parents=True)
@@ -184,7 +197,7 @@ class Ctx:
                 (sub / f"f{i:05d}").write_bytes(bodies[(i + d) % 64])
         big = self.tree / "big"
         big.mkdir()
-        chunk = bytes(rng.getrandbits(8) for _ in range(1 << 16))
+        chunk = bytes(rng.getrandbits(8) for _ in range(UNIT["large_bytes"]))
         for i in range(self.n["large_files"]):
             with open(big / f"b{i:03d}", "wb") as fh:
                 fh.writelines(chunk for _ in range(self.n["large_bytes"] // len(chunk)))
@@ -199,10 +212,40 @@ class Ctx:
             "-C",
             str(self.tree),
         ]
+        self.verify_tree()
         checked([*git, "init", "--quiet"])
         checked([*git, "add", "-A"])
         checked([*git, "commit", "--quiet", "--no-verify", "-m", "bench tree"])
         marker.write_text(want)
+
+    def verify_tree(self):
+        """Refuse, never repair: a short or stray fixture file on the cowfs arm may be data loss.
+
+        Checks the exact entry set and file lengths, not contents: a same-length corruption is not detected,
+        because hashing 100k files on every run would dominate setup.
+        """
+        sub = max(1, self.n["small_files"] // SMALL_PER_DIR)
+        fix = f"remove {self.tree}"
+        want_dirs = {f"d{d:03d}" for d in range(SMALL_PER_DIR)}
+        want_small = {f"f{i:05d}" for i in range(sub)}
+        want_large = {f"b{i:03d}" for i in range(self.n["large_files"])}
+        try:
+            with os.scandir(self.tree) as it:
+                top = {e.name for e in it}
+            extra = top - want_dirs - {"big", ".git", ".generated"}
+            if extra or not (want_dirs | {"big"}) <= top:
+                raise SystemExit(f"tree top level differs: stray {sorted(extra)[:3]} missing {sorted((want_dirs | {'big'}) - top)[:3]}; {fix}")
+            for d in sorted(want_dirs):
+                with os.scandir(self.tree / d) as it:
+                    ents = [(e.name, e.is_file(follow_symlinks=False) and e.stat().st_size) for e in it]
+                if {n for n, _ in ents} != want_small or any(z != SMALL_BYTES for _, z in ents):
+                    raise SystemExit(f"tree {d}: want exactly {sub} files of {SMALL_BYTES} bytes, got {sorted(ents)[:3]}.. ({len(ents)} entries); {fix}")
+            with os.scandir(self.tree / "big") as it:
+                big = {e.name: e.is_file(follow_symlinks=False) and e.stat().st_size for e in it}
+            if set(big) != want_large or any(z != self.n["large_bytes"] for z in big.values()):
+                raise SystemExit(f"tree big: want exactly {len(want_large)} files of {self.n['large_bytes']} bytes, got {sorted(big.items())[:3]}.. ({len(big)} entries); {fix}")
+        except OSError as e:
+            raise SystemExit(f"tree fixture unreadable: {e}; {fix}")
 
     # --- gates ---------------------------------------------------------------
 
@@ -293,34 +336,48 @@ class Ctx:
         d = self.root / "big"
         d.mkdir(parents=True, exist_ok=True)
         path = d / "seq.bin"
-        chunk = os.urandom(1 << 20)
-        t = time.monotonic()
-        with open(path, "wb") as fh:
-            fh.writelines(chunk for _ in range(self.n["big_bytes"] // len(chunk)))
-            fh.flush()
-            os.fsync(fh.fileno())
-        write = time.monotonic() - t
-        t = time.monotonic()
-        got = 0
-        with open(path, "rb") as fh:
-            while True:
-                b = fh.read(1 << 20)
-                if not b:
-                    break
-                got += len(b)
-        read = time.monotonic() - t
-        fd = os.open(d, os.O_RDONLY)
-        os.fsync(fd)
-        os.close(fd)
-        path.unlink()
-        mib = self.n["big_bytes"] / (1 << 20)
+        chunk = os.urandom(UNIT["big_bytes"])
+        expected = self.n["big_bytes"]
+        try:
+            t = time.monotonic()
+            with open(path, "wb") as fh:
+                fh.writelines(chunk for _ in range(expected // len(chunk)))
+                fh.flush()
+                os.fsync(fh.fileno())
+            write = time.monotonic() - t
+            written = path.stat().st_size
+            if written != expected:
+                raise SystemExit(f"g5 wrote {written} bytes, counts() says {expected}")
+            t = time.monotonic()
+            got = 0
+            with open(path, "rb") as fh:
+                while True:
+                    b = fh.read(UNIT["big_bytes"])
+                    if not b:
+                        break
+                    got += len(b)
+            read = time.monotonic() - t
+            if got != written:
+                raise SystemExit(f"g5 read back {got} bytes of the {written} it wrote: invalid run, no rep recorded")
+            fd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        finally:
+            path.unlink(missing_ok=True)
+            if path.exists():
+                raise SystemExit(f"g5 could not remove its own file {path}")
+        mib = expected / (1 << 20)
         return {
-            "bytes": self.n["big_bytes"],
+            "bytes": expected,
+            "written_bytes": written,
+            "read_bytes": got,
             "write_s": write,
             "read_s": read,
             "write_mib_s": mib / write if write else 0.0,
             "read_mib_s": mib / read if read else 0.0,
-            "read_matches": got == self.n["big_bytes"],
+            "read_matches": True,
         }
 
     def g6(self):
@@ -370,6 +427,7 @@ def meta(root: Path, label: str, reps: int, gates: list, n: dict) -> dict:
         "reps": reps,
         "gates": gates,
         "counts": n,
+        "scale": float(os.environ.get("COWFS_BENCH_SCALE", "100")),
         "corpus_sha": os.environ.get("COWFS_BENCH_CORPUS_SHA", DEFAULT_SHA),
         "cargo_home": ctx_env_cargo_home(),
         "cargo_jobs": os.environ.get("COWFS_BENCH_CARGO_JOBS", "4"),

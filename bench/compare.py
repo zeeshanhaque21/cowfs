@@ -7,6 +7,30 @@ Usage: compare.py --native NATIVE.jsonl [NATIVE2.jsonl ...] --cowfs COWFS.jsonl
 Every rep of every gate is read, not just the median, and the median, min and
 max of the per-rep ratios are printed alongside the rep counts.
 
+Every input file, the noise-floor file included, is validated first, and any failure
+exits 3 with no comparison printed. A file needs exactly one valid meta record before
+its first rep, whose counts.big_bytes is an integer multiple of 1 MiB, at least 1 MiB,
+and equal to the value its scale implies when the meta records a scale, and at least
+one rep. Every rep, whatever its gate, needs a recognised gate, an integer rep index,
+a finite non-bool non-negative wall_s, and a load1_before and load1_after that are
+numeric, non-bool, and either NaN (what the harness writes when getloadavg fails) or
+finite and non-negative. Infinity, -Infinity and finite negative values are all
+refused, in every input slot. Every
+g5 rep additionally needs integer (not bool, not float) bytes, written_bytes and
+read_bytes that all equal meta big_bytes; the read_matches flag is not consulted. There
+is no legacy exemption: rows with only a flag, and files whose meta or reps break the
+rules above, are invalid, never a performance verdict.
+
+g5 is all or nothing across the inputs. If any input has g5 reps, every input must,
+else exit 3 naming the ones that do not. If no input has g5 reps, a scoped comparison
+still runs and is judged per gate as before, and the output prints `g5   not run (no
+input has g5 reps)` instead of a g5 line, never a g5 pass or a throughput claim. So
+g1/g2/g3-only comparisons keep working, and a g5 result can never be certified without
+its byte counts. A comparison in which no gate is present in both the native and the
+cowfs arm is refused (exit 3), not printed as a zero-gate pass. This is a
+byte-accounting check on the harness's own output, not provenance: it cannot tell a
+hand-written but internally consistent file from a real run.
+
 Ratios are refused, not printed, when the machine was too loaded for them to
 mean anything: load1 above 30 on either side, or the two arms more than 2x
 apart. Two previous reviewers found timings unmeasurable at load 100 to 300,
@@ -36,6 +60,9 @@ import statistics
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gates  # noqa: E402
+
 RATIO_BAR = 1.5
 LOAD_CEILING = 30.0
 LOAD_SKEW = 2.0
@@ -51,6 +78,8 @@ def load(paths):
             if not line:
                 continue
             row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
             if row.get("kind") == "meta":
                 meta = meta or row
             elif row.get("kind") == "rep":
@@ -58,6 +87,122 @@ def load(paths):
     if not reps:
         raise SystemExit(f"no reps in {paths}")
     return meta, reps
+
+
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def is_num(v):
+    try:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    except OverflowError:
+        return False
+
+
+def is_nonneg_load(v):
+    """NaN (getloadavg failed) or a finite value >= 0; a number too large for a float is not a load."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isnan(v) or (math.isfinite(v) and v >= 0)
+    except OverflowError:
+        return False
+
+
+def meta_problem(meta):
+    """Why a meta record cannot anchor g5 byte counts, or None."""
+    counts = meta.get("counts")
+    if not isinstance(counts, dict):
+        return "meta has no counts"
+    big = counts.get("big_bytes")
+    unit = gates.UNIT["big_bytes"]
+    if not is_int(big) or big < gates.MIN_BYTES or big % unit:
+        return f"meta counts big_bytes {big!r} is not an integer multiple of {unit} that is at least {gates.MIN_BYTES}"
+    if "scale" in meta:
+        scale = meta["scale"]
+        if not is_num(scale):
+            return f"meta scale {scale!r} is not a finite number"
+        try:
+            want = gates.scaled_bytes("big_bytes", scale)
+        except (OverflowError, ValueError):
+            return f"meta scale {scale!r} implies no representable byte count"
+        if big != want:
+            return f"meta scale {scale} implies big_bytes {want}, meta says {big}"
+    return None
+
+
+def g5_problem(row, meta_bytes):
+    """Why a g5 rep is not a valid read-back, or None. Integers decide; read_matches is never consulted."""
+    m = row.get("metrics")
+    if not isinstance(m, dict):
+        return "no metrics"
+    got = {k: m.get(k) for k in ("bytes", "written_bytes", "read_bytes")}
+    for k, v in got.items():
+        if not is_int(v):
+            return f"{k} {v!r} is missing or not an integer"
+    if not all(v == meta_bytes for v in got.values()):
+        return f"expected {got['bytes']} written {got['written_bytes']} read {got['read_bytes']} are not all meta big_bytes {meta_bytes}"
+    return None
+
+
+def file_problems(path):
+    """Every reason this result file cannot be trusted, plus its g5 rep count."""
+    try:
+        text = Path(path).read_text()
+    except OSError as e:
+        return [f"{path}: unreadable: {e}"], 0
+    out = []
+    meta_bytes = None
+    metas = 0
+    g5 = 0
+    reps = 0
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            out.append(f"{path}:{n}: not JSON")
+            continue
+        if not isinstance(row, dict):
+            out.append(f"{path}:{n}: not a JSON object")
+            continue
+        kind = row.get("kind")
+        if kind == "meta":
+            metas += 1
+            if metas > 1:
+                out.append(f"{path}:{n}: more than one meta record")
+                continue
+            why = meta_problem(row)
+            if why:
+                out.append(f"{path}:{n}: {why}")
+            else:
+                meta_bytes = row["counts"]["big_bytes"]
+        elif kind == "rep":
+            if metas == 0:
+                out.append(f"{path}:{n}: rep before the meta record")
+            reps += 1
+            if row.get("gate") not in GATES:
+                out.append(f"{path}:{n}: rep gate {row.get('gate')!r} is not one of {GATES}")
+            if not is_int(row.get("rep")):
+                out.append(f"{path}:{n}: rep index {row.get('rep')!r} is not an integer")
+            if not is_num(row.get("wall_s")) or row["wall_s"] < 0:
+                out.append(f"{path}:{n}: rep wall_s {row.get('wall_s')!r} is missing, not a finite number, or negative")
+            for k in ("load1_before", "load1_after"):
+                v = row.get(k)
+                if not is_nonneg_load(v):
+                    out.append(f"{path}:{n}: rep {k} {v!r} is missing, not a number, or out of range (NaN or finite >= 0)")
+            if row.get("gate") == "g5":
+                g5 += 1
+                why = g5_problem(row, meta_bytes) if meta_bytes is not None else "no valid meta to check against"
+                if why:
+                    out.append(f"{path}:{n}: g5 rep {row.get('rep')}: {why}")
+    if not metas:
+        out.append(f"{path}: no meta record")
+    if not reps:
+        out.append(f"{path}: no rep records")
+    return out, g5
 
 
 def by_gate(reps):
@@ -114,6 +259,24 @@ def main() -> int:
     args = ap.parse_args()
 
     on_macos = sys.platform == "darwin"
+    bad = []
+    g5n = {}
+    for path in [*args.native, args.cowfs, *([args.noise_floor] if args.noise_floor else [])]:
+        why, n = file_problems(path)
+        bad += why
+        g5n[path] = n
+    if any(g5n.values()):
+        bad += [f"{p}: no g5 reps while other inputs have g5" for p, n in g5n.items() if not n]
+    if not bad:
+        native_gates = set().union(*[set(by_gate(load([p])[1])) for p in args.native])
+        cowfs_gates = set(by_gate(load([args.cowfs])[1]))
+        if not native_gates & cowfs_gates:
+            bad.append("inputs: no gate is present in both the native and the cowfs arm, nothing to compare")
+    if bad:
+        for line in bad:
+            print(f"INVALID {line}", file=sys.stderr)
+        print("RESULT: invalid, g5 byte accounting is not verifiable", file=sys.stderr)
+        return 3
     _, na = load(args.native)
     _, nb = load([args.cowfs])
     ga, gb = by_gate(na), by_gate(nb)
@@ -184,6 +347,8 @@ def main() -> int:
               "which runs the native arm twice around the cowfs arms.")
 
     print()
+    if not any(g5n.values()):
+        print("g5   not run (no input has g5 reps)")
     if unmeasurable:
         print(f"RESULT: {unmeasurable} gate(s) unmeasurable, {fails} failed")
         return 2

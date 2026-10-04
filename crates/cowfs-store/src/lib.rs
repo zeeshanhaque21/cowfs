@@ -16,7 +16,7 @@ mod wm;
 use std::fmt;
 
 pub use chunk::{chunks, Chunks, AVG_CHUNK_LEN, MAX_CHUNK_LEN, MIN_CHUNK_LEN};
-pub use compact::{Compaction, PackInfo, PackPlan, Rewrite};
+pub use compact::{Compaction, Discarded, PackInfo, PackPlan, Rewrite};
 pub use error::{Error, Result};
 #[doc(hidden)]
 pub use fsio::{oplog_marker, oplog_start, oplog_take, LogOp, Op, Trace};

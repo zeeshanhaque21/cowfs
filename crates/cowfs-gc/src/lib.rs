@@ -33,9 +33,10 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use cowfs_meta::{Marker, Meta};
-use cowfs_store::{BlockId, PackPlan, Rewrite, Store};
+use cowfs_store::{BlockId, Compaction, PackPlan, Rewrite, Store};
 
 pub use error::{Error, Result, RootsError};
+use report::net_reclaimed;
 pub use report::{GcReport, Progress, SkipReason, Skipped};
 use state::{Hints, Marks};
 
@@ -113,7 +114,9 @@ pub struct Options {
     pub batch_bytes: u64,
     /// Most access-time hints held in memory. Past this, new ids are not recorded.
     pub max_hints: usize,
-    /// Most persisted marked roots and blocks. Past this the persistent set is dropped.
+    /// Most persisted (root, block) pairs and roots. Past this the persistent set is dropped.
+    /// Counting pairs rather than distinct blocks is what bounds the file, since a block two roots
+    /// share is written under both.
     pub max_persisted_blocks: usize,
     /// Report and change nothing.
     pub dry_run: bool,
@@ -137,6 +140,8 @@ impl Default for Options {
 }
 
 type ProgressFn = Box<dyn FnMut(&Progress) + Send + Sync>;
+/// A test seam that runs inside the mark walk. See [`Gc::set_between_lookup_and_walk`].
+type LookupHookFn = Box<dyn FnMut(cowfs_meta::SnapshotId) + Send>;
 
 /// A collector over one store and one metadata database.
 pub struct Gc {
@@ -153,6 +158,14 @@ pub struct Gc {
     /// one has just decided to keep. Serialising the cycle removes that whole class of race, and
     /// a real deployment runs one collect at a time anyway.
     cycle: Mutex<()>,
+    /// Test seam: run once per cycle between the freeze listing and the mark walk, so a test can
+    /// drive a commit into that exact window deterministically. `None` in production.
+    #[doc(hidden)]
+    pub between_list_and_walk: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test seam: run once per listed snapshot between its lookup and its walk, so a test can place
+    /// a removal in that exact window deterministically. `None` in production.
+    #[doc(hidden)]
+    pub between_lookup_and_walk: Mutex<Option<LookupHookFn>>,
 }
 
 impl Gc {
@@ -184,6 +197,8 @@ impl Gc {
             progress: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             cycle: Mutex::new(()),
+            between_list_and_walk: Mutex::new(None),
+            between_lookup_and_walk: Mutex::new(None),
         })
     }
 
@@ -256,6 +271,33 @@ impl Gc {
         *self.progress.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
     }
 
+    /// Test seam: run `f` once, between the freeze listing and the mark walk of the next cycle.
+    ///
+    /// The window is the one where a commit to a listed snapshot changes its root after the
+    /// listing read it; a test uses this to place such a commit deterministically, without
+    /// timing. Never set outside `tests/`.
+    #[doc(hidden)]
+    pub fn set_between_list_and_walk(&self, f: Box<dyn FnMut() + Send>) {
+        *self
+            .between_list_and_walk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// Test seam: run `f(id)` once per listed snapshot, between the collector's lookup of a listed
+    /// snapshot and the walk that reads its root.
+    ///
+    /// The window is the one where a snapshot removed after the lookup but before the walk makes the
+    /// walk report `NoSuchSnapshot`; a test uses this to place that removal deterministically,
+    /// without timing. Never set outside `tests/`.
+    #[doc(hidden)]
+    pub fn set_between_lookup_and_walk(&self, f: LookupHookFn) {
+        *self
+            .between_lookup_and_walk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
     /// One cycle: freeze, mark, choose candidates, copy, then verify and unlink under a barrier.
     ///
     /// One cycle runs at a time per collector: a second call waits. Two overlapping cycles would
@@ -320,6 +362,15 @@ impl Gc {
             .iter()
             .map(|i| (*i.root.as_bytes(), i.id))
             .collect();
+
+        if let Some(f) = self
+            .between_list_and_walk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            f();
+        }
 
         // 2. Mark. No barrier: a root captured above is immutable, so a write during the walk
         // cannot change what it yields.
@@ -391,6 +442,7 @@ impl Gc {
                 }
                 r.candidates += 1;
                 r.candidate_bytes += plan.record_bytes();
+                r.candidate_dead_bytes += plan.dead_bytes;
                 // A hint only orders the work. Coldest first, so a run that gets cut short
                 // reclaims cold bytes.
                 let cold = hints.coldness(&ids, plan.live_bytes);
@@ -452,17 +504,27 @@ impl Gc {
                 self.emit(&progress);
                 continue;
             }
-            match self.copy_one(plan, &live, &mut budget, &mut progress) {
+            let mut abandoned = 0;
+            match self.copy_one(plan, &live, &mut budget, &mut progress, &mut abandoned) {
                 // `None` means the copy was abandoned part way: the pack is left whole and the
                 // next cycle starts it again.
                 Ok(Some(rw)) => {
                     r.packs_rewritten += 1;
                     r.records_copied += rw.records;
                     r.bytes_copied += rw.bytes;
+                    r.rewrite_bytes += rw.file_bytes;
                     copied.push(rw);
                 }
-                Ok(None) => r.skip(plan.id, SkipReason::NotReached),
-                Err(e) => r.error(e),
+                Ok(None) => {
+                    // A partial copy left real bytes on disk this cycle wrote, so net never
+                    // overstates savings even though the pack was not committed.
+                    r.rewrite_bytes += abandoned;
+                    r.skip(plan.id, SkipReason::NotReached);
+                }
+                Err(e) => {
+                    r.rewrite_bytes += abandoned;
+                    r.error(e);
+                }
             }
             progress.packs_done += 1;
             self.emit(&progress);
@@ -520,13 +582,23 @@ impl Gc {
                     r.skip(rw.from, SkipReason::BecameLive);
                     continue;
                 }
-                match self.store.discard_pack(rw.from, &rw.condemned) {
-                    Ok(freed) => {
+                match self.store.discard(rw.from, &rw.condemned) {
+                    Ok(d) => {
+                        // Credit the unlink the store really performed, even when a later step
+                        // failed: gross is the file length of every pack this cycle unlinked, and
+                        // the pack is gone whether or not the acceptance record was written.
                         r.packs_unlinked += 1;
-                        r.freed_bytes += freed;
+                        r.freed_bytes += d.removed_bytes;
                         progress.freed_bytes = r.freed_bytes;
                         self.emit(&progress);
+                        // A durability failure is not swallowed. The bytes are counted because
+                        // they are gone; the error is reported because the unlink is not confirmed.
+                        if let Some(e) = d.durability_error {
+                            r.unlink_durability_errors += 1;
+                            r.error(e);
+                        }
                     }
+                    // The unlink itself failed, so nothing was removed and nothing is claimed.
                     Err(e) => r.error(e),
                 }
             }
@@ -574,34 +646,78 @@ impl Gc {
                 // blocks are in the set and the marker holds its subtrees.
                 continue;
             }
-            if record && self.marks().has_root(&key) {
-                // An earlier cycle walked this exact root, so its recorded blocks are its blocks.
-                if let Some(bs) = persisted.get(&key) {
-                    live.extend(bs.iter().copied());
-                }
-                r.marked_skipped_roots += 1;
-                walked.insert(key);
-                continue;
-            }
             // A snapshot removed between the listing and the lookup is gone, so its blocks are
             // not live. That is not an error: a collect runs while snapshots come and go.
             let Ok(snap) = self.meta.snapshot_by_id(id) else {
                 continue;
             };
-            for b in snap.live_blocks(marker)? {
+            if let Some(f) = self
+                .between_lookup_and_walk
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                f(id);
+            }
+            // The root read here and the nodes it walks are one epoch (`live_blocks_with_root`).
+            // The root can differ from the listed `key`: a writer committed to this snapshot after
+            // the freeze listing. Recording the listed key then would claim a root this walk never
+            // descended, and a fork still on the listed root would be skipped as covered while its
+            // blocks sat in no live set. So the walked root is what gets recorded, and the listed
+            // key is left unwalked for the entries that still resolve to it.
+            //
+            // The lookup above held the session read lock only for its own call, so a removal can
+            // land in the gap before this one. `live_blocks_with_root` re-reads the namespace under
+            // the lock and reports `NoSuchSnapshot` for a id removed in that gap. That id names no
+            // root in the durable table any more, and a fork of it recorded its own root before the
+            // removal committed, so no snapshot this cycle keeps is reached through it: it has no
+            // addressable root entry, and skipping it keeps nothing alive. Only that one error is
+            // skipped. Every other error is a real failure and stops the cycle, still fail-closed.
+            //
+            // A walk that starts with an empty marker descends from the root every time, so what it
+            // yields is that root's complete reachable set. A walk sharing a marker with an earlier
+            // root yields only what that walk did not already reach, which is not this root's set:
+            // recording it would let a later cycle skip this root's walk and free the blocks that a
+            // shared subtree carries. So only a complete walk is recorded, and a root reached only as
+            // a delta is walked again next cycle, which costs one walk and is always correct.
+            let complete = marker.is_empty();
+            let (root, walk) = match snap.live_blocks_with_root(marker) {
+                Ok(v) => v,
+                Err(cowfs_meta::Error::NoSuchSnapshot) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let walked_root = *root.as_bytes();
+            if walked.contains(&walked_root) {
+                // Another entry this cycle already walked exactly this root. Its blocks and the
+                // marker's subtrees are in hand, so descending again would only repeat work.
+                r.marked_skipped_roots += 1;
+                continue;
+            }
+            if record && self.marks().has_root(&walked_root) && persisted.contains_key(&walked_root)
+            {
+                // An earlier cycle walked this exact root, so its recorded blocks are its blocks.
+                // The recorded set has to be in hand too: a root the file names but this cycle's
+                // listing does not is not this cycle's to skip, and skipping it would seed live from
+                // nothing.
+                live.extend(persisted[&walked_root].iter().copied());
+                r.marked_skipped_roots += 1;
+                walked.insert(walked_root);
+                continue;
+            }
+            for b in walk {
                 let b = b?;
                 if b == HOLE {
                     continue;
                 }
                 r.marked += 1;
                 live.insert(b);
-                if record {
-                    self.marks().add_block(&key, b);
+                if record && complete {
+                    self.marks().add_block(&walked_root, b);
                 }
             }
-            walked.insert(key);
-            if record {
-                self.marks().add_root(&key);
+            walked.insert(walked_root);
+            if record && complete {
+                self.marks().add_root(&walked_root);
             }
         }
         Ok(live)
@@ -631,13 +747,18 @@ impl Gc {
     }
 
     /// Copy one candidate. `Ok(None)` means the copy was abandoned: the budget ran out or the
-    /// cycle was cancelled, and the pack is left whole for the next cycle.
+    /// cycle was cancelled, and the pack is left whole for the next cycle. `abandoned` receives
+    /// the on-disk length of any target pack the abandoned copy created, header included, so the
+    /// caller can account bytes actually written. It is set on every exit after the target may
+    /// exist, including an I/O or corruption error, not only a cancel, because a target the copy
+    /// created is real bytes on disk whatever ended the copy.
     fn copy_one(
         &self,
         plan: &PackPlan,
         live: &HashSet<BlockId>,
         budget: &mut u64,
         progress: &mut Progress,
+        abandoned: &mut u64,
     ) -> Result<Option<Rewrite>> {
         let is_live = |b: BlockId| live.contains(&b);
         let mut c = self.store.begin_compaction(plan, &is_live)?;
@@ -645,19 +766,59 @@ impl Gc {
             // The whole copy does not fit in what is left of the budget, so do not start it.
             return Ok(None);
         }
-        while !self.store.copy_batch(&mut c, self.opts.batch_bytes)? {
-            let owed = c.outstanding_bytes();
-            progress.bytes_copied += c.written();
-            if self.is_cancelled() || (*budget > 0 && owed > *budget) {
+        // Every step after `begin_compaction` can fail once the target pack exists, and the
+        // target's bytes are this cycle's own writes whatever ended the copy. On any failure,
+        // account the target's real on-disk length. A short write that errored leaves `c.len`
+        // behind the file length, so the on-disk length is the exact figure, not `c.len`.
+        let mut run = |c: &mut Compaction, budget: &mut u64| -> Result<bool> {
+            loop {
+                let done = self.store.copy_batch(c, self.opts.batch_bytes)?;
+                if done {
+                    return Ok(true);
+                }
+                let owed = c.outstanding_bytes();
+                progress.bytes_copied += c.written();
+                if self.is_cancelled() {
+                    return Ok(false);
+                }
+                if *budget > 0 && owed > *budget {
+                    return Ok(false);
+                }
+                *budget = budget.saturating_sub(owed);
+            }
+        };
+        match run(&mut c, budget) {
+            Ok(true) => {}
+            Ok(false) => {
+                *abandoned += self.target_bytes(&c);
                 return Ok(None);
             }
-            *budget = budget.saturating_sub(owed);
+            Err(e) => {
+                *abandoned += self.target_bytes(&c);
+                return Err(e);
+            }
         }
         progress.bytes_copied += c.written();
         if *budget > 0 {
             *budget = budget.saturating_sub(c.written());
         }
-        Ok(Some(self.store.finish_compaction(&c)?))
+        match self.store.finish_compaction(&c) {
+            Ok(rw) => Ok(Some(rw)),
+            Err(e) => {
+                *abandoned += self.target_bytes(&c);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// On-disk length of a compaction's target pack, header included. Zero when the copy has not
+    /// created a target yet, so an abandoned copy that wrote nothing is not counted twice.
+    fn target_bytes(&self, c: &Compaction) -> u64 {
+        if c.target_created() {
+            self.store.pack_file_len(c.to())
+        } else {
+            0
+        }
     }
 
     /// Flush the hints, then drop every persisted block nothing references any more.
@@ -666,6 +827,8 @@ impl Gc {
     /// the store holds that this cycle found unreachable is dropped, so the set shrinks as
     /// snapshots go away instead of pinning garbage forever.
     fn finish(&self, r: &mut GcReport, live: &HashSet<BlockId>, pinned: &[BlockId]) {
+        r.gross_removed_bytes = r.freed_bytes;
+        r.net_reclaimed_bytes = net_reclaimed(r.gross_removed_bytes, r.rewrite_bytes);
         {
             let h = self.hints.lock().unwrap_or_else(PoisonError::into_inner);
             r.hints_tracked = h.tracked();

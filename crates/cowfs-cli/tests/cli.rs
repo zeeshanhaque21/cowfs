@@ -1,5 +1,6 @@
 //! Runs the built `cowfs` binary against a `cowfs serve --stub` server.
 
+use cowfs_ctl::{Response, ServerFrame};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
@@ -185,16 +186,59 @@ fn every_subcommand_works_with_json_output() {
             "candidate_bytes",
             "dry_run",
             "freed_blocks",
-            "freed_bytes"
+            "freed_bytes",
+            "gross_removed_bytes",
+            "net_reclaimed_bytes",
+            "rewrite_bytes"
         ]
     );
     assert_eq!(
         (&dry["dry_run"], &dry["freed_blocks"]),
         (&Value::Bool(true), &Value::from(0))
     );
+    // A dry run reports a candidate estimate and no actual gross, rewrite or net.
+    assert_eq!(dry["gross_removed_bytes"], 0);
+    assert_eq!(dry["rewrite_bytes"], 0);
+    assert_eq!(dry["net_reclaimed_bytes"], 0);
     let gc = d.json(&["gc"]);
     assert_eq!(gc["dry_run"], false);
     assert!(gc["freed_blocks"].as_u64().unwrap() > 0);
+    // `freed_bytes` stays the gross figure and the explicit gross name agrees with it.
+    assert_eq!(gc["freed_bytes"], gc["gross_removed_bytes"]);
+    // Net is signed and equals gross minus rewrite.
+    let gross = gc["gross_removed_bytes"].as_i64().unwrap();
+    let rewrite = gc["rewrite_bytes"].as_i64().unwrap();
+    let net = gc["net_reclaimed_bytes"].as_i64().unwrap();
+    assert_eq!(net, gross - rewrite, "gross {gross}, rewrite {rewrite}");
+
+    // What the CLI printed must decode again through the same protocol layer. A legacy report
+    // serializing its unknown figures as `null` while gross stayed present produced JSON this
+    // decoder rejected, so the tool refused its own output.
+    let printed = serde_json::to_string(&gc).unwrap();
+    let refed =
+        format!(r#"{{"type":"response","id":1,"result":{{"kind":"gc","data":{printed}}}}}"#);
+    let back = ServerFrame::decode(refed.as_bytes())
+        .unwrap_or_else(|e| panic!("the CLI's own gc JSON was rejected: {e:?}\n{printed}"));
+    let ServerFrame::Response { result, .. } = back else {
+        panic!("{back:?}")
+    };
+    let Response::Gc(decoded) = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(
+        decoded.gross_removed_bytes,
+        gc["gross_removed_bytes"].as_u64().unwrap()
+    );
+    assert_eq!(
+        decoded.rewrite_bytes,
+        Some(gc["rewrite_bytes"].as_u64().unwrap())
+    );
+    assert_eq!(decoded.net_reclaimed_bytes, Some(net));
+    assert_eq!(
+        decoded.net_reclaimed_bytes,
+        Some(decoded.gross_removed_bytes as i64 - decoded.rewrite_bytes.unwrap() as i64),
+        "the arithmetic survives the round trip"
+    );
 
     let fsck = d.json(&["fsck"]);
     assert_eq!(

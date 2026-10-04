@@ -245,12 +245,17 @@ impl ControlHandler for StubHandler {
         self.work("mark", Unit::Items, ctx)?;
         self.work("sweep", Unit::Bytes, ctx)?;
         let (blocks, bytes) = (3, 3 * STUB_BLOCK_BYTES);
+        let freed_blocks = if params.dry_run { 0 } else { blocks };
+        let freed_bytes = if params.dry_run { 0 } else { bytes };
         Ok(GcReport {
             dry_run: params.dry_run,
             candidate_blocks: blocks,
             candidate_bytes: bytes,
-            freed_blocks: if params.dry_run { 0 } else { blocks },
-            freed_bytes: if params.dry_run { 0 } else { bytes },
+            freed_blocks,
+            freed_bytes,
+            gross_removed_bytes: freed_bytes,
+            rewrite_bytes: Some(0),
+            net_reclaimed_bytes: Some(i64::try_from(freed_bytes).unwrap_or(i64::MAX)),
         })
     }
 

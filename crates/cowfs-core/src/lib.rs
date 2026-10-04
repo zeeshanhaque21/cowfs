@@ -8,6 +8,10 @@ mod blocks;
 mod dcache;
 mod error;
 mod file;
+mod gate;
+mod gc;
+#[cfg(test)]
+mod gc_barrier_window;
 mod import;
 mod inner;
 mod ino;
@@ -36,6 +40,7 @@ use cowfs_vfs::{Error, Ino, Timestamp};
 use crate::blocks::Blocks;
 use crate::dcache::DCache;
 use crate::error::{from_io, from_meta, from_store};
+use crate::gate::Gate;
 use crate::inner::{Counters, Inner, Snaps};
 use crate::ino::{pack, Aliases, MAX_SNAP};
 use crate::queue::SnapCtx;
@@ -44,6 +49,7 @@ use crate::util::{MutexExt, RwExt, ShardMap};
 /// Test seams for the durability calls the design argument depends on. Not a stable API.
 #[doc(hidden)]
 pub mod fsops;
+pub use crate::gc::{Collector, CoreRoots};
 pub use crate::import::{ingest, Hooks, ImportError, Ingested};
 pub use crate::inner::{FileHealth, Health, LaneHealth};
 pub use crate::inner::{Options, Stats};
@@ -55,6 +61,10 @@ pub use cowfs_vfs::NAME_MAX;
 /// The most one `read` call allocates. The trait says "reads up to `size` bytes", so a larger
 /// request is answered in pieces; without a cap a caller can make the mount fault in 4 GiB per call.
 pub const MAX_READ_BYTES: u64 = 8 << 20;
+
+/// Most `Damage::MissingLiveBlock` entries `Core::fsck` lists. A bound keeps a wholesale store loss
+/// from turning the report into an unbounded enumeration; the walk still visits every live id.
+pub const MAX_MISSING_LIVE_REFS: usize = 256;
 
 /// Errors from the control plane.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -223,6 +233,7 @@ impl Core {
         let inner = Arc::new(Inner {
             meta,
             blocks: Blocks::new(store, opts.block_cache_bytes),
+            gate: Arc::new(Gate::new()),
             snaps: RwLock::new(Snaps::default()),
             nodes: ShardMap::new(),
             dents: DCache::new(opts.dentry_cache),
@@ -413,9 +424,55 @@ impl Core {
         store.close().map_err(from_store)
     }
 
-    /// Re-hashes every block in the store.
+    /// Re-hashes every block in the store, then verifies that every block a durable snapshot
+    /// references is actually present.
+    ///
+    /// [`Store::fsck`] only sees records that are still on disk, so a snapshot naming a block that
+    /// was removed reports clean through it. This walks the committed tree of every durable
+    /// snapshot and adds [`cowfs_store::Damage::MissingLiveBlock`] for each live id the store does
+    /// not have, so a filesystem-level clean result means the trees are resolvable, not just that
+    /// the extant records are intact.
+    ///
+    /// The walk covers durable references only: an open unlinked file or a chunk list not yet
+    /// committed names blocks that are not referenced by any committed tree and are not reported.
+    /// That is GC's live set (`meta.durable_snapshots`), so a block this reports missing would fail
+    /// a read through a snapshot mount. Nothing is repaired, reaped or freed.
     pub fn fsck(&self) -> Result<FsckReport, Error> {
-        self.inner.blocks.store().fsck().map_err(from_store)
+        let mut report = self.inner.blocks.store().fsck().map_err(from_store)?;
+        self.missing_live_refs(&mut report)?;
+        Ok(report)
+    }
+
+    /// Adds one [`cowfs_store::Damage::MissingLiveBlock`] per live id the store does not contain.
+    ///
+    /// At most [`MAX_MISSING_LIVE_REFS`] are listed, so a wholesale store loss cannot turn the
+    /// report into an unbounded enumeration; the traversal itself still visits every live id.
+    fn missing_live_refs(&self, report: &mut FsckReport) -> Result<(), Error> {
+        let store = self.inner.blocks.store();
+        let mut marker = cowfs_meta::Marker::new();
+        let mut listed = 0usize;
+        for info in self.inner.meta.durable_snapshots().map_err(from_meta)? {
+            let snap = match self.inner.meta.snapshot_by_id(info.id) {
+                Ok(s) => s,
+                Err(cowfs_meta::Error::NoSuchSnapshot) => continue,
+                Err(e) => return Err(from_meta(e)),
+            };
+            let walk = snap.live_blocks(&mut marker).map_err(from_meta)?;
+            for id in walk {
+                let id = id.map_err(from_meta)?;
+                if id == file::HOLE || store.contains(id) {
+                    continue;
+                }
+                report
+                    .damage
+                    .push(cowfs_store::Damage::MissingLiveBlock { id });
+                listed += 1;
+                if listed >= MAX_MISSING_LIVE_REFS {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Counters and cache sizes.
@@ -474,6 +531,24 @@ impl Core {
     #[doc(hidden)]
     pub fn set_load_node_contention(&self, ino: Ino, tries: usize) {
         *self.inner.load_node_contention.lk() = (tries > 0).then_some((ino, tries));
+    }
+
+    /// Test seam: 1 makes the collector's barrier succeed without closing the reference gate, which
+    /// is the negative control for the barrier. 0 restores it.
+    ///
+    /// Built only for this crate's own tests, so a production build has no such method and cannot
+    /// turn a fail-open barrier on. The barrier window test in `gc_barrier_window` drives it.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn set_gate_fault(&self, kind: u8) {
+        self.inner.gate.set_fault(kind);
+    }
+
+    /// Test seam: threads parked at the reference gate right now. Built only for this crate's tests.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn gate_waiters(&self) -> usize {
+        self.inner.gate.waiting()
     }
 
     /// Test seam: make the next `times` flushes of `ino` fail, `kind` 1 transient (out of space),

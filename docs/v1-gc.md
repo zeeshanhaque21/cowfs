@@ -164,6 +164,22 @@ A cycle is these steps.
    That watermark is the cycle's **epoch**.
 2. **Mark, no barrier.** Walk every root with one shared `Marker` and union `pinned_blocks`.
    The live set is complete for every root that existed at the freeze.
+   A root listed in step 1 can have moved by the time it is walked: a writer may have committed to
+   that snapshot in between.
+   The walk therefore reports the root it actually read (`snapshot_by_id`'s current root, read in the
+   same read transaction as the nodes it walks), and that walked root is what is recorded in
+   `walked`, in the persisted `mark.bin`, and in the `Marker`.
+   Recording the listed key instead would claim a root the walk never descended, and a fork still
+   on the listed root would be skipped as already covered while its blocks sat in no live set.
+   When the walked root differs from the listed key, the listed key is left unwalked so the entries
+   that still resolve to it are walked themselves.
+   The persisted `mark.bin` carries a format version (`MAGIC_MARKS`).
+   The current version is `COWMARK3`, which records one block list per walked root; `COWMARK2` and
+   `COWMARK1` stored a flat block list, which cannot say whose blocks a removed snapshot had, and
+   `COWMARK1` could also record a listed root key beside a different, newly committed root's blocks.
+   Neither older file is trusted: it loads as empty and every root is walked in full.
+   `docs/gc-root-mark-retention.md` has the format and the recording rules.
+   The cache is derived data, so discarding it costs one walk and deletes no user block or snapshot.
 3. **Choose candidates, no barrier.** For every pack, one scan counts its live and dead record
    bytes with respect to the live set.
    A pack is a candidate when its dead bytes reach `dead_ratio` of its record bytes and it has at
@@ -233,27 +249,21 @@ Without `reference_barrier` there is no sound way to free anything, and pretendi
 would trade criterion 3 for reclaimed bytes.
 So a collector with no barrier marks, reports, and reclaims nothing, and says so in
 `GcReport::skipped`.
-This is a decision for the lead: `cowfs-core` needs about ten lines to implement
-`reference_barrier` for its flusher lock, and then collection works.
+`cowfs-core` now provides one: the reference gate of `docs/gc-core-integration.md`.
+The flusher lock of this note's first draft could not serve, because there is one flush lock per
+snapshot and the NFS and FUSE writers reach the store without it.
 
-### What still blocks the wiring
+### The wiring
 
-Two gaps in `cowfs-core`, both of which the collector's tests are written against today.
+`cowfs-core` implements both halves, and `docs/gc-core-integration.md` holds the design, the lock order and the tests.
 
-`reference_barrier` does not exist, so every cycle over core reports and frees nothing.
-`tests/core_end_to_end.rs` checks the half that can be checked: `Core::pinned_blocks` is exact or
-`Busy` and never partial, even with a writer committing, which is the contract
-`ExtraRoots::pinned_blocks` needs.
+- `Core::collector(Options)` builds a `Collector`: a `Gc` over the `Arc<Store>` that core's own block layer holds, and `CoreRoots` as its `ExtraRoots`.
+- `CoreRoots::pinned_blocks` is `Core::pinned_blocks`, exact or `Busy`.
+- `CoreRoots::reference_barrier` returns a barrier over the reference gate. `take` closes the gate: no thread can store a chunk or commit a chunk list until the returned hold is dropped, and it gives up (`None`) after two seconds rather than wait for a stuck reader.
+- `GcReport::candidate_dead_bytes` is new: the record bytes of the candidate packs that no root reaches.
 
-`Core` exposes `store(&self) -> &Store` and `meta(&self) -> &Meta`, not the `Arc`s, and
-`Gc::open` needs `Arc<Store>`. Opening the store a second time is `Locked`, by design.
-So `Gc::open` cannot be handed core's store today.
-
-The fix is one accessor on `cowfs-core`: `pub fn store_arc(&self) -> Arc<Store>`, handing out the
-`Arc` `Inner` already holds. The better shape is the daemon owning the `Arc<Store>` and passing it
-to both core and the collector. **This branch does not own `cowfs-core`**, so the accessor is not
-added here and the end-to-end collect over core is still not in this change. That is the one thing
-standing between this crate and a real reference side.
+`tests/core_end_to_end.rs` keeps its own copy of `ExtraRoots` that offers no barrier, which is the contract check for `pinned_blocks`.
+`tests/core_reclaim.rs` is the collection over the real core.
 
 ## Access-time hints
 
@@ -489,6 +499,7 @@ Run everything with `cargo test -p cowfs-gc`. The heavy ones are listed after.
   `begin_compaction`, never unlinked, and makes the collector refuse the store. A gap is counted
   and never copied away silently. A torn sidecar is reported and kept. An acknowledged store is
   collectable again after a restart.
+- `tests/core_reclaim.rs`: 12 tests over the real `cowfs-core`: a reclaiming cycle with survivors read after a reopen, a revived block, a queued dedup, an open orphan, no barrier or no answer, a dry run, a cancel before and during a cycle, a collector dropped before and alive at `Core::close`, writers and forks beside collections, and the barrier window with its negative control.
 - `tests/kill9.rs`: 1 test, ignored. A child writes, syncs and collects in a loop while the
   parent SIGKILLs it at a random moment. Run:
   `COWFS_KILL_ROUNDS=120 cargo test -p cowfs-gc --release --test kill9 -- --ignored --nocapture --test-threads 1`.

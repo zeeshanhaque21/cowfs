@@ -1,0 +1,17 @@
+[package]
+name = "gc-fixture-seed"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "gc-fixture-seed"
+path = "src/main.rs"
+
+[dependencies]
+cowfs-core = { path = "../../crates/cowfs-core" }
+cowfs-store = { path = "../../crates/cowfs-store" }
+cowfs-vfs = { path = "../../crates/cowfs-vfs" }
+blake3 = "1"
+
+[workspace]
