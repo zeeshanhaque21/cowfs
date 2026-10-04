@@ -14,12 +14,14 @@
 //! - The spawned `Child` is owned by an RAII guard that kills and reaps it on every exit path,
 //!   including a panic. No path can abandon an unrecognised process: the guard only ever signals
 //!   the pid std reserved for the handle it holds, never a process group.
-//! - On timeout the parent re-checks the child's command with `ps` as a diagnostic, but a `ps`
-//!   failure or mismatch never panics and never abandons the child; it records the mismatch and
-//!   still kills and reaps the owned handle.
+//! - Verify-before-kill is taken from the owned handle alone: the reserved pid plus the `try_wait`
+//!   state seen immediately before `Child::kill`. No external probe runs on the deadline path, so a
+//!   hung or absent `ps` cannot extend the deadline. The pid is never reused before the reap.
 //! - The child's stdout and stderr are drained on threads with a finite total budget, so a
-//!   descendant holding a pipe cannot block the parent forever. If the budget expires the reader
-//!   threads are detached (they own only their cloned pipe) and the parent reports what it got.
+//!   descendant holding a pipe cannot block the parent forever. If the budget elapses without the
+//!   channel disconnecting, the reader threads are detached (they own only their cloned pipe),
+//!   `drain_expired` is reported, and the parent fails. A silent descendant that holds the pipe
+//!   open is a failure, not a clean drain.
 //! - A recursion guard (`CHILD_ENV`, plus a per-run nonce) makes the spawned process run the child
 //!   body instead of spawning again. The parent also requires the child's evidence line and its
 //!   nonce, so a filter typo or an inherited environment cannot pass as a success.
@@ -40,20 +42,23 @@ pub const NONCE_ENV: &str = "COWFS_GC_CHILD_NONCE";
 pub const PARK_ENV: &str = "COWFS_GC_CHILD_PARK";
 /// Set to "1" in the child to make a writer fail early (the stop-on-error path).
 pub const FAIL_ENV: &str = "COWFS_GC_CHILD_FAIL";
+/// Set to a seconds count in the child to spawn a bounded descendant that holds the inherited
+/// stdout/stderr pipe open for that many seconds (the drain-expiry path).
+pub const DESC_ENV: &str = "COWFS_GC_CHILD_DESC";
 /// Total wall budget for draining the child's pipes after it exits or is killed.
 const DRAIN_BUDGET: Duration = Duration::from_secs(10);
 
 /// True when this process was spawned as the fixture child. Requires both the guard and a nonce, so
 /// an accidentally inherited `CHILD_ENV` alone (without a spawned nonce) does not turn the parent
-/// into an in-process body. `run_child_fixture` clears both before spawning.
+/// into an in-process body. The parent sets both on the child `Command` only.
 pub fn is_child() -> bool {
     std::env::var_os(CHILD_ENV).is_some() && std::env::var_os(NONCE_ENV).is_some()
 }
 
-/// True when the guard variable is present at all, ignoring the nonce. Used by the preset-env
-/// control to assert the parent is not misclassified as a child.
-pub fn guard_present() -> bool {
-    std::env::var_os(CHILD_ENV).is_some()
+/// The child predicate as a pure function of its two inputs, so a control can assert the
+/// guard-without-nonce case without mutating the process environment.
+pub fn is_child_given(guard_and_nonce: (bool, bool)) -> bool {
+    guard_and_nonce.0 && guard_and_nonce.1
 }
 
 /// True when the child must permanently park its collector after setup.
@@ -64,6 +69,11 @@ pub fn is_park_child() -> bool {
 /// True when the child must arm an early writer failure after setup.
 pub fn is_fail_child() -> bool {
     std::env::var(FAIL_ENV).is_ok_and(|v| v == "1")
+}
+
+/// The bounded number of seconds a descendant should hold the inherited pipe for, if requested.
+pub fn descendant_secs() -> Option<u64> {
+    std::env::var(DESC_ENV).ok().and_then(|v| v.parse().ok())
 }
 
 /// The nonce this child was started with, if any. The parent requires the child to echo it.
@@ -96,10 +106,11 @@ pub struct ChildOutcome {
     pub waited: Duration,
     /// True when the parent killed the child at the deadline.
     pub timed_out: bool,
-    /// True when the drain budget expired and the reader threads were detached.
+    /// True when the drain budget elapsed without the channel disconnecting: a descendant still
+    /// held a pipe open, which is a failure, not a clean drain.
     pub drain_expired: bool,
-    /// The `ps` diagnostic taken before the kill, if any.
-    pub ps_note: Option<String>,
+    /// The verify-before-kill state of the owned handle, taken immediately before the kill.
+    pub prekill_note: Option<String>,
 }
 
 impl ChildOutcome {
@@ -119,15 +130,11 @@ impl ChildOutcome {
 /// panic. Only signals the pid std reserved for this handle.
 struct OwnedChild {
     child: Option<Child>,
-    test_name: String,
 }
 
 impl OwnedChild {
-    fn new(child: Child, test_name: &str) -> Self {
-        Self {
-            child: Some(child),
-            test_name: test_name.to_owned(),
-        }
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
@@ -149,31 +156,17 @@ impl OwnedChild {
         c.wait().ok()
     }
 
-    /// Diagnostic only: whether the pid's command names this fixture. Never panics; returns a note
-    /// describing the outcome. A `ps` failure does not stop the kill of the owned handle.
-    fn verify(&self) -> Option<String> {
-        let pid = self.pid()?;
-        let out = Command::new("ps")
-            .args(["-o", "command=", "-p", &pid.to_string()])
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-                let cmd = String::from_utf8_lossy(&o.stdout);
-                if cmd.contains(&self.test_name) {
-                    Some(format!("ps_ok pid={pid}"))
-                } else {
-                    Some(format!(
-                        "ps_mismatch pid={pid} (proceeding to kill the owned handle): {cmd:?}"
-                    ))
-                }
-            }
-            Ok(o) => Some(format!(
-                "ps_failed pid={pid} status={:?} (proceeding to kill the owned handle)",
-                o.status.code()
-            )),
-            Err(e) => Some(format!(
-                "ps_error pid={pid}: {e} (proceeding to kill the owned handle)"
-            )),
+    /// Standing verify-before-kill evidence, taken from the owned handle alone.
+    ///
+    /// No external probe runs here: an earlier version shelled out to `ps` before the kill, and a
+    /// hung `ps` (a `PATH` shim that slept 35 s) extended a 20 s deadline to 55 s. The owned
+    /// `std::process::Child` already reserves the pid until it is reaped, so the safe statement is
+    /// the pid reserved for this handle plus the `try_wait` state observed immediately before the
+    /// kill. It never names an unknown pid and never touches a process group.
+    fn state_before_kill(&self) -> String {
+        match self.pid() {
+            Some(pid) => format!("owned pid={pid} alive_until_kill"),
+            None => "owned pid=<already reaped>".to_string(),
         }
     }
 }
@@ -211,10 +204,27 @@ pub fn run_child_fixture(
     deadline: Duration,
     log_path: &Path,
 ) -> (ChildOutcome, String) {
-    // Clear any inherited guard from the parent's own environment so a preset value cannot make the
-    // spawned child think it is nested, or make the parent's dispatch misread itself as the child.
-    std::env::remove_var(CHILD_ENV);
-    std::env::remove_var(NONCE_ENV);
+    run_child_impl(test_name, child_env, deadline, log_path, true)
+}
+
+/// Run `test_name` with the guard set but deliberately *without* a spawned nonce. Used only by the
+/// preset-inherited-guard control to prove that an inherited guard alone does not dispatch a
+/// process into the child body. Never use this to run a fixture that needs the child path.
+pub fn run_guard_only_child(test_name: &str, deadline: Duration, log_path: &Path) -> ChildOutcome {
+    run_child_impl(test_name, &[], deadline, log_path, false).0
+}
+
+fn run_child_impl(
+    test_name: &str,
+    child_env: &[(&str, &str)],
+    deadline: Duration,
+    log_path: &Path,
+    with_nonce: bool,
+) -> (ChildOutcome, String) {
+    // The spawned child gets the guard explicitly on its `Command`; no in-process environment
+    // mutation happens here, so concurrent tests in this binary do not race on the process
+    // environment. An inherited `CHILD_ENV` alone cannot make this parent misread itself as the
+    // child, because `is_child()` requires the guard and a nonce together.
     let nonce = make_nonce();
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = Command::new(&exe);
@@ -223,12 +233,16 @@ pub fn run_child_fixture(
         .arg("--nocapture")
         .env(CHILD_ENV, "1")
         .env(LOG_ENV, log_path)
-        .env(NONCE_ENV, &nonce)
         .env_remove(PARK_ENV)
         .env_remove(FAIL_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if with_nonce {
+        cmd.env(NONCE_ENV, &nonce);
+    } else {
+        cmd.env_remove(NONCE_ENV);
+    }
     for (k, v) in child_env {
         cmd.env(k, v);
     }
@@ -236,7 +250,7 @@ pub fn run_child_fixture(
     let out = child.stdout.take().expect("child stdout");
     let err = child.stderr.take().expect("child stderr");
 
-    let owned = OwnedChild::new(child, test_name);
+    let owned = OwnedChild::new(child);
 
     // Drain both pipes on one thread each, so a verbose child cannot fill a pipe and deadlock.
     let (tx, rx) = mpsc::channel::<String>();
@@ -246,7 +260,7 @@ pub fn run_child_fixture(
 
     let started = Instant::now();
     let mut timed_out = false;
-    let mut ps_note = None;
+    let mut prekill_note = None;
     let code = {
         let mut owned = owned;
         loop {
@@ -254,7 +268,7 @@ pub fn run_child_fixture(
                 Ok(Some(status)) => break status.code(),
                 Ok(None) => {
                     if started.elapsed() >= deadline {
-                        ps_note = owned.verify();
+                        prekill_note = Some(owned.state_before_kill());
                         let status = owned.kill_and_reap();
                         timed_out = true;
                         break status.and_then(|s| s.code());
@@ -263,7 +277,10 @@ pub fn run_child_fixture(
                 }
                 // try_wait failed: still reap the owned handle and report a failure code.
                 Err(e) => {
-                    ps_note = Some(format!("try_wait_error: {e}"));
+                    prekill_note = Some(format!(
+                        "try_wait_error: {e} ({})",
+                        owned.state_before_kill()
+                    ));
                     let status = owned.kill_and_reap();
                     break status.and_then(|s| s.code());
                 }
@@ -272,20 +289,12 @@ pub fn run_child_fixture(
     };
 
     // Collect the drained output with a finite total budget. If a descendant holds a pipe open the
-    // reader threads block on that clone; we detach them rather than join forever.
-    let drain_started = Instant::now();
+    // reader threads block on that clone; we detach them rather than join forever. The budget
+    // elapsing without a `Disconnected` is reported as `drain_expired`, because it means a child of
+    // the child still held the pipe: a silent holder must fail the parent, not read as a clean drain.
     let mut output = String::new();
-    let mut drain_expired = false;
-    while drain_started.elapsed() < DRAIN_BUDGET {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => output.push_str(&chunk),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    if drain_started.elapsed() >= DRAIN_BUDGET && finish_pending(&mut output, &rx) {
-        drain_expired = true;
-    }
+    let disconnected = drain_until(&rx, &mut output, DRAIN_BUDGET);
+    let drain_expired = !disconnected;
 
     (
         ChildOutcome {
@@ -294,21 +303,33 @@ pub fn run_child_fixture(
             waited: started.elapsed(),
             timed_out,
             drain_expired,
-            ps_note,
+            prekill_note,
         },
         nonce,
     )
 }
 
-/// Try to pull any already-buffered chunks without blocking. Returns true if any arrived after the
-/// budget, meaning a writer was still live when the budget expired.
-fn finish_pending(output: &mut String, rx: &mpsc::Receiver<String>) -> bool {
-    let mut got = false;
-    while let Ok(chunk) = rx.try_recv() {
-        output.push_str(&chunk);
-        got = true;
+/// Drain until the sender disconnects or `budget` elapses. Returns `true` if the channel
+/// disconnected (both reader threads closed their pipe and dropped their senders), `false` if the
+/// budget elapsed first, which means a descendant still held a pipe open. Any chunks already
+/// buffered when the budget elapses are pulled non-blockingly first, so the captured output is
+/// preserved either way.
+fn drain_until(rx: &mpsc::Receiver<String>, output: &mut String, budget: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            while let Ok(chunk) = rx.try_recv() {
+                output.push_str(&chunk);
+            }
+            return false;
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(chunk) => output.push_str(&chunk),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+        }
     }
-    got
 }
 
 fn drain(mut r: impl Read, tx: mpsc::Sender<String>) {

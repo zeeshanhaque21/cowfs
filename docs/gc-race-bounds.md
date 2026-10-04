@@ -81,13 +81,50 @@ contrast cleanly.
 
 The `resource_watchdog.rs` file keeps the helper-mechanics controls on a smaller real `cowfs-core`
 fixture: a happy child that reclaims real packs and reads a survivor back after a reopen, the parked
-child (parent kills and FAILS, never PASS or SKIP), a generic child failure that exits non-zero
-promptly, a filter that matches no test, a preset inherited guard, and a nonce mismatch. The failure
-control is a deliberate panic on the child's main thread (honestly named a generic failure); there is
-no separate injected *writer-thread* failure control, because `Parts::write` panics rather than
-returning a `Result`, so an injected writer error cannot be propagated through the fixture's
-`failure`/`stop` path without new production surface. The race fixture's real writer errors
-(`fork`/`sync`) do propagate through `failure`/`stop` and are surfaced by `run_bounded`.
+child (parent kills and FAILS, never PASS or SKIP), a slow seam-less child that must be rejected as
+not-parked, a generic main-thread-panic child failure that exits non-zero promptly, a descendant that
+holds the pipe open past the drain budget (reported as a drain expiry and failed, bounded), a filter
+that matches no test, a guard-only process that must take the parent branch, and a nonce mismatch.
+
+The guard-only control is discriminating and fast: it asserts the pure dispatch predicate rejects
+`(guard, no nonce)` and accepts `(guard, nonce)`, then spawns a real process with the guard set and
+*no* nonce running a dedicated body whose two branches log `phase=ran-parent-path` or
+`phase=wrongly-ran-body`. The control requires the parent branch and rejects the body branch, so it
+cannot pass on an empty output. No `set_var`/`remove_var` runs in the multithreaded test binary; the
+guard and nonce travel on the child `Command` only.
+
+Two guard generalisations the review caught, both fixed test-only:
+
+- The park controls once accepted any child that was merely slow. `phase=parking-collector` is logged
+  *before* the seam is installed, and the unparked body can run past a short deadline under load, so
+  the control now requires `phase=parked`, which the seam logs only when it actually runs, before it
+  accepts `timed_out`. The slow seam-less child is the negative control that demonstrates the
+  rejection.
+- Verify-before-kill no longer shells out. An earlier version ran `ps` on the deadline path with no
+  bound, so a hung `ps` (a `PATH` shim that slept 35 s) extended a 20 s deadline to 55 s. The state
+  is now read from the owned `std::process::Child` alone (the reserved pid plus the `try_wait` state
+  seen immediately before `Child::kill`), so no external probe can extend the deadline and the pid is
+  never reused before the reap.
+
+The real writer-thread failure path *is* covered, with no new production surface:
+`race.rs::a_writer_thread_failure_stops_the_phase_and_fails_the_parent` builds its fixture with the
+existing `Fixture::with_hook` test helper (added in `f501157`) and arms the metadata `before_sync`
+hook after setup, so a concurrent writer's `fork`/`sync` fails with a non-`NoSuchSnapshot` error. The
+writer records it and stops the phase, and the parent sees a prompt non-zero exit well under the
+deadline with the writer diagnostic and no success counts. An earlier revision of this doc wrongly
+said that needed new production surface; it did not.
+
+Each guard fix has a mutation falsifier that reproduces the defect against the new control and shows
+the control fails without the fix:
+
+- Reintroducing the unbounded `ps` on the deadline path makes the park control run 55.35 s under a
+  hung-`ps` shim (and invokes `ps`); the fixed version ends at 20 s and never invokes `ps`.
+- Making the drain budget expiry report a clean drain makes the descendant control fail with
+  `a descendant holding the pipe must be reported as a drain expiry, not a clean drain`.
+- Removing the seam from the park body makes the park control fail with
+  `the collector must actually reach the parked seam, not merely be slow`.
+- Never arming the writer hook makes the writer-failure control fail with
+  `a writer failure must exit non-zero: Some(0)`.
 
 The `24 MiB` and `9 s` figures are the cooperative in-process knobs, not the hard runtime bound. The
 hard bound for each wrapped fixture is the parent's declared deadline (`CHILD_DEADLINE`, 120 s).

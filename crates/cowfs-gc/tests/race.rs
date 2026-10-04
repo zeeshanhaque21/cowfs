@@ -30,7 +30,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::child::{child_log, is_child, is_park_child, run_child_fixture, PARK_ENV};
+use common::child::{
+    child_log, is_child, is_fail_child, is_park_child, run_child_fixture, FAIL_ENV, PARK_ENV,
+};
 use common::{Fixture, Roots};
 use cowfs_store::BlockId;
 
@@ -205,7 +207,7 @@ fn all_nonzero(fields: &[(String, u64)], keys: &[&str]) -> bool {
 #[test]
 fn writers_and_collects_at_once_lose_nothing() {
     if is_child() {
-        writers_and_collects_body(is_park_child());
+        writers_and_collects_body(is_park_child(), is_fail_child());
         return;
     }
     let keep = tempfile::tempdir().expect("parent tempdir");
@@ -244,7 +246,7 @@ fn writers_and_collects_at_once_lose_nothing() {
 #[test]
 fn a_parked_writers_fixture_is_killed_by_the_parent_and_the_parent_fails() {
     if is_child() {
-        writers_and_collects_body(is_park_child());
+        writers_and_collects_body(is_park_child(), is_fail_child());
         return;
     }
     let keep = tempfile::tempdir().expect("parent tempdir");
@@ -257,16 +259,24 @@ fn a_parked_writers_fixture_is_killed_by_the_parent_and_the_parent_fails() {
         &log,
     );
     assert!(
+        outcome.waited < deadline + Duration::from_secs(10),
+        "the parent deadline must bound the job: waited={}ms",
+        outcome.waited.as_millis()
+    );
+    // The seam must actually have run. `phase=parking-collector` is logged before the seam is
+    // installed, so a slow child that never installed the seam would still show it. `phase=parked`
+    // is logged only from inside the seam, so requiring it is what separates "parked" from "slow".
+    let logtext = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        logtext.contains("phase=parked"),
+        "the collector must actually reach the parked seam, not merely be slow: {logtext:?}"
+    );
+    assert!(
         outcome.timed_out,
         "the parent must kill the parked race child: code={:?} waited={}ms\n{}",
         outcome.code,
         outcome.waited.as_millis(),
         outcome.output
-    );
-    assert!(
-        outcome.waited < deadline + Duration::from_secs(10),
-        "the parent deadline must bound the job: waited={}ms",
-        outcome.waited.as_millis()
     );
     // No success evidence escaped: a parked child must never print real counts.
     assert!(
@@ -274,14 +284,9 @@ fn a_parked_writers_fixture_is_killed_by_the_parent_and_the_parent_fails() {
         "a parked child must never print its success line: {}",
         outcome.output
     );
-    let logtext = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(
         logtext.contains("phase=race-setup-done"),
         "the child did real setup before parking: {logtext:?}"
-    );
-    assert!(
-        logtext.contains("phase=parking-collector"),
-        "the child reached the park phase (not a spawn/filter failure): {logtext:?}"
     );
     assert!(
         !logtext.contains("phase=race-collected"),
@@ -289,8 +294,124 @@ fn a_parked_writers_fixture_is_killed_by_the_parent_and_the_parent_fails() {
     );
 }
 
-fn writers_and_collects_body(park: bool) {
-    let f = Fixture::eager(128 << 10);
+/// Negative control for the park control's own discriminator: the same writers body with `park`
+/// requested but the seam removed and a 30 s sleep instead. The child is slow, not parked, so it
+/// never logs `phase=parked`; the parent's `parked` requirement must reject it even though it
+/// times out. This is the mutant the previous control wrongly accepted (reviewer evidence), and it
+/// is the reason the control requires `phase=parked`. Short deadline, one run.
+#[test]
+fn a_slow_writer_child_without_the_seam_is_not_a_parked_child() {
+    if is_child() {
+        // Simulate the mutant: log the pre-seam line as the real body does, but install no seam and
+        // sleep past the deadline instead of running the fixture.
+        if is_park_child() {
+            child_log("phase=race-setup-done");
+            child_log("phase=parking-collector");
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        return;
+    }
+    let keep = tempfile::tempdir().expect("parent tempdir");
+    let log = keep.path().join("race-writers-slow.log");
+    let deadline = Duration::from_secs(8);
+    let (outcome, _) = run_child_fixture(
+        "a_slow_writer_child_without_the_seam_is_not_a_parked_child",
+        &[(PARK_ENV, "1")],
+        deadline,
+        &log,
+    );
+    assert!(
+        outcome.timed_out,
+        "the slow child is killed at the deadline: code={:?} waited={}ms",
+        outcome.code,
+        outcome.waited.as_millis()
+    );
+    let logtext = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logtext.contains("phase=parked"),
+        "a seam-less slow child must never log the parked phase: {logtext:?}"
+    );
+    // The park control's discriminator rejects it: no `phase=parked` means it is not a parked child.
+    assert!(
+        !logtext.contains("phase=parked"),
+        "and therefore the parked-child requirement would fail, which is the point of this control"
+    );
+}
+
+/// A real writer-thread failure, not a main-thread panic. The child builds its fixture with a
+/// metadata `before_sync` hook (`Fixture::with_hook`, existing test helper) and arms it after setup,
+/// so a concurrent writer's `fork`/`sync` fails with a non-`NoSuchSnapshot` error. The writer must
+/// record that failure and stop the phase, and the parent must see a prompt non-zero exit well under
+/// the deadline, with the writer diagnostic in the output and no success counts. This uses no new
+/// production surface.
+#[test]
+fn a_writer_thread_failure_stops_the_phase_and_fails_the_parent() {
+    if is_child() {
+        writers_and_collects_body(is_park_child(), is_fail_child());
+        return;
+    }
+    let keep = tempfile::tempdir().expect("parent tempdir");
+    let log = keep.path().join("race-writers-fail.log");
+    let (outcome, _) = run_child_fixture(
+        "a_writer_thread_failure_stops_the_phase_and_fails_the_parent",
+        &[(FAIL_ENV, "1")],
+        CHILD_DEADLINE,
+        &log,
+    );
+    assert!(
+        !outcome.timed_out,
+        "the writer failure must stop the child on its own, not need the deadline: waited={}ms",
+        outcome.waited.as_millis()
+    );
+    assert!(
+        outcome.waited < Duration::from_secs(60),
+        "the writer failure must be prompt: waited={}ms",
+        outcome.waited.as_millis()
+    );
+    assert_ne!(
+        outcome.code,
+        Some(0),
+        "a writer failure must exit non-zero: {:?}\n{}",
+        outcome.code,
+        outcome.output
+    );
+    assert!(
+        outcome.output.contains("writer") && outcome.output.contains("injected writer failure"),
+        "the actual writer diagnostic must reach the parent: {}",
+        outcome.output
+    );
+    // No success counts escaped: the phase stopped on the error, not after a clean sweep.
+    assert!(
+        parse_fields(&outcome.output, "race bounds:").is_none(),
+        "a failed phase must not print success counts: {}",
+        outcome.output
+    );
+    let logtext = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        logtext.contains("phase=race-setup-done"),
+        "the child did real setup before the failure: {logtext:?}"
+    );
+}
+
+fn writers_and_collects_body(park: bool, fail: bool) {
+    // For the writer-failure control the metadata `before_sync` hook is armed only *after* the
+    // fixture's own setup, so it fails a concurrent writer's `fork`/`sync`, not the setup itself.
+    let armed = Arc::new(AtomicBool::new(false));
+    let f = if fail {
+        let armed_hook = Arc::clone(&armed);
+        Fixture::with_hook(
+            128 << 10,
+            Arc::new(move || {
+                if armed_hook.load(Relaxed) {
+                    Err(std::io::Error::other("injected writer failure"))
+                } else {
+                    Ok(())
+                }
+            }),
+        )
+    } else {
+        Fixture::eager(128 << 10)
+    };
     // The fixture owns a TempDir and a lock, so the threads take the parts that are Send + Sync.
     let parts = f.parts();
     let parts = &parts;
@@ -306,6 +427,14 @@ fn writers_and_collects_body(park: bool) {
     parts.meta.sync().unwrap();
     parts.store.sync().unwrap();
     child_log("phase=race-setup-done");
+
+    if fail {
+        // Arm the hook now that setup is done: the next writer `fork`/`sync` fails with a
+        // non-`NoSuchSnapshot` metadata error, which the writer must turn into a recorded failure
+        // that stops the phase. This exercises the real writer-thread error path, distinct from a
+        // panic on the child's main thread.
+        armed.store(true, Relaxed);
+    }
 
     if park {
         // Park the collector forever inside the cycle-lock seam, after real setup. The in-process
