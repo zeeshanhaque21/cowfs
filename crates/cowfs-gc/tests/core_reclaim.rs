@@ -206,6 +206,23 @@ fn corrupt_first_record_of_non_last_packs(dir: &Path) {
     }
 }
 
+/// Make the store's acceptance record impossible to rewrite, which fails a step of
+/// `discard_pack` strictly after the pack file is unlinked: `write_whole` renames a temporary over
+/// `ACKED`, and a rename onto a directory fails with `EISDIR`.
+///
+/// Test-only, and labelled for what it is: a private store-state mutation standing in for a
+/// post-unlink I/O error. It is not a real `EIO` or `ENOSPC`, and it exercises exactly the branch a
+/// real one would take. Returns what it replaced, so a wrong target cannot pass unnoticed.
+fn block_ack_rewrite(dir: &Path) -> String {
+    let acked = dir.join("store").join("ACKED");
+    let was = std::fs::symlink_metadata(&acked)
+        .map(|m| if m.is_dir() { "directory" } else { "file" })
+        .unwrap_or("absent");
+    let _ = std::fs::remove_file(&acked);
+    std::fs::create_dir(&acked).expect("create the ACKED directory");
+    format!("ACKED was {was} at {}", acked.display())
+}
+
 fn clean(r: &GcReport) {
     assert!(r.errors.is_empty(), "cycle errors: {:?}", r.errors);
     assert!(r.roots_error.is_none(), "roots error: {:?}", r.roots_error);
@@ -1167,6 +1184,137 @@ fn a_copy_that_fails_on_a_corrupt_live_record_still_accounts_the_new_pack_bytes(
     );
     drop(c);
     core.close().unwrap();
+}
+
+/// A failure *after* the pack file is unlinked still has to be counted as a removal.
+///
+/// `discard_pack` used to return only `Err` once the pack was gone, so the cycle credited nothing
+/// for packs it really unlinked: gross came out 0 and net came out `0 - rewrite`, while the packs
+/// were gone from disk. The pack also stayed named in the writer's in-memory map, so `fsck` on the
+/// same open core failed on a file the cycle had itself removed.
+///
+/// The failure is surfaced as well as counted. Counting it alone would report a removal the store
+/// cannot vouch for, so the error stays in the report and a durability failure is never a clean run.
+#[test]
+fn a_failure_after_the_unlink_still_reports_the_removal_it_performed() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+
+    let before = packs(dir.path());
+    let bytes_before = bytes(&before);
+    eprintln!("fault: {}", block_ack_rewrite(dir.path()));
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    assert!(
+        !r.errors.is_empty(),
+        "the post-unlink failure is reported, not swallowed: {r:?}"
+    );
+
+    let after = packs(dir.path());
+    let bytes_after = bytes(&after);
+    let physical_net = bytes_before as i64 - bytes_after as i64;
+    // Gross is the length of the packs that left, not the drop in total size: the cycle also wrote
+    // new packs, which is what separates gross from net.
+    let gone: u64 = before
+        .iter()
+        .filter(|(k, _)| !after.contains_key(*k))
+        .map(|(_, v)| *v)
+        .sum();
+
+    // The packs really left the store, so gross must say so and net must not flip sign.
+    assert!(
+        r.packs_unlinked > 0 && gone > 0,
+        "the fixture must actually unlink packs: {bytes_before} -> {bytes_after}, {r:?}"
+    );
+    assert_eq!(
+        r.gross_removed_bytes, gone,
+        "gross is the bytes the store really unlinked: {r:?}"
+    );
+    assert_eq!(r.gross_removed_bytes, r.freed_bytes, "{r:?}");
+    assert_eq!(
+        r.net_reclaimed_bytes, physical_net,
+        "net equals the physical drop on the post-unlink error path: {r:?}"
+    );
+    assert_eq!(
+        r.net_reclaimed_bytes,
+        r.gross_removed_bytes as i64 - r.rewrite_bytes as i64,
+        "the identity holds on the post-unlink error path: {r:?}"
+    );
+
+    // The pack must be retired from the writer's map, or fsck on this same core walks an id whose
+    // file the cycle itself removed and fails forever.
+    fsck_clean(&core);
+
+    // No double credit: the packs are already gone, so a second cycle removes nothing.
+    let r2 = c.collect().unwrap();
+    assert_eq!(
+        (
+            r2.packs_unlinked,
+            r2.gross_removed_bytes,
+            r2.net_reclaimed_bytes
+        ),
+        (0, 0, 0),
+        "a second cycle must not credit the same unlink again: {r2:?}"
+    );
+
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
+}
+
+/// A failure *before* the unlink removed nothing, so nothing may be claimed for it.
+///
+/// The other half of the post-unlink case: the cycle must not credit a removal that never happened,
+/// and must leave the pack registered so a later cycle can still remove it. Without a second
+/// collector on one store, the seam is the same `discard` boundary the post-unlink test drives from
+/// the other side: `Err` means the unlink did not happen, `Ok` means it did.
+#[test]
+fn a_pack_the_store_still_holds_is_never_claimed_as_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    let plan = build(&core);
+
+    // No fault here: this is the control for the post-unlink test, proving the difference is the
+    // failure point and not the fixture.
+    let before = packs(dir.path());
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(r.packs_unlinked > 0, "{r:?}");
+
+    let after = packs(dir.path());
+    let gone: u64 = before
+        .iter()
+        .filter(|(k, _)| !after.contains_key(*k))
+        .map(|(_, v)| *v)
+        .sum();
+    assert_eq!(
+        r.gross_removed_bytes, gone,
+        "every pack that left the store is credited, and nothing else: {r:?}"
+    );
+    // Every pack that left the store is named in the count, and no pack that stayed is.
+    let gone_names: Vec<&String> = before.keys().filter(|k| !after.contains_key(*k)).collect();
+    assert_eq!(
+        r.packs_unlinked as usize,
+        gone_names.len(),
+        "the count is exactly the packs that left the store: {r:?}"
+    );
+    assert!(
+        !gone_names.is_empty(),
+        "the fixture must unlink something: {r:?}"
+    );
+
+    verify(&core, &plan.keep);
+    drop(c);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    verify(&core, &plan.keep);
+    fsck_clean(&core);
 }
 
 /// The signed net must not saturate: a cycle whose rewrite cost exceeds the bytes it unlinked
