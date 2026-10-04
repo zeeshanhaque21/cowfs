@@ -37,8 +37,10 @@ coverage {"compared": ["g1"], "gates_known": 6, "not_compared": [...]}
 Three parts, one set of facts each.
 
 - `gate coverage` counts what was compared out of the six gates the harness knows.
-- One indented line per gate that some input requested or that has reps in one arm only, naming the arm with no data for it, how many reps the other arm recorded, and every compared-arm input that asked for the gate together with how many reps that input recorded.
-- One `coverage {...}` line, the same facts as JSON, with a `not_compared` entry for every gate that produced no comparison, not only the in-scope ones. Each entry carries `missing_in` (`cowfs`, `native` or `any input`), `reps` per arm, and `requested_by` mapping each input that asked for the gate to the reps it recorded.
+- One indented line per gate that some input requested or that has reps in one arm only, naming the missing arm, the other arm's rep total, and the requesting labels with their summed rep counts.
+- One `coverage {...}` line with the same facts as JSON and a `not_compared` entry for every gate that produced no comparison, not only the in-scope ones.
+  Each entry carries `missing_in` (`cowfs`, `native` or `any input`), `reps` per arm, and `requested_by` mapping requesting labels to their rep totals.
+  Files sharing a label are summed only when their metadata requested the gate; files without a label use their path as the key.
 
 Attribution is read from the compared arms' input metadata only: the `--native` files and the `--cowfs` file.
 A `--noise-floor` file that is not also passed as a native input is validated and counted in the noise-floor table, but its meta is not consulted for `requested_by`, so a gate only that file recorded can print no human line and an empty `requested_by`.
@@ -87,7 +89,7 @@ Known limits, all deliberate:
 ## Evidence
 
 Real CLI, same artifacts before and after, both in `bench/out/coverage80/` (ignored).
-Nine scenarios each: the reported one-sided `g1,g3` case, the same case on real `gates.py` output, one-sided in the other direction, a matched `g1`-only pair, a matched `g1,g3` pair, a genuine over-bar `FAIL`, the g5 one-sided refusal, a meta with no gate list, and a fully matched pair.
+The ten cases below include one-sided and matched comparisons, refusal shapes, missing gate metadata and duplicate-label attribution.
 
 | case | before | after |
 |---|---|---|
