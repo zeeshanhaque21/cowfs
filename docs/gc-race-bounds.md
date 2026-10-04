@@ -1,35 +1,162 @@
 # Bounded GC race fixtures (issue 83)
 
 `crates/cowfs-gc/tests/race.rs` runs writers, snapshot create/remove, and collects at once.
-Its concurrent fixtures are now bounded, for the reason in issue 83: on a runner where a collect
-stalled, the writer loops kept appending until the disk filled (`StorageFull`, "No space left on
-device"), and the workspace step ran for about five hours.
+Its concurrent fixtures are bounded two ways: cooperative in-process knobs, and a hard process-level
+parent deadline that wraps each actual race `#[test]`. Both exist for the reason in issue 83: on a
+runner where a collect stalled, the writer loops kept appending until the disk filled
+(`StorageFull`, "No space left on device"), and the workspace step ran for about five hours.
 
-## What changed
+## The two bounds, stated exactly
 
-- Every concurrent writer loop has a fixed byte budget (`WRITE_BYTE_BUDGET`, 24 MiB) and a fixed
-  iteration cap (`WRITE_ITER_CAP`).
-- The phase has a finite wall-clock cap (`RUN_CAP`, 4 s) and a no-progress timeout
-  (`NO_PROGRESS`, 60 s) enforced by an outermost watchdog thread that sets the shared stop flag.
-- Any worker or collector error sets the stop flag and records the failure; the phase then asserts
-  on that failure instead of panicking inside a spawned thread.
-- Each run prints the bytes, writes and collects it actually reached, and asserts they are
+There are two different bounds, and only one of them is hard.
+
+**Cooperative in-process bound** (`race.rs`):
+
+- `WRITE_BYTE_BUDGET` is 24 MiB **per test, shared across all of that test's writers** (`clone_state`
+  shares one counter), not per writer. It counts input bytes only (20000 or 8000 per write), not the
+  stored bytes, which also include compaction copies and the metadata file. Overshoot is at most one
+  write per writer.
+- Two tests carry a budget, so the in-job input bound is about 48 MiB plus overshoot. This is an
+  input bound, not a claim about physical bytes on disk.
+- `WRITE_ITER_CAP` (100000) is never the binding limit at the default write size, so it adds nothing
+  beyond a backstop.
+- The phase is asked to stop at `RUN_CAP + 5 s` (9 s); the doc previously said 4 s, which is only the
+  half of the expression. The writers test has no other time stop; the stall test also stops when its
+  4 cycles finish.
+- Any worker or collector error sets the stop flag and records the failure; the phase then asserts on
+  that failure instead of panicking inside a spawned thread.
+- Each run prints the bytes, writes, cycles and barriers it actually reached, and asserts they are
   non-zero, so a budget that silently starved the workload fails loudly rather than passing empty.
 
-The bound is on the rate as well as the total: a writer stops as soon as the byte budget is spent,
-so a descheduled runner stops early instead of growing the store without limit.
+This whole bound is **cooperative**: it sets a flag every loop checks. It bounds what the writers do,
+but it cannot end a test whose collector parks forever inside a blocking call, because the collector
+runs inside `std::thread::scope` and the scope joins it. Reproduced: with the collector parked in a
+seam, the test ran until an external 40 s alarm killed it (`rc=142`), despite the 9 s cooperative cap
+and the 60 s no-progress timeout.
+
+**Hard process-level bound** (`crates/cowfs-gc/tests/common/child.rs`), applied to the **actual**
+concurrent race fixtures:
+
+- The three concurrent fixtures in `race.rs` are each wrapped: the `#[test]` is a parent that spawns
+  the fixture body in a child of the same test binary and holds a fixed deadline of its own
+  (`CHILD_DEADLINE`, 120 s). The parent polls `try_wait`, so it detects a prompt non-zero exit and
+  otherwise ends at the deadline. The parent's deadline does not depend on the child's own joins,
+  cancels or progress flags.
+- The wrapped entrypoints are the real ones, not a demo:
+  `writers_and_collects_at_once_lose_nothing`, `the_barrier_costs_writers_a_bounded_stall` and
+  `two_collectors_on_one_store_are_safe`. Each ran its workout inside `std::thread::scope` before, so a
+  parked collector hung the scope; each now runs that same body in a child bounded by the parent.
+- `120 s` is a defined finite budget, not a raised CI job timeout. It is derived from the cooperative
+  cap (`RUN_CAP + 5 s`, 9 s) plus the bounded race phase's final collect, its per-live-block readback,
+  `fsck`, and process startup: a passing run finishes in seconds and never waits it out.
+- At the deadline the parent kills **only the child it spawned**. The spawned `Child` is owned by an
+  RAII guard that kills and reaps it on every exit path, including a panic, so no error branch can
+  abandon it. The guard signals only the pid std reserved for that handle, never a process group. A
+  `ps` command check is a diagnostic only: a `ps` error or mismatch never panics and never abandons
+  the child, it records the note and still kills the owned handle.
+- `try_wait`/`wait` errors do not panic and cannot orphan the child: the RAII guard reaps it. The
+  child's stdout and stderr are drained on threads with a finite total budget (`recv_timeout`); if the
+  budget expires the reader threads are detached and the parent reports `drain_expired` rather than
+  blocking forever on a descendant holding a pipe.
+- A recursion guard (`CHILD_ENV`) plus a per-run nonce make the spawned process run the fixture body
+  instead of spawning again. The dispatch requires **both** the guard and the nonce, so an
+  accidentally inherited `CHILD_ENV` alone does not turn the parent into an unbounded in-process body;
+  the parent clears both before spawning. The parent requires the child's typed evidence line with the
+  nonce, so a filter typo that makes the child run zero tests cannot pass.
+- The parent parses the child's typed counts and rejects zeros: `race bounds: bytes=… writes=… 
+  collects=… ops=…` must have `writes`, `collects` and `ops` all `> 0`, and `stall bounds: bytes=… 
+  writes=… cycles=… barriers=…` must have `writes`, `cycles` and `barriers` all `> 0`. A success exit
+  code with a fabricated constant marker and no real counts is rejected.
+- The child appends and fsyncs a phase log, so a hard kill still leaves the phase it reached.
+
+**The PARK control, inside the real writers fixture**: `race.rs::a_parked_writers_fixture_is_killed_by_the_parent_and_the_parent_fails`
+runs the *same* `writers_and_collects_body` with `COWFS_GC_CHILD_PARK=1`. After real setup it parks
+the collector forever inside the existing `Gc` test seam (`set_between_list_and_walk`, with the cycle
+lock held) - no new production callback. The parent must observe `timed_out`, kill the child within
+`deadline + 10 s`, see **no** `race bounds:` success line, and see in the child log that it reached
+`phase=race-setup-done` and `phase=parking-collector` but never `phase=race-collected`. The self-test
+passes only because the inner fixture **timed out**; the same fixture unparked
+(`writers_and_collects_at_once_lose_nothing`) passes with non-zero real work, so the two controls
+contrast cleanly.
+
+The `resource_watchdog.rs` file keeps the helper-mechanics controls on a smaller real `cowfs-core`
+fixture: a happy child that reclaims real packs and reads a survivor back after a reopen, the parked
+child (parent kills and FAILS, never PASS or SKIP), a slow seam-less child that must be rejected as
+not-parked, a generic main-thread-panic child failure that exits non-zero promptly, a descendant that
+holds the pipe open past the drain budget (reported as a drain expiry and failed, bounded), a filter
+that matches no test, a guard-only process that must take the parent branch, and a nonce mismatch.
+
+The guard-only control is discriminating and fast: it asserts the pure dispatch predicate rejects
+`(guard, no nonce)` and accepts `(guard, nonce)`, then spawns a real process with the guard set and
+*no* nonce running a dedicated body whose two branches log `phase=ran-parent-path` or
+`phase=wrongly-ran-body`. The control requires the parent branch and rejects the body branch, so it
+cannot pass on an empty output. No `set_var`/`remove_var` runs in the multithreaded test binary; the
+guard and nonce travel on the child `Command` only.
+
+Two guard generalisations the review caught, both fixed test-only:
+
+- The park controls once accepted any child that was merely slow. `phase=parking-collector` is logged
+  *before* the seam is installed, and the unparked body can run past a short deadline under load, so
+  the control now requires `phase=parked`, which the seam logs only when it actually runs, before it
+  accepts `timed_out`. The slow seam-less child is the negative control that demonstrates the
+  rejection.
+- Verify-before-kill no longer shells out. An earlier version ran `ps` on the deadline path with no
+  bound, so a hung `ps` (a `PATH` shim that slept 35 s) extended a 20 s deadline to 55 s. The state
+  is now read from the owned `std::process::Child` alone (the reserved pid plus the `try_wait` state
+  seen immediately before `Child::kill`), so no external probe can extend the deadline and the pid is
+  never reused before the reap.
+
+The real writer-thread failure path *is* covered, with no new production surface:
+`race.rs::a_writer_thread_failure_stops_the_phase_and_fails_the_parent` builds its fixture with the
+existing `Fixture::with_hook` test helper (added in `f501157`) and arms the metadata `before_sync`
+hook after setup, so a concurrent writer's `fork`/`sync` fails with a non-`NoSuchSnapshot` error. The
+writer records it and stops the phase, and the parent sees a prompt non-zero exit well under the
+deadline with the writer diagnostic and no success counts. An earlier revision of this doc wrongly
+said that needed new production surface; it did not.
+
+Each guard fix has a mutation falsifier that reproduces the defect against the new control and shows
+the control fails without the fix:
+
+- Reintroducing the unbounded `ps` on the deadline path makes the park control run 55.35 s under a
+  hung-`ps` shim (and invokes `ps`); the fixed version ends at 20 s and never invokes `ps`.
+- Making the drain budget expiry report a clean drain makes the descendant control fail with
+  `a descendant holding the pipe must be reported as a drain expiry, not a clean drain`.
+- Removing the seam from the park body makes the park control fail with
+  `the collector must actually reach the parked seam, not merely be slow`.
+- Never arming the writer hook makes the writer-failure control fail with
+  `a writer failure must exit non-zero: Some(0)`.
+
+The `24 MiB` and `9 s` figures are the cooperative in-process knobs, not the hard runtime bound. The
+hard bound for each wrapped fixture is the parent's declared deadline (`CHILD_DEADLINE`, 120 s).
 
 ## What did not change
 
 - The adversarial structure is preserved: a shared `base` snapshot, forked per writer, with a
-  concurrent create/remove/reap thread and a collect loop, and every collect's live set re-read
-  from the store.
-- The stall test's assertion is still the relative one (`held_us < collect_us`): the barrier's own
-  held time is a fraction of the collect window, so it is handed off per pack. That assertion is a
-  functional concurrency check, **not** a performance gate: wall-clock under a descheduled runner is
-  variance. The loose `worst_us < 30_000_000` line is only a backstop for a barrier that is
-  pathological for some other reason.
-- No timeout was loosened and no failure is ignored.
+  concurrent create/remove/reap thread and a collect loop, and every collect's live set re-read from
+  the store.
+- No timeout was loosened and no failure is ignored. The parent deadline fails (never skips) on a
+  hang.
+- Coverage, observed on this wrapped fixture: the writers test reached
+  `race bounds: writes=851 collects=18 ops=1082`, and the stall test reached
+  `stall bounds: writes=358 cycles=4 barriers=5`. These are single-run samples, not throughput
+  claims. The collector loop still starves the writers and each cycle is slow, so the per-collect
+  "every live block reads" check runs a bounded number of times per run. The floors the parent
+  enforces are `writes > 0`, `collects > 0`, `ops > 0` (writers) and `writes > 0`, `cycles > 0`,
+  `barriers > 0` (stall): a nonzero-work floor, not a throughput claim.
+
+## The barrier-stall assertion
+
+The stall fixture is a **functional** concurrency check: the barrier is taken at least once, the
+writers and the collector both make progress, and a collect causes no loss (every live block reads
+back). It is **not** a latency or fairness gate.
+
+An earlier version asserted `held_us < collect_us`, on the theory that a collector holding one
+barrier to the end of the sweep could not pass it. That was reproduced false: a mutant that takes the
+barrier once and holds it for the whole sweep (199 writes, 4 cycles), and a mutant that takes it once
+and holds it for the whole cycle (8 writes, 4 cycles), both pass it, and both pass the 30 s backstop.
+The ratio does not discriminate the hand-off property, so both the ratio and the backstop are gone,
+and no hand-off or latency claim is made from this fixture. The hand-off itself is covered by the gate
+unit test in `cowfs-core`, not by this wall-clock test.
 
 ## The `NoSuchSnapshot` failure is not the fixture's
 

@@ -518,6 +518,9 @@ struct Conn {
     dead: AtomicBool,
     last_active: AtomicU64,
     inflight: Mutex<HashMap<u64, CancelToken>>,
+    /// Terminal frames whose write is in progress. Counted outside the inflight map so a slow
+    /// write never holds the map lock, yet teardown still sees the request as unfinished.
+    finishing: AtomicU64,
 }
 
 impl Conn {
@@ -529,21 +532,24 @@ impl Conn {
             dead: AtomicBool::new(false),
             last_active: AtomicU64::new(0),
             inflight: Mutex::new(HashMap::new()),
+            finishing: AtomicU64::new(0),
         })
     }
 
     fn send(&self, frame: &ServerFrame) -> bool {
-        if self.dead.load(Ordering::SeqCst) {
-            return false;
-        }
-        let ok = {
-            let _guard = lock(&self.write_lock);
-            (&self.stream).write_all(&frame.encode()).is_ok()
-        };
+        let ok = self.write_frame(frame);
         if !ok {
             self.kill();
         }
         ok
+    }
+
+    fn write_frame(&self, frame: &ServerFrame) -> bool {
+        if self.dead.load(Ordering::SeqCst) {
+            return false;
+        }
+        let _guard = lock(&self.write_lock);
+        (&self.stream).write_all(&frame.encode()).is_ok()
     }
 
     fn send_error(&self, id: Option<u64>, error: CtlError) -> bool {
@@ -555,8 +561,23 @@ impl Conn {
     /// Closing a connection is the connection thread's job and always drains what the peer sent
     /// first, so a frame that is on its way out cannot be cut by it.
     fn finish(&self, id: u64, frame: &ServerFrame) {
-        if lock(&self.inflight).remove(&id).is_some() {
-            self.send(frame);
+        {
+            let mut inflight = lock(&self.inflight);
+            if inflight.remove(&id).is_none() {
+                return;
+            }
+            // Keep teardown from observing completion before the terminal write finishes, but do
+            // not hold the map lock across the write: admission and shutdown take it too. The
+            // counter is bumped under the lock, so any observer that sees the id gone also sees a
+            // nonzero finishing count until the write below completes.
+            self.finishing.fetch_add(1, Ordering::SeqCst);
+        }
+        let ok = self.write_frame(frame);
+        // Release the completion claim only after the terminal frame is on the wire. The map lock
+        // is free again, so a failed write can safely reacquire it through `kill`.
+        self.finishing.fetch_sub(1, Ordering::SeqCst);
+        if !ok {
+            self.kill();
         }
     }
 
@@ -567,7 +588,7 @@ impl Conn {
     }
 
     fn inflight_empty(&self) -> bool {
-        lock(&self.inflight).is_empty()
+        lock(&self.inflight).is_empty() && self.finishing.load(Ordering::SeqCst) == 0
     }
 
     /// Ends every request that is still running with `shutting_down`. Only sent when the server
@@ -1010,4 +1031,78 @@ fn dispatch(
             Response::Ok(Empty {})
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_write_remains_inflight_until_sent() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let conn = Arc::new(Conn::new(&server).unwrap());
+        lock(&conn.inflight).insert(1, CancelToken::new());
+        let write = lock(&conn.write_lock);
+        let frame = ServerFrame::Error {
+            id: Some(1),
+            error: CtlError::new(ErrorCode::Cancelled, "done"),
+        };
+        let expected = frame.encode();
+        let worker = thread::spawn({
+            let conn = Arc::clone(&conn);
+            move || conn.finish(1, &frame)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // The finisher removes the id under the map lock, bumps `finishing`, then blocks on the
+        // write lock held above. Seeing a nonzero count proves it is inside the terminal write.
+        // Both the map and the counter must report busy in that window.
+        while conn.finishing.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "finisher did not reach the write"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !conn.inflight_empty(),
+            "teardown can observe completion before the terminal write"
+        );
+        drop(write);
+        worker.join().unwrap();
+        assert!(conn.inflight_empty());
+        conn.kill();
+        let mut actual = Vec::new();
+        client.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn terminal_write_failure_does_not_deadlock_cancellation() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let conn = Arc::new(Conn::new(&server).unwrap());
+        let pending = CancelToken::new();
+        lock(&conn.inflight).insert(1, CancelToken::new());
+        lock(&conn.inflight).insert(2, pending.clone());
+        drop(client);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn({
+            let conn = Arc::clone(&conn);
+            move || {
+                conn.finish(
+                    1,
+                    &ServerFrame::Error {
+                        id: Some(1),
+                        error: CtlError::new(ErrorCode::Cancelled, "done"),
+                    },
+                );
+                tx.send(()).unwrap();
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(conn.dead.load(Ordering::SeqCst));
+        assert!(pending.is_cancelled());
+    }
 }

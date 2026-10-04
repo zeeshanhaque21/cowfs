@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod child;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};

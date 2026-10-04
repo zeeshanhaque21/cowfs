@@ -48,8 +48,12 @@ outright (issue 83).
 
 - The id names no root in the durable table any more, so nothing this cycle keeps is reached through
   it.
-- A fork of it recorded its own root before the removal committed, so the fork is walked through its
-  own listed id, not the removed one.
+- A fork made **before** the freeze listing recorded its own root before the removal committed, so it
+  is walked through its own listed id. A fork made **after** the listing is not in the step-2 list at
+  all; it is covered by the step-5 re-list of durable roots under the barrier, so the vanished
+  snapshot's blocks are still kept if that late fork is their only holder.
+  Reviewer evidence reproduced both rows, including the case where the late fork is the only holder
+  (the packs holding the victim's blocks were skipped `BecameLive` in step 5).
 
 The collector therefore skips **that one id** and continues.
 It does not record the failed root as walked, does not add a block or root to the persisted mark, and
@@ -57,6 +61,15 @@ writes no partial marker: the skip happens before any of that.
 Every other error (storage, corruption, a failing hook) still stops the cycle with
 `Err(e) => return Err(e.into())`, the same conversion the old `?` used, so a real failure is never
 treated as a vanished snapshot.
+
+### The lookup/walk seam runs in step 5 too, with the barrier held
+
+`Gc::set_between_lookup_and_walk` is a test-only seam whose callback runs for **every** walk the
+collector does, not only the step-2 mark pass. In step 5 the collector re-walks the durable roots
+under a taken barrier, so a callback that fires there runs with the barrier held. A callback that
+does a gated core write on that thread would self-deadlock at the gate. The shipped tests guard on the
+snapshot id and fire once, so none of them hit it; a new test that uses this seam must do the same.
+The production code never sets it.
 
 Proof (private stores, this worktree):
 
