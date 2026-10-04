@@ -24,7 +24,7 @@ is safe.
 | `cowfs-daemon` | sha256 `4f29fab15f09ac2754c8ee0d4b7b9b0c515b620fbf10b89c6c010c99844085d8` |
 | `cowfs` | sha256 `9567bded815291568a523c6d7a5772e9fd997d797da19cd9d628bee56ca0c5b5` |
 | transport | real in-process NFSv3 loopback, `cowfs-daemon --backend core` |
-| per-case wall clock | 0.2 s to 4.2 s, 60 s total for all 32 case executions |
+| per-case wall clock | 0.2 s to 3.7 s, 65 s total for all 32 case executions |
 
 Binaries are built from the committed tree with
 `cargo build -p cowfs-cli -p cowfs-daemon`; the harness records the revision and both
@@ -98,7 +98,7 @@ reason, and the reason is stored in the receipt rather than hidden.
 
 ### 1. On this transport, a POSIX parent-directory `fsync` after a rename is not a durability receipt
 
-Measured, 2 reps each, kill 2 to 6 ms after the rename:
+Measured, 2 reps each, kill 2 to 5 ms after the rename:
 
 - `os.fsync(dirfd)` after `os.rename`: the rename was **gone** after the fresh reopen. The
   directory held `orig.bin`, exactly the pre-rename name.
@@ -139,7 +139,7 @@ Consequently:
 
 The dead set was made real, not shared: 12,582,912 bytes written into a snapshot of their own,
 that snapshot removed, then one `gc` cycle.
-Measured report: `candidate_blocks` 155 and 154 across the two reps, `freed_bytes` 0,
+Measured report: `candidate_blocks` 159 and 160 across the two reps, `freed_bytes` 0,
 `freed_blocks` 0.
 
 Zero freed is the expected result, not a bug: a small fixture lives in the open pack, which
@@ -160,7 +160,7 @@ Sampled, all with the kill 0 to 6 ms after the last receipt, except where noted:
 - after an `mmap` write with `msync` and `fsync` (level B);
 - after a fork whose name was committed by a later `COMMIT` (level B);
 - after a `snapshot rm` (level A);
-- after a completed `gc` cycle, 0.49 s and 0.69 s after the last receipt (level B);
+- after a completed `gc` cycle, 0.56 s and 0.94 s after the last receipt (level B);
 - on an idle daemon (control).
 
 Of the level A receipts, 26 survived and 6 were lost: the 4 rename receipts of finding 1,
@@ -252,9 +252,10 @@ scripts/verify-daemon-crash.py --only rename_writefsync  # one boundary
 `records.jsonl` is appended, flushed and `fsync`ed per record, so a killed run leaves usable
 evidence and a rerun skips the cases already marked terminal.
 
-## Two harness bugs found and fixed during this work
+## Three harness bugs found and fixed during this work
 
-Recorded because both produced convincing false results before they were caught.
+Recorded because the first two produced convincing false results before they were caught, and
+the third silently disabled a feature this report claims.
 
 1. `receipts.durable_items()[-1]` was used to re-file a receipt after a rename. It silently
    re-filed the *last* receipt, not the renamed one, so a case that had actually passed looked
@@ -263,5 +264,9 @@ Recorded because both produced convincing false results before they were caught.
 2. The sample phase and the matrix phase reused the same store path for the same case, so
    `snapshot create live` failed on the matrix run against the sample run's residue. The store
    path now carries the phase.
+3. The resume key and the recorded case name were different strings, so no case was ever
+   skipped on a rerun; a rerun replayed against its own residue and reported failures. The
+   terminal record now carries an explicit `key`, and a rerun with the same run id skips
+   completed cases.
 
-The first one is the reason the rename boundary was probed three ways instead of asserted once.
+Bug 1 is the reason the rename boundary was probed three ways instead of asserted once.

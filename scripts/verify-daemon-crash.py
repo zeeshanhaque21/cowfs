@@ -175,11 +175,16 @@ class Recorder:
         return out
 
     def done_cases(self):
-        """Case names whose terminal record is present, for resume."""
+        """Resume keys of cases whose terminal record is present.
+
+        Keyed on the explicit `key` field rather than the case name, because the
+        case name and the resume key are different strings and comparing them
+        silently never matches.
+        """
         names = set()
         for r in self.prior:
-            if r.get("name", "").startswith("case.") and r.get("terminal"):
-                names.add(r.get("case"))
+            if r.get("terminal") and r.get("key"):
+                names.add(r["key"])
         return names
 
     def record(self, name, ok, **fields):
@@ -1504,6 +1509,7 @@ def main():
             rec.record(
                 "case.terminal",
                 results[key],
+                key=key,
                 case=fixture,
                 terminal=True,
                 phase=phase,
