@@ -392,11 +392,23 @@ class Receipts:
                 ),
             )
 
-    def repath_by_path(self, old, new):
-        """Re-file a receipt under a new name after a rename, matched by path."""
+    def repath_by_path(self, old, new, rec=None):
+        """Re-file a receipt under a new name after a rename, matched by path.
+
+        The change is written to the ledger as an immutable event. Without it the
+        ledger holds the pre-rename path while the manifest holds the post-rename
+        one, and the case's own evidence stops matching itself.
+        """
         for r in self.items:
             if r.path == old:
                 r.path = new
+                if rec is not None:
+                    rec.record(
+                        "receipt.repath",
+                        True,
+                        receipt=r.as_dict(),
+                        **{"from": old, "to": new},
+                    )
                 return True
         return False
 
@@ -499,11 +511,17 @@ class Probe:
 
     IDLE_BASELINE_SECS = 0.5
 
-    def __init__(self, rec, case):
+    def __init__(self, rec, case, reader=None, baseline_secs=None):
+        """`reader` is the counter source. Injectable so the unavailable branch and
+        each drift figure can be tested deterministically, with no real nfsstat."""
         self.rec = rec
         self.case = case
-        first = commit_count()
-        self.available = first is not None
+        self._reader = reader or commit_count
+        self._baseline_secs = (
+            self.IDLE_BASELINE_SECS if baseline_secs is None else baseline_secs
+        )
+        first = self._read(tries=1)
+        self.available = isinstance(first, int)
         self.baseline = self._idle_baseline()
         self.marks = {}
 
@@ -511,7 +529,7 @@ class Probe:
         if not self.available:
             return None
         before = self._read()
-        time.sleep(self.IDLE_BASELINE_SECS)
+        time.sleep(self._baseline_secs)
         after = self._read()
         if not (isinstance(before, int) and isinstance(after, int)):
             self.rec.record(
@@ -533,13 +551,22 @@ class Probe:
         return drift
 
     def _read(self, tries=3):
-        """Read the counter, retrying: nfsstat occasionally fails under host load."""
+        """Read the counter, retrying: nfsstat occasionally fails under host load.
+
+        A reader that raises is treated exactly like one that returns nothing, so
+        an unavailable counter can never be mistaken for a reading of zero.
+        """
         last = None
         for _ in range(tries):
-            v = commit_count()
-            if v is not None:
-                return v
-            last = NFSSTAT_LAST_ERROR
+            try:
+                v = self._reader()
+            except Exception as e:  # noqa: BLE001 - any failure means unavailable
+                v = None
+                last = "%s: %s" % (type(e).__name__, e)
+            else:
+                if isinstance(v, int):
+                    return v
+                last = v if isinstance(v, str) else "counter reader returned %r" % (v,)
             time.sleep(0.2)
         return last  # the error string, not a number
 
@@ -566,6 +593,33 @@ class Probe:
             return
         m["after"] = self._read()
 
+    @staticmethod
+    def attributable_for(delta, drift):
+        """Is a positive COMMIT signal attributable to this step?
+
+        The rule, stated once so it can be tested as a truth table instead of
+        inferred from a precedence accident:
+
+          * ``delta <= 0`` is never positive attribution. A zero delta is an
+            observation of no COMMIT attributable to the step, not evidence of
+            activity, and a negative delta means the counter was reset (or the
+            tool changed under us), which invalidates the reading entirely.
+          * with ``drift == 0`` any positive delta is attributable.
+          * with ``drift > 0`` the host was already moving the counter, so the
+            signal must stand at ``3 * drift`` or more to be separable.
+
+        Returns None when either figure is unknown. The numbers are a raw
+        difference of two cumulative host-wide readings; the drift figure is
+        reported alongside so a reader can judge the separation themselves.
+        """
+        if delta is None or drift is None:
+            return None
+        if delta <= 0:
+            return False
+        if drift == 0:
+            return True
+        return delta >= 3 * drift
+
     def report(self, label):
         m = self.marks.get(label)
         if m is None:
@@ -575,6 +629,7 @@ class Probe:
                 "commit_delta": None,
                 "before": None,
                 "after": None,
+                "attributable": None,
                 "error": "no sample taken for this label",
                 "note": "this step was never sampled; no claim about COMMIT",
             }
@@ -584,28 +639,23 @@ class Probe:
         numeric = isinstance(before, int) and isinstance(after, int)
         drift = self.baseline if isinstance(self.baseline, int) else None
         delta = (after - before) if numeric else None
-        # The counter is host-wide, so a step is only attributable when its delta
-        # stands clear of the drift seen over an idle window of the same length.
-        # On a busy machine this is often false, and then the harness says so
-        # instead of reading "no COMMIT" into a delta that noise could explain.
-        attributable = None
-        if delta is not None and drift is not None:
-            attributable = drift == 0 and delta > 0 or abs(delta) >= 3 * abs(drift)
         rec = {
             "label": label,
             "available": self.available,
             "before": before if numeric else None,
             "after": after if numeric else None,
             "commit_delta": delta,
+            "delta_is_background_subtracted": False,
             "idle_baseline_drift": drift,
-            "attributable": attributable,
+            "attributable": self.attributable_for(delta, drift) if numeric else None,
             "error": None
             if numeric
             else "unreadable: before=%r after=%r" % (before, after),
             "note": (
-                "host-wide NFSv3 client counter, delta across one single-threaded "
-                "step; attributable=false means the idle drift on this host is large "
-                "enough to explain the delta, so no claim is made either way"
+                "host-wide NFSv3 client counter, raw difference across one "
+                "single-threaded step, not background-subtracted; a step is only "
+                "attributable when its positive delta stands clear of the idle "
+                "drift, and a zero delta is never positive attribution"
             ),
         }
         self.rec.record("wire.report", True, case=self.case, **rec)
@@ -917,7 +967,25 @@ class CaseResult:
 def verify_readback(fresh, receipts, res, rec):
     for r in receipts.by_kind("durable"):
         p = os.path.join(fresh.mount, r.path)
-        if not os.path.exists(p):
+        present = os.path.exists(p)
+        got = sha256_file(p) if present else None
+        matched = present and got == r.sha256 and os.path.getsize(p) == r.size
+        # A semantic record, independent of any pass/fail flag: this is what the
+        # durable promise actually resolved to, and the cached-verdict check
+        # re-derives the outcome from these fields rather than trusting `ok`.
+        rec.record(
+            "readback.durable",
+            True,
+            case=res.name,
+            path=r.path,
+            want=r.sha256,
+            want_size=r.size,
+            present=present,
+            got=got,
+            matched=bool(matched),
+            boundary=r.boundary,
+        )
+        if not present:
             parent = os.path.dirname(p)
             try:
                 siblings = sorted(os.listdir(parent))
@@ -933,17 +1001,15 @@ def verify_readback(fresh, receipts, res, rec):
                 detail="caller's sync returned success and the bytes are gone",
             )
             continue
-        got = sha256_file(p)
-        size = os.path.getsize(p)
         res.check(
             rec,
-            got == r.sha256 and size == r.size,
+            matched,
             "durable_match",
             path=r.path,
             want=r.sha256,
             got=got,
             want_size=r.size,
-            got_size=size,
+            got_size=os.path.getsize(p),
         )
     for r in receipts.by_kind("applied"):
         p = os.path.join(fresh.mount, r.path)
@@ -958,11 +1024,13 @@ def verify_readback(fresh, receipts, res, rec):
         )
     for r in receipts.by_kind("removed"):
         p = os.path.join(fresh.mount, r.path)
+        present = os.path.exists(p)
         res.check(
             rec,
-            not os.path.exists(p),
+            not present,
             "removed_absent",
             path=r.path,
+            present=present,
             detail="this harness removed it on purpose",
         )
 
@@ -977,6 +1045,7 @@ def verify_snapshot_names(fresh, receipts, res, rec):
                 present,
                 "snapshot_name_present",
                 snapshot=n["name"],
+                present=present,
                 boundary=n["boundary"],
             )
         else:
@@ -998,7 +1067,9 @@ def verify_no_torn_tree(fresh, res, rec):
     }
     for name in sorted(x for x in listed if x):
         d = os.path.join(fresh.mount, name)
-        if not res.check(rec, os.path.isdir(d), "snapshot_is_dir", snapshot=name):
+        if not res.check(
+            rec, os.path.isdir(d), "snapshot_is_dir", snapshot=name, present=os.path.isdir(d)
+        ):
             continue
         try:
             entries = sorted(os.listdir(d))
@@ -1134,6 +1205,18 @@ def run_case(identity, ops, run_dir, parent_rec, case_dir=None):
         "steps": [rec.step],
         "secs": round(time.time() - started, 1),
     }
+    # The verdict is persisted to the ledger as it was computed, before the
+    # terminal record. A cached verdict is checked against this and against the
+    # semantic readback records, so editing manifest.json alone cannot relabel a
+    # failure as a pass.
+    rec.record(
+        "case.verdict",
+        outcome == "pass",
+        outcome=outcome,
+        failures=list(res.failures),
+        assertions=[{"label": a["label"], "ok": a["ok"]} for a in res.assertions],
+        receipt_state=[r.as_dict() for r in receipts.items],
+    )
     mpath = os.path.join(case_dir, "manifest.json")
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
@@ -1223,11 +1306,11 @@ def case_rename_posix_durability(d, receipts, res, rec, probe):
     a directory fsync the rename comes back lost and the case FAILS. It is written to
     be falsifiable and is not reclassified afterwards. See issue #90.
     """
-    dst = _rename_setup(d, receipts, res, rec, probe, 400)
+    _rename_setup(d, receipts, res, rec, probe, 400)
     probe.sample("fsync_parent_dir")
     fsync_dir(os.path.join(d.mount, "live"))
     probe.mark("fsync_parent_dir")
-    receipts.repath_by_path("live/orig.bin", "live/moved.bin")
+    receipts.repath_by_path("live/orig.bin", "live/moved.bin", rec)
     rec.record(
         "case.phase",
         True,
@@ -1251,7 +1334,7 @@ def case_rename_posix_durability_ro(d, receipts, res, rec, probe):
     finally:
         os.close(fd)
     probe.mark("fsync_readonly_fd")
-    receipts.repath_by_path("live/orig.bin", "live/moved.bin")
+    receipts.repath_by_path("live/orig.bin", "live/moved.bin", rec)
     rec.record(
         "case.phase",
         True,
@@ -1274,7 +1357,7 @@ def case_rename_committed(d, receipts, res, rec, probe):
         d.mount, "live", "trigger.bin", deterministic_body(SAMPLE_BYTES, 403), True, rec, receipts
     )
     probe.mark("trigger_fsync")
-    receipts.repath_by_path("live/orig.bin", "live/moved.bin")
+    receipts.repath_by_path("live/orig.bin", "live/moved.bin", rec)
     rec.record(
         "case.phase",
         True,
@@ -1463,7 +1546,6 @@ def run_native_case(identity, run_dir, parent_rec, case_dir=None):
         case_dir = next_case_dir(run_dir, case, identity)
     rec = Recorder(case_dir)
     res = CaseResult(case)
-    probe = Probe(rec, case)
     started = time.time()
     outcomes = {}
 
@@ -1495,7 +1577,10 @@ def run_native_case(identity, run_dir, parent_rec, case_dir=None):
 
         receipts = Receipts()
         rpath = os.path.join(expect, "receipts.json")
-        if not res.check(rec, os.path.exists(rpath), "native_receipts_present_" + mode):
+        if not res.check(
+            rec, os.path.exists(rpath), "native_receipts_present_" + mode,
+            present=os.path.exists(rpath),
+        ):
             continue
         with open(rpath, "r", encoding="utf-8") as f:
             receipts.items = [
@@ -1522,6 +1607,16 @@ def run_native_case(identity, run_dir, parent_rec, case_dir=None):
         "failures": res.failures,
         "secs": round(time.time() - started, 1),
     }
+    # Same ledger contract as a cowfs case, so a cached native verdict is checked
+    # against the same things rather than being trusted.
+    rec.record(
+        "case.verdict",
+        outcome == "pass",
+        outcome=outcome,
+        failures=list(res.failures),
+        assertions=[{"label": a["label"], "ok": a["ok"]} for a in res.assertions],
+        receipt_state=[],
+    )
     mpath = os.path.join(case_dir, "manifest.json")
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
@@ -1529,6 +1624,10 @@ def run_native_case(identity, run_dir, parent_rec, case_dir=None):
         os.fsync(f.fileno())
     rec.record("case.terminal", outcome == "pass", key=identity["key"], manifest=manifest)
     rec.close()
+    parent_rec.record(
+        "case.begin", True, key=identity["key"], case=case, identity=identity,
+        dir=case_dir, category="native",
+    )
     parent_rec.record(
         "native.terminal", outcome == "pass", key=identity["key"], case=case, outcome=outcome
     )
@@ -1584,13 +1683,104 @@ REQUIRED_MANIFEST_FIELDS = (
 )
 
 
+def _expected_from_assert_record(r):
+    """Recompute what an assertion record's own fields say it should be.
+
+    Returns None when the record carries no field that determines the answer, so
+    this never invents an expectation. Every case that returns an expectation is
+    derivable from data the record already carries, which is what makes a flipped
+    `ok` flag detectable: the verdict comes from `want`/`got`, `present`,
+    `n_problems`, `rc` and the recorded parent listing, not from the flag.
+    """
+    label = str(r.get("name", ""))[len("assert."):]
+    if label == "durable_match":
+        return r.get("want") == r.get("got") and r.get("want_size") == r.get("got_size")
+    if label == "durable_present":
+        # The failure path records the parent listing, so presence of the file is
+        # checkable against it. An ok=True claim that also carries a listing which
+        # omits the file is a contradiction.
+        entries = r.get("parent_entries")
+        if entries is None:
+            return None
+        base = os.path.basename(str(r.get("path", "")))
+        return base in entries
+    if label == "fsck_clean":
+        return (r.get("n_problems") or 0) == 0
+    if label in ("snapshot_name_present", "snapshot_is_dir"):
+        if "present" not in r:
+            return None
+        return bool(r["present"])
+    if label == "removed_absent":
+        # The assertion is that the path is gone, so ok tracks the absence.
+        if "present" not in r:
+            return None
+        return not r["present"]
+    if label in ("snapshot_rm_ok", "gc_rm_garbage_ok"):
+        return r.get("rc") == 0
+    if label.startswith("native_writer_exit_"):
+        return r.get("rc") == r.get("expected_rc")
+    if label.startswith("native_durable_match_"):
+        return r.get("want") == r.get("got")
+    if label.startswith("native_receipts_present_"):
+        return bool(r.get("present", True))
+    return None
+
+
+def derive_verdict(prior, manifest_receipts):
+    """Recompute the case outcome from the ledger, ignoring every `ok` flag.
+
+    Returns (derived_outcome, derived_failure_labels, contradictions).
+
+    `contradictions` lists assertion records whose `ok` flag disagrees with what
+    the record's own fields say. Those are reported separately from the derived
+    failures and are never deduplicated against them, because a flag that
+    contradicts its own evidence is a defect even when the outcome happens to come
+    out the same either way.
+    """
+    failures = []
+    contradictions = []
+    readback = {
+        r["path"]: r for r in prior if r.get("name") == "readback.durable"
+    }
+    # Every durable receipt must have a semantic readback record. One without is
+    # a promise that was never checked.
+    for rc in manifest_receipts:
+        if rc.get("kind") != "durable":
+            continue
+        rb = readback.get(rc["path"])
+        if rb is None:
+            failures.append("durable_present")
+            continue
+        if not rb.get("present"):
+            failures.append("durable_present")
+        elif rb.get("got") != rc["sha256"]:
+            failures.append("durable_match")
+
+    for r in prior:
+        n = str(r.get("name", ""))
+        if not n.startswith("assert."):
+            continue
+        label = n[len("assert."):]
+        want = _expected_from_assert_record(r)
+        if want is not None and bool(r.get("ok")) != want:
+            contradictions.append(label)
+            failures.append(label)
+
+    derived = "fail" if failures else "pass"
+    return derived, sorted(set(failures)), sorted(set(contradictions))
+
+
 def validate_cached(identity, case_dir):
     """Decide whether a previous verdict in `case_dir` may be reused.
 
-    Returns (ok, reason, manifest). Fail closed at every step: nothing is reused
-    because a record says so. The identity must match exactly, the manifest must be
-    complete, the evidence file it points at must exist, and that evidence must
-    actually contain the receipts and assertions the manifest claims.
+    Returns (ok, reason, manifest). This is artifact consistency, not
+    authentication: anyone who can rewrite both `manifest.json` and
+    `records.jsonl` coherently can still forge a verdict, because there is no
+    signature and none is claimed. What it does guarantee is that the specific
+    laundering the review performed -- editing a manifest to turn a recorded
+    failure into a pass -- is rejected, because the outcome is re-derived from
+    the ledger's semantic readback fields and from a verdict record written at
+    execution time.
     """
     mpath = os.path.join(case_dir, "manifest.json")
     epath = os.path.join(case_dir, "records.jsonl")
@@ -1612,21 +1802,74 @@ def validate_cached(identity, case_dir):
     if not os.path.exists(epath):
         return False, "evidence file absent", None
 
-    # Verify the manifest against the evidence rather than against itself.
     prior = read_records(epath)
     term = [r for r in prior if r.get("name") == "case.terminal"]
     if not term:
         return False, "no terminal record in evidence", None
     if term[-1].get("manifest", {}).get("identity") != identity:
         return False, "terminal record identity mismatch", None
-    issued = [r["receipt"] for r in prior if r.get("name") == "receipt.issued"]
-    for want in man["receipts"]:
-        match = [
-            i for i in issued
-            if i["path"] == want["path"] and i["sha256"] == want["sha256"]
-        ]
-        if not match:
-            return False, "receipt %r absent from evidence" % want["path"], None
+
+    verdict = [r for r in prior if r.get("name") == "case.verdict"]
+    if not verdict:
+        return False, "no case.verdict in evidence", None
+    v = verdict[-1]
+
+    # Receipts: kind, resolved path, hash and size must all agree, and the
+    # resolved path must follow the recorded repath chain rather than be asserted.
+    issued = {}
+    for r in prior:
+        if r.get("name") == "receipt.issued":
+            issued[r["receipt"]["path"]] = r["receipt"]
+    renamed = {}
+    for r in prior:
+        if r.get("name") == "receipt.repath":
+            renamed[r["to"]] = r["from"]
+    ledger_state = v.get("receipt_state") or []
+    if len(ledger_state) != len(man["receipts"]):
+        return False, "receipt count differs between ledger and manifest", None
+    for want, got in zip(ledger_state, man["receipts"]):
+        for field in ("path", "sha256", "size", "kind", "boundary"):
+            if want.get(field) != got.get(field):
+                return False, "receipt %r field %r differs" % (
+                    want.get("path"), field,
+                ), None
+        # A renamed path is only legitimate if the ledger recorded the rename and
+        # the path it came from was genuinely issued.
+        if got["path"] in renamed:
+            origin = renamed[got["path"]]
+            if origin not in issued:
+                return False, "receipt %r claims a rename from %r, which was never issued" % (
+                    got["path"], origin,
+                ), None
+
+    # Assertions: the manifest must match the verdict record exactly, values included.
+    v_asserts = v.get("assertions") or []
+    if [(a["label"], a["ok"]) for a in v_asserts] != [
+        (a["label"], a["ok"]) for a in man["assertions"]
+    ]:
+        return False, "manifest assertions differ from the ledger verdict", None
+
+    # The outcome must be the one the ledger's own facts imply.
+    derived, derived_failures, contradictions = derive_verdict(prior, man["receipts"])
+    if contradictions:
+        return False, "assertion flags contradict their own fields: %r" % (
+            contradictions,
+        ), None
+    if derived != man["outcome"]:
+        return False, "manifest outcome %r but the ledger derives %r" % (
+            man["outcome"], derived,
+        ), None
+    if sorted(man["failures"]) != derived_failures:
+        return False, "manifest failures %r but the ledger derives %r" % (
+            sorted(man["failures"]), derived_failures,
+        ), None
+    if v.get("outcome") != man["outcome"]:
+        return False, "ledger verdict %r but manifest says %r" % (
+            v.get("outcome"), man["outcome"],
+        ), None
+    if sorted(v.get("failures") or []) != sorted(man["failures"]):
+        return False, "ledger verdict failures differ from the manifest", None
+
     checked = set()
     for r in prior:
         n = str(r.get("name", ""))
@@ -1757,7 +2000,7 @@ def main():
     rec.record("sockdir.ready", True, dir=SOCK_DIR)
 
     counts = {"executed": 0, "reused": 0, "rejected": 0, "passed": 0, "failed": 0,
-              "aborted": 0, "error": 0}
+              "aborted": 0, "error": 0, "unknown_case": 0}
     failures = {}
     exit_code = 3
 
@@ -1789,12 +2032,29 @@ def main():
             a for a in (args.stage, args.only, str(args.reps)) if a is not None
         )
 
-        log("plan: %d cowfs case executions, native=%s" % (len(plan), native))
+        # The native control is a planned execution too, so it is counted here
+        # rather than appearing in the totals without ever being in the plan.
+        planned_cowfs = len(plan)
+        planned_native = 1 if native else 0
+        planned_total = planned_cowfs + planned_native
+        rec.record(
+            "plan.enumerated",
+            True,
+            planned_total=planned_total,
+            planned_cowfs=planned_cowfs,
+            planned_native=planned_native,
+            entries=["%s/%s/r%d" % (c, ph, r) for c, ph, r in plan]
+            + (["native/native/r0"] if native else []),
+            note="planned_total must equal executed + reused for the accounting to hold",
+        )
+        log("plan: %d executions (%d cowfs + %d native)"
+            % (planned_total, planned_cowfs, planned_native))
 
         for cname, phase, rep in plan:
             if cname not in CASES:
                 rec.record("plan.unknown_case", False, case=cname)
                 failures["%s-%s-r%d" % (cname, phase, rep)] = "unknown case"
+                counts["unknown_case"] += 1
                 continue
             ident = case_identity(phase, cname, rep, argv_scope, {"files": SAMPLE_FILES})
             case = case_name_for(ident)
@@ -1837,6 +2097,7 @@ def main():
             ident = case_identity("native", "native", 0, argv_scope, {"files": SAMPLE_FILES})
             case = case_name_for(ident)
             reused = None
+            reasons = []
             for d in candidate_dirs(run_dir, case, ident):
                 if not os.path.isdir(d):
                     break
@@ -1844,6 +2105,7 @@ def main():
                 if good:
                     reused = (d, man)
                     break
+                reasons.append("%s: %s" % (os.path.basename(d), reason))
             if reused is not None:
                 d, man = reused
                 counts["reused"] += 1
@@ -1851,6 +2113,10 @@ def main():
                 rec.record("cache.reused", True, key=ident["key"], dir=d)
             else:
                 counts["rejected"] += 1
+                rec.record(
+                    "cache.rejected", True, key=ident["key"],
+                    reasons=reasons or ["no attempt directory yet"],
+                )
                 outcome, manifest, _ = run_native_case(ident, run_dir, rec)
                 counts["executed"] += 1
                 tally(counts, outcome)
@@ -1858,22 +2124,38 @@ def main():
                     failures[case] = ",".join(manifest["failures"])
 
         fresh = counts["executed"] > 0
-        if not fresh:
+        any_failed = bool(
+            counts["failed"] or counts["aborted"] or counts["error"]
+            or counts["unknown_case"]
+        )
+        if not fresh and any_failed:
+            # A cached-only run whose cached verdicts include a failure is not
+            # UNMEASURABLE and must never exit 0. It is a complete, declared set
+            # that includes a real failure, so it fails.
+            exit_code = 1
+            verdict = "cached_only_with_failures"
+        elif not fresh:
             exit_code = 0 if args.accept_cached else 2
             verdict = "cached_only"
-        elif counts["failed"] or counts["aborted"] or counts["error"]:
+        elif any_failed:
             exit_code = 1
             verdict = "executed_with_failures"
         else:
             exit_code = 0
             verdict = "executed_all_passed"
 
+        accounted = counts["executed"] + counts["reused"] + counts["unknown_case"]
         summary = {
             "run_id": run_id,
             "verdict": verdict,
             "fresh_acceptance": fresh,
             "exit": exit_code,
             "counts": counts,
+            "planned_total": planned_total,
+            "planned_cowfs": planned_cowfs,
+            "planned_native": planned_native,
+            "accounted_total": accounted,
+            "accounting_balances": accounted == planned_total,
             "failures": failures,
             "known_failing_cases": {
                 k: v for k, v in KNOWN_FAILING.items()
@@ -1892,8 +2174,16 @@ def main():
 
         log("")
         log("verdict           : %s (exit %d)" % (verdict, exit_code))
+        if verdict == "cached_only_with_failures":
+            log("")
+            log("This run executed ZERO cases and reused %d cached verdict(s), of which"
+                % counts["reused"])
+            log("%d failed. A cached failure stays a failure: exit 1, not 0."
+                % (counts["failed"] + counts["aborted"] + counts["error"]))
         log("fresh acceptance  : %s" % ("yes" if fresh else "NO - zero cases executed"))
         log("executed / reused : %d / %d" % (counts["executed"], counts["reused"]))
+        log("accounting        : %d planned, %d accounted, balanced=%s"
+            % (planned_total, accounted, accounted == planned_total))
         log("passed / failed   : %d / %d" % (counts["passed"], counts["failed"]))
         if failures:
             log("failing cases:")
