@@ -131,9 +131,68 @@ namespace suites.
 
 `cargo fmt --all -- --check` clean. `cargo clippy -p cowfs-core --all-targets` clean.
 
+## Correction of two claims that were false on head `0d51b38`
+
+An earlier version of this document, written for head `0d51b38cbdd0d709811575020cc9a109048ba325`,
+stated `cargo fmt --all -- --check` clean and presented the green local test runs as though the head
+was in good shape.
+Both statements were wrong, and the mistake is worth recording because the shape of it is easy to
+repeat.
+
+**The formatter was red on that head, and CI never ran a test because of it.**
+
+```
+CI run 37231298754, workflow ci, event pull_request, branch fix/core-model-94
+  check (ubuntu-latest)  failure
+  check (macos-latest)   failure
+  linux-fuse             success
+cargo fmt --all -- --check    -> exit 1
+4 hunks, all in crates/cowfs-core/tests/elide_dentry.rs
+```
+
+Both failing jobs stopped at the first step, `cargo fmt --all -- --check`, so `cargo test --workspace`
+never executed.
+Every green test number in the earlier version of this document was therefore local only, and no CI run
+had ever exercised the tests.
+
+**Why the local check reported clean anyway.**
+The earlier check was written as:
+
+```
+cargo fmt --all -- --check 2>&1 | head -30; echo "fmt exit=$?"
+```
+
+`$?` there is the exit status of `head`, the last command in the pipeline, not of `cargo fmt`.
+`head` succeeded, so the script printed `fmt exit=0` while the formatter was failing.
+The formatter never printed a diff, so nothing in the output contradicted the printed status either.
+
+The lesson is narrow and mechanical: check a status by running the command on its own and reading its
+own exit code, and never infer a green build from a tool that ran after the one being checked.
+The critic's review of `0d51b38` found this on the head; the same check, run directly, now gives
+`exit 0` on the repaired head.
+
+**What was and was not green on `0d51b38`.**
+The fix logic was reviewed and correct, and the local test runs were genuinely green.
+What was not established was that the head could build its CI at all.
+A local green run and a red formatter on the same commit are both true, and only one of them was
+reported.
+
+## The second patched site was untested
+
+The fix changes two sites, `op_unlink` and `op_rmdir`.
+The first version of the test file exercised only `op_unlink`, so nothing in the repository would
+catch a regression in the `rmdir` elide path.
+That was found by review after the first push, not before it.
+
+The repository now covers both sites: `mkdir` in `s0`, fork, then `rmdir`, `mkdir`, `rmdir` in `s1`,
+then a cache drop, then `mkdir` must succeed, with `Stats::elided == 1` asserted so the elide path is
+proven to be the one taken.
+
 ## The regression test
 
-`crates/cowfs-core/tests/elide_dentry.rs`, five tests over the public `Core` API:
+`crates/cowfs-core/tests/elide_dentry.rs`, eight tests over the public `Core` API.
+Four cover the file path (`op_unlink`) and four cover the directory path (`op_rmdir`), which is the
+second patched site:
 
 - `create_after_an_elided_unlink_sees_the_name_as_free`: the exact sequence, then asserts the true
   expected state rather than only the absence of an error: `lookup` is `NotFound`, `create` succeeds,
@@ -150,17 +209,61 @@ namespace suites.
   `MemVfs` (`crates/cowfs-vfs-test`), which deletes by name with no nlink gate, rather than assumed.
 - `the_same_sequence_under_default_options`: the issue's "tiny caches only" reading, pinned as a test
   so it cannot be reintroduced silently.
+- `mkdir_after_an_elided_rmdir_sees_the_name_as_free`: the directory counterpart of the first test.
+  `mkdir d` in `s0`, fork, then `rmdir`, `mkdir`, `rmdir` in `s1`, a cache drop, then `mkdir` must
+  succeed. Asserts the true state: `lookup` is `NotFound`, the listing is exactly `["d"]`, `s0` still
+  lists `["d"]` and is untouched by everything done in `s1`, and after a `sync` plus another cache drop
+  the tombstone is gone while the listing is still correct. The second assertion is what distinguishes
+  "correct" from "cached forever": the entry is dirty only until the batch commits.
+- `a_removed_directory_is_gone_from_meta_after_a_reopen`: the removal is committed, so meta itself has
+  dropped the name, and it is still free after a real `Core::open`. `s0` still has its directory.
+  `check()` and `fsck` are asserted clean both before and after the reopen.
+- `a_directory_that_is_still_present_still_answers_exists`: the directory counterpart of the `Exists`
+  control. A live directory name still answers `Exists`, an absent name answers `NotFound`, and a
+  directory with an entry answers `NotEmpty`.
 
-The test was checked to be non-vacuous: with the fix stashed and only `ns.rs` reverted,
-`create_after_an_elided_unlink_sees_the_name_as_free` and `the_same_sequence_under_default_options`
-both fail, and pass again once it is restored.
+The whole file was checked to be non-vacuous against the pre-fix `ns.rs`, with every other file at
+this head.
+An archive of this head had exactly one file replaced, by `git show ceb96c6:crates/cowfs-core/src/ns.rs`,
+and every other file was verified identical to the head by hash:
+
+| build | `elide_dentry` |
+|---|---|
+| old `ns.rs` from `ceb96c6` | 4 passed, **4 failed** |
+| this head | **8 passed**, 0 failed |
+
+The four failures on the old source are `create_after_an_elided_unlink_sees_the_name_as_free`,
+`the_same_sequence_under_default_options`, `mkdir_after_an_elided_rmdir_sees_the_name_as_free` and
+`a_removed_directory_is_gone_from_meta_after_a_reopen`.
+Both patched sites are covered by at least one discriminating test.
+The four that pass on both builds are the durability and control tests, which do not depend on the
+cache drop: `create_after_an_elided_unlink_survives_a_reopen`,
+`an_unlinked_name_stays_free_after_a_reopen_of_the_whole_sequence`, and the two `Exists` controls.
+They are worth keeping, but they do not pin this bug and are not claimed to.
+
+## Status of CI on this head
+
+- CI run `37231298754`, head `0d51b38`: **red**, and it failed before any test ran, at
+  `cargo fmt --all -- --check`. `cargo test --workspace` did not execute in CI for that head.
+- No CI run has yet been green for any head of this PR.
+  Every test number in this document is local.
+  A CI result on the repaired head is reported only if it is actually observed, and this document does
+  not claim a green CI run it has not seen.
 
 ## Overlap with concurrent leases
 
-`fix/nfs-namespace-durability-90` (native lease 13) touches `crates/cowfs-core/src/inner.rs`,
-`io.rs` and `vfs_impl.rs` only. `git diff --name-only origin/main origin/fix/nfs-namespace-durability-90
--- crates/cowfs-core/src/ns.rs` is empty, so the namespace file this fix changes is untouched by that
-lease and the two do not overlap in the same file. Both changes are in `cowfs-core`, so integration
-should still be sequenced rather than merged blind.
+`fix/nfs-namespace-durability-90` (native lease 13, branch `342bfa0`) touches
+`crates/cowfs-core/src/inner.rs`, `io.rs`, `vfs_impl.rs`, plus `cowfs-daemon/tests/namespace_durability.rs`,
+`cowfs-nfs/src/adapter.rs` and `cowfs-vfs/src/vfs.rs`.
+`git diff --name-only origin/main origin/fix/nfs-namespace-durability-90 -- crates/cowfs-core/src/ns.rs`
+is empty, so the one file this fix changes is untouched by that lease and there is no textual conflict.
 
-No `CHANGELOG.md` edit, no workflow edit, no merge.
+The two are still both `cowfs-core` and both touch namespace durability semantics, so integration must
+be sequenced and retested together, in that order, on the exact post-merge head.
+The Core seed for that retest is
+`9aa30bfa88a2438194d3b5ae7af55c7e2a59ff8a233abfe1cd0ddbec9d213900`, already pinned in
+`crates/cowfs-core/tests/model.proptest-regressions`, together with lease 13's own durability suite.
+
+Issue #94 is fixed on `main` only after this PR merges.
+
+No `CHANGELOG.md` edit, no workflow edit, no merge, no lease returned.

@@ -60,7 +60,10 @@ fn unlink_and_recreate_twice(c: &Core) -> u64 {
     c.unlink(s1, b"f").unwrap();
 
     let st = c.stats();
-    assert_eq!(st.elided, 1, "the second unlink did not elide the queued create");
+    assert_eq!(
+        st.elided, 1,
+        "the second unlink did not elide the queued create"
+    );
     s1
 }
 
@@ -112,7 +115,10 @@ fn create_after_an_elided_unlink_survives_a_reopen() {
     assert_eq!(names(&c, s1), vec![b"f".to_vec()]);
     let reopened = c.lookup(s1, b"f").unwrap().ino;
     assert_eq!(read_all(&c, reopened), b"third");
-    assert_ne!(reopened, committed, "a reopened session hands out new inode numbers");
+    assert_ne!(
+        reopened, committed,
+        "a reopened session hands out new inode numbers"
+    );
     c.check().unwrap();
     assert!(c.fsck().unwrap().is_clean());
 }
@@ -131,7 +137,8 @@ fn an_unlinked_name_stays_free_after_a_reopen_of_the_whole_sequence() {
     let c = Core::open(dir.path(), tiny()).unwrap();
     let s1 = root_entry(&c, "s1").ino;
     assert_eq!(c.lookup(s1, b"f"), Err(Error::NotFound));
-    c.create(s1, b"f", 0o644).expect("the name is free in meta too");
+    c.create(s1, b"f", 0o644)
+        .expect("the name is free in meta too");
     c.check().unwrap();
     assert!(c.fsck().unwrap().is_clean());
 }
@@ -156,8 +163,129 @@ fn a_name_that_is_still_present_still_answers_exists() {
     let b = c.create(s, b"f", 0o644).expect("the name f is free");
     c.forget(b.ino, 1);
     assert_ne!(b.ino, a.ino, "create after unlink makes a new inode");
-    assert_eq!(c.lookup(s, b"g").unwrap().nlink, 1, "g is the old inode, still linked once");
+    assert_eq!(
+        c.lookup(s, b"g").unwrap().nlink,
+        1,
+        "g is the old inode, still linked once"
+    );
     assert_eq!(names(c, s), vec![b"f".to_vec(), b"g".to_vec()]);
+}
+
+/// The same sequence for the second patched site, `op_rmdir`: a directory inherited from `s0`,
+/// removed and recreated twice in `s1`. The second `rmdir` elides the queued `mkdir`, so the removal
+/// the fork inherited is still queued with it.
+fn rmdir_and_recreate_twice(c: &Core) -> (u64, u64) {
+    c.create_snapshot("s0").unwrap();
+    let s0 = root_entry(c, "s0").ino;
+    let a = c.mkdir(s0, b"d", 0o755).unwrap();
+    c.forget(a.ino, 1);
+    c.fork_snapshot("s0", "s1").unwrap();
+    let s1 = root_entry(c, "s1").ino;
+
+    c.rmdir(s1, b"d").unwrap();
+    let b = c.mkdir(s1, b"d", 0o755).unwrap();
+    c.forget(b.ino, 1);
+    c.rmdir(s1, b"d").unwrap();
+
+    let st = c.stats();
+    assert_eq!(
+        st.elided, 1,
+        "the second rmdir did not elide the queued mkdir"
+    );
+    (s0, s1)
+}
+
+#[test]
+fn mkdir_after_an_elided_rmdir_sees_the_name_as_free() {
+    let f = fixture_with(tiny());
+    let (s0, s1) = rmdir_and_recreate_twice(&f.core);
+    f.core.drop_caches();
+
+    assert_eq!(
+        f.core.lookup(s1, b"d"),
+        Err(Error::NotFound),
+        "the directory was removed twice, so the mount must not find it"
+    );
+    let d = f
+        .core
+        .mkdir(s1, b"d", 0o755)
+        .expect("the name was removed, so it is free");
+    f.core.forget(d.ino, 1);
+
+    assert_eq!(f.core.lookup(s1, b"d").unwrap().ino, d.ino);
+    assert_eq!(names(&f.core, s1), vec![b"d".to_vec()]);
+    assert_eq!(
+        names(&f.core, s0),
+        vec![b"d".to_vec()],
+        "s0 must be untouched by everything done in s1"
+    );
+
+    // the tombstone is not immortal: once the batch commits, the drop takes it away again
+    f.core.sync().unwrap();
+    f.core.drop_caches();
+    assert_eq!(names(&f.core, s1), vec![b"d".to_vec()]);
+    f.core.check().unwrap();
+    assert!(f.core.fsck().unwrap().is_clean());
+}
+
+#[test]
+fn a_removed_directory_is_gone_from_meta_after_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), tiny()).unwrap();
+    let (_s0, s1) = rmdir_and_recreate_twice(&core);
+    core.drop_caches();
+    assert_eq!(core.lookup(s1, b"d"), Err(Error::NotFound));
+    core.sync().unwrap();
+    core.check().unwrap();
+    assert!(core.fsck().unwrap().is_clean());
+    drop(core);
+
+    let c = Core::open(dir.path(), tiny()).unwrap();
+    let s0 = root_entry(&c, "s0").ino;
+    let s1 = root_entry(&c, "s1").ino;
+    assert_eq!(c.lookup(s1, b"d"), Err(Error::NotFound));
+    assert_eq!(names(&c, s1), Vec::<Vec<u8>>::new());
+    assert_eq!(
+        names(&c, s0),
+        vec![b"d".to_vec()],
+        "s0 still has its directory"
+    );
+    let d = c
+        .mkdir(s1, b"d", 0o755)
+        .expect("the name is free in meta too");
+    c.forget(d.ino, 1);
+    assert_eq!(names(&c, s1), vec![b"d".to_vec()]);
+    c.check().unwrap();
+    assert!(c.fsck().unwrap().is_clean());
+}
+
+#[test]
+fn a_directory_that_is_still_present_still_answers_exists() {
+    let f = fixture_with(tiny());
+    let c = &f.core;
+    c.create_snapshot("s").unwrap();
+    let s = root_entry(c, "s").ino;
+    let a = c.mkdir(s, b"d", 0o755).unwrap();
+    c.forget(a.ino, 1);
+    assert_eq!(
+        c.mkdir(s, b"d", 0o755),
+        Err(Error::Exists),
+        "the fix must not make a live directory name look free"
+    );
+    assert_eq!(c.rmdir(s, b"nope"), Err(Error::NotFound));
+
+    let e = c.mkdir(s, b"e", 0o755).unwrap().ino;
+    c.forget(e, 1);
+    let x = c.create(e, b"x", 0o644).unwrap().ino;
+    c.forget(x, 1);
+    c.sync().unwrap();
+    assert_eq!(
+        c.rmdir(s, b"e"),
+        Err(Error::NotEmpty),
+        "a directory with an entry cannot be removed"
+    );
+    assert_eq!(names(c, s), vec![b"d".to_vec(), b"e".to_vec()]);
+    c.check().unwrap();
 }
 
 #[test]
