@@ -1,0 +1,49 @@
+# xfstests generic cases this gate may run, reviewed against
+# xfstests-dev 3e1ee800e52a0f53d7d9a7809be1ffc80ec1788f (2026-08-28).
+#
+# Only a bare numeric line is read as a case id. The reviewed set is below, and
+# the notes after it are comments so they can never become one.
+#
+# `bench/xfstests_gate.py classify` recomputes the set from the tree's own
+# sources and refuses to run (exit 3) when it no longer matches this file, so an
+# upstream change cannot silently widen the gate. The sha of this list is
+# recorded in every run's meta record.
+#
+# What "reviewed" means here: every id below was read line by line, and each one
+# touches nothing outside $TEST_DIR, needs no scratch device, no second user, no
+# mkfs, no mount, no built helper binary, and no more than a megabyte of space.
+# The gate re-checks that mechanically before every run, and re-checks each case
+# log for an assertion that silently did not happen.
+#
+# --- the reviewed set ---
+005
+236
+245
+309
+360
+755
+# --- end of the reviewed set ---
+#
+# Per-case notes:
+# 005  touch through a 25-deep symlink chain returns ELOOP. Relative rm only.
+# 236  a hard link bumps the target inode ctime. Sleeps 1s.
+# 245  mv of a directory onto an existing name. Renames inside $TEST_DIR.
+# 309  mv into a directory bumps that directory's mtime and ctime. Real status
+#      increments on mismatch, so a pass here is a real assertion.
+# 360  readlink of a 1019-byte target, md5 of the result. Needs perl, present.
+# 755  unlinking a hard link bumps the target inode ctime. Weak case: it echoes
+#      on a mismatch but never raises status, so its pass means less than the
+#      others.
+#
+# Known limits of this list, stated rather than hidden:
+# - 6 of 802 generic cases. Everything else is refused with a recorded reason:
+#   511 need a scratch device, 93 a device, a mount or root, 88 a helper binary,
+#   40 source this gate has not read, 26 an absolute path in a destructive
+#   command, 26 a second user or a device node, 11 a soak runtime, and 1 more
+#   than 1 GiB of space.
+# - A static scan cannot see a helper a case reaches indirectly at runtime. The
+#   per-case log check is what catches that, and it turns such a case INVALID
+#   rather than passing it.
+# - The gate refuses the whole suite unless its own startup gate passes, which
+#   on an unprivileged host without the suite's built helpers it does not. See
+#   docs/verification/ready-g5.md.
