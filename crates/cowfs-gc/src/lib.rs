@@ -580,13 +580,23 @@ impl Gc {
                     r.skip(rw.from, SkipReason::BecameLive);
                     continue;
                 }
-                match self.store.discard_pack(rw.from, &rw.condemned) {
-                    Ok(freed) => {
+                match self.store.discard(rw.from, &rw.condemned) {
+                    Ok(d) => {
+                        // Credit the unlink the store really performed, even when a later step
+                        // failed: gross is the file length of every pack this cycle unlinked, and
+                        // the pack is gone whether or not the acceptance record was written.
                         r.packs_unlinked += 1;
-                        r.freed_bytes += freed;
+                        r.freed_bytes += d.removed_bytes;
                         progress.freed_bytes = r.freed_bytes;
                         self.emit(&progress);
+                        // A durability failure is not swallowed. The bytes are counted because
+                        // they are gone; the error is reported because the unlink is not confirmed.
+                        if let Some(e) = d.durability_error {
+                            r.unlink_durability_errors += 1;
+                            r.error(e);
+                        }
                     }
+                    // The unlink itself failed, so nothing was removed and nothing is claimed.
                     Err(e) => r.error(e),
                 }
             }
