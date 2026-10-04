@@ -268,11 +268,49 @@ fn accept_loop(
             break;
         }
         if shared.abandoned() {
+            // The deadline has passed. Deliver each straggler's `shutting_down` frame from its own
+            // worker, then wait a bounded grace for those workers. A readable client's frame is
+            // written before `wait()` returns, so `cowfs serve` can exit right after it without
+            // dropping the frame. A worker for a client that stopped reading blocks on the write
+            // lock a progress write holds for the whole `write_timeout`; the grace expires and
+            // `wait()` returns without joining it, so a blocked write cannot stretch the deadline.
+            // The worker count is bounded by `max_connections`.
             let stragglers: Vec<Arc<Conn>> = lock(&shared.conns).values().cloned().collect();
-            for conn in stragglers {
-                conn.abandon_inflight();
-                conn.kill();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let mut workers = Vec::with_capacity(stragglers.len());
+            for conn in &stragglers {
+                let owned = Arc::clone(conn);
+                let done_tx = done_tx.clone();
+                match thread::Builder::new()
+                    .name("cowfs-ctl-abandon".into())
+                    .spawn(move || {
+                        owned.abandon_inflight();
+                        owned.kill();
+                        let _ = done_tx.send(());
+                    }) {
+                    Ok(worker) => workers.push(worker),
+                    // No worker: deliver the frame best-effort without blocking on a held write
+                    // lock, then close, so a readable peer still gets `shutting_down` and no
+                    // connection is left open past the return.
+                    Err(_) => {
+                        conn.best_effort_abandon();
+                        conn.kill();
+                    }
+                }
             }
+            drop(done_tx);
+            let grace = Instant::now() + opts.drain_deadline;
+            for _ in 0..workers.len() {
+                let left = grace.saturating_duration_since(Instant::now());
+                if done_rx.recv_timeout(left).is_err() {
+                    break;
+                }
+            }
+            // A worker that has not finished is parked behind a blocked progress write. Its peer
+            // is not reading, so no frame can reach it; the worker still runs and the connection's
+            // reader side is closed by `drain_and_close` once the write unwinds. `wait()` does not
+            // join the workers, so a blocked write cannot stretch it past the grace above.
+            drop(workers);
             break;
         }
         thread::sleep(Duration::from_millis(10));
@@ -603,6 +641,33 @@ impl Conn {
                     error: CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
                 },
             );
+        }
+    }
+
+    /// Same as `abandon_inflight`, but the terminal write is skipped when the write lock is held.
+    /// Used on the shutdown deadline when no helper thread could be spawned, so the deadline path
+    /// never blocks behind a peer that stopped reading, while a readable peer still gets its frame.
+    fn best_effort_abandon(&self) {
+        let ids: Vec<u64> = lock(&self.inflight).keys().copied().collect();
+        for id in ids {
+            let frame = ServerFrame::Error {
+                id: Some(id),
+                error: CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
+            };
+            if let Ok(mut inflight) = self.inflight.try_lock() {
+                if inflight.remove(&id).is_none() {
+                    continue;
+                }
+                drop(inflight);
+                if let Ok(_write) = self.write_lock.try_lock() {
+                    if self.dead.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    if (&self.stream).write_all(&frame.encode()).is_err() {
+                        self.dead.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
         }
     }
 
