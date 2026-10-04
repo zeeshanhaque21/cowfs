@@ -1423,3 +1423,111 @@ fn a_no_op_cycle_reports_zero_gross_rewrite_and_net() {
     drop(c);
     core.close().unwrap();
 }
+
+/// Run cycles until the persisted marks trust every durable root, which is the state a daemon's
+/// repeated requests reach: nothing is walked, so the marks alone decide what is live.
+///
+/// The bound is a guard, not the criterion. `marked == 0` is the criterion, and a collector that
+/// never got there would trip the bound instead of passing silently.
+fn cycles_until_the_marks_are_trusted(core: &Core) -> u32 {
+    for n in 1..=8u32 {
+        let c = core.collector(gc_opts()).unwrap();
+        let r = c.collect().unwrap();
+        clean(&r);
+        assert_eq!(r.packs_unlinked, 0, "nothing is dead yet: {r:?}");
+        drop(c);
+        if r.marked == 0 {
+            return n;
+        }
+    }
+    panic!("the marks never stopped walking a durable root after 8 cycles");
+}
+
+/// Issue 82: a fresh collector must not credit one recorded root with another root's blocks.
+///
+/// Two snapshots share no content, so every block the base names is garbage the moment it is gone,
+/// and a run of base-only files makes at least one pack entirely base-owned. Cycles run until the
+/// persisted marks trust both roots, which is where a per-request collector reaches after a couple
+/// of requests. The base is then removed and one more fresh collector runs.
+///
+/// That cycle must unlink a real eligible pack. Under the old cache it unlinked nothing, because the
+/// marks kept the base's blocks alive under the surviving root's key. Asserting the pack count and
+/// the byte total also rules out a cycle that reports a reclaim it did not perform, and the
+/// survivors are read back byte-identical after a close and a reopen with a clean `fsck`, so a
+/// collector that got the reclaim by freeing live data fails here.
+#[test]
+fn a_removed_base_is_reclaimed_by_the_next_fresh_collector() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path(), core_opts(false)).unwrap();
+    core.create_snapshot("keep").unwrap();
+    core.create_snapshot("base").unwrap();
+    let kv = core.snapshot_view("keep").unwrap();
+    let bv = core.snapshot_view("base").unwrap();
+    let mut keep = Vec::new();
+    for i in 0..8u32 {
+        // Interleaved, so some packs hold records from both roots.
+        let k = (format!("k{i:02}"), body(40_000, 2000 + i));
+        put_file(&kv, &k.0, &k.1);
+        keep.push(k);
+        core.sync().unwrap();
+        let b = (format!("b{i:02}"), body(40_000, 3000 + i));
+        put_file(&bv, &b.0, &b.1);
+        core.sync().unwrap();
+    }
+    for i in 0..8u32 {
+        let b = (format!("only{i:02}"), body(40_000, 4000 + i));
+        put_file(&bv, &b.0, &b.1);
+        core.sync().unwrap();
+    }
+    // A tail on the keeper, so the durable watermark is past every pack the base owns.
+    add_tail(&core, &mut keep, "tail", 5);
+    drop(kv);
+    drop(bv);
+    core.sync().unwrap();
+    let converged = cycles_until_the_marks_are_trusted(&core);
+    assert!(
+        dir.path().join("gc").join("mark.bin").exists(),
+        "cycle {converged} left a marks file behind"
+    );
+
+    let before = packs(dir.path());
+    let blocks_before = core.store().stats().blocks;
+    core.remove_snapshot("base").unwrap();
+    core.sync().unwrap();
+    assert!(
+        core.list_snapshots()
+            .unwrap()
+            .iter()
+            .all(|s| s.name != "base"),
+        "the base is gone"
+    );
+
+    let c = core.collector(gc_opts()).unwrap();
+    let r = c.collect().unwrap();
+    clean(&r);
+    assert!(
+        r.packs_unlinked >= 1 && r.freed_bytes > 0,
+        "the removed base's packs were reclaimed: {r:?}"
+    );
+    let after = packs(dir.path());
+    assert!(
+        after.len() < before.len(),
+        "pack files: {} -> {}",
+        before.len(),
+        after.len()
+    );
+    assert!(
+        bytes(&after) < bytes(&before),
+        "{} -> {}",
+        bytes(&before),
+        bytes(&after)
+    );
+    assert!(core.store().stats().blocks < blocks_before);
+
+    drop(c);
+    core.close().unwrap();
+    let core = reopen(dir.path());
+    verify(&core, &keep);
+    fsck_clean(&core);
+    core.close().unwrap();
+}

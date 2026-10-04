@@ -671,6 +671,14 @@ impl Gc {
             // removal committed, so no snapshot this cycle keeps is reached through it: it has no
             // addressable root entry, and skipping it keeps nothing alive. Only that one error is
             // skipped. Every other error is a real failure and stops the cycle, still fail-closed.
+            //
+            // A walk that starts with an empty marker descends from the root every time, so what it
+            // yields is that root's complete reachable set. A walk sharing a marker with an earlier
+            // root yields only what that walk did not already reach, which is not this root's set:
+            // recording it would let a later cycle skip this root's walk and free the blocks that a
+            // shared subtree carries. So only a complete walk is recorded, and a root reached only as
+            // a delta is walked again next cycle, which costs one walk and is always correct.
+            let complete = marker.is_empty();
             let (root, walk) = match snap.live_blocks_with_root(marker) {
                 Ok(v) => v,
                 Err(cowfs_meta::Error::NoSuchSnapshot) => continue,
@@ -683,11 +691,13 @@ impl Gc {
                 r.marked_skipped_roots += 1;
                 continue;
             }
-            if record && self.marks().has_root(&walked_root) {
+            if record && self.marks().has_root(&walked_root) && persisted.contains_key(&walked_root)
+            {
                 // An earlier cycle walked this exact root, so its recorded blocks are its blocks.
-                if let Some(bs) = persisted.get(&walked_root) {
-                    live.extend(bs.iter().copied());
-                }
+                // The recorded set has to be in hand too: a root the file names but this cycle's
+                // listing does not is not this cycle's to skip, and skipping it would seed live from
+                // nothing.
+                live.extend(persisted[&walked_root].iter().copied());
                 r.marked_skipped_roots += 1;
                 walked.insert(walked_root);
                 continue;
@@ -699,12 +709,12 @@ impl Gc {
                 }
                 r.marked += 1;
                 live.insert(b);
-                if record {
+                if record && complete {
                     self.marks().add_block(&walked_root, b);
                 }
             }
             walked.insert(walked_root);
-            if record {
+            if record && complete {
                 self.marks().add_root(&walked_root);
             }
         }
