@@ -1,7 +1,12 @@
 # Verification: core model #94, the dentry of an elided unlink
 
-Independent reproduction and fix for issue #94, on lease 16, branch `fix/core-model-94`, base
-`ceb96c67033cbf97f79267d6af7db3fa204d77d1` (which is `origin/main`).
+Independent reproduction and fix for issue #94, on lease 16, branch `fix/core-model-94`.
+
+The reproduction was done against `ceb96c67033cbf97f79267d6af7db3fa204d77d1`, which was `origin/main`
+when the bug was found.
+The branch has since been rebased onto `0915f97`, current `origin/main`, so CI runs against current
+main; the rebase touched no file of this change and `crates/cowfs-core/src/ns.rs` carries blob
+`5a1024c115d51806131c6f6cc9ff99f5f20e6588` before and after it.
 
 `cowfs-core/src` was byte-identical to `origin/main` before this change; the bug is in Core, not in
 the model test, and not in the PR #79 change that surfaced it.
@@ -125,11 +130,25 @@ on every run (no `PROPTEST_SEED` is set), so these are five distinct seed sets, 
 | 4 | 128 | 2 passed, 0 failed |
 | 5 | 160 | 2 passed, 0 failed |
 
-Whole crate, after the fix: `cargo test -p cowfs-core` gives **276 passed, 0 failed** across every
-test target, including the model tests, `fsck`, `invariant`, `crash`, `kill9` and the snapshot and
+Whole crate, after the fix: `cargo test -p cowfs-core` gives **279 passed, 0 failed, 9 ignored** across
+every test target, including the model tests, `fsck`, `invariant`, `crash`, `kill9` and the snapshot and
 namespace suites.
+279 is 276 plus the 3 tests added for the `rmdir` site; the 9 ignored are pre-existing crate-level
+ignores, not tests skipped for this change.
 
-`cargo fmt --all -- --check` clean. `cargo clippy -p cowfs-core --all-targets` clean.
+Every exit code below was read by running the command on its own, never through a pipeline, after the
+false claim in the next section had already been made once:
+
+```
+cargo fmt --all -- --check                                exit 0
+cargo clippy -p cowfs-core --all-targets -- -D warnings   exit 0
+cargo test -p cowfs-core --test model                     2 passed, 0 failed
+cargo test -p cowfs-core --test elide_dentry              8 passed, 0 failed
+cargo test -p cowfs-core                                  279 passed, 0 failed, 9 ignored
+```
+
+Those numbers were re-measured after the rebase onto `0915f97`, with the model seed `9aa30bfa...`
+unchanged and `crates/cowfs-core/src/ns.rs` still at blob `5a1024c115d51806131c6f6cc9ff99f5f20e6588`.
 
 ## Correction of two claims that were false on head `0d51b38`
 
