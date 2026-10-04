@@ -254,8 +254,8 @@ impl ControlHandler for StubHandler {
             freed_blocks,
             freed_bytes,
             gross_removed_bytes: freed_bytes,
-            rewrite_bytes: 0,
-            net_reclaimed_bytes: freed_bytes as i64,
+            rewrite_bytes: Some(0),
+            net_reclaimed_bytes: Some(i64::try_from(freed_bytes).unwrap_or(i64::MAX)),
         })
     }
 

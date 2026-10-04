@@ -167,11 +167,17 @@ pub struct SnapshotList {
 /// `freed_bytes` is the **gross** file length of every pack the cycle unlinked, kept under its
 /// original name for compatibility. It is not the space saved: surviving live records are
 /// rewritten into a new pack. `gross_removed_bytes` is the same number under an explicit gross
-/// name, `rewrite_bytes` is the bytes written into the cycle's new packs (headers included), and
-/// `net_reclaimed_bytes` is `gross_removed_bytes - rewrite_bytes`, signed. A dry run reports the
-/// estimate in `candidate_bytes` and zero actual gross, rewrite and net.
+/// name.
+///
+/// `rewrite_bytes` and `net_reclaimed_bytes` are `Some` only when the report carries the post-#81
+/// fields. A report from before those fields has no rewrite figure at all, so its net is
+/// **unknown**, not zero: a legacy cycle may well have rewritten a pack, and deriving
+/// `net = gross` or `net = gross - 0` would report a saving that was never measured. `None` is
+/// that unknown, and the human output says so rather than printing a false zero.
+///
+/// A dry run reports the estimate in `candidate_bytes` and zero actual gross, rewrite and net.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "GcReportWire")]
+#[serde(try_from = "GcReportWire")]
 pub struct GcReport {
     pub dry_run: bool,
     pub candidate_blocks: u64,
@@ -183,12 +189,18 @@ pub struct GcReport {
     /// than zero, which would read as "nothing removed".
     pub gross_removed_bytes: u64,
     /// Bytes written into the packs this cycle created, file headers included.
-    pub rewrite_bytes: u64,
+    /// `None` when the report predates the field, so the figure is unknown.
+    pub rewrite_bytes: Option<u64>,
     /// Net space reclaimed: `gross_removed_bytes - rewrite_bytes`, signed.
-    pub net_reclaimed_bytes: i64,
+    /// `None` when the report predates the field, so the figure is unknown.
+    pub net_reclaimed_bytes: Option<i64>,
 }
 
-/// The wire shape of [`GcReport`], where the post-#81 fields are optional.
+/// The wire shape of [`GcReport`], where the post-#81 fields are optional together.
+///
+/// The three fields are one unit: present means a new report, absent means a legacy one.
+/// A payload that carries some but not all of them is inconsistent and is rejected, so a
+/// half-written report can never default into a wrong number.
 #[derive(Deserialize)]
 struct GcReportWire {
     dry_run: bool,
@@ -199,24 +211,70 @@ struct GcReportWire {
     #[serde(default)]
     gross_removed_bytes: Option<u64>,
     #[serde(default)]
-    rewrite_bytes: u64,
+    rewrite_bytes: Option<u64>,
     #[serde(default)]
-    net_reclaimed_bytes: i64,
+    net_reclaimed_bytes: Option<i64>,
 }
 
-impl From<GcReportWire> for GcReport {
-    fn from(w: GcReportWire) -> Self {
-        let gross_removed_bytes = w.gross_removed_bytes.unwrap_or(w.freed_bytes);
-        GcReport {
-            dry_run: w.dry_run,
-            candidate_blocks: w.candidate_blocks,
-            candidate_bytes: w.candidate_bytes,
-            freed_blocks: w.freed_blocks,
-            freed_bytes: w.freed_bytes,
+impl TryFrom<GcReportWire> for GcReport {
+    type Error = String;
+
+    fn try_from(w: GcReportWire) -> Result<Self, Self::Error> {
+        let GcReportWire {
+            dry_run,
+            candidate_blocks,
+            candidate_bytes,
+            freed_blocks,
+            freed_bytes,
             gross_removed_bytes,
-            rewrite_bytes: w.rewrite_bytes,
-            net_reclaimed_bytes: w.net_reclaimed_bytes,
-        }
+            rewrite_bytes,
+            net_reclaimed_bytes,
+        } = w;
+        let (gross_removed_bytes, rewrite_bytes, net_reclaimed_bytes) =
+            match (gross_removed_bytes, rewrite_bytes, net_reclaimed_bytes) {
+                // A legacy report: gross is `freed_bytes`, net is unknown.
+                (None, None, None) => (freed_bytes, None, None),
+                // A new report: the explicit fields must be internally consistent.
+                (Some(gross), Some(rewrite), Some(net)) => {
+                    check_new_fields(freed_bytes, gross, rewrite, net)?;
+                    (gross, Some(rewrite), Some(net))
+                }
+                // A partially present report cannot be repaired without guessing.
+                _ => return Err(PARTIAL_FIELDS.to_owned()),
+            };
+        Ok(GcReport {
+            dry_run,
+            candidate_blocks,
+            candidate_bytes,
+            freed_blocks,
+            freed_bytes,
+            gross_removed_bytes,
+            rewrite_bytes,
+            net_reclaimed_bytes,
+        })
+    }
+}
+
+const PARTIAL_FIELDS: &str = "gc report carries only some of gross_removed_bytes, \
+     rewrite_bytes, net_reclaimed_bytes; they are present together or absent together";
+
+/// Check a report that claims the post-#81 fields: the explicit gross must agree with the legacy
+/// `freed_bytes`, and the net must be gross minus rewrite exactly.
+fn check_new_fields(freed_bytes: u64, gross: u64, rewrite: u64, net: i64) -> Result<(), String> {
+    if gross != freed_bytes {
+        return Err(format!(
+            "gc report gross {gross} disagrees with freed_bytes {freed_bytes}"
+        ));
+    }
+    let expected = i128::from(gross) - i128::from(rewrite);
+    match i64::try_from(expected) {
+        Ok(v) if v == net => Ok(()),
+        Ok(_) => Err(format!(
+            "gc report net {net} disagrees with gross {gross} minus rewrite {rewrite}"
+        )),
+        Err(_) => Err(format!(
+            "gc report gross {gross} minus rewrite {rewrite} is out of i64 range"
+        )),
     }
 }
 

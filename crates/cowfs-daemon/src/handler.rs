@@ -342,9 +342,16 @@ impl ControlHandler for Handler {
             ));
         }
         if let (Some(first), 0) = (r.errors.first(), r.freed_bytes) {
+            // The cycle failed before it unlinked any pack, but it may still have written bytes
+            // into a new pack. The message carries the real gross, rewrite and net so the caller
+            // sees the actual cost instead of a bare "freed nothing" that hides a rewrite.
             return Err(CtlError::new(
                 ErrorCode::IoError,
-                format!("garbage collection freed nothing: {first}"),
+                format!(
+                    "garbage collection freed nothing: {first}; {} removed (gross), {} rewritten, \
+                     net {} reclaimed",
+                    r.gross_removed_bytes, r.rewrite_bytes, r.net_reclaimed_bytes
+                ),
             ));
         }
         Ok(GcReport {
@@ -354,8 +361,8 @@ impl ControlHandler for Handler {
             freed_blocks: out.blocks_before.saturating_sub(out.blocks_after),
             freed_bytes: r.freed_bytes,
             gross_removed_bytes: r.gross_removed_bytes,
-            rewrite_bytes: r.rewrite_bytes,
-            net_reclaimed_bytes: r.net_reclaimed_bytes,
+            rewrite_bytes: Some(r.rewrite_bytes),
+            net_reclaimed_bytes: Some(r.net_reclaimed_bytes),
         })
     }
 
@@ -784,7 +791,7 @@ mod tests {
                 dry.rewrite_bytes,
                 dry.net_reclaimed_bytes
             ),
-            (0, 0, 0),
+            (0, Some(0), Some(0)),
             "a dry run reports no actual gross, rewrite or net: {dry:?}"
         );
         assert_eq!(
@@ -802,7 +809,7 @@ mod tests {
         );
         assert_eq!(
             live.net_reclaimed_bytes,
-            live.gross_removed_bytes as i64 - live.rewrite_bytes as i64,
+            Some(live.gross_removed_bytes as i64 - live.rewrite_bytes.unwrap() as i64),
             "net is gross minus rewrite, signed: {live:?}"
         );
         let after = backend.usage().unwrap().unwrap();
@@ -817,6 +824,88 @@ mod tests {
             assert!(get(k.as_ref(), n) == *data, "{n}");
         }
         assert!(backend.fsck().unwrap().unwrap().damage.is_empty());
+    }
+
+    /// A backend that reports a GC cycle which failed but still wrote bytes into a new pack: an
+    /// error, zero unlinked packs, and a positive rewrite. Used to check the daemon surfaces the
+    /// real cost rather than dropping the report behind a bare "freed nothing".
+    #[derive(Debug)]
+    struct FailingGc {
+        inner: PathBackend,
+        report: cowfs_gc::GcReport,
+    }
+
+    impl Backend for FailingGc {
+        fn ingests_directories(&self) -> bool {
+            self.inner.ingests_directories()
+        }
+
+        fn root(&self) -> std::io::Result<Arc<dyn cowfs_vfs::Vfs>> {
+            self.inner.root()
+        }
+
+        fn snapshot(&self, name: &str) -> std::io::Result<Arc<dyn cowfs_vfs::Vfs>> {
+            self.inner.snapshot(name)
+        }
+
+        fn store_path(&self) -> &std::path::Path {
+            self.inner.store_path()
+        }
+
+        fn snapshots(&self) -> &dyn crate::backend::Snapshots {
+            self.inner.snapshots()
+        }
+
+        fn collect_garbage(
+            &self,
+            _dry_run: bool,
+            _progress: crate::backend::GcProgress<'_>,
+            _cancelled: &dyn Fn() -> bool,
+        ) -> CtlResult<Option<crate::backend::GcOutcome>> {
+            Ok(Some(crate::backend::GcOutcome {
+                report: self.report.clone(),
+                blocks_before: 10,
+                blocks_after: 10,
+            }))
+        }
+    }
+
+    #[test]
+    fn a_failed_gc_that_wrote_bytes_reports_the_cost_not_a_bare_freed_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = cowfs_gc::GcReport {
+            rewrite_bytes: 4096,
+            net_reclaimed_bytes: -4096,
+            errors: vec!["corrupt record in pack 5".into()],
+            ..Default::default()
+        };
+        let backend: Arc<dyn Backend> = Arc::new(FailingGc {
+            inner: PathBackend::open(dir.path().join("store")).unwrap(),
+            report,
+        });
+        backend.snapshots().create("base", None).unwrap();
+        let mount = Arc::new(
+            Mounted::no_mount(dir.path().join("mnt")).expect("the placeholder is always there"),
+        );
+        let exports = Exports::new(
+            Arc::clone(&backend),
+            vec![dir.path().join("pool")],
+            vec![backend.store_path().to_owned()],
+            dir.path().join("mnt"),
+        );
+        let h = Handler::new(backend, mount, exports);
+        let ctx = OpContext::new(cowfs_ctl::CancelToken::new(), |_| true);
+        let e = h.gc(GcParams { dry_run: false }, &ctx).unwrap_err();
+        assert_eq!(e.code, ErrorCode::IoError, "{e}");
+        let msg = e.message.clone();
+        assert!(
+            msg.contains("4096") && msg.contains("rewritten"),
+            "the failure must carry the real rewrite cost, not a bare 'freed nothing': {msg}"
+        );
+        assert!(
+            msg.contains("-4096") || msg.contains("net -"),
+            "the failure must show the signed net: {msg}"
+        );
     }
 
     #[test]

@@ -117,13 +117,22 @@ pub fn human(response: &Response) -> String {
             g.candidate_blocks,
             bytes(g.candidate_bytes)
         ),
-        Response::Gc(g) => format!(
-            "freed {} blocks; {} removed (gross), {} rewritten, net {} reclaimed",
-            g.freed_blocks,
-            bytes(g.gross_removed_bytes),
-            bytes(g.rewrite_bytes),
-            signed_bytes(g.net_reclaimed_bytes)
-        ),
+        Response::Gc(g) => match (g.rewrite_bytes, g.net_reclaimed_bytes) {
+            (Some(rewrite), Some(net)) => format!(
+                "freed {} blocks; {} removed (gross), {} rewritten, net {} reclaimed",
+                g.freed_blocks,
+                bytes(g.gross_removed_bytes),
+                bytes(rewrite),
+                signed_bytes(net)
+            ),
+            // A report from before the rewrite and net fields: gross is real, but the rewrite
+            // cost was never measured, so the net is unknown rather than zero.
+            _ => format!(
+                "freed {} blocks; {} removed (gross); rewrite and net unknown (legacy report)",
+                g.freed_blocks,
+                bytes(g.gross_removed_bytes)
+            ),
+        },
         Response::Fsck(f) => {
             let mut out = format!(
                 "{}: {} blocks ({}), {} snapshots checked",
@@ -346,13 +355,34 @@ mod tests {
             freed_blocks: 7,
             freed_bytes: 4096,
             gross_removed_bytes: 4096,
-            rewrite_bytes: 1024,
-            net_reclaimed_bytes: 3072,
+            rewrite_bytes: Some(1024),
+            net_reclaimed_bytes: Some(3072),
         };
         let text = human(&Response::Gc(g));
         assert!(text.contains("removed (gross)"), "{text}");
         assert!(text.contains("rewritten"), "{text}");
         assert!(text.contains("net 3.0 KiB reclaimed"), "{text}");
+    }
+
+    #[test]
+    fn gc_human_line_says_unknown_for_a_legacy_report() {
+        use cowfs_ctl::GcReport;
+        let g = GcReport {
+            dry_run: false,
+            candidate_blocks: 7,
+            candidate_bytes: 4096,
+            freed_blocks: 7,
+            freed_bytes: 4096,
+            gross_removed_bytes: 4096,
+            rewrite_bytes: None,
+            net_reclaimed_bytes: None,
+        };
+        let text = human(&Response::Gc(g));
+        assert!(text.contains("removed (gross)"), "{text}");
+        assert!(
+            text.contains("unknown") && text.contains("legacy"),
+            "a legacy report must not print a false net: {text}"
+        );
     }
 
     #[test]
