@@ -274,7 +274,12 @@ otherwise) and it is `busy` with nothing changed while anything holds it.
 - `base`: null, or `{repo, git_ref, commit}` where each field is a string or null.
 - `created_unix_ms`: integer.
 
-`GcReport`: `{dry_run, candidate_blocks, candidate_bytes, freed_blocks, freed_bytes}`.
+`GcReport`: `{dry_run, candidate_blocks, candidate_bytes, freed_blocks, freed_bytes, gross_removed_bytes, rewrite_bytes, net_reclaimed_bytes}`.
+`freed_bytes` is the gross file length of every pack the cycle unlinked, kept under its original name.
+`gross_removed_bytes` is the same figure under an explicit gross name.
+`rewrite_bytes` is the bytes written into the packs the cycle created, file headers included.
+`net_reclaimed_bytes` is `gross_removed_bytes - rewrite_bytes`, signed.
+A payload from before these fields existed decodes with `gross_removed_bytes` taken from `freed_bytes`, and `rewrite_bytes` and `net_reclaimed_bytes` as zero.
 
 `FsckReport`: `{ok, blocks_checked, bytes_checked, snapshots_checked, problems: [{kind, detail}]}`.
 
