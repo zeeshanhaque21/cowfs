@@ -105,15 +105,23 @@ command -v rustc >/dev/null || unmeasurable "rustc is not on PATH"
 
 export CARGO_TARGET_DIR="$out/target"
 bin=$CARGO_TARGET_DIR/debug/cowfs
+# The build is pinned to this repository, never to whatever workspace the caller happens to be
+# standing in. Without `--manifest-path`, running this script from another directory built the wrong
+# workspace, which showed up as a confusing `cargo build` failure.
+cargo_build() { # cargo_build PKGS...
+  (cd "$repo" && cargo build --manifest-path "$repo/Cargo.toml" -j 4 "$@") >>"$out/build.log" 2>&1
+}
+
 say "build: cargo build -p cowfs-cli -p cowfs-treehouse -p cowfs-daemon"
-cargo build -p cowfs-cli -p cowfs-treehouse -p cowfs-daemon -j 4 >>"$out/build.log" 2>&1 ||
+cargo_build -p cowfs-cli -p cowfs-treehouse -p cowfs-daemon ||
   fail "cargo build failed, see $out/build.log"
 [ -x "$bin" ] || fail "cargo build produced no $bin"
 companion=$CARGO_TARGET_DIR/debug/cowfs-treehouse
 [ -x "$companion" ] || fail "cargo build produced no $companion"
 daemon_bin=$CARGO_TARGET_DIR/debug/cowfs-daemon
 [ -x "$daemon_bin" ] || fail "cargo build produced no $daemon_bin"
-say "build: $("$bin" --version 2>&1 | head -1), companion present"
+version=$("$bin" --version 2>&1 || true)
+say "build: cowfs ${version%%:*}, companion present"
 
 mkdir -p "$store" "$mnt" "$canonical" "$thhome"
 [ -z "$(ls -A "$canonical")" ] || fail "$canonical is not empty, it must be a bare directory"
@@ -188,10 +196,22 @@ git -C "$repo_dir" commit -q -m "the warm base fixture"
 commit=$(git -C "$repo_dir" rev-parse HEAD)
 say "repo: $repo_dir at $commit"
 
-say "warm base: importing the repo into the store"
-cowfs import "$repo_dir" --name base >>"$out/import.log" 2>&1 ||
-  fail "import failed, see $out/import.log"
+# A seed, and only that. `import` copies a directory in; it does not publish a warm base and records
+# no commit, so nothing may be cloned from this snapshot for the acceptance. The published base comes
+# from the `base refresh` below, and `base status` has to confirm it before anything is cloned.
+say "seed: importing the repo as a snapshot to refresh from"
+cowfs import "$repo_dir" --name seed >>"$out/import.log" 2>&1 ||
+  fail "the seed import failed, see $out/import.log"
+say "seed: imported as 'seed'; no base is claimed from it"
 
+# One `base refresh`, and its real exit code.
+#
+# There is no `|| true` and no tolerance here. `base refresh` is the operation that publishes the warm
+# base, so a refresh that fails is a failure. An earlier version of this script accepted a failed
+# refresh as long as the build's artifact had landed, and printed PASS with exit 0 while every
+# product operation it claimed to accept had failed. An artifact cannot stand in for the postcondition
+# it was supposed to establish.
+#
 # The build runs in the snapshot itself, through --slot, because this host has no treehouse binary to
 # lease a slot with. That is the same run_build call site a leased slot takes, so the seam under test
 # is identical; only the slot provider differs, and the doc says so.
@@ -201,68 +221,80 @@ refresh() { # refresh SLOT_DIR OUT_NAME
     >"$2" 2>&1
 }
 
-# Judges one `base refresh` by what it produced, not by its exit code.
-#
-# UNMEASURABLE means no build ran, and that is the one failure that is not about the artifact. Any
-# other nonzero exit is tolerated only when the artifact landed: `base refresh` runs the build
-# before the daemon materialises the warm base, and on git 2.39 that second step fails because
-# `git worktree add --detach <sha>` reports the commit on stdout instead of the path. That is a
-# daemon defect outside this change, and it is reported here rather than swallowed.
-classify_refresh() { # classify_refresh SLOT OUT_NAME
+refresh_ok() { # refresh_ok SLOT OUT_NAME
+  if refresh "$mnt/$1" "$2"; then
+    say "refresh: $1 published its base and exited 0"
+    return 0
+  fi
   if grep -q UNMEASURABLE "$2"; then
     tail -5 "$2" | tee -a "$out/run.log"
     unmeasurable "the companion reported no namespace: $(tail -1 "$2")"
   fi
-  if [ -f "$mnt/$1/app" ]; then
-    say "seam: the $1 build ran at the canonical path and its artifact landed; the refresh then reported: $(tail -1 "$2")"
-    return 0
-  fi
-  fail "no artifact in $1, so the build never ran: $(tail -3 "$2" | tr '\n' ' ')"
+  fail "base refresh for $1 exited nonzero, so no warm base was published: $(tail -2 "$2" | tr '\n' ' ')"
 }
 
-# The build inside `base refresh` runs before the daemon's own base_refresh, so the artifact is on
-# disk even when that later step fails. A failure there is reported and then tolerated, because the
-# claim under test is about the path the build ran at, not about the daemon materialising a warm
-# base. What is not tolerated is a missing artifact: that would mean the build never ran.
-build_ran=0
-if refresh "$mnt/base" "$out/refresh.log"; then
-  say "warm base: refresh succeeded end to end"
-  build_ran=1
-else
-  classify_refresh base "$out/refresh.log" || true
-  build_ran=1
-fi
+# The published warm base, read back through the control API.
+#
+# `base status` is the product's own answer to "is there a base for this repository", so it, and not a
+# file seen on the mount, is what this asserts. A base that was imported from a directory would fail
+# here, which is the point: an import is a seed, not a refresh.
+published_base() { # published_base OUT_NAME
+  companion_run --json base status --repo "$repo_dir" --ref main >"$1" 2>&1 || true
+  python3 - "$1" <<'PYCHECK'
+import json, sys
 
-[ -f "$mnt/base/app" ] || fail "the base snapshot has no app"
-cp "$mnt/base/app" "$out/app-base"
-say "warm base: the artifact landed in the base snapshot at the store level"
+last = [l for l in open(sys.argv[1]).read().splitlines() if l.strip()]
+if not last:
+    raise SystemExit("base status printed nothing")
+status = json.loads(last[-1])
+print(
+    f"base status: pool_id={status['pool_id']} snapshot={status['snapshot']} "
+    f"base_commit={status['base_commit']} fresh={status['fresh']}"
+)
+if status["base_commit"] is None:
+    raise SystemExit(f"no base commit is recorded, so no warm base was published: {status}")
+if status["snapshot"] != f"{status['pool_id']}-base":
+    raise SystemExit(f"the base snapshot name is not the derived one: {status}")
+if not status["fresh"]:
+    raise SystemExit(f"the base is not fresh for this ref: {status}")
+print(status["snapshot"])
+PYCHECK
+}
 
-# Whatever the daemon's base_refresh did or did not do, the two claims below are about slots cloned
-# from `base` and built through the companion, which is the mode (b) path issue 17 is about.
+say "warm base: refreshing through cowfs-treehouse base refresh --canonical $canonical"
+refresh_ok seed "$out/refresh.log"
+
+# The postcondition, asserted before anything is cloned from it.
+base_snap=$(published_base "$out/base-status.log") ||
+  fail "the control API does not report a published warm base: $(tail -1 "$out/base-status.log")"
+say "warm base: the control API reports it published and fresh; snapshot $base_snap"
+
+[ -f "$mnt/$base_snap/app" ] || fail "the published warm base $base_snap has no app"
+cp "$mnt/$base_snap/app" "$out/app-base"
+say "warm base: the artifact landed in the published warm base at the store level"
+
+# Two fresh slots cloned from the PUBLISHED warm base, never from the imported seed. Both must carry
+# the base's own source.
 for name in slotA slotB; do
-  say "slot: cloning $name from base"
-  cowfs snapshot create "$name" --from base >"$out/snapshot-$name.log" 2>&1 ||
+  say "slot: cloning $name from the published warm base $base_snap"
+  cowfs snapshot create "$name" --from "$base_snap" >"$out/snapshot-$name.log" 2>&1 ||
     fail "snapshot create $name failed, see $out/snapshot-$name.log"
 done
 cowfs snapshot list | tee -a "$out/run.log"
-# "clone of base" is what the core backend records as a parent; the path backend does not, so the
-# clone is proven by content instead: both slots must hold base's main.rs, byte for byte.
-base_main=$(sha256sum "$mnt/base/main.rs" | cut -d' ' -f1)
+base_main=$(sha256sum "$mnt/$base_snap/main.rs" | cut -d' ' -f1)
 for name in slotA slotB; do
-  [ -f "$mnt/$name/main.rs" ] || fail "$name has no main.rs, so it is not a clone of base"
+  [ -f "$mnt/$name/main.rs" ] || fail "$name has no main.rs, so it is not a clone of $base_snap"
   got=$(sha256sum "$mnt/$name/main.rs" | cut -d' ' -f1)
-  [ "$got" = "$base_main" ] || fail "$name main.rs differs from base, so it is not a clone"
+  [ "$got" = "$base_main" ] || fail "$name main.rs differs from the warm base, so it is not a clone"
 done
-say "slots: slotA and slotB each hold base's main.rs at $base_main, so both are clones"
-[ "$build_ran" = 1 ] || fail "the warm base build did not run, so the slots have nothing to compare"
+say "slots: slotA and slotB each hold the warm base's main.rs at $base_main"
 
 # Two fresh slots cloned from that warm base, each built through the same seam at the same canonical
 # path. These are the two artifacts the issue is about.
 hash_of() { sha256sum "$1" | cut -d' ' -f1; }
 for name in slotA slotB; do
   say "slot: building $name through the companion at the canonical path"
-  refresh "$mnt/$name" "$out/build-$name.log" || true
-  classify_refresh "$name" "$out/build-$name.log"
+  refresh_ok "$name" "$out/build-$name.log"
   [ -f "$mnt/$name/app" ] || fail "$name has no app after the build"
   cp "$mnt/$name/app" "$out/app-$name"
 done

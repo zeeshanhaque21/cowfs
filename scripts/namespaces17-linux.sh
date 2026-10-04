@@ -132,11 +132,20 @@ save_mountinfo() {
 # The build goes in this run's own output directory so nothing shared is written to.
 export CARGO_TARGET_DIR="$out/target"
 bin=$CARGO_TARGET_DIR/debug/cowfs
+# The build is pinned to this repository, never to whatever workspace the caller happens to be
+# standing in. Without `--manifest-path`, running this script from another directory built the wrong
+# workspace, which showed up as a confusing `cargo build` failure.
+cargo_build() { # cargo_build PKGS...
+  (cd "$repo" && cargo build --manifest-path "$repo/Cargo.toml" -j 4 "$@") >>"$out/build.log" 2>&1
+}
+
 say "build: cargo build -p cowfs-cli (target $CARGO_TARGET_DIR)"
-cargo build -p cowfs-cli -j 4 >>"$out/build.log" 2>&1 ||
+cargo_build -p cowfs-cli ||
   fail "cargo build -p cowfs-cli failed, see $out/build.log"
 [ -x "$bin" ] || fail "cargo build produced no $bin"
-say "build: $("$bin" --version 2>&1 | head -1)"
+# Captured before it is trimmed: `| head -1` closes the pipe and can kill this script.
+version=$("$bin" --version 2>&1 || true)
+say "build: cowfs ${version%%:*}"
 
 mkdir -p "$store" "$mnt" "$canonical"
 [ -z "$(ls -A "$canonical")" ] || fail "$canonical is not empty, it must be a bare directory"
