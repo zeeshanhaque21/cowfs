@@ -264,3 +264,52 @@ normal path, and the close-within-the-bound guarantee holds for both.
   outlive `wait()`; the contract already says handler threads are detached and die with the
   process. What is guaranteed here is that no handler blocked in socket IO, no control-client buffer
   writer, and no connection survive the return.
+
+## Correction: the budget is one absolute end instant, not three graces
+
+An earlier revision of this note said the three waits after the shutdown deadline were bounded by
+"the same `drain_deadline`". That was true of the duration and false of the end instant, which is
+what a budget is made of. Each wait computed its own `Instant::now() + opts.drain_deadline`, so a
+straggler that finished nothing stretched `wait()` to `shutdown_deadline` plus three graces.
+
+There is now one `grace_end`, computed once where the deadline branch is entered and reused by the
+worker-signal wait, the worker join and the release wait. The branch is polled every 10 ms, so that
+instant is at most one poll interval after the real deadline, which is the scheduling slack.
+
+The one grace is split rather than given to whichever wait asks first. Delivery takes the front half
+and the close the back half. The close is what the contract requires and a frame is only promised as
+best effort, so it cannot be starved. With the split removed, the delivery wait consumed the whole
+grace, the close never ran, and a parked connection was still open when `wait()` returned
+(`connection_closed_at_return=false`).
+
+Measured with `shutdown_deadline` 300 ms and `drain_deadline` 500 ms, so the budget is 800 ms and the
+test allows 250 ms more for scheduling:
+
+| case | three graces | one grace |
+|---|---|---|
+| parked writer and CPU handler | 1303 ms (fail) | 805 ms (pass) |
+| parked writer only | 888 ms (passes either way) | 679 ms |
+| CPU handler only | 807 ms (passes either way) | 803 ms |
+
+The mixed case is the one that discriminates, which is why it is the committed test: a parked writer
+alone returns inside even the inflated budget, and a CPU-bound handler alone does too. Only the pair
+holds the release wait open for the whole grace.
+
+Parked-ness is proven, not assumed: the flood handler's step counter must go still in two consecutive
+250 ms windows, which can only happen while a `write_all` has not returned. Neither socket is read
+before `wait()` returns, because a read would drain the buffer and unpark the write under test.
+
+### What the fix does not promise
+
+A handler stuck on the CPU rather than in a socket write cannot be reached by half-closing. It is
+detached and dies with the process, which is what the contract already says of handler threads. It no
+longer costs a second grace. No claim is made here that every handler is joined or deallocated.
+
+## Tests that declare their own budget
+
+The 250 ms default `drain_deadline` cannot serve both phases: the close needs about 150 ms, leaving
+under 100 ms for delivery. Two tests therefore declare a `drain_deadline` they can actually be served
+inside, rather than implying delivery works at any budget:
+`a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace`, whose client resumes
+400 ms after shutdown, and `abandoned_blocked_connection_is_released_before_wait_returns`, which needs
+room for the close. The source deadline is unchanged.
