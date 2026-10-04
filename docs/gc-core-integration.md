@@ -208,6 +208,7 @@ Candidate figures are an upper bound: a pack below the dead-ratio threshold is n
 The gross and net figures are cycle-owned: they come from the packs this cycle actually unlinked and the packs it actually wrote, not from a process-wide before/after of the store size, which a concurrent writer would corrupt.
 See `docs/gc-space-accounting.md` for the full accounting rule.
 A live request that freed nothing because the reference side would not hold still answers `busy`, and one that freed nothing because of a cycle error answers `io_error`, so a quiet success is never a silent failure.
+That `io_error` message carries the cycle's actual gross, rewrite and signed net, because a cycle that errored after writing a new pack but before unlinking anything still spent those bytes and a bare "freed nothing" would hide the cost.
 A cancelled request answers `cancelled`; what the collector had already copied is finished and unlinked (the collector's rule), so the store is consistent and the next request does the rest.
 
 ## Failure behaviour

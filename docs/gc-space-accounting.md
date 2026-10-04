@@ -17,6 +17,7 @@ A `gc` report now carries, in both the core library (`cowfs_gc::GcReport`) and t
 - `rewrite_bytes`: the bytes this cycle wrote into the new packs it created, file headers included.
   It counts a committed rewrite, and it also counts the bytes of an abandoned partial copy, because those bytes really did land on disk.
 - `net_reclaimed_bytes`: `gross_removed_bytes - rewrite_bytes`, signed.
+  It is computed in a wider integer and checked against the signed range, so a store large enough to overflow a subtraction cannot produce a wrapped, bogus positive net.
 
 The legacy field `freed_bytes` keeps its original meaning and its original name.
 It stays the gross figure so that an existing reader sees exactly what it always saw, and the explicit gross name is added beside it rather than replacing it.
@@ -39,6 +40,7 @@ Dividing that delta into "removed" and "rewritten" is not possible from two dire
 
 Because net is cycle-owned, it equals the physical drop in store bytes only when the store is quiescent.
 The regression test `a_mixed_pack_reports_gross_removed_rewrite_and_signed_net` asserts that equality under a quiescent store, then the identity `net == gross - rewrite` stands on its own under any concurrency.
+`collections_run_beside_writers_and_forks_without_deadlock_or_loss` asserts that same identity on every cycle while three writers and a fork loop commit concurrently, which is what a concurrent writer's appends must not be able to distort.
 
 ## Dry run
 
@@ -54,11 +56,37 @@ The counts follow what the cycle really finished, never what it planned:
 - A copy abandoned part way is not committed and its pack is not unlinked, but the bytes it wrote to the abandoned target file are counted in `rewrite_bytes`, so net never overstates savings.
 - A pack left in place because a condemned block became live again is counted in neither gross nor rewrite for that attempt.
 
+The abandoned figure is read from the target file's real on-disk length at the moment the copy stopped, and that happens on **every** exit from a copy, not only on a cancel or an exhausted budget.
+A copy that fails part way through a batch (a corrupt source record, a short write, a failed sync, a failed commit) has still put bytes on disk, so those bytes belong in `rewrite_bytes` whatever ended the copy.
+The on-disk length is the exact figure rather than the compaction's in-memory write cursor: a write that fails part way leaves the file longer than the cursor ever advanced, so the cursor would undercount.
+
+Counting the committed rewrite and the abandoned figure together is not a double count, because a pack is only ever measured once.
+A copy either commits, in which case its committed `file_bytes` is added, or it is abandoned, in which case the target file's length is added.
+A target the copy never created contributes zero.
+
+Regression coverage for this edge is `a_copy_that_fails_on_a_corrupt_live_record_still_accounts_the_new_pack_bytes`: it corrupts a live record after the new pack has been created and asserts the reported net equals the physical pack drop.
+On the pre-fix code that test fails, reporting `rewrite_bytes: 0` for a cycle that left a new pack on disk.
+
 ## Human and machine output
 
-The control protocol carries the three fields as new members of `GcReport`.
-They are optional on the wire: a payload from before #81 decodes with `gross_removed_bytes` taken from `freed_bytes` and the other two as zero, and a new payload always serializes all three.
+The control protocol carries the three fields as new members of `GcReport`, optional on the wire.
+A new payload always serializes all three.
+
+A payload from before #81 carries none of the three.
+Its gross is real and is taken from `freed_bytes`, but its **net is unknown**, and it is represented as unknown rather than as a number.
+A legacy cycle may well have rewritten a pack; deriving `net = gross` or `net = gross - 0` would report a saving that was never measured.
+So `rewrite_bytes` and `net_reclaimed_bytes` are `Option` on the control side, `None` meaning unknown, and the CLI human line for such a report says `rewrite and net unknown (legacy report)` instead of printing a false zero.
+
+The three new fields are one unit on the wire: present together or absent together.
+A payload carrying only some of them is rejected, as is one whose explicit `gross_removed_bytes` disagrees with `freed_bytes`, or whose `net_reclaimed_bytes` is not exactly `gross - rewrite`, or whose difference does not fit an `i64`.
+Both checks exist so a malformed report surfaces as an error instead of decoding into a wrong number.
+
 The CLI human line for a real cycle reads `freed N blocks; X removed (gross), Y rewritten, net Z reclaimed`, and the dry-run line labels its number an estimate.
+
+## A failed cycle still reports its cost
+
+A cycle that hits an error after writing a new pack but before unlinking anything has spent real bytes and reclaimed none.
+The daemon returns that as an error, but the message carries the actual gross, rewrite and signed net, so a caller sees the cost the cycle incurred rather than a bare "freed nothing" that hides a rewrite behind a wall.
 
 ## Acceptance
 
@@ -66,4 +94,7 @@ The CLI human line for a real cycle reads `freed N blocks; X removed (gross), Y 
 cargo test -p cowfs-gc --test core_reclaim
 cargo test -p cowfs-ctl --test wire
 cargo test -p cowfs-cli
+python3 scripts/verify-gc-daemon.py --work <private work dir>
 ```
+
+The end-to-end verifier records the real numbers of one real cycle on a private store and asserts `gross_removed_bytes`, `rewrite_bytes` and `net_reclaimed_bytes` agree with the physical pack sizes before and after, under the record `reclaim.reported_gross_rewrite_net_agree_with_physical`.
