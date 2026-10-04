@@ -52,6 +52,55 @@ digests, which is exactly what the harness refuses to reuse a cached verdict wit
 The harness does not exist at the base commit `ceb96c6`, and no row here claims it does. An
 earlier revision of this report cited `ceb96c6` and was wrong.
 
+### The binary changed after that run, so the counts above are not re-asserted for current main
+
+This branch has since merged main at `46b0f269d5bef4a2c204c25f5b3015da601d3beb`, which carries #93
+and #95. The 29-execution run above was measured against a binary built at `90c9a8f`, **before**
+both. Its digests are not the digests of the integrated binary:
+
+| | 29-execution run at `90c9a8f` | integrated binary after the merge |
+|---|---|---|
+| `cowfs-daemon` | `4f29fab1...` | `eb48f336d56c7632e15a12481a6e4cee5a2eadf88f104fcd80db98db69c39e0a` |
+| `cowfs` | `9567bded...` | `e0cc963bb66d897f4b0567ebe8c3966f748f81cdead5e6a447fddd6c7936029d` |
+
+So the six losses, the 46-of-52 durability match and every other count above are properties of the
+**pre-merge binary**. They are carried forward as that run's record and nothing more. Re-running all
+29 cases purely to restate unchanged numbers was not done: eleven other workers hold the shared
+heavy lane, and the brief for this revision scopes the re-measurement. What is needed instead is a
+scoped re-measurement of the failing boundary on the integrated binary, which is the next section.
+
+### Scoped re-measurement on the integrated binary
+
+Executed on the merged tree, one sample per case, real daemon, real CLI, real NFS loopback, private
+store, SIGKILL and reopen:
+
+| | |
+|---|---|
+| executed / reused | 2 / 0 |
+| planned / accounted | 2 / 2, balanced |
+| passed / failed | 1 / 1 |
+| `write_fsync` | passed |
+| `rename_posix_durability` | **failed** on `durable_present`: the caller's `fsync` returned success and the bytes are gone |
+| `fsck_clean`, `snapshot_is_dir` | passed |
+| run exit | 1, `executed_with_failures` |
+| receipt | one `durable` receipt, `nfs_commit` boundary, seq 1, on `live/moved.bin` |
+| teardown | `unmount.after_kill` and `unmount.teardown` both `not_mounted`, `abandoned: false` |
+| evidence | `bench/out/crash88/integrated-sample/` (gitignored) |
+
+The finding is therefore **unchanged on the integrated binary**: a successful POSIX parent-directory
+`fsync` after `rename` still emits no COMMIT on this client, and the promised name is still lost.
+That is the same defect issue #90 owns, and it is still not fixed here. Receipt classification is
+unchanged: nothing was downgraded to make the run read better.
+
+The teardown records are the first real-run evidence for the tri-state mount inspection. Both real
+unmounts returned `not_mounted` after the fact with no abandonment, and the pre-existing
+`unmount.refused_not_our_mount` still records a genuine absence when nothing is mounted. No
+`unmount.blocked_unknown_mount_state` appeared, because the table was readable on this host.
+
+What this run does **not** establish: the 29-case matrix on the integrated binary. Only the failing
+boundary and its passing neighbour were re-measured. The other counts above remain the `90c9a8f`
+run's and are labelled as such.
+
 ## The receipt model, and why nothing is reclassified
 
 Read off the source:
@@ -317,7 +366,7 @@ worker's tree, none were mine, and none were touched.
 
 ## CI
 
-`bench/test_daemon_crash.py`, 87 tests, discovered by the step CI already runs,
+`bench/test_daemon_crash.py`, now 154 tests, discovered by the step CI already runs,
 `python3 -m unittest discover -s bench`. No workflow change. Synthetic ledgers, fake fixtures and
 short-lived private processes only: no daemon, no mount, no cargo, nothing under `~/.cowfs`.
 
@@ -341,6 +390,38 @@ One test in the previous revision called the real mount runner instead of mockin
 what kept the ubuntu job red: `/sbin/mount` does not exist on that runner and the resulting
 `FileNotFoundError` escaped. It now mocks the runner, as its siblings do, and a missing binary is
 handled by the runtime rather than by the test.
+
+### The two defects the next review found, and the policy they forced
+
+A line carrying `on` but no parenthesised type was previously skipped, so a table holding one such
+line beside valid ones still reported a confident `not_mounted`. That is the dangerous direction: a
+truncated copy of our own entry is then indistinguishable from a foreign one, and a false absence is
+what lets cleanup proceed. The policy now is:
+
+- an exact match on a fully parsed line is `mounted`. That is a positive identification, and a
+  neighbour that failed to parse cannot retract it.
+- no match, plus any unparseable entry, is `unknown`, which blocks cleanup and runs no `umount`.
+- a fully readable table with no match is still `not_mounted`.
+
+Empty output, a non-zero exit, a reader failure, a timeout and a missing binary all remain `unknown`.
+No mount walk and no `realpath` fallback was added; the only resolution is the key cached before the
+mount existed.
+
+Separately, mount(8) escapes were never decoded, so on a host that escapes them a path containing a
+space read as absent. `decode_mount_field` handles exactly the four documented sequences, `\040`
+`\011` `\012` `\134`, in one left-to-right pass with no rescan, so `\134040` is a literal backslash
+followed by `040` and never a space. It is deliberately not `unicode_escape`, which would interpret
+backslash sequences a path may legitimately contain; an unrecognised sequence stays literal. The
+decoded point is compared for exact equality against the cached key, so a prefix, a child and a
+parent of the real path are each still a genuine absence, and a host that prints a literal space
+still matches. `parse_mount_entry` covers the two forms in scope, with or without a util-linux
+`type <fs>` suffix, and splits at the first `on` because the device is a single token in every form
+this harness produces; a device containing `on` would lengthen the point rather than shorten it
+into a false match.
+
+Both were reproduced before the fix. The teeth fixture records 6 of 12 cases holding on the old tree
+and 12 of 12 on the fixed tree, at `bench/out/crash88-portability-repair/teeth-OLD.txt` and
+`teeth-NEW.txt`.
 
 Coverage: the nfsstat parser against recorded output including the NLM column; ledger
 immutability; identity sensitivity per bound field; every cache-rejection path above; the
