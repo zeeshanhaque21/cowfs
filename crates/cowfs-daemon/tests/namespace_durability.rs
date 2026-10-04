@@ -1,0 +1,461 @@
+//! A name the caller synced is still there after the daemon is killed. Issue #90.
+//!
+//! On this transport a namespace RPC used to be answered from memory, so `rename` was
+//! `Ack::Applied`: macOS emits no COMMIT for a directory `fsync`, nor for an `fsync` of a
+//! descriptor with no dirty pages, so the POSIX habit bought no durability and nothing told the
+//! caller. The repair makes the adapter durable before it answers, so the crash itself is the
+//! regression: a real daemon, the real CLI, a real NFS mount, a private store, `SIGKILL` right
+//! after the caller returns, and the same store reopened by a fresh daemon.
+//!
+//! `fsck` clean plus the old name intact would not be enough on their own, so every case compares
+//! both names and the bytes, and `DirtySibling` keeps the control the issue measured as working,
+//! which proves the rename is committable on this daemon.
+//!
+//! ```text
+//! cargo test -p cowfs-daemon --test namespace_durability -- --ignored --test-threads=1 --nocapture
+//! ```
+
+use std::fs;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long to wait for something that should happen at once.
+const SETTLE: Duration = Duration::from_secs(60);
+
+const SNAP: &str = "snap";
+const OLD: &str = "old.txt";
+const NEW: &str = "new.txt";
+const SIBLING: &str = "sibling.txt";
+/// Long enough that a lost or truncated body cannot pass as equal.
+const BODY: &[u8] = b"cowfs namespace durability payload 0123456789 abcdefghijklmnopqrstuvwxyz\n";
+
+/// What the caller does after `rename` returns.
+#[derive(Clone, Copy, Debug)]
+enum After {
+    /// `fsync` of the parent directory: the POSIX habit, and the case the issue measured as lost.
+    ParentDir,
+    /// `fsync` of a read-only descriptor of the renamed file: also measured as lost.
+    ReadOnlyFd,
+    /// The control the issue measured as working: write and `fsync` a sibling file.
+    DirtySibling,
+    /// No sync at all. A barrier at ack time has to cover this too.
+    Nothing,
+}
+
+impl After {
+    const CASES: [After; 4] = [
+        After::ParentDir,
+        After::ReadOnlyFd,
+        After::DirtySibling,
+        After::Nothing,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            After::ParentDir => "fsync-parent-dir",
+            After::ReadOnlyFd => "fsync-read-only-fd",
+            After::DirtySibling => "write-fsync-sibling",
+            After::Nothing => "no-sync-at-all",
+        }
+    }
+
+    /// The POSIX habit, done on the mounted snapshot.
+    fn apply(self, dir: &Path) {
+        match self {
+            After::ParentDir => fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .expect("fsync the parent directory"),
+            After::ReadOnlyFd => fs::File::open(dir.join(NEW))
+                .and_then(|f| f.sync_all())
+                .expect("fsync a read-only descriptor of the renamed file"),
+            After::DirtySibling => {
+                let mut f = fs::File::create(dir.join(SIBLING)).expect("create the sibling");
+                f.write_all(b"control\n").expect("write the sibling");
+                f.sync_all().expect("fsync the sibling");
+            }
+            After::Nothing => {}
+        }
+    }
+}
+
+/// `bench/out/durability90`, created once and resolved so the evidence lands in the worktree.
+fn artifacts() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/out/durability90");
+    fs::create_dir_all(&root).expect("the artifact directory");
+    fs::canonicalize(&root).unwrap_or(root)
+}
+
+fn test_bin() -> PathBuf {
+    let mut path = std::env::current_exe().expect("the test binary has a path");
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    path
+}
+
+fn running(child: &mut Child) -> bool {
+    !matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+}
+
+fn private(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("a private export root");
+}
+
+/// 64-bit FNV-1a, only so the log carries a fingerprint of what was read back.
+fn digest(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// One private store, one mount, one socket, all owned by this run and removed when it ends.
+struct Run {
+    dir: PathBuf,
+    socket: PathBuf,
+    store: PathBuf,
+    mount: PathBuf,
+    child: Option<Child>,
+}
+
+impl Run {
+    fn new(case: &str, rep: usize) -> Run {
+        let tag = format!("{case}-rep{rep}");
+        let root = artifacts();
+        let dir = root.join(&tag);
+        let store = root.join(format!("store-{tag}"));
+        let mount = root.join(format!("mnt-{tag}"));
+        for p in [&dir, &store, &mount] {
+            if p.exists() {
+                cowfs_vfs_path::force_remove_dir_all(p);
+            }
+        }
+        fs::create_dir_all(dir.join("pool")).expect("the export root");
+        fs::create_dir_all(&mount).expect("the mount point");
+        // `sun_path` is 104 bytes, so the socket lives on the short TMPDIR, not under the long
+        // worktree path.
+        let socket =
+            std::env::temp_dir().join(format!("d90-{}-{tag}.sock", std::process::id()));
+        Run {
+            dir,
+            socket,
+            store,
+            mount,
+            child: None,
+        }
+    }
+
+    fn start(&mut self) {
+        assert!(self.child.is_none(), "already running");
+        let log = fs::File::create(self.dir.join("daemon.log")).expect("the daemon log");
+        let err = log.try_clone().expect("a second log handle");
+        let child = Command::new(test_bin().join("cowfs-daemon"))
+            .arg("--store")
+            .arg(self.store.display().to_string())
+            .arg("--mount")
+            .arg(self.mount.display().to_string())
+            .arg("--socket")
+            .arg(self.socket.display().to_string())
+            .arg("--export-root")
+            .arg(self.dir.join("pool").display().to_string())
+            .arg("--backend")
+            .arg("core")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(err))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("the daemon binary runs");
+        let mut child = child;
+        // Either the socket answers and the mount is up, or the child is gone. Both end the loop.
+        let deadline = Instant::now() + SETTLE;
+        while Instant::now() < deadline {
+            if self.cli(&["status"]).is_ok() {
+                assert!(
+                    cowfs_daemon::mounts::is_mounted(&self.mount),
+                    "the daemon answered but nothing is mounted"
+                );
+                self.child = Some(child);
+                return;
+            }
+            assert!(running(&mut child), "the daemon exited before it served");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the daemon did not start serving within {SETTLE:?}");
+    }
+
+    fn cli(&self, args: &[&str]) -> Result<String, String> {
+        let out = Command::new(test_bin().join("cowfs"))
+            .arg("--socket")
+            .arg(&self.socket)
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "cowfs {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The snapshot the case works in, through the mount.
+    fn snap(&self) -> PathBuf {
+        self.mount.join(SNAP)
+    }
+
+    /// The pid this test started and may signal. Nothing else is ever signalled.
+    fn pid(&self) -> u32 {
+        self.child.as_ref().expect("a running daemon").id()
+    }
+
+    /// `SIGKILL` of the pid this test started, then wait for it to be gone. `kill` runs the real
+    /// binary so the signal is the one named, and no process group is ever touched.
+    fn sigkill(&mut self) {
+        let mut child = self.child.take().expect("a running daemon");
+        let pid = child.id();
+        assert!(
+            Command::new("/bin/kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status()
+                .is_ok_and(|s| s.success()),
+            "could not SIGKILL {pid}"
+        );
+        let deadline = Instant::now() + SETTLE;
+        while Instant::now() < deadline {
+            if !running(&mut child) {
+                let _ = child.wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the daemon ignored SIGKILL");
+    }
+
+    fn stop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = Command::new("/bin/kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status();
+        let deadline = Instant::now() + SETTLE;
+        while Instant::now() < deadline {
+            if !running(&mut child) {
+                let _ = child.wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        self.stop();
+        // Never walk a tree that is still a mount point: a dead server turns the recursive delete
+        // into an unbounded hang. macOS `umount` has no `-z`, so wait for the table to agree.
+        let removable = if cowfs_daemon::mounts::is_mounted(&self.mount) {
+            let _ = Command::new("/sbin/umount")
+                .arg("-f")
+                .arg(&self.mount)
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline && cowfs_daemon::mounts::is_mounted(&self.mount) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            !cowfs_daemon::mounts::is_mounted(&self.mount)
+        } else {
+            true
+        };
+        if !removable {
+            eprintln!(
+                "LEAK: {} is still in the mount table, leaving it alone",
+                self.mount.display()
+            );
+        }
+        for suffix in ["", ".lock"] {
+            let _ = fs::remove_file(format!("{}{suffix}", self.socket.display()));
+        }
+        if removable {
+            cowfs_vfs_path::force_remove_dir_all(&self.dir);
+            cowfs_vfs_path::force_remove_dir_all(&self.store);
+            cowfs_vfs_path::force_remove_dir_all(&self.mount);
+        }
+    }
+}
+
+/// One case, one rep: create the file, rename it, sync the way the case says, then kill the
+/// daemon 2 to 6 ms later and read the same store back through a fresh daemon and mount.
+fn rep(case: After, rep: usize) {
+    let mut run = Run::new(case.name(), rep);
+    private(&run.dir.join("pool"));
+    run.start();
+    run.cli(&["snapshot", "create", SNAP]).expect("snapshot create");
+    let dir = run.snap();
+
+    let old = dir.join(OLD);
+    let mut f = fs::File::create(&old).expect("create the file to rename");
+    f.write_all(BODY).expect("write the body");
+    // Durable before the rename, so the only uncommitted thing left is the rename itself.
+    f.sync_all().expect("fsync the file");
+    drop(f);
+
+    fs::rename(&old, dir.join(NEW)).expect("rename");
+    case.apply(&dir);
+    let before = fs::read(dir.join(NEW)).expect("read the renamed file back");
+    assert_eq!(before, BODY, "the rename did not read back before the kill");
+
+    let pid = run.pid();
+    std::thread::sleep(Duration::from_millis(2 + (rep as u64 % 5)));
+    run.sigkill();
+
+    run.start();
+    assert_ne!(run.pid(), pid, "the restart reused the killed pid");
+    let dir = run.snap();
+    let after = fs::read(dir.join(NEW)).expect("the new name must survive the kill");
+    assert_eq!(
+        after, before,
+        "{}: the new name came back with other bytes",
+        case.name()
+    );
+    assert_eq!(
+        fs::read(&dir.join(OLD)).ok(),
+        None,
+        "{}: the old name came back too",
+        case.name()
+    );
+    let fsck = run.cli(&["fsck"]).expect("fsck after the kill");
+    assert!(
+        fsck.contains("ok: ") && fsck.contains("snapshots checked"),
+        "{}: fsck: {fsck}",
+        case.name()
+    );
+    eprintln!(
+        "durability90 {} rep{rep}: pid {pid} SIGKILLed, new name survived, digest {}",
+        case.name(),
+        digest(&after)
+    );
+}
+
+/// Every case the caller can reach, three reps each. Small on purpose: each rep starts a daemon,
+/// mounts, kills and mounts again.
+#[test]
+#[ignore = "mounts a filesystem and kills a daemon; run with --ignored"]
+fn a_synced_namespace_survives_a_killed_daemon() {
+    if !cowfs_daemon::mounts::available() {
+        eprintln!("SKIP: no usable mount adapter on this host");
+        return;
+    }
+    let only = std::env::var("DURABILITY90_ONLY").ok();
+    for case in After::CASES {
+        if only.as_deref().is_some_and(|want| want != case.name()) {
+            continue;
+        }
+        for nth in 1..=3 {
+            rep(case, nth);
+        }
+    }
+}
+
+/// The worker of the native control. Not a test; the control below runs it.
+#[test]
+#[ignore = "helper process of the native control"]
+fn native_helper() {
+    let Ok(dir) = std::env::var("DURABILITY90_NATIVE_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let old = dir.join(OLD);
+    let mut f = fs::File::create(&old).expect("create the file to rename");
+    f.write_all(BODY).expect("write the body");
+    f.sync_all().expect("fsync the file");
+    drop(f);
+    fs::rename(&old, dir.join(NEW)).expect("rename");
+    fs::File::open(&dir)
+        .and_then(|d| d.sync_all())
+        .expect("fsync the parent directory");
+    // The rename and the directory fsync have returned and the caller has been told so; the
+    // kill lands after that, never in the middle of an operation.
+    println!("renamed");
+    std::io::stdout().flush().expect("the helper speaks");
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The same recipe on native APFS, with the worker killed instead of a daemon. It cannot fail on
+/// durability, because a process kill does not touch the page cache, so what it proves is that the
+/// recipe, the readback and the cleanup are sound, not that the sync mattered.
+#[test]
+#[ignore = "spawns and kills a helper; run with --ignored"]
+fn native_apfs_survives_the_same_recipe() {
+    let root = artifacts().join("native");
+    if root.exists() {
+        cowfs_vfs_path::force_remove_dir_all(&root);
+    }
+    fs::create_dir_all(&root).expect("the native directory");
+    let mut child = Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "native_helper", "--ignored", "--nocapture"])
+        .env("DURABILITY90_NATIVE_DIR", &root)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("the helper runs");
+    let pid = child.id();
+    let mut said = String::new();
+    {
+        let out = child.stdout.take().expect("the helper's stdout");
+        for line in std::io::BufReader::new(out).lines() {
+            let line = line.expect("the helper's line");
+            if line.contains("renamed") {
+                said = line;
+                break;
+            }
+        }
+    }
+    assert_eq!(said.trim(), "renamed", "the helper never reported the rename");
+    assert!(
+        Command::new("/bin/kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status()
+            .is_ok_and(|s| s.success()),
+        "could not SIGKILL the helper {pid}"
+    );
+    let deadline = Instant::now() + SETTLE;
+    while Instant::now() < deadline {
+        if !running(&mut child) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        fs::read(root.join(NEW)).expect("the native new name"),
+        BODY,
+        "native APFS lost the rename"
+    );
+    assert!(!root.join(OLD).exists(), "native APFS kept both names");
+    eprintln!(
+        "durability90 native: pid {pid} SIGKILLed after the rename and the directory fsync, \
+         new name survived, digest {}",
+        digest(BODY)
+    );
+    cowfs_vfs_path::force_remove_dir_all(&root);
+}
