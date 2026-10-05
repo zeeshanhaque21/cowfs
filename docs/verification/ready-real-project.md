@@ -16,7 +16,7 @@ the harness changes the corpus it measures.
 
 | Receipt set | `workspace_head` / `sample_commit` | What it covers |
 | --- | --- | --- |
-| Controls and the representative Core run | see "Executed and skipped" | the repair itself, on the repaired tree |
+| Controls, the representative Core run, and the blocker gates | `a64e1189ff5f8ac8d34b24aad5d820818f8eaf72` | the repaired tree, at the commit that carries it |
 | In-slot build and native control | `4a70c53ae4c7062458ae7e63dbe8619cce1458a1` | the two expensive builds |
 
 The two expensive builds ran while the N1 to N7 repair was still uncommitted, so their receipts
@@ -45,10 +45,10 @@ safe controls, no mount and no daemon              6
 negative controls that must fail                  4   (F1, seeded boolean claim, seeded string claim, seeded undescribed row)
 ```
 
-The receipt file is append-only and was written by several runs during the repair, so its row count
-is cumulative and is **not** a count of tests. Rows in the current file: 42, of which 37 carry
-`outcome: "measured"` and 5 carry `outcome: "cleanup"`. **Zero rows lack an outcome**, which is
-itself asserted by `the_acceptance_receipt_states_what_was_measured`.
+The receipt file for this head is written only by the run recorded here: 28 rows, of which 24 carry
+`outcome: "measured"` and 4 carry `outcome: "cleanup"`, and **zero rows lack an outcome**, which
+`the_acceptance_receipt_states_what_was_measured` asserts. Earlier receipt files from the repair are
+kept beside it under distinct names and are **not** part of this count.
 
 ## Safe controls, run before any mounted work
 
@@ -105,7 +105,7 @@ and still report success.
 | Verified ingest of the real project | PASS | `verified: true`, both roots equal |
 | Fork id distinct from base, parented by it | PASS | `sr-slot-1`, parent `sr-base` |
 | Real export at a treehouse-shaped slot path | PASS | mount table lists it, fstype `nfs`, answering store exact |
-| Export equals the source, both directions | PASS | 2508 vs 2508, 0 only-in-export, 0 only-in-source |
+| Export equals the source, both directions | PASS | 2573 vs 2573, 0 only-in-export, 0 only-in-source |
 | Export is writable | PASS | write succeeded |
 | Real `cargo build` inside the export | PASS | exit 0, after mount identity readback |
 | Real `cargo test` inside the export | PASS | exit 0 |
@@ -116,7 +116,8 @@ and still report success.
 
 ```
 sample project        this repository at the commit under test
-workspace head        4a70c53ae4c7062458ae7e63dbe8619cce1458a1   (see the binding table above)
+workspace head        a64e1189ff5f8ac8d34b24aad5d820818f8eaf72
+                      (the in-slot build and native control name the previous commit)
 rustc                 rustc 1.99.0 (b940084d7 2026-09-28)
 cargo                 cargo 1.99.0 (5f94df478 2026-08-27)
 git                   git version 2.56.0
@@ -169,8 +170,10 @@ the right assertions. No duration is claimed for either build.
 Reset returned the slot to the base, entry for entry and byte for byte:
 
 ```
-base entries                     2508
-slot entries after reset         2508
+import root hash                  40ee247b291bbc05a515c24a460f6238cb53ae85867af7804af7b40ad36e7b2d
+import files / bytes             2194 / 12,857,077
+base entries                     2573
+slot entries after reset         2573
 slot write survived reset        false
 ```
 
@@ -351,9 +354,9 @@ is when the incident happened, not because the whole file is a pre-fix run.
   re-read and matched. The start time is compared, so a recycled pid carrying the same argv is
   refused; a negative control proves it. The shared `Watchdog` is unused because its abort path runs
   no destructors and would leave a live daemon and a live mount.
-- All five private daemons in the recorded runs exited on their own after a control-plane shutdown,
+- All four private daemons in the recorded run exited on their own after a control-plane shutdown,
   none was signalled, and every teardown recorded an empty `mounts_left_listed` and an empty
-  quarantine.
+  quarantine. Five ran in the earlier full-suite run at `1b1f2e1`, also clean.
 
 Defects this harness had, found and fixed during this work, recorded because they are the kind that
 damage a shared machine:
