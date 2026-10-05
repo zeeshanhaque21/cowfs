@@ -629,23 +629,37 @@ fn repeated_rollbacks_keep_counting_and_keep_moving_the_floors() {
 
     let mut floors = Vec::new();
     let mut handed_out = max_ino;
+    let mut saved_batch: Option<Vec<u8>> = None;
     for round in 1..=2u64 {
         // Each round needs a large batch as the newest commit, or a rollback is unreachable:
         // see `build`. The recovered store is reopened, given fresh files, and re-snapshotted.
         if round > 1 {
-            let m = Meta::open(&fx.path, opts()).unwrap();
-            let s = m.snapshots().unwrap()[0].name.clone();
-            let s = m.snapshot(&s).unwrap();
-            let fresh = write_tail_batch(&s, round as u32);
-            handed_out = handed_out.max(*fresh.iter().max().unwrap());
-            m.sync().unwrap();
-            let before = m.health();
-            std::fs::copy(&fx.path, &fx.scratch).unwrap();
-            drop(m);
-            // The store is closed now, so its newest commit is the one the copy captured.
-            std::fs::copy(&fx.scratch, &fx.path).unwrap();
+            // `Snapshot` shares `Meta`'s `Arc<Handle>` and that handle commits on drop, so both
+            // must be gone before the saved bytes go back.
+            let (saved, before) = {
+                let m = Meta::open(&fx.path, opts()).unwrap();
+                let s = m.snapshots().unwrap()[0].name.clone();
+                let s = m.snapshot(&s).unwrap();
+                let fresh = write_tail_batch(&s, round as u32);
+                handed_out = handed_out.max(*fresh.iter().max().unwrap());
+                m.sync().unwrap();
+                let before = m.health();
+                let saved = std::fs::read(&fx.path).unwrap();
+                drop(s);
+                drop(m);
+                (saved, before)
+            };
+            std::fs::write(&fx.path, &saved).unwrap();
             fx.before = before;
-            let _ = std::fs::remove_file(&fx.scratch);
+            saved_batch = Some(saved);
+        }
+        if let Some(saved) = saved_batch.as_deref() {
+            assert_eq!(
+                sha_file(&fx.path),
+                sha(saved),
+                "round {round}: the fixture must still be the saved batch, so the newest commit \
+                 owns pages of its own and a rollback is reachable"
+            );
         }
         damage_newest_commit(&fx);
         let (m, rec) = Meta::open_recover(&fx.path, opts()).unwrap();
