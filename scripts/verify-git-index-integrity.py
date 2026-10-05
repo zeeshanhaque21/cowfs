@@ -922,8 +922,8 @@ def attest_mount_arm(native_repo: Path, mount_repo: Path, mountpoint: Path,
     a different device from the native arm while being plain APFS with no NFS server behind it.
     So this requires all of: the mount table has an exact parsed line for the mountpoint, that
     line's fstype is nfs, the mount arm's device differs from the native arm's, the device differs
-    from the `--out` scratch root, the daemon process is alive and owned, and a fresh write witness
-    in the mount arm lands on the foreign device.
+    from the local scratch root the mountpoint sits in, the daemon process is alive and owned, and a
+    fresh write witness in the mount arm lands on the foreign device.
 
     Returns `pass: False` with `why` rather than raising, so the caller can record UNMEASURABLE
     instead of crashing.
@@ -938,7 +938,11 @@ def attest_mount_arm(native_repo: Path, mount_repo: Path, mountpoint: Path,
         why.append(f"mount table fstype is {fstypes}, expected nfs")
 
     devs = {}
-    for name, p in (("native", native_repo), ("mount", mount_repo), ("out", mountpoint)):
+    # `scratch` is the directory the mountpoint sits in, not the mountpoint itself: the mountpoint is
+    # legitimately on the NFS device, so comparing the mount arm against it would compare the export
+    # against itself and reject every correct run.
+    for name, p in (("native", native_repo), ("mount", mount_repo),
+                    ("scratch", mountpoint.parent)):
         try:
             st = os.stat(p)
             devs[name] = {"st_dev": st.st_dev, "resolved": str(p.resolve())}
@@ -950,11 +954,12 @@ def attest_mount_arm(native_repo: Path, mount_repo: Path, mountpoint: Path,
         why.append(
             f"mount arm st_dev {devs['mount']['st_dev']} equals native arm "
             f"{devs['native']['st_dev']}: the mount arm is not on a foreign filesystem")
-    if ("st_dev" in devs.get("mount", {}) and "st_dev" in devs.get("out", {})
-            and devs["mount"]["st_dev"] == devs["out"]["st_dev"]):
+    if ("st_dev" in devs.get("mount", {}) and "st_dev" in devs.get("scratch", {})
+            and devs["mount"]["st_dev"] == devs["scratch"]["st_dev"]):
         why.append(
-            "mount arm st_dev equals the scratch root device: the arm resolved to local "
-            "scratch, not to the NFS export")
+            f"mount arm st_dev {devs['mount']['st_dev']} equals the local scratch root "
+            f"{devs['scratch']['resolved']}: the arm resolved to local scratch, not to the "
+            "NFS export")
 
     identity = daemon.identity(daemon.pid) if daemon.pid else {"argv": None}
     if identity.get("argv") is None or not daemon.owned(daemon.pid):

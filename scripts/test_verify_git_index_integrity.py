@@ -267,6 +267,20 @@ class MountAttestation(unittest.TestCase):
             identity=lambda p: {"argv": None}, owned=lambda p: False), a)
         self.assertFalse(r["pass"])
 
+    def test_local_dir_inside_the_scratch_root_is_refused(self):
+        """A mount arm that is just a directory the harness made next to the mountpoint is the
+        silent-fallback shape. Comparing its device against the mountpoint itself would compare the
+        export against itself and accept it, so it must be compared against the scratch root."""
+        mountpoint = self.root / "mnt"
+        mountpoint.mkdir()
+        local = self.root / "fallback"
+        local.mkdir()
+        r = vgi.attest_mount_arm(local, local, mountpoint, SimpleNamespace(
+            pid=None, store=Path("/nonexistent/s"), sock=Path("/nonexistent/k"),
+            identity=lambda p: {"argv": None}, owned=lambda p: False), local)
+        self.assertFalse(r["pass"])
+        self.assertTrue(any("local scratch" in w for w in r["why"]), r["why"])
+
     def test_negative_controls_report_ok(self):
         a = self.root / "native"
         a.mkdir()
