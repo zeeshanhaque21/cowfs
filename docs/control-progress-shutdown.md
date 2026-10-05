@@ -183,7 +183,9 @@ close real. The guarantee is now explicitly two-sided, and the second side is a 
   gets its complete terminal frame, and `wait()` does not return before that frame is on the wire.
   Asserted by `an_unblocked_client_still_receives_a_terminal_frame_at_shutdown`,
   `healthy_reader_behind_a_stalled_writer_is_not_delayed` (frame at 307 ms, code `shutting_down`)
-  and `admission.rs::a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace`.
+  `admission.rs::a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace` and
+  `a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame`, the latter resuming at 340 and
+  400 ms in `a4`'s 200/250 ms geometry and at 90 and 95 percent of a 1000 ms grace.
 - **Past the delivery grace**, the connection is closed before `wait()` returns. A peer that is
   still not reading then gets no promise for a frame: it may see a partial frame followed by EOF.
   A complete terminal frame cannot be promised to a peer that resumes reading only after the close.
@@ -276,11 +278,30 @@ There is now one `grace_end`, computed once where the deadline branch is entered
 worker-signal wait, the worker join and the release wait. The branch is polled every 10 ms, so that
 instant is at most one poll interval after the real deadline, which is the scheduling slack.
 
-The one grace is split rather than given to whichever wait asks first. Delivery takes the front half
-and the close the back half. The close is what the contract requires and a frame is only promised as
-best effort, so it cannot be starved. With the split removed, the delivery wait consumed the whole
-grace, the close never ran, and a parked connection was still open when `wait()` returned
-(`connection_closed_at_return=false`).
+The whole grace is the delivery window. `kill` runs at `grace_end`, so a client that resumes reading
+at any point inside `shutdown_deadline + drain_deadline` still gets its frame: after the resume the
+parked write unwinds, the handler returns, and the terminal frame is written inside that window.
+
+An earlier revision reserved the back half of the grace for the close. That was withdrawn, not
+justified:
+
+- **It silently shortened a documented guarantee.** `kill` ran at the halfway mark, so a client
+  resuming at 340 or 400 ms in `a4`'s own 200/250 ms geometry got `NoFrame` or a truncated frame
+  where the three-grace code gave a whole one. The fix for that had been to widen `a4` to a 500 ms
+  grace, which made the cut invisible rather than removing it.
+- **Its stated reason did not reproduce.** The justification was that without the split the close
+  did not happen at the return. Measured across mixed, parked-only, three grace values and two
+  deadlines, read EOF was observed at the return in every shape on the unsplit source.
+
+What a reserve would actually buy is letting a killed parked handler unwind before the return.
+That is a weaker claim than the contract makes: `v1-control-api.md` detaches handler threads and lets
+them die with the process. So the reserve is removed and that case is handed back to the contract
+rather than paid for out of the delivery window.
+
+Two internal test assertions that required the handler to be unwound at the return were stricter than
+the contract and are corrected to gate the close and the bounded `wait()` instead, with the detached
+handler's eventual exit asserted separately as this test loop's own thread budget.
+`handler_alive_at_return` is reported, not asserted away.
 
 Measured with `shutdown_deadline` 300 ms and `drain_deadline` 500 ms, so the budget is 800 ms and the
 test allows 250 ms more for scheduling:
@@ -307,9 +328,15 @@ longer costs a second grace. No claim is made here that every handler is joined 
 
 ## Tests that declare their own budget
 
-The 250 ms default `drain_deadline` cannot serve both phases: the close needs about 150 ms, leaving
-under 100 ms for delivery. Two tests therefore declare a `drain_deadline` they can actually be served
-inside, rather than implying delivery works at any budget:
-`a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace`, whose client resumes
-400 ms after shutdown, and `abandoned_blocked_connection_is_released_before_wait_returns`, which needs
-room for the close. The source deadline is unchanged.
+`a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace` is back on the 250 ms
+default grace, resuming at 400 ms inside a window that closes at 450 ms. That was its original
+geometry and it is left alone deliberately: widening it to 500 ms is what hid the delivery cut.
+
+`a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame` is the committed regression. A
+finite handler, so the terminal frame is the only thing left to deliver and a late arrival cannot be
+a progress frame. Four geometries, five reps each: `a4`'s 200/250 ms resuming at 340 and 400 ms, and a
+1000 ms grace resuming at 900 and 950 ms, which is inside the window but past any halfway or
+two-thirds cut. 20 of 20 whole frames on this source; on the half-split head the first geometry fails
+outright with `whole_terminal=false` at 340 ms.
+
+Measured with `shutdown_deadline` 300 ms and `drain_deadline` 500 ms, so the budget is 800 ms and the
