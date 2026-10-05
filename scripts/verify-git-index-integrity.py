@@ -18,8 +18,11 @@ interrupted run keeps everything up to the last completed step.
 Checks are semantic and use real git, not byte comparisons alone:
 
   * `git fsck --full --no-progress` exit code and output
-  * `git show-index < a.idx` exit code (idx magic + trailing SHA-1 trailer)
-  * `git verify-pack -v a.idx` exit code
+  * `git show-index < a.idx` exit code. Measured on git 2.56.0 and 2.54.0, this returns 0 on a
+    wholly zeroed idx and on a flipped trailing checksum byte, so it is a weaker signal than its
+    name suggests and never gates alone
+  * `git verify-pack -v a.idx` exit code, which is nonzero for both of those shapes and is what the
+    `idx_integrity` gate requires alongside show-index and a present sibling .pack
   * `git log --format=%H` count, and HEAD / HEAD^{tree} identical across arms
   * `git status --porcelain=v1` exit code and content
   * long-zero-run structure of every `.pack` and `.idx` (the shape the spike observed)
@@ -33,12 +36,15 @@ daemon and its mount are snapshotted before and after and never addressed. No si
 pid whose command line does not carry this run's exact store and socket.
 
 usage:
-    verify-git-index-integrity.py [--ops N] [--out DIR] [--keep-daemon]
+    verify-git-index-integrity.py [--ops N] [--out DIR] [--bin-dir DIR] [--cookie-entries N]
+                                  [--keep-daemon]
 
-`--ops` is the declared operation-window size and is clamped to the 30..60 band the task allows.
-This is a bounded window, not a soak.
+`--ops` is the declared operation-window size. `build_ops()` is the authority on how many exist, so
+the usable range is 30..len(build_ops()), which is 44. A request above that is refused with exit 3
+rather than silently shortened. This is a bounded window, not a soak.
 
-Exits 0 when every semantic check passed on both arms, 1 otherwise.
+Exit codes: 0 clean, 1 integrity failure, 2 prerequisite or refused invocation, 3 bad window, 4 the
+mount arm could not be proven so nothing was measured.
 """
 
 from __future__ import annotations
@@ -54,10 +60,20 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-OPS_MIN, OPS_MAX = 30, 60
+# Exit codes, so a caller can tell an integrity failure from a refused invocation without
+# parsing text. Anything nonzero means the run did not produce a clean pass.
+EXIT_OK = 0
+EXIT_INTEGRITY = 1
+EXIT_PREREQ = 2          # missing binary, unusable mount table, attestation failed closed
+EXIT_BAD_INPUT = 3       # the requested window or bounds do not exist
+EXIT_UNMEASURABLE = 4    # the mount arm could not be proven, so nothing was measured
+
+OPS_MIN = 30
+OPS_MAX_DOCUMENTED = 60  # the band the task allows; the real ceiling is len(build_ops()).
 ZERO_RUN_MIN = 4096
 SHARED_DAEMON_PID = 15263
 
@@ -123,8 +139,10 @@ def proc(argv, cwd=None, env=None, timeout=900) -> dict:
         e.update(env)
     t0 = time.monotonic()
     try:
+        # check=False is explicit and load-bearing: this harness must read `returncode` itself and
+        # must never raise on a nonzero exit. A bare call reads as an accidental omission.
         p = subprocess.run(
-            argv, cwd=cwd, env=e, capture_output=True, timeout=timeout
+            argv, cwd=cwd, env=e, capture_output=True, timeout=timeout, check=False
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -145,27 +163,133 @@ def proc(argv, cwd=None, env=None, timeout=900) -> dict:
     }
 
 
+# `mount`(8) escapes a space, tab, newline or backslash in a path as an octal escape. The decoder
+# runs exactly one pass, so `\040040` is a space followed by a literal `040`, never a double decode.
+MOUNT_UNESCAPE = {"\\040": " ", "\\011": "\t", "\\012": "\n", "\\134": "\\"}
+_MOUNT_ESCAPE_RE = re.compile(r"\\[0-7]{3}")
+
+
+def unescape_mount_path(text: str) -> str:
+    """Single-pass decode of `mount`(8)'s octal escapes. Anything else is left untouched."""
+    return _MOUNT_ESCAPE_RE.sub(lambda m: MOUNT_UNESCAPE.get(m.group(0), m.group(0)), text)
+
+
+def split_mount_line(line: str) -> tuple[str, str, str] | None:
+    """One `mount`(8) line as `(source, mountpoint, fstype)`, or `None` if it is not a mount line.
+
+    The real shape is `<source> on <mountpoint> (<fstype>, <options>)`. The mountpoint is the text
+    between the first ` on ` and the last ` (` that opens the options list, so a source containing a
+    space (`map auto_home`) and a mountpoint containing ` (` both still parse. Both sides are
+    unescaped exactly once. The fstype is the first token inside the options list, which is where
+    mount(8) actually prints it.
+    """
+    on = line.find(" on ")
+    if on <= 0:
+        return None
+    open_paren = line.rfind(" (")
+    if open_paren < on + 5:  # the mountpoint is at least one character
+        return None
+    close = line.rfind(")")
+    if close < open_paren + 2:
+        return None
+    fstype = line[open_paren + 2:close].split(",", 1)[0].strip()
+    if not fstype:
+        return None
+    return line[:on], unescape_mount_path(line[on + 4:open_paren]), fstype
+
+
+class MountTable:
+    """Tri-state reader over `mount`(8).
+
+    `PRESENT` is an exact parsed match for the requested path.
+    `ABSENT` is only reported when the whole table read cleanly and no line parsed to that path.
+    `UNKNOWN` covers a reader that failed, timed out, returned nothing, or returned a line this
+    parser cannot read, because any of those would otherwise read as a clean absence and let a
+    live mount be reported as gone.
+    """
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+    def __init__(self, rc, stdout: str, stderr: str, target: Path):
+        self.rc = rc
+        self.stderr = stderr
+        self.target = str(target)
+        self.lines = [l for l in stdout.splitlines() if l.strip()]
+        self.unparsed = [l for l in self.lines if split_mount_line(l) is None]
+        self.matches = [l for l in self.lines if (split_mount_line(l) or ("", "", ""))[1] == self.target]
+
+    @property
+    def state(self) -> str:
+        if self.matches:
+            # An exact match wins even when neighbours are unreadable: the target itself parsed.
+            return self.PRESENT
+        if self.rc != 0 or not self.lines or self.unparsed:
+            return self.UNKNOWN
+        return self.ABSENT
+
+    def detail(self) -> dict:
+        parsed = [split_mount_line(l) for l in self.lines]
+        return {
+            "state": self.state,
+            "target": self.target,
+            "reader_rc": self.rc,
+            "line_count": len(self.lines),
+            "unparsed_lines": len(self.unparsed),
+            "unparsed_sample": self.unparsed[:3],
+            "matched_lines": self.matches,
+            "fstypes": sorted({p[2] for p in parsed if p}),
+            "stderr": self.stderr[-500:],
+        }
+
+
+def read_mount_table(target: Path, reader=subprocess.run) -> MountTable:
+    """One pass of `mount`(8). `reader` is injectable so the tri-state can be unit tested against
+    synthetic failures without touching a real mount or a real NFS server."""
+    try:
+        p = reader(["mount"], capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return MountTable(None, "", "timeout", target)
+    except OSError as exc:
+        return MountTable(None, "", f"oserror: {exc!r}", target)
+    return MountTable(
+        p.returncode,
+        p.stdout.decode("utf8", "replace"),
+        p.stderr.decode("utf8", "replace"),
+        target,
+    )
+
+
 def mount_line_for(mountpoint: Path) -> str | None:
-    mp = str(mountpoint)
-    out = subprocess.run(["mount"], capture_output=True).stdout.decode("utf8", "replace")
-    for line in out.splitlines():
-        if f" on {mp} " in line:
-            return line
-    return None
+    """Convenience for the one caller that wants a line. `None` now means "not proven present", so
+    every use must go through `read_mount_table(...).state` before it can claim an absence."""
+    t = read_mount_table(mountpoint)
+    return t.matches[0] if t.state == MountTable.PRESENT else None
+
+
+def pid_field(pid: int, field: str) -> str | None:
+    out = subprocess.run(
+        ["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, check=False
+    ).stdout.decode("utf8", "replace")
+    return out.strip() or None
 
 
 def pid_argv(pid: int) -> str | None:
-    out = subprocess.run(
-        ["ps", "-o", "command=", "-p", str(pid)], capture_output=True
-    ).stdout.decode("utf8", "replace")
-    return out.strip() or None
+    return pid_field(pid, "command")
 
 
 def pid_lstart(pid: int) -> str | None:
+    return pid_field(pid, "lstart")
+
+
+def pid_exe(pid: int) -> str | None:
+    """Resolved executable path, so a recycled pid running a different binary is detectable even
+    when the command line happens to look similar."""
     out = subprocess.run(
-        ["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True
-    ).stdout.decode("utf8", "replace")
-    return out.strip() or None
+        ["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, check=False
+    ).stdout.decode("utf8", "replace").strip()
+    return out or None
 
 
 # ---------------------------------------------------------------- content
@@ -231,12 +355,32 @@ def tracked_files(repo: Path) -> list[str]:
 # ---------------------------------------------------------------- windows
 
 
+class BadWindow(Exception):
+    """The requested window does not exist. Carries the real ceiling so the message can say so
+    instead of the caller discovering a silently shortened window in the log."""
+
+
 class OpWindow:
-    """The declared operation window. `ops` is bounded to the 30..60 band."""
+    """The declared operation window, bounded to what actually exists.
+
+    `build_ops()` is the authority on how many operations exist, so the real ceiling is
+    `len(build_ops())`, not the documented 60. A request above that fails closed: a silently
+    shortened window would report a smaller declared count than the one that was asked for, and
+    then compare it against a `planned == executed` check that both arms trivially satisfy.
+    """
 
     def __init__(self, size: int):
+        available = len(build_ops())
+        if not OPS_MIN <= size <= available:
+            raise BadWindow(
+                f"requested window {size} is outside {OPS_MIN}..{available}; "
+                f"build_ops() defines {available} operations and the documented band ceiling "
+                f"is {OPS_MAX_DOCUMENTED}"
+            )
         self.ops = build_ops()[:size]
-        assert OPS_MIN <= len(self.ops) <= OPS_MAX, len(self.ops)
+        self.requested = size
+        self.available = available
+        assert len(self.ops) == size, (len(self.ops), size)
 
     def names(self) -> list[str]:
         return [o["name"] for o in self.ops]
@@ -261,7 +405,7 @@ def build_ops() -> list[dict]:
         {"name": "commit.op2", "git": ["commit", "-q", "-m", "op2"]},
         {"name": "fsck", "git": ["fsck", "--full", "--no-progress"]},
         {"name": "gc", "git": ["gc", "-q"]},
-        {"name": "idx.check", "check": "show-index"},
+        {"name": "idx.check", "check": "idx_integrity"},
         {"name": "pack.verify", "check": "verify-pack"},
         {"name": "write.text", "write": ("text", "src/main.txt", "changed\n" * 3000)},
         # An unstaged edit makes `--refresh` report "needs update" and exit 1 on a correct
@@ -273,7 +417,7 @@ def build_ops() -> list[dict]:
         {"name": "index.refresh.clean", "git": ["update-index", "--refresh"], "expect": [0]},
         {"name": "commit.am", "git": ["commit", "-q", "-m", "op3"]},
         {"name": "repack.adf", "git": ["repack", "-adf"]},
-        {"name": "idx.check", "check": "show-index"},
+        {"name": "idx.check", "check": "idx_integrity"},
         {"name": "fsck", "git": ["fsck", "--full", "--no-progress"]},
         {"name": "worktree.add", "git": ["worktree", "add", "-q", "../wt1", "-b", "wtbranch"]},
         {"name": "worktree.remove", "git": ["worktree", "remove", "../wt1"],
@@ -286,7 +430,7 @@ def build_ops() -> list[dict]:
         {"name": "merge.topic", "git": ["merge", "--no-edit", "-q", "topic"]},
         {"name": "log.oneline", "git": ["log", "--oneline", "-n", "5"]},
         {"name": "repack.adfl", "git": ["repack", "-adfl"]},
-        {"name": "idx.check", "check": "show-index"},
+        {"name": "idx.check", "check": "idx_integrity"},
         {"name": "fsck", "git": ["fsck", "--full", "--no-progress"]},
         # `stash pop` needs a stash entry. The written path is untracked, and `stash push` ignores
         # untracked files unless told not to, so `-u` is required; without it the push exits 0
@@ -299,7 +443,7 @@ def build_ops() -> list[dict]:
         {"name": "reflog.expire", "git": [
             "reflog", "expire", "--all", "--expire=now", "--expire-unreachable=now"]},
         {"name": "gc.aggressive", "git": ["gc", "-q", "--aggressive", "--prune=now"]},
-        {"name": "idx.check", "check": "show-index"},
+        {"name": "idx.check", "check": "idx_integrity"},
         {"name": "pack.verify", "check": "verify-pack"},
         {"name": "fsck", "git": ["fsck", "--full", "--no-progress"]},
         {"name": "count-objects", "git": ["count-objects", "-v"]},
@@ -316,11 +460,25 @@ def idx_files(repo: Path) -> list[Path]:
 
 
 def run_idx_check(repo: Path, kind: str) -> list[dict]:
-    """`git show-index` validates the idx magic and its own trailing SHA-1; verify-pack reads
-    every object the idx points at. Both are real git, both return real exit codes."""
+    """Per-idx structural validation with real git and real exit codes.
+
+    Measured on git 2.56.0 and 2.54.0, `git show-index` returns **0** on a wholly zeroed idx and
+    **0** on a flipped trailing checksum byte, which is exactly the historical shape, so it is
+    reported as a weaker signal and never gates alone. `git verify-pack -v` reads every object the
+    idx points at and returns nonzero for the same inputs, so `idx_integrity` requires both.
+
+    `kind` may be `show-index`, `verify-pack`, or `idx_integrity` for the combined gate.
+    """
     out = []
     for idx in idx_files(repo):
-        if kind == "show-index":
+        entry: dict = {"idx": idx.name, "idx_sha256": sha256_file(idx),
+                       "idx_bytes": idx.stat().st_size}
+        # verify-pack also requires the sibling .pack, so bind the two together explicitly: an idx
+        # with no pack is a missing-pack condition, not a silent skip.
+        pack = idx.with_suffix(".pack")
+        entry["pack_present"] = pack.is_file()
+        entry["pack_bytes"] = pack.stat().st_size if pack.is_file() else None
+        if kind in ("show-index", "idx_integrity"):
             with idx.open("rb") as fh:
                 p = subprocess.run(
                     ["git", "show-index"],
@@ -329,21 +487,41 @@ def run_idx_check(repo: Path, kind: str) -> list[dict]:
                     env={**os.environ, **GIT_ENV},
                     capture_output=True,
                     timeout=900,
+                    check=False,
                 )
-            r = {
+            entry["show_index"] = {
                 "argv": ["git", "show-index", "<", str(idx.relative_to(repo))],
                 "rc": p.returncode,
                 "stdout_lines": len(p.stdout.splitlines()),
                 "stderr": p.stderr.decode("utf8", "replace")[-2000:],
             }
-        else:
-            r = proc(["git", "verify-pack", "-v", str(idx)], cwd=repo)
-            r["argv"] = ["git", "verify-pack", "-v", str(idx.relative_to(repo))]
-        r["idx"] = idx.name
-        r["idx_sha256"] = sha256_file(idx)
-        r["idx_bytes"] = idx.stat().st_size
-        out.append(r)
+        if kind in ("verify-pack", "idx_integrity"):
+            vp = proc(["git", "verify-pack", "-v", str(idx)], cwd=repo)
+            vp["argv"] = ["git", "verify-pack", "-v", str(idx.relative_to(repo))]
+            vp.pop("stdout", None)
+            entry["verify_pack"] = vp
+        if kind == "idx_integrity":
+            si = entry["show_index"]["rc"]
+            vpr = entry["verify_pack"]["rc"]
+            entry["pass"] = bool(entry["pack_present"]) and si == 0 and vpr == 0
+            entry["why_fail"] = None if entry["pass"] else (
+                [] if entry["pack_present"] else [f"{idx.name}: sibling .pack absent"]
+            ) + ([] if si == 0 else [f"{idx.name}: show-index rc {si}"]) \
+              + ([] if vpr == 0 else [f"{idx.name}: verify-pack rc {vpr}"])
+        out.append(entry)
     return out
+
+
+def idx_integrity(repo: Path, label: str) -> dict:
+    """The combined gate: it fails when there is no idx to check, when a pack is missing, or when
+    either git check is nonzero. An empty pack directory is a fail, not a vacuous pass."""
+    rows = run_idx_check(repo, "idx_integrity")
+    return {
+        "arm": label,
+        "count": len(rows),
+        "rows": rows,
+        "pass": bool(rows) and all(r["pass"] for r in rows),
+    }
 
 
 def zero_runs(p: Path) -> dict:
@@ -427,12 +605,26 @@ def run_window(win: OpWindow, repo: Path, label: str, run: Run) -> dict:
             try:
                 r = do_write(repo, op["write"])
                 rc = 0
-            except Exception as exc:  # a fixture write failure is an op failure, not a crash
+            except OSError as exc:
+                # A fixture write failure is an op failure, not a crash. Only OSError is caught:
+                # anything else here is a harness bug and must surface rather than be recorded as
+                # an op result.
                 r = {"error": repr(exc)}
                 rc = None
         elif "check" in op:
-            r = run_idx_check(repo, op["check"])
-            rc = 0 if r and all(x["rc"] == 0 for x in r) else (None if not r else 1)
+            # `idx.check` is the combined gate, never show-index alone: show-index returns 0 on a
+            # wholly zeroed idx, which is the historical shape. `pack.verify` is verify-pack alone,
+            # and an empty pack directory is a fail, not a vacuous pass.
+            r = idx_integrity(repo, label) if op["check"] == "idx_integrity" else None
+            if r is not None:
+                rc = 0 if r["pass"] else 1
+            else:
+                rows = run_idx_check(repo, op["check"])
+                # The per-idx rc for a single-check kind is nested under that check's key, so a
+                # top-level read would report a false failure for every row.
+                sub = op["check"].replace("-", "_")
+                ok = rows and all(row["pack_present"] and row[sub]["rc"] == 0 for row in rows)
+                rc = 0 if ok else (None if not rows else 1)
         else:
             r = proc(["git"] + op["git"], cwd=repo)
             rc = r["rc"]
@@ -448,9 +640,11 @@ def run_window(win: OpWindow, repo: Path, label: str, run: Run) -> dict:
             arm=label,
             i=i,
             name=op["name"],
-            argv=(r if isinstance(r, list) else r).get("argv")
-            if isinstance(r, dict)
-            else ["git"] + op.get("git", []),
+            # `idx_integrity` returns a dict whose rows are the per-idx argv; the other check kinds
+            # return a plain list of per-idx dicts. Neither is a single argv, so the recorded argv
+            # is the op's own git command for those, and the rows carry the detail.
+            argv=r.get("argv") if isinstance(r, dict) and "argv" in r
+            else (["git"] + op["git"] if "git" in op else f"<{op['check']} check>"),
             rc=rc,
             detail=_trim(r),
         )
@@ -523,9 +717,12 @@ def semantic_checks(repo: Path, label: str, seed: dict) -> dict:
         rows = run_idx_check(repo, kind)
         out["checks"][f"idx.{kind}"] = {
             "count": len(rows),
-            "pass": bool(rows) and all(x["rc"] == 0 for x in rows),
-            "rows": [{k: v for k, v in x.items() if k != "stdout"} for x in rows],
+            "pass": bool(rows) and all(x.get("rc") == 0 for x in rows),
+            "rows": rows,
         }
+    strong = idx_integrity(repo, label)
+    out["checks"]["idx_integrity"] = {"count": strong["count"], "pass": strong["pass"],
+                                      "rows": strong["rows"]}
     out["pack_zero_report"] = pack_zero_report(repo)
     out["idx_by_name"] = {p.name: sha256_file(p) for p in idx_files(repo)}
 
@@ -585,6 +782,7 @@ class PrivateDaemon:
         self.sock = self.sock_dir / "d.sock"
         self.log = root / f"daemon-{tag}.log"
         self.pid: int | None = None
+        self.spawn: dict | None = None
         self.run = run
         self.root = root
 
@@ -596,57 +794,265 @@ class PrivateDaemon:
         self.sock_dir.mkdir(mode=0o700)
         self.log.parent.mkdir(parents=True, exist_ok=True)
         fh = self.log.open("a", buffering=1)
+        argv = [str(self.bin), "--store", str(self.store), "--mount", str(self.mount),
+                "--socket", str(self.sock), "--backend", "core"]
         p = subprocess.Popen(
-            [str(self.bin), "--store", str(self.store), "--mount", str(self.mount),
-             "--socket", str(self.sock), "--backend", "core"],
+            argv,
             stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
         self.pid = p.pid
-        self.run.rec("daemon.start", pid=self.pid, store=str(self.store),
-                     mount=str(self.mount), socket=str(self.sock), log=str(self.log))
+        # Recorded before the mount wait, so a pid is always attributable even if the wait fails.
+        self.spawn = {
+            "pid": self.pid,
+            "argv": argv,
+            "exe": str(self.bin.resolve()),
+            "store": str(self.store),
+            "mount": str(self.mount),
+            "socket": str(self.sock),
+            "socket_dir_mode": oct(self.sock_dir.stat().st_mode & 0o777),
+            "log": str(self.log),
+            "start_new_session": True,
+        }
+        # Sampled once, right after the spawn, and compared on every later ownership check.
+        self.spawn["lstart_at_start"] = pid_lstart(self.pid)
+        self.run.rec("daemon.start", **self.spawn)
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             if p.poll() is not None:
                 return {"ok": False, "why": "daemon exited", "rc": p.returncode,
+                        "spawn": self.spawn,
                         "log": self.log.read_text()[-4000:]}
-            line = mount_line_for(self.mount)
-            if line:
-                return {"ok": True, "pid": self.pid, "mount_line": line,
-                        "socket_exists": self.sock.exists()}
+            t = read_mount_table(self.mount)
+            if t.state == MountTable.PRESENT:
+                self.run.rec("daemon.mount_present", **t.detail())
+                return {"ok": True, "pid": self.pid, "mount": t.detail(),
+                        "spawn": self.spawn, "socket_exists": self.sock.exists()}
             time.sleep(0.5)
-        return {"ok": False, "why": "mount never appeared", "log": self.log.read_text()[-4000:]}
+        return {"ok": False, "why": "mount never appeared; table never reached PRESENT",
+                "spawn": self.spawn, "log": self.log.read_text()[-4000:]}
+
+    def identity(self, pid: int) -> dict:
+        """Everything a signal decision may use, recorded together so the evidence is one record."""
+        return {"pid": pid, "argv": pid_argv(pid), "lstart": pid_lstart(pid),
+                "comm": pid_exe(pid)}
 
     def owned(self, pid: int) -> bool:
+        """This run's daemon and no other.
+
+        Store and socket in the command line were the original guard.
+        Start time and executable are added so a pid recycled after our process exited cannot be
+        signalled by a later teardown, which argv alone would not catch.
+        """
         argv = pid_argv(pid) or ""
-        return str(self.store) in argv and str(self.sock) in argv
+        if str(self.store) not in argv or str(self.sock) not in argv:
+            return False
+        if self.spawn is None:
+            return False
+        if pid_lstart(pid) != self.spawn["lstart_at_start"]:
+            return False
+        return (pid_exe(pid) or "") == self.spawn["exe"]
 
     def ctl(self, *args, timeout=1800) -> dict:
         return proc([str(self.cli), "--socket", str(self.sock), "--json", *args],
                     timeout=timeout)
 
     def stop(self) -> dict:
+        """Stop the process, then report the process state and the mount state separately.
+
+        A dead process is never reported as a clean teardown: the mount table is read independently
+        and `mount_state` may be UNKNOWN, in which case the caller must treat the mount as pending
+        in the kernel rather than as cleaned up. This harness never calls umount and never walks a
+        mount, so it has no way to clear a mount it did not create.
+        """
         if self.pid is None:
-            return {"stopped": False, "why": "never started"}
-        argv = pid_argv(self.pid)
-        if argv is None:
-            # Already reaped. A second stop after an explicit one is normal, not a refusal.
-            return {"stopped": True, "pid": self.pid, "why": "already gone",
-                    "mount_line_after": mount_line_for(self.mount)}
-        if not self.owned(self.pid):
-            return {"stopped": False, "why": "pid is not this run's daemon", "argv": argv}
+            return {"process_stopped": False, "why": "never started"}
+        before = self.identity(self.pid)
+        if before["argv"] is None:
+            process_stopped = True
+            why = "pid already gone before this stop"
+        elif not self.owned(self.pid):
+            return {"process_stopped": False, "why": "pid is not this run's daemon",
+                    "identity": before, "spawn": self.spawn}
+        else:
+            self.run.rec("signal.SIGTERM", target=self.identity(self.pid), spawn=self.spawn)
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                process_stopped, why = True, "ProcessLookupError at kill; process state unverified"
+            else:
+                deadline = time.monotonic() + 60
+                process_stopped = False
+                while time.monotonic() < deadline:
+                    if not self.owned(self.pid):
+                        process_stopped = True
+                        break
+                    time.sleep(0.25)
+                why = "argv guard cleared" if process_stopped else "still owned after 60s"
+        after = self.identity(self.pid)
+        t = read_mount_table(self.mount)
+        out = {
+            "process_stopped": process_stopped,
+            "process_why": why,
+            "identity_before": before,
+            "identity_after": after,
+            "spawn": self.spawn,
+            "mount_state": t.state,
+            "mount": t.detail(),
+            "log": self.log.read_text()[-2000:],
+        }
+        # A process that is gone but a mount that is not proven absent is a quarantine, not a
+        # cleanup. Say so in the record rather than in a boolean somebody downstream will trust.
+        out["clean"] = bool(process_stopped and t.state == MountTable.ABSENT)
+        if process_stopped and t.state != MountTable.ABSENT:
+            out["quarantine"] = (
+                f"process gone but mount table reads {t.state}; treat the mount as pending in the "
+                f"kernel at {self.mount}, leave it, and let an operator inspect it"
+            )
+        self.run.rec("daemon.stop", **{k: v for k, v in out.items() if k != "log"})
+        return out
+
+
+def attest_mount_arm(native_repo: Path, mount_repo: Path, mountpoint: Path,
+                     daemon, snapshot_dir: Path) -> dict:
+    """Prove the mount arm really is on a foreign, NFS-served filesystem, or fail closed.
+
+    A different `st_dev` is necessary but never sufficient: the failure this guards is the NFS mount
+    silently falling back to the underlying local directory, and a local directory would still show
+    a different device from the native arm while being plain APFS with no NFS server behind it.
+    So this requires all of: the mount table has an exact parsed line for the mountpoint, that
+    line's fstype is nfs, the mount arm's device differs from the native arm's, the device differs
+    from the `--out` scratch root, the daemon process is alive and owned, and a fresh write witness
+    in the mount arm lands on the foreign device.
+
+    Returns `pass: False` with `why` rather than raising, so the caller can record UNMEASURABLE
+    instead of crashing.
+    """
+    why: list[str] = []
+    table = read_mount_table(mountpoint)
+    rows = [split_mount_line(l) for l in table.matches]
+    fstypes = sorted({r[2] for r in rows if r})
+    if table.state != MountTable.PRESENT:
+        why.append(f"mount table for {mountpoint} is {table.state}, not PRESENT")
+    elif "nfs" not in fstypes:
+        why.append(f"mount table fstype is {fstypes}, expected nfs")
+
+    devs = {}
+    for name, p in (("native", native_repo), ("mount", mount_repo), ("out", mountpoint)):
         try:
-            os.kill(self.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return {"stopped": True, "why": "already gone"}
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if not self.owned(self.pid):
-                break
-            time.sleep(0.25)
-        still = mount_line_for(self.mount)
-        return {"stopped": not still, "pid": self.pid, "mount_line_after": still,
-                "log": self.log.read_text()[-2000:]}
+            st = os.stat(p)
+            devs[name] = {"st_dev": st.st_dev, "resolved": str(p.resolve())}
+        except OSError as exc:
+            devs[name] = {"error": repr(exc)}
+            why.append(f"cannot stat {name} arm at {p}: {exc!r}")
+    if ("st_dev" in devs.get("native", {}) and "st_dev" in devs.get("mount", {})
+            and devs["native"]["st_dev"] == devs["mount"]["st_dev"]):
+        why.append(
+            f"mount arm st_dev {devs['mount']['st_dev']} equals native arm "
+            f"{devs['native']['st_dev']}: the mount arm is not on a foreign filesystem")
+    if ("st_dev" in devs.get("mount", {}) and "st_dev" in devs.get("out", {})
+            and devs["mount"]["st_dev"] == devs["out"]["st_dev"]):
+        why.append(
+            "mount arm st_dev equals the scratch root device: the arm resolved to local "
+            "scratch, not to the NFS export")
+
+    identity = daemon.identity(daemon.pid) if daemon.pid else {"argv": None}
+    if identity.get("argv") is None or not daemon.owned(daemon.pid):
+        why.append("no live owned private daemon is serving the mountpoint")
+    if "--backend core" not in (identity.get("argv") or ""):
+        why.append("serving daemon argv does not carry --backend core")
+    for token in (str(daemon.store), str(daemon.sock)):
+        if token not in (identity.get("argv") or ""):
+            why.append(f"serving daemon argv lacks this run's {token}")
+
+    witness = None
+    try:
+        w = mount_repo / ".cowfs-mount-witness"
+        payload = f"ready-21 {os.getpid()} {time.time_ns()}".encode()
+        w.write_bytes(payload)
+        readback = w.read_bytes()
+        st = w.stat()
+        witness = {"path": str(w), "bytes_match": readback == payload,
+                   "st_dev": st.st_dev, "removed": False}
+        w.unlink()
+        witness["removed"] = not w.exists()
+    except OSError as exc:
+        witness = {"error": repr(exc)}
+        why.append(f"mount-arm write witness failed: {exc!r}")
+    if witness and witness.get("bytes_match") is False:
+        why.append("mount-arm write witness did not read back the bytes written")
+
+    out = {
+        "mountpoint": str(mountpoint),
+        "snapshot_dir": str(snapshot_dir),
+        "mount_table": table.detail(),
+        "mount_line": table.matches[0] if table.matches else None,
+        "fstypes": fstypes,
+        "devices": devs,
+        "devices_differ": (
+            "st_dev" in devs.get("native", {}) and "st_dev" in devs.get("mount", {})
+            and devs["native"]["st_dev"] != devs["mount"]["st_dev"]
+        ),
+        "daemon_identity": identity,
+        "daemon_owned": bool(identity.get("argv")) and daemon.owned(daemon.pid),
+        "backend_declared": "core",
+        "write_witness": witness,
+        "why": why,
+    }
+    out["pass"] = not why
+    return out
+
+
+def attest_negative_controls(attest_fn, native_repo: Path, mount_repo: Path,
+                             mountpoint: Path, daemon, snapshot_dir: Path) -> list[dict]:
+    """Prove `attest_mount_arm` actually fails when the mount arm is not a foreign NFS export.
+
+    Two APFS directories with no mount table line are exactly the shape of a silent local fallback,
+    so the attestation must return `pass: False` for it. A detector that cannot fail here would let
+    the false-PASS this gate exists to prevent straight through.
+    """
+    controls = []
+
+    class _NoDaemon:
+        pid = None
+        store = Path("/nonexistent/store")
+        sock = Path("/nonexistent/sock")
+
+        def identity(self, _pid):
+            return {"argv": None, "lstart": None, "comm": None}
+
+        def owned(self, _pid):
+            return False
+
+    local_a = Path(tempfile.mkdtemp(prefix="r21-neg-a-"))
+    local_b = Path(tempfile.mkdtemp(prefix="r21-neg-b-"))
+    try:
+        r = attest_fn(local_a, local_b, local_b, _NoDaemon(), local_b)
+        controls.append({
+            "control": "two local dirs, no mount table line, no daemon",
+            "expect": "fail",
+            "pass": r["pass"] is False,
+            "attested_pass": r["pass"],
+            "why": r["why"],
+        })
+    finally:
+        shutil.rmtree(local_a, ignore_errors=True)
+        shutil.rmtree(local_b, ignore_errors=True)
+
+    # The same directories, but claiming the native arm's own path as the "foreign" mountpoint.
+    local_c = Path(tempfile.mkdtemp(prefix="r21-neg-c-"))
+    try:
+        r = attest_fn(native_repo, local_c, local_c, _NoDaemon(), local_c)
+        controls.append({
+            "control": "mount arm is a local dir while the native arm is a real repo",
+            "expect": "fail",
+            "pass": r["pass"] is False,
+            "attested_pass": r["pass"],
+            "why": r["why"],
+        })
+    finally:
+        shutil.rmtree(local_c, ignore_errors=True)
+    return controls
 
 
 def shared_snapshot() -> dict:
@@ -887,23 +1293,35 @@ class Leaked:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ops", type=int, default=41)
-    ap.add_argument("--out", default=None)
+    ap = argparse.ArgumentParser(
+        description="Git index and pack-index integrity over a private cowfs Core NFS mount.")
+    ap.add_argument("--ops", type=int, default=42,
+                    help=f"declared window size, {OPS_MIN}..{len(build_ops())}")
+    ap.add_argument("--out", default=None, help="parent for the immutable attempt directory")
+    ap.add_argument("--bin-dir", default=None,
+                    help="directory holding cowfs-daemon and cowfs; default "
+                         "bench/out/ready-21/target/release")
     ap.add_argument("--cookie-entries", type=int, default=2500)
     ap.add_argument("--keep-daemon", action="store_true")
     args = ap.parse_args()
 
-    if not OPS_MIN <= args.ops <= OPS_MAX:
-        print(f"--ops must be in {OPS_MIN}..{OPS_MAX}", file=sys.stderr)
-        return 2
+    try:
+        win = OpWindow(args.ops)
+    except BadWindow as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_BAD_INPUT
 
     here = Path(__file__).resolve().parent.parent
-    binaries = here / "bench" / "out" / "ready-21" / "target" / "release"
-    for b in ("cowfs-daemon", "cowfs"):
-        if not (binaries / b).is_file():
-            print(f"missing {binaries / b}; build it first", file=sys.stderr)
-            return 2
+    binaries = Path(args.bin_dir) if args.bin_dir else \
+        here / "bench" / "out" / "ready-21" / "target" / "release"
+    missing = [b for b in ("cowfs-daemon", "cowfs") if not (binaries / b).is_file()]
+    if missing:
+        print(f"missing {binaries}/{{{','.join(missing)}}}; build them into that directory first, "
+              f"for example:\n"
+              f"  CARGO_TARGET_DIR=$PWD/bench/out/ready-21/target \\\n"
+              f"    cargo build --release --locked -j4 -p cowfs-cli -p cowfs-daemon -p cowfs-gc",
+              file=sys.stderr)
+        return EXIT_PREREQ
 
     stamp = time.strftime("%Y%m%dT%H%M%S")
     root = Path(args.out) if args.out else here / "bench" / "out" / "ready-21"
@@ -916,12 +1334,17 @@ def main() -> int:
     run.rec("preflight", shared_daemon=shared_before,
             git_version=proc(["git", "--version"])["stdout"].strip(),
             python=sys.version.split()[0], platform=platform.platform(),
+            bin_dir=str(binaries),
             binaries={b: sha256_file(binaries / b) for b in ("cowfs-daemon", "cowfs")},
+            requested_ops=win.requested, available_ops=win.available,
+            ops_bounds=[OPS_MIN, win.available],
+            ops_documented_band=[OPS_MIN, OPS_MAX_DOCUMENTED],
             git_config_list=proc(["git", "config", "--list", "--show-origin"])["stdout"][-4000:])
 
-    win = OpWindow(args.ops)
-    summary["declared_window"] = {"size": len(win.ops), "ops": win.names()}
-    run.rec("window.declared", size=len(win.ops), ops=win.names())
+    summary["declared_window"] = {"requested": win.requested, "size": len(win.ops),
+                                  "available": win.available, "ops": win.names()}
+    run.rec("window.declared", requested=win.requested, size=len(win.ops),
+            available=win.available, ops=win.names())
 
     # ---- fixture
     seed_dir = attempt / "seed"
@@ -957,9 +1380,10 @@ def body(args, here, binaries, attempt, run, summary, win, seed, leak) -> int:
     summary["daemon"] = started
     if not started.get("ok"):
         summary["verdict"] = "DAEMON DID NOT START"
+        summary["exit_code"] = EXIT_PREREQ
         summary["shared_daemon_after"] = shared_snapshot()
         print(json.dumps(summary["verdict"]))
-        return 1
+        return EXIT_PREREQ
 
     seed_dir = attempt / "seed"
     imp = daemon.ctl("import", str(seed_dir), "--name", "seed")
@@ -967,7 +1391,8 @@ def body(args, here, binaries, attempt, run, summary, win, seed, leak) -> int:
     summary["import"] = {"rc": imp["rc"], "stdout": imp["stdout"][-2000:]}
     if imp["rc"] != 0:
         summary["verdict"] = "IMPORT FAILED"
-        return 1
+        summary["exit_code"] = EXIT_PREREQ
+        return EXIT_PREREQ
 
     snapshot_dir = daemon.mount / "seed"
 
@@ -982,9 +1407,30 @@ def body(args, here, binaries, attempt, run, summary, win, seed, leak) -> int:
     if not arms["native"]["ok"] or not arms["mount"]["ok"]:
         summary["verdict"] = "CLONE FAILED"
         summary["clone_detail"] = {k: v.get("clone", v) for k, v in arms.items()}
-        return 1
+        summary["exit_code"] = EXIT_PREREQ
+        return EXIT_PREREQ
 
     repo = {"native": attempt / "arm-native", "mount": snapshot_dir / "work"}
+
+    # ---- mount provenance, before any measured claim.
+    # The false PASS this refuses is the NFS mount silently falling back to the local directory
+    # under it: both arms would be APFS, two APFS runs of a deterministic seed do agree, and the
+    # verdict would read clean for a run that never touched cowfs.
+    att = attest_mount_arm(repo["native"], repo["mount"], daemon.mount, daemon, snapshot_dir)
+    neg = attest_negative_controls(attest_mount_arm, repo["native"], repo["mount"],
+                                   daemon.mount, daemon, snapshot_dir)
+    run.rec("mount.attestation", **{k: v for k, v in att.items() if k != "write_witness"})
+    run.rec("mount.attestation_negative", controls=neg)
+    summary["mount_attestation"] = att
+    summary["mount_attestation_negative"] = neg
+    if not att["pass"] or not all(c["pass"] for c in neg):
+        # Fail closed: an unproven mount arm measures nothing, so this is a prerequisite failure
+        # and not an integrity finding.
+        summary["verdict"] = "MOUNT ARM NOT ATTESTED: refusing to report an integrity verdict"
+        summary["exit_code"] = EXIT_PREREQ
+        print(json.dumps({"verdict": summary["verdict"], "why": att["why"],
+                          "negative_ok": [c["pass"] for c in neg]}, indent=2))
+        return EXIT_PREREQ
 
     # ---- the declared window, both arms
     summary["window"] = {}
@@ -1108,10 +1554,11 @@ def body(args, here, binaries, attempt, run, summary, win, seed, leak) -> int:
             g = proc(["git", "fsck", "--full", "--no-progress"], cwd=snap2 / "work")
             reread["git_fsck"] = {"rc": g["rc"], "stdout": g["stdout"][-3000:],
                                   "pass": g["rc"] == 0}
-            for kind in ("show-index", "verify-pack"):
+            for kind in ("show-index", "verify-pack", "idx_integrity"):
                 rows = run_idx_check(snap2 / "work", kind)
-                reread[f"idx_{kind}"] = {"count": len(rows),
-                                         "pass": bool(rows) and all(x["rc"] == 0 for x in rows),
+                ok = all(x.get("pass") if kind == "idx_integrity" else x.get("rc") == 0
+                         for x in rows)
+                reread[f"idx_{kind}"] = {"count": len(rows), "pass": bool(rows) and ok,
                                          "idx": [x["idx"] for x in rows],
                                          "sha256": {x["idx"]: x["idx_sha256"] for x in rows}}
             reread["status"] = proc(["git", "status", "--porcelain=v1"], cwd=snap2 / "work")
@@ -1123,6 +1570,7 @@ def body(args, here, binaries, attempt, run, summary, win, seed, leak) -> int:
             and (reread.get("git_fsck") or {}).get("pass", False)
             and (reread.get("idx_show-index") or {}).get("pass", False)
             and (reread.get("idx_verify-pack") or {}).get("pass", False)
+            and (reread.get("idx_idx_integrity") or {}).get("pass", False)
         )
         run.rec("reopen.checks", **{k: v for k, v in reread.items()
                                     if k != "pack_zero_report"})
@@ -1139,11 +1587,19 @@ def body(args, here, binaries, attempt, run, summary, win, seed, leak) -> int:
     run.rec("isolation", **summary["shared_daemon"])
 
     # ---- verdict
+    # `window_planned_eq_executed` compares the request against what ran on both arms, so a
+    # shortened window can never present itself as a clean pass.
     parts = {
-        "window_executed": all(summary["window"][a]["executed"] == len(win.ops)
-                               for a in ("native", "mount")),
+        "window_planned_eq_executed": all(
+            summary["window"][a]["executed"] == win.requested == len(win.ops)
+            and summary["window"][a]["declared"] == win.requested
+            for a in ("native", "mount")),
         "window_no_failed_op": all(not summary["window"][a]["failed_ops"]
                                    for a in ("native", "mount")),
+        "mount_attested": att["pass"],
+        "mount_attestation_negative_controls": all(c["pass"] for c in neg),
+        "idx_integrity_native": summary["checks"]["native"]["idx_integrity"]["pass"],
+        "idx_integrity_mount": summary["checks"]["mount"]["idx_integrity"]["pass"],
         "checks_native": summary["checks"]["native"]["pass"],
         "checks_mount": summary["checks"]["mount"]["pass"],
         "pack_compare": pack_cmp["pass"],
@@ -1164,13 +1620,16 @@ def body(args, here, binaries, attempt, run, summary, win, seed, leak) -> int:
     # the cookie probe is deliberately outside the verdict: slot 1 owns it and it is not an
     # index-integrity result
     summary["ended"] = time.time()
+    summary["exit_code"] = EXIT_OK if integrity_clean else EXIT_INTEGRITY
     (attempt / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
-    run.rec("verdict", verdict=summary["verdict"], **parts)
+    run.rec("verdict", verdict=summary["verdict"], exit_code=summary["exit_code"], **parts)
     if args.keep_daemon:
         print(json.dumps({"kept_daemon": daemon2.pid, "attempt": str(attempt)}))
     print(json.dumps({"verdict": summary["verdict"], "attempt": str(attempt),
-                      "declared_ops": len(win.ops), **parts}, indent=2))
-    return 0 if integrity_clean else 1
+                      "requested_ops": win.requested, "declared_ops": len(win.ops),
+                      "available_ops": win.available, "exit_code": summary["exit_code"],
+                      **parts}, indent=2))
+    return summary["exit_code"]
 
 
 if __name__ == "__main__":
