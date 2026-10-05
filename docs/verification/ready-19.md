@@ -97,7 +97,7 @@ Exit codes are the exit code of the command, never of a pipeline.
 
 RPC battery, private server over `PathVfs` on a scratch directory, no mount:
 
-- 5 passed, 0 failed, 2 ignored, 30.01s.
+- 5 passed, 0 failed, 3 ignored, 11.38s.
 - Churn: 6,000 namespace cycles over the real filesystem. Resident set 9 MiB at iteration 600,
   11 MiB at 6,000, growth 2 MiB. An earlier run of the same battery reported 1 MiB.
 
@@ -112,19 +112,22 @@ Mounted, private server, private mountpoint, private backing directory:
 - `touch -h` on a mounted symlink sets the link's own mtime, seen identically through the mount and
   by `lstat` on the backing directory, and leaves the target's mtime as `rsync` left it.
 
-readdir paging, 12,000 entries in one directory, 64 entries per page, over the protocol:
+readdir paging, 12,000 entries in one directory, 64 entries per page, over the protocol.
+Two runs, on a machine other workers were using:
 
-| Figure | Value |
-| --- | --- |
-| pages | 204 |
-| first page | 40.64 ms |
-| mean of pages two onwards | 1.61 ms |
-| native read of the same directory | 7.81 ms |
-| native read plus one `lstat` per entry | 57.03 ms |
+| Figure | run 1 | run 2 (head) |
+| --- | --- | --- |
+| pages | 204 | 204 |
+| first page | 40.64 ms | 28.97 ms |
+| mean of pages two onwards | 1.61 ms | 1.05 ms |
+| native read of the same directory | 7.81 ms | 7.00 ms |
+| native read plus one `lstat` per entry | 57.03 ms | 43.12 ms |
 
 #19 recorded 23 to 71 ms per page on a 10,000 to 15,000 entry directory. Pages after the first now
-cost 1.61 ms, and the assertion that keeps them there compares that figure with the 7.81 ms it
-would have to exceed to mean the directory is being re-read.
+cost 1.05 to 1.61 ms, and the assertion that keeps them there compares that figure with the 7.00 ms
+it would have to exceed to mean the directory is being re-read.
+
+Every figure above comes from a run at `b4b3f37905d7f571a38c55d8ae37a83c26df9a23`.
 
 Regressions run at the same head:
 
