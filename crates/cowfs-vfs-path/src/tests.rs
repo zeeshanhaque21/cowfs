@@ -299,6 +299,39 @@ fn an_inode_number_the_backing_filesystem_reuses_gets_a_new_ino() {
     }
 }
 
+/// The six fields `table.rs` builds its readdir cache key from, read the same way it reads them.
+fn dir_stamp(p: &std::path::Path) -> (i64, i64, i64, i64, u64, u64) {
+    let m = std::fs::symlink_metadata(p).expect("stat the directory");
+    (
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+        m.size(),
+        m.nlink(),
+    )
+}
+
+/// Moves the directory's mtime a day into the past. An explicit `futimens` is a write, so it lands
+/// at once however coarse the host's directory clock is, and a day is further from "now" than any
+/// tick boundary can put it back on.
+fn force_observable_mtime(p: &std::path::Path) {
+    use std::time::{Duration, UNIX_EPOCH};
+    let now = std::fs::symlink_metadata(p)
+        .expect("stat")
+        .modified()
+        .expect("mtime");
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(86_400);
+    let target = UNIX_EPOCH + Duration::from_secs(secs.saturating_sub(86_400));
+    std::fs::File::open(p)
+        .expect("open the directory")
+        .set_times(std::fs::FileTimes::new().set_modified(target))
+        .expect("set the directory mtime");
+}
+
 #[test]
 fn readdir_sees_a_name_created_outside_the_vfs_while_a_listing_is_paged() {
     let (scratch, v) = fs();
@@ -306,8 +339,24 @@ fn readdir_sees_a_name_created_outside_the_vfs_while_a_listing_is_paged() {
         v.create(ROOT_INO, n.as_bytes(), 0o644).expect("create");
     }
     let first = v.readdir(ROOT_INO, 0, 2).expect("first page");
+    // What the Vfs recorded to decide whether the cached listing is still current.
+    let cached = dir_stamp(&scratch.0);
     std::fs::write(scratch.0.join("e"), b"new").expect("create outside");
     std::fs::remove_file(scratch.0.join("a")).expect("remove outside");
+    // Those two calls are the external change. Whether the host's directory timestamps can show it
+    // is the host's business, and on a host whose directory clock ticks they cannot, in which case
+    // the assertion below would measure the clock instead of the cache. So the stamp this test
+    // needs is made observable on purpose, and proved observable before the listing resumes.
+    // Whether an external change inside a single tick must also be seen is a separate property,
+    // tracked in issue #120; this test is about the cache, not the clock.
+    force_observable_mtime(&scratch.0);
+    let changed = dir_stamp(&scratch.0);
+    assert_ne!(
+        cached, changed,
+        "precondition: the external change has to move at least one of the six directory stamp \
+         fields the Vfs can see, or this test cannot tell a stale cache from an unobservable change"
+    );
+    println!("PRECONDITION stamp_before={cached:?} stamp_after={changed:?}");
     let mut names: Vec<Vec<u8>> = first.entries.iter().map(|e| e.name.clone()).collect();
     assert_eq!(names, [b"a".to_vec(), b"b".to_vec()]);
     let mut cookie = first.entries.last().expect("entry").cookie;
@@ -334,7 +383,8 @@ fn readdir_sees_a_name_created_outside_the_vfs_while_a_listing_is_paged() {
             b"d".to_vec(),
             b"e".to_vec()
         ],
-        "'a' was listed in the page taken before it was removed, 'e' was created outside"
+        "'a' was listed in the page taken before it was removed, 'e' was created outside, and the \
+         directory stamp changed, so the cache has to have been invalidated"
     );
     let fresh: Vec<Vec<u8>> = v
         .readdir(ROOT_INO, 0, 100)
