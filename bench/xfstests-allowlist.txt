@@ -2,7 +2,8 @@
 #
 # This file is machine-readable pin data, not a comment block. Every line is
 # `key value...`, and only those keys are read: tree_sha, case <id> <sha256>,
-# common <relpath> <sha256>, case_count, review <id> <text>.
+# common <relpath> <sha256>, runner <relpath> <sha256>, case_count,
+# review <id> <text>.
 #
 # Bound at xfstests-dev tree 3e1ee800e52a0f53d7d9a7809be1ffc80ec1788f
 # (2026-08-28), cloned with --depth 1 into a private reference path. The suite is
@@ -10,15 +11,28 @@
 #
 # `bench/xfstests_gate.py` re-reads the tree on every attempt and compares every
 # byte named below before the first case subprocess runs. It refuses with exit 3
-# when the tree sha moved, when a reviewed case or a transitive `common/*` file
-# changed, when the worktree is dirty outside the pinned set, or when the
-# classifier's safe set no longer equals this list. A per-case source hash is
-# recorded next to every executed case, so a run is traceable to the bytes it ran.
+# when the tree sha moved, when a reviewed case, a transitive `common/*` file or
+# the executor changed, when the worktree is dirty outside the pinned set, when the
+# classifier's safe set no longer equals this list, or when a case sources a file
+# this scan could not resolve. A per-case source hash is recorded next to every
+# executed case, so a run is traceable to the bytes it ran.
 #
-# The `common/*` hashes are the transitive closure of what these cases execute,
-# read from the sources rather than trusted by filename: common/preamble and
-# common/filter come from the case, common/rc from common/preamble, and
-# common/report from common/rc.
+# The `common/*` hashes are the transitive closure of what each case executes, read
+# from the sources rather than trusted by filename. Both shell spellings are read:
+# `. ./common/rc` and `. common/config`, plus `source`. Per-case closure is what the
+# scan measured against the tree named above; 005 and 245 also reach common/filter,
+# the other four do not. A pin that omits any reachable file is refused, which is
+# what an earlier revision of this file got wrong: it named four common files and
+# the same six cases actually reach sixteen, including common/config,
+# common/test_names and common/exit.
+#
+# `runner check` pins the suite's own runner by content. A receipt is admissible
+# only when the bytes of `check` in the tree are these bytes, so replacing the
+# runner is refused by the receipt rather than believed.
+#
+# tests/generic/group.list is a build artifact and is deliberately not pinned: it
+# does not exist until the suite is built. Its absence blocks the run at preflight,
+# and when it exists a receipt checks that it selects the requested case.
 #
 # Each id below was also read line by line. All six touch nothing outside
 # $TEST_DIR, need no scratch device, no second user, no mkfs, no mount, no built
@@ -27,54 +41,124 @@
 #   005  touch through a 25-deep symlink chain returns ELOOP. Relative rm only.
 #   236  a hard link bumps the target inode ctime. Sleeps 1s.
 #   245  mv of a directory onto an existing name. Renames inside $TEST_DIR.
-#   309  mv into a directory bumps that directory's mtime and ctime. Real status
-#        increments on mismatch, so a pass here is a real assertion.
+#   309  mv into a directory bumps that directory's mtime and ctime. Real status increments on mismatch, so a pass here is a real assertion.
 #   360  readlink of a 1019-byte target, md5 of the result. Needs perl, present.
-#   755  unlinking a hard link bumps the target inode ctime. Weak case: it echoes
-#        on a mismatch and never raises status, so its pass means less than the
-#        other five.
-#
+#   755  unlinking a hard link bumps the target inode ctime. Weak case: it echoes on a mismatch and never raises status.
 # Limits, stated rather than hidden:
 # - 6 of 802 generic cases is 0.7 per cent of the group. Even with the
 #   prerequisite block lifted this cannot carry the gate.
 # - The classifier is a hypothesis about safety, not proof. It is what refuses
-#   the other 796 and it has been wrong three times: it missed `$here/src/...`,
-#   `_test_cycle_mount`, and `_user_do`. This file, not the classifier, is the
-#   authority on what may run.
+#   the other 796 and it has been wrong four times: it missed `$here/src/...`,
+#   `_test_cycle_mount`, `_user_do`, and `026`. This file, not the classifier,
+#   is the authority on what may run.
 # - A static scan cannot see a helper a case reaches indirectly at run time. The
 #   per-case log check is what catches that, and it makes such a case INVALID
 #   rather than passing it.
 # - The gate refuses the whole suite unless its own startup gate passes, which on
 #   an unprivileged host without the suite's built helpers it does not. See
 #   docs/verification/ready-g5.md and issue #101.
-#
 tree_sha 3e1ee800e52a0f53d7d9a7809be1ffc80ec1788f
 case 005 a71a9caf6b970c124daeddd9d0276216f4508e81b27443f5d1a3ecae7bd63abf
+common common/btrfs ea473cba3ba999de87a70dbda0dbf18ce5cbbf893f6b04a7b28cdaf691667356
+common common/ceph 1acf6333adaae1dcd0e433061f62b72cc8a87381b96faf102f35907feded2a12
+common common/config 8ceb462e8f17a4054d2dcc8f566b7d5c9f787eb4a6a63a365e55538fbda3ab70
+common common/exit 306e4d4f2a45294e4e8c87ded9a239bf016677c2175fc75039aac4f63d4449ae
+common common/ext4 8e19fa7f9f8ff4839acb5ffde5702ef160985df3e2490899421eeaf3bdae7fd8
+common common/f2fs 9f8971c0eb994e763e50caf4c45d1a341a311fc279ae3f5d6c42c2a0de331205
 common common/filter 774df0179dca08bd63fc9e324d5e83675e8f2c576bea4c6d6c0c58715aa9c584
+common common/module 2a7360513a6a47f5ad87db0b082397fbea4b49d8badc72bc25702dc32b64366b
+common common/nfs ee9fc8084a7a584fc82ff7c08e9c8fda1dc5e14502434e36bf72e1a2e123f0dc
+common common/overlay 3e3ad551e752284e58e59001f547fdcf18f930cb2b5a4cb560867d491fe6cc4b
 common common/preamble 8075d64be89104c414915b9f7039470586693c8f117fa12a28298f19891a7cae
 common common/rc 64967c4bab6e9aa886b554c39714a94d5dcfa5d9c0b5cb70b4d89a294ae397fa
 common common/report 202f47c5cd4f6d6bce95fa4121ccae0aaa055b6d89cf8b5fddc5f6c04176f765
+common common/test_names 0c8c467c2eaa8704f6283d63206a88f9c2330a8dfe7bd3b8da85bbfbe765e37c
+common common/ubifs ee31a83e92216e1c42c1e5c0805d7ea77710caae752f164750f3ffbd5e91f2a7
+common common/xfs ccaab1fc40967c0f09e600b3c96b368b8aad85348f6a6e8665b7a8e0a1657381
 case 236 57623690df623c908188a624063e22e073253055f080af51ed457d10f8faed5f
+common common/btrfs ea473cba3ba999de87a70dbda0dbf18ce5cbbf893f6b04a7b28cdaf691667356
+common common/ceph 1acf6333adaae1dcd0e433061f62b72cc8a87381b96faf102f35907feded2a12
+common common/config 8ceb462e8f17a4054d2dcc8f566b7d5c9f787eb4a6a63a365e55538fbda3ab70
+common common/exit 306e4d4f2a45294e4e8c87ded9a239bf016677c2175fc75039aac4f63d4449ae
+common common/ext4 8e19fa7f9f8ff4839acb5ffde5702ef160985df3e2490899421eeaf3bdae7fd8
+common common/f2fs 9f8971c0eb994e763e50caf4c45d1a341a311fc279ae3f5d6c42c2a0de331205
+common common/module 2a7360513a6a47f5ad87db0b082397fbea4b49d8badc72bc25702dc32b64366b
+common common/nfs ee9fc8084a7a584fc82ff7c08e9c8fda1dc5e14502434e36bf72e1a2e123f0dc
+common common/overlay 3e3ad551e752284e58e59001f547fdcf18f930cb2b5a4cb560867d491fe6cc4b
 common common/preamble 8075d64be89104c414915b9f7039470586693c8f117fa12a28298f19891a7cae
 common common/rc 64967c4bab6e9aa886b554c39714a94d5dcfa5d9c0b5cb70b4d89a294ae397fa
 common common/report 202f47c5cd4f6d6bce95fa4121ccae0aaa055b6d89cf8b5fddc5f6c04176f765
+common common/test_names 0c8c467c2eaa8704f6283d63206a88f9c2330a8dfe7bd3b8da85bbfbe765e37c
+common common/ubifs ee31a83e92216e1c42c1e5c0805d7ea77710caae752f164750f3ffbd5e91f2a7
+common common/xfs ccaab1fc40967c0f09e600b3c96b368b8aad85348f6a6e8665b7a8e0a1657381
 case 245 2931ec29e7019431de5f48d5606153e8cf7e8656abe3f8ecc3cb13aced0c8063
+common common/btrfs ea473cba3ba999de87a70dbda0dbf18ce5cbbf893f6b04a7b28cdaf691667356
+common common/ceph 1acf6333adaae1dcd0e433061f62b72cc8a87381b96faf102f35907feded2a12
+common common/config 8ceb462e8f17a4054d2dcc8f566b7d5c9f787eb4a6a63a365e55538fbda3ab70
+common common/exit 306e4d4f2a45294e4e8c87ded9a239bf016677c2175fc75039aac4f63d4449ae
+common common/ext4 8e19fa7f9f8ff4839acb5ffde5702ef160985df3e2490899421eeaf3bdae7fd8
+common common/f2fs 9f8971c0eb994e763e50caf4c45d1a341a311fc279ae3f5d6c42c2a0de331205
 common common/filter 774df0179dca08bd63fc9e324d5e83675e8f2c576bea4c6d6c0c58715aa9c584
+common common/module 2a7360513a6a47f5ad87db0b082397fbea4b49d8badc72bc25702dc32b64366b
+common common/nfs ee9fc8084a7a584fc82ff7c08e9c8fda1dc5e14502434e36bf72e1a2e123f0dc
+common common/overlay 3e3ad551e752284e58e59001f547fdcf18f930cb2b5a4cb560867d491fe6cc4b
 common common/preamble 8075d64be89104c414915b9f7039470586693c8f117fa12a28298f19891a7cae
 common common/rc 64967c4bab6e9aa886b554c39714a94d5dcfa5d9c0b5cb70b4d89a294ae397fa
 common common/report 202f47c5cd4f6d6bce95fa4121ccae0aaa055b6d89cf8b5fddc5f6c04176f765
+common common/test_names 0c8c467c2eaa8704f6283d63206a88f9c2330a8dfe7bd3b8da85bbfbe765e37c
+common common/ubifs ee31a83e92216e1c42c1e5c0805d7ea77710caae752f164750f3ffbd5e91f2a7
+common common/xfs ccaab1fc40967c0f09e600b3c96b368b8aad85348f6a6e8665b7a8e0a1657381
 case 309 3991c44729210922e8b0083dd9fa810530e9f912c7673d7d06b946b87739cd46
+common common/btrfs ea473cba3ba999de87a70dbda0dbf18ce5cbbf893f6b04a7b28cdaf691667356
+common common/ceph 1acf6333adaae1dcd0e433061f62b72cc8a87381b96faf102f35907feded2a12
+common common/config 8ceb462e8f17a4054d2dcc8f566b7d5c9f787eb4a6a63a365e55538fbda3ab70
+common common/exit 306e4d4f2a45294e4e8c87ded9a239bf016677c2175fc75039aac4f63d4449ae
+common common/ext4 8e19fa7f9f8ff4839acb5ffde5702ef160985df3e2490899421eeaf3bdae7fd8
+common common/f2fs 9f8971c0eb994e763e50caf4c45d1a341a311fc279ae3f5d6c42c2a0de331205
 common common/filter 774df0179dca08bd63fc9e324d5e83675e8f2c576bea4c6d6c0c58715aa9c584
+common common/module 2a7360513a6a47f5ad87db0b082397fbea4b49d8badc72bc25702dc32b64366b
+common common/nfs ee9fc8084a7a584fc82ff7c08e9c8fda1dc5e14502434e36bf72e1a2e123f0dc
+common common/overlay 3e3ad551e752284e58e59001f547fdcf18f930cb2b5a4cb560867d491fe6cc4b
 common common/preamble 8075d64be89104c414915b9f7039470586693c8f117fa12a28298f19891a7cae
 common common/rc 64967c4bab6e9aa886b554c39714a94d5dcfa5d9c0b5cb70b4d89a294ae397fa
 common common/report 202f47c5cd4f6d6bce95fa4121ccae0aaa055b6d89cf8b5fddc5f6c04176f765
+common common/test_names 0c8c467c2eaa8704f6283d63206a88f9c2330a8dfe7bd3b8da85bbfbe765e37c
+common common/ubifs ee31a83e92216e1c42c1e5c0805d7ea77710caae752f164750f3ffbd5e91f2a7
+common common/xfs ccaab1fc40967c0f09e600b3c96b368b8aad85348f6a6e8665b7a8e0a1657381
 case 360 b9a0832d1cab29c7367ae641d1c35e65c0b9356a5bc1a818a895b0ca7929a393
+common common/btrfs ea473cba3ba999de87a70dbda0dbf18ce5cbbf893f6b04a7b28cdaf691667356
+common common/ceph 1acf6333adaae1dcd0e433061f62b72cc8a87381b96faf102f35907feded2a12
+common common/config 8ceb462e8f17a4054d2dcc8f566b7d5c9f787eb4a6a63a365e55538fbda3ab70
+common common/exit 306e4d4f2a45294e4e8c87ded9a239bf016677c2175fc75039aac4f63d4449ae
+common common/ext4 8e19fa7f9f8ff4839acb5ffde5702ef160985df3e2490899421eeaf3bdae7fd8
+common common/f2fs 9f8971c0eb994e763e50caf4c45d1a341a311fc279ae3f5d6c42c2a0de331205
 common common/filter 774df0179dca08bd63fc9e324d5e83675e8f2c576bea4c6d6c0c58715aa9c584
+common common/module 2a7360513a6a47f5ad87db0b082397fbea4b49d8badc72bc25702dc32b64366b
+common common/nfs ee9fc8084a7a584fc82ff7c08e9c8fda1dc5e14502434e36bf72e1a2e123f0dc
+common common/overlay 3e3ad551e752284e58e59001f547fdcf18f930cb2b5a4cb560867d491fe6cc4b
 common common/preamble 8075d64be89104c414915b9f7039470586693c8f117fa12a28298f19891a7cae
 common common/rc 64967c4bab6e9aa886b554c39714a94d5dcfa5d9c0b5cb70b4d89a294ae397fa
 common common/report 202f47c5cd4f6d6bce95fa4121ccae0aaa055b6d89cf8b5fddc5f6c04176f765
+common common/test_names 0c8c467c2eaa8704f6283d63206a88f9c2330a8dfe7bd3b8da85bbfbe765e37c
+common common/ubifs ee31a83e92216e1c42c1e5c0805d7ea77710caae752f164750f3ffbd5e91f2a7
+common common/xfs ccaab1fc40967c0f09e600b3c96b368b8aad85348f6a6e8665b7a8e0a1657381
 case 755 933ebd3dce19deadd0c0a4cef6a3fee41c7c69aa0bdab6c9c81a8dbfd6ac1520
+common common/btrfs ea473cba3ba999de87a70dbda0dbf18ce5cbbf893f6b04a7b28cdaf691667356
+common common/ceph 1acf6333adaae1dcd0e433061f62b72cc8a87381b96faf102f35907feded2a12
+common common/config 8ceb462e8f17a4054d2dcc8f566b7d5c9f787eb4a6a63a365e55538fbda3ab70
+common common/exit 306e4d4f2a45294e4e8c87ded9a239bf016677c2175fc75039aac4f63d4449ae
+common common/ext4 8e19fa7f9f8ff4839acb5ffde5702ef160985df3e2490899421eeaf3bdae7fd8
+common common/f2fs 9f8971c0eb994e763e50caf4c45d1a341a311fc279ae3f5d6c42c2a0de331205
+common common/module 2a7360513a6a47f5ad87db0b082397fbea4b49d8badc72bc25702dc32b64366b
+common common/nfs ee9fc8084a7a584fc82ff7c08e9c8fda1dc5e14502434e36bf72e1a2e123f0dc
+common common/overlay 3e3ad551e752284e58e59001f547fdcf18f930cb2b5a4cb560867d491fe6cc4b
 common common/preamble 8075d64be89104c414915b9f7039470586693c8f117fa12a28298f19891a7cae
 common common/rc 64967c4bab6e9aa886b554c39714a94d5dcfa5d9c0b5cb70b4d89a294ae397fa
 common common/report 202f47c5cd4f6d6bce95fa4121ccae0aaa055b6d89cf8b5fddc5f6c04176f765
+common common/test_names 0c8c467c2eaa8704f6283d63206a88f9c2330a8dfe7bd3b8da85bbfbe765e37c
+common common/ubifs ee31a83e92216e1c42c1e5c0805d7ea77710caae752f164750f3ffbd5e91f2a7
+common common/xfs ccaab1fc40967c0f09e600b3c96b368b8aad85348f6a6e8665b7a8e0a1657381
+runner check 53dd21653ec6eabd15b3d7e73b821b9fcc98202d3c791a65768329897bd69e18
 case_count 6
+review group.list absent, generated by the suite build, so it is not pinned
+review closure measured per case against tree 3e1ee800e52a0f53d7d9a7809be1ffc80ec1788f with depth 8, 0 unresolved source references, union 16 common files

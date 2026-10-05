@@ -30,23 +30,43 @@ because a simpler version of this gate was wrong.
     missing prerequisite to PASS.
 
 3.  Success needs positive evidence.  Exit 0 is necessary and not sufficient.
-    A case scores only when the observer block it printed is present and
-    complete, it names the case that was asked for, it did real I/O inside its
-    own test directory, and its own status was 0.  An empty log, a whitespace
-    log, a no-op, a log that merely looks like a pass, and a pass printed for the
-    wrong case are all INVALID.  A case whose outcome is a skip or a refusal is
-    classified before any comparison happens, and neither arm's skip is ever
-    ignored.
+    `direct` can never produce a PASS at all, because without the suite's runner
+    there is no supported success witness.  Under `check` a PASS needs a receipt
+    that verified, each probe measured: the runner exists, is executable and its
+    bytes are the ones the reviewed pin names; the tree is the reviewed tree, at
+    the reviewed sha, clean; the runner named exactly the requested case, with no
+    id missing, extra or duplicated; the suite's own last summary line reports a
+    pass whose count equals the ids named, with nothing not run or ignored; and
+    the suite's own group.list selects the case.  The suite streams the case's
+    output too, so its summary lines are taken by position and by count: a
+    second `Ran:` line, or a banner a case printed, cannot become the witness.
+    A case whose outcome is a skip or a refusal is classified before any
+    comparison happens, and neither arm's skip is ever ignored.  A case that
+    exits nonzero is judged FAILED before any observer bookkeeping, so a real
+    filesystem failure is never explained away by an arm that could not be
+    measured.
 
 4.  Source is pinned, not named.  The allowlist carries the tree sha, the case
-    sha of every allowlisted case, and the sha of every `common/*` file those
-    cases pull in.  Every attempt re-reads the tree and re-hashes those files and
+    sha of every allowlisted case, the sha of every `common/*` file those cases
+    reach by reading their sources, and the sha of the suite's own runner.
+    Both shell spellings are read, `. ./common/rc` and `. common/config`, and a
+    source line this scan cannot resolve is a refusal rather than a clean
+    result.  The closure is walked at one depth, CLOSURE_DEPTH, both when a pin
+    is generated and when it is verified, so the two cannot claim different
+    coverage.  Every attempt re-reads the tree and re-hashes those files and
     refuses before the first subprocess when any of them moved, when the worktree
     is dirty, or when the reviewed set drifted.  A per-case source hash is
     recorded next to every executed case.
 
-5.  Only what was measured is recorded.  Capability notes are probe results,
-    never literals.  A report on a FAIL or INVALID run exits nonzero.
+5.  The reviewed suite is the one this gate ships a pin for.  That pin lives
+    beside this file and is not selectable from the command line, so pointing the
+    gate at a tree this lane built, with a pin matching that tree, produces a
+    receipt labelled harness proof and never xfstests acceptance evidence.
+
+6.  Only what was measured is recorded.  Capability notes are probe results,
+    never literals, and each entry records how it was measured; the twenty-third
+    entry says in its own `how` that it is stated rather than probed.  A report
+    on a FAIL or INVALID run exits nonzero.
 
 Exit codes, the same set `bench/compare.py` uses:
   0  PASS          every measured case passed on both arms
@@ -160,7 +180,11 @@ ALLOWED_SOURCES = {
     "preamble", "rc", "filter", "list", "config", "promotion",
     "ftruncate.inc", "util", "attr", "pwrite-buffers", "rc.local",
 }
-SOURCE_RE = re.compile(r"^\s*\.\s+\./([a-z]+)/([A-Za-z0-9_.-]+)", re.M)
+# Shell sourcing, as the suite actually writes it. The pinned tree uses
+# `. common/config`, `. common/exit`, `. common/test_names` as well as
+# `. ./common/rc`, so an optional `./` is required or the closure silently misses
+# files. `.` and `source` are both accepted because both appear.
+SOURCE_RE = re.compile(r"^\s*(?:\.|source)\s+\.?/?([a-z]+)/([A-Za-z0-9_.-]+)\s*$", re.M)
 SIZE_RE = re.compile(r"\btruncate\s+-s\s+([0-9]+)([KMGT])?")
 SIZE_UNIT = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 
@@ -267,8 +291,13 @@ def git_provenance(root):
         # `?? dir/`, which would hide the very path that matters here.
         dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-uall"],
                                capture_output=True, text=True, timeout=180)
-        rec["dirty_paths"] = [l for l in dirty.stdout.splitlines() if l.strip()][:20]
-        rec["dirty"] = bool(rec["dirty_paths"])
+        # Every modified path is kept for the refusal decision. A cap on the
+        # recorded copy is safe; a cap on the list that decides is not, because a
+        # modified pinned file past position 20 would be invisible to it.
+        rec["dirty_paths_all"] = [l for l in dirty.stdout.splitlines() if l.strip()]
+        rec["dirty_paths"] = rec["dirty_paths_all"][:20]
+        rec["dirty_path_count"] = len(rec["dirty_paths_all"])
+        rec["dirty"] = bool(rec["dirty_paths_all"])
     except (OSError, subprocess.SubprocessError) as exc:
         rec["detail"] = f"{type(exc).__name__}: {exc}"
     return rec
@@ -286,13 +315,20 @@ def tool_version(path):
 
 
 def probe_capabilities(path, tree_root):
-    """Capability notes are probe results. Nothing here is a literal claim."""
+    """Capability notes are probe results. Nothing here is a literal claim.
+
+    Every entry records how it was measured, so a reader can tell a measurement
+    from a stated value without trusting this docstring. 22 entries are measured
+    by a lookup, a stat or a getuid; one is derived from two lookups, and one is
+    recorded absent by construction and says so in its own `how`.
+    """
     caps = {}
     for name in ("autoconf", "automake", "libtool", "libtoolize", "m4", "aclocal",
                  "autoheader", "autoreconf", "getfattr", "setfattr", "attr",
                  "mkfs.ext4", "mkfs.xfs", "xfs_io", "mkfs"):
         found = shutil.which(name, path=path)
-        caps[name] = {"present": bool(found), "path": found}
+        caps[name] = {"present": bool(found), "path": found,
+                      "how": f"PATH lookup of {name!r} with PATH={path}"}
     for rel, key in (("include/builddefs", "include/builddefs"),
                      ("include/config.h", "include/config.h"),
                      ("ltp/fsstress", "ltp/fsstress"),
@@ -300,18 +336,26 @@ def probe_capabilities(path, tree_root):
                      ("src/mkfile", "src/mkfile")):
         target = Path(tree_root) / rel
         caps[key] = {"present": target.is_file(),
-                     "executable": bool(target.is_file() and os.access(target, os.X_OK))}
-    caps["sbin_on_path"] = {n: caps.get(n, {}).get("present", False)
-                            for n in ("mkfs", "xfs_io")}
+                     "executable": bool(target.is_file() and os.access(target, os.X_OK)),
+                     "how": f"stat of {target}"}
+    caps["sbin_on_path"] = {"present": any(caps[n]["present"] for n in ("mkfs", "xfs_io")),
+                            "mkfs": caps["mkfs"]["present"],
+                            "xfs_io": caps["xfs_io"]["present"],
+                            "how": "derived from the two PATH lookups above"}
     # A loop or scratch device would let ./check format a real test device.
-    # Recorded as absent-by-construction: this gate never asks for one.
+    # Recorded as absent by construction: this gate never asks for one, so there
+    # is no probe behind this value and the entry must not claim one.
     caps["block_scratch_device"] = {
         "present": False,
+        "how": "stated, not probed",
         "detail": "not requested and not probed: this gate runs cases against "
                   "directory-backed arms with SCRATCH_DEV empty, and formatting a "
                   "device is out of scope for it",
     }
-    caps["uid_is_root"] = os.getuid() == 0
+    caps["uid_is_root"] = {"present": os.getuid() == 0, "how": "os.getuid() == 0"}
+    # 23 entries: 15 PATH lookups and 6 stat-or-getuid measurements, one derived
+    # from two of those lookups, and one stated rather than probed.
+    caps["_counts"] = {"measured": 21, "derived": 1, "stated": 1, "total": 23}
     return caps
 
 
@@ -659,16 +703,33 @@ def classify_group(tests_root):
     return out
 
 
+# The reviewed suite's identity. `--allowlist` chooses which reviewed cases run;
+# it does not get to say which suite is the suite. A caller that points this gate
+# at a tree it built itself, and writes a pin matching that tree, gets a receipt
+# labelled harness proof and never xfstests acceptance.
+REVIEWED_PIN_FILE = Path(__file__).resolve().with_name("xfstests-allowlist.txt")
+
+
+def reviewed_pin():
+    """The pin that ships with the gate, read fresh so a stale copy cannot leak."""
+    pin, err = parse_allowlist(REVIEWED_PIN_FILE)
+    if err or not pin:
+        return None, f"the reviewed pin {REVIEWED_PIN_FILE} is unreadable: {err}"
+    return pin, None
+
+
 # --- the reviewed pin -------------------------------------------------------
 
 def parse_allowlist(path=None):
     """The allowlist file is machine-readable pin data, not a comment block.
     Format: `key value` lines, `#` comments. Keys: tree_sha, case_count,
-    case <id> <sha256>, common <relpath> <sha256>."""
+    case <id> <sha256>, common <relpath> <sha256>, runner <relpath> <sha256>,
+    review <id> <note>."""
     path = Path(path or ALLOWLIST_FILE)
     if not path.exists():
         return None, f"{path} is missing"
-    pin = {"tree_sha": None, "case_count": None, "cases": {}, "common": {}, "reviews": {}}
+    pin = {"tree_sha": None, "case_count": None, "cases": {}, "common": {},
+           "runner": {}, "reviews": {}}
     for raw in path.read_text().splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -683,6 +744,8 @@ def parse_allowlist(path=None):
             pin["cases"][parts[1]] = parts[2]
         elif key == "common" and len(parts) == 3:
             pin["common"][parts[1]] = parts[2]
+        elif key == "runner" and len(parts) == 3:
+            pin["runner"][parts[1]] = parts[2]
         elif key == "review" and len(parts) >= 3:
             pin["reviews"][parts[1]] = " ".join(parts[2:])
         elif CASE_ID_RE.fullmatch(key):
@@ -690,14 +753,25 @@ def parse_allowlist(path=None):
     return pin, None
 
 
-def common_closure(case_path, tree_root, depth=4):
+# How far the source scan follows `.` lines. The pin is generated and verified at
+# this depth, so the two can never claim different coverage; the reviewed cases
+# settle at seven levels, and eight leaves the deepest one a margin without
+# pretending to follow an unbounded chain.
+CLOSURE_DEPTH = 8
+
+
+def common_closure(case_path, tree_root, depth=None):
     """Every file an allowlisted case can execute, by reading its sources.
+
+    `depth` defaults to CLOSURE_DEPTH, so generating a pin and verifying it walk
+    the same graph and the two cannot claim different coverage.
 
     The case itself is pinned as a case, so only the files it pulls in are
     returned here. A `.` line inside a reviewed common file pulls in more, so
     this walks the whole chain rather than trusting one level. A file reached but
     not pinned is the caller's problem to hear about.
     """
+    depth = CLOSURE_DEPTH if depth is None else depth
     tree_root = Path(tree_root).resolve()
     case_path = Path(case_path).resolve()
     try:
@@ -705,6 +779,7 @@ def common_closure(case_path, tree_root, depth=4):
     except ValueError:
         case_rel = None
     seen = {}
+    unresolved = []
     frontier = [(case_path, True)]
     for _ in range(depth):
         nxt = []
@@ -722,14 +797,23 @@ def common_closure(case_path, tree_root, depth=4):
                     rel = None
                 if rel and rel != case_rel:
                     seen[rel] = sha256_file(item)
-            for _, name in SOURCE_RE.findall(text):
-                for d in ("common", "generic", "xfs"):
-                    cand = (tree_root / d / name).resolve()
+            for d, name in SOURCE_RE.findall(text):
+                # Resolve against every directory the suite can source from, so a
+                # file this scan cannot name is refused later rather than missed
+                # here. `closure_unresolved` in the record is what makes that
+                # visible.
+                for base in (tree_root / d, tree_root / "common", tree_root / "generic",
+                             tree_root / "xfs", tree_root / "tests" / "generic"):
+                    cand = (base / name).resolve()
                     if cand.is_file() and cand != case_path:
                         nxt.append((cand, False))
+                    elif base == tree_root / d:
+                        unresolved.append(f"{d}/{name}")
         if not nxt:
             break
         frontier = nxt
+    if unresolved:
+        seen["__unresolved__"] = sorted(set(unresolved))
     return seen
 
 
@@ -755,7 +839,7 @@ def verify_source_pin(tree_root, records=None, allowlist=None):
     # so those are allowed by extension. Everything else modified is a refusal.
     pinned_paths = set(pin["cases"]) | set(pin["common"])
     build_suffixes = (".o", ".a", ".la", ".lo", ".log", ".so", ".d")
-    dirty = list(prov.get("dirty_paths", []))
+    dirty = list(prov.get("dirty_paths_all") or prov.get("dirty_paths") or [])
     unexpected_dirty, ignored_dirty = [], []
     for line in dirty:
         m = re.match(r"^..\s+(.*)$", line)
@@ -775,7 +859,9 @@ def verify_source_pin(tree_root, records=None, allowlist=None):
     detail["dirty_refused"] = unexpected_dirty
     if unexpected_dirty:
         problems.append("worktree is dirty in paths outside the pinned set: "
-                        + "; ".join(unexpected_dirty[:5]))
+                        + "; ".join(unexpected_dirty[:5])
+                        + (f" (and {len(unexpected_dirty) - 5} more)" if len(unexpected_dirty) > 5
+                           else ""))
     # Every allowlisted case: source hash.
     cases_dir = tree_root / "tests" / "generic"
     for cid, want in sorted(pin["cases"].items()):
@@ -795,6 +881,11 @@ def verify_source_pin(tree_root, records=None, allowlist=None):
         closure = common_closure(path, tree_root)
         detail.setdefault("closure", {})[cid] = closure
         for rel, got in sorted(closure.items()):
+            if rel == "__unresolved__":
+                # A source line this scan could not resolve to a file. That is a
+                # gap in what was read, not a clean result, so it refuses.
+                problems.append(f"case {cid} sources files this scan could not resolve: {got}")
+                continue
             want = pin["common"].get(rel)
             if want is None:
                 problems.append(f"case {cid} pulls in unpinned {rel}")
@@ -865,51 +956,83 @@ def prepare_dir(path):
 CHECK_PASS_ALL = re.compile(r"^Passed all (\d+) tests$", re.M)
 CHECK_FAILED_N = re.compile(r"^Failed (\d+) of (\d+) tests$", re.M)
 CHECK_NOT_RUN = re.compile(r"^Not run: (.+)$", re.M)
-CHECK_TEST_LINE = re.compile(r"^(Ran: .+)$", re.M)
+CHECK_TEST_LINE = re.compile(r"^Ran: (.+)$", re.M)
 CHECK_IGNORED = re.compile(r"^(.+) - unknown test, ignored$", re.M)
 
 
-def parse_check_output(text, rc):
-    """What `check` itself said. A pass needs the suite's own success line.
+def suite_witness(text):
+    """The suite's own verdict lines, taken by position and by how many there are.
 
-    `check` returns 0 when every selected case passed and 1 when any failed, and
-    prints `Passed all N tests` or `Failed M of N tests`. Both are read here so a
-    pass rests on the suite's grammar rather than on this harness's opinion.
+    The runner streams the case's output too, so a case can print a line shaped
+    exactly like the suite's summary. Two rules make those lines inert rather than
+    a defence against them:
+
+      * the runner names its testlist once, so a second `Ran:` line means the
+        stream is not the runner's alone and the run is refused
+      * the pass/fail summary is the runner's last line, so a summary printed by a
+        case earlier in the stream is not read as the verdict
+
+    Returns (ids, run_lines, summary_matches, problem).
     """
-    out = {"pass": False, "rc": rc, "ran": None, "passed": None, "failed": None,
-           "not_run": [], "why": None, "ignored": []}
-    passed_all = CHECK_PASS_ALL.search(text)
-    failed_n = CHECK_FAILED_N.search(text)
-    not_run = CHECK_NOT_RUN.search(text)
-    if not_run:
-        out["not_run"] = not_run.group(1).split()
-    # `check` prints this when it could not resolve a testlist entry, so no case
-    # ran. Its own summary would then describe zero tests.
-    out["ignored"] = [m.group(1) for m in CHECK_IGNORED.finditer(text)]
-    ran = CHECK_TEST_LINE.search(text)
-    if ran:
-        out["ran"] = ran.group(1)
-    if failed_n:
-        out["failed"] = int(failed_n.group(1))
-        out["passed"] = int(failed_n.group(2)) - int(failed_n.group(1))
-        out["why"] = f"check reported {out['failed']} of {failed_n.group(2)} failed"
+    run_lines = CHECK_TEST_LINE.findall(text)
+    problem = None
+    if len(run_lines) > 1:
+        problem = (f"the runner's output has {len(run_lines)} `Ran:` lines, so the "
+                   "stream is not the suite runner's alone")
+    ids = []
+    if run_lines:
+        ids = [t.strip() for t in run_lines[0].split(":")[-1].split() if t.strip()]
+    # The summary is the last one in the stream, never the first. Both forms are
+    # collected with their position so stream order is kept rather than grouped.
+    summaries = sorted(
+        [(m.start(), m.group(0)) for m in
+         list(CHECK_PASS_ALL.finditer(text)) + list(CHECK_FAILED_N.finditer(text))])
+    return ids, run_lines, [line for _, line in summaries], problem
+
+
+def parse_check_output(text, rc):
+    """What the suite's own output says, and whether that is a pass.
+
+    Only the suite's own grammar is read. A case's output is in the same stream,
+    so the lines are taken by position and counted, not by pattern match alone.
+    """
+    ids, run_lines, summaries, problem = suite_witness(text)
+    out = {"rc": rc, "pass": False, "passed": None, "failed": None, "total": None,
+           "ran": ids, "not_run": CHECK_NOT_RUN.findall(text),
+           "ignored": CHECK_IGNORED.findall(text), "why": None, "problem": problem}
+    if problem:
+        out["why"] = problem
         return out
-    if passed_all:
-        out["passed"] = int(passed_all.group(1))
-        out["why"] = f"check reported 'Passed all {out['passed']} tests'"
-        # Both the suite's line and its exit code must agree, and the suite must
-        # have run at least the case that was asked for. A summary describing
-        # zero executed cases is not a pass for this case.
-        if rc == 0 and out["passed"] > 0 and not out["not_run"] and not out["ignored"]:
-            out["pass"] = True
-        else:
-            extra = f"exit={rc} not_run={out['not_run']}"
-            if out["ignored"]:
-                extra += f" ignored={out['ignored']}"
-            out["why"] += " but " + extra
+    if not summaries:
+        out["why"] = "check printed neither a pass nor a failure summary"
         return out
-    out["why"] = "check printed neither a pass nor a failure summary"
+    last = summaries[-1]
+    if re.fullmatch(r"Passed all (\d+) tests", last):
+        out["passed"] = int(re.fullmatch(r"Passed all (\d+) tests", last).group(1))
+        out["total"] = out["passed"]
+    else:
+        m = re.fullmatch(r"Failed (\d+) of (\d+) tests", last)
+        out["failed"], out["total"] = int(m.group(1)), int(m.group(2))
+        out["why"] = f"the suite reported {last}"
+        return out
+    if len(ids) != out["total"]:
+        out["why"] = (f"the suite named {len(ids)} tests but counted {out['total']}; "
+                      "the two must agree")
+        return out
+    if rc != 0:
+        out["why"] = f"the suite reported a pass but exited {rc}"
+        return out
+    if out["not_run"]:
+        out["why"] = f"the suite did not run {out['not_run']}"
+        return out
+    if out["ignored"]:
+        out["why"] = f"the suite ignored {out['ignored']}"
+        return out
+    out["pass"] = True
+    out["why"] = (f"the suite ran {len(ids)} tests and reported {last}, on the runner's "
+                  "own last summary line")
     return out
+
 
 
 def check_argv(case_rel):
@@ -920,6 +1043,347 @@ def check_argv(case_rel):
     it would have to guess. Nothing else reaches check's argv.
     """
     return ["./check", "-d", case_rel]
+
+
+# --- owned child registry ---------------------------------------------------
+#
+# A case is signalled only when the harness can still prove, at the moment of the
+# signal, that the pid it holds is the process it spawned. Four things have to
+# line up, and any of them failing means no signal at all:
+#
+#   1. the pid is in the spawn registry, so the harness spawned it
+#   2. the child handle has not been reaped, so the pid was never recycled
+#   3. the kernel's own record for that pid still matches what was recorded at
+#      spawn: start time, process group and session
+#   4. the process group and session are the harness's own spawn session, never
+#      the harness's own group
+#
+# `start_new_session=True` makes the child's session and process group id equal
+# its pid, so check 4 is what distinguishes a case from the harness itself.
+#
+# The signal is sent to the single pid the harness holds a handle for, not to a
+# process group. That is the standing instruction, and it also means a
+# descendant is not contained by the signal; that is recorded in the case record
+# as `descendants_contained: false` rather than papered over.
+
+SPAWNED = {}
+SIGNAL_LOG = []
+
+
+def proc_identity(pid):
+    """What the kernel says about a pid right now, or None if it is gone.
+
+    Reads /proc, so it is a measurement rather than an assumption. On a host with
+    no /proc it returns None, and every caller then refuses to signal.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            raw = fh.read().decode("utf-8", "replace")
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmdline = fh.read().decode("utf-8", "replace").split("\0")
+    except (OSError, ValueError):
+        return None
+    # comm can contain spaces and parentheses, so parse after the last ')'.
+    close = raw.rfind(")")
+    if close < 0:
+        return None
+    fields = raw[close + 2:].split()
+    try:
+        pgrp = int(fields[2])
+        sid = int(fields[3])
+        starttime = int(fields[19])
+    except (IndexError, ValueError):
+        return None
+    return {"pid": pid, "pgrp": pgrp, "sid": sid, "starttime": starttime,
+            "argv": [a for a in cmdline if a]}
+
+
+def register_child(proc, argv, cwd):
+    """Record what was spawned, before anything can go wrong."""
+    ident = proc_identity(proc.pid)
+    entry = {
+        "pid": proc.pid,
+        "proc": proc,
+        "argv": list(argv),
+        "cwd": str(cwd),
+        "spawn_identity": ident,
+        "reaped": False,
+    }
+    SPAWNED[proc.pid] = entry
+    return entry
+
+
+def forget_child(pid):
+    entry = SPAWNED.pop(pid, None)
+    if entry is not None:
+        entry["reaped"] = True
+    return entry
+
+
+def child_owns_pid(entry):
+    """Can this harness still prove the pid is the process it spawned?
+
+    Returns (ok, reason). Every refusal reason is recorded, so a quarantine is
+    auditable rather than silent.
+    """
+    if entry is None:
+        return False, "no spawn registry entry for this pid"
+    if entry.get("reaped"):
+        return False, "the child handle was already reaped"
+    proc = entry.get("proc")
+    if proc is None:
+        return False, "no child handle is held for this pid"
+    if proc.poll() is not None:
+        return False, "the child already exited"
+    spawn = entry.get("spawn_identity")
+    if not spawn:
+        return False, "no spawn-time identity was recorded, so identity cannot be proven"
+    now = proc_identity(entry["pid"])
+    if now is None:
+        return False, "the pid is gone from the kernel's process table"
+    if now["starttime"] != spawn["starttime"]:
+        return False, (f"start time differs: recorded {spawn['starttime']}, "
+                       f"now {now['starttime']}, so this pid was reused")
+    if now["pgrp"] != spawn["pgrp"] or now["sid"] != spawn["sid"]:
+        return False, (f"process group or session changed: recorded "
+                       f"pgrp={spawn['pgrp']} sid={spawn['sid']}, now "
+                       f"pgrp={now['pgrp']} sid={now['sid']}")
+    # start_new_session=True puts the child in its own session, so its sid is its
+    # pid and its pgrp is its pid. A child that reports the harness's own group
+    # or session has been reparented or joined to us, and is not ours to signal.
+    harness_pgid = os.getpgrp()
+    harness_sid = os.getsid(0)
+    if now["sid"] == entry["pid"] and now["pgrp"] == entry["pid"]:
+        if now["pgrp"] == harness_pgid or now["sid"] == harness_sid:
+            return False, "the child is in the harness's own process group or session"
+        return True, "owned spawn session, pid still ours"
+    return False, (f"the child is not in its own spawn session "
+                   f"(pgrp={now['pgrp']} sid={now['sid']})")
+
+
+def signal_owned_child(entry, sig, grace=30):
+    """Signal the single pid we hold a handle for, after proving ownership.
+
+    Never raises. Returns a record of what happened, including a refusal.
+    """
+    ok, reason = child_owns_pid(entry)
+    if not ok:
+        rec = {"signalled": False, "signal": sig, "why": f"quarantined: {reason}"}
+        SIGNAL_LOG.append(rec)
+        return rec
+    pid = entry["pid"]
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        rec = {"signalled": False, "signal": sig, "why": "ProcessLookupError: the pid vanished"
+                                                            " between the check and the signal"}
+        SIGNAL_LOG.append(rec)
+        return rec
+    except PermissionError:
+        rec = {"signalled": False, "signal": sig, "why": "PermissionError"}
+        SIGNAL_LOG.append(rec)
+        return rec
+    rec = {"signalled": True, "signal": sig, "pid": pid, "why": reason}
+    SIGNAL_LOG.append(rec)
+    return rec
+
+
+def stop_child(entry, grace=30):
+    """Terminate an owned case: SIGTERM, then SIGKILL, re-proving ownership each
+    time. Logs are flushed by the caller before this runs."""
+    out = {"term": None, "kill": None, "quarantined": None}
+    term = signal_owned_child(entry, 15, grace)
+    out["term"] = term
+    if not term["signalled"]:
+        out["quarantined"] = term["why"]
+        return out
+    try:
+        entry["proc"].wait(timeout=grace)
+        return out
+    except subprocess.TimeoutExpired:
+        pass
+    kill = signal_owned_child(entry, 9, grace)
+    out["kill"] = kill
+    if not kill["signalled"]:
+        out["quarantined"] = kill["why"]
+        return out
+    try:
+        entry["proc"].wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        out["quarantined"] = "the child did not exit after SIGKILL"
+    return out
+
+def read_fd_all(fd):
+    """Read a stream's bytes from offset 0 without moving its offset.
+
+    The child wrote through the same open file description, so the offset sits at
+    the end; a plain read would start there and find nothing.
+    """
+    try:
+        size = os.fstat(fd).st_size
+    except OSError:
+        return ""
+    if size <= 0:
+        return ""
+    try:
+        return os.pread(fd, size, 0).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def measure_io(test_dir):
+    """Do real I/O in a directory, on the filesystem that directory is on.
+
+    Used by the check path, where the case is wrapped by the suite's runner and
+    cannot print its own observer block. The probe directory is left behind and
+    named so it is obvious in the evidence what created it.
+    """
+    probe = Path(test_dir) / ".g5-io-probe"
+    try:
+        probe.mkdir(parents=True, exist_ok=False)
+        (probe / "f").write_text("witness\n")
+        ok = (probe / "f").read_text() == "witness\n"
+        (probe / "f").unlink()
+        probe.rmdir()
+        return "OK" if ok else "MISMATCH"
+    except OSError:
+        return "SKIPPED"
+
+
+def check_receipt(check_out, check_err, tree_root, witness_text, case_rel, rc):
+    """The receipt an accepted run must carry.
+
+    A pass is admissible only when all of these hold, and each is measured rather
+    than asserted:
+      * `check` is a real file in this tree and is executable
+      * the tree sha equals the reviewed one, from the tree's own git
+      * the case the runner named is the case that was requested
+      * the runner reported a positive count, and it is at least the number asked
+      * the ids it named are exactly the ids requested: none missing, none extra,
+        none duplicated
+      * nothing was reported as not run or ignored
+      * the runner's exit code is 0
+
+    The receipt records which of these failed, so a refusal is legible.
+    """
+    out = {"ok": False, "probes": [], "tree_sha": None, "check": None,
+           "ran_ids": [], "requested_ids": [case_rel], "problems": []}
+
+    def probe(name, ok, detail):
+        out["probes"].append({"probe": name, "ok": bool(ok), "detail": str(detail)})
+        if not ok:
+            out["problems"].append(f"{name}: {detail}")
+        return ok
+
+    runner = Path(tree_root) / "check"
+    probe("check_present", runner.is_file(), str(runner))
+    probe("check_executable", runner.is_file() and os.access(runner, os.X_OK), str(runner))
+    if runner.is_file():
+        out["check"] = {"path": str(runner), "sha256": sha256_file(runner),
+                        "size": runner.stat().st_size}
+    prov = git_provenance(tree_root)
+    out["tree_sha"] = prov.get("sha")
+    out["tree_clean"] = not prov.get("dirty")
+    pin, perr = reviewed_pin()
+    if perr or not pin:
+        probe("reviewed_pin_readable", False, perr or "no reviewed pin")
+        pin = {"tree_sha": None, "runner": {}}
+    else:
+        probe("reviewed_pin_readable", True, REVIEWED_PIN_FILE)
+    # The tree must be the reviewed suite by the gate's own pin, so a caller that
+    # supplies its own matching pin still gets harness proof and not acceptance.
+    probe("tree_sha_is_reviewed", bool(pin["tree_sha"]) and prov.get("sha") == pin["tree_sha"],
+          f"tree={prov.get('sha')} reviewed={pin['tree_sha']}")
+    probe("tree_clean", not prov.get("dirty"), prov.get("dirty_paths"))
+
+    # The executor is pinned by the reviewed pin, not by anything the run passes in.
+    want_check = (pin.get("runner") or {}).get("check")
+    if runner.is_file():
+        got = out["check"]["sha256"]
+        probe("check_sha_is_pinned", bool(want_check) and got == want_check,
+              f"got={got} pinned={want_check} (pinned by {REVIEWED_PIN_FILE.name})")
+    group = Path(tree_root) / "tests" / "generic" / "group.list"
+    out["group_list"] = {"path": str(group), "present": group.is_file()}
+    if not group.is_file():
+        probe("group_list_selects_case", False,
+              f"{group} is missing, so the suite selected nothing")
+    else:
+        out["group_list"]["sha256"] = sha256_file(group)
+        ids = []
+        for line in group.read_text(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in ("auto", "long", "medium", "short"):
+                ids.append(parts[1])
+        out["group_list"]["selected"] = ids
+        bare = Path(case_rel).name
+        probe("group_list_selects_case", bare in ids,
+              f"{bare} in the suite's own group.list selection {ids[:12]}")
+
+    ran = CHECK_TEST_LINE.search(witness_text)
+    listed = []
+    if ran:
+        listed = [t.strip() for t in ran.group(1).split(":")[-1].split() if t.strip()]
+    out["ran_ids"] = listed
+    requested = [case_rel]
+    missing = sorted(set(requested) - set(listed))
+    extra = sorted(set(listed) - set(requested))
+    dupes = sorted({i for i in listed if listed.count(i) > 1})
+    probe("case_named", listed[:1] == requested, f"runner named {listed} wanted {requested}")
+    probe("no_missing_ids", not missing, f"missing={missing}")
+    probe("no_extra_ids", not extra, f"extra={extra}")
+    probe("no_duplicate_ids", not dupes, f"duplicated={dupes}")
+    probe("runner_exit_zero", rc == 0, f"rc={rc}")
+
+    verdict = parse_check_output(witness_text, rc)
+    out["suite_verdict"] = verdict
+    probe("suite_reported_pass", verdict["pass"], verdict.get("why"))
+    probe("suite_count_matches_request",
+          verdict.get("passed") == len(requested) == len(listed),
+          f"passed={verdict.get('passed')} requested={len(requested)} named={len(listed)}")
+    probe("one_testlist_line", verdict.get("problem") is None, verdict.get("problem"))
+    probe("nothing_not_run", not verdict.get("not_run"), verdict.get("not_run"))
+    probe("nothing_ignored", not verdict.get("ignored"), verdict.get("ignored"))
+
+    out["case_id"] = listed[0] if listed else None
+    out["ok"] = not out["problems"]
+    out["synthetic"] = is_synthetic_tree(tree_root)
+    if out["synthetic"]:
+        # A receipt from a tree this gate did not review describes the runner and
+        # the harness, not xfstests. It is kept, labelled, and never acceptance.
+        out["acceptance"] = False
+        out["label"] = ("harness proof only: this tree is not the reviewed suite, "
+                        "so this receipt is not xfstests acceptance evidence")
+    elif not out["ok"]:
+        out["acceptance"] = False
+        out["label"] = "refused"
+    else:
+        # Source and build provenance for the case, read here rather than trusted
+        # from the caller: the suite's own selection file and the executor's bytes.
+        out["acceptance"] = True
+        out["label"] = ("xfstests acceptance evidence: reviewed tree sha, pinned check "
+                        "executor, case id from the suite's own runner, and the suite's "
+                        "own group.list selection")
+    case_path = Path(tree_root) / "tests" / case_rel
+    out["case_source"] = {
+        "case": sha256_file(case_path) if case_path.is_file() else None,
+        "case_path": str(case_path),
+        "group_list": (out.get("group_list") or {}).get("sha256"),
+        "check": out.get("check"),
+    }
+    return out
+
+
+def is_synthetic_tree(tree_root):
+    """Whether a tree is the reviewed suite or something this lane built.
+
+    Read from the reviewed pin, not from `--allowlist` and not from a path, so
+    moving, renaming, or re-pinning a tree cannot turn a stand-in into the suite.
+    """
+    pin, err = reviewed_pin()
+    if err or not pin or not pin["tree_sha"]:
+        return True
+    prov = git_provenance(tree_root)
+    return prov.get("sha") != pin["tree_sha"]
 
 
 def run_case_check(observer, case_rel, test_dir, tmpdir, result_dir, tree_root, timeout,
@@ -943,33 +1407,50 @@ def run_case_check(observer, case_rel, test_dir, tmpdir, result_dir, tree_root, 
     with open(log, "ab", buffering=0) as fh:
         fh.write(f"# argv={argv} cwd={tree_root} test_dir={test_dir}\n".encode())
         fh.flush()
-        proc = subprocess.Popen(argv, cwd=str(tree_root), env=env, stdout=fh,
-                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                start_new_session=True)
-        killed = None
+        # check's own stdout and stderr go to their own files, not into the case
+        # log. That separation is what makes its summary lines unforgeable by the
+        # case, and it keeps the evidence on disk for the receipt.
+        check_dir = Path(log).parent / "check-streams"
+        check_dir.mkdir(parents=True, exist_ok=True)
+        check_out = Path(check_dir / f"{case_rel.replace('/', '_')}.out").open("w+b", buffering=0)
+        check_err = Path(check_dir / f"{case_rel.replace('/', '_')}.err").open("w+b", buffering=0)
+        proc = subprocess.Popen(argv, cwd=str(tree_root), env=env,
+                                stdout=check_out, stderr=check_err,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+        # Registered at spawn, before anything can go wrong, so the identity that
+        # a later signal is checked against was captured while it was still true.
+        entry = register_child(proc, argv, tree_root)
+        timed_out = False
+        stop = None
         try:
             rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), 15)
-                killed = "SIGTERM to the case's own process group"
-            except ProcessLookupError:
-                killed = "already gone"
-            try:
-                rc = proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), 9)
-                    killed = "SIGKILL to the case's own process group"
-                except ProcessLookupError:
-                    pass
-                rc = proc.wait(timeout=30)
+            timed_out = True
+            # The log is flushed and fsynced before any signal, so a failure row
+            # keeps the output the case produced up to that point.
+            fh.flush()
+            os.fsync(fh.fileno())
+            stop = stop_child(entry)
+            rc = entry["proc"].returncode if entry["proc"].returncode is not None else -15
+        finally:
+            forget_child(proc.pid)
+    killed = None
+    if stop is not None:
+        killed = ("signalled" if (stop["term"] or {}).get("signalled")
+                  else f"quarantined, no signal: {stop.get('quarantined')}")
     text = log.read_text(errors="replace") if log.exists() else ""
-    # check wraps each case in a shell function, so the observer block never
-    # appears. Its own summary is the witness, and the case identity comes from
-    # the `Ran:` line it prints.
+    # The witness is read from check's own streams, never from the case's stdout.
+    # A case can print anything, including a line shaped exactly like check's
+    # summary, and the two are separated here so a forged banner is inert.
+    witness_text = "".join(read_fd_all(f.fileno()) for f in (check_out, check_err)
+                           if f is not None)
+    rec = check_receipt(check_out, check_err, tree_root, witness_text, case_rel, rc)
+    if rec is None:
+        raise RuntimeError("the suite runner's own streams are unreadable")
+    case_id = rec.pop("case_id")
+    verdict = rec.pop("suite_verdict")
     # `Ran:` holds check's own testlist, which is what it resolved and ran.
-    ran = CHECK_TEST_LINE.search(text)
+    ran = CHECK_TEST_LINE.search(witness_text)
     case_id = None
     if ran:
         listed = [t.strip() for t in ran.group(1).split(":")[-1].split() if t.strip()]
@@ -980,12 +1461,15 @@ def run_case_check(observer, case_rel, test_dir, tmpdir, result_dir, tree_root, 
         "runner": "check",
         "invoked_as": case_rel,
         "rc": rc,
-        "timed_out": killed is not None,
+        "timed_out": timed_out,
         "kill": killed,
+        "stop": stop,
+        "descendants_contained": False,
         "wall_s": round(time.time() - started, 3),
         "test_dir": str(test_dir),
         "log": str(log),
-        "suite_verdict": parse_check_output(text, rc),
+        "suite_verdict": verdict,
+        "receipt": rec,
         "scan": scan_log(text),
         "log_text": text,
         "observer": {
@@ -994,7 +1478,7 @@ def run_case_check(observer, case_rel, test_dir, tmpdir, result_dir, tree_root, 
             "EXPECT": case_rel,
             "CASE_RC": str(rc),
             "TEST_DIR": str(test_dir),
-            "IO": "OK",
+            "IO": measure_io(test_dir),
             "RESIDUE": " ".join(sorted(
                 p.name for p in Path(test_dir).iterdir())) if Path(test_dir).is_dir() else "",
             "LOG_BYTES": str(len(text)),
@@ -1029,29 +1513,32 @@ def run_case(observer, case_rel, test_dir, tmpdir, result_dir, tree_root, timeou
     with open(log, "ab", buffering=0) as fh:
         fh.write(f"# argv={argv} cwd={tree_root} test_dir={test_dir}\n".encode())
         fh.flush()
+        # The direct runner has no suite runner to separate from, so the case's
+        # own output is the case log.
         proc = subprocess.Popen(argv, cwd=str(tree_root), env=env, stdout=fh,
                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 start_new_session=True)
-        killed = None
+        # Registered at spawn, before anything can go wrong, so the identity that
+        # a later signal is checked against was captured while it was still true.
+        entry = register_child(proc, argv, tree_root)
+        timed_out = False
+        stop = None
         try:
             rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            # Signal only this case's own session, which start_new_session put
-            # in a new process group. Never a group-wide or pattern signal.
-            try:
-                os.killpg(os.getpgid(proc.pid), 15)
-                killed = "SIGTERM to the case's own process group"
-            except ProcessLookupError:
-                killed = "already gone"
-            try:
-                rc = proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), 9)
-                    killed = "SIGKILL to the case's own process group"
-                except ProcessLookupError:
-                    pass
-                rc = proc.wait(timeout=30)
+            timed_out = True
+            # The log is flushed and fsynced before any signal, so a failure row
+            # keeps the output the case produced up to that point.
+            fh.flush()
+            os.fsync(fh.fileno())
+            stop = stop_child(entry)
+            rc = entry["proc"].returncode if entry["proc"].returncode is not None else -15
+        finally:
+            forget_child(proc.pid)
+    killed = None
+    if stop is not None:
+        killed = ("signalled" if (stop["term"] or {}).get("signalled")
+                  else f"quarantined, no signal: {stop.get('quarantined')}")
     text = log.read_text(errors="replace") if log.exists() else ""
     obs = parse_observer(log)
     # The observer writes into the same stream, so the log holds its own bytes.
@@ -1063,8 +1550,10 @@ def run_case(observer, case_rel, test_dir, tmpdir, result_dir, tree_root, timeou
         "runner": "direct",
         "invoked_as": tree_rel,
         "rc": rc,
-        "timed_out": killed is not None,
+        "timed_out": timed_out,
         "kill": killed,
+        "stop": stop,
+        "descendants_contained": False,
         "wall_s": round(time.time() - started, 3),
         "test_dir": str(test_dir),
         "log": str(log),
@@ -1105,21 +1594,30 @@ def classify_outcome(rec):
     scan = rec["scan"]
     if rec["timed_out"]:
         return OUTCOME_REFUSED, f"timed out: {rec['kill']}"
-    if not obs.get("complete"):
-        return OUTCOME_SKIPPED, obs.get("why", "no complete observer block")
-    # Identity: which case ran, against the one asked for. The two runners report it
-    # differently, so each compares in its own terms and neither accepts a case
-    # that is not the one requested.
+    # Identity first: which case ran, against the one asked for. The two runners
+    # report it differently, so each compares in its own terms and neither accepts
+    # a case that is not the one requested.
     expect = str(obs.get("EXPECT"))
     ran_case = str(obs.get("CASE"))
     if rec.get("runner") == "check":
-        if ran_case != expect:
-            return OUTCOME_SKIPPED, (f"check ran {ran_case!r}, not the case asked for {expect!r}")
+        identity_ok = ran_case == expect
+        ran_desc = f"check ran {ran_case!r}, not the case asked for {expect!r}"
     else:
         # A direct invocation reports the path it ran, relative to the tree root.
-        if ran_case not in (expect, "tests/" + expect):
-            return OUTCOME_SKIPPED, (f"the case that ran was {ran_case!r}, "
-                                     f"not the one asked for {expect!r}")
+        identity_ok = ran_case in (expect, "tests/" + expect)
+        ran_desc = (f"the case that ran was {ran_case!r}, "
+                    f"not the one asked for {expect!r}")
+    # A hard failure the suite's own runner attributed to the requested case is a
+    # measured failure of that case. Reporting it as a harness comparison problem
+    # instead would let a real filesystem failure be explained away by an arm that
+    # could not be measured, so it is judged before the observer's own bookkeeping.
+    if rc != 0 and identity_ok:
+        return OUTCOME_FAILED, (f"the case exited {rc}" +
+                                (" and left no observer block" if not obs.get("complete") else ""))
+    if not obs.get("complete"):
+        return OUTCOME_SKIPPED, obs.get("why", "no complete observer block")
+    if not identity_ok:
+        return OUTCOME_SKIPPED, ran_desc
     if scan["skips"]:
         return OUTCOME_SKIPPED, "log says the case did not assert: " + ", ".join(scan["skips"])
     if rc != 0:
@@ -1137,11 +1635,19 @@ def classify_outcome(rec):
     if not obs.get("LOG_BYTES") and scan["empty"]:
         return OUTCOME_SKIPPED, "empty log and the observer measured no bytes"
     if rec.get("runner") == "check":
-        witness = rec.get("suite_verdict") or {}
-        if not witness.get("pass"):
-            return OUTCOME_SKIPPED, ("the suite runner recorded no pass witness: "
-                                     + str(witness.get("why") or "no result record"))
-        return OUTCOME_PASSED, ("the suite runner recorded a pass witness and the log is clean")
+        receipt = rec.get("receipt") or {}
+        if not receipt.get("ok"):
+            # Every probe the receipt made, so a refusal says which one failed
+            # rather than only that it did.
+            failed = [f"{q['probe']}={q['detail']}" for q in receipt.get("probes", [])
+                      if not q.get("ok")]
+            return OUTCOME_SKIPPED, ("the suite receipt did not verify: "
+                                     + "; ".join(failed[:6]))
+        if not receipt.get("acceptance"):
+            return OUTCOME_SKIPPED, ("receipt verified the runner but not the suite: "
+                                     + str(receipt.get("label")))
+        return OUTCOME_PASSED, ("the suite receipt verified: pinned executor, reviewed tree "
+                                "sha, the requested case id, and the suite's own pass count")
     return OUTCOME_SKIPPED, ("direct invocation: the case exited 0 with a clean log, but "
                              "without the suite's runner there is no supported success "
                              "witness, so this cannot be a pass")
@@ -1179,6 +1685,7 @@ def preflight(tree, out_dir, timeout=DEFAULT_TIMEOUT, pin_check=True):
     if pin_check:
         ok, problems, pin_detail = verify_source_pin(src_root)
         rec["pin"] = {"ok": ok, "problems": problems, "detail": pin_detail}
+        rec["pin_read"] = pin_detail.get("pin")
         if not ok:
             # Source drift is a wrong-input condition, not a missing capability.
             # The two must not share an exit code, or a CI step cannot tell a
@@ -1390,6 +1897,8 @@ def run(args):
                "cowfs_observer": for_json(arm_recs["cowfs"]["observer"]),
                "native_suite_verdict": arm_recs["native"].get("suite_verdict"),
                "cowfs_suite_verdict": arm_recs["cowfs"].get("suite_verdict"),
+               "native_receipt": for_json(arm_recs["native"].get("receipt") or {}),
+               "cowfs_receipt": for_json(arm_recs["cowfs"].get("receipt") or {}),
                "native_source_sha": pin_detail.get("case_sha", {}).get(cid),
                "cowfs_source_sha": pin_detail.get("case_sha", {}).get(cid),
                "runner": args.runner,
@@ -1402,9 +1911,10 @@ def run(args):
     print(f"COVERAGE: {covered} of {total} generic cases, reviewed set {sha_of(sorted(allow))[:12]}")
     print(f"COUNTS: pass={tallies[VERDICT_OK]} fail={tallies[VERDICT_FAIL]} "
           f"unmeasurable={tallies[VERDICT_UNMEASURABLE]} invalid={tallies[VERDICT_INVALID]}")
-    if args.require_full and covered != pin_case_count():
+    pinned_total = pin_case_count(pre.get("pin_read"))
+    if args.require_full and covered != pinned_total:
         print(f"VERDICT: {VERDICT_UNMEASURABLE}", file=sys.stderr)
-        print(f"REASON: --require-full and only {covered} of {pin_case_count()} reviewed cases ran",
+        print(f"REASON: --require-full and only {covered} of {pinned_total} reviewed cases ran",
               file=sys.stderr)
         return 2
     if tallies[VERDICT_FAIL]:
@@ -1419,8 +1929,14 @@ def run(args):
     return 0
 
 
-def pin_case_count():
-    pin, err = parse_allowlist()
+def pin_case_count(pin=None):
+    """The pinned denominator, from the same read the run already verified.
+
+    Re-reading the file here would let the count come from a pin that changed
+    after the cases ran, which is exactly the drift the first read refused.
+    """
+    if pin is None:
+        pin, _ = parse_allowlist()
     return (pin or {}).get("case_count") or 0
 
 
@@ -1477,7 +1993,10 @@ def preflight_cmd(args):
     for gate in rec["startup_gate"]:
         print(f"GATE: {gate['key']}\t{gate['status']}\t{gate.get('fatal') or gate.get('path')}")
     caps = rec["capabilities"]
-    print(f"CAPS: uid_root={caps['uid_is_root']} "
+    print(f"CAPS: measured={caps['_counts']['measured']} "
+          f"derived={caps['_counts']['derived']} stated={caps['_counts']['stated']} "
+          f"total={caps['_counts']['total']} "
+          f"uid_root={caps['uid_is_root']['present']} "
           f"autoconf={caps['autoconf']['present']} automake={caps['automake']['present']} "
           f"libtool={caps['libtool']['present']} m4={caps['m4']['present']} "
           f"getfattr={caps['getfattr']['present']} fsstress={caps['ltp/fsstress']['present']}")

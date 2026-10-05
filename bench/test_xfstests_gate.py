@@ -119,6 +119,23 @@ class Tree:
             # The suite's own refusal grammar.
             "nofatal": 'printf "Ran: %s\\n" "$__seq"\necho "fsstress not found or executable"\n'
                        'echo "Passed all 1 tests"\nexit 0\n',
+            # Claims more tests than it ran, and the suite's own count must match
+            # the ids it named.
+            "wrongcount": 'printf "Ran: %s\\n" "$__seq"\necho "Passed all 3 tests"\nexit 0\n',
+            # Says nothing at all, not even which case ran.
+            "empty": "exit 0\n",
+            # Reports a case as ignored, which the suite does when it skips one.
+            "ignored": 'printf "Ran: %s\\n" "$__seq"\n'
+                       'echo "generic/777 - unknown test, ignored"\n'
+                       'echo "Passed all 1 tests"\nexit 0\n',
+            # Runs the case for real, so whatever the case prints lands in the
+            # runner's own stream, which is where a forged summary would have to
+            # appear to be believed.
+            "tee": 'printf "Ran: %s\\n" "$__seq"\n'
+                   'for __a in "$@"; do\n'
+                   '  case "$__a" in */[0-9]*) sh "tests/$__a" ;; esac\n'
+                   'done\n'
+                   'echo "Passed all 1 tests"\nexit 0\n',
         }
         write(self.root / "check", "#!/bin/sh\n" + preamble + scripts[behaviour], executable=True)
         # Committed, so the source pin sees a clean tree. An uncommitted runner
@@ -135,12 +152,21 @@ class Tree:
     def failing(self, cid):
         self.case(cid, "status=1", extra='echo "not run" >&2\n')
 
-    def pin(self, path, ids=("005",), case_count=None):
+    def pin(self, path, ids=("005",), case_count=None, group_list=True,
+            selection=None):
         """Write a pin that matches this tree, so drift is not the thing tested.
 
-        Commits first: a pin is written from the committed state, and anything
-        written afterwards would be dirty by design.
+        Writes the suite's own selection file and commits before the pin, because
+        a pin is written from the committed state and anything written afterwards
+        would be dirty by design. The executor is pinned by sha, which is what
+        makes a receipt bind to the runner rather than to the run's own claim.
         """
+        path_gl = self.root / "tests" / "generic" / "group.list"
+        if selection is None and group_list:
+            selection = "".join(f"auto {cid}\n" for cid in ids)
+        if selection is not None:
+            write(path_gl, selection)
+        group_list = path_gl
         self.git_commit("cases")
         lines = [f"tree_sha {self.sha()}"]
         for cid in ids:
@@ -149,6 +175,13 @@ class Tree:
             for rel, sha in sorted(gate.common_closure(
                     self.root / "tests" / "generic" / cid, self.root).items()):
                 lines.append(f"common {rel} {sha}")
+        check = self.root / "check"
+        if check.is_file():
+            lines.append(f"runner check {gate.sha256_file(check)}")
+        if group_list.is_file():
+            lines.append(f"review group.list sha256={gate.sha256_file(group_list)}")
+        else:
+            lines.append("review group.list absent, so the suite selected nothing")
         lines.append(f"case_count {case_count if case_count is not None else len(ids)}")
         return write(path, "\n".join(lines) + "\n")
 
@@ -197,6 +230,23 @@ class HarnessCase(unittest.TestCase):
             os.environ["FAKE_FAIL_PATH"] = fail_path
             self.addCleanup(os.environ.pop, "FAKE_FAIL_PATH", None)
         return "check"
+
+    def use_this_tree_as_reviewed(self, path=None):
+        """Point the gate's reviewed pin at this fixture tree.
+
+        A test double, and labelled as one: it exists so the receipt's positive
+        path can be exercised. `test_a_stand_in_tree_is_never_acceptance` leaves
+        the shipped pin in place and shows the same tree is then refused.
+        """
+        real = gate.REVIEWED_PIN_FILE
+        gate.REVIEWED_PIN_FILE = path or (self.tmp_path / "reviewed-allowlist.txt")
+        self.addCleanup(setattr, gate, "REVIEWED_PIN_FILE", real)
+        return gate.REVIEWED_PIN_FILE
+
+    def pin_as_reviewed(self, ids=("005",), **kw):
+        pin = self.tree.pin(self.tmp_path / "reviewed-allowlist.txt", ids, **kw)
+        self.use_this_tree_as_reviewed(pin)
+        return pin
 
     def arm_dirs(self):
         """Two roots the harness will accept: distinct devices are not available
@@ -256,7 +306,8 @@ class ArmPlacement(HarnessCase):
         self.with_check()
         self.tree.passing("005")
         self.tree.passing("010")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         native, cowfs = self.arm_dirs()
         rc, _ = self.run_gate(self.args(cases="005"))
         self.assertEqual(rc, 0, "expected the synthetic case to pass on both arms")
@@ -275,7 +326,8 @@ class ArmPlacement(HarnessCase):
         self.open_gate()
         self.tree.passing("005")
         self.tree.passing("010")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         a = self.args(cases="005")
         a.cowfs_root = a.native_root
         rc, _ = self.run_gate(a)
@@ -320,7 +372,8 @@ class ArmPlacement(HarnessCase):
         self.with_check()
         self.tree.passing("005")
         self.tree.passing("010")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         rc, _ = self.run_gate(self.args(cases="005"))
         run_dir = next(Path(self.out()).glob("run-*"))
         meta = json.loads((run_dir / "results.jsonl").read_text().splitlines()[0])
@@ -334,7 +387,8 @@ class ArmPlacement(HarnessCase):
         self.with_check()
         self.tree.passing("005")
         self.tree.passing("010")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         rc, out = self.run_gate(self.args(cases="005"))
         self.assertEqual(rc, 0, out)
         run_dir = next(Path(self.out()).glob("run-*"))
@@ -367,7 +421,11 @@ class SuccessEvidence(HarnessCase):
              "outcome": None, "outcome_why": None,
              "log_text": log_text, "log": "x.log"}
         if runner == "check":
-            r["suite_verdict"] = {"pass": witness, "rc": rc, "why": "test fixture"}
+            r["suite_verdict"] = {"pass": witness, "rc": rc, "why": "test fixture",
+                                  "passed": 1 if witness else 0, "not_run": [], "ignored": []}
+            r["receipt"] = {"ok": witness, "acceptance": witness,
+                            "label": "xfstests acceptance evidence" if witness else "refused",
+                            "probes": [{"probe": "fixture", "ok": witness, "detail": "test fixture"}]}
         # Classify through the real classifier, so the verdict under test is the
         # one production code would produce from the same evidence.
         r["outcome"], r["outcome_why"] = gate.classify_outcome(r)
@@ -452,7 +510,8 @@ class SuccessEvidence(HarnessCase):
                                'test "$(cat "$TEST_DIR/real")" = hello || status=1\n'
                                'rm -f "$TEST_DIR/real"\nstatus=0')
         self.tree.passing("010")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         work = self.cowfs / "w"
         test_dir = gate.prepare_dir(work / "testdir")
         tmpdir = gate.prepare_dir(work / "tmp")
@@ -664,7 +723,8 @@ class ClassifyExit(HarnessCase):
 
     def test_no_drift_exits_zero(self):
         self.tree.passing("005")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005",))
+        self.pin_as_reviewed(("005",))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
 
         class A:
             pass
@@ -696,7 +756,8 @@ class MissingProbe(HarnessCase):
         self.use_distinct_arms()
         self.with_check()
         self.tree.passing("005")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005",))
+        self.pin_as_reviewed(("005",))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         rc, _ = self.run_gate(self.args(cases="005"))
         self.assertEqual(rc, 2)
 
@@ -927,9 +988,11 @@ class EndToEnd(HarnessCase):
     def test_a_matched_run_records_exact_codes(self):
         self.open_gate()
         self.with_check()
+        self.use_distinct_arms()
         self.tree.passing("005")
         self.tree.passing("010")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         # One tmpfs cannot host two distinguishable arms, so run against a
         # private pair the harness accepts by relaxing only the FUSE rule.
         self.use_distinct_arms()
@@ -939,24 +1002,39 @@ class EndToEnd(HarnessCase):
         rows = [json.loads(l) for l in (run_dir / "results.jsonl").read_text().splitlines()]
         self.assertEqual([r["kind"] for r in rows[1:]], ["case_verdict"])
         verdict = rows[1]
-        self.assertEqual(verdict["verdict"], "PASS")
+        self.assertEqual(verdict["verdict"], "PASS", verdict["why"])
         self.assertEqual(verdict["native_rc"], 0)
         self.assertEqual(verdict["cowfs_rc"], 0)
         self.assertTrue(Path(verdict["native_log"]).is_file())
         self.assertTrue(Path(verdict["cowfs_log"]).is_file())
-        self.assertIn("pass witness", verdict["why"])
+        # A PASS is only reachable with a receipt that bound the executor, the
+        # reviewed tree, the case id and the suite's own selection.
+        receipt = verdict.get("native_receipt") or {}
+        self.assertTrue(receipt.get("ok"), receipt.get("problems"))
+        self.assertTrue(receipt.get("acceptance"), receipt.get("label"))
+        probed = {q["probe"] for q in receipt["probes"]}
+        self.assertLessEqual({"check_sha_is_pinned", "tree_sha_is_reviewed",
+                              "group_list_selects_case", "case_named",
+                              "no_missing_ids", "no_extra_ids", "no_duplicate_ids",
+                              "runner_exit_zero", "suite_reported_pass"}, probed)
+        src = receipt.get("case_source") or {}
+        self.assertTrue(src.get("case"), src)
+        self.assertTrue(src.get("group_list"), src)
 
     def test_cowfs_failure_exits_one_and_keeps_the_evidence(self):
         self.open_gate()
         self.tree.passing("005")
         self.tree.passing("010")
         self.with_check("fail_arm", fail_path="ARM-COWFS")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.use_distinct_arms()
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         self.use_distinct_arms()
         # A case that fails when its directory sits under the cowfs side. It
         # reports its own directory, so it cannot be a path-substring illusion.
         self.tree.case("005", 'case "$TEST_DIR" in *ARM-COWFS*) status=1 ;; *) status=0 ;; esac')
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         rc, _ = self.run_gate(self.args(cases="005"))
         self.assertEqual(rc, 1)
         run_dir = next(Path(self.out()).glob("run-*"))
@@ -971,14 +1049,17 @@ class EndToEnd(HarnessCase):
     def test_a_case_that_does_nothing_never_scores_pass(self):
         self.open_gate()
         self.with_check()
+        self.use_distinct_arms()
         self.tree.passing("005")
         self.tree.passing("010")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         self.use_distinct_arms()
         # A runner that exits 0 without saying anything passed: the exact shape
         # that produced a false PASS before.
         self.with_check("silent")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005", "010"))
+        self.pin_as_reviewed(("005", "010"))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         rc, _ = self.run_gate(self.args(cases="005"))
         self.assertNotEqual(rc, 0)
         run_dir = next(Path(self.out()).glob("run-*"))
@@ -988,9 +1069,11 @@ class EndToEnd(HarnessCase):
     def test_a_case_outside_the_reviewed_set_is_refused(self):
         self.open_gate()
         self.with_check()
+        self.use_distinct_arms()
         self.tree.passing("005")
         self.tree.passing("010")
-        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("005",))
+        self.pin_as_reviewed(("005",))
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         self.use_distinct_arms()
         rc, _ = self.run_gate(self.args(cases="005,010"))
         self.assertEqual(rc, 3)
@@ -1011,3 +1094,444 @@ class EndToEnd(HarnessCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnedChildCleanup(unittest.TestCase):
+    """A case is signalled only while the harness can still prove it owns the pid.
+
+    Each test builds the state that would make a signal unsafe and asserts no
+    signal was sent. The one positive test signals a child this harness spawned and
+    verified, which is the only case where a signal is allowed at all.
+    """
+
+    def setUp(self):
+        self.signals = []
+        real_kill = os.kill
+
+        def counting_kill(pid, sig):
+            self.signals.append((pid, sig))
+            return real_kill(pid, sig)
+
+        self.real_kill = real_kill
+        os.kill = counting_kill
+        self.addCleanup(setattr, os, "kill", real_kill)
+        gate.SPAWNED.clear()
+        gate.SIGNAL_LOG.clear()
+        self.addCleanup(gate.SPAWNED.clear)
+
+    def entry_for(self, pid=4242, starttime=111, pgrp=None, sid=None, complete=True,
+                  exited=False, identity=True):
+        """A registry entry with the fields the ownership check reads."""
+        pgrp = pid if pgrp is None else pgrp
+        sid = pid if sid is None else sid
+        entry = {
+            "pid": pid,
+            "proc": type("Handle", (), {
+                "poll": lambda self=None: (0 if exited else None),
+                "wait": lambda self=None, timeout=None: 0,
+            })(),
+            "argv": ["sleep", "1"],
+            "cwd": "/tmp",
+            "spawn_identity": ({"pid": pid, "pgrp": pgrp, "sid": sid,
+                                "starttime": starttime, "argv": ["sleep", "1"]}
+                               if identity else None),
+            "reaped": False,
+        }
+        gate.SPAWNED[pid] = entry
+        return entry
+
+    def stub_identity(self, got):
+        real = gate.proc_identity
+        gate.proc_identity = lambda pid: got
+        self.addCleanup(setattr, gate, "proc_identity", real)
+
+    def assert_no_signal(self, entry):
+        rec = gate.signal_owned_child(entry, 15)
+        self.assertFalse(rec["signalled"], rec)
+        self.assertIn("quarantined", rec["why"])
+        self.assertEqual(self.signals, [], "no signal may be sent")
+
+    def test_a_pid_reused_by_another_process_is_never_signalled(self):
+        entry = self.entry_for(starttime=111)
+        # Same pid and process group, different start time: the pid was recycled.
+        self.stub_identity({"pid": 4242, "pgrp": 4242, "sid": 4242,
+                            "starttime": 999, "argv": ["bash"]})
+        self.assert_no_signal(entry)
+
+    def test_a_child_that_has_already_exited_is_never_signalled(self):
+        entry = self.entry_for(exited=True)
+        self.stub_identity({"pid": 4242, "pgrp": 4242, "sid": 4242,
+                            "starttime": 111, "argv": ["sleep"]})
+        self.assert_no_signal(entry)
+
+    def test_a_reaped_child_handle_is_never_signalled(self):
+        entry = self.entry_for()
+        gate.forget_child(entry["pid"])
+        self.stub_identity({"pid": 4242, "pgrp": 4242, "sid": 4242,
+                            "starttime": 111, "argv": ["sleep"]})
+        self.assert_no_signal(entry)
+
+    def test_no_spawn_identity_means_no_signal(self):
+        entry = self.entry_for(identity=False)
+        self.assert_no_signal(entry)
+
+    def test_a_pid_missing_from_the_registry_is_never_signalled(self):
+        entry = self.entry_for()
+        gate.SPAWNED.clear()
+        self.assert_no_signal(entry)
+
+    def test_a_process_lookup_error_between_check_and_signal_is_recorded(self):
+        entry = self.entry_for()
+        self.stub_identity({"pid": 4242, "pgrp": 4242, "sid": 4242,
+                            "starttime": 111, "argv": ["sleep"]})
+
+        def vanishing(pid, sig):
+            raise ProcessLookupError(pid)
+
+        os.kill = vanishing
+        rec = gate.signal_owned_child(entry, 15)
+        self.assertFalse(rec["signalled"], rec)
+        self.assertIn("ProcessLookupError", rec["why"])
+
+    def test_a_child_in_the_harness_process_group_is_never_signalled(self):
+        # A child that shares the harness group is not the harness's own session.
+        entry = self.entry_for(pgrp=os.getpgrp(), sid=os.getsid(0))
+        self.stub_identity({"pid": 4242, "pgrp": os.getpgrp(), "sid": os.getsid(0),
+                            "starttime": 111, "argv": ["sleep"]})
+        self.assert_no_signal(entry)
+
+    def test_a_child_that_left_its_own_session_is_never_signalled(self):
+        entry = self.entry_for()
+        self.stub_identity({"pid": 4242, "pgrp": 4242, "sid": 7,
+                            "starttime": 111, "argv": ["sleep"]})
+        self.assert_no_signal(entry)
+
+    def test_our_own_child_is_signalled_exactly_once(self):
+        """The only permitted signal: a child spawned here, verified, then killed.
+
+        /proc is Linux-only, so this asserts the no-signal refusals above on the
+        Mac and skips the positive case where the kernel cannot be asked.
+        """
+        import subprocess
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        entry = gate.register_child(proc, ["sleep", "30"], "/tmp")
+        ident = gate.proc_identity(proc.pid)
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        if not ident:
+            self.skipTest("no /proc here, so kernel identity cannot be read")
+        self.assertEqual(ident["sid"], proc.pid)
+        self.assertEqual(ident["pgrp"], proc.pid)
+        stop = gate.stop_child(entry)
+        self.assertEqual(len(self.signals), 1, self.signals)
+        self.assertEqual(self.signals[0][0], proc.pid)
+        self.assertIsNone(stop["quarantined"], stop)
+
+    def test_no_group_or_pattern_signal_call_exists_anywhere(self):
+        """A group signal can select a process the harness never proved it owns."""
+        source = Path(gate.__file__).read_text()
+        for banned in ("killpg", "getpgid", "pkill", "os.killpg", "kill(-"):
+            self.assertNotIn(banned, source, banned)
+
+
+class ShellSourceClosure(unittest.TestCase):
+    """The closure a case pulls in is read from real shell sources, both forms.
+
+    The suite writes `. ./common/rc` and `. common/config`; a regex that only
+    knows the first form silently leaves the second unhashed, and the pin then
+    claims a coverage it does not have.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tree = Path(self.tmp.name) / "t"
+        write(self.tree / "common" / "config", "# config\nexport MKFS_PROG=x\n")
+        write(self.tree / "common" / "exit", "# exit\n")
+        write(self.tree / "common" / "test_names", "# test_names\n")
+        write(self.tree / "common" / "preamble", ". common/exit\n. common/test_names\n"
+                                               ". ./common/rc\n")
+        write(self.tree / "common" / "rc", ". common/config\nsource ./common/promotion\n")
+        write(self.tree / "common" / "promotion", "# promotion\n")
+        write(self.tree / "common" / "filter", "# filter\n")
+        self.case = write(self.tree / "tests" / "generic" / "005",
+                          "#! /bin/sh\n. ./common/preamble\n. ./common/filter\nexit 0\n",
+                          executable=True)
+
+    def test_both_source_spellings_are_matched(self):
+        found = gate.SOURCE_RE.findall(". common/config\n. ./common/rc\nsource common/exit\n")
+        self.assertEqual([name for _, name in found], ["config", "rc", "exit"])
+
+    def test_the_transitive_closure_reaches_config_exit_and_test_names(self):
+        closure = gate.common_closure(self.case, self.tree)
+        self.assertLessEqual(
+            {"common/config", "common/exit", "common/test_names", "common/preamble",
+             "common/rc", "common/promotion", "common/filter"}, set(closure))
+
+    def test_every_reached_file_is_hashed_as_read(self):
+        closure = gate.common_closure(self.case, self.tree)
+        for rel, sha in closure.items():
+            if rel == "__unresolved__":
+                continue
+            self.assertEqual(sha, gate.sha256_file(self.tree / rel), rel)
+
+
+class PinCoversTheWholeReachableClosure(unittest.TestCase):
+    """A pin that omits a file the case can reach is refused, not accepted."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.tree = Tree(self.base / "t")
+        self.tree.case("005", "status=0")
+        self.records = gate.classify_group(self.tree.root / "tests")
+
+    def pin(self, omit=(), ids=("005",)):
+        self.tree.git_commit("cases")
+        lines = [f"tree_sha {self.tree.sha()}"]
+        for cid in ids:
+            lines.append(f"case {cid} {gate.sha256_file(self.tree.root / 'tests' / 'generic' / cid)}")
+        for cid in ids:
+            for rel, sha in sorted(gate.common_closure(
+                    self.tree.root / "tests" / "generic" / cid, self.tree.root).items()):
+                if rel == "__unresolved__" or rel in omit:
+                    continue
+                lines.append(f"common {rel} {sha}")
+        lines.append(f"case_count {len(ids)}")
+        return write(self.base / "pin.txt", "\n".join(lines) + "\n")
+
+    def test_a_pin_missing_a_reached_common_file_is_refused(self):
+        """The b005753 pin shape: closure that missed common/config."""
+        omit = {"common/preamble", "common/rc", "common/promotion"}
+        pin = self.pin(omit=omit)
+        ok, problems, _ = gate.verify_source_pin(self.tree.root, records=self.records,
+                                                 allowlist=pin)
+        self.assertFalse(ok)
+        self.assertTrue(any("unpinned" in p for p in problems), problems)
+
+    def test_a_pin_missing_a_transitive_file_is_refused(self):
+        pin = self.pin(omit={"common/promotion"})
+        ok, problems, _ = gate.verify_source_pin(self.tree.root, records=self.records,
+                                                 allowlist=pin)
+        self.assertFalse(ok)
+        self.assertTrue(any("common/promotion" in p for p in problems), problems)
+
+    def test_a_complete_pin_is_accepted_and_records_the_closure(self):
+        pin = self.pin()
+        ok, problems, detail = gate.verify_source_pin(self.tree.root, records=self.records,
+                                                      allowlist=pin)
+        self.assertTrue(ok, problems)
+        self.assertIn("common/promotion", detail["closure"]["005"])
+
+    def test_a_tampered_common_config_is_refused(self):
+        pin = self.pin()
+        ok, _, _ = gate.verify_source_pin(self.tree.root, records=self.records, allowlist=pin)
+        self.assertTrue(ok)
+        write(self.tree.root / "common" / "config", "# config\n# tampered\n")
+        ok2, problems, _ = gate.verify_source_pin(self.tree.root, records=self.records,
+                                                  allowlist=pin)
+        self.assertFalse(ok2)
+        self.assertTrue(any("common/config" in p for p in problems), problems)
+
+    def test_a_source_line_this_scan_cannot_resolve_is_refused(self):
+        write(self.tree.root / "common" / "rc", ". common/nowhere\n")
+        self.tree.git_commit("rc moved")
+        pin = self.pin()
+        write(self.tree.root / "common" / "rc", ". common/nowhere\n")
+        ok, problems, detail = gate.verify_source_pin(self.tree.root, records=self.records,
+                                                      allowlist=pin)
+        self.assertIn("__unresolved__", detail.get("closure", {}).get("005", {}))
+        self.assertTrue(any("could not resolve" in p for p in problems), problems)
+
+
+class AForgedSummaryIsNotAcceptance(HarnessCase):
+    """The shape that made this gate wrong: exit 0 and a success line.
+
+    Every test here drives the real CLI against a stand-in suite and shows the
+    run cannot reach PASS, and that the receipt names the probe that refused it.
+    A unit fixture can prove the grammar is parsed; only this can prove the gate
+    refuses to act on it.
+    """
+
+    def build(self, behaviour="pass", body="status=0", ids=("005", "010"), fail_path=None):
+        self.open_gate()
+        self.use_distinct_arms()
+        self.with_check(behaviour, fail_path=fail_path)
+        self.tree.case("005", body)
+        self.tree.case("010", "status=0")
+        self.pin_as_reviewed(ids)
+        gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
+        return self.run_gate(self.args(cases="005", runner="check"))
+
+    def row(self, out=None):
+        run_dir = sorted(Path(out or self.out()).glob("run-*"))[-1]
+        rows = [json.loads(l) for l in (run_dir / "results.jsonl").read_text().splitlines()]
+        return rows[-1], run_dir
+
+    def repin_caller_allowlist(self, ids=("005", "010"), group_list=True,
+                               selection=None):
+        """Re-pin only the tree --allowlist reads, leaving the reviewed pin alone.
+
+        The reviewed pin is the gate's own and is what an acceptance receipt is
+        measured against, so a tampered tree that matches a caller-supplied pin
+        still has to be refused by the receipt.
+        """
+        pin = self.tree.pin(self.tmp_path / "allowlist2.txt", ids,
+                            group_list=group_list, selection=selection)
+        gate.ALLOWLIST_FILE = pin
+        return pin
+
+    def run_again(self, **kw):
+        """A second attempt in its own out dir and arm roots.
+
+        A case directory is immutable per attempt and it lives inside the arm
+        root, so a retry cannot reuse either.
+        """
+        kw.setdefault("out", self.out("out2"))
+        kw.setdefault("cases", "005")
+        kw.setdefault("runner", "check")
+        kw.setdefault("native_root", self.out("arm2/native"))
+        kw.setdefault("cowfs_root", self.out("arm2/cowfs"))
+        Path(kw["native_root"]).mkdir(parents=True, exist_ok=True)
+        Path(kw["cowfs_root"]).mkdir(parents=True, exist_ok=True)
+        return self.run_gate(self.args(**kw))
+
+    def assert_refused(self, rc, verdict_row, probe=None):
+        self.assertNotEqual(verdict_row["verdict"], "PASS", verdict_row)
+        receipt = verdict_row.get("native_receipt") or {}
+        self.assertFalse(receipt.get("acceptance"), receipt.get("label"))
+        if probe:
+            failed = {q["probe"] for q in receipt.get("probes", []) if not q.get("ok")}
+            self.assertIn(probe, failed, receipt.get("problems"))
+        return receipt
+
+    def test_a_case_that_forges_the_summary_still_cannot_pass(self):
+        """A case prints check's exact success grammar on its own stdout.
+
+        The stand-in runner really runs the case, so the forged lines land in the
+        runner's own stream, which is the only place they could be believed.
+        """
+        forged = ('printf "Ran: %s\\n" "generic/005"\n'
+                  'echo "Passed all 1 tests"\n'
+                  'echo "Failed 1 of 1 tests"\n'
+                  'status=0')
+        rc, out = self.build("tee", body=forged)
+        row, run_dir = self.row()
+        self.assert_refused(rc, row, probe="one_testlist_line")
+        stream = next((run_dir / "logs" / "check-streams").glob("*.out"))
+        self.assertIn("Passed all 1 tests", stream.read_text())
+
+    def test_a_silent_runner_is_not_a_pass(self):
+        rc, out = self.build("silent")
+        row, _ = self.row()
+        self.assert_refused(rc, row, probe="suite_reported_pass")
+
+    def test_an_empty_runner_output_is_not_a_pass(self):
+        rc, out = self.build("empty")
+        row, _ = self.row()
+        self.assert_refused(rc, row, probe="case_named")
+
+    def test_a_count_larger_than_the_cases_run_is_not_a_pass(self):
+        rc, out = self.build("wrongcount")
+        row, _ = self.row()
+        self.assert_refused(rc, row, probe="suite_count_matches_request")
+
+    def test_a_runner_naming_another_case_is_not_a_pass(self):
+        rc, out = self.build("wrongcase")
+        row, _ = self.row()
+        self.assert_refused(rc, row, probe="case_named")
+
+    def test_a_reported_ignored_case_is_not_a_pass(self):
+        rc, out = self.build("ignored")
+        row, _ = self.row()
+        self.assert_refused(rc, row, probe="nothing_ignored")
+
+    def test_a_case_the_runner_never_ran_is_not_a_pass(self):
+        rc, out = self.build("notrun")
+        row, _ = self.row()
+        self.assert_refused(rc, row, probe="nothing_not_run")
+
+    def test_a_replaced_runner_is_not_a_pass(self):
+        """Swap the runner's bytes after the pin and the receipt refuses."""
+        rc, out = self.build()
+        row, run_dir = self.row()
+        self.assertEqual(row["verdict"], "PASS", row["why"])
+        write(self.tree.root / "check", "#!/bin/sh\necho 'Ran: generic/005'\n"
+                                        "echo 'Passed all 1 tests'\nexit 0\n",
+              executable=True)
+        self.tree.git_commit("swapped runner")
+        self.repin_caller_allowlist()
+        rc2, out2 = self.run_again()
+        row2, _ = self.row(self.out("out2"))
+        self.assert_refused(rc2, row2, probe="check_sha_is_pinned")
+
+    def test_a_missing_group_list_is_refused_before_any_case_runs(self):
+        """Without the suite's selection file `check` resolves nothing at all.
+
+        That is a prereq the gate refuses up front, so there is no run directory:
+        the refusal is earlier and stronger than any receipt probe.
+        """
+        rc, out = self.build()
+        row, _ = self.row()
+        self.assertEqual(row["verdict"], "PASS", row["why"])
+        (self.tree.root / "tests" / "generic" / "group.list").unlink()
+        self.repin_caller_allowlist(group_list=False)
+        rc2, out2 = self.run_again()
+        self.assertNotEqual(rc2, 0, out2)
+        self.assertEqual(list(Path(self.out("out2")).glob("run-*")), [])
+        preflights = list(Path(self.out("out2")).glob("preflight-*.jsonl"))
+        self.assertTrue(preflights, out2)
+        text = preflights[-1].read_text()
+        self.assertIn("group.list", text, text[:400])
+
+    def test_a_selection_that_omits_the_case_is_not_a_pass(self):
+        """group.list exists but does not select the case that was requested."""
+        rc, out = self.build()
+        row, _ = self.row()
+        self.assertEqual(row["verdict"], "PASS", row["why"])
+        self.repin_caller_allowlist(selection="auto 010\n")
+        rc2, out2 = self.run_again()
+        row2, _ = self.row(self.out("out2"))
+        self.assert_refused(rc2, row2, probe="group_list_selects_case")
+
+    def test_a_stand_in_tree_is_never_acceptance_under_the_shipped_pin(self):
+        """The forge the critic named: own tree, own matching pin, full CLI.
+
+        `pin_as_reviewed` is what the other tests use to exercise the accepted
+        path. Here it is undone, so the pin that ships with the gate decides, and
+        the same run is harness proof only.
+        """
+        rc, out = self.build()
+        row, _ = self.row()
+        self.assertEqual(row["verdict"], "PASS", row["why"])
+        gate.REVIEWED_PIN_FILE = Path(gate.__file__).resolve().with_name("xfstests-allowlist.txt")
+        rc2, out2 = self.run_again()
+        row2, _ = self.row(self.out("out2"))
+        self.assert_refused(rc2, row2, probe="tree_sha_is_reviewed")
+        self.assertIn("harness proof", row2["native_receipt"]["label"])
+
+    def test_direct_invocation_never_passes(self):
+        rc, out = self.build()
+        rc2, out2 = self.run_again(runner="direct")
+        row, _ = self.row(self.out("out2"))
+        self.assertNotEqual(row["verdict"], "PASS", row)
+        self.assertIn("direct", row["why"].lower())
+
+    def test_a_hard_failure_is_not_downgraded_to_unmeasurable(self):
+        """A real filesystem failure where native passed is FAIL and exit 1."""
+        rc, out = self.build("fail_arm", fail_path="ARM-COWFS")
+        row, _ = self.row()
+        self.assertEqual(row["verdict"], "FAIL", row)
+        self.assertEqual(rc, 1, out)
+
+    def test_a_hard_failure_with_no_observer_block_is_still_a_failure(self):
+        """The cowfs arm dies hard: no observer block, so no residue to compare.
+
+        Reporting that as a harness problem would explain a real failure away, so
+        the case's own exit code is judged first.
+        """
+        rc, out = self.build("fail_arm", fail_path="ARM-COWFS",
+                             body='echo "cowfs: I/O error" >&2; status=1')
+        row, _ = self.row()
+        self.assertEqual(row["verdict"], "FAIL", row)
+        self.assertEqual(rc, 1, out)
