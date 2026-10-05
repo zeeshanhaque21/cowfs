@@ -31,6 +31,16 @@ cowfs arm is refused (exit 3), not printed as a zero-gate pass. This is a
 byte-accounting check on the harness's own output, not provenance: it cannot tell a
 hand-written but internally consistent file from a real run.
 
+Partial gate coverage is reported, never silent (issue #80). A gate that some input
+requested, or that has reps in one arm only, is listed with the arm that has no data
+for it and the inputs that asked for it, so a dropped gate reads as a dropped gate
+rather than as an absent line. The same block prints one `coverage {...}` line, the
+machine-readable form of the same facts. The aggregate verdict carries its own scope,
+naming how many of the six gates were compared and which were not, so a partial result
+never reads as though every production gate was exercised. Coverage changes no verdict
+and no exit code: a matched g1-only or g1/g3-only comparison is still 0, and the gates
+it did not run are still not evidence about anything.
+
 Ratios are refused, not printed, when the machine was too loaded for them to
 mean anything: load1 above 30 on either side, or the two arms more than 2x
 apart. Two previous reviewers found timings unmeasurable at load 100 to 300,
@@ -69,17 +79,23 @@ LOAD_SKEW = 2.0
 GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
 
 
+def rows_of(path):
+    out = []
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
 def load(paths):
     meta = None
     reps = []
     for path in paths:
-        for line in Path(path).read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if not isinstance(row, dict):
-                continue
+        for row in rows_of(path):
             if row.get("kind") == "meta":
                 meta = meta or row
             elif row.get("kind") == "rep":
@@ -87,6 +103,76 @@ def load(paths):
     if not reps:
         raise SystemExit(f"no reps in {paths}")
     return meta, reps
+
+
+def inputs_of(paths):
+    """One entry per input file: what it calls itself, what it asked for, what it recorded."""
+    out = []
+    for path in paths:
+        rows = rows_of(path)
+        meta = next((r for r in rows if r.get("kind") == "meta"), {})
+        label = meta.get("label")
+        wanted = meta.get("gates")
+        counts = {}
+        for row in rows:
+            if row.get("kind") == "rep" and row.get("gate") in GATES:
+                counts[row["gate"]] = counts.get(row["gate"], 0) + 1
+        out.append({
+            "label": label if isinstance(label, str) and label else path,
+            "requested": {g for g in wanted if g in GATES} if isinstance(wanted, list) else None,
+            "counts": counts,
+        })
+    return out
+
+
+def requested_by(inputs, gate):
+    """Reps recorded under each label that asked for the gate, summed over inputs sharing a label.
+
+    gates.py appends a timestamp to a label rather than uniquifying it, so one label can be
+    two files. Keyed per file that would report one file's count as the label's; summing
+    keeps the number equal to the reps those inputs actually recorded. Only inputs whose own
+    meta asked for the gate are counted, so a file that merely shares the label is never
+    named as a requester.
+    """
+    out = {}
+    for i in inputs:
+        if i["requested"] is None or gate not in i["requested"]:
+            continue
+        out[i["label"]] = out.get(i["label"], 0) + i["counts"].get(gate, 0)
+    return out
+
+
+def coverage_gaps(native_inputs, cowfs_inputs):
+    """Every known gate with no comparison: the arm missing its data, and who asked for it."""
+    out = []
+    for gate in GATES:
+        n = sum(i["counts"].get(gate, 0) for i in native_inputs)
+        c = sum(i["counts"].get(gate, 0) for i in cowfs_inputs)
+        if n and c:
+            continue
+        out.append({
+            "gate": gate,
+            "missing_in": "cowfs" if n else ("native" if c else "any input"),
+            "reps": {"native": n, "cowfs": c},
+            "requested_by": requested_by([*native_inputs, *cowfs_inputs], gate),
+        })
+    return out
+
+
+def gap_reason(gap):
+    gate, missing = gap["gate"], gap["missing_in"]
+    where = "no data in any input" if missing == "any input" else f"the {missing} arm has no {gate} data"
+    have = ", ".join(f"{arm} has {n} reps" for arm, n in gap["reps"].items() if n)
+    asked = ", ".join(f"{label} requested it and recorded {n} reps"
+                      for label, n in sorted(gap["requested_by"].items()))
+    return f"{gate}  not compared: {where}" + (f", {have}" if have else "") + \
+           f"; {asked or 'requested by no input'}"
+
+
+def scope_text(compared):
+    rest = [g for g in GATES if g not in compared]
+    text = f"compared {len(compared)} of {len(GATES)} ({' '.join(compared) or 'none'})"
+    return f"{text}, not compared {' '.join(rest)}" if rest else text
 
 
 def is_int(v):
@@ -323,6 +409,17 @@ def main() -> int:
         if status == "FAIL":
             fails += 1
 
+    native_inputs = inputs_of(args.native)
+    cowfs_inputs = inputs_of([args.cowfs])
+    gaps = coverage_gaps(native_inputs, cowfs_inputs)
+    compared = [g for g in GATES if g not in {x["gate"] for x in gaps}]
+    print()
+    print(f"gate coverage  {len(compared)} of {len(GATES)} compared ({' '.join(compared) or 'none'})")
+    for gap in gaps:
+        if gap["reps"]["native"] or gap["reps"]["cowfs"] or gap["requested_by"]:
+            print(f"  {gap_reason(gap)}")
+    print("coverage " + json.dumps({"compared": compared, "gates_known": len(GATES), "not_compared": gaps}))
+
     if args.noise_floor:
         _, nc = load([args.noise_floor])
         gc = by_gate(nc)
@@ -341,6 +438,9 @@ def main() -> int:
             flag = "unmeasurable" if peak > LOAD_CEILING else ""
             print(f"{gate:<5} {min(len(a), len(c)):>5} {median(a):>9.4f} {median(c):>9.4f} "
                   f"{statistics.median(ra):>7.3f} {peak:>6.1f}  {flag}")
+        thin = [g for g in GATES if g in ga and g not in gc]
+        if thin:
+            print(f"  noise floor has no {' '.join(thin)} data, which the native arm ran")
     else:
         print()
         print("noise floor: not measured. Pass --noise-floor, or use run-pair.sh, "
@@ -349,10 +449,11 @@ def main() -> int:
     print()
     if not any(g5n.values()):
         print("g5   not run (no input has g5 reps)")
+    scope = scope_text(compared)
     if unmeasurable:
-        print(f"RESULT: {unmeasurable} gate(s) unmeasurable, {fails} failed")
+        print(f"RESULT: {unmeasurable} gate(s) unmeasurable, {fails} failed  scope: {scope}")
         return 2
-    print(f"RESULT: {'PASS' if fails == 0 else f'FAIL ({fails})'}")
+    print(f"RESULT: {'PASS' if fails == 0 else f'FAIL ({fails})'}  scope: {scope}")
     return 1 if fails else 0
 
 
