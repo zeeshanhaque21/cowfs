@@ -455,6 +455,7 @@ that takes a lock is not listed here.
 | `inner::flush_locked_snapshot` | sc.q | 1 |
 | `inner::commit_batch` | sc.q, nodes, dents, aliases, unsynced | 1 then 2 then leaf |
 | `inner::restore_state` | st.rd, nodes | 2 |
+| `inner::op_times` | st.rd, nodes | 2 |
 | `inner::commit` | aliases, snap. | 3 then leaf |
 | `inner::sync_all` | unsynced | leaf |
 | `inner::fsync_snapshot` | unsynced | leaf |

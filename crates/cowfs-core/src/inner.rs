@@ -789,7 +789,8 @@ impl Inner {
 
     fn commit_batch(&self, sc: &SnapCtx, batch: Batch) -> Result<()> {
         let states = self.restore_states(&batch);
-        match self.commit(sc, &batch, &states) {
+        let times = self.op_times(&batch);
+        match self.commit(sc, &batch, &states, &times) {
             Ok(created) => {
                 {
                     let mut al = self.aliases.wr();
@@ -866,12 +867,61 @@ impl Inner {
             .collect()
     }
 
+    /// The time each queued operation happened, keyed by the inode whose cached `ctime` carries it.
+    ///
+    /// Every operation that reaches meta stamps two or three inodes from one `Timestamp::now()`
+    /// reading, and the layer above writes that same value into each cached node as it queues, so
+    /// one of those nodes is the operation's time. Read before the commit opens meta's writer lock,
+    /// like [`Inner::restore_states`], for the same lock-order reason.
+    ///
+    /// An inode whose node has gone is absent, and its operations keep the batch time, which is what
+    /// they had before.
+    fn op_times(&self, b: &Batch) -> HashMap<Ino, cowfs_meta::Timestamp> {
+        // `NodeState::attr` is behind an `RwLock`, so this reads it the way `restore_state` does and
+        // is listed in the audit table beside it for the same lock-order reason.
+        let stamp = |ino: &Ino| {
+            self.nodes
+                .get(ino)
+                .map(|n| to_meta_ts(n.st.rd().attr.ctime))
+        };
+        let mut out = HashMap::new();
+        for op in &b.ops {
+            // the inode whose cached ctime is this operation's single clock reading
+            let subject = match op {
+                Op::Create { child, .. } => child,
+                Op::Link { ino, .. } | Op::Content { ino, .. } => ino,
+                // the parent, which the namespace operations stamp from the same reading as the
+                // child they name, and which the operation carries by inode
+                Op::Unlink { parent, .. } | Op::Rmdir { parent, .. } => parent,
+                Op::Rename { from, .. } => from,
+            };
+            if let Some(t) = stamp(subject) {
+                out.insert(*subject, t);
+            }
+        }
+        for ino in &b.touched {
+            if let Some(t) = stamp(ino) {
+                out.insert(*ino, t);
+            }
+        }
+        out
+    }
+
     fn commit(
         &self,
         sc: &SnapCtx,
         b: &Batch,
         states: &HashMap<Ino, (u32, Timestamp, Timestamp)>,
+        times: &HashMap<Ino, cowfs_meta::Timestamp>,
     ) -> Result<Vec<(Ino, u64)>> {
+        // `ctime` is the time of the change, not the time of the batch: stamp each operation with
+        // the time its cached node already holds. Only `ctime` follows it, and an inode the batch
+        // does not name keeps the wall clock the transaction opened with.
+        let stamp = |tx: &mut cowfs_meta::Tx<'_>, ino: Ino| {
+            if let Some(t) = times.get(&ino) {
+                tx.set_now(*t);
+            }
+        };
         use cowfs_meta::Error as M;
         let alias = self.aliases.rd().clone();
         let res = sc.snap.batch(|tx| {
@@ -901,6 +951,7 @@ impl Inner {
                         if b.elided.contains(child) {
                             continue;
                         }
+                        stamp(tx, *child);
                         let p = resolve(*parent, &newly)?;
                         let a = match what {
                             Create::File => tx.create(p, name, *mode)?,
@@ -910,12 +961,15 @@ impl Inner {
                         newly.insert(*child, a.ino.0);
                     }
                     Op::Link { ino, parent, name } => {
+                        stamp(tx, *ino);
                         tx.link(resolve(*ino, &newly)?, resolve(*parent, &newly)?, name)?;
                     }
                     Op::Unlink { parent, name } => {
+                        stamp(tx, *parent);
                         tx.unlink(resolve(*parent, &newly)?, name)?;
                     }
                     Op::Rmdir { parent, name } => {
+                        stamp(tx, *parent);
                         tx.rmdir(resolve(*parent, &newly)?, name)?;
                     }
                     Op::Rename {
@@ -935,6 +989,7 @@ impl Inner {
                         if b.elided.contains(ino) {
                             continue;
                         }
+                        stamp(tx, *ino);
                         tx.set_content(resolve(*ino, &newly)?, &chunks.refs, *size)?;
                     }
                 }
@@ -955,6 +1010,9 @@ impl Inner {
                     mtime: Some(to_meta_ts(*mtime)),
                     size: None,
                 };
+                // the same reason: this loop runs once per touched inode, and without a stamp per
+                // inode every one of them would take the transaction's opening time
+                stamp(tx, *ino);
                 match tx.setattr(m, set) {
                     Ok(_) | Err(M::NotFound) => {}
                     Err(e) => return Err(e),
