@@ -60,6 +60,17 @@ OP_CAPABILITY = {
     "fallocate": "",
     "collapse_range": "COLLAPSE_RANGE",
     "insert_range": "INSERT_RANGE",
+    "exchange_range": "EXCHANGE_RANGE",
+    "dedupe_range": "DEDUPE_RANGE",
+}
+
+# The names the runner's own probe uses, for the operations it tries. An operation with no probe
+# row here is evidenced only by fsx's own record, which is enough: fsx wrote the attempt and the
+# skip itself, in the op stream it recorded on the filesystem.
+PROBE_NAME = {
+    "punch_hole": "punch_hole", "zero_range": "zero_range",
+    "write_zeroes": "write_zeroes", "collapse_range": "collapse_range",
+    "insert_range": "insert_range", "fallocate": "fallocate",
 }
 
 # The operations that carry the file's bytes. A capability gap on an operation that does not
@@ -132,6 +143,74 @@ def manifest_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+# ltp/fsx.c line 79: the ring buffer that holds the recorded operations. Pinned in
+# fsx-gate.json's tool manifest as part of the source digest, and asserted against the binary's
+# own LOG DUMP total below.
+LOGSIZE = 10000
+
+
+def op_stream(ops_path):
+    """(sequence, skips) from the .fsxops file fsx writes with --record-ops.
+
+    sequence is the op name of each recorded operation, in order, so the two arms' streams can be
+    compared position by position. skips counts the `skip <op>` lines, which are fsx's own record
+    of an operation it attempted and the filesystem refused.
+
+    fsx keeps only the last LOGSIZE operations in this file, so the sequence is a tail and not the
+    whole run. The authoritative length is the count fsx prints when it finishes, recorded next to
+    it, and the two are reported together so a truncated stream is never read as a short one.
+    """
+    sequence = []
+    skips = {}
+    try:
+        with open(ops_path, "r", errors="replace") as f:
+            for line in f:
+                name = line.split(" ", 1)[0].strip()
+                if not name:
+                    continue
+                if name == "skip":
+                    rest = line.split(" ", 1)
+                    skipped = rest[1].split(" ", 1)[0].strip() if len(rest) > 1 else "?"
+                    skips[skipped] = skips.get(skipped, 0) + 1
+                    sequence.append("skip " + skipped)
+                    continue
+                sequence.append(name)
+    except OSError as e:
+        return [], {}, str(e)
+    return sequence, skips, None
+
+
+def first_divergence(native_seq, cowfs_seq, gaps):
+    """Where the two recorded operation streams part company, and what part company there is.
+
+    Returns None when the streams agree. Otherwise the index, both operations at it, the operation
+    names involved, and whether a recorded capability gap is what differs. Only the first
+    divergence matters: if it is an operation one arm is recorded as not having, every later
+    difference follows from it, because fsx's file offsets and lengths move once an operation is
+    skipped. If the first divergence is anything else, a capability does not explain it.
+    """
+    limit = min(len(native_seq), len(cowfs_seq))
+    for i in range(limit):
+        if native_seq[i] == cowfs_seq[i]:
+            continue
+        left, right = native_seq[i], cowfs_seq[i]
+        # fsx never skips silently: an operation it attempted and the filesystem refused is
+        # recorded as `skip <op>`. So a capability difference at this index is the same operation,
+        # one side recorded as skipped and the other not. An unrelated operation in its place is
+        # not something a gap explains.
+        bare = [n.split(" ", 1)[1] if n.startswith("skip ") else n for n in (left, right)]
+        skipped_by = [n for n, b in zip((left, right), bare) if n.startswith("skip ")]
+        return {"index": i, "native": left, "cowfs": right,
+                "operations": sorted(set(bare)),
+                "caused_by_capability": bool(skipped_by) and bare[0] == bare[1] and bare[0] in gaps}
+    if len(native_seq) != len(cowfs_seq):
+        return {"index": limit, "native": native_seq[limit] if limit < len(native_seq) else None,
+                "cowfs": cowfs_seq[limit] if limit < len(cowfs_seq) else None,
+                "operations": [], "caused_by_capability": False,
+                "one_stream_ended": True}
+    return None
 
 
 def op_counts(ops_path):
@@ -446,6 +525,7 @@ def run_case(binary, arm, root, mode, seed, ops, caps, out_dir, timeout, run_tag
     opsfile = os.path.join(case_dir, "fsx.dat.fsxops")
     ops_sha, _ = sha256_file(opsfile)
     counts = op_counts(opsfile)
+    sequence, skips, stream_error = op_stream(opsfile)
     # The evidence copy is a copy: it is verified against the file on the filesystem, and both
     # digests are recorded so a copy that did not land is visible rather than assumed. The log
     # file is not copied: fsx's log and its LOG DUMP both go to stdout, which is already in
@@ -480,6 +560,11 @@ def run_case(binary, arm, root, mode, seed, ops, caps, out_dir, timeout, run_tag
         "data_size": data_size, "data_real_fstype": fstype, "data_witness": witness,
         "data_st_dev": st_dev(data), "root_st_dev": st_dev(root),
         "ops_file": opsfile, "ops_sha256": ops_sha, "op_counts": counts,
+        "op_sequence": sequence, "op_skips": skips, "op_stream_error": stream_error,
+        "op_sequence_len": len(sequence),
+        "op_sequence_note": ("fsx keeps only the last LOGSIZE operations in this file, so this is a "
+                             "tail; log_dump_total and the completion count are the authoritative "
+                             "lengths"),
         "fsx_reported_unsupported": parse_disabled_modes(out + err),
         "over_cap": over_cap,
         "evidence": evidence, "evidence_copy": copied, "log": log,
@@ -487,26 +572,20 @@ def run_case(binary, arm, root, mode, seed, ops, caps, out_dir, timeout, run_tag
 
 
 def capability_evidence(case, probe_by_arm):
-    """Which of the hole operations this filesystem is known not to have, with the source.
+    """Which of the hole operations this arm is recorded as not having, and where that is written.
 
-    Two independent sources agree or neither counts: the runner's own probe of the syscall, and
-    fsx's own line saying it disabled the mode. fsx's message names the mode, not the operation,
-    so an op whose capability string is a substring of the message is treated as unsupported.
+    Two places on disk say so, and either is enough because both were produced by the filesystem
+    under test rather than by this script's expectations: fsx's own `skip <op>` lines in the op
+    stream it recorded in the case directory, which show it tried the operation and the filesystem
+    refused it, and the runner's probe of the same syscall.
     """
     gaps = set()
-    disabled = " ".join(case["fsx_reported_unsupported"])
-    for op, capability in OP_CAPABILITY.items():
-        if capability == "":
-            # Plain fallocate(2): the probe's "fallocate" row is the only evidence for it.
-            if probe_by_arm.get(case["arm"], {}).get("fallocate", True) is False:
-                gaps.add(op)
-            continue
-        probe_name = {"PUNCH_HOLE": "punch_hole", "ZERO_RANGE": "zero_range",
-                      "WRITE_ZEROES": "write_zeroes", "COLLAPSE_RANGE": "collapse_range",
-                      "INSERT_RANGE": "insert_range"}.get(capability, capability.lower())
-        probe_says_no = probe_by_arm.get(case["arm"], {}).get(probe_name, True) is False
-        fsx_says_no = capability in disabled
-        if probe_says_no and fsx_says_no:
+    skips = case.get("op_skips") or {}
+    probe = probe_by_arm.get(case["arm"], {})
+    for op in OP_CAPABILITY:
+        if skips.get(op):
+            gaps.add(op)
+        elif probe.get(PROBE_NAME.get(op, op)) is False:
             gaps.add(op)
     return gaps
 
@@ -523,6 +602,14 @@ def attribute_deltas(deltas, gaps):
     for op in sorted(deltas):
         (explained if op in gaps else unexplained).append(op)
     return explained, unexplained
+
+
+def case_arm(case):
+    return case.get("arm", "?")
+
+
+def mode_arm_label(arm):
+    return "the native arm" if arm == "native" else "the cowfs arm"
 
 
 def counts_or_empty(case):
@@ -607,24 +694,61 @@ def compare_case(mode, seed, ops, native, cowfs, fresh_open, probe_by_arm=None, 
     stream_match = native["ops_sha256"] is not None and native["ops_sha256"] == cowfs["ops_sha256"]
     byte_bearing_unexplained = [op for op in unexplained if op in BYTE_BEARING_OPS]
 
+    divergence = None
+    # fsx keeps only the last LOGSIZE operations in the file it records, so a run longer than that
+    # leaves a tail, not the whole stream, and position-by-position alignment of a tail compares
+    # two unrelated parts of the run. Where the arms part company is then not locatable, and the
+    # honest verdict is that it cannot be located, not that it was fine.
+    recorded = {arm: len((case.get("op_sequence") or [])) for arm, case in
+                (("native", native), ("cowfs", cowfs))}
+    declared_ops = max([ops] + [c["ops_executed"] or 0 for c in (native, cowfs)])
+    # fsx writes min(run length, LOGSIZE) operations. So a stream shorter than the run it came
+    # from is a tail, and a stream shorter than the other arm's stream is a divergence instead.
+    stream_is_tail = any(
+        (case.get("ops_executed") or 0) > LOGSIZE
+        and recorded[arm] < (case.get("ops_executed") or 0)
+        for arm, case in (("native", native), ("cowfs", cowfs)))
     if require_same_stream:
         if not stream_match:
             problems.append("op stream differs although %s declares one operation mix for both arms "
                             "(differs in %s)" % (mode["name"], ", ".join(sorted(deltas)) or "unknown"))
-    elif unexplained:
-        # No capability accounts for these, so the gate cannot say what the two arms did.
-        problems.append("op stream differs in %s with no capability behind the difference%s"
-                        % (", ".join(unexplained),
-                           "" if byte_bearing_unexplained else
-                           " (a difference in the byte-bearing operations %s cannot be excused by a "
-                           "hole capability)" % ", ".join(BYTE_BEARING_OPS)
-                           if byte_bearing_unexplained else ""))
-    if not require_same_stream and explained and not unexplained and not stream_match:
-        # Every difference is a hole capability, so the arms did genuinely different work.
-        unmeasurable.append(
-            "the two arms ran different operations (%s) because of a capability one filesystem "
-            "does not have; fsx exiting 0 on both is not execution equivalence and the bytes are "
-            "not comparable" % ", ".join(explained))
+    elif not stream_match:
+        # Where the streams part company decides what the rest of the difference means.
+        divergence = first_divergence(native.get("op_sequence") or [],
+                                      cowfs.get("op_sequence") or [], both_gaps)
+        if divergence is None:
+            # Same operation names in the same order but a different digest: the operands differ,
+            # which a capability gap does not explain either.
+            problems.append("the two op streams have the same recorded operations in the same order "
+                            "but different contents (%s then %s), so a capability gap does not "
+                            "explain it"
+                            % (native["ops_sha256"], cowfs["ops_sha256"]))
+        elif stream_is_tail:
+            unmeasurable.append(
+                "fsx ran %s operations and keeps only the last %s in the file it records, so the "
+                "recorded stream on each arm is a tail of %s and %s operations. Where the two arms "
+                "part company cannot be located in a tail, so this difference cannot be attributed. "
+                "A capability mode has to run within the recorded window for its difference to be "
+                "readable." % (declared_ops, LOGSIZE, recorded["native"], recorded["cowfs"]))
+        elif divergence["caused_by_capability"]:
+            unmeasurable.append(
+                "the two arms' operation streams part company at operation %d, where %s recorded %s "
+                "and %s recorded %s: %s is an operation this filesystem is recorded as not having, "
+                "and every difference after it follows from that, because fsx's offsets and lengths "
+                "move once an operation is skipped. The arms did different work, so their files are "
+                "not comparable and fsx exiting 0 on both is not execution equivalence."
+                % (divergence["index"],
+                   mode_arm_label(case_arm(native)), divergence["native"],
+                   mode_arm_label(case_arm(cowfs)), divergence["cowfs"],
+                   " and ".join(divergence["operations"])))
+        else:
+            problems.append(
+                "the two op streams part company at operation %d, where native recorded %s and cowfs "
+                "recorded %s, and that operation is not one this filesystem is recorded as lacking; "
+                "a capability gap explains nothing from here on, so the arms are not comparable%s"
+                % (divergence["index"], divergence["native"], divergence["cowfs"],
+                   " (one stream ends here and the other does not)" if divergence.get(
+                       "one_stream_ended") else ""))
 
     hashes_compared = False
     if stream_match:
@@ -674,6 +798,10 @@ def compare_case(mode, seed, ops, native, cowfs, fresh_open, probe_by_arm=None, 
         "ops_stream_match": stream_match, "hashes_compared": hashes_compared,
         "hash_comparison": ("compared, streams identical" if hashes_compared else
                             "not comparable: the two arms ran different operations"),
+        "first_stream_divergence": divergence,
+        "ops_stream_lengths": {"native": len(native.get("op_sequence") or []),
+                               "cowfs": len(cowfs.get("op_sequence") or [])},
+        "op_skips": {"native": native.get("op_skips"), "cowfs": cowfs.get("op_skips")},
         "op_count_deltas": deltas, "skip_delta": skip_delta,
         "deltas_explained_by_capability": explained,
         "deltas_unexplained": unexplained,

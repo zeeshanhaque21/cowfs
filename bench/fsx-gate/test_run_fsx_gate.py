@@ -38,6 +38,8 @@ def case(**kw):
             "data_st_dev": 234, "root_st_dev": 234, "over_cap": [],
             "ops_file": "/tmp/fsx.dat.fsxops", "ops_sha256": "bb",
             "op_counts": {"write": 4, "read": 3, "mapread": 1, "mapwrite": 1, "truncate": 1},
+            "op_sequence": ["write", "read", "mapread", "mapwrite", "truncate"],
+            "op_skips": {}, "op_stream_error": None,
             "fsx_reported_unsupported": []}
     base.update(kw)
     return base
@@ -85,32 +87,85 @@ class Attribution(unittest.TestCase):
 
 
 class CapabilityEvidence(unittest.TestCase):
-    def fsx_case(self, arm, disabled):
-        return {"arm": arm, "fsx_reported_unsupported": disabled}
+    """A gap needs evidence the filesystem wrote, not evidence this script assumed."""
 
-    def test_needs_both_the_probe_and_fsx_to_agree(self):
+    def case(self, arm, skips=None):
+        return {"arm": arm, "op_skips": dict(skips or {}), "fsx_reported_unsupported": []}
+
+    def test_a_recorded_skip_is_the_evidence(self):
+        probe = {"cowfs": {}}
+        got = gate.capability_evidence(self.case("cowfs", {"exchange_range": 12}), probe)
+        self.assertIn("exchange_range", got)
+
+    def test_a_probe_alone_is_also_evidence(self):
         probe = {"cowfs": {"punch_hole": False}}
-        case = self.fsx_case("cowfs", ["filesystem does not support fallocate mode "
-                                       "FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, disabling"])
-        self.assertIn("punch_hole", gate.capability_evidence(case, probe))
+        self.assertIn("punch_hole", gate.capability_evidence(self.case("cowfs"), probe))
 
-    def test_a_probe_alone_is_not_enough(self):
-        probe = {"cowfs": {"punch_hole": False}}
-        case = self.fsx_case("cowfs", [])
-        self.assertNotIn("punch_hole", gate.capability_evidence(case, probe))
-
-    def test_fsx_alone_is_not_enough(self):
+    def test_neither_recorded_nor_probed_is_no_gap(self):
         probe = {"cowfs": {"punch_hole": True}}
-        case = self.fsx_case("cowfs", ["fallocate mode FALLOC_FL_PUNCH_HOLE: unsupported"])
-        self.assertNotIn("punch_hole", gate.capability_evidence(case, probe))
+        self.assertEqual(gate.capability_evidence(self.case("cowfs"), probe), set())
+
+    def test_the_probe_of_one_arm_does_not_speak_for_the_other(self):
+        probe = {"native": {"punch_hole": False}, "cowfs": {"punch_hole": True}}
+        self.assertIn("punch_hole", gate.capability_evidence(self.case("native"), probe))
+        self.assertEqual(gate.capability_evidence(self.case("cowfs"), probe), set())
+
+
+class FirstDivergence(unittest.TestCase):
+    """F2: the attribution is mechanical. It turns on the first operation the streams disagree on."""
+
+    def test_identical_streams_have_no_divergence(self):
+        self.assertIsNone(gate.first_divergence(["a", "b"], ["a", "b"], set()))
+
+    def test_the_index_and_both_operations_are_reported(self):
+        got = gate.first_divergence(["a", "b", "c"], ["a", "x", "c"], set())
+        self.assertEqual((got["index"], got["native"], got["cowfs"]), (1, "b", "x"))
+        self.assertFalse(got["caused_by_capability"])
+
+    def test_a_recorded_skip_at_that_index_is_a_capability_difference(self):
+        got = gate.first_divergence(["exchange_range", "read"],
+                                    ["skip exchange_range", "read"], {"exchange_range"})
+        self.assertTrue(got["caused_by_capability"])
+        self.assertEqual(got["operations"], ["exchange_range"])
+
+    def test_a_skip_of_an_operation_nobody_lacks_is_not_a_capability_difference(self):
+        got = gate.first_divergence(["exchange_range", "read"],
+                                    ["skip exchange_range", "read"], {"punch_hole"})
+        self.assertFalse(got["caused_by_capability"])
+
+    def test_only_the_first_divergence_matters(self):
+        # The streams agree on the first two, so the third is where the difference starts.
+        got = gate.first_divergence(["a", "b", "punch_hole"], ["a", "b", "read"], {"punch_hole"})
+        self.assertEqual(got["index"], 2)
+        # And an unrelated operation taking the hole operation's place is not a skip of it.
+        self.assertFalse(got["caused_by_capability"])
+
+    def test_a_different_operation_in_the_place_of_a_gap_is_not_a_skip_of_it(self):
+        got = gate.first_divergence(["a", "b", "punch_hole"], ["a", "b", "skip punch_hole"],
+                                    {"punch_hole"})
+        self.assertTrue(got["caused_by_capability"])
+        got = gate.first_divergence(["a", "b", "punch_hole"], ["a", "b", "read"], {"punch_hole"})
+        self.assertFalse(got["caused_by_capability"])
+
+    def test_one_stream_ending_early_is_a_divergence(self):
+        got = gate.first_divergence(["a", "b", "c"], ["a", "b"], set())
+        self.assertTrue(got["one_stream_ended"])
+        self.assertEqual(got["index"], 2)
 
 
 class CompareCase(unittest.TestCase):
     """The reviewer's controls 12, 13 and 14, plus the guard the first version lacked."""
 
     def arms(self, native_counts, cowfs_counts, native_gaps=(), cowfs_gaps=(), disabled=(),
-             same_stream=True, native_sha="aa", cowfs_sha="aa", readback="aa"):
-        """Two arms that are identical except for what a test varies."""
+             same_stream=True, native_sha="aa", cowfs_sha="aa", readback="aa",
+             native_seq=None, cowfs_seq=None, native_skips=None, cowfs_skips=None):
+        """Two arms that are identical except for what a test varies.
+
+        The recorded op streams default to the same sequence on both arms, so a test that cares
+        about counts alone is not accidentally testing the divergence rule, and a test that cares
+        about divergence says where the streams part company.
+        """
+        base_seq = ["write", "read", "mapread", "mapwrite", "truncate"]
         probe = {"native": {op: False for op in native_gaps},
                  "cowfs": {op: False for op in cowfs_gaps},
                  "_probe_rows": []}
@@ -120,10 +175,14 @@ class CompareCase(unittest.TestCase):
         native_stream, cowfs_stream = ("same", "same") if same_stream else ("ns", "cs")
         native = case(arm="native", data_st_dev=2050, ops_sha256=native_stream, op_counts=native_counts,
                       data_real_fstype="ext4", data_realpath="/n/fsx.dat",
+                      op_sequence=list(native_seq if native_seq is not None else base_seq),
+                      op_skips=dict(native_skips or {}),
                       fsx_reported_unsupported=[line % ("PUNCH_HOLE | FALLOC_FL_KEEP_SIZE")]
                       if "punch_hole" in disabled else [])
         cowfs = case(arm="cowfs", data_st_dev=234, ops_sha256=cowfs_stream, op_counts=cowfs_counts,
                      data_real_fstype="fuse.cowfs", data_realpath="/c/fsx.dat",
+                     op_sequence=list(cowfs_seq if cowfs_seq is not None else base_seq),
+                     op_skips=dict(cowfs_skips or {}),
                      fsx_reported_unsupported=[line % "PUNCH_HOLE"] if "punch_hole" in disabled else [])
         return native, cowfs, probe, {"cowfs": {"sha256": readback, "size": 100}}
 
@@ -134,27 +193,46 @@ class CompareCase(unittest.TestCase):
             {"write": 4, "read": 1000, "punch_hole": 50, "skip": 0},
             {"write": 4, "read": 100, "skip": 50},
             cowfs_gaps=("punch_hole",), disabled=("punch_hole",),
-            same_stream=False, cowfs_sha="cc", readback="cc")
+            same_stream=False, cowfs_sha="cc", readback="cc",
+            # The hole operations agree, so the first disagreement is a read, which is not one
+            # of them.
+            native_seq=["punch_hole", "read", "write"], cowfs_seq=["punch_hole", "read"])
         got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
                                 native, cowfs, fresh, probe)
-        self.assertEqual(got["status"], "FAIL")
+        self.assertEqual(got["status"], "FAIL", got["problems"])
+        self.assertEqual(got["first_stream_divergence"]["index"], 2)
+        self.assertFalse(got["first_stream_divergence"]["caused_by_capability"])
         self.assertIn("read", got["deltas_unexplained"])
         self.assertIn("read", got["byte_bearing_deltas_unexplained"])
 
     def test_control_13_the_same_delta_with_no_gap_is_also_a_failure(self):
         native, cowfs, probe, fresh = self.arms(
-            {"write": 4, "read": 1000, "skip": 0}, {"write": 4, "read": 100, "skip": 50})
+            {"write": 4, "read": 1000, "skip": 0}, {"write": 4, "read": 100, "skip": 50},
+            # Ten recorded operations on both arms, so this is a whole stream and not a tail:
+            # one arm's runs out one operation early, which is the divergence.
+            same_stream=False,
+            native_seq=["read"] * 10, cowfs_seq=["read"] * 9)
         got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
                                 native, cowfs, fresh, probe)
-        self.assertEqual(got["status"], "FAIL")
+        self.assertEqual(got["status"], "FAIL", got["problems"])
+        self.assertTrue(got["first_stream_divergence"]["one_stream_ended"])
+        self.assertTrue(any("part company" in p for p in got["problems"]), got["problems"])
 
     def test_control_14_the_gap_on_the_native_arm_alone_is_not_an_excuse_either(self):
         native, cowfs, probe, fresh = self.arms(
             {"write": 4, "read": 1000, "skip": 0}, {"write": 4, "read": 100, "skip": 50},
-            native_gaps=("punch_hole",), disabled=("punch_hole",))
+            native_gaps=("punch_hole",), disabled=("punch_hole",), same_stream=False,
+            native_skips={"punch_hole": 50},
+            # Ten operations: the native arm performed a punch hole the cowfs arm did not reach,
+            # so its stream is one operation longer. The gap is on the other arm and explains
+            # nothing about where these two streams part company.
+            native_seq=["read"] * 9 + ["punch_hole"], cowfs_seq=["read"] * 9)
         got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
                                 native, cowfs, fresh, probe)
-        self.assertEqual(got["status"], "FAIL")
+        self.assertEqual(got["status"], "FAIL", got["problems"])
+        self.assertIn("punch_hole", got["native_capability_gaps"])
+        self.assertEqual(got["first_stream_divergence"]["index"], 9)
+        self.assertTrue(got["first_stream_divergence"]["one_stream_ended"])
 
     def test_a_pure_capability_difference_is_unmeasurable_not_a_pass(self):
         # Only hole-family ops differ: the arms did genuinely different work, so fsx exiting 0 on
@@ -162,13 +240,92 @@ class CompareCase(unittest.TestCase):
         native, cowfs, probe, fresh = self.arms(
             {"write": 4, "read": 4, "punch_hole": 50, "skip": 0},
             {"write": 4, "read": 4, "skip": 50},
-            cowfs_gaps=("punch_hole",), disabled=("punch_hole",), same_stream=False)
+            cowfs_gaps=("punch_hole",), disabled=("punch_hole",), same_stream=False,
+            cowfs_skips={"punch_hole": 50},
+            native_seq=["punch_hole", "read", "write"],
+            cowfs_seq=["skip punch_hole", "read", "write"])
         got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
                                 native, cowfs, fresh, probe)
         self.assertEqual(got["status"], "UNMEASURABLE", got["problems"])
         self.assertEqual(got["problems"], [])
-        self.assertEqual(got["deltas_unexplained"], [])
+        self.assertEqual(got["first_stream_divergence"]["index"], 0)
+        self.assertTrue(got["first_stream_divergence"]["caused_by_capability"])
         self.assertTrue(got["unmeasurable"])
+
+    def test_the_shape_of_a_real_full_mode_difference(self):
+        """The measured shape: the streams part company on the first hole operation fsx attempts,
+        and everything after it moves with the file. Not a pass, and not corruption either."""
+        native, cowfs, probe, fresh = self.arms(
+            {"write": 100, "read": 900, "punch_hole": 12, "exchange_range": 12, "skip": 0},
+            {"write": 110, "read": 800, "skip": 24},
+            cowfs_gaps=("punch_hole", "exchange_range"), same_stream=False,
+            cowfs_skips={"punch_hole": 12, "exchange_range": 12},
+            native_seq=["exchange_range", "read", "write"],
+            cowfs_seq=["skip exchange_range", "read", "write"])
+        got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "UNMEASURABLE", got["problems"])
+        self.assertEqual(got["first_stream_divergence"]["index"], 0)
+        self.assertEqual(got["first_stream_divergence"]["operations"], ["exchange_range"])
+        # Every count delta is still recorded, the ones no capability names included.
+        self.assertIn("read", got["op_count_deltas"])
+        self.assertEqual(got["hash_comparison"], "not comparable: the two arms ran different "
+                                                "operations")
+
+    def long_run_pair(self, executed, native_seq, cowfs_seq, skips):
+        """Two arms of a run longer than the recorded window, built directly."""
+        probe = {"native": {}, "cowfs": {}, "_probe_rows": []}
+        native = case(arm="native", data_st_dev=2050, ops_executed=executed,
+                      data_real_fstype="ext4", data_realpath="/n/fsx.dat",
+                      ops_sha256="ns", op_sequence=native_seq)
+        cowfs = case(data_st_dev=234, ops_executed=executed, ops_sha256="cs",
+                     data_real_fstype="fuse.cowfs", data_realpath="/c/fsx.dat",
+                     op_sequence=cowfs_seq, op_skips=skips)
+        return native, cowfs, probe, {"cowfs": {"sha256": "aa", "size": 100}}
+
+    def test_a_recorded_stream_shorter_than_the_run_cannot_be_attributed(self):
+        # fsx keeps only the last LOGSIZE operations it records. A run longer than that leaves a
+        # tail on each arm, and where two arms part company cannot be located in a tail, so the
+        # pair is UNMEASURABLE and never PASS, whatever the counts say.
+        native, cowfs, probe, fresh = self.long_run_pair(
+            20000, ["read"] * 10000, ["skip punch_hole"] + ["read"] * 9999, {"punch_hole": 24})
+        got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 20000,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "UNMEASURABLE", got["problems"])
+        self.assertTrue(any("tail of" in u for u in got["unmeasurable"]), got["unmeasurable"])
+        self.assertEqual(got["ops_stream_lengths"], {"native": 10000, "cowfs": 10000})
+
+    def test_a_whole_stream_at_the_same_length_can_be_attributed(self):
+        # The same difference inside the recorded window is locatable, and a capability gap at the
+        # first divergence makes the pair UNMEASURABLE with the reason rather than a silent pass.
+        native, cowfs, probe, fresh = self.long_run_pair(
+            10000, ["punch_hole"] + ["read"] * 9999, ["skip punch_hole"] + ["read"] * 9999,
+            {"punch_hole": 24})
+        got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10000,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "UNMEASURABLE", got["problems"])
+        self.assertEqual(got["first_stream_divergence"]["index"], 0)
+        self.assertTrue(got["first_stream_divergence"]["caused_by_capability"])
+
+    def test_a_difference_after_a_gap_is_still_attributed_to_the_gap_and_recorded(self):
+        # The gap is at the first divergence, so everything after it moves with the file. That is
+        # UNMEASURABLE with the deltas on the record, and it is not a failure: nothing asserted
+        # anything false.
+        native, cowfs, probe, fresh = self.long_run_pair(
+            10000, ["punch_hole"] + ["read"] * 9999, ["skip punch_hole"] + ["read"] * 9998,
+            {"punch_hole": 24})
+        native["op_sequence"][1] = "truncate"
+        native["op_counts"] = {"write": 100, "read": 900, "truncate": 12, "skip": 0}
+        cowfs["op_counts"] = {"write": 110, "read": 800, "truncate": 11, "skip": 24}
+        got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10000,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "UNMEASURABLE", got["problems"])
+        self.assertEqual(got["problems"], [])
+        self.assertEqual(got["first_stream_divergence"]["index"], 0)
+        self.assertIn("every difference after it follows from that", got["unmeasurable"][0])
+        self.assertEqual(got["ops_stream_lengths"], {"native": 10000, "cowfs": 9999})
+        # The unexplained deltas are still recorded even though they are consequences.
+        self.assertIn("truncate", got["op_count_deltas"])
 
     def test_a_matched_mode_with_a_stream_difference_is_a_failure(self):
         native, cowfs, probe, fresh = self.arms({"write": 4}, {"write": 5}, same_stream=False)

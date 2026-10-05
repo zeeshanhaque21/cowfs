@@ -88,7 +88,8 @@
     "max_op_bytes": 16384,
     "max_bytes_written_per_arm": 7864320,
     "comment": "fsx's own defaults are a 256 KiB file and a 64 KiB operation; the op cap is lowered to 16 KiB so a seed stays modest. Byte caps are enforced by the runner, which refuses a data file over max_file_bytes and reports the total written per arm.",
-    "caps_note": "max_file_bytes and max_op_bytes reach fsx as -l and -o and the runner refuses a data file larger than max_file_bytes. max_bytes_written_per_arm is the whole-run budget per arm: the declared batch is 15 seed pairs, so 15 x 2 x max_file_bytes, and a run that exceeds it is reported FAIL after the fact rather than refused mid-run, because the per-file cap is the one fsx enforces and the total is this gate's own budget."
+    "caps_note": "max_file_bytes and max_op_bytes reach fsx as -l and -o and the runner refuses a data file larger than max_file_bytes. max_bytes_written_per_arm is the whole-run budget per arm: the declared batch is 15 seed pairs, so 15 x 2 x max_file_bytes, and a run that exceeds it is reported FAIL after the fact rather than refused mid-run, because the per-file cap is the one fsx enforces and the total is this gate's own budget. recorded_op_window is fsx's own LOGSIZE, the ring buffer it keeps the recorded operations in. A mode whose difference has to be located runs within it; a mode compared by digest does not need to.",
+    "recorded_op_window": 10000
   },
   "arms": [
     "native",
@@ -141,7 +142,7 @@
         89
       ],
       "ops": 20000,
-      "why": "The declared batch: ten seeds, one operation mix on both arms, so the two files must end byte-identical. The fallocate family is disabled on BOTH arms, which is what makes the two operation streams identical; that is a declared subset of fsx's capability set, not a weakened acceptance."
+      "why": "The declared batch: ten seeds, one operation mix on both arms, so the two files must end byte-identical. The fallocate family is disabled on BOTH arms, which is what makes the two operation streams identical; that is a declared subset of fsx's capability set, not a weakened acceptance. At 20000 operations the recorded stream is a tail, so this mode relies on the digest comparison, which covers the whole run, and not on locating the first divergence."
     },
     {
       "name": "sync",
@@ -174,8 +175,8 @@
         2,
         3
       ],
-      "ops": 20000,
-      "why": "fsx's own default mix with every capability it finds, which is how the hole coverage of this mount is measured rather than assumed. This mode cannot PASS: the mount has no fallocate, so fsx records a different operation stream on each arm and the two files are not comparable. fsx's exit status is recorded; execution equivalence is UNMEASURABLE and stays that way until the mount implements fallocate. Issue 103."
+      "ops": 10000,
+      "why": "fsx's own default mix with every capability it finds, which is how the hole coverage of this mount is measured rather than assumed. This mode cannot PASS: the mount has no fallocate, so fsx records a different operation stream on each arm and the two files are not comparable. It runs at 10000 operations rather than 20000 because fsx keeps only the last 10000 operations it records, and locating where the two arms part company needs the whole stream, not a tail. fsx's exit status is recorded; execution equivalence is UNMEASURABLE and stays that way until the mount implements fallocate. Issue 103."
     }
   ],
   "required_op_types": {
