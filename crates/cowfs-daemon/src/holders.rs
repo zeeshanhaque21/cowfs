@@ -146,7 +146,7 @@ fn finish(pid: u32, command: String, holds: Vec<Hold>) -> Option<ProcessInfo> {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::{finish, hold, Hold, HoldKind, Path, PathBuf, ProcessInfo};
+    use super::{finish, hold, Hold, HoldKind, Path, ProcessInfo};
     use std::collections::BTreeSet;
 
     /// `(major, minor, inode)` triples named by `/proc/locks`, which is how a flock is seen here:
@@ -182,7 +182,7 @@ mod imp {
     ///
     /// Found by shape rather than by index, because a waiting lock inserts `-> PID` between the pid
     /// and the device and an OFD lock prints a pid of `-1`.
-    fn device_of(line: &str) -> Option<(u64, u64, u64)> {
+    pub fn device_of(line: &str) -> Option<(u64, u64, u64)> {
         let field = line
             .split_whitespace()
             .find(|f| f.matches(':').count() == 2 && !f.contains("->"))?;
@@ -247,9 +247,6 @@ mod imp {
         }
         Ok(out)
     }
-
-    /// `PathBuf` is imported for the other platform's module and unused here.
-    const _: fn() -> Option<PathBuf> = || None;
 }
 
 #[cfg(not(target_os = "linux"))]
