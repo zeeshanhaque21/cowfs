@@ -334,9 +334,34 @@ geometry and it is left alone deliberately: widening it to 500 ms is what hid th
 
 `a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame` is the committed regression. A
 finite handler, so the terminal frame is the only thing left to deliver and a late arrival cannot be
-a progress frame. Four geometries, five reps each: `a4`'s 200/250 ms resuming at 340 and 400 ms, and a
-1000 ms grace resuming at 900 and 950 ms, which is inside the window but past any halfway or
-two-thirds cut. 20 of 20 whole frames on this source; on the half-split head the first geometry fails
+a progress frame. Three geometries, five reps each, all past the cut the half-split head used and all
+with real room left for the unwind, the handler return and the terminal write. Resume is measured from
+the start of shutdown, so the window closes at `deadline + drain_deadline`:
+
+| case | window closes | resume | room left | half-split cut was |
+|---|---|---|---|---|
+| 200/250 | 450 ms | 340 ms | 110 ms | 325 ms |
+| 200/1000 | 1200 ms | 900 ms | 300 ms | 700 ms |
+| 200/1000 | 1200 ms | 950 ms | 250 ms | 700 ms |
+
+15 of 15 whole frames with the peer closed, and on the half-split head the first geometry fails
 outright with `whole_terminal=false` at 340 ms.
+
+The 200/250 geometry resuming at 400 ms was a committed point and is no longer one. It left 50 ms, and
+one hosted macOS rep in six missed it at `elapsed_ms=547` against a 450 ms window. A hard `whole`
+assertion that close to the bound fails intermittently on a loaded runner and gets blamed on something
+else. Resuming at 340 ms in that geometry still sits past the 325 ms cut, which is the property under
+test, with more than twice the room. Resuming at 400 to 449 ms there remains worth probing by hand and
+appears in the review evidence; it is not a hosted correctness gate, because no scheduler promises
+50 ms.
+
+The fixture emits one mebibyte per event, which parks on the first write on every runner where the
+sibling 1 MiB fixtures here park, and two events, so it still parks if a runner absorbs the first.
+Deliberately not more: every extra event is backlog the client must drain after it resumes, and that
+drain is charged against the room left in the window. An earlier 400 events of 2000 bytes, 781 KiB in
+total, did not park on the ubuntu runner at all, so `assert_parked` failed before any assertion about
+frames ran; that the socket buffer absorbed it is inference from the step counter advancing 37 to 50,
+not a measurement. Eight events of 1 MiB then left up to 7 MiB to drain in the 110 ms the 450 ms
+geometry allows, and failed locally at `elapsed_ms=456`. `assert_parked` is unchanged throughout.
 
 Measured with `shutdown_deadline` 300 ms and `drain_deadline` 500 ms, so the budget is 800 ms and the
