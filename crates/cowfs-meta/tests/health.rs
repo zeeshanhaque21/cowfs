@@ -90,9 +90,10 @@ struct Fixture {
 /// redb keeps two commit slots and shares every page the newer commit did not rewrite, so when the
 /// last commit is a single small write almost every page belongs to both slots: damaging one
 /// breaks the previous commit too and no rollback is possible. Measured on a 78-page fixture
-/// built with a one-write final commit, all 155 single- and two-page candidates gave either
-/// "still opens" or "unrepairable" and none gave a rollback. A final batch of `TAIL` files gives
-/// the newest slot pages of its own, and then a rollback is reachable.
+/// built with a one-write final commit, all 153 single- and two-page candidates (the search
+/// enumerates `(N-1) + (N-2)`) gave either "still opens" or "unrepairable" and none gave a
+/// rollback. A final batch of `TAIL` files gives the newest slot pages of its own, and then a
+/// rollback is reachable.
 fn build(path: &Path, files: u32, snapshots: &[&str]) -> Fixture {
     let m = Meta::open(path, opts()).unwrap();
     let (mut inodes, mut snaps) = (Vec::new(), Vec::new());
