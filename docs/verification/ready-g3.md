@@ -345,10 +345,15 @@ truth.
 
 Counts from this repair:
 
-- 68 checks in `bench/test_pjdfstest.py`, none skipped, ruff and py_compile clean
+- 73 checks in `bench/test_pjdfstest.py`, none skipped, ruff and py_compile clean
+- five of those are `VerdictStates` methods that default discovery had never collected, because
+  their names lacked the `test_` prefix. Two were stale the moment they ran, and the one whose
+  expectation the settled taxonomy does not support is now named for what it asserts, with the
+  question left to the gate's owner rather than settled by a test or by a classifier change
 - 104 checks from `python3 -m unittest discover -s bench` in a clean copy of the tracked files with
-  no `bench/out` and no `.git`: all pass, no skips. 68 are this lane's and 36 belong to
-  `bench/test_gates.py`, which another lane owns
+  no `bench/out` and no `.git`: all pass, no skips, of which 68 were this lane's and 36 belong to
+  `bench/test_gates.py`, which another lane owns. That count is the one measured before this round's
+  five were collected, and it is left as measured rather than restated as a fresh total
 - 29 checks in the writer, classification and fixture classes, run as written, reversed, odds then
   evens, in three seeded shuffles, and each alone in its own process: no failures, no order coupling
 - the two classification checks fail against the previous source in a tree with no cache, one with
@@ -425,7 +430,7 @@ and are read-only evidence.
 Same input, three working directories, the published CLI as a child process, the pinned five-case
 closure, outputs into three fresh directories:
 
-| working directory | exit | payload sha256 |
+| working directory | exit | payload sha256 in this checkout |
 | --- | --- | --- |
 | the fixture directory | 1 | `ca26de0f649457fe...` |
 | its parent | 1 | `ca26de0f649457fe...` |
@@ -433,6 +438,14 @@ closure, outputs into three fresh directories:
 
 The three payloads are byte-identical, each with 25 established regressions and 26 unpairable
 assertions.
+
+That digest is a witness for one checkout at one commit, not a content address of the verdict.
+The payload embeds the reader's own absolute paths: the identity receipt's path, the test directory
+read, the ambient checkout and its head.
+Move the run, or read it from another clone, and the same records give a different digest with the
+same verdict.
+Only the parts of the payload that are hashes of the inputs, the analyser's own sha256 and the
+transcript hashes, are environment-independent, and those are the parts to compare across machines.
 
 Two ways a record set can still mislead are closed by name:
 
@@ -585,7 +598,7 @@ while True:
 sys.exit(subprocess.run(sys.argv[2:]).returncode)' /Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/mac-heavy.lock \
   python3 bench/pjdfstest.py --tests mkfifo/00.t,open/17.t,mkdir/00.t,rmdir/12.t,unlink/14.t
 
-# The comparator's own checks. 68 of them, none of which needs the tool cache or a mount.
+# The comparator's own checks. 73 of them, none of which needs the tool cache or a mount.
 python3 bench/test_pjdfstest.py
 python3 -m unittest discover -s bench
 

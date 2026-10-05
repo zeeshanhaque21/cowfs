@@ -282,7 +282,8 @@ exactly the attribution the old field got wrong.
 
 | check | source | result |
 | --- | --- | --- |
-| `python3 bench/test_pjdfstest.py` | this lane | 68 checks, exit 0 |
+| `python3 bench/test_pjdfstest.py` | this lane | 73 collected, 73 run, exit 0 |
+| `python3 -m unittest test_pjdfstest.VerdictStates` | this lane | 5 collected ids, 5 run, exit 0 |
 | `python3 -m unittest discover -s bench` in a copy of the tracked files with no `bench/out` and no `.git` | this lane | 104 checks, exit 0, no skips, of which 68 are this lane's and 36 are `bench/test_gates.py` |
 | the writer, classification and fixture classes as written, reversed, odds then evens, three seeded shuffles, and each check alone | this lane | 29 checks, 0 failures each way, 0 skips |
 | the two classification checks against the previous source | this lane, in a cache-free tree | both fail |
@@ -328,7 +329,7 @@ receipt and not the fixture.
 
 | number | source |
 | --- | --- |
-| three working directories, exit 1 each, payload sha256 `ca26de0f649457fe` identical | the published CLI as a child process, outputs in three fresh directories |
+| three working directories, exit 1 each, payload sha256 `ca26de0f649457fe` identical within this checkout | the published CLI as a child process, outputs in three fresh directories; the digest also moves if the run directory or the clone moves, because the payload embeds absolute paths, so it is a within-environment witness rather than a portable digest |
 | 25 established and 26 unpairable from all three | each payload's comparison |
 | a relative raw path that climbs out of the run is refused by name | a check with `../outside/borrowed.tap`, exit 3 |
 | a relative raw path through a symlink out of the run is refused | a check with `raw/link.tap`, exit 3 |
@@ -356,6 +357,44 @@ inherits the machine's state.
 `COWFS_BENCH_FAKE_LOAD1` exists as a hook in `bench/gates.py` and no check in `test_gates.py` sets
 it.
 #125 carries the fix, and asks for the preserved failure first, which nobody has.
+
+## Five verdict properties that were never collected
+
+`VerdictStates` held five methods whose names lacked the `test_` prefix, so default discovery never
+collected them and every report of this module's coverage excluded them.
+They are not new tests and they were not written this round; they were written, not collected.
+
+| before | after |
+| --- | --- |
+| `getTestCaseNames(VerdictStates)` returns 0 usable tests | returns 5 ids |
+| module collects 68 | module collects 73 |
+| the class is never run by `python3 bench/test_pjdfstest.py` | it is, and passes |
+
+Two of the five were stale the moment they ran, which is what collection would have shown:
+
+| method | wanted | got | why |
+| --- | --- | --- | --- |
+| established regression is FAIL | FAIL 1 | INVALID 3 | the fixture passed no source, so the classification prerequisite refused |
+| a pass needs a pairable scope | UNMEASURABLE 2 | INVALID 3 | same |
+
+The first is corrected by giving the fixture the verified pinned context it needs: the committed
+curated closure, checked against its pins inside the check itself, and a case whose pinned script
+proves its own slot order, which is what the real transcript looks like.
+One established regression in that context is FAIL 1, and the check asserts the regression count as
+well as the state.
+
+The second is not a fixture defect and is recorded rather than settled here.
+The settled taxonomy discloses coverage and lets no other kind of reason move the exit, so a run with
+a verified source and nothing pairable is PASS 0 with a disclosure, which is what the check now
+asserts, along with the same fixture being INVALID 3 when the source is absent.
+Whether an entirely empty scope should read as a pass is the gate owner's question: it has the same
+shape as the false pass this harness refuses elsewhere, evidence that could not be read.
+The method is renamed to what it asserts, and nothing in the production classifier changed.
+
+The other three were already correct and needed only the prefix: a synthetic record is refused by the
+verdict itself, malformed JSON is invalid input rather than a pass, and a record set mixing raw and
+raw-less cases is refused. Each still asserts its own specific message, so the prefix did not turn
+them into duplicates of the new prerequisite checks.
 
 ## What was not done
 
