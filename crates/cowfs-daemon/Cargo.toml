@@ -43,3 +43,7 @@ workspace = true
 [[test]]
 name = "guard"
 path = "tests/guard/mod.rs"
+
+[[test]]
+name = "evidence"
+path = "tests/evidence/mod.rs"

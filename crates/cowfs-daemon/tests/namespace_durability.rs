@@ -15,6 +15,10 @@
 //! cargo test -p cowfs-daemon --test namespace_durability -- --ignored --test-threads=1 --nocapture
 //! ```
 
+#[path = "evidence/reader.rs"]
+mod evidence;
+
+use evidence::{Provenance, Row};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -396,32 +400,59 @@ fn a_synced_namespace_survives_a_killed_daemon() {
         return;
     }
     let only = std::env::var("DURABILITY90_ONLY").ok();
-    let evidence = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(artifacts().join("results.jsonl"))
-        .expect("the evidence file");
-    let mut w = std::io::BufWriter::new(evidence);
+    // One attempt, one directory, one provenance record. The revision and every binding are
+    // repeated on each row, so a reader of the rows alone is not relying on the manifest having been
+    // shipped alongside, and no row can be mistaken for the output of some other tree.
+    let attempt = std::env::var("DURABILITY90_ATTEMPT").unwrap_or_else(|_| "local".into());
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let prov = Provenance::collect(
+        &repo,
+        &[
+            "crates/cowfs-daemon/tests/namespace_durability.rs",
+            "crates/cowfs-nfs/src/adapter.rs",
+            "crates/cowfs-nfs/src/lib.rs",
+            "crates/cowfs-core/src/inner.rs",
+            "crates/cowfs-core/src/io.rs",
+            "crates/cowfs-core/src/view.rs",
+            "crates/cowfs-core/src/vfs_impl.rs",
+            "crates/cowfs-vfs/src/vfs.rs",
+        ],
+        &[test_bin().join("cowfs-daemon"), test_bin().join("cowfs")],
+    );
+    eprintln!(
+        "durability90 attempt {attempt}: revision {} ({}), {} bindings",
+        prov.revision.head,
+        prov.revision.label(),
+        prov.bound.len()
+    );
+    let dir = artifacts().join("repair").join(&attempt);
+    let mut rows: Vec<Row> = Vec::new();
     let mut outcomes = Vec::new();
     for case in After::CASES {
         if only.as_deref().is_some_and(|want| want != case.name()) {
             continue;
         }
-        for nth in 1..=3 {
+        // `DURABILITY90_REPS` bounds the matrix for a small provenance run, so a receipt can be
+        // regenerated from an actual measurement without paying for the full three-per-case batch.
+        let reps: usize = std::env::var("DURABILITY90_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(3);
+        for nth in 1..=reps {
             let out = rep(case, nth);
-            // Appended and flushed per rep, so a run that dies keeps what it proved.
-            writeln!(
-                w,
-                "{{\"case\":\"{}\",\"rep\":{},\"pid\":{},\"new_name\":{},\"old_name\":{},\"fsck\":{:?}}}",
-                out.case,
-                out.rep,
-                out.pid,
-                out.after.is_some(),
-                out.old_back.is_some(),
-                out.fsck.trim()
-            )
-            .expect("the evidence line");
-            w.flush().expect("flush the evidence line");
+            rows.push(Row {
+                case: out.case,
+                rep: out.rep,
+                pid: out.pid,
+                new_name_kept: out.after.is_some(),
+                old_name_back: out.old_back.is_some(),
+                new_digest: out.after.as_deref().map(digest).unwrap_or_default(),
+                fsck: out.fsck.trim().to_string(),
+            });
+            // Rewritten and flushed after every rep, so a run that dies keeps the rows it already
+            // proved.
+            evidence::write_attempt(&dir, &attempt, &prov, &rows).expect("write the receipts");
             outcomes.push(out);
         }
     }
