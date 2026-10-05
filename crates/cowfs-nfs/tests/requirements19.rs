@@ -77,13 +77,12 @@ fn a_native_chmod_through_a_symlink_lands_on_the_target() {
     let s = scratch();
     fs::write(s.native.join("target"), b"x").unwrap();
     std::os::unix::fs::symlink("target", s.native.join("link")).unwrap();
-    fs::set_permissions(
-        s.native.join("link"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    fs::set_permissions(s.native.join("link"), fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
-        (mode_of(&s.native.join("link")), mode_of(&s.native.join("target"))),
+        (
+            mode_of(&s.native.join("link")),
+            mode_of(&s.native.join("target"))
+        ),
         (0o755, 0o600),
         "a followed chmod changed the target and left the link alone"
     );
@@ -107,10 +106,7 @@ fn setattr_gives_a_symlink_its_own_times_and_mode_over_the_real_filesystem() {
     let (st, after) = c.setattr(&link, sattr_mtime(1000, 5));
     assert_eq!(st, OK, "a valid symlink takes its own times");
     assert_eq!(
-        (
-            after.unwrap().mtime.seconds,
-            after.unwrap().mtime.nseconds
-        ),
+        (after.unwrap().mtime.seconds, after.unwrap().mtime.nseconds),
         (1000, 5)
     );
     assert_eq!(
@@ -135,14 +131,21 @@ fn setattr_gives_a_symlink_its_own_times_and_mode_over_the_real_filesystem() {
     assert_eq!(st, OK);
     assert_eq!(a.unwrap().mode, 0o600);
     assert_eq!(
-        (mode_of(&s.backing.join("link")), mode_of(&s.backing.join("target"))),
+        (
+            mode_of(&s.backing.join("link")),
+            mode_of(&s.backing.join("target"))
+        ),
         (0o600, 0o644),
         "the link's mode changed on disk and the target's did not"
     );
 
     let a = c.attrs(&link);
     assert_eq!(a.ftype, ftype3::NF3LNK, "the handle still names the link");
-    assert_eq!((a.mode, a.size), (0o600, 6), "the link keeps its own attributes");
+    assert_eq!(
+        (a.mode, a.size),
+        (0o600, 6),
+        "the link keeps its own attributes"
+    );
 }
 
 /// #19: readdir replies carried a stale `nlink`, so `find -links +1` undercounted. The count in
@@ -415,13 +418,13 @@ fn touching_a_symlink_on_the_mount_leaves_its_target_alone() {
     let target_mtime = mtime_of(&src.join("node_modules/.bin/tool"));
 
     // The control: the same rsync into a plain directory succeeds, so exit 23 could only be ours.
-    let (ok, out) = sh(&s.dir.path().join("native"), "rsync -a ../src/ dst/");
+    let (ok, out) = sh(&s.native, &format!("rsync -a {}/ dst/", src.display()));
     assert!(ok, "native rsync failed: {out}");
 
     let Some((m, mnt)) = mounted_backing(&s.backing, MountOptions::default()) else {
         return;
     };
-    let (ok, out) = sh(&mnt, "rsync -a ../src/ tree/");
+    let (ok, out) = sh(&mnt, &format!("rsync -a {}/ tree/", src.display()));
     println!("RSYNC ok={ok} out={out:?}");
     assert!(ok, "rsync onto the mount failed: {out}");
 
@@ -440,7 +443,13 @@ fn touching_a_symlink_on_the_mount_leaves_its_target_alone() {
     // The kernel client itself, not rsync: `touch -h` never follows, and on the mount it becomes
     // SETATTR on the link's own file handle. The same stamp is applied to a native copy of the
     // same tree, so the expected value needs no hardcoded epoch.
-    let (ok, out) = sh(&s.native, "rsync -a ../src/ . && touch -h -t 200001020304 node_modules/.bin/link");
+    let (ok, out) = sh(
+        &s.native,
+        &format!(
+            "rsync -a {}/ . && touch -h -t 200001020304 node_modules/.bin/link",
+            src.display()
+        ),
+    );
     assert!(ok, "native control touch failed: {out}");
     let wanted = mtime_of(&s.native.join("node_modules/.bin/link"));
     let (ok, out) = sh(
@@ -453,8 +462,7 @@ fn touching_a_symlink_on_the_mount_leaves_its_target_alone() {
     for name in ["link", "dangling"] {
         let on_mount = mtime_of(&mnt.join(format!("tree/node_modules/.bin/{name}")));
         assert_eq!(
-            on_mount,
-            wanted,
+            on_mount, wanted,
             "{name} took the time the client asked for"
         );
     }
