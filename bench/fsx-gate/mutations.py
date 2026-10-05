@@ -8,8 +8,11 @@ Every control is a way of lying to the runner. The point of the list is that eac
 changes the arm's identity, changes what fsx is allowed to excuse, or fakes work that was never
 done. A control that comes back PASS is a defect in the gate, not a control that failed.
 
-None of this mounts anything or needs root: the controls that would need a real mount are marked
-as such and are run by hand against a private one, recorded in the report.
+Exit codes are the repository-wide contract: 0 PASS, 1 FAIL, 2 UNMEASURABLE, 3 INVALID. A control
+that comes back 0 is a defect in the gate, not a control that failed.
+
+Nothing here mounts anything or needs root on its own account; the controls that need a real mount
+are run against the caller's private one, which is what --cowfs-root and --daemon-pid-file name.
 """
 
 import argparse
@@ -57,7 +60,7 @@ def control_second_arm_is_not_cowfs(args, work):
                           "--out", os.path.join(work, "out-5d"), "--mode", "full",
                           "--label", "control-5d-tmpfs-as-cowfs"])
     return {"control": "5d", "name": "a tmpfs labelled cowfs", "exit": code,
-            "expect": "refused before any case",
+            "expect": "3 INVALID: refused before any case",
             "status": "ok" if code == 3 and "cowfs" in out else "LEAK",
             "output": out.strip().splitlines()[:6] + err.strip().splitlines()[:2]}
 
@@ -89,7 +92,7 @@ def control_synthetic_child(args, work):
                           "--daemon-pid-file", args.daemon_pid_file or "",
                           "--label", "control-16-synthetic-child"])
     return {"control": "16", "name": "a synthetic child instead of the pinned fsx", "exit": code,
-            "expect": "refused: the binary is not the manifest's",
+            "expect": "3 INVALID: the binary is not the manifest's",
             "status": "ok" if code == 3 and "manifest" in out else "LEAK",
             "output": out.strip().splitlines()[:6] + err.strip().splitlines()[:2]}
 
@@ -121,11 +124,14 @@ def control_reused_attempt_dir(args, work):
     after = sorted(os.listdir(os.path.join(args.cowfs_root, ".fsx-gate")))
     # The child writes no bytes, so its data file is empty and the gate must refuse the empty
     # result. Nothing is deleted, so the stale directory is still there and still unread.
-    refused_empty = code == 1 and "empty" in out
+    # The result is empty and its op stream is missing, which the contract calls INVALID rather
+    # than FAIL: both are refusals, and this control tests that it refuses and does not fall back
+    # on the stale directory. What it must never be is 0.
+    refused_empty = code != 0 and "empty" in out
     # And the fresh attempt must be a new directory, not the stale one.
     fresh_dirs = [d for d in after if d not in before]
     return {"control": "19", "name": "a child that writes nothing over stale bytes", "exit": code,
-            "expect": "an empty result is refused and the stale directory is not reused",
+            "expect": "not 0: an empty result is refused and the stale directory is not reused",
             "status": "ok" if refused_empty and "stale-case" not in fresh_dirs else "LEAK",
             "attempt_dirs_before": before, "attempt_dirs_after": after,
             "stale_preserved": "stale-case" in after,
@@ -144,7 +150,7 @@ def control_restart_noop(args, work):
                           "--restart-cmd", "/bin/true"])
     leaked = code == 0
     return {"control": "17", "name": "a restart hook that does nothing", "exit": code,
-            "expect": "failed: pid and start time are unchanged",
+            "expect": "3 INVALID: pid and start time unchanged, so nothing replaced the daemon",
             "status": "LEAK" if leaked else "ok",
             "output": out.strip().splitlines()[-6:] + err.strip().splitlines()[:2]}
 

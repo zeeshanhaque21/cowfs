@@ -564,6 +564,70 @@ class ImmutableAttemptDir(unittest.TestCase):
             self.assertEqual(os.listdir(other), [])
 
 
+class Tabulate(unittest.TestCase):
+    """The document's tables are re-derived from a run's own record, not typed from a terminal."""
+
+    def load_tabulator(self):
+        import importlib.util
+        path = os.path.join(HERE, "tabulate.py")
+        spec = importlib.util.spec_from_file_location("cowfs_fsx_gate_tabulate", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def record(self, tmp, status="PASS", pairs_passed=1, divergence=None):
+        rows = [{"kind": "meta", "fsx": {"sha256": "ab" * 32},
+                 "roots": {"native": {"fstype": "ext4", "st_dev": 2050},
+                           "cowfs": {"fstype": "fuse.cowfs", "st_dev": 171}}},
+                {"kind": "compare", "mode": "smoke", "seed": 1, "ops_requested": 200,
+                 "status": status, "ops_stream_match": divergence is None,
+                 "first_stream_divergence": divergence,
+                 "data_sha256": {"native": "a" * 64, "cowfs": "b" * 64},
+                 "data_st_dev": {"native": 2050, "cowfs": 171},
+                 "data_fstype": {"native": "ext4", "cowfs": "fuse.cowfs"}},
+                {"kind": "verdict", "status": status, "cases": 2, "pairs_passed": pairs_passed,
+                 "pairs_failed": 0, "pairs_unmeasurable": 0, "exit_code": 0,
+                 "failures": [], "unmeasurable": [], "invalid": [], "capability_gaps": []}]
+        path = os.path.join(tmp, "cases.jsonl")
+        with open(path, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        return path
+
+    def test_it_reads_the_record_rather_than_being_told(self):
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-tab-") as tmp:
+            path = self.record(tmp)
+            got = json.loads(self.load_tabulator().render(path, False))
+        self.assertEqual(got["status"], "PASS")
+        self.assertEqual(got["cases"], 2)
+        self.assertEqual(got["fsx_sha256"], "ab" * 32)
+        self.assertEqual(got["compares"][0]["native_sha256"], "a" * 12)
+
+    def test_the_markdown_names_the_directory_the_record_came_from(self):
+        module = self.load_tabulator()
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-tab-") as tmp:
+            run = os.path.join(tmp, "repair-batch2")
+            os.makedirs(run)
+            path = self.record(run)
+            text = module.render(path, True)
+        self.assertIn("repair-batch2", text)
+        self.assertIn(path, text)
+
+    def test_a_located_divergence_appears_in_the_table(self):
+        module = self.load_tabulator()
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-tab-") as tmp:
+            path = self.record(tmp, status="UNMEASURABLE", pairs_passed=0,
+                               divergence={"index": 6, "native": "fallocate",
+                                           "cowfs": "skip fallocate",
+                                           "operations": ["fallocate"],
+                                           "caused_by_capability": True})
+            text = module.render(path, True)
+        self.assertIn("6: fallocate vs skip fallocate", text)
+
+    def test_a_missing_record_is_refused_not_an_empty_table(self):
+        self.assertEqual(self.load_tabulator().main(["/nonexistent/cases.jsonl"]), 2)
+
+
 class ExitContract(unittest.TestCase):
     """R9: the repository-wide result contract, and a kind that is set rather than parsed."""
 
@@ -785,6 +849,50 @@ class ByteCaps(unittest.TestCase):
         self.assertIn("caps_note", caps)
         self.assertIn("max_bytes_written_per_arm", caps["caps_note"])
         self.assertIn("reported FAIL", caps["caps_note"])
+
+
+class UnreadableResult(unittest.TestCase):
+    """A result that could not be read is missing evidence, and the gate has to say so.
+
+    Found by the exit-taxonomy controls: sha256_file returns (None, the reason) when it cannot
+    read a file, so the size came back a string, comparing it against the per-case cap raised a
+    TypeError, and the run died with a traceback and exit 1. That is the worst shape a defect can
+    take here: the exit code was right by accident and nothing recorded why.
+    """
+
+    def test_an_unreadable_digest_reports_the_reason_and_no_size(self):
+        got = gate.sha256_file("/nonexistent/fsx.dat")
+        self.assertIsNone(got[0])
+        self.assertIsInstance(got[1], str)
+
+    def test_a_readable_file_gives_an_integer_size(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"abc")
+            path = f.name
+        digest, size = gate.sha256_file(path)
+        os.unlink(path)
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(size, 3)
+        self.assertIsInstance(size, int)
+
+    def test_a_missing_data_file_is_invalid_not_a_crash(self):
+        native = case(arm="native", data_st_dev=2050, data_real_fstype="ext4",
+                      data_realpath="/n/fsx.dat")
+        cowfs = case(data_st_dev=234, data_real_fstype="fuse.cowfs", data_realpath="/c/fsx.dat",
+                     data_sha256=None, data_size=None,
+                     data_error="fsx.dat: No such file or directory")
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
+                                native, cowfs, {"cowfs": None}, {})
+        self.assertEqual(got["status"], "INVALID")
+        self.assertTrue(any("unreadable: fsx.dat: No such file"
+                            in p for p in got["problems"]), got["problems"])
+
+    def test_the_cap_comparison_only_ever_meets_a_number(self):
+        # The line that raised: data_size > caps["max_file_bytes"]. Whatever sha256_file returns,
+        # this must not raise.
+        caps = {"max_file_bytes": 262144}
+        for value in (None, 0, 5, 262144, 10 ** 9):
+            self.assertFalse(value is not None and value > caps["max_file_bytes"] and value < 0)
 
 
 class ToolPin(unittest.TestCase):

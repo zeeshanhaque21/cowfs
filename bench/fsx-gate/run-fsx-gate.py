@@ -573,6 +573,14 @@ def run_case(binary, arm, root, mode, seed, ops, caps, out_dir, timeout, run_tag
         os.fsync(f.fileno())
 
     data_sha, data_size = sha256_file(data)
+    # sha256_file returns (None, the reason) when it cannot read the file, so the size comes back a
+    # string then. Comparing it against the cap raised a TypeError, which surfaced as a traceback
+    # and an exit 1 that looked like a verdict: a control reached it by accident. An unreadable
+    # result is a missing result, and the compare reports it as one.
+    data_error = None
+    if not isinstance(data_size, int):
+        data_error, data_size = data_size, None
+        data_sha = None
     opsfile = os.path.join(case_dir, "fsx.dat.fsxops")
     ops_sha, _ = sha256_file(opsfile)
     counts = op_counts(opsfile)
@@ -608,7 +616,8 @@ def run_case(binary, arm, root, mode, seed, ops, caps, out_dir, timeout, run_tag
         "log_dump_total": parse_log_dump_total(out),
         "case_dir": case_dir, "case_dir_fresh": True,
         "data_path": data, "data_realpath": data_real, "data_sha256": data_sha,
-        "data_size": data_size, "data_real_fstype": fstype, "data_witness": witness,
+        "data_size": data_size, "data_error": data_error,
+        "data_real_fstype": fstype, "data_witness": witness,
         "data_st_dev": st_dev(data), "root_st_dev": st_dev(root),
         "ops_file": opsfile, "ops_sha256": ops_sha, "op_counts": counts,
         "op_sequence": sequence, "op_skips": skips, "op_stream_error": stream_error,
@@ -788,7 +797,8 @@ def compare_case(mode, seed, ops, native, cowfs, fresh_open, probe_by_arm=None, 
             problems.append(divergence("%s fsx executed %d ops, %d declared"
                                         % (arm, case["ops_executed"], ops)))
         if case["data_sha256"] is None:
-            problems.append(invalid("%s data file unreadable: %s" % (arm, case["data_size"])))
+            problems.append(invalid("%s data file unreadable: %s"
+                                    % (arm, case.get("data_error") or case["data_size"])))
         elif case["data_size"] == 0:
             problems.append(divergence("%s data file is empty" % arm))
         # The witness is the file fsx actually wrote: its device, its realpath and the
