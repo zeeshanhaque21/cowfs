@@ -2,11 +2,20 @@
 
 Lease: `.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/5/cowfs`, branch `followup/metadata-health-40`.
 Base: `46b0f269d5bef4a2c204c25f5b3015da601d3beb`.
-Commit: `4366cbbfda32fc4a2003aa36d0872c085aa12c56`, pushed over authenticated HTTPS.
-PR: https://github.com/zeeshanhaque21/cowfs/pull/new/followup/metadata-health-40
+PR: https://github.com/zeeshanhaque21/cowfs/pull/116
+
+Revision 2, after the independent review in `docs/reviews/metadata-health40-final.md`
+(sha256 `0807d7f54a007665c641537122e708c5c3d4d71677ce0957b3da823fa45c863a`) requested changes.
+The blocker was real and is fixed; the coverage gap is closed.
+Source commit `8a6e1ba22cf879b6d7797b8ae2a338ba29fe32b5`, pushed over authenticated HTTPS.
+That is the tree every count below was measured at.
+The previous PR head was `a1f302353bc829e30d4d09875df9536be5c1ffcd`, whose source commit was
+`4366cbbfda32fc4a2003aa36d0872c085aa12c56`; that one is quoted only where a before/after needs it,
+and is not the tree under test.
 
 Lane: slot 5, "Metadata recovery counters and health reporting".
-Owned source: `crates/cowfs-meta/src/db.rs`, `crates/cowfs-meta/src/lib.rs`, `crates/cowfs-meta/tests/health.rs`.
+Owned source: `crates/cowfs-meta/src/db.rs`, `crates/cowfs-meta/src/lib.rs`,
+`crates/cowfs-meta/tests/health.rs`, `crates/cowfs-meta/tests/recovery40.rs`.
 No `CHANGELOG.md` edit, no workflow or runner change, no merge, no lease return.
 
 ## What issue #40 asks, and what this lane did with it
@@ -166,7 +175,8 @@ If a redb upgrade changes the layout so no page produces the wanted verdict, the
 ### Three fixture properties, each forced by a measured failure
 
 The final commit must be a large batch.
-With a one-write final commit, a 78-page fixture gave **no rollback at all**: all 155 single- and two-page candidates came back either "still opens" or "unrepairable".
+With a one-write final commit, a 78-page fixture gave **no rollback at all**: all 153 single- and two-page candidates came back either "still opens" or "unrepairable".
+The search enumerates `(N-1) + (N-2)` candidates, so 78 pages gives `2N-3 = 153`.
 redb keeps two commit slots and shares every page the newer commit did not rewrite, so a small last commit leaves almost every page belonging to both slots and no page damageable in isolation.
 A final batch of 400 files gives the newest slot pages of its own.
 Consequently damage must target a **copy** taken while that batch is newest, because `close` and `drop` each commit once more and would put a small commit back on top.
@@ -184,7 +194,7 @@ Creating a file does not add a snapshot, so the count stays at 1 while a backgro
 
 ## Result
 
-`cargo test -p cowfs-meta` at `4366cbbf`, real exit code 0, 78 passed, 0 failed, 2 ignored.
+Head under test: the source commit below. Counts are from a full `cargo test -p cowfs-meta` at that exact tree, real exit code 0.
 
 | Suite | Passed | Failed | Ignored |
 | --- | --- | --- | --- |
@@ -196,44 +206,115 @@ Creating a file does not add a snapshot, so the count stays at 1 while a backgro
 | `tests/kill9.rs` | 2 | 0 | 0 |
 | `tests/model.rs` | 2 | 0 | 0 |
 | `tests/posix.rs` | 16 | 0 | 0 |
-| `tests/review.rs` | 20 | 0 | 1 |
+| `tests/recovery40.rs` | 4 | 0 | 0 |
+| `tests/review.rs` | 20 | 0 | 0 |
 | doc-tests | 0 | 0 | 0 |
-| total | 78 | 0 | 2 |
+| total | 82 | 0 | 2 |
 
 The two ignored tests were already ignored at the base commit; not new skips.
 `cargo clippy -p cowfs-meta --all-targets -- -D warnings` real exit 0.
 `cargo fmt -p cowfs-meta -- --check` real exit 0.
-All three ran through the wave lock as foreground invocations.
+All three ran through the wave lock as foreground invocations, each with a private `CARGO_TARGET_DIR`.
 
-### Old fail, new pass, for M1
+### The review blocker, reproduced before it was fixed
 
-`bench/out/ready-40/toggle_bg_panic_fix.py` reverts only the `Job::Flush` arm, runs the one M1 test, restores the arm, runs it again.
-
-| Step | Real exit |
-| --- | --- |
-| pre-fix `Job::Flush => inner.timer_flush(),` | 101, `test result: FAILED. 0 passed; 1 failed` |
-| fixed arm restored | 0, `test result: ok` |
-
-The failure is the M1 symptom, not an incidental one:
+Reproduced on the reviewed PR head `a1f3023` source, pristine, no mutant.
+Fixture: build with `ino_block = 64`, recover with `ino_block = 4`.
 
 ```
-thread 'cowfs-meta-bg' panicked at crates/cowfs-meta/tests/health.rs:257:17:
-thread 'background_flush_survives_a_panicking_sync_hook' panicked at health.rs:49:5:
-timed out after 20s waiting for the background commit after the panicking hook
+SPIKE built=64 recovered=4 ino_floor=6 max_handed=65
+SPIKE reused_count=60 reused=[6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+health=Health { last_flush_error: None, flush_failures: 0, ... recoveries: 1, poisoned: false }
 ```
 
-The thread panicked in the hook, died, and the change was never flushed.
-The 20 s bound is what separates a dead timer thread from a slow one.
+60 inode numbers handed out twice, `Health` reporting a healthy store, no error and no warning.
+The spike file is deleted; the same shape is now a permanent test.
 
-### Lock contention
+### The fix
 
-Heavily contended. Across the logs in `bench/out/ready-40/`, 8 attempts returned exit 75 (lane busy) and were retried, which is the documented behaviour and not a permission slip; every log records its own `real_exit`.
+`ino_block` is persisted in the `meta` table when the file is created, validated on open
+(`clamp(1, INO_LIMIT)`, and a stored zero is `corrupt`), and the **stored** value governs the
+allocator and `record_recovery`, exactly as the stored `node_size` already did.
+A caller's `ino_block` is now ignored on an existing file.
+
+A file written before the key existed has no provable bound, so `record_recovery` refuses with a
+reason instead of guessing.
+That is the `node_size` precedent again: validate, persist, and let the stored value govern.
+Refusing to recover is recoverable; re-issuing a number is not.
+
+### Load-bearing coverage: four isolated builds
+
+Every variant ran in its own `CARGO_TARGET_DIR`, with the source sha256 printed before the build so
+a stale binary cannot be mistaken for a result.
+`cp -R` preserving mtimes is a known trap here; the receipts below are what makes the reading safe.
+
+| Build | `db.rs` sha256 (first 16) | persisted key | `+block` | `+1` | Result |
+| --- | --- | --- | --- | --- | --- |
+| shipping | `de79c2713fbb0148` | yes | yes | yes | **0**, 4 passed |
+| PR head `a1f3023` | `4d26d725527c2454` | no | yes | yes | 101 |
+| no inode bump | `a2f62c568a395e9f` | yes | **no** | yes | 101 |
+| no snapshot bump | `bfae9acf6aa21591` | yes | yes | **no** | 101 |
+| neither bump | `816c04d8004add9b` | yes | **no** | **no** | 101 |
+
+Which test killed which, read from the output rather than inferred:
+
+| Build | Killed by | Message |
+| --- | --- | --- |
+| PR head | 3 of 4 | `re-issued 60 pre-crash numbers`, plus `the current build must persist the block` |
+| no inode bump | 2 of 4 | `re-issued 64 pre-crash numbers` |
+| no snapshot bump | 1 of 4 | `snapshot id 2 was handed out twice` |
+| neither bump | 3 of 4 | both messages above |
+
+The old source fails these tests for the right reason: the same fixture that passes on the shipping
+source re-issues 60 numbers on it.
+
+### Why the old tests passed the mutants
+
+The shipped `health.rs` rollback fixture lost a commit that never moved either counter: healthy
+`ino_floor` was 450 and the value stored after the rollback was still 450; healthy `snapshot_floor`
+was 3 and the stored value was still 3.
+Its assertions were satisfied by `Tx::alloc_ino`'s own headroom, because `alloc_ino` reserves before
+handing out, so `reserved` is always at least one above the highest number handed out.
+The bump and the `+1` were untested.
+
+The replacement fixture makes the newest durable commit **a reservation**: arm the hook to fail
+after the snapshot exists, so every main commit fails while every `reserve_durable` still commits,
+since it runs no hook. One batch keeps `pending_ops` at 1, under the backlog cap.
+One rollback then undoes exactly that reservation, which is the only shape in which the bound is
+observable.
+
+Assertions are on handed-out sets and read-back state, never on floor headroom:
+the actual inode numbers before and after, disjointness, a fresh reopen, and `lookup` through a new
+handle so the file is what is checked.
+
+### The other review findings
+
+- **Inline `Ack::Applied` hook panic.** It escaped to the caller and left `Health` at zeros. Now the
+  panic is recorded, `flush_err` is set, and then it is re-raised, so the caller still sees it.
+  Safe to catch here for the same reason the background job may catch it: `run_hook` runs before
+  `begin_write`, so no transaction is left open.
+  This is a scoped panic contract on that one boundary, not a general policy of treating a panic
+  like a background failure.
+- **`consecutive_flush_failures` doc overstated the behaviour.** The refusal in `mutate` is gated on
+  the session's `flush_err`, which the panic path never set. The doc now says the counter counts and
+  does not by itself refuse anything, and points at `last_flush_error`.
+- **Reap `Err` arm.** Previously it recorded the failure but did not re-arm, so reaping still
+  stopped, only more visibly. It now re-arms on `Ok(Err(e))` as well, with the same 300 us pause that
+  bounds a persistently failing reap. The silent stop is gone in both the panic and error paths.
+  Still **not** proved by a fault-injection test; labelled as reasoned from the code.
+- **Doc transcript line number** corrected from `health.rs:257` to the actual `268`, and the damage
+  candidate count from 155 to 153 with the `2N-3` derivation.
+- **Provenance.** Source commit and doc commit are named separately below; the counts above were
+  measured at the source commit, not inferred from the earlier PR head.
 
 ## Residual criteria, and who owns them
 
 - **M2**, one transient corrupt read poisons the whole handle and the pending window is discarded on drop. `Inner::note` sets `poisoned` on any `Error::Corrupt`; `finish_on_drop` discards pending changes if the hook fails. Not reproduced, not touched, because a partial fix would be speculative. Exact owner: `Inner::note`, `Inner::check_writable`, `Inner::finish_on_drop` in `crates/cowfs-meta/src/db.rs`. Same file this lane owns, so the natural next change here once reproduced.
 - **`Health.poisoned`** is surfaced, not fixed. `Inner::poisoned` had no test in `cowfs-meta` before this change; `rg -n 'poison' crates/cowfs-meta/tests/` matched nothing outside the new file. The control test only proves it reads `false` on a healthy store. Proving it needs a fixture whose read returns `Error::Corrupt` without failing the whole open.
-- **The reap arm of `bg_main`** changed from silent-swallow to recorded. Same defect class as M1, found by reading the adjacent arm rather than reproducing it, so it is **not** claimed as proved. Three lines, purely additive: a failed reap commit increments the flush counters and sets the reason.
+- **The reap arm of `bg_main`** now re-arms on `Ok(Err(e))` as well as recording it, so reaping no longer stops silently in either the panic or the error path. Still **not** proved by a fault-injection test: found by reading the adjacent arm, not reproduced, so it is not claimed as proved. Proving it needs a fixture whose reap step genuinely fails.
+- **Real power-loss behaviour is not established.** Everything here is redb's own repair path
+  driven by page damage on a closed file. That models a lost commit; it is not a power cut, and a
+  surviving process is not power loss. The crash harness question from the issue is still open.
 - **Mutant harness** not ported. `crates/cowfs-meta/tests/critic.rs` already has a crash harness that shreds a serialized image and drives `open_recover`; the missing piece is a harness that deletes individual implementation lines and asserts the suite goes red. That needs a stable assertion set across the whole crate, so it belongs with the builder-suite owner.
 - **Real-`cowfs-store` crash re-run** is out of scope for a `cowfs-meta` lane.
 - **Performance table ordering** in `docs/v1-meta.md` is a docs edit in a design document this lane did not otherwise touch.
