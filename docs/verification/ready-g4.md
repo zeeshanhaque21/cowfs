@@ -352,7 +352,7 @@ A hook that does nothing is INVALID, because nothing replaced the daemon.
 | --- | --- |
 | gate unit tests, `python3 -m unittest bench.test_fsx_gate` | 111, one skipped where `/proc` is absent |
 | branch tree alone, `python3 -m unittest discover -s bench` | 147 |
-| CI at this head, run 37266237441, ubuntu and macos | 391 each |
+| CI at this head, run 37267392430, ubuntu and macos | 391 each |
 | distinct gate test names present in the CI log | 111 |
 | duplicate test names in CI discovery | 0 |
 | mutation controls against the private mount | 5, 0 leaks |

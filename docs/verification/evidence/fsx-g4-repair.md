@@ -20,7 +20,7 @@ ran against its own private mount on 2026-10-04.
 | F4 | the case directory was reused, so stale bytes passed as this run's work | every attempt is a fresh directory, nothing is deleted to make room | control 19; `ImmutableAttemptDir` (3) |
 | F5 | the binary digest was recorded and compared to nothing | `fsx-gate.json` carries an approved manifest and a mismatch is refused before anything runs | control 16; `ToolPin` (4) |
 | F6 | a byte budget nothing compared against | the cap is checked against the plan before a child exists, and an unexpected exceedance is reported per arm | `PlannedBudget` (10), `ByteCaps` (3) |
-| F7 | the tests were never discovered by CI | `bench/test_fsx_gate.py` loads the module by path from the command CI runs; the workflow file is untouched | 111 distinct gate test names in the CI log at run 37266237441 |
+| F7 | the tests were never discovered by CI | `bench/test_fsx_gate.py` loads the module by path from the command CI runs; the workflow file is untouched | 111 distinct gate test names in the CI log at run 37267392430 |
 
 | residual | what the review found | at this head | proof at this head |
 | --- | --- | --- | --- |
@@ -122,7 +122,7 @@ under `bench/`, and `bench/fsx-gate/` has a hyphen in its name, so the gate's ow
 discovered.
 `bench/test_fsx_gate.py` loads the gate's module by path and adds no assertion of its own, so no
 assertion is duplicated and the workflow file is not edited.
-At run 37266237441 the CI log carries all 111 gate test names and 0 duplicates.
+At run 37267392430 the CI log carries all 111 gate test names and 0 duplicates.
 
 ## Defects the new controls found
 
