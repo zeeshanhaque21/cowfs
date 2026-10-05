@@ -62,6 +62,20 @@ def control_second_arm_is_not_cowfs(args, work):
             "output": out.strip().splitlines()[:6] + err.strip().splitlines()[:2]}
 
 
+def control_native_arm_is_the_mount(args, work):
+    """5f: the control pointed at the filesystem under test is not a control."""
+    code, out, err = run([sys.executable, args.runner, "--native-root", args.cowfs_root,
+                          "--cowfs-root", args.cowfs_root, "--fsx-bin", args.fsx,
+                          "--config", args.config, "--out", os.path.join(work, "out-5f"),
+                          "--mode", "smoke",
+                          "--daemon-pid-file", args.daemon_pid_file or "",
+                          "--label", "control-5f-native-is-the-mount"])
+    return {"control": "5f", "name": "the native arm pointed at the cowfs mount", "exit": code,
+            "expect": "refused: the control is the thing under test",
+            "status": "ok" if code == 3 and "the thing under test" in out else "LEAK",
+            "output": out.strip().splitlines()[:6] + err.strip().splitlines()[:2]}
+
+
 def control_synthetic_child(args, work):
     """16: an executable that prints the A-OK line is not the pinned tool."""
     if not args.fsx:
@@ -154,6 +168,8 @@ def main(argv=None):
 
     results = []
     results.append(control_second_arm_is_not_cowfs(args, work))
+    if args.fsx:
+        results.append(control_native_arm_is_the_mount(args, work))
     results.append(control_synthetic_child(args, work))
     results.append(control_reused_attempt_dir(args, work))
     if args.daemon_pid_file and os.path.exists(args.daemon_pid_file):
