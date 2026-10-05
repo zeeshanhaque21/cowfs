@@ -1,48 +1,71 @@
 {
-  "cowfs_build": {
-    "cowfs_cli_sha256": "33055fed260adfcad8db2fc0740f7678f39416c0c7295795cd7d127b4133fadf",
-    "cowfs_daemon_sha256": "4804a16546a87679aaf7a1af0c12be651cc5eabc5567eb6ce951e4879c8b9655",
-    "cowfs_head": "d004caacf42d0859d61018c7aa119cf4c529cc35"
+ "cowfs_build": {
+  "cowfs_cli_sha256": "33055fed260adfcad8db2fc0740f7678f39416c0c7295795cd7d127b4133fadf",
+  "cowfs_daemon_sha256": "4804a16546a87679aaf7a1af0c12be651cc5eabc5567eb6ce951e4879c8b9655",
+  "cowfs_head": "d004caacf42d0859d61018c7aa119cf4c529cc35"
+ },
+ "daemon": {
+  "argv": [
+   "target/release/cowfs-daemon",
+   "--store",
+   "store",
+   "--mount",
+   "mnt",
+   "--socket",
+   "rt/c.sock",
+   "--backend",
+   "core"
+  ],
+  "pid": 8004,
+  "registered_at": "2026-10-04T19:57:48-0700",
+  "socket": "rt/c.sock",
+  "store": "store"
+ },
+ "mount_table_line": "localhost:/<private-export> on mnt (nfs, nodev, nosuid, mounted by <user>",
+ "problems": [],
+ "recorded_at": "2026-10-04T19:57:49-0700",
+ "runtime_identity": {
+  "cowfs": {
+   "fstype": "nfs",
+   "mountpoint": "mnt",
+   "path": "mnt/pjd",
+   "problem": null,
+   "source": "localhost:/<private-export>",
+   "st_dev": 436209661,
+   "table_line": null
   },
-  "daemon": {
-    "argv": [
-      "/Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/target/release/cowfs-daemon",
-      "--store",
-      "/Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/bench/out/ready-g3/run/20261005T025742Z/store",
-      "--mount",
-      "/Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/bench/out/ready-g3/run/20261005T025742Z/mnt",
-      "--socket",
-      "/Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/rt/c.sock",
-      "--backend",
-      "core"
-    ],
-    "pid": 8004,
-    "registered_at": "2026-10-04T19:57:48-0700",
-    "socket": "/Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/rt/c.sock",
-    "store": "/Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/bench/out/ready-g3/run/20261005T025742Z/store"
+  "declared_scope": "sanitised-reference",
+  "native": {
+   "fstype": "apfs",
+   "mountpoint": "/",
+   "path": "native",
+   "problem": null,
+   "source": "/dev/disk3s1s1",
+   "st_dev": 16777234,
+   "table_line": null
   },
-  "mount_table_line": "localhost:/cowfs-de4387245f4a6633cfc77c43fa2d25bd on /Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/bench/out/ready-g3/run/20261005T025742Z/mnt (nfs, nodev, nosuid, mounted by zeeshanhaque)",
-  "problems": [],
-  "recorded_at": "2026-10-04T19:57:49-0700",
-  "runtime_identity": {
-    "cowfs": {
-      "fstype": "nfs",
-      "mountpoint": "/Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/bench/out/ready-g3/run/20261005T025742Z/mnt",
-      "path": "/Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/bench/out/ready-g3/run/20261005T025742Z/mnt/pjd",
-      "problem": null,
-      "source": "localhost:/cowfs-de4387245f4a6633cfc77c43fa2d25bd",
-      "st_dev": 436209661,
-      "table_line": null
-    },
-    "native": {
-      "fstype": "apfs",
-      "mountpoint": "/",
-      "path": "/Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/9/cowfs/bench/out/ready-g3/run/20261005T025742Z/native",
-      "problem": null,
-      "source": "/dev/disk3s1s1",
-      "st_dev": 16777234,
-      "table_line": null
-    }
-  },
-  "validated": true
+  "sanitisation": {
+   "kept": [
+    "st_dev",
+    "fstype",
+    "mountpoint",
+    "plan",
+    "ok",
+    "not_ok",
+    "raw_sha256"
+   ],
+   "kind": "host paths, the capture host's user and the private export name replaced by tokens",
+   "meaning": "provenance of the capture, not an attestation of the filesystem it ran on",
+   "rules": [
+    "the tool checkout prefix becomes tool",
+    "the run directory prefix becomes relative",
+    "the remaining lease prefix becomes repo-relative",
+    "the private export name becomes <private-export>",
+    "mounted by <user>"
+   ],
+   "source_identity_sha256": "31d92ea0d2bd89d73ff0882328fbc96c5634ae9e999d4d7bfea806b2a02703ad",
+   "source_run": "20261005T025742Z"
+  }
+ },
+ "validated": true
 }

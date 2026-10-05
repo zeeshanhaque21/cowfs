@@ -336,6 +336,13 @@ CURATED_CASES = {
 }
 
 
+# Metadata a curated closure may carry beside its pinned cases. COPYING is the upstream notice and
+# is pinned exactly like a case; README.md is documentation and is allowed by name only. Every other
+# file is refused, so a closure cannot carry a script or a payload the pin does not cover.
+CURATED_METADATA = {"COPYING": "e12b8e42b14e014b3e02f19a6b49de44dfb5f16dec55db1ace0f110be2d71330"}
+CURATED_METADATA_NAMES = {"COPYING", "README.md"}
+
+
 def verify_curated_closure(src: Path) -> dict:
     """Verify a curated script directory against the closure pinned in this file.
 
@@ -361,7 +368,21 @@ def verify_curated_closure(src: Path) -> dict:
     extra = present - set(CURATED_CASES)
     if extra:
         problems.append(f"a curated closure carries only the pinned cases, not {sorted(extra)[:3]}")
-    return {"problems": problems, "source_sha256": None, "cases": cases}
+    for item in sorted(src.rglob("*")):
+        if not item.is_file() or item.is_symlink():
+            continue
+        rel = item.relative_to(src).as_posix()
+        if rel.startswith("tests/"):
+            continue
+        if rel not in CURATED_METADATA_NAMES:
+            problems.append(f"a curated closure carries no {rel}; only {sorted(CURATED_METADATA_NAMES)}")
+            continue
+        want = CURATED_METADATA.get(rel)
+        if want and sha256(item) != want:
+            problems.append(f"{rel} sha256 {sha256(item)} is not the pinned blob {want}")
+    return {"problems": problems, "source_sha256": None, "cases": cases,
+            "metadata": {rel: sha256(src / rel) for rel in sorted(CURATED_METADATA_NAMES)
+                         if (src / rel).is_file()}}
 
 
 def verify_tool(src: Path) -> dict:
@@ -605,6 +626,22 @@ def classification_prerequisite(tool: dict | None, tests_root: Path | None, comp
         return [(f"{len(missing)} compared case(s) have no script profile, first {missing[0]}: "
                  "a missing script cannot prove an assertion's position")]
     return []
+
+
+def stream_path(run_dir: Path, raw: str) -> Path:
+    """Where a record's raw stream is, refusing a relative path that climbs out of the run.
+
+    A relative path is anchored on the run directory, not on the working directory, so the same
+    record set scores identically from any directory. An absolute path is taken as written, because
+    the historical record sets name their own run directory and are read-only evidence.
+    """
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    root, resolved = Path(run_dir).resolve(), (Path(run_dir) / path).resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"{raw!r} resolves to {resolved}, which is outside the run directory {root}")
+    return resolved
 
 
 def guard_case(record: dict, expected_test: str, raw_text: str | None, legacy: bool = False) -> list[str]:
@@ -1020,10 +1057,16 @@ def verdict(run_dir: Path, tool: dict | None = None, tests_root: Path | None = N
         legacy = False
     for record in parsed:
         raw_text = None
-        if record.get("raw") and Path(record["raw"]).is_file():
-            if sha256(Path(record["raw"])) != record.get("raw_sha256"):
+        stream = None
+        if record.get("raw"):
+            try:
+                stream = stream_path(run_dir, record["raw"])
+            except ValueError as exc:
+                problems.append(f"{record.get('test')} on {record.get('arm')}: {exc}")
+        if stream is not None and stream.is_file():
+            if sha256(stream) != record.get("raw_sha256"):
                 problems.append(f"{record.get('test')} on {record.get('arm')}: raw stream hash moved")
-            raw_text = Path(record["raw"]).read_text().split("\n--- stderr ---\n")[0]
+            raw_text = stream.read_text().split("\n--- stderr ---\n")[0]
         elif record.get("raw"):
             problems.append(f"{record.get('test')} on {record.get('arm')}: raw stream is missing")
         complaints = guard_case(record, record.get("test", ""), raw_text, legacy=legacy)
@@ -1051,6 +1094,11 @@ def verdict(run_dir: Path, tool: dict | None = None, tests_root: Path | None = N
     reasons += [reason(INTEGRITY, message) for message in
                 classification_prerequisite(tool, tests_root, compared, profiles)]
     reasons += validate_runtime_identity(identity)
+    scope = (identity or {}).get("declared_scope") if isinstance(identity, dict) else None
+    if scope:
+        reasons.append(reason(COVERAGE, f"the identity receipt declares scope {scope!r}, so this is "
+                                        "a reading of the records it ships with and attests nothing "
+                                        "about a live mount"))
     if not arms or set(arms) != {"native", "cowfs"}:
         reasons.append(reason(CAPABILITY,
                               f"the run has arms {sorted(arms)}, not a matched native and cowfs pair"))
@@ -1281,6 +1329,7 @@ def analysis_provenance(repo: Path, run_dir: Path, tests_root: Path | None, tool
         "analyser_sha256": sha256(Path(__file__).resolve()),
         "pinned_tool_commit": PINNED_COMMIT,
         "tool_source_problems": (tool or {}).get("problems", []),
+        "tool_metadata": (tool or {}).get("metadata", {}),
         "tests_root": str(tests_root) if tests_root else None,
         "inputs": inputs,
         "note": "This file is a fresh reading of the inputs above. It says nothing about the runtime "
@@ -1320,9 +1369,18 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     # The identity comes from the run's own receipt, written while its mount was up. A run without
     # one cannot be placed on a filesystem, so it is INVALID rather than quietly unpairable.
     receipt = run_dir / "identity.json"
-    identity = json.loads(receipt.read_text()).get("runtime_identity") if receipt.is_file() else None
+    document = json.loads(receipt.read_text()) if receipt.is_file() else {}
+    identity = document.get("runtime_identity")
     report = verdict(run_dir, tool, tests_root, identity)
     report["analysis"] = analysis_provenance(repo, run_dir, tests_root, tool)
+    # A receipt that declares itself sanitised says so in the analysis too, so the reader sees the
+    # scope next to the verdict instead of having to remember it.
+    report["analysis"]["identity_receipt"] = {
+        "path": str(receipt),
+        "sha256": sha256(receipt) if receipt.is_file() else None,
+        "declared_scope": (identity or {}).get("declared_scope"),
+        "sanitisation": (identity or {}).get("sanitisation"),
+    }
 
     def emit() -> None:
         log(f"state {report['state']} exit {report['exit_status']}")

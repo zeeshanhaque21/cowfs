@@ -282,17 +282,80 @@ exactly the attribution the old field got wrong.
 
 | check | source | result |
 | --- | --- | --- |
-| `python3 bench/test_pjdfstest.py` | this lane | 56 checks, exit 0 |
-| `python3 -m unittest discover -s bench` in a copy of the tracked files with no `bench/out` and no `.git` | this lane | 92 checks, exit 0, no skips, of which 56 are this lane's and 36 are `bench/test_gates.py` |
-| the writer class as written, reversed, three seeded shuffles, and each check alone | this lane | 17 checks, 0 failures each way, 0 skips |
+| `python3 bench/test_pjdfstest.py` | this lane | 68 checks, exit 0 |
+| `python3 -m unittest discover -s bench` in a copy of the tracked files with no `bench/out` and no `.git` | this lane | 104 checks, exit 0, no skips, of which 68 are this lane's and 36 are `bench/test_gates.py` |
+| the writer, classification and fixture classes as written, reversed, odds then evens, three seeded shuffles, and each check alone | this lane | 29 checks, 0 failures each way, 0 skips |
 | the two classification checks against the previous source | this lane, in a cache-free tree | both fail |
 | `ruff check` on both files | this lane | clean |
 | `python3 -m py_compile` on both files | this lane | clean |
 
-The fixture is 18 files: a README, the identity receipt, ten transcripts, ten records and five
-upstream scripts.
+The fixture is 20 files: a README, a provenance map, the sanitised identity receipt, ten transcripts,
+ten records, five upstream scripts and the upstream notice.
 The five scripts hash to what the pinned commit holds for them, verified against the checkout at
 `85a8aea9` before they were copied.
+
+## Licence, corrected against the upstream object
+
+| number | source |
+| --- | --- |
+| `bench/pjdfstest-fixture/tool/COPYING` is byte-identical to `COPYING` at `85a8aea9` | `git show 85a8aea9:COPYING` piped through `diff -` against the fixture file, no output |
+| its sha256 is `e12b8e42b14e014b3e02f19a6b49de44dfb5f16dec55db1ace0f110be2d71330` | that same git object's content, and the fixture file |
+| the notice names Pawel Jakub Dawidek 2006-2012 | `grep -m1 Copyright` on the fixture file |
+| the five scripts carry no per-file notice | independent review, confirmed by reading each file |
+| a closure with an extra script, an extra file or an edited notice exits 3 | three checks, each spawning the CLI |
+| `CURATED_METADATA` pins the notice, `CURATED_METADATA_NAMES` allows `COPYING` and `README.md` | `bench/pjdfstest.py` |
+
+## Host facts removed from the committed copy
+
+| number | source |
+| --- | --- |
+| 30 occurrences of the capture host and username before, 0 after | parsed JSON paths, then a scan of every committed fixture file for `/Users/`, `zeeshanhaque`, `.treehouse`, `/tmp/` |
+| 11 identity fields rewritten, 22 kept | `PROVENANCE.json`, `identity_fields_rewritten` and `identity_fields_kept`, each compared against the source document |
+| `run/cases.jsonl` `eb2ff1245baa4aa3` becomes `edc6ca52e1fd2cec` | both hashes recomputed after the transform |
+| `run/identity.json` `31d92ea0d2bd89d7` becomes `84dc788f83a5fa28` | same, and the fixture is a derivative, not the receipt |
+| the ten transcripts contain no host facts and are byte-identical | the source `raw/` was copied, not rewritten, and every `raw_sha256` verifies |
+| the five scripts keep their pinned hashes | `bd017018`, `f631099b`, `b2aa69d1`, `0078ce2f`, `ce168a45`, each equal to its literal in the harness and to the upstream blob |
+| the source run is unchanged by the transform | digests before and after, equal |
+| the source run is unchanged by every check and every CLI run | `cases.jsonl` `eb2ff124`, `identity.json` `31d92ea0`, and the ten streams, re-verified after each batch |
+
+The credentials scan found none, so this is host and username disclosure rather than a secret leak,
+and it is labelled that way rather than inflated.
+The fixture's identity declares `sanitised-reference`, the verdict reports that scope as a coverage
+disclosure, and a copy with the declaration removed stops reporting it, so the disclosure follows the
+receipt and not the fixture.
+
+## Portability, measured the way a reader meets it
+
+| number | source |
+| --- | --- |
+| three working directories, exit 1 each, payload sha256 `ca26de0f649457fe` identical | the published CLI as a child process, outputs in three fresh directories |
+| 25 established and 26 unpairable from all three | each payload's comparison |
+| a relative raw path that climbs out of the run is refused by name | a check with `../outside/borrowed.tap`, exit 3 |
+| a relative raw path through a symlink out of the run is refused | a check with `raw/link.tap`, exit 3 |
+| an absolute raw path is taken as written | a check pointing every record at a copy outside the run, exit 1 |
+| every raw stream unreadable is INVALID 3, not PASS 0 | a check with the raw directory emptied, exit 3 |
+| a run wider than the closure is INVALID 3 | `rmdir/12.t` renamed to `rmdir/13.t` in both arms, exit 3 |
+| a closure missing entirely is INVALID 3 | the CLI with no `--tool` against a checkout with no cache |
+| the live receipt declares no scope, so no disclosure is added | the CLI over the real run, exit 1 |
+
+## The flake, measured twice and still unresolved
+
+| measurement | result |
+| --- | --- |
+| this lane, 8 runs of the CI command at this working tree | 0 failures, ambient `load1` 15.1 to 18.5 |
+| this lane, 8 runs at `22340a9` | 0 failures, ambient `load1` 13.5 to 16.5 |
+| independent review, 8 runs at that head | 1 failure, in `bench/test_gates.py`, outside this diff |
+| independent review, 8 runs at `22340a9` and 8 on `main` | 0 failures |
+
+16 clean-archive runs here did not reproduce it, so this lane does not claim a cause and does not
+patch the file.
+The mechanism available to it is in `bench/compare.py`: an unmeasurable gate returns 2 when the
+recorded `load1` peak passes `LOAD_CEILING` 30.0 or the arms are skewed by more than `LOAD_SKEW` 2.0,
+and those loads are the ones the gate run recorded, so a test that runs against real ambient load
+inherits the machine's state.
+`COWFS_BENCH_FAKE_LOAD1` exists as a hook in `bench/gates.py` and no check in `test_gates.py` sets
+it.
+#125 carries the fix, and asks for the preserved failure first, which nobody has.
 
 ## What was not done
 

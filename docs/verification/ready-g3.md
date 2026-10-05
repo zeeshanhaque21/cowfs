@@ -345,14 +345,101 @@ truth.
 
 Counts from this repair:
 
-- 56 checks in `bench/test_pjdfstest.py`, none skipped, ruff and py_compile clean
-- 92 checks from `python3 -m unittest discover -s bench` in a clean copy of the tracked files with
-  no `bench/out` and no `.git`: all pass, no skips. 56 are this lane's and 36 belong to
+- 68 checks in `bench/test_pjdfstest.py`, none skipped, ruff and py_compile clean
+- 104 checks from `python3 -m unittest discover -s bench` in a clean copy of the tracked files with
+  no `bench/out` and no `.git`: all pass, no skips. 68 are this lane's and 36 belong to
   `bench/test_gates.py`, which another lane owns
-- 17 checks in the writer and classification class, run as written, reversed, in three seeded
-  shuffles, and each alone in its own process: no failures and no order coupling
+- 29 checks in the writer, classification and fixture classes, run as written, reversed, odds then
+  evens, in three seeded shuffles, and each alone in its own process: no failures, no order coupling
 - the two classification checks fail against the previous source in a tree with no cache, one with
   exit 0 and one with `PASS`, so they test the gate rather than the machine it ran on
+- one check scans every committed fixture file for host identifiers and re-verifies each hash in
+  `PROVENANCE.json`, each pinned script and the pinned notice
+
+## The fixture is licensed correctly and carries no host facts
+
+The redistribution now ships the notice it is bound by.
+`bench/pjdfstest-fixture/tool/COPYING` is the upstream `COPYING`, copied byte for byte from the
+pinned commit, sha256 `e12b8e42b14e014b3e02f19a6b49de44dfb5f16dec55db1ace0f110be2d71330`, and it
+names the holder the notice names:
+
+> Copyright (c) 2006-2012 Pawel Jakub Dawidek <pawel@dawidek.net>
+
+An earlier revision of this fixture's README credited a name that is not in that notice, which is a
+licensing defect in a public redistribution rather than a wording problem, and it is corrected
+here. The five `.t` files carry no per-file notice of their own, `unlink/14.t` carrying only an
+`$FreeBSD$` keyword, so `COPYING` is the authoritative statement. The harness pins `COPYING` exactly
+as it pins the five scripts, and a closure may carry `COPYING` and `README.md` beside them and
+nothing else: an extra script, any other file, or an edited notice is refused with exit 3.
+
+The committed copy also published the capture host's absolute paths and the maintainer's username in
+30 places, which is host disclosure and not a secret leak: a scan for credentials found none.
+Those 30 occurrences are now 0.
+
+| file | occurrences of `/Users/` before | after |
+| --- | --- | --- |
+| `run/cases.jsonl` | 20, in `case_dir` and `script_path` of all ten records | 0 |
+| `run/identity.json` | 10, in `daemon.store`, `daemon.socket`, four `daemon.argv` entries, `mount_table_line`, both arms' `path`, and the cowfs `mountpoint` | 0 |
+| the ten transcripts | 0 | 0 |
+
+Replacement is by rule rather than field by field, so the map is mechanical and checkable: the tool
+checkout prefix becomes `tool`, the run directory prefix becomes relative to the copy, the remaining
+lease prefix becomes repo-relative, the private export name becomes `<private-export>` and
+`mounted by` becomes `mounted by <user>`.
+The transcripts are untouched, so every `raw_sha256` still verifies.
+`sanitise_run()` in the test module is that transform, it only ever reads its source, and it is
+exercised against a synthetic source of the same shape.
+`bench/pjdfstest-fixture/PROVENANCE.json` records the source hashes, the eleven rewritten fields,
+the twenty-two kept ones, and the hash of every file it wrote.
+
+### The fixture's identity copy is a sanitised reference, not a receipt
+
+Because of that transform the fixture's `identity.json` is no longer byte-identical to the receipt
+it came from, and it says so in itself:
+`runtime_identity.declared_scope` is `sanitised-reference` and `runtime_identity.sanitisation`
+records the rules, the source receipt's sha256 `31d92ea0d2bd89d7`, and the fields that were kept.
+
+| | original | fixture |
+| --- | --- | --- |
+| `run/cases.jsonl` | `eb2ff1245baa4aa3...` | `edc6ca52e1fd2cec...` |
+| `run/identity.json` | `31d92ea0d2bd89d7...` | `84dc788f83a5fa28...` |
+
+The kept fields, `st_dev`, `fstype`, `mountpoint`, the plan and the per-case counts, are the
+provenance of that capture: they say which filesystems the run saw and say nothing about any
+filesystem now.
+Only the live run directory holds a receipt that attests a filesystem.
+A reconciliation of the fixture reports the declared scope as a coverage disclosure and repeats it
+in its analysis block, so a sanitised record set cannot be read as an attestation.
+The disclosure follows the receipt rather than the fixture: remove the declared scope from a copy and
+it disappears, which is a named check.
+
+## One record set, one verdict, from any directory
+
+`verdict()` resolved each record's `raw` path against the working directory, so the committed fixture
+only worked from one place and returned INVALID 3 for the wrong reason elsewhere.
+A relative raw path is now anchored on the run directory, and a relative path that resolves outside
+it, directly or through a symlink, is refused by name rather than followed.
+An absolute path is taken as written, because the historical record sets name their own run directory
+and are read-only evidence.
+
+Same input, three working directories, the published CLI as a child process, the pinned five-case
+closure, outputs into three fresh directories:
+
+| working directory | exit | payload sha256 |
+| --- | --- | --- |
+| the fixture directory | 1 | `ca26de0f649457fe...` |
+| its parent | 1 | `ca26de0f649457fe...` |
+| an unrelated directory | 1 | `ca26de0f649457fe...` |
+
+The three payloads are byte-identical, each with 25 established regressions and 26 unpairable
+assertions.
+
+Two ways a record set can still mislead are closed by name:
+
+- a record set whose every raw stream is unreadable is INVALID 3, never PASS 0, because missing
+  evidence is an integrity failure rather than an absence of divergence
+- a run that reaches a case the closure cannot prove is INVALID 3, so the five pinned cases cannot be
+  stretched into a verdict about a wider run
 
 ## What the harness now refuses
 
@@ -415,6 +502,32 @@ Every child is registered with its pid, start time and argv before anything wait
 signal is refused unless that pid still reads as the process this harness started.
 No process group, no `pkill`, no mount walk.
 
+## One unresolved flake, measured and not attributed
+
+`python3 -m unittest discover -s bench`, the command CI runs, failed once in eight runs at the
+previous head of this branch in an unchanged file, `bench/test_gates.py`, in
+`test_gates_writes_scale_into_meta_that_compare_accepts`, with `2 != 0`.
+That file is not in this change and this lane does not patch it.
+The independent review measured 1 failure in 8 at that head, 0 in 8 one commit earlier and 0 in 8 on
+`main`, and declined to attribute it, which is the right call at that sample size.
+
+This lane measured again rather than repeating the claim: 8 runs at this working tree and 8 at
+`22340a9`, each a clean archive of the tracked files, with ambient `load1` between 13.5 and 18.5
+throughout, and 0 failures in 16.
+So the flake did not reproduce here and nothing in this change is shown to cause it.
+
+What the code does say, which is evidence rather than a theory about the machine:
+`bench/compare.py` decides a gate is unmeasurable when the recorded `load1` peak exceeds
+`LOAD_CEILING` 30.0 or when the two arms' loads are skewed by more than `LOAD_SKEW` 2.0, and returns
+2; the loads it uses are the `load1_before` and `load1_after` values the gate run recorded, so a test
+that runs the gate against real ambient load inherits whatever the machine was doing.
+`bench/gates.py` has a `COWFS_BENCH_FAKE_LOAD1` hook for exactly this, and no check in `test_gates.py`
+sets it.
+
+That is the mechanism a failure would have to travel. Whether it is the mechanism this failure took
+is unproven: the failure itself was not preserved, so #125 asks for it to be captured before a fix is
+proposed, and this lane proposes none.
+
 ## Remaining scope
 
 - **The Linux FUSE arm is UNMEASURABLE.** `moonscape` has `/dev/fuse` and `fusermount3`, so the arm
@@ -460,7 +573,7 @@ success and then reads back an answer it did not ask for.
 # Re-derive the historical verdict from the preserved records. No mount, no daemon, no build.
 # The pinned scripts are a prerequisite, so they are named; the default is only a convenience.
 python3 bench/pjdfstest.py --reconcile bench/out/ready-g3/run/20261005T004337Z \
-  --tool bench/out/ready-g3/tool/pjdfstest --output /tmp/g3-004337.json
+  --tool bench/out/ready-g3/tool/pjdfstest --output "$PWD/g3-004337.json"
 
 # A small matched run. The whole invocation holds the shared Mac lock.
 rtk proxy python3 -c 'import fcntl,os,subprocess,sys,time; p=sys.argv[1]; os.makedirs(os.path.dirname(p),exist_ok=True); f=open(p,"a"); until=time.monotonic()+600
@@ -472,9 +585,15 @@ while True:
 sys.exit(subprocess.run(sys.argv[2:]).returncode)' /Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/mac-heavy.lock \
   python3 bench/pjdfstest.py --tests mkfifo/00.t,open/17.t,mkdir/00.t,rmdir/12.t,unlink/14.t
 
-# The comparator's own checks. 56 of them, none of which needs the tool cache or a mount.
+# The comparator's own checks. 68 of them, none of which needs the tool cache or a mount.
 python3 bench/test_pjdfstest.py
 python3 -m unittest discover -s bench
+
+# The same records from three working directories, which must agree byte for byte.
+for where in bench/pjdfstest-fixture bench .; do
+  (cd $where && python3 "$OLDPWD/bench/pjdfstest.py" --reconcile "$OLDPWD/bench/pjdfstest-fixture/run" \
+     --tool "$OLDPWD/bench/pjdfstest-fixture/tool" --output "$OLDPWD/g3-$(basename $where).json")
+done
 
 # The bounded spike that found the false PASS, in both directions.
 SPIKE_WITHOUT_TOOL_EXIT=3 python3 bench/out/pjdfstest-fresh-clone-spike/spike.py

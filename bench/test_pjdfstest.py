@@ -11,6 +11,7 @@ duplicated result is the property the whole gate rests on.
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,155 @@ expect 0 unlink ${n0}
 def args_of(detail):
     m = p.TRIED_RE.search(detail)
     return m.group(1) if m else None
+
+
+SANITISED_SCOPE = "sanitised-reference"
+EXPORT_RE = re.compile(r"cowfs-[0-9a-f]{32}")
+MOUNTED_BY_RE = re.compile(r"mounted by \S+")
+
+
+def scrub(value, prefixes):
+    """Replace host facts by rule: the longest prefix first, then the export and user tokens."""
+    if not isinstance(value, str):
+        return value
+    for base, replacement in sorted(prefixes, key=lambda pair: len(pair[0]), reverse=True):
+        if value == base:
+            value = replacement or Path(base).name
+        elif value.startswith(base + "/"):
+            value = value[len(base) + 1:]
+            if replacement:
+                value = f"{replacement}/{value}"
+        elif base in value:
+            value = value.replace(base + "/", f"{replacement}/" if replacement else "")
+    return MOUNTED_BY_RE.sub("mounted by <user>", EXPORT_RE.sub("<private-export>", value))
+
+
+def json_paths(node, path=""):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from json_paths(value, f"{path}.{key}" if path else key)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from json_paths(value, f"{path}[{index}]")
+    else:
+        yield path, node
+
+
+FIXTURE = Path(__file__).resolve().parents[1] / "bench" / "pjdfstest-fixture"
+ESTABLISHED = 25
+UNPAIRABLE = 26
+
+
+def stage_fixture(root: Path, rewrite_raw: bool = True) -> tuple[Path, Path]:
+    """Copy the tracked fixture into `root`, optionally re-pointing raw streams at the copy.
+
+    The committed records already name their streams relatively. The rewrite exists to exercise the
+    absolute form, which the historical record sets use, and it keeps every raw_sha256 verifiable
+    because the transcript bytes are identical either way.
+    """
+    run, tool = root / "run", root / "tool"
+    shutil.copytree(FIXTURE / "run", run)
+    shutil.copytree(FIXTURE / "tool", tool)
+    if rewrite_raw:
+        rows = [json.loads(line) for line in (run / "cases.jsonl").read_text().splitlines()]
+        for row in rows:
+            row["raw"] = str((run / row["raw"]).resolve())
+        (run / "cases.jsonl").write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+    return run, tool
+
+
+def digests(root: Path) -> dict:
+    return {str(q.relative_to(root)): hashlib.sha256(q.read_bytes()).hexdigest()
+            for q in sorted(root.rglob("*")) if q.is_file()}
+
+
+def run_cli(script: Path, run: Path, *args: str, repo: Path | None = None,
+            cwd: Path | None = None) -> subprocess.CompletedProcess:
+    """The published CLI as a child process, which is how a reader meets it."""
+    command = [sys.executable, str(script), "--reconcile", str(run)]
+    if repo is not None:
+        command += ["--repo", str(repo)]
+    return subprocess.run(command + list(args), capture_output=True, text=True, timeout=600,
+                          cwd=None if cwd is None else str(cwd), check=False)
+
+
+def sanitise_run(source_run: Path, tool_root: Path, lease_root: Path, dest: Path) -> dict:
+    """Write a host-free, portable copy of a run's records into `dest`, and describe the transform.
+
+    Replacements are by rule rather than field by field, so the map is mechanical and checkable: the
+    run directory and the remaining lease prefix become relative to the copy, the tool checkout
+    becomes `tool`, and the capture host's user and private export name become declared tokens. The
+    ten transcripts and the five case scripts are copied byte for byte.
+
+    The identity copy this writes is a sanitised reference, not a live receipt. It declares its own
+    scope and records the sha256 of the receipt it came from, because the fields it keeps say which
+    filesystems that run saw and say nothing about any filesystem now.
+
+    The source is only ever read.
+    """
+    prefixes = ((str(tool_root), "tool"), (str(source_run), ""), (str(lease_root), ""))
+    (dest / "run" / "raw").mkdir(parents=True)
+    for rel in p.CURATED_CASES:
+        (dest / "tool" / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(tool_root / rel, dest / "tool" / rel)
+    shutil.copy(tool_root / "COPYING", dest / "tool" / "COPYING")
+    for stream in sorted((source_run / "raw").iterdir()):
+        shutil.copy(stream, dest / "run" / "raw" / stream.name)
+
+    rows = [json.loads(line) for line in (source_run / "cases.jsonl").read_text().splitlines()]
+    rewritten = []
+    for row in rows:
+        row["raw"] = f"raw/{Path(row['raw']).name}"
+        rewritten.append({key: scrub(value, prefixes)
+                          for key, value in row.items()})
+    (dest / "run" / "cases.jsonl").write_text(
+        "".join(json.dumps(r, sort_keys=True) + "\n" for r in rewritten))
+
+    identity = json.loads((source_run / "identity.json").read_text())
+    before = dict(json_paths(identity))
+    cleaned = json.loads(json.dumps(identity))
+    cleaned = _replace_strings(cleaned, lambda v: scrub(v, prefixes))
+    cleaned["runtime_identity"]["declared_scope"] = SANITISED_SCOPE
+    cleaned["runtime_identity"]["sanitisation"] = {
+        "kind": "host paths, the capture host's user and the private export name replaced by tokens",
+        "source_run": source_run.name,
+        "source_identity_sha256": hashlib.sha256((source_run / "identity.json").read_bytes())
+                                  .hexdigest(),
+        "rules": ["the tool checkout prefix becomes tool", "the run directory prefix becomes relative",
+                  "the remaining lease prefix becomes repo-relative",
+                  "the private export name becomes <private-export>", "mounted by <user>"],
+        "kept": ["st_dev", "fstype", "mountpoint", "plan", "ok", "not_ok", "raw_sha256"],
+        "meaning": "provenance of the capture, not an attestation of the filesystem it ran on",
+    }
+    (dest / "run" / "identity.json").write_text(json.dumps(cleaned, indent=1, sort_keys=True) + "\n")
+    changed = sorted(path for path, value in json_paths(cleaned)
+                     if before.get(path) != value and path in before)
+
+    provenance = {
+        "what_this_is": "a host-free derivative of one receipted run, kept so the checks have a "
+                        "fixed self-contained input",
+        "source_run": source_run.name,
+        "source": {name: hashlib.sha256((source_run / name).read_bytes()).hexdigest()
+                   for name in ("cases.jsonl", "identity.json")},
+        "fixture": {str(path.relative_to(dest)): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in sorted(dest.rglob("*")) if path.is_file()},
+        "identity_fields_rewritten": changed,
+        "identity_fields_kept": sorted(set(before) - set(changed)),
+        "declared_scope": SANITISED_SCOPE,
+        "not_a_live_receipt": "the fixture's identity.json is a sanitised reference. The live receipt "
+                              "is the run directory it came from, and only that receipt attests a "
+                              "filesystem.",
+    }
+    (dest / "PROVENANCE.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
+    return provenance
+
+
+def _replace_strings(node, transform):
+    if isinstance(node, dict):
+        return {key: _replace_strings(value, transform) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_replace_strings(value, transform) for value in node]
+    return transform(node)
 
 
 class PairingInvariant(unittest.TestCase):
@@ -450,50 +600,23 @@ class ReconcileNeverOverwrites(unittest.TestCase):
     check having run first, or on a file it does not own. Nothing here touches a preserved run.
     """
 
-    FIXTURE = Path(__file__).resolve().parents[1] / "bench" / "pjdfstest-fixture"
+    ESTABLISHED = ESTABLISHED
+    UNPAIRABLE = UNPAIRABLE
     SENTINEL = "this file is evidence and must not change\n"
     # What the pinned closure makes of the fixture's records: the receipted run 20261005T025742Z
     # scored 25 established regressions and 26 unpairable assertions on exactly these bytes.
-    ESTABLISHED = 25
-    UNPAIRABLE = 26
 
     def setUp(self):
         self.work = Path(tempfile.mkdtemp(prefix="pjdfstest-reconcile-"))
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
         (self.work / "analysis").mkdir()
-        self.run, self.tool = self.stage()
+        self.run, self.tool = stage_fixture(self.work)
 
-    @classmethod
-    def stage(cls, root: Path | None = None) -> tuple[Path, Path]:
-        """Copy the tracked fixture and re-point its raw streams at that copy.
-
-        The committed records name the run they came from, so the copy points each record at its own
-        raw file. The bytes are identical, so every recorded raw_sha256 still verifies.
-        """
-        work = root or Path(tempfile.mkdtemp(prefix="pjdfstest-reconcile-"))
-        run = work / "run"
-        shutil.copytree(cls.FIXTURE / "run", run)
-        tool = work / "tool"
-        shutil.copytree(cls.FIXTURE / "tool", tool)
-        rows = [json.loads(line) for line in (run / "cases.jsonl").read_text().splitlines()]
-        for row in rows:
-            row["raw"] = str((run / row["raw"]).resolve())
-        (run / "cases.jsonl").write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
-        return run, tool
-
-    @staticmethod
-    def digests(root: Path) -> dict:
-        return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in sorted(root.rglob("*")) if p.is_file()}
+    digests = staticmethod(digests)
 
     def cli(self, *args: str, repo: Path | None = None,
-            script: Path | None = None) -> subprocess.CompletedProcess:
-        """The published CLI as a child process, which is how a reader meets it."""
-        command = [sys.executable, str(script or Path(p.__file__)), "--reconcile", str(self.run)]
-        if repo is not None:
-            command += ["--repo", str(repo)]
-        return subprocess.run(command + list(args), capture_output=True, text=True, timeout=600,
-                              check=False)
+            script: Path | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
+        return run_cli(script or Path(p.__file__), self.run, *args, repo=repo, cwd=cwd)
 
     def git_repo(self, name: str, tracked: Path) -> Path:
         """A private git repo holding one tracked file, so provenance can be exercised at all."""
@@ -693,6 +816,216 @@ class ReconcileNeverOverwrites(unittest.TestCase):
         self.assertEqual(
             json.loads((self.work / "analysis" / "u.json").read_text())["analysis"]
             ["analyser_revision"], "UNKNOWN", "an edited script must not claim a revision")
+
+class FixtureIsPortableAndDeclared(unittest.TestCase):
+    """The committed fixture is host-free, self-describing, and scores the same from anywhere.
+
+    The fixture exists so the checks have a fixed input. These checks are about that input's
+    integrity, and about the two ways a reader can be misled by a record set: one that only works
+    from one directory, and one whose missing evidence reads as a clean bill of health.
+    """
+
+    HOST_NEEDLES = ("/Users/", "zeeshanhaque", ".treehouse", "/tmp/")
+    ORIGINAL_CASES = "eb2ff1245baa4aa3"
+    ORIGINAL_IDENTITY = "31d92ea0d2bd89d7"
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="pjdfstest-fixture-"))
+        self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        (self.work / "analysis").mkdir()
+        self.run, self.tool = stage_fixture(self.work, rewrite_raw=False)
+        self.harness = Path(p.__file__)
+
+    def rows(self) -> list[dict]:
+        return [json.loads(line) for line in (self.run / "cases.jsonl").read_text().splitlines()]
+
+    def write_rows(self, rows: list[dict]) -> None:
+        (self.run / "cases.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+
+    def reconcile(self, *args: str, run: Path | None = None, cwd: Path | None = None,
+                  repo: Path | None = None) -> tuple[subprocess.CompletedProcess, Path]:
+        out = self.work / "out" / f"analysis-{len(list((self.work / 'out').glob('*.json')))}.json"
+        out.parent.mkdir(exist_ok=True)
+        done = run_cli(self.harness, run or self.run, "--tool", str(self.tool), "--output", str(out),
+                       cwd=cwd, repo=repo)
+        return done, out
+
+    def test_the_same_records_score_the_same_from_three_working_directories(self):
+        payloads = []
+        for name, cwd in (("inside", self.run.parent), ("one-up", self.run.parent.parent),
+                          ("unrelated", self.work)):
+            done, out = self.reconcile(cwd=cwd)
+            self.assertEqual(done.returncode, 1, f"{name}: " + done.stdout + done.stderr)
+            self.assertIn("state FAIL exit 1", done.stdout, name)
+            payloads.append(out.read_bytes())
+            out.unlink()
+        self.assertEqual(len(set(payloads)), 1, "the working directory changed the verdict")
+        payload = json.loads(payloads[0])
+        self.assertEqual(len(payload["comparison"]["established_regressions"]), ESTABLISHED)
+        self.assertEqual(len(payload["comparison"]["unpairable"]), UNPAIRABLE)
+
+    def test_a_relative_raw_path_cannot_climb_out_of_the_run(self):
+        outside = self.work / "outside"
+        outside.mkdir()
+        shutil.copy(self.run / "raw" / "native_open_17.t.tap", outside / "borrowed.tap")
+        rows = self.rows()
+        for row in rows:
+            if (row["arm"], row["test"]) == ("native", "open/17.t"):
+                row["raw"] = "../outside/borrowed.tap"
+        self.write_rows(rows)
+        done, _ = self.reconcile()
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("outside the run directory", done.stdout)
+
+    def test_a_relative_raw_path_through_a_symlink_out_of_the_run_is_refused(self):
+        outside = self.work / "outside"
+        outside.mkdir()
+        target = outside / "elsewhere.tap"
+        shutil.copy(self.run / "raw" / "native_open_17.t.tap", target)
+        link = self.run / "raw" / "link.tap"
+        link.symlink_to(target)
+        rows = self.rows()
+        for row in rows:
+            if (row["arm"], row["test"]) == ("native", "open/17.t"):
+                row["raw"] = "raw/link.tap"
+        self.write_rows(rows)
+        done, _ = self.reconcile()
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("outside the run directory", done.stdout)
+
+    def test_an_absolute_raw_path_is_taken_as_written(self):
+        elsewhere = self.work / "historical"
+        shutil.copytree(self.run / "raw", elsewhere / "raw")
+        rows = self.rows()
+        for row in rows:
+            row["raw"] = str((elsewhere / row["raw"]).resolve())
+        self.write_rows(rows)
+        done, out = self.reconcile()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn("outside the run directory", done.stdout)
+        self.assertEqual(len(json.loads(out.read_text())["comparison"]["established_regressions"]),
+                         ESTABLISHED)
+
+    def test_a_record_set_with_no_readable_raw_stream_is_invalid_not_pass(self):
+        for stream in (self.run / "raw").iterdir():
+            stream.unlink()
+        done, _ = self.reconcile()
+        self.assertNotEqual(done.returncode, 0, "missing evidence must never read as a pass")
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("raw stream is missing", done.stdout)
+        self.assertIn("INTEGRITY", done.stdout)
+
+    def test_a_run_wider_than_the_closure_is_refused(self):
+        rows = self.rows()
+        for row in rows:
+            if row["test"] == "unlink/14.t":
+                row["test"] = "unlink/15.t"
+        self.write_rows(rows)
+        done, _ = self.reconcile()
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("have no script profile", done.stdout)
+
+    def test_a_closure_with_an_extra_script_is_refused(self):
+        extra = self.tool / "tests" / "open" / "18.t"
+        extra.write_text("#!/bin/sh\nexpect 0 unlink ${n0}\n")
+        done, _ = self.reconcile()
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("carries only the pinned cases", done.stdout)
+
+    def test_a_closure_with_a_file_that_is_not_metadata_is_refused(self):
+        (self.tool / "helper.sh").write_text("#!/bin/sh\necho not a case\n")
+        done, _ = self.reconcile()
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("carries no helper.sh", done.stdout)
+
+    def test_an_altered_upstream_notice_is_refused(self):
+        notice = self.tool / "COPYING"
+        notice.write_text(notice.read_text() + "extra\n")
+        done, _ = self.reconcile()
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("COPYING sha256", done.stdout)
+
+    def test_the_fixture_carries_no_host_identifiers_and_hashes_as_declared(self):
+        provenance = json.loads((FIXTURE / "PROVENANCE.json").read_text())
+        for rel, want in provenance["fixture"].items():
+            self.assertEqual(hashlib.sha256((FIXTURE / rel).read_bytes()).hexdigest(), want, rel)
+        self.assertTrue(provenance["source"]["cases.jsonl"].startswith(self.ORIGINAL_CASES))
+        self.assertTrue(provenance["source"]["identity.json"].startswith(self.ORIGINAL_IDENTITY))
+        for path in sorted(FIXTURE.rglob("*")):
+            if not path.is_file():
+                continue
+            text = path.read_text(errors="replace")
+            for needle in self.HOST_NEEDLES:
+                self.assertNotIn(needle, text, f"{path} carries {needle}")
+        for rel, want in p.CURATED_CASES.items():
+            self.assertEqual(hashlib.sha256((FIXTURE / "tool" / rel).read_bytes()).hexdigest(), want,
+                             rel)
+        self.assertEqual(hashlib.sha256((FIXTURE / "tool/COPYING").read_bytes()).hexdigest(),
+                         p.CURATED_METADATA["COPYING"])
+
+    def test_the_transform_replaces_host_facts_by_rule(self):
+        lease = self.work / "Users" / "someone" / "repo"
+        source, tool = lease / "run", lease / "tool"
+        (source / "raw").mkdir(parents=True)
+        shutil.copytree(FIXTURE / "tool", tool)
+        rows = self.rows()
+        for index, row in enumerate(rows):
+            stream = source / "raw" / Path(row["raw"]).name
+            shutil.copy(FIXTURE / "run" / row["raw"], stream)
+            row["raw"] = str(stream)
+            row["case_dir"] = f"{source}/case-{index}"
+            row["script_path"] = f"{tool}/{row['script_path']}"
+        source.joinpath("cases.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+        document = json.loads((FIXTURE / "run/identity.json").read_text())
+        document["daemon"]["store"] = f"{source}/store"
+        document["daemon"]["socket"] = f"{lease}/rt/c.sock"
+        document["daemon"]["argv"] = [f"{lease}/target/release/cowfs-daemon", "--store",
+                                      f"{source}/store"]
+        document["runtime_identity"]["native"]["path"] = f"{source}/native"
+        document["runtime_identity"]["cowfs"]["path"] = f"{source}/mnt/pjd"
+        document["runtime_identity"]["cowfs"]["mountpoint"] = f"{source}/mnt"
+        source.joinpath("identity.json").write_text(json.dumps(document, indent=1) + "\n")
+        before = digests(source)
+        dest = self.work / "derived"
+        provenance = sanitise_run(source, tool, lease, dest)
+        self.assertEqual(digests(source), before, "the transform wrote to its source")
+        for path in sorted(dest.rglob("*")):
+            if path.is_file():
+                text = path.read_text(errors="replace")
+                self.assertNotIn(f"{lease}/", text, f"{path} kept a host path")
+        self.assertIn("runtime_identity.native.path", provenance["identity_fields_rewritten"])
+        self.assertIn("daemon.socket", provenance["identity_fields_rewritten"])
+        self.assertEqual(provenance["declared_scope"], SANITISED_SCOPE)
+        identity = json.loads((dest / "run" / "identity.json").read_text())
+        self.assertEqual(identity["runtime_identity"]["declared_scope"], SANITISED_SCOPE)
+        self.assertEqual(identity["runtime_identity"]["sanitisation"]["source_identity_sha256"],
+                         hashlib.sha256((source / "identity.json").read_bytes()).hexdigest())
+        derived = [json.loads(line) for line in
+                   (dest / "run" / "cases.jsonl").read_text().splitlines()]
+        for row in derived:
+            self.assertEqual(hashlib.sha256((dest / "run" / row["raw"]).read_bytes()).hexdigest(),
+                             row["raw_sha256"], row["test"])
+
+    def test_the_verdict_repeats_the_receipts_declared_scope(self):
+        done, out = self.reconcile()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f"declares scope {SANITISED_SCOPE!r}", done.stdout)
+        analysis = json.loads(out.read_text())["analysis"]
+        self.assertEqual(analysis["identity_receipt"]["declared_scope"], SANITISED_SCOPE)
+        self.assertTrue(analysis["identity_receipt"]["sanitisation"]["source_identity_sha256"]
+                        .startswith(self.ORIGINAL_IDENTITY))
+        document = json.loads((self.run / "identity.json").read_text())
+        del document["runtime_identity"]["declared_scope"]
+        del document["runtime_identity"]["sanitisation"]
+        (self.run / "identity.json").write_text(json.dumps(document, indent=1, sort_keys=True) + "\n")
+        again, _ = self.reconcile()
+        self.assertEqual(again.returncode, 1, again.stdout + again.stderr)
+        self.assertNotIn("declares scope", again.stdout,
+                         "the disclosure must follow the receipt, not this fixture")
+
+
 
 if __name__ == "__main__":
     unittest.main()
