@@ -1181,17 +1181,25 @@ class DeviceDisambiguation(unittest.TestCase):
         self.assertIsNone(self.module().fstype_of_device(self.dev("8:2"), None, self.ROWS))
 
     def test_an_unreadable_table_is_an_absence_not_an_ambiguity(self):
-        original = self.module().read_mountinfo
-        self.module().read_mountinfo = lambda: (None, "permission denied")
+        # One module instance for the whole test. Calling self.module() again loads a fresh one,
+        # so patching a temporary and then asking a new module for the answer tested nothing: on
+        # macOS it passed for the wrong reason, because there is no /proc/self/mountinfo there and
+        # the real reader fails anyway. Linux CI is what caught it.
+        module = self.module()
+        original = module.read_mountinfo
+        module.read_mountinfo = lambda: (None, "permission denied")
         try:
-            got = self.module().mountinfo_for_device(self.dev("8:2"), "/x")
-            kind = self.module().fstype_of_device(self.dev("8:2"), "/x")
+            got = module.mountinfo_for_device(self.dev("8:2"), "/x")
+            kind = module.fstype_of_device(self.dev("8:2"), "/x")
         finally:
-            self.module().read_mountinfo = original
+            module.read_mountinfo = original
         self.assertTrue(got["unreadable"])
         self.assertNotIn("ambiguous", got)
         self.assertIn("unreadable", got["reason"])
         self.assertIsNone(kind)
+        # And with the real reader restored the same question is answered, so the test above was
+        # exercising the patch and not the absence of /proc.
+        self.assertIsNotNone(module.mountinfo_for_device(self.dev("8:2"), "/x"))
 
 
 class SeparateProcessReadback(unittest.TestCase):
