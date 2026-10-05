@@ -287,7 +287,8 @@ impl ControlHandler for Handler {
         // issue #20 needs a scan of exactly that directory. Which directories this daemon may be
         // asked about is still a server-side rule, so a name that climbs out with `..` is refused
         // rather than followed.
-        let canonical = std::fs::canonicalize(&dir).map_err(|e| io(e, &format!("cannot resolve {snapshot:?}")))?;
+        let canonical = std::fs::canonicalize(&dir)
+            .map_err(|e| io(e, &format!("cannot resolve {snapshot:?}")))?;
         if !canonical.starts_with(&self.mount_path) {
             return Err(CtlError::new(
                 ErrorCode::InvalidParams,

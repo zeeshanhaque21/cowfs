@@ -618,13 +618,8 @@ pub fn return_slot(
                 "{} holds {} that treehouse cannot see, and --force was not given; returning it \
                  now would unlink a file a live process still has open",
                 opts.slot.display(),
-                holders::describe(
-                    &unseen
-                        .into_iter()
-                        .map(|p| (*p).clone())
-                        .collect::<Vec<_>>()
-                )
-                .join(", ")
+                holders::describe(&unseen.into_iter().map(|p| (*p).clone()).collect::<Vec<_>>())
+                    .join(", ")
             )));
         }
     }
@@ -812,7 +807,10 @@ mod tests {
     fn only_a_hold_treehouse_cannot_see_stops_the_return_before_treehouse_is_asked() {
         // Case c of spike 5: chdir'd out, still has the file open. Nothing but the descriptor gives
         // it away, so this is the one the return must intercept.
-        assert!(only_unseen_holds(&holds(&[(HoldKind::Fd, "/slot/held.txt")])));
+        assert!(only_unseen_holds(&holds(&[(
+            HoldKind::Fd,
+            "/slot/held.txt"
+        )])));
         assert!(only_unseen_holds(&holds(&[(HoldKind::Lock, "/slot/l")])));
         // A working-directory holder is treehouse's own case and it refuses in its own words.
         assert!(!only_unseen_holds(&holds(&[(HoldKind::Cwd, "/slot")])));

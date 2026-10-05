@@ -102,8 +102,9 @@ mod imp {
     /// as absent, and a lock held on the mount is enough to block an unmount.
     fn locked() -> Result<BTreeSet<(u64, u64, u64)>, String> {
         let mut out = BTreeSet::new();
-        let text = std::fs::read_to_string("/proc/locks")
-            .map_err(|e| format!("/proc/locks cannot be read, so a flock would be invisible: {e}"))?;
+        let text = std::fs::read_to_string("/proc/locks").map_err(|e| {
+            format!("/proc/locks cannot be read, so a flock would be invisible: {e}")
+        })?;
         for line in text.lines() {
             let mut f = line.split_whitespace();
             let (Some(_kind), Some(_pid), Some(dev), Some(ino)) =
@@ -190,8 +191,7 @@ mod imp {
     /// message has to name which one it is.
     pub fn lsof_usable() -> bool {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(LSOF)
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        std::fs::metadata(LSOF).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }
 
     pub fn scan_lsof(prefix: &Path, timeout: Duration) -> Result<Vec<ProcessInfo>, String> {
@@ -254,7 +254,10 @@ mod imp {
     /// The pipes are drained on their own thread because a wedged `lsof` never closes stdout:
     /// reading it to end on this one would make the deadline unreachable and hang the daemon
     /// instead of reporting that the answer is unknown.
-    pub fn run_bounded(cmd: &mut std::process::Command, timeout: Duration) -> Result<String, String> {
+    pub fn run_bounded(
+        cmd: &mut std::process::Command,
+        timeout: Duration,
+    ) -> Result<String, String> {
         use std::io::Read;
         use std::process::Stdio;
         use std::sync::mpsc;
@@ -313,8 +316,12 @@ mod imp {
         };
         // The child is reaped here so it never sits as a zombie, and its pipes are already closed
         // by a process that exited, so the drains below return without waiting.
-        let text = out_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
-        let err = err_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        let text = out_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_default();
+        let err = err_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_default();
         // lsof exits 1 when it matched nothing, which is an answer. Every other failure used to
         // read back as "no holders", which is the fail-open this whole path exists to remove.
         match status.code() {
@@ -541,7 +548,8 @@ mod tests {
         let started = std::time::Instant::now();
         let mut wedged = Command::new("/bin/sh");
         wedged.args(["-c", "sleep 30"]);
-        let why = imp::run_bounded(&mut wedged, Duration::from_millis(150)).expect_err("must time out");
+        let why =
+            imp::run_bounded(&mut wedged, Duration::from_millis(150)).expect_err("must time out");
         assert!(why.contains("did not finish"), "{why}");
         assert!(
             started.elapsed() < Duration::from_secs(10),

@@ -79,11 +79,7 @@ fn lease(s: &Sandbox, root: &Path) -> PathBuf {
         "treehouse get --lease failed: {}",
         stderr_of(&out)
     );
-    PathBuf::from(
-        last_json(&stdout_of(&out))["path"]
-            .as_str()
-            .expect("path"),
-    )
+    PathBuf::from(last_json(&stdout_of(&out))["path"].as_str().expect("path"))
 }
 
 /// The `return` invocation, with the daemon and the shimmed treehouse an operator would use.
@@ -119,10 +115,10 @@ fn return_args<'a>(
 fn is_leased(s: &Sandbox, root: &Path, slot: &Path) -> bool {
     let wanted = canon(slot);
     status(s, root).iter().any(|e| {
-        e["lease_id"]
-            .as_str()
-            .is_some_and(|id| !id.is_empty())
-            && e["path"].as_str().is_some_and(|p| canon(Path::new(p)) == wanted)
+        e["lease_id"].as_str().is_some_and(|id| !id.is_empty())
+            && e["path"]
+                .as_str()
+                .is_some_and(|p| canon(Path::new(p)) == wanted)
     })
 }
 
@@ -174,7 +170,10 @@ fn holder_outside_the_slot(slot: &Path, file: &Path, marker: &Path) -> Fixture {
             file.display()
         );
         if !cowfs_treehouse::alive(fixture.pid) {
-            panic!("the holder fixture {} died before opening the file", fixture.pid);
+            panic!(
+                "the holder fixture {} died before opening the file",
+                fixture.pid
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -299,7 +298,10 @@ fn force_kills_the_real_holder_and_only_then_returns_the_slot() {
         "treehouse's own reset cleaned the untracked file, which is only safe because the holder \
          is gone; while it was alive that same unlink is what leaves the slot dirty"
     );
-    assert!(!is_leased(&s, &mount, &slot), "the slot went back to the pool");
+    assert!(
+        !is_leased(&s, &mount, &slot),
+        "the slot went back to the pool"
+    );
 }
 
 /// A pool that is not on a mount keeps working exactly as before: cowfs has nothing to scan, says
@@ -328,7 +330,10 @@ fn a_mode_a_slot_off_the_mount_is_reported_as_unscanned_and_still_returns() {
             .contains("not scanned"),
         "and it never reads as proof: {v}"
     );
-    assert!(!is_leased(&s, &s.pool(), &slot), "the slot went back to the pool");
+    assert!(
+        !is_leased(&s, &s.pool(), &slot),
+        "the slot went back to the pool"
+    );
 }
 
 /// A handler that cannot answer the scan, which is what a machine without a usable `lsof` produces.
@@ -395,7 +400,10 @@ fn a_daemon_that_cannot_answer_the_holder_scan_stops_the_return() {
     assert_ne!(out.status.code(), Some(5), "it is not busy, it is blind");
     let err = stderr_of(&out);
     assert!(err.contains("cannot scan holders"), "{err}");
-    assert!(err.contains("lsof"), "the reason names the capability: {err}");
+    assert!(
+        err.contains("lsof"),
+        "the reason names the capability: {err}"
+    );
     assert!(slot.join(".git").exists(), "the slot was left in place");
     assert!(is_leased(&s, &mount, &slot), "and it was never released");
 }
