@@ -339,6 +339,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "cowfs-vfs",
+ "cowfs-vfs-path",
  "cowfs-vfs-test",
  "nfsserve",
  "signal-hook",
