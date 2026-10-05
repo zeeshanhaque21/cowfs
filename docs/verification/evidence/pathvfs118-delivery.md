@@ -146,9 +146,11 @@ The comment in the test says this and points at #120.
 The expected-entries assertion is untouched: the resumed listing must produce `[a, b, c, d, e]`, and
 the fresh-from-the-start listing must produce `[b, c, d, e]`, so the name created outside is still
 required to be reachable through `PathVfs` and not merely present on the backing filesystem.
-The precondition is asserted, not assumed: the test performs extra external mutations until the stamp
-actually changes, then asserts it, rather than polling one unchanged event, and there is no arbitrary
-sleep, no retry loop, no `#[ignore]`, no `cfg` gate, no skipped assertion and no threshold weakening.
+The precondition is asserted, not assumed: after the real external write and remove, the test makes one
+deterministic modification of the backing directory mtime and asserts that the six-field stamp
+changed.
+There is no arbitrary sleep, retry loop, `#[ignore]`, `cfg` gate, skipped assertion or threshold
+weakening.
 
 #120, the same-tick coherence gap in the adapter itself, is explicitly not addressed here and remains
 open.
