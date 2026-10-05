@@ -324,8 +324,7 @@ fn with_core<T>(slot: &CoreSlot, f: impl FnOnce(&Core) -> io::Result<T>) -> io::
     }
 }
 
-/// Records what `name` is a base of, then makes it a base whose provenance is unknown, and returns
-/// what it was.
+/// Makes `name` a base whose provenance is unknown, if it was a base at all.
 ///
 /// A swap replaces the tree under a name, so the record of the tree that was there describes bytes
 /// that are gone. Reporting that record would be a claim about the new tree that nothing supports.
@@ -334,46 +333,21 @@ fn with_core<T>(slot: &CoreSlot, f: impl FnOnce(&Core) -> io::Result<T>) -> io::
 /// rather than fresh.
 ///
 /// A name with no record is not a base and does not become one here: a plain snapshot must not
-/// acquire a record that nothing asked for. Returns `None` in that case, having changed nothing.
+/// acquire a record that nothing asked for.
 fn invalidate_base_record(
     root: &Path,
     records: &mut std::collections::BTreeMap<String, crate::base_meta::Record>,
     name: &str,
-) -> io::Result<Option<cowfs_ctl::BaseMeta>> {
-    let Some(was) = records.get(name).cloned() else {
-        return Ok(None);
-    };
+) -> io::Result<()> {
+    if records.get(name).is_none() {
+        return Ok(());
+    }
     crate::base_meta::write_locked(
         root,
         records,
         name,
         &crate::base_meta::Record::promoted_unknown(),
-    )?;
-    Ok(Some(cowfs_ctl::BaseMeta::from(was)))
-}
-
-/// Puts back the record a swap invalidated, because the swap did not happen after all.
-///
-/// Same intent as [`rollback_base`]: a record that is left cleared names a base whose provenance
-/// nobody knows, when the tree it described is still there and was still described.
-fn restore_base_record(
-    root: &Path,
-    records: &mut std::collections::BTreeMap<String, crate::base_meta::Record>,
-    name: &str,
-    was: Option<cowfs_ctl::BaseMeta>,
-    cause: io::Error,
-) -> io::Error {
-    let Some(was) = was else {
-        return cause;
-    };
-    match crate::base_meta::write_locked(root, records, name, &crate::base_meta::Record::from(&was))
-    {
-        Ok(()) => cause,
-        Err(rollback) => io::Error::new(
-            cause.kind(),
-            format!("{cause}; and the base record could not be put back: {rollback}"),
-        ),
-    }
+    )
 }
 
 /// Puts a base record back where it was after a snapshot rename failed, and says so if even that
@@ -744,19 +718,20 @@ impl Snapshots for CoreSnapshots {
         // describes the tree that is being replaced, and a base that keeps it would report a commit
         // that did not produce the tree now under its name.
         self.bases.exclusive(|records| {
-            // The record goes first, because it is the only half of this that can still be undone.
-            // The staged swap past its point of no return rolls forward rather than reporting an
-            // error, so a record written afterwards could not be taken back if the publication
-            // failed: the caller would be told the swap worked and handed a base still carrying the
-            // commit of the tree that was just replaced, with the old tree already gone.
-            //
-            // Nothing else has changed when this write fails, so that failure leaves both the old
-            // tree and the old record exactly as they were.
-            let was = invalidate_base_record(self.bases.root(), records, name)?;
+            // Refusals that are decided before anything is touched, while the old tree and the old
+            // record are both still there: a swap with itself, and a source or target that does not
+            // exist. `promote_base` would refuse these too, but only after the record was cleared,
+            // and a refusal is not a replacement, so it must leave the record alone. Holding this
+            // section across the check and the swap is what makes that safe: create, remove, rename
+            // and promote all mutate the namespace inside this same section, so nothing can appear
+            // or disappear between the check and the swap.
+            if name == from {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot swap a snapshot with itself",
+                ));
+            }
             self.with(|c| {
-                // `promote_base` creates its target when it is absent, which is what a base wants and
-                // a reset does not: `snapshot_reset` replaces a snapshot, so a missing one is
-                // `not_found` rather than a new snapshot that was never asked for.
                 for n in [name, from] {
                     Self::names(c)?
                         .into_iter()
@@ -764,12 +739,26 @@ impl Snapshots for CoreSnapshots {
                         .then_some(())
                         .ok_or_else(|| missing(n))?;
                 }
-                c.promote_base(from, name).map_err(control_io).map(|_| ())
-            })
-            // An error out of the staged swap means it rolled back, so the old tree is still there
-            // and the record it was published with is put back, the same way `rename` puts a moved
-            // record back.
-            .map_err(|e| restore_base_record(self.bases.root(), records, name, was, e))
+                Ok::<(), io::Error>(())
+            })?;
+
+            // Past this point the swap may have replaced the tree, so the record is cleared and
+            // stays cleared.
+            //
+            // An `Err` out of the staged swap does not mean the old tree is still there. Past its
+            // point of no return the core rolls forward and only reports an error when the
+            // roll-forward itself fails, which leaves the intent file for the next `Core::open` to
+            // finish (`crates/cowfs-core/src/swap.rs`). The error alone cannot tell a rollback from
+            // a failed roll-forward, so restoring the old record on `Err` would put `commit-AAA`
+            // back over a tree the pending intent is about to install, which is the stale
+            // provenance this swap exists to prevent.
+            //
+            // So an error from here reports the failure and leaves the provenance invalidated.
+            // On a swap that really did roll back that loses provenance that was still true, and
+            // the base reports itself stale rather than fresh, which is the honest answer when this
+            // code cannot tell which happened.
+            invalidate_base_record(self.bases.root(), records, name)?;
+            self.with(|c| c.promote_base(from, name).map_err(control_io).map(|_| ()))
         })?;
         let mut info = self.info(name)?;
         // The core forks twice: `from` into a staging name, then the staging name into `name`. So
@@ -1029,22 +1018,45 @@ impl Snapshots for PathSnapshots {
         // One critical section, as on the core: the tree going and its record going are one step, so
         // a reader never sees a base whose record describes the tree it replaced.
         self.bases.exclusive(|records| {
-            // The record goes first, for the same reason as on the core: it is the only half of
-            // this that can still be undone, and a copy that fails must leave the old tree and the
-            // old record together.
-            let was = invalidate_base_record(self.bases.root(), records, name)?;
+            // Cleared before the tree is touched, and not put back afterwards, for the same reason
+            // as on the core: past this point the swap may have replaced the tree, and an error
+            // from the renames cannot say whether it did.
+            invalidate_base_record(self.bases.root(), records, name)?;
             // Build beside the old tree, then swap by rename, so a failed copy changes nothing.
             let staging = self.store.join(format!(".cowfs-swap-{name}"));
             let retired = self.store.join(format!(".cowfs-retired-{name}"));
+            cowfs_vfs_path::force_remove_dir_all(&staging);
+            cowfs_vfs_path::force_remove_dir_all(&retired);
             let result = (|| {
                 copy_tree(&self.dir(from), &staging)?;
                 std::fs::rename(self.dir(name), &retired)?;
                 std::fs::rename(&staging, self.dir(name))?;
                 Ok::<(), io::Error>(())
             })();
-            cowfs_vfs_path::force_remove_dir_all(&staging);
-            cowfs_vfs_path::force_remove_dir_all(&retired);
-            result.map_err(|e| restore_base_record(self.bases.root(), records, name, was, e))
+            match result {
+                Ok(()) => cowfs_vfs_path::force_remove_dir_all(&retired),
+                Err(e) => {
+                    // The old tree is only at `retired` if it got that far, and the target has none.
+                    // Put it back where it was. If that cannot be done the retired copy is left
+                    // alone: it is the only remaining copy of the tree the target had, and deleting
+                    // it would destroy work to tidy a directory.
+                    cowfs_vfs_path::force_remove_dir_all(&staging);
+                    if retired.is_dir() {
+                        return Err(match std::fs::rename(&retired, self.dir(name)) {
+                            Ok(()) => e,
+                            Err(back) => io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "{e}; and the replaced tree could not be put back, and is left \
+                                     at {retired:?} rather than deleted: {back}"
+                                ),
+                            ),
+                        });
+                    }
+                    return Err(e);
+                }
+            }
+            Ok::<(), io::Error>(())
         })?;
         Ok(self.info(name, Some(from.to_owned())))
     }
