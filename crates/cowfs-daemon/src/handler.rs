@@ -20,6 +20,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// `mount` joined with `name`, or `None` when the name could leave the mount.
+///
+/// Pure path arithmetic: no syscall, no `realpath`, so it cannot be the thing that wedges on a stale
+/// mount. What a symlink does after the join is settled later, by the scan, which resolves the
+/// prefix under its own deadline and refuses a result that is not inside the mount.
+pub(crate) fn lexical_child(mount: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty() || name.starts_with('/') {
+        return None;
+    }
+    // A leading `.` would name the mount itself, which is a scan of the whole mount: refused, while
+    // a `.` further along, such as `base/./slot`, stays legal.
+    let mut components = name.split('/');
+    let first = components.next().unwrap_or_default();
+    if first.is_empty() || first == "." || first == ".." {
+        return None;
+    }
+    if components.any(|c| c.is_empty() || c == "..") {
+        return None;
+    }
+    Some(mount.join(name))
+}
+
 fn io(e: std::io::Error, what: &str) -> CtlError {
     let code = match e.kind() {
         std::io::ErrorKind::NotFound => ErrorCode::NotFound,
@@ -153,10 +175,6 @@ impl Handler {
         ))
     }
 
-    fn dir_of(&self, name: &str) -> PathBuf {
-        self.mount_path.join(name)
-    }
-
     /// The report for a backend that ingested and verified the tree itself. Both root hashes are
     /// recomputed here, the source on disk and the snapshot through its `Vfs`, so the caller gets
     /// the same evidence the passthrough backend reports and can check it independently.
@@ -276,28 +294,29 @@ impl ControlHandler for Handler {
     }
 
     fn holders(&self, snapshot: &str) -> CtlResult<Vec<ProcessInfo>> {
-        let dir = self.dir_of(snapshot);
+        // The name is resolved against the mount, so it may name a directory inside it and not only
+        // a snapshot: a mode (a) treehouse slot is a worktree directory inside a snapshot, and issue
+        // #20 needs a scan of exactly that directory. Which directories this daemon may be asked
+        // about is a server-side rule, and its first half costs no syscall at all: a name that is
+        // absolute, or climbs out with `..`, is refused here before anything touches the mount.
+        let Some(dir) = lexical_child(&self.mount_path, snapshot) else {
+            return Err(CtlError::new(
+                ErrorCode::InvalidParams,
+                format!("{snapshot:?} is not a directory inside the mount"),
+            ));
+        };
         if !dir.exists() {
             return Err(CtlError::not_found(format!(
                 "snapshot {snapshot:?} does not exist"
             )));
         }
-        // The name is resolved against the mount, so it may name a directory inside it and not
-        // only a snapshot: a mode (a) treehouse slot is a worktree directory inside a snapshot, and
-        // issue #20 needs a scan of exactly that directory. Which directories this daemon may be
-        // asked about is still a server-side rule, so a name that climbs out with `..` is refused
-        // rather than followed.
-        let canonical = std::fs::canonicalize(&dir)
-            .map_err(|e| io(e, &format!("cannot resolve {snapshot:?}")))?;
-        if !canonical.starts_with(&self.mount_path) {
-            return Err(CtlError::new(
-                ErrorCode::InvalidParams,
-                format!("{snapshot:?} is not a directory inside the mount"),
-            ));
-        }
+        // The second half, once the prefix has been resolved, runs inside the scan's own deadline:
+        // resolving a path is the syscall a stale mount can wedge, and this daemon has been bitten
+        // by exactly that twice, in 90c9a8f and 265fc3f.
+        //
         // A platform that cannot answer is not a clear slot: reporting no holders because lsof is
-        // missing or wedged is how a reset lands under a live writer.
-        match holders::scan_checked(&canonical) {
+        // missing, wedged, or handed back a partial answer is how a reset lands under a live writer.
+        match holders::scan_mounted(&self.mount_path, &dir) {
             holders::Scan::Holders(found) => Ok(found),
             holders::Scan::Unavailable(why) => Err(CtlError::new(
                 ErrorCode::Unsupported,

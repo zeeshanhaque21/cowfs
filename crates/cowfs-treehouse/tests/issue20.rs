@@ -304,6 +304,59 @@ fn force_kills_the_real_holder_and_only_then_returns_the_slot() {
     );
 }
 
+/// `--force` does not become a licence to signal something this process may not signal. The holder
+/// here is the test process itself, which is an ancestor of the companion it starts, and it holds a
+/// real open descriptor in the slot for the whole run.
+#[test]
+fn force_refuses_a_holder_it_may_not_signal_and_leaves_the_descriptor_open() {
+    let _w = Watchdog::start(180);
+    crate::require_treehouse!();
+    let (s, stub) = on_mount_pool();
+    let mount = mount_of(&s);
+    let slot = lease(&s, &mount);
+    let file = slot.join("held.txt");
+    std::fs::write(&file, b"held\n").expect("write the file the holder will open");
+    // The descriptor is held by this process for the whole run, and nothing here closes it.
+    let open = std::fs::File::open(&file).expect("this process opens the file");
+    register_stub_holder(&stub, &mount, &slot, std::process::id(), HoldKind::Fd);
+
+    let args = return_args(
+        &s,
+        &stub.socket,
+        &mount,
+        &slot,
+        &["--force", "--nfs-timeout", "2"],
+    );
+    let out = run_companion(&args);
+    assert_ne!(
+        out.status.success(),
+        true,
+        "a holder this process may not signal must stop the return: {}",
+        stdout_of(&out)
+    );
+    assert_eq!(out.status.code(), Some(5), "stderr: {}", stderr_of(&out));
+    let err = stderr_of(&out);
+    assert!(err.contains("may not signal"), "{err}");
+    assert!(
+        err.contains(&std::process::id().to_string()),
+        "and it names the pid it will not touch: {err}"
+    );
+    // Native control: the descriptor is still open and still reads, so nothing was signalled and
+    // nothing unlinked it.
+    use std::io::Read;
+    let mut text = String::new();
+    let mut again = open;
+    again
+        .read_to_string(&mut text)
+        .expect("the descriptor this process still holds is readable");
+    assert_eq!(text, "held\n", "{text:?}");
+    assert!(file.exists(), "the held file is still there");
+    assert!(
+        is_leased(&s, &mount, &slot),
+        "and the lease was never released"
+    );
+}
+
 /// A pool that is not on a mount keeps working exactly as before: cowfs has nothing to scan, says
 /// so, and hands the slot back. This is the off-mount mode (a) case the refusal must not break.
 #[test]

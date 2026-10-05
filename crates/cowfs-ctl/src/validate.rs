@@ -55,6 +55,10 @@ pub fn validate_snapshot_name(name: &str) -> CtlResult<()> {
 /// real directory in a pool and a slot is three levels below it. What it may not do is leave the
 /// mount: an absolute path or a `..` component is refused here, and the daemon re-checks the
 /// resolved path against its own mount before it scans anything.
+///
+/// A leading `.` component is refused too. It names the mount itself, and a scan of the whole mount
+/// is a scan of the wrong size with no bound but the deadline, after which every return on the
+/// machine blocks. A `.` further along is harmless and stays legal.
 pub fn validate_mount_relative(name: &str) -> CtlResult<()> {
     let bad = |why: &str| {
         Err(CtlError::invalid(format!(
@@ -73,9 +77,14 @@ pub fn validate_mount_relative(name: &str) -> CtlResult<()> {
     if name.chars().any(char::is_control) {
         return bad("must not contain control characters");
     }
-    // A component of `..` is the only way out, and a trailing slash would name a directory twice.
-    if name.split('/').any(|c| c == "..") {
-        return bad("must not contain a `..` component");
+    let mut components = name.split('/');
+    let first = components.next().unwrap_or_default();
+    if first == "." {
+        return bad("must not name the mount itself");
+    }
+    // A component of `..` is the only way out, and an empty one would name a directory twice.
+    if components.clone().any(|c| c.is_empty() || c == "..") {
+        return bad("must not contain a `..` or empty component");
     }
     if name.ends_with('/') {
         return bad("must not end with a slash");
@@ -182,7 +191,8 @@ mod tests {
     }
 
     /// A mode (a) slot is `.treehouse/{pool}/{slot}/{repo}` below the mount, so the name has to
-    /// carry a dot directory, three levels and slashes, and still be unable to leave the mount.
+    /// carry a dot directory, three levels and slashes, still be unable to leave the mount, and not
+    /// be able to name the mount itself.
     #[test]
     fn mount_relative_names() {
         for ok in [
@@ -200,6 +210,11 @@ mod tests {
             ".treehouse/../../elsewhere",
             "a/../b",
             ".treehouse/repo/1/repo/",
+            "a//b",
+            // A leading `.` is the mount itself, which is the whole mount to scan.
+            ".",
+            "./snap",
+            "a/./../b",
             "a\0b",
             "a\nb",
             &"x".repeat(4097),
