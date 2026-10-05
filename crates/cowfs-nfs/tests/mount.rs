@@ -503,6 +503,83 @@ fn sh(dir: &Path, script: &str) -> (bool, String) {
     )
 }
 
+/// A hard link under a live sidecar name used to shadow the view and then take the file's bytes:
+/// `ln doc ._doc` succeeded, and the next `xattr -w` on `doc` made the kernel write its
+/// AppleDouble file to `._doc`, which was the same inode. Native `mkdir`, `ln` and `ln -s` under
+/// that name are refused now, so `doc` keeps its content and still takes attributes.
+#[test]
+#[ignore = "mounts a filesystem; run with --ignored"]
+fn native_tools_cannot_shadow_a_live_sidecar_name() {
+    let vfs = common::counting::CountingVfs::new();
+    let Some(m) = mounted_vfs(vfs.clone(), translated()) else {
+        return;
+    };
+    let root = m.path().to_path_buf();
+    // Prove this is a real mount and not an early return, so the log cannot be read as a pass
+    // that never did anything.
+    let table = Command::new("/sbin/mount").output().unwrap();
+    assert!(
+        is_listed(&String::from_utf8_lossy(&table.stdout), &root),
+        "no real mount at {}",
+        root.display()
+    );
+    println!(
+        "MOUNT {}",
+        String::from_utf8_lossy(&table.stdout)
+            .lines()
+            .find(|l| l.contains(&root.display().to_string()))
+            .unwrap_or("<none>")
+    );
+
+    let (ok, out) = sh(
+        &root,
+        r#"set -e
+        printf 'the quick brown fox' > doc
+        xattr -w user.k v doc
+        echo "content=[$(cat doc)] user.k=[$(xattr -p user.k doc)]"
+
+        # A directory, a symlink and a hard link under the live sidecar name are all refused.
+        for attempt in "mkdir ._doc" "ln -s doc ._doc" "ln doc ._doc"; do
+            if $attempt 2>err.txt; then
+                echo "ACCEPTED: $attempt" >&2
+                exit 1
+            fi
+            echo "refused: $attempt -> $(cat err.txt)"
+            rm -f err.txt
+        done
+        test ! -e ._doc || test -f ._doc
+
+        # Nothing changed, and the sidecar channel still works.
+        test "$(cat doc)" = 'the quick brown fox'
+        test "$(xattr -p user.k doc)" = v
+        xattr -w user.j w doc
+        test "$(xattr -p user.j doc)" = w
+        test "$(cat doc)" = 'the quick brown fox'
+        test "$(xattr doc | grep -c '^user\.')" = 2
+        echo "after: content=[$(cat doc)] xattrs=[$(xattr doc | tr '\n' ' ')]"
+        echo "listing: [$(ls -a | tr '\n' ' ')]"
+        "#,
+    );
+    println!("{out}");
+    assert!(ok, "script failed: {}", tail(&out, 12));
+    assert!(
+        !out.contains("ACCEPTED"),
+        "a native tool took the sidecar name: {out}"
+    );
+    assert!(
+        out.contains("refused: mkdir ._doc")
+            && out.contains("refused: ln -s doc ._doc")
+            && out.contains("refused: ln doc ._doc"),
+        "not every attempt was refused: {out}"
+    );
+    assert!(
+        vfs.appledouble_names().is_empty(),
+        "sidecars were stored: {:?}",
+        vfs.appledouble_names()
+    );
+    m.finish();
+}
+
 #[test]
 #[ignore = "mounts a filesystem; run with --ignored"]
 fn xattrs_round_trip_without_sidecar_inodes() {

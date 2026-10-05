@@ -29,6 +29,7 @@ pub const INVAL: u32 = nfsstat3::NFS3ERR_INVAL as u32;
 pub const NAMETOOLONG: u32 = nfsstat3::NFS3ERR_NAMETOOLONG as u32;
 pub const NOTSUPP: u32 = nfsstat3::NFS3ERR_NOTSUPP as u32;
 pub const ROFS: u32 = nfsstat3::NFS3ERR_ROFS as u32;
+pub const ACCES: u32 = nfsstat3::NFS3ERR_ACCES as u32;
 
 const NFS: u32 = 100_003;
 const MOUNT: u32 = 100_005;
