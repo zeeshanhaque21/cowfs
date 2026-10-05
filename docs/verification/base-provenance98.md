@@ -1,6 +1,7 @@
 # Issue #98: warm-base provenance, published durably and never lost
 
-Task: #98 on top of the issue #17 namespace PR (#92), after the review of `f1529cc`.
+Task: #98 on top of the issue #17 namespace PR (#92). Reviewed `f1529cc`, then `6929e63`; this file
+records both rounds, the second being the repair of what the review of `6929e63` found.
 
 ## What #98 was
 
@@ -162,13 +163,13 @@ directories are on disk afterwards. Raw logs in `bench/out/namespaces17-p98-repa
 
 ## Counts, measured on this machine
 
-Toolchain `rustc 1.99.0 (b940084d7 2026-09-28)`, `clippy 0.1.99`. Each exit captured directly, no
-pipeline in a status position.
+Toolchain `rustc 1.99.0 (b940084d7 2026-09-28)`, `clippy 0.1.99`, macOS. Each exit captured directly,
+no pipeline in a status position.
 
 | Suite | Result | Exit |
 |---|---|---|
-| `cargo test -p cowfs-daemon --lib` | `running 82 tests`, 82 passed | 0 |
-| `cargo test -p cowfs-daemon` | 82 lib, 0 main, 5 ignored in `end_to_end`, 0 doc | 0 |
+| `cargo test -p cowfs-daemon --lib` | `running 85 tests`, 85 passed | 0 |
+| `cargo test -p cowfs-daemon` | 85 lib, 0 main, 5 ignored in `end_to_end`, 0 doc | 0 |
 | `cargo test -p cowfs-treehouse --test canonical`, macOS | `running 10 tests`, 10 passed | 0 |
 | `python3 -m unittest discover -s bench -p test_namespaces.py`, macOS | `Ran 17 tests`, `OK (skipped=10)` | 0 |
 | `cargo fmt --all --check` | clean | 0 |
@@ -176,14 +177,110 @@ pipeline in a status position.
 | `cargo clippy -p cowfs-treehouse --all-targets -- -D warnings` | clean | 0 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean | 0 |
 
-`cowfs-daemon` lib tests, by module: `backend` 17, `base_meta` 15, `import` 14, `handler` 14, `exports`
-13, `mounts` 3, `holders` 3, `daemon` 2, plus 1 store probe, 82 in total.
+`cowfs-daemon` lib tests, by module, at this head: `backend` 20, `base_meta` 15, `import` 14, `handler`
+14, `exports` 13, `mounts` 3, `holders` 3, `daemon` 2, plus 1 store probe, **85** in total. This is the
+macOS count. The review reported 81 on Linux for the previous head; the platform difference is real and
+is not harmonised here, because the two numbers count tests that are gated per platform and no single
+figure describes both.
 
 The baseline is **55** at `e243cb1`, measured by checking those three files out at that commit and running
 the same command, so this change adds 27. The review reported 54 at `e243cb1` and 70 at `f1529cc`; its
 delta of 16 for the same interval matches my 55 to 71, so the difference is one test in the baseline and
 it is in the baseline, not in this change. I did not reconcile which one, and I did not touch the
 pre-existing tests.
+
+## The Core `create` defect, and the create ordering it exposed
+
+`CoreSnapshots::create` cleared the base record **before** the core refused a duplicate name. So
+`snapshot create warm` on a base named `warm` exited 1 and left the snapshot with no base at all: the
+record gone from the store and from the map, live and after a reopen. `PathSnapshots::create` already
+refused first and kept everything, and neither the handler nor the control server pre-checks existence,
+so on the core backend the deletion came first and the refusal second.
+
+The core now refuses first too, from one shared `name_taken`, so both backends report a duplicate
+identically. The order is the whole fix: clearing a record is destructive, and it now only ever runs for
+a name the backend has just established is free.
+
+Regressions, old behaviour first, same signatures:
+
+| Test | against `6929e63` | at this head |
+|---|---|---|
+| `a_refused_duplicate_create_keeps_a_core_snapshot_and_its_whole_record` | **FAILED**, record `NotFound` | passes |
+| `a_refused_duplicate_create_keeps_a_path_snapshot_and_its_whole_record` | passes, the control | passes |
+| `a_recreated_snapshot_is_never_a_base_even_when_a_record_outlived_it` | passes | passes |
+| `a_create_that_cannot_clear_a_stale_record_creates_no_snapshot` | not present | passes |
+
+The core test asserts the snapshot's Merkle root and the whole record are unchanged, live and after a
+`CoreBackend` reopened on the same store. The path test asserts the snapshot's bytes and the record, the
+same way. The orphan guard passing on the old behaviour is the point of running it in the same table:
+the repair did not weaken it.
+
+### Failure after the pre-check, and what is still not safe
+
+Every failure after the pre-check is safe because of what the pre-check proved, and that is written into
+the code rather than left implied. If the record cannot be cleared, `create` returns an error and no
+snapshot is created, so nothing half-exists. If the record was cleared and the core then refused, the
+record that went belonged to a name with no snapshot behind it, which is the only kind that step is
+allowed to touch.
+
+What is **not** safe, and is documented as such at the call site: this is a pre-check, not a transaction.
+Two concurrent creates of one free name can both pass it, and the loser is rejected by the core
+afterwards. That narrows the window in which one request can clear a record another has just published;
+it does not close it. Serialising namespace operations per name is a broader change than this repair and
+is not made here.
+
+Related limits, unchanged and recorded rather than fixed:
+
+- Atomicity means atomic **per record file**. The store's mutex keeps a record's bytes and its cache
+  entry in agreement; it does not make a record move and a tree move one step.
+- The per-name lock in the conformance suite (`WithHolders::lock_for`) is a test wrapper. It is not in
+  the production path and is not runtime serialisation.
+
+### Public proof, real daemon, both backends
+
+`bench/out/namespaces17-p98-create/duplicate-create-proof.sh`, run on moonscape in its own immutable
+attempt directory. Real `cowfs-daemon`, real FUSE mount, both backends, public API only for everything
+after the precondition.
+
+The precondition is a record with a complete commit, written straight into the store while the daemon is
+stopped, because there is no public verb for a commit on this path and the subject of the run is what
+happens next, not how the record got there.
+
+| | core | path |
+|---|---|---|
+| duplicate create refused | exit 1, `cannot create snapshot "warm": name is taken` | same |
+| record sha256 across the refusal | `cdaeceea…` unchanged | `cdaeceea…` unchanged |
+| listing across the refusal | unchanged | unchanged |
+| snapshot bytes across the refusal | unchanged | unchanged |
+| after a daemon reopened on the same store | all three unchanged | all three unchanged |
+| a new snapshot on an orphaned record | did not adopt the commit | did not adopt the commit |
+
+The listing is compared with `created_unix_ms` removed. The path backend does not persist a snapshot's
+creation time; `create_meta` stamps it with the current clock on every read, so two listings of the same
+unchanged snapshot differ in that one field. That is pre-existing, it is not what is under test, and the
+normalisation is a no-op on the core backend, whose timestamps are stable. Without it the path arm fails
+on a field that cannot be stable.
+
+What the public run does not cover: Core warm-base publication, which `base_refresh` refuses on the core
+by design, and anything about mode (b) acceptance. The Path publication acceptance is a separate run and
+is unchanged by this repair.
+
+## Two smaller corrections from the same review
+
+**`remove` is not crash-durable and no longer says it is.** The doc comment called the operation durable
+"before this returns". `write_locked` fsyncs the record and its directory; the removal path fsyncs nothing
+after the unlink, so a crash there can leave a record on disk that the live map has already dropped.
+Nothing in the product depends on a removal surviving a power loss, so the comment now states the
+asymmetry instead of claiming a guarantee the code does not provide. No durability scope was added: this
+is a wording fix, and pretending otherwise would be a larger change than the defect.
+
+**`remove_locked` refuses a symlinked record directory explicitly**, rather than relying on
+`remove_dir_all`'s own symlink handling, so the delete path says what it will not do instead of quietly
+unlinking a link. `write_locked` already refused one.
+
+**The harness's socket length guard counted characters** while the kernel limit is in bytes, so it now
+measures bytes with `wc -c`. The path is ASCII in practice so the two agree, but the guard should measure
+the unit the limit is in.
 
 ## The workspace clippy gate
 
