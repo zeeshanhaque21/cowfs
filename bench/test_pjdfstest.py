@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Checks for the matched-arm logic in bench/pjdfstest.py.
+"""Checks for bench/pjdfstest.py.
 
-Only the parts that can decide a verdict are here: what a TAP stream means, which difference
-counts as a regression, and which runs are refused instead of called a pass.
+Every record here is marked synthetic. The verdict refuses synthetic records, so a fixture can
+never be scored as conformance evidence; these tests prove the refusal and the pairing rules
+directly instead.
+
+The pairing tests come first on purpose: an identity that survives a shifted, added, missing or
+duplicated result is the property the whole gate rests on.
 """
 
+import json
 import sys
 import tempfile
 import unittest
@@ -12,114 +17,321 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pjdfstest  # noqa: E402
-
-
-def rec(arm, test, cases, plan=None, rc=0):
-    return {"arm": arm, "test": test, "cases": cases, "plan": plan, "ok": sum(1 for c in cases if c["ok"]),
-            "not_ok": sum(1 for c in cases if not c["ok"]), "rc": rc, "todo": 0, "timed_out": False}
+import pjdfstest as p
 
 
 def case(ok, detail="", root=False, n=1):
     return {"n": n, "ok": ok, "todo": False, "detail": detail, "root_required": root}
 
 
-class ParseTap(unittest.TestCase):
-    def test_plan_and_counts(self):
-        tap = pjdfstest.parse_tap(
-            "1..3\nok 1\nok 2\nnot ok 3 - tried 'mkdir x', expected 0, got EPERM\n")
-        self.assertEqual(tap["plan"], 3)
-        self.assertEqual((tap["ok"], tap["not_ok"]), (2, 1))
-
-    def test_todo_marker_is_a_pass(self):
-        tap = pjdfstest.parse_tap("1..2\nok 1 # TODO x\nnot ok 2 - boom\n")
-        self.assertEqual(tap["ok"], 1)
-        self.assertEqual(tap["todo"], 1)
-        self.assertTrue(tap["cases"][0]["todo"])
-
-    def test_quick_exit_is_one_ok_not_a_run(self):
-        tap = pjdfstest.parse_tap("1..1\nok 1\n")
-        self.assertEqual((tap["plan"], tap["ok"]), (1, 1))
-
-    def test_no_plan_yields_no_cases(self):
-        self.assertEqual(pjdfstest.parse_tap("not ok - could not find pjdfstest app\n")["cases"], [])
+def record(arm, test, cases, plan=None, rc=0, **extra):
+    """A synthetic record in the shape cases.jsonl holds."""
+    return {"arm": arm, "test": test, "cases": cases, "plan": plan if plan is not None else len(cases),
+            "ok": sum(1 for c in cases if c["ok"]), "not_ok": sum(1 for c in cases if not c["ok"]),
+            "rc": rc, "timed_out": False, "bail_out": 0, "malformed": [], "synthetic": True, **extra}
 
 
-class RootRequired(unittest.TestCase):
-    def test_uid_switch_needs_privilege(self):
-        self.assertTrue(pjdfstest.ROOT_REQUIRED_RE.search("tried '-u 65534 -g 65534 mkdir x 0755'"))
-        self.assertTrue(pjdfstest.ROOT_REQUIRED_RE.search("tried 'mknod x b 0644 1 2'"))
-        self.assertTrue(pjdfstest.ROOT_REQUIRED_RE.search("not root"))
-        self.assertFalse(pjdfstest.ROOT_REQUIRED_RE.search("tried 'rename a b'"))
+SCRIPT_LOOP = """#!/bin/sh
+. ../misc.sh
+for type in regular dir fifo block char socket symlink; do
+\tcreate_file ${type} ${n0}
+\texpect EEXIST open ${n0} O_CREAT,O_EXCL 0644
+\texpect 0 unlink ${n0}
+done
+"""
+SCRIPT_PLAIN = """#!/bin/sh
+. ../misc.sh
+expect 0 create ${n0} 0644
+expect regular,0644 stat ${n0} type,mode
+expect 0 unlink ${n0}
+"""
 
 
-class Compare(unittest.TestCase):
-    def test_native_pass_cowfs_fail_is_a_regression(self):
-        native = {"open/00.t": rec("native", "open/00.t", [case(True, n=1), case(True, n=2)])}
-        cowfs = {"open/00.t": rec("cowfs", "open/00.t", [case(True, n=1), case(False, n=2)])}
-        diff = pjdfstest.compare(native, cowfs)
-        self.assertEqual([r["n"] for r in diff["regressions"]], [2])
-
-    def test_cowfs_looser_is_reported_separately(self):
-        native = {"x.t": rec("native", "x.t", [case(False)])}
-        cowfs = {"x.t": rec("cowfs", "x.t", [case(True)])}
-        diff = pjdfstest.compare(native, cowfs)
-        self.assertEqual(diff["regressions"], [])
-        self.assertEqual([r["n"] for r in diff["cowfs_looser_than_native"]], [1])
-
-    def test_identical_arms_have_no_differences(self):
-        same = [case(True), case(False, "boom")]
-        diff = pjdfstest.compare({"x.t": rec("native", "x.t", same)}, {"x.t": rec("cowfs", "x.t", same)})
-        self.assertEqual((diff["regressions"], diff["cowfs_looser_than_native"]), ([], []))
-
-    def test_root_required_regression_is_not_a_clean_failure(self):
-        native = {"x.t": rec("native", "x.t", [case(True, "chown . 65534 65534", True)])}
-        cowfs = {"x.t": rec("cowfs", "x.t", [case(False, "chown . 65534 65534", True)])}
-        diff = pjdfstest.compare(native, cowfs)
-        self.assertEqual(len(diff["regressions"]), 1)
-        self.assertEqual(diff["regressions_outside_root_required"], [])
-
-    def test_case_on_one_arm_only_is_unpaired(self):
-        diff = pjdfstest.compare({"a.t": rec("native", "a.t", [case(True)])}, {})
-        self.assertEqual(diff["unpaired_cases"], ["a.t"])
+def args_of(detail):
+    m = p.TRIED_RE.search(detail)
+    return m.group(1) if m else None
 
 
-class Verdict(unittest.TestCase):
-    totals = {"native": {"executed": 2, "empty_output": 0, "timeouts": 0},
-              "cowfs": {"executed": 2, "empty_output": 0, "timeouts": 0}}
-    clean = {"regressions": [], "regressions_outside_root_required": [], "cowfs_looser_than_native": [],
-             "unpaired_cases": []}
+class PairingInvariant(unittest.TestCase):
+    """One script, one arm's results shifted, added to or removed: identity must not move."""
 
-    def test_matched_passes(self):
-        v = pjdfstest.verdict(self.totals, self.clean, ["a.t"], ["HAVE_OPENAT"])
-        self.assertEqual(v["state"], "PASS")
+    def setUp(self):
+        self.profile = p.script_profile(SCRIPT_PLAIN)
 
-    def test_regression_fails(self):
-        diff = {**self.clean, "regressions": [{"test": "a.t", "n": 1, "root_required": False}],
-                "regressions_outside_root_required": [{"test": "a.t", "n": 1, "root_required": False}]}
-        self.assertEqual(pjdfstest.verdict(self.totals, diff, ["a.t"], [])["state"], "FAIL")
+    def test_a_shift_after_a_removed_result_does_not_repair_a_pair(self):
+        native = record("native", "x.t", [
+            case(True, "tried 'create pjdfstest_aaaaaaaa 0644', expected 0, got 0"),
+            case(True, "tried 'stat pjdfstest_aaaaaaaa type,mode', expected regular,0644, got regular,0644"),
+            case(True, "tried 'unlink pjdfstest_aaaaaaaa', expected 0, got 0"),
+        ])
+        cowfs = record("cowfs", "x.t", [
+            case(True, "tried 'create pjdfstest_bbbbbbbb 0644', expected 0, got 0"),
+            case(False, "tried 'stat pjdfstest_bbbbbbbb type,mode', expected regular,0644, got ENOENT"),
+        ])
+        result = p.pair_case(native, cowfs, self.profile)
+        keys = [(pair["operation"], pair["occurrence"]) for pair in result["pairs"]]
+        self.assertEqual(keys, [("create <gen1> 0644", 0), ("stat <gen1> type,mode", 0)])
+        self.assertEqual([u["reason"] for u in result["unpairable"]],
+                         ["'unlink <gen1>' appears 1 times natively and 0 times on the mount"])
 
-    def test_empty_run_is_unmeasurable_not_a_pass(self):
-        totals = {"native": {"executed": 0, "empty_output": 1, "timeouts": 0},
-                  "cowfs": {"executed": 2, "empty_output": 0, "timeouts": 0}}
-        self.assertEqual(pjdfstest.verdict(totals, self.clean, ["a.t"], [])["state"], "UNMEASURABLE")
+    def test_an_added_result_does_not_shift_the_next_identity(self):
+        native = record("native", "x.t", [
+            case(True, "tried 'create pjdfstest_aaaaaaaa 0644', expected 0, got 0"),
+            case(True, "tried 'stat pjdfstest_aaaaaaaa type,mode', expected regular,0644, got regular,0644"),
+        ])
+        cowfs = record("cowfs", "x.t", [
+            case(True, "tried 'create pjdfstest_bbbbbbbb 0644', expected 0, got 0"),
+            case(True, "tried 'symlink test pjdfstest_cccccccc', expected 0, got 0"),
+            case(True, "tried 'stat pjdfstest_bbbbbbbb type,mode', expected regular,0644, got regular,0644"),
+        ])
+        result = p.pair_case(native, cowfs, self.profile)
+        paired = {pair["operation"]: pair for pair in result["pairs"]}
+        self.assertEqual(paired["stat <gen1> type,mode"]["native_ok"], True)
+        self.assertEqual(paired["stat <gen1> type,mode"]["cowfs_ok"], True)
+        self.assertEqual([u["reason"] for u in result["unpairable"]][:1],
+                         ["'symlink test <gen1>' appears 0 times natively and 1 times on the mount"])
 
-    def test_timeout_is_unmeasurable_not_a_verdict(self):
-        totals = {"native": {"executed": 2, "empty_output": 0, "timeouts": 1},
-                  "cowfs": {"executed": 2, "empty_output": 0, "timeouts": 0}}
-        self.assertEqual(pjdfstest.verdict(totals, self.clean, ["a.t"], [])["state"], "UNMEASURABLE")
+    def test_a_repeated_operation_is_unpairable_without_a_literal_loop(self):
+        native = record("native", "x.t", [case(True, "tried 'unlink pjdfstest_aaaaaaaa', expected 0, got 0"),
+                                          case(True, "tried 'unlink pjdfstest_bbbbbbbb', expected 0, got 0")])
+        cowfs = record("cowfs", "x.t", [case(True, "tried 'unlink pjdfstest_cccccccc', expected 0, got 0"),
+                                        case(True, "tried 'unlink pjdfstest_dddddddd', expected 0, got 0")])
+        result = p.pair_case(native, cowfs, self.profile)
+        self.assertEqual(result["pairs"], [])
+        self.assertTrue(all("no literal for loop" in u["reason"] for u in result["unpairable"]))
+
+    def test_a_literal_loop_orders_its_repeats_and_keeps_its_suffix(self):
+        profile = p.script_profile(SCRIPT_LOOP)
+        native = record("native", "open/22.t", [
+            case(True, "tried 'open pjdfstest_aaaaaaaa O_CREAT,O_EXCL 0644', expected EEXIST, got EEXIST"),
+            case(False, "tried 'open pjdfstest_aaaaaaaa O_CREAT,O_EXCL 0644', expected EEXIST, got 0"),
+        ])
+        cowfs = record("cowfs", "open/22.t", [
+            case(True, "tried 'open pjdfstest_bbbbbbbb O_CREAT,O_EXCL 0644', expected EEXIST, got EEXIST"),
+            case(False, "tried 'open pjdfstest_bbbbbbbb O_CREAT,O_EXCL 0644', expected EEXIST, got 0"),
+        ])
+        result = p.pair_case(native, cowfs, profile)
+        self.assertEqual([(pair["occurrence"], pair["confidence"]) for pair in result["pairs"]],
+                         [(0, p.ESTABLISHED), (1, p.ESTABLISHED)])
+        self.assertEqual(result["unpairable"], [])
+
+    def test_generated_names_do_not_change_identity_but_argument_order_does(self):
+        self.assertEqual(p.normalize_operation("create pjdfstest_aaaaaaaa 0644"),
+                         p.normalize_operation("create pjdfstest_bbbbbbbb 0644"))
+        # Both orderings canonicalise to the same string, which is why an all-generated
+        # operation is a candidate rather than an established pair.
+        self.assertEqual(p.normalize_operation("link pjdfstest_aaaaaaaa pjdfstest_bbbbbbbb"),
+                         p.normalize_operation("link pjdfstest_bbbbbbbb pjdfstest_aaaaaaaa"))
+        self.assertFalse(p.literal_pinned(p.normalize_operation("link pjdfstest_aaaaaaaa pjdfstest_bbbbbbbb")))
+        self.assertTrue(p.literal_pinned(p.normalize_operation("create pjdfstest_aaaaaaaa 0644")))
+
+    def test_error_text_is_never_part_of_identity(self):
+        native = record("native", "x.t", [case(True, "tried 'unlink pjdfstest_aaaaaaaa', expected 0, got EPERM")])
+        cowfs = record("cowfs", "x.t", [case(False, "tried 'unlink pjdfstest_bbbbbbbb', expected 0, got EIO")])
+        result = p.pair_case(native, cowfs, self.profile)
+        self.assertEqual(len(result["pairs"]), 1)
+        # One generated name and nothing else pins the operation, so this is a candidate.
+        self.assertEqual(result["pairs"][0]["confidence"], p.CANDIDATE)
+
+    def test_textless_assertions_are_never_paired(self):
+        native = record("native", "x.t", [case(True, "")])
+        cowfs = record("cowfs", "x.t", [case(False, "")])
+        result = p.pair_case(native, cowfs, self.profile)
+        self.assertEqual(result["pairs"], [])
+        self.assertEqual(len(result["unpairable"]), 2)
+
+    def test_a_text_duplicate_is_ambiguous_rather_than_paired_arbitrarily(self):
+        native = record("native", "x.t", [case(True, "tried 'unlink pjdfstest_aaaaaaaa', expected 0, got 0")])
+        cowfs = record("cowfs", "x.t", [case(False, "tried 'unlink pjdfstest_aaaaaaaa', expected 0, got 0"),
+                                        case(False, "tried 'unlink pjdfstest_aaaaaaaa', expected 0, got 0")])
+        result = p.pair_case(native, cowfs, self.profile)
+        self.assertEqual(result["pairs"], [])
+        self.assertIn("appears 1 times natively and 2 times on the mount",
+                      result["unpairable"][0]["reason"])
+
+
+class ScriptProfile(unittest.TestCase):
+    def test_result_dependent_control_flow_is_detected(self):
+        self.assertTrue(p.script_profile("expect 0 stat x mode\n[ $? -eq 0 ] && expect 0 unlink x\n")
+                         ["result_dependent_control_flow"])
+        self.assertFalse(p.script_profile(SCRIPT_PLAIN)["result_dependent_control_flow"])
+
+    def test_slot_identity_is_provable_only_without_a_blocker(self):
+        self.assertEqual(p.script_profile(SCRIPT_PLAIN)["slot_identity_blockers"], [])
+        blocked = p.script_profile("if [ -e x ]; then expect 0 unlink x; fi\n")["slot_identity_blockers"]
+        self.assertTrue(any("branches" in b for b in blocked))
+        helper = p.script_profile("create_file ${type} ${n0}\n")["slot_identity_blockers"]
+        self.assertTrue(any("create_file" in b for b in helper))
+
+    def test_a_script_slot_labels_an_assertion_the_stream_leaves_textless(self):
+        native = record("native", "x.t", [case(True, ""), case(True, "")])
+        # A failing test_check prints no operation text either, so the slot label is all there is.
+        cowfs = record("cowfs", "x.t", [case(True, ""), case(False, "")])
+        profile = p.script_profile("expect 0 create ${n0} 0644\ntest_check $a -lt $b\n")
+        result = p.pair_case(native, cowfs, profile)
+        self.assertEqual(result["route"], "script slot")
+        self.assertEqual([pair["confidence"] for pair in result["pairs"]], [p.ESTABLISHED, p.ESTABLISHED])
+        self.assertEqual(result["pairs"][1]["identity"], "script slot 1 (test_check (no operation text))")
+        self.assertEqual(result["pairs"][1]["operation"], "(test_check)")
+
+    def test_a_stream_that_contradicts_the_script_slot_is_refused(self):
+        native = record("native", "x.t", [case(True, "")])
+        cowfs = record("cowfs", "x.t", [case(False, "tried 'mkdir pjdfstest_bbbbbbbb 0755', expected 0, got EPERM")])
+        profile = p.script_profile("expect 0 unlink ${n0}\n")
+        result = p.pair_case(native, cowfs, profile)
+        self.assertEqual(result["pairs"], [])
+        self.assertIn("where the script's slot 0 is 'unlink <gen1>'", result["unpairable"][0]["reason"])
+
+    def test_helper_expansion_is_recorded(self):
+        self.assertTrue(p.script_profile("create_file ${type} ${n0}\n")["helper_expands_assertions"])
+        self.assertFalse(p.script_profile(SCRIPT_PLAIN)["helper_expands_assertions"])
+
+
+class MountState(unittest.TestCase):
+    TABLE = ("localhost:/cowfs-abc on /private/tmp/m (nfs, nodev, nosuid)\n"
+             "map auto_home on /System/Volumes/Data/home (autofs, nosuid)\n")
+
+    def test_exact_decoded_match_is_mounted(self):
+        self.assertEqual(p.mount_entries(self.TABLE)[0][1], "/private/tmp/m")
+        self.assertEqual(p._unescape("/private/tmp/a\\040b"), "/private/tmp/a b")
+
+    def test_a_prefix_is_not_a_match(self):
+        state = p.mount_state.__wrapped__(Path("/private/tmp/m")) if hasattr(p.mount_state, "__wrapped__") else None
+        self.assertIsNone(state)
+        entries = p.mount_entries(self.TABLE)
+        self.assertNotIn("/private/tmp", [e[1] for e in entries])
+        self.assertNotIn("/private/tmp/m/inner", [e[1] for e in entries])
+
+    def test_unknown_table_is_not_absence(self):
+        self.assertEqual(p.INVALID, "INVALID")
+        self.assertEqual(p.UNKNOWN, "UNKNOWN")
+        self.assertIn("UNKNOWN", (p.UNKNOWN, p.MOUNTED, p.NOT_MOUNTED))
+
+    def test_exit_taxonomy_is_fixed(self):
+        self.assertEqual(p.EXIT_STATUS, {p.PASS: 0, p.FAIL: 1, p.UNMEASURABLE: 2, p.INVALID: 3})
+
+
+class Guards(unittest.TestCase):
+    def raw(self, text):
+        return text
+
+    def test_truncated_stream_is_refused(self):
+        record_ = {"test": "x.t", "rc": 0, "timed_out": False, "raw": "present",
+                   "cases": [], "plan": None, "malformed": []}
+        problems = p.guard_case(record_, "x.t", self.raw("ok 1\nnot ok 2 - boom\n"))
+        self.assertIn("no plan line, so the stream cannot be scored", problems)
+
+    def test_plan_count_mismatch_is_refused(self):
+        problems = p.guard_case({"test": "x.t", "rc": 0, "timed_out": False, "raw": "present"},
+                                "x.t", self.raw("1..5\nok 1\n"))
+        self.assertIn("plan 5 does not match the 1 assertions emitted", problems)
+
+    def test_duplicate_and_non_contiguous_ids_are_refused(self):
+        dupe = "1..3\nok 1\nok 1\nok 2\n"
+        self.assertIn("duplicate assertion ids", p.guard_case(
+            {"test": "x.t", "rc": 0, "timed_out": False, "raw": "present"}, "x.t", self.raw(dupe)))
+        gap = "1..3\nok 1\nok 3\n"
+        self.assertIn("assertion ids are not contiguous from 1", p.guard_case(
+            {"test": "x.t", "rc": 0, "timed_out": False, "raw": "present"}, "x.t", self.raw(gap)))
+
+    def test_bail_out_and_nonzero_child_are_refused(self):
+        stream = "1..2\nok 1\nBail out! server died\n"
+        problems = p.guard_case({"test": "x.t", "rc": 0, "timed_out": False, "raw": "present"},
+                                "x.t", self.raw(stream))
+        self.assertTrue(any("Bail out!" in c for c in problems))
+        self.assertIn("child exited 2, not 0", p.guard_case(
+            {"test": "x.t", "rc": 2, "timed_out": False, "raw": "present"}, "x.t",
+            self.raw("1..1\nok 1\n")))
+
+    def test_wrong_case_name_is_refused(self):
+        self.assertTrue(any("the run listed it as" in c for c in p.guard_case(
+            {"test": "y.t", "rc": 0, "timed_out": False, "raw": "present"}, "x.t",
+            self.raw("1..1\nok 1\n"))))
+
+    def test_synthetic_records_are_never_conformance(self):
+        self.assertIn("synthetic fixture: a unit-test record is not conformance evidence",
+                      p.guard_case(record("native", "x.t", [case(True, "tried 'x'")]), "x.t", None))
+
+    def test_legacy_records_are_flagged_but_not_per_case_refused(self):
+        legacy = {"test": "x.t", "rc": 0, "timed_out": False,
+                  "cases": [case(True, "tried 'unlink pjdfstest_a', expected 0, got 0")], "plan": 1}
+        self.assertEqual(p.guard_case(legacy, "x.t", None, legacy=True), [])
+        self.assertTrue(p.guard_case(legacy, "x.t", None, legacy=False))
+
+
+class VerdictStates(unittest.TestCase):
+    def run_verdict(self, native_cases, cowfs_cases, extra=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            lines = []
+            for arm, cases in (("native", native_cases), ("cowfs", cowfs_cases)):
+                record_ = record(arm, "x.t", cases)
+                record_.pop("synthetic")
+                record_.update({"bail_out": 0, "malformed": []})
+                if extra:
+                    record_.update(extra)
+                lines.append(json.dumps(record_, sort_keys=True))
+            (run / "cases.jsonl").write_text("\n".join(lines) + "\n")
+            return p.verdict(run)
+
+    def established_regression_is_fail(self):
+        good = case(True, "tried 'unlink pjdfstest_a', expected 0, got 0")
+        bad = case(False, "tried 'unlink pjdfstest_b', expected 0, got EPERM")
+        report = self.run_verdict([good], [bad])
+        self.assertEqual(report["state"], p.FAIL)
+        self.assertEqual(report["exit_status"], 1)
+
+    def a_pass_needs_a_pairable_scope(self):
+        good = case(True, "tried 'unlink pjdfstest_a', expected 0, got 0")
+        report = self.run_verdict([good], [case(True, "tried 'unlink pjdfstest_b', expected 0, got 0")])
+        self.assertEqual(report["state"], p.UNMEASURABLE)
+        self.assertTrue(any("cannot be paired" in r or "not established" in r for r in report["reasons"]))
+
+    def synthetic_records_are_refused_by_the_verdict_itself(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            lines = []
+            for arm in ("native", "cowfs"):
+                lines.append(json.dumps(record(arm, "x.t", [case(True, "tried 'unlink pjdfstest_a'")]),
+                                         sort_keys=True))
+            (run / "cases.jsonl").write_text("\n".join(lines) + "\n")
+            report = p.verdict(run)
+            self.assertEqual(report["state"], p.UNMEASURABLE)
+            self.assertTrue(any("synthetic fixture" in problem for problem in report["guard_problems"]))
+
+    def malformed_json_is_invalid_input_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            (run / "cases.jsonl").write_text("{not json\n")
+            self.assertEqual(p.verdict(run)["state"], p.INVALID)
+
+    def mixed_raw_formats_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            first = record("native", "x.t", [case(True, "tried 'unlink pjdfstest_a'")])
+            second = record("cowfs", "x.t", [case(True, "tried 'unlink pjdfstest_b'")])
+            first.pop("synthetic")
+            second.pop("synthetic")
+            first["raw"] = str(run / "a.tap")
+            (run / "a.tap").write_text("1..1\nok 1\n")
+            first["raw_sha256"] = p.sha256(run / "a.tap")
+            (run / "cases.jsonl").write_text(json.dumps(first, sort_keys=True) + "\n" +
+                                              json.dumps(second, sort_keys=True) + "\n")
+            report = p.verdict(run)
+            self.assertEqual(report["state"], p.UNMEASURABLE)
+            self.assertTrue(any("mixes cases" in problem for problem in report["guard_problems"]))
 
 
 class TestList(unittest.TestCase):
     def test_groups_and_explicit_cases_filter(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "tests"
-            for grp, name in (("open", "00.t"), ("link", "00.t")):
+            for grp in ("open", "link"):
                 (root / grp).mkdir(parents=True)
-                (root / grp / name).touch()
-            self.assertEqual(pjdfstest.test_list(root, ["link"], None), ["link/00.t"])
-            self.assertEqual(pjdfstest.test_list(root, None, ["open/00.t"]), ["open/00.t"])
-            self.assertEqual(pjdfstest.test_list(root, ["nope"], None), [])
+                (root / grp / "00.t").touch()
+            self.assertEqual(p.test_list(root, ["link"], None), ["link/00.t"])
+            self.assertEqual(p.test_list(root, None, ["open/00.t"]), ["open/00.t"])
+            self.assertEqual(p.test_list(root, ["nope"], None), [])
 
 
 if __name__ == "__main__":
