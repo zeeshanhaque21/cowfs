@@ -876,7 +876,7 @@ mod tests {
             "27: FLOCK  ADVISORY  WRITE 1327043 00:40:228185 0 EOF",
             "31: FLOCK  ADVISORY  WRITE 4231 08:01:1234567 0 EOF  -> 4100",
             "32: -1      OFDLCK  WRITETRUNC -1 00:ff:99 0 100",
-            "33: POSIX   MANDATORY READ  900 a:f:2d 0 EOF",
+            "33: POSIX   MANDATORY READ  900 a:f:45 0 EOF",
             "34: FLOCK  ADVISORY  WRITE 7 08:02:9 0 EOF",
         ];
         let mut got: Vec<(u64, u64, u64)> = Vec::new();
@@ -892,7 +892,11 @@ mod tests {
             "a waiting lock moves the device field, and 08 01 are hex"
         );
         assert_eq!(got[2], (0, 0xff, 99), "an OFD lock has pid -1");
-        assert_eq!(got[3], (10, 15, 45), "a and f are hex digits, not decimal");
+        assert_eq!(
+            got[3],
+            (10, 15, 45),
+            "a and f are hex digits; the inode stays decimal"
+        );
         assert_eq!(got[4], (0x08, 0x02, 9));
         // The trap the review found: reading the device from the fourth field yields the word
         // ADVISORY and nothing else.
@@ -922,59 +926,74 @@ mod tests {
     /// A real `flock`, taken by a real other process, reported as a lock hold on the right file.
     ///
     /// The parser tests above use captured rows; this one is the end of the chain on a real Linux,
-    /// because the field index and the hex radix were both wrong for long enough that no test could
-    /// have noticed: the head parser read the word `ADVISORY` as the device and produced an empty
-    /// set, which is the same as reporting no locks.
+    /// because the field index and the radix were both wrong for long enough that no test could
+    /// have noticed: the old parser read the word `ADVISORY` as the device and produced an empty
+    /// set, which is indistinguishable from reporting no locks.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_real_flock_is_reported_as_a_lock_hold() {
-        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
         use std::process::{Command, Stdio};
         let dir = tempfile::tempdir().expect("tempdir");
         let real = dir.path().canonicalize().unwrap();
         let file = real.join("locked");
         std::fs::write(&file, b"x").unwrap();
-        // A fifo with no writer: the holder blocks on opening it, without forking, so killing it
-        // releases the only lock there is and the assertion below is about the scan and not about
-        // an orphan.
-        let wait = dir.path().join("wait");
-        let fifo = wait.to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&file).unwrap().ino().to_string();
 
-        let holder = Command::new("/usr/bin/flock")
-            .args(["-x", &file.to_string_lossy(), "/bin/sh", "-c"])
-            .arg(format!("echo locked; read line < {fifo}"))
+        // `flock FILE sleep` keeps one process for the whole run, so the descriptor and the lock
+        // belong to exactly the pid this test spawned, and killing it releases both.
+        let mut child = match Command::new("/usr/bin/flock")
+            .args(["-x", &file.to_string_lossy(), "sleep", "600"])
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
-        let Ok(mut holder) = holder else {
-            eprintln!(
-                "skipping: no /usr/bin/flock on this machine, so no real lock to find; the parser \
-                 is covered by the captured rows above"
-            );
-            return;
-        };
-        let mut line = String::new();
+            .spawn()
         {
-            let mut byte = [0u8; 1];
-            let out = holder.stdout.as_mut().expect("piped");
-            while out.read(&mut byte).unwrap_or(0) == 1 && byte[0] != b'\n' {
-                line.push(byte[0] as char);
-            }
+            Ok(child) => child,
+            Err(_) => match Command::new("python3")
+                .args([
+                    "-c",
+                    "import fcntl,sys,time\nf=open(sys.argv[1],'r+')\nfcntl.flock(f,fcntl.LOCK_EX)\ntime.sleep(600)",
+                    &file.to_string_lossy(),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(_) => {
+                    eprintln!(
+                        "skipping: neither /usr/bin/flock nor python3 is on this machine, so no \
+                         real lock can be taken here; the parser is covered by the captured rows"
+                    );
+                    return;
+                }
+            },
+        };
+        // Readiness from the kernel rather than from a sleep: the inode has to appear in the table
+        // the parser reads. Only the last component of the device field is used here, so this does
+        // not depend on the hex parsing under test.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lock_table_has_inode(&inode) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lock on {inode} never reached /proc/locks"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(line.trim(), "locked", "the holder never took the lock");
 
         let found = match scan_checked(&real) {
             Scan::Holders(found) => found,
             // A refusal is a legitimate answer on a table this build cannot read, but it does not
             // prove the lock was found, so it must not pass as one.
             other => {
-                let _ = holder.kill();
-                let _ = holder.wait();
+                let _ = child.kill();
+                let _ = child.wait();
                 panic!("the scan did not complete: {other:?}");
             }
         };
-        let mine = found
+        found
             .iter()
             .flat_map(|p| &p.holds)
             .find(|h| h.kind == HoldKind::Lock && Path::new(&h.path) == file.as_path())
@@ -984,9 +1003,17 @@ mod tests {
                     file.display()
                 )
             });
-        assert!(mine.path.ends_with("locked"), "{mine:?}");
-        let _ = holder.kill();
-        let _ = holder.wait();
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while lock_table_has_inode(&inode) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lock is still in /proc/locks after its holder was killed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         // Once the lock is gone the answer is empty again, which is the difference between a
         // reported lock and an empty table that happens to look the same.
         match scan_checked(&real) {
@@ -999,5 +1026,17 @@ mod tests {
             ),
             other => eprintln!("refused instead: {other:?}"),
         }
+    }
+
+    /// Whether `/proc/locks` names this inode in the device field of any row.
+    #[cfg(target_os = "linux")]
+    fn lock_table_has_inode(inode: &str) -> bool {
+        let Ok(text) = std::fs::read_to_string("/proc/locks") else {
+            return false;
+        };
+        text.lines().any(|line| {
+            line.split_whitespace()
+                .any(|field| field.rsplit(':').next() == Some(inode))
+        })
     }
 }
