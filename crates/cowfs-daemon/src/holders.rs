@@ -120,7 +120,7 @@ mod imp {
                 out.insert((maj, min, ino));
             }
         }
-        out
+        Ok(out)
     }
 
     fn command(pid: u32) -> String {
