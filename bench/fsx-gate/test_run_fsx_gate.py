@@ -8,8 +8,14 @@ missing result is a failure, a capability the filesystem lacks is recorded rathe
 and a required operation that never happened is a failure unless the tool said why.
 """
 
+import contextlib
+import hashlib
 import importlib.util
+import io
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -22,9 +28,14 @@ CAPS = {"max_file_bytes": 262144, "max_op_bytes": 16384}
 
 
 def case(**kw):
+    """A case row as the new run_case writes one: witnesses, freshness and the cap field."""
     base = {"kind": "case", "mode": "mixed", "seed": 1, "arm": "cowfs", "exit": 0,
-            "timed_out": False, "seconds": 1.0, "ops_declared": 10, "ops_executed": 10,
-            "data_path": "/tmp/fsx.dat", "data_sha256": "aa", "data_size": 100,
+            "timed_out": False, "seconds": 1.0, "run_tag": "t-1",
+            "ops_requested": 10, "ops_executed": 10, "log_dump_total": 10,
+            "case_dir": "/tmp/fsx.dat", "case_dir_fresh": True,
+            "data_path": "/tmp/fsx.dat", "data_realpath": "/tmp/fsx.dat",
+            "data_sha256": "aa", "data_size": 100, "data_real_fstype": "fuse.cowfs",
+            "data_st_dev": 234, "root_st_dev": 234, "over_cap": [],
             "ops_file": "/tmp/fsx.dat.fsxops", "ops_sha256": "bb",
             "op_counts": {"write": 4, "read": 3, "mapread": 1, "mapwrite": 1, "truncate": 1},
             "fsx_reported_unsupported": []}
@@ -32,294 +43,517 @@ def case(**kw):
     return base
 
 
-def compare(**kw):
-    base = {"kind": "compare", "mode": "mixed", "seed": 1, "ops_declared": 10,
-            "ops_executed": {"native": 10, "cowfs": 10},
+def cmp_case(**kw):
+    """A compare row as the new compare_case writes one."""
+    base = {"kind": "compare", "mode": "matched", "seed": 1, "status": "PASS",
+            "require_identical_op_stream": True, "ops_requested": 10,
+            "ops_executed": {"native": 10, "cowfs": 10}, "ops_skipped": {"native": 0, "cowfs": 0},
+            "unsupported_reasons": {"native": [], "cowfs": [], "probe": []},
             "data_sha256": {"native": "aa", "cowfs": "aa"},
             "data_size": {"native": 100, "cowfs": 100},
-            "data_st_dev": {"native": 1, "cowfs": 2},
+            "data_st_dev": {"native": 2050, "cowfs": 234},
+            "data_fstype": {"native": "ext4", "cowfs": "fuse.cowfs"},
             "ops_stream_sha256": {"native": "bb", "cowfs": "bb"},
             "ops_stream_match": True, "hashes_compared": True,
+            "hash_comparison": "compared, streams identical",
             "op_count_deltas": {}, "skip_delta": {"native": 0, "cowfs": 0},
-            "explained_by_capability": [], "consequent_deltas": [], "hash_comparison": "compared",
-            "require_identical_op_stream": True,
+            "deltas_explained_by_capability": [], "deltas_unexplained": [],
+            "byte_bearing_deltas_unexplained": [],
             "cowfs_capability_gaps": [], "native_capability_gaps": [],
-            "fresh_open_sha256": {"cowfs": "aa"}, "problems": []}
+            "fresh_open_sha256": {"cowfs": {"sha256": "aa", "size": 100}},
+            "unmeasurable": [], "problems": []}
     base.update(kw)
     return base
 
 
-class ParseOpsExecuted(unittest.TestCase):
-    def test_reads_the_count_fsx_reported(self):
-        self.assertEqual(gate.parse_ops_executed("All 200 operations completed A-OK!\n"), 200)
+class Attribution(unittest.TestCase):
+    def test_every_delta_is_attributed_on_its_own(self):
+        explained, unexplained = gate.attribute_deltas(
+            {"read": {"native": 10, "cowfs": 9}, "punch_hole": {"native": 5, "cowfs": 0}},
+            {"punch_hole"})
+        self.assertEqual(explained, ["punch_hole"])
+        self.assertEqual(unexplained, ["read"])
 
-    def test_takes_the_last_report_not_the_first(self):
-        self.assertEqual(gate.parse_ops_executed("All 5 operations completed A-OK!\nAll 9 operations completed A-OK!\n"), 9)
+    def test_the_whole_fallocate_family_is_in_the_map(self):
+        for op in ("punch_hole", "zero_range", "write_zeroes", "fallocate",
+                   "collapse_range", "insert_range"):
+            self.assertIn(op, gate.OP_CAPABILITY, op)
 
-    def test_absent_report_is_none_so_a_run_cannot_pass_on_a_guess(self):
-        self.assertIsNone(gate.parse_ops_executed("seed 1\n"))
-        self.assertIsNone(gate.parse_ops_executed(""))
-
-
-class ParseLogDump(unittest.TestCase):
-    def test_total_operations(self):
-        self.assertEqual(gate.parse_log_dump_total("LOG DUMP (10000 total operations):\n"), 10000)
-
-    def test_absent(self):
-        self.assertIsNone(gate.parse_log_dump_total("no dump here"))
+    def test_byte_bearing_ops_are_named(self):
+        for op in ("read", "write", "mapread", "mapwrite", "truncate"):
+            self.assertIn(op, gate.BYTE_BEARING_OPS)
 
 
-class ParseDisabledModes(unittest.TestCase):
-    def test_keeps_the_tools_own_wording_and_the_mode(self):
-        line = ("main: filesystem does not support fallocate mode FALLOC_FL_PUNCH_HOLE | "
-                "FALLOC_FL_KEEP_SIZE, disabling!\n")
-        got = gate.parse_disabled_modes(line)
-        self.assertEqual(len(got), 1)
-        self.assertIn("FALLOC_FL_PUNCH_HOLE", got[0])
-        self.assertIn("disabling", got[0])
+class CapabilityEvidence(unittest.TestCase):
+    def fsx_case(self, arm, disabled):
+        return {"arm": arm, "fsx_reported_unsupported": disabled}
 
-    def test_a_clean_run_reports_nothing(self):
-        self.assertEqual(gate.parse_disabled_modes("All 10 operations completed A-OK!\n"), [])
+    def test_needs_both_the_probe_and_fsx_to_agree(self):
+        probe = {"cowfs": {"punch_hole": False}}
+        case = self.fsx_case("cowfs", ["filesystem does not support fallocate mode "
+                                       "FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, disabling"])
+        self.assertIn("punch_hole", gate.capability_evidence(case, probe))
 
+    def test_a_probe_alone_is_not_enough(self):
+        probe = {"cowfs": {"punch_hole": False}}
+        case = self.fsx_case("cowfs", [])
+        self.assertNotIn("punch_hole", gate.capability_evidence(case, probe))
 
-class OpCounts(unittest.TestCase):
-    def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="fsx-gate-test-")
-
-    def write(self, text):
-        path = os.path.join(self.dir, "fsx.dat.fsxops")
-        with open(path, "w") as f:
-            f.write(text)
-        return path
-
-    def test_counts_each_op_and_keeps_skips_apart(self):
-        path = self.write("write 0x0 0x10\nread 0x0 0x10\nread 0x20 0x10\nskip\ntruncate 0x0\n")
-        self.assertEqual(gate.op_counts(path),
-                         {"write": 1, "read": 2, "truncate": 1, "skip": 1})
-
-    def test_longer_names_are_not_counted_as_their_prefix(self):
-        path = self.write("read_dontcache 0x0 0x10\nwrite_dontcache 0x0 0x10\nmapread 0x0 0x10\n")
-        counts = gate.op_counts(path)
-        self.assertEqual(counts.get("read"), None)
-        self.assertEqual(counts.get("write"), None)
-        self.assertEqual(counts["read_dontcache"], 1)
-        self.assertEqual(counts["mapread"], 1)
-
-    def test_a_missing_ops_file_is_an_error_not_an_empty_pass(self):
-        counts = gate.op_counts(os.path.join(self.dir, "absent.fsxops"))
-        self.assertIn("error", counts)
-
-
-class Sha256File(unittest.TestCase):
-    def test_missing_file_is_a_reason_not_a_digest(self):
-        digest, detail = gate.sha256_file("/nonexistent/fsx.dat")
-        self.assertIsNone(digest)
-        self.assertIn("fsx.dat", detail)
-
-    def test_digest_and_size(self):
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            f.write(b"abc" * 100)
-            path = f.name
-        digest, size = gate.sha256_file(path)
-        os.unlink(path)
-        self.assertEqual(size, 300)
-        self.assertEqual(len(digest), 64)
-
-
-class FsxArgv(unittest.TestCase):
-    def test_both_arms_get_the_same_argv_except_the_attempt_directory(self):
-        mode = {"name": "mixed", "flags": ["-f"]}
-        native = gate.fsx_argv("/bin/fsx", mode["flags"], 3, 2000, CAPS, "/native/att", "fsx.dat")
-        cowfs = gate.fsx_argv("/bin/fsx", mode["flags"], 3, 2000, CAPS, "/cowfs/att", "fsx.dat")
-        # The attempt directory appears twice, in -P and in the data path, and it is the only
-        # thing that differs: the matched part of the gate is the argv, not the location.
-        self.assertEqual([a.replace("/native/", "/ARM/") for a in native],
-                         [a.replace("/cowfs/", "/ARM/") for a in cowfs])
-        self.assertNotEqual(native, cowfs)
-        for token in ("-S", "3", "-N", "2000", "-l", "262144", "-o", "16384", "-f", "--record-ops"):
-            self.assertIn(token, native)
-
-    def test_the_declared_caps_reach_the_command_line(self):
-        argv = gate.fsx_argv("/bin/fsx", [], 1, 5, CAPS, "/a", "fsx.dat")
-        self.assertEqual(argv[argv.index("-l") + 1], "262144")
-        self.assertEqual(argv[argv.index("-o") + 1], "16384")
+    def test_fsx_alone_is_not_enough(self):
+        probe = {"cowfs": {"punch_hole": True}}
+        case = self.fsx_case("cowfs", ["fallocate mode FALLOC_FL_PUNCH_HOLE: unsupported"])
+        self.assertNotIn("punch_hole", gate.capability_evidence(case, probe))
 
 
 class CompareCase(unittest.TestCase):
-    def compare(self, native=None, cowfs=None, fresh=None, ops=10, probe=None):
-        return gate.compare_case({"name": "mixed"}, 1, ops,
-                                 native or case(arm="native", data_st_dev=1),
-                                 cowfs or case(data_st_dev=2),
-                                 fresh or {"cowfs": "aa"}, probe)
+    """The reviewer's controls 12, 13 and 14, plus the guard the first version lacked."""
 
-    def test_matching_arms_have_no_problems(self):
-        self.assertEqual(self.compare()["problems"], [])
+    def arms(self, native_counts, cowfs_counts, native_gaps=(), cowfs_gaps=(), disabled=(),
+             same_stream=True, native_sha="aa", cowfs_sha="aa", readback="aa"):
+        """Two arms that are identical except for what a test varies."""
+        probe = {"native": {op: False for op in native_gaps},
+                 "cowfs": {op: False for op in cowfs_gaps},
+                 "_probe_rows": []}
+        line = "filesystem does not support fallocate mode FALLOC_%s, disabling"
+        # Same stream digest means the streams match; different digests mean they do not. The two
+        # arms get different digests so "the streams differ" is what a differing case means.
+        native_stream, cowfs_stream = ("same", "same") if same_stream else ("ns", "cs")
+        native = case(arm="native", data_st_dev=2050, ops_sha256=native_stream, op_counts=native_counts,
+                      data_real_fstype="ext4", data_realpath="/n/fsx.dat",
+                      fsx_reported_unsupported=[line % ("PUNCH_HOLE | FALLOC_FL_KEEP_SIZE")]
+                      if "punch_hole" in disabled else [])
+        cowfs = case(arm="cowfs", data_st_dev=234, ops_sha256=cowfs_stream, op_counts=cowfs_counts,
+                     data_real_fstype="fuse.cowfs", data_realpath="/c/fsx.dat",
+                     fsx_reported_unsupported=[line % "PUNCH_HOLE"] if "punch_hole" in disabled else [])
+        return native, cowfs, probe, {"cowfs": {"sha256": readback, "size": 100}}
+
+    def test_control_12_an_explained_hole_does_not_excuse_900_fewer_reads(self):
+        # The reviewer's control 12: punch_hole explained, read differs, bytes differ. Old code
+        # passed it. It must not: a difference in a byte-bearing operation is a failure.
+        native, cowfs, probe, fresh = self.arms(
+            {"write": 4, "read": 1000, "punch_hole": 50, "skip": 0},
+            {"write": 4, "read": 100, "skip": 50},
+            cowfs_gaps=("punch_hole",), disabled=("punch_hole",),
+            same_stream=False, cowfs_sha="cc", readback="cc")
+        got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "FAIL")
+        self.assertIn("read", got["deltas_unexplained"])
+        self.assertIn("read", got["byte_bearing_deltas_unexplained"])
+
+    def test_control_13_the_same_delta_with_no_gap_is_also_a_failure(self):
+        native, cowfs, probe, fresh = self.arms(
+            {"write": 4, "read": 1000, "skip": 0}, {"write": 4, "read": 100, "skip": 50})
+        got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "FAIL")
+
+    def test_control_14_the_gap_on_the_native_arm_alone_is_not_an_excuse_either(self):
+        native, cowfs, probe, fresh = self.arms(
+            {"write": 4, "read": 1000, "skip": 0}, {"write": 4, "read": 100, "skip": 50},
+            native_gaps=("punch_hole",), disabled=("punch_hole",))
+        got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "FAIL")
+
+    def test_a_pure_capability_difference_is_unmeasurable_not_a_pass(self):
+        # Only hole-family ops differ: the arms did genuinely different work, so fsx exiting 0 on
+        # both is not execution equivalence and this cannot be PASS.
+        native, cowfs, probe, fresh = self.arms(
+            {"write": 4, "read": 4, "punch_hole": 50, "skip": 0},
+            {"write": 4, "read": 4, "skip": 50},
+            cowfs_gaps=("punch_hole",), disabled=("punch_hole",), same_stream=False)
+        got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "UNMEASURABLE", got["problems"])
+        self.assertEqual(got["problems"], [])
+        self.assertEqual(got["deltas_unexplained"], [])
+        self.assertTrue(got["unmeasurable"])
+
+    def test_a_matched_mode_with_a_stream_difference_is_a_failure(self):
+        native, cowfs, probe, fresh = self.arms({"write": 4}, {"write": 5}, same_stream=False)
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "FAIL", got["problems"])
+        self.assertTrue(any("declares one operation mix" in p for p in got["problems"]),
+                        got["problems"])
+
+    def test_matching_arms_pass(self):
+        native, cowfs, probe, fresh = self.arms({"write": 4, "read": 4}, {"write": 4, "read": 4})
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["status"], "PASS")
+        self.assertEqual(got["problems"], [])
+        self.assertEqual(got["unmeasurable"], [])
 
     def test_two_arms_on_one_device_are_a_contaminated_run(self):
-        # The false pass this catches: fsx wrote both arms inside the evidence directory, so the
-        # "cowfs" arm never touched the mount and matched native by construction.
-        got = self.compare(cowfs=case(data_st_dev=1, data_sha256="aa"))
+        native = case(arm="native", data_st_dev=1, data_real_fstype="ext4", data_realpath="/n/x")
+        cowfs = case(data_st_dev=1, data_real_fstype="ext4", data_realpath="/c/x")
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
+                                native, cowfs, {"cowfs": {"sha256": "aa", "size": 100}}, {})
+        self.assertEqual(got["status"], "FAIL")
         self.assertTrue(any("same filesystem" in p for p in got["problems"]), got["problems"])
 
-    def test_an_identical_op_stream_must_produce_identical_bytes(self):
-        got = self.compare(cowfs=case(data_sha256="cc"))
-        self.assertTrue(any("identical op streams produced different bytes" in p for p in got["problems"]))
+    def test_a_tmpfs_labelled_cowfs_is_a_failure(self):
+        # The reviewer's control 5: the directory is called cowfs but is tmpfs.
+        native = case(arm="native", data_st_dev=2050, data_real_fstype="ext4", data_realpath="/n/x")
+        cowfs = case(data_st_dev=2051, data_real_fstype="tmpfs", data_realpath="/c/x")
+        got = gate.compare_case({"name": "full", "require_identical_op_stream": False}, 1, 10,
+                                native, cowfs, {"cowfs": {"sha256": "aa", "size": 100}}, {})
+        self.assertEqual(got["status"], "FAIL")
+        self.assertTrue(any("not a cowfs mount" in p for p in got["problems"]), got["problems"])
 
-    def test_a_hole_op_missing_on_one_arm_is_explained_by_the_probe(self):
-        native = case(arm="native", data_st_dev=1, ops_sha256="bb",
-                      op_counts={"write": 4, "read": 3, "punch_hole": 2, "skip": 0})
-        cowfs = case(data_st_dev=2, ops_sha256="cc",
-                     op_counts={"write": 4, "read": 3, "skip": 2})
-        probe = {"cowfs": {"punch_hole": False}}
-        got = self.compare(native=native, cowfs=cowfs, probe=probe)
-        self.assertIn("punch_hole", got["explained_by_capability"])
-        self.assertFalse(got["ops_stream_match"])
-        self.assertFalse(got["hashes_compared"])
-        self.assertEqual(got["problems"], [])
-
-    def test_a_non_hole_op_delta_with_no_gap_is_unexplained_and_fails(self):
-            native = case(arm="native", data_st_dev=1, ops_sha256="bb",
-                          op_counts={"write": 4, "read": 3, "mapread": 2, "skip": 0})
-            cowfs = case(data_st_dev=2, ops_sha256="cc",
-                         op_counts={"write": 4, "read": 3, "skip": 0})
-            got = self.compare(native=native, cowfs=cowfs)
-            self.assertEqual(got["consequent_deltas"], ["mapread"])
-            self.assertTrue(any("no capability gap" in p for p in got["problems"]))
-
-    def test_a_skip_delta_alone_never_excuses_a_different_op(self):
-            # The rule this replaced let any difference smaller than the skip count pass as
-            # "absorbed", which would have excused a stream that diverged for any reason at all.
-            native = case(arm="native", data_st_dev=1, ops_sha256="bb",
-                          op_counts={"write": 40, "read": 30, "mapread": 10, "skip": 100})
-            cowfs = case(data_st_dev=2, ops_sha256="cc",
-                         op_counts={"write": 41, "read": 30, "mapread": 9, "skip": 200})
-            got = self.compare(native=native, cowfs=cowfs)
-            self.assertTrue(any("no capability gap" in p for p in got["problems"]), got["problems"])
-
-    def test_a_mode_that_declares_one_mix_fails_on_any_stream_difference(self):
-            native = case(arm="native", data_st_dev=1, ops_sha256="bb",
-                          op_counts={"write": 4, "punch_hole": 2})
-            cowfs = case(data_st_dev=2, ops_sha256="cc", op_counts={"write": 4})
-            probe = {"cowfs": {"punch_hole": False}}
-            got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
-                                    native, cowfs, {"cowfs": "aa"}, probe)
-            self.assertTrue(any("declares one operation mix" in p for p in got["problems"]), got["problems"])
+    def test_a_missing_filesystem_witness_is_a_failure(self):
+        native = case(arm="native", data_st_dev=2050, data_real_fstype="ext4", data_realpath="/n/x")
+        cowfs = case(data_st_dev=234, data_real_fstype=None, data_realpath=None)
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
+                                native, cowfs, {"cowfs": {"sha256": "aa", "size": 100}}, {})
+        self.assertEqual(got["status"], "FAIL")
+        self.assertTrue(any("witness" in p for p in got["problems"]), got["problems"])
 
     def test_a_nonzero_exit_is_a_problem(self):
-        got = self.compare(cowfs=case(exit=201))["problems"]
-        self.assertIn("cowfs fsx exited 201", got)
-
-    def test_a_timeout_is_a_problem(self):
-        got = self.compare(cowfs=case(timed_out=True, exit=None))["problems"]
-        self.assertTrue(any("timed out" in p for p in got))
-
-    def test_a_missing_op_count_is_a_problem(self):
-        got = self.compare(cowfs=case(ops_executed=None))["problems"]
-        self.assertIn("cowfs fsx never reported its op count", got)
-
-    def test_fewer_ops_than_declared_is_a_problem(self):
-        got = self.compare(cowfs=case(ops_executed=7), ops=10)["problems"]
-        self.assertIn("cowfs fsx executed 7 ops, 10 declared", got)
-
-    def test_differing_bytes_are_a_problem_when_the_streams_match(self):
-        got = self.compare(cowfs=case(data_sha256="cc"))["problems"]
-        self.assertTrue(any("identical op streams produced different bytes" in p for p in got), got)
-
-    def test_an_empty_result_is_a_problem(self):
-        got = self.compare(cowfs=case(data_size=0))["problems"]
-        self.assertIn("cowfs data file is empty", got)
-
-    def test_a_differing_op_stream_alone_is_not_a_failure(self):
-        # fsx picks its operations after probing the filesystem, so two honest arms may record
-        # different streams. What has to hold is that the difference is explained, not absent.
-        got = self.compare(cowfs=case(ops_sha256="dd"))
-        self.assertEqual(got["problems"], [])
-        self.assertFalse(got["ops_stream_match"])
-
-    def test_a_fresh_open_that_reads_something_else_is_a_problem(self):
-        got = self.compare(fresh={"cowfs": "ee"})["problems"]
-        self.assertTrue(any("fresh open read ee" in p for p in got))
-
-
-class Verdict(unittest.TestCase):
-    REQUIRED = {"mixed": ["read", "write", "mapread", "mapwrite", "truncate"]}
-
-    def verdict(self, cases=None, compares=None, restarts=None, probe=None, required=None):
-        return gate.verdict(cases if cases is not None else [case()],
-                            compares if compares is not None else [compare()],
-                            restarts or [], required if required is not None else self.REQUIRED,
-                            probe or [])
-
-    def test_a_clean_run_passes(self):
-        self.assertEqual(self.verdict()["status"], "PASS")
-
-    def test_no_case_at_all_fails_rather_than_passing(self):
-        got = gate.verdict([], [], [], {}, [])
+        native, cowfs, probe, fresh = self.arms({"write": 4}, {"write": 4})
+        cowfs["exit"] = 201
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
+                                native, cowfs, fresh, probe)
         self.assertEqual(got["status"], "FAIL")
-        self.assertIn("no case ran", got["failures"])
+        self.assertIn("cowfs fsx exited 201", got["problems"])
 
-    def test_a_failing_compare_fails(self):
-        got = self.verdict(compares=[compare(problems=["cowfs fsx exited 201"])])
+    def test_a_fresh_open_in_a_different_shape_is_still_checked(self):
+        native, cowfs, probe, fresh = self.arms({"write": 4}, {"write": 4}, readback="ee")
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
+                                native, cowfs, fresh, probe)
+        self.assertTrue(any("reopened the file and read ee" in p for p in got["problems"]),
+                        got["problems"])
+
+    def test_a_separate_process_reading_a_different_size_is_a_problem(self):
+        native, cowfs, probe, fresh = self.arms({"write": 4}, {"write": 4})
+        fresh = {"cowfs": {"sha256": "aa", "size": 99}}
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
+                                native, cowfs, fresh, probe)
+        self.assertTrue(any("read 99 bytes" in p for p in got["problems"]), got["problems"])
+
+    def test_an_unreadable_op_stream_is_a_problem_not_an_operation_named_error(self):
+        native, cowfs, probe, fresh = self.arms({"write": 4}, {"write": 4})
+        cowfs["op_counts"] = {"error": "fsx.dat.fsxops: No such file or directory"}
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 1, 10,
+                                native, cowfs, fresh, probe)
         self.assertEqual(got["status"], "FAIL")
-        self.assertIn("mixed seed 1: cowfs fsx exited 201", got["failures"])
+        self.assertTrue(any("op stream could not be read" in p for p in got["problems"]),
+                        got["problems"])
+        self.assertNotIn("error", got["op_count_deltas"])
 
-    def test_an_unsupported_probe_alone_does_not_fail_or_pass_by_itself(self):
-        probe = [{"arm": "cowfs", "op": "punch_hole", "ok": False, "detail": "EOPNOTSUPP"}]
-        got = self.verdict(probe=probe)
-        self.assertEqual(got["status"], "PASS")
-        self.assertEqual(got["unsupported"], ["EOPNOTSUPP"])
+    def test_a_missing_ops_file_counts_as_no_operations(self):
+        native, cowfs, probe, fresh = self.arms({"write": 4}, {"write": 4})
+        self.assertEqual(gate.counts_or_empty(case(op_counts=None)), {})
+        self.assertEqual(gate.counts_or_empty(case(op_counts={"write": 2})), {"write": 2})
 
-    def test_a_required_op_that_never_happened_fails(self):
-        got = self.verdict(cases=[case(op_counts={"write": 4, "read": 3})])
-        self.assertEqual(got["status"], "FAIL")
-        self.assertTrue(any("never performed mapread" in f for f in got["failures"]))
+    def test_each_pair_reports_requested_executed_and_skipped_counts(self):
+        native, cowfs, probe, fresh = self.arms({"write": 4, "skip": 3}, {"write": 4, "skip": 3})
+        got = gate.compare_case({"name": "matched", "require_identical_op_stream": True}, 7, 10,
+                                native, cowfs, fresh, probe)
+        self.assertEqual(got["ops_requested"], 10)
+        self.assertEqual(got["ops_executed"], {"native": 10, "cowfs": 10})
+        self.assertEqual(got["ops_skipped"], {"native": 3, "cowfs": 3})
+        self.assertIn("unsupported_reasons", got)
 
-    def test_a_hole_op_the_filesystem_lacks_is_a_recorded_gap_not_a_pass_or_a_failure(self):
-        counts = {"write": 4, "read": 3, "mapread": 1, "mapwrite": 1, "truncate": 1, "zero_range": 1}
-        cases = [case(op_counts=counts),
-                 case(arm="native", op_counts=counts,
-                      fsx_reported_unsupported=["fallocate mode FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, disabling!"]),
-                 case(op_counts=counts,
-                      fsx_reported_unsupported=["fallocate mode FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, disabling!"])]
-        got = self.verdict(cases=cases, required={"mixed": ["punch_hole"]})
-        self.assertEqual(got["status"], "PASS")
-        self.assertEqual(got["required_ops_missing"], [])
-        self.assertEqual(len(got["capability_gaps"]), 1)
-        self.assertIn("never performed punch_hole", got["capability_gaps"][0])
-        self.assertIn("fsx reported", got["capability_gaps"][0])
 
-    def test_the_gap_names_the_message_for_that_operation_not_the_first_one(self):
-        # Every punch_hole disable line also contains KEEP_SIZE, so quoting the first disabled
-        # mode would blame the wrong capability.
-        cases = [case(op_counts={"write": 4, "read": 3},
-                      fsx_reported_unsupported=[
-                          "fallocate mode FALLOC_FL_KEEP_SIZE: filesystem does not support "
-                          "fallocate mode FALLOC_FL_KEEP_SIZE, disabling",
-                          "fallocate mode FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE: filesystem "
-                          "does not support fallocate mode FALLOC_FL_PUNCH_HOLE | "
-                          "FALLOC_FL_KEEP_SIZE, disabling"])]
-        got = self.verdict(cases=cases, required={"mixed": ["punch_hole"]})
-        self.assertEqual(len(got["capability_gaps"]), 1)
-        self.assertIn("FALLOC_FL_PUNCH_HOLE", got["capability_gaps"][0])
+class RestartLeg(unittest.TestCase):
+    """F3: the reviewer's control 17 was --restart-cmd /bin/true, which passed."""
 
-    def test_the_probe_alone_can_explain_a_missing_hole_op(self):
-        probe = [{"arm": "cowfs", "op": "punch_hole", "ok": False, "detail": "EOPNOTSUPP"}]
-        got = self.verdict(probe=probe, required={"mixed": ["punch_hole"]})
-        self.assertEqual(got["status"], "PASS")
-        self.assertEqual(len(got["capability_gaps"]), 1)
+    class Args:
+        restart_cmd = "/usr/bin/true"
+        cowfs_root = "/mount"
+        daemon_pid_file = None
+        expect_backend = "core"
 
-    def test_a_restart_leg_that_failed_fails(self):
-        got = self.verdict(restarts=[{"exit": 1, "error": "unmount failed", "problems": []}])
-        self.assertEqual(got["status"], "FAIL")
-        self.assertTrue(any("restart leg exited 1" in f for f in got["failures"]))
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "the daemon generation is read from /proc")
+    def test_a_manifest_helper_reads_a_generation(self):
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-pid-") as tmp:
+            pid = os.getpid()
+            pidfile = os.path.join(tmp, "daemon.pid")
+            with open(pidfile, "w") as f:
+                f.write(str(pid))
+            got, error = gate.daemon_generation(pidfile)
+        self.assertIsNone(error)
+        self.assertEqual(got["pid"], pid)
+        self.assertIsNotNone(got["starttime"])
 
-    def test_a_restart_that_changed_bytes_fails(self):
-        got = self.verdict(restarts=[{"exit": 0, "problems": ["fsx.dat read cc after the restart, aa before"]}])
-        self.assertEqual(got["status"], "FAIL")
+    def test_an_unreadable_pid_file_is_an_error_not_a_pass(self):
+        got, error = gate.daemon_generation("/nonexistent/daemon.pid")
+        self.assertIsNone(got)
+        self.assertIn("pid file", error)
 
-    def test_a_clean_restart_still_passes(self):
-        got = self.verdict(restarts=[{"exit": 0, "problems": []}])
-        self.assertEqual(got["status"], "PASS")
+    def test_the_unchanged_pid_is_reported_as_no_replacement(self):
+        args = self.Args()
+        generation = {"pid": 42, "starttime": "100", "store": "/s", "socket": "/k",
+                      "mount": "/m", "backend": "core", "binary_sha256": "bb"}
+        args.restart_cmd = "/bin/true"
+        original = gate.daemon_generation
+        gate.daemon_generation = lambda pidfile: (dict(generation), None)
+        original_attest = gate.manifest_module
+        gate.manifest_module = lambda: type("M", (), {"attest": staticmethod(
+            lambda root, pid, backend: {"ok": True, "st_dev": 234})})()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                row = gate.restart_leg(args, [], dict(generation), {"st_dev": 234})
+        finally:
+            gate.daemon_generation = original
+            gate.manifest_module = original_attest
+        self.assertTrue(any("unchanged after the restart hook" in p for p in row["problems"]),
+                        row["problems"])
+        self.assertTrue(any("same generation" in p for p in row["problems"]), row["problems"])
+
+    def test_a_new_pid_with_a_new_start_time_on_the_same_store_passes(self):
+        args = self.Args()
+        before = {"pid": 42, "starttime": "100", "store": "/s", "socket": "/k",
+                  "mount": "/m", "backend": "core", "binary_sha256": "bb"}
+        after = dict(before, pid=99, starttime="200")
+        original = gate.daemon_generation
+        gate.daemon_generation = lambda pidfile: (dict(after), None)
+        original_attest = gate.manifest_module
+        gate.manifest_module = lambda: type("M", (), {"attest": staticmethod(
+            lambda root, pid, backend: {"ok": True, "st_dev": 234})})()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                row = gate.restart_leg(args, [], before, {"st_dev": 234})
+        finally:
+            gate.daemon_generation = original
+            gate.manifest_module = original_attest
+        self.assertEqual(row["problems"], [])
+        self.assertEqual(row["generation_after"]["pid"], 99)
+
+    def test_a_changed_store_across_the_restart_is_a_problem(self):
+        args = self.Args()
+        before = {"pid": 42, "starttime": "100", "store": "/s", "socket": "/k",
+                  "mount": "/m", "backend": "core", "binary_sha256": "bb"}
+        after = dict(before, pid=99, starttime="200", store="/other")
+        original = gate.daemon_generation
+        gate.daemon_generation = lambda pidfile: (dict(after), None)
+        original_attest = gate.manifest_module
+        gate.manifest_module = lambda: type("M", (), {"attest": staticmethod(
+            lambda root, pid, backend: {"ok": True, "st_dev": 234})})()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                row = gate.restart_leg(args, [], before, {"st_dev": 234})
+        finally:
+            gate.daemon_generation = original
+            gate.manifest_module = original_attest
+        self.assertTrue(any("changed across the restart" in p for p in row["problems"]),
+                        row["problems"])
+
+    def test_the_mount_losing_its_attestation_is_a_problem(self):
+        args = self.Args()
+        before = {"pid": 42, "starttime": "100", "store": "/s", "socket": "/k",
+                  "mount": "/m", "backend": "core", "binary_sha256": "bb"}
+        after = dict(before, pid=99, starttime="200")
+        original = gate.daemon_generation
+        gate.daemon_generation = lambda pidfile: (dict(after), None)
+        original_attest = gate.manifest_module
+        gate.manifest_module = lambda: type("M", (), {"attest": staticmethod(
+            lambda root, pid, backend: {"ok": False, "reason": "not a mount"})})()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                row = gate.restart_leg(args, [], before, {"st_dev": 234})
+        finally:
+            gate.daemon_generation = original
+            gate.manifest_module = original_attest
+        self.assertTrue(any("not attested after the restart" in p for p in row["problems"]),
+                        row["problems"])
+
+
+class ImmutableAttemptDir(unittest.TestCase):
+    """F4: the reviewer's control 19 reused a case directory, so a stale file passed as work."""
+
+    def test_a_fresh_directory_is_created_and_empty(self):
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-fresh-") as tmp:
+            got = gate.fresh_attempt_dir(tmp, "matched-seed1-cowfs")
+            self.assertTrue(os.path.isdir(got))
+            self.assertEqual(os.listdir(got), [])
+            self.assertEqual(os.stat(got).st_mode & 0o777, 0o700)
+
+    def test_two_calls_never_return_the_same_path(self):
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-fresh2-") as tmp:
+            first = gate.fresh_attempt_dir(tmp, "x")
+            second = gate.fresh_attempt_dir(tmp, "x")
+            self.assertNotEqual(first, second)
+            self.assertTrue(os.path.isdir(first))
+
+    def test_stale_content_does_not_satisfy_a_new_attempt(self):
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-fresh3-") as tmp:
+            gate.fresh_attempt_dir(tmp, "x")
+            other = gate.fresh_attempt_dir(tmp, "x")
+            self.assertEqual(os.listdir(other), [])
+
+
+class ByteCaps(unittest.TestCase):
+    """F6: the config declared a per-arm byte budget that nothing compared anything against."""
+
+    def test_the_config_budget_covers_the_declared_batch(self):
+        gate_json = json.load(open(os.path.join(HERE, "fsx-gate.json")))
+        caps = gate_json["caps"]
+        pairs = sum(len(m["seeds"]) for m in gate_json["modes"])
+        self.assertEqual(pairs, 15)
+        self.assertEqual(caps["max_bytes_written_per_arm"], pairs * 2 * caps["max_file_bytes"])
+        self.assertGreaterEqual(caps["max_bytes_written_per_arm"], caps["max_file_bytes"])
+
+    def test_a_data_file_over_the_declared_cap_is_reported(self):
+        caps = json.load(open(os.path.join(HERE, "fsx-gate.json")))["caps"]
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-cap-") as tmp:
+            got = gate.fresh_attempt_dir(tmp, "cap")
+            data = os.path.join(got, "fsx.dat")
+            with open(data, "wb") as f:
+                f.write(b"\0" * (caps["max_file_bytes"] + 1))
+            digest, size = gate.sha256_file(data)
+        self.assertEqual(size, caps["max_file_bytes"] + 1)
+        self.assertIsNotNone(digest)
+        over = size > caps["max_file_bytes"]
+        self.assertTrue(over)
+
+    def test_the_arm_budget_is_a_whole_run_figure_not_a_per_file_one(self):
+        gate_json = json.load(open(os.path.join(HERE, "fsx-gate.json")))
+        caps = gate_json["caps"]
+        self.assertIn("caps_note", caps)
+        self.assertIn("max_bytes_written_per_arm", caps["caps_note"])
+        self.assertIn("reported FAIL", caps["caps_note"])
+
+
+class ToolPin(unittest.TestCase):
+    """F5: the reviewer's control 16 ran a synthetic child because the binary was never pinned."""
+
+    def manifest_gate(self, binary_sha, extra=()):
+        gate_json = json.load(open(os.path.join(HERE, "fsx-gate.json")))
+        args = ["--native-root", "/tmp", "--cowfs-root", "/tmp", "--fsx-bin", "/bin/sh",
+                "--out", tempfile.mkdtemp(prefix="fsx-gate-pin-"), "--config",
+                os.path.join(HERE, "fsx-gate.json")]
+        return gate_json, args, list(extra)
+
+    def test_the_gate_config_carries_a_manifest(self):
+        gate_json, _, _ = self.manifest_gate(None)
+        manifest = gate_json["tool"]["manifest"]
+        self.assertEqual(len(manifest["expected_binary_sha256"]), 64)
+        self.assertEqual(len(manifest["expected_source_sha256"]), 3)
+        for digest in manifest["expected_source_sha256"].values():
+            self.assertEqual(len(digest), 64)
+        self.assertTrue(manifest["expected_compile"])
+
+    def test_a_mismatched_binary_is_unmeasurable_before_anything_runs(self):
+        out = tempfile.mkdtemp(prefix="fsx-gate-pinout-")
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HERE, "run-fsx-gate.py"),
+             "--native-root", out, "--cowfs-root", out, "--fsx-bin", "/bin/sh",
+             "--config", os.path.join(HERE, "fsx-gate.json"), "--out", out],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("approved manifest pins", proc.stdout)
+
+    def test_the_recorded_tool_check_says_whether_the_pin_was_applied(self):
+        gate_json = json.load(open(os.path.join(HERE, "fsx-gate.json")))
+        self.assertIn("manifest", gate_json["tool"])
+
+    def test_allow_unpinned_is_a_mutation_control_not_an_acceptance(self):
+        out = tempfile.mkdtemp(prefix="fsx-gate-unpinned-")
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HERE, "run-fsx-gate.py"),
+             "--native-root", out, "--cowfs-root", out, "--fsx-bin", "/bin/sh",
+             "--config", os.path.join(HERE, "fsx-gate.json"), "--out", out,
+             "--allow-unpinned-fsx"],
+            capture_output=True, text=True, timeout=300)
+        # The arm attestation still refuses a directory that is not a cowfs mount.
+        self.assertEqual(proc.returncode, 3)
+        record = os.path.join(out, "cases.jsonl")
+        rows = [json.loads(line) for line in open(record)]
+        meta = [r for r in rows if r["kind"] == "meta"][0]
+        self.assertFalse(meta["tool_check"]["pinned"])
+        self.assertIn("mutation control", meta["tool_check"]["note"])
+
+
+class ArmAttestation(unittest.TestCase):
+    """F1: the reviewer's control 5 pointed the cowfs arm at tmpfs and it passed."""
+
+    def test_a_plain_directory_is_not_attested_as_a_cowfs_mount(self):
+        module = gate.manifest_module()
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-attest-") as tmp:
+            # No pid file and no declared backend: the question is only "is this a cowfs mount",
+            # and a temp directory is not one.
+            got = module.attest(tmp, None, None, module.COWFS_FSTYPES)
+            # The same call with no filesystem types required has to resolve, or the native
+            # control could never be attested at all.
+            loose = module.attest(tmp, None, None, None)
+        self.assertIn(got["status"], ("UNKNOWN", "WRONG_FSTYPE"))
+        self.assertFalse(got["ok"])
+        self.assertTrue(got.get("reason"))
+        self.assertTrue(loose["ok"])
+        self.assertIsNone(loose.get("reason"))
+
+    def test_the_fstype_check_names_what_it_found(self):
+        module = gate.manifest_module()
+        self.assertIn("fuse.cowfs", module.COWFS_FSTYPES)
+        source = open(os.path.join(HERE, "mount-manifest.py")).read()
+        self.assertIn("WRONG_FSTYPE", source)
+        self.assertIn("no mount table entry contains", source)
+
+    def test_resolve_mount_picks_the_longest_prefix(self):
+        module = gate.manifest_module()
+        rows = [{"source": "a", "mountpoint": "/", "fstype": "ext4"},
+                {"source": "b", "mountpoint": "/mnt/inner", "fstype": "fuse.cowfs"}]
+        self.assertEqual(module.resolve_mount("/mnt/inner/deep", rows)["fstype"], "fuse.cowfs")
+        self.assertEqual(module.resolve_mount("/mnt/other", rows)["fstype"], "ext4")
+        self.assertIsNone(module.resolve_mount("/elsewhere", []))
+
+
+class ReadbackComparesAgainstTheRecord(unittest.TestCase):
+    """The readback after a restart must be compared with what this run recorded, not with a
+    value the reader was handed."""
+
+    def test_the_row_carries_both_generations_and_the_expectations(self):
+        row = {"kind": "restart", "generation_before": {"pid": 1, "starttime": "10"},
+               "generation_after": {"pid": 2, "starttime": "20"},
+               "rehashed": {"/m/fsx.dat": {"sha256": "aa", "size": 100}},
+               "problems": []}
+        self.assertEqual(row["generation_before"]["starttime"], "10")
+        self.assertEqual(row["generation_after"]["starttime"], "20")
+        self.assertEqual(row["rehashed"]["/m/fsx.dat"]["size"], 100)
+
+    def test_a_readback_that_matches_the_record_is_not_a_problem(self):
+        want = {"sha256": "aa", "size": 100}
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"x" * 100)
+            path = f.name
+        got, error = gate.readback_in_new_process(path)
+        os.unlink(path)
+        self.assertIsNone(error)
+        self.assertEqual(got["size"], want["size"])
+
+
+class SeparateProcessReadback(unittest.TestCase):
+    def test_a_missing_file_is_an_error_not_a_digest(self):
+        got, error = gate.readback_in_new_process("/nonexistent/fsx.dat")
+        self.assertIsNone(got)
+        self.assertIn("failed", error)
+
+
+class ReadbackIsAFilesystemRead(unittest.TestCase):
+    def test_the_readback_hashes_the_file_not_a_stated_expectation(self):
+        import hashlib
+        payload = b"actual bytes on the filesystem"
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(payload)
+            path = f.name
+        got, error = gate.readback_in_new_process(path)
+        os.unlink(path)
+        self.assertIsNone(error)
+        self.assertEqual(got["sha256"], hashlib.sha256(payload).hexdigest())
+        self.assertEqual(got["size"], len(payload))
+
+    def test_the_readback_of_an_empty_file_is_zero_bytes(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            path = f.name
+        got, error = gate.readback_in_new_process(path)
+        os.unlink(path)
+        self.assertIsNone(error)
+        self.assertEqual(got["size"], 0)
+        self.assertEqual(got["sha256"], hashlib.sha256(b"").hexdigest())
 
 
 class MountIdentity(unittest.TestCase):
@@ -368,13 +602,29 @@ class Summary(unittest.TestCase):
             path = os.path.join(tmp, "summary.md")
             result = {"status": "FAIL", "cases": 1, "failures": ["boom"],
                       "unsupported": ["EOPNOTSUPP"], "required_ops_missing": []}
-            gate.summary(path, result, {"fsx": {"sha256": "ab"}, "roots": {}}, [compare()])
+            gate.summary(path, result, {"fsx": {"sha256": "ab"}, "roots": {}}, [cmp_case()])
             with open(path) as f:
                 text = f.read()
         self.assertIn("status: FAIL", text)
-        self.assertIn("| mixed | 1 |", text)
+        self.assertIn("| matched | 1 | 10 | 10/10 | 0/0 |", text)
+        self.assertIn("ext4/fuse.cowfs", text)
         self.assertIn("EOPNOTSUPP", text)
         self.assertIn("boom", text)
+
+    def test_the_pair_table_carries_the_verdict_and_the_counts(self):
+        with tempfile.TemporaryDirectory(prefix="fsx-gate-summary2-") as tmp:
+            path = os.path.join(tmp, "summary.md")
+            result = {"status": "UNMEASURABLE", "cases": 2, "pairs_passed": 1,
+                      "pairs_failed": 0, "pairs_unmeasurable": 1, "failures": [],
+                      "unmeasurable": ["arms ran different operations"], "unsupported": [],
+                      "capability_gaps": ["punch_hole gap"]}
+            gate.summary(path, result, {"fsx": {"sha256": "ab"}, "roots": {}},
+                         [cmp_case(), cmp_case(seed=2, status="UNMEASURABLE")])
+            with open(path) as f:
+                text = f.read()
+        self.assertIn("pairs: 1 passed, 0 failed, 1 unmeasurable", text)
+        self.assertIn("arms ran different operations", text)
+        self.assertIn("UNMEASURABLE", text)
 
 
 class Probe(unittest.TestCase):

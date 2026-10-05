@@ -49,11 +49,24 @@ OP_NAMES = [
 
 # An op type that never happened is a failure, unless the op is gated behind a capability the
 # filesystem does not have. Those become recorded capability gaps instead of silent passes.
+# The whole fallocate family is listed, not just the two the first version named: fsx's default
+# mix also records fallocate, collapse_range and insert_range, and leaving those out of the map
+# meant they were counted as unexplained differences while the two named ones excused them.
+# An empty value means the op needs a plain fallocate(2), which is the capability that gates it.
 OP_CAPABILITY = {
     "punch_hole": "PUNCH_HOLE",
     "zero_range": "ZERO_RANGE",
     "write_zeroes": "WRITE_ZEROES",
+    "fallocate": "",
+    "collapse_range": "COLLAPSE_RANGE",
+    "insert_range": "INSERT_RANGE",
 }
+
+# The operations that carry the file's bytes. A capability gap on an operation that does not
+# change the bytes cannot excuse a difference in these: if the two arms did a different number of
+# reads, writes, mapped writes or truncates, the two files are not comparable and the case is
+# unmeasurable, not passing.
+BYTE_BEARING_OPS = ("read", "write", "mapread", "mapwrite", "truncate")
 
 EXIT_PASS, EXIT_FAIL, EXIT_USAGE, EXIT_UNMEASURABLE = 0, 1, 2, 3
 
@@ -106,8 +119,19 @@ def st_dev(path):
     """The device a file's bytes live on. Two arms on one device means one arm did not run."""
     try:
         return os.stat(path).st_dev
-    except OSError as e:
+    except OSError:
         return None
+
+
+def manifest_module():
+    """mount-manifest.py, loaded from beside this file so there is one implementation of the
+    mount-table and statfs questions rather than two."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mount-manifest.py")
+    spec = importlib.util.spec_from_file_location("cowfs_mount_manifest", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def op_counts(ops_path):
@@ -359,15 +383,41 @@ def fsx_argv(binary, mode_flags, seed, ops, caps, attempt_dir, data_name):
     return argv
 
 
-def run_case(binary, arm, root, mode, seed, ops, caps, out_dir, timeout):
-    """One fsx run on one arm. The case directory is inside the arm root, so the work happens on
-    that filesystem and not on whatever holds the evidence directory."""
-    case_dir = os.path.join(root, ".fsx-gate", "%s-seed%s" % (mode["name"], seed))
-    os.makedirs(case_dir, exist_ok=True)
+def fresh_attempt_dir(parent, label):
+    """A directory that has never existed, made with O_EXCL so nothing can be reused.
+
+    Reusing a case directory is how a stale file passes as this invocation's work: the digests
+    would be the previous run's. Nothing is deleted to make room. If the name is taken the run
+    refuses, because a failed or interrupted attempt is evidence and deleting it would destroy it.
+    """
+    os.makedirs(parent, exist_ok=True)
+    for _ in range(4096):
+        name = "%s-%d-%d" % (label, os.getpid(), int(time.time() * 1000) % 100000000)
+        path = os.path.join(parent, name)
+        try:
+            os.mkdir(path, 0o700)
+            return path
+        except FileExistsError:
+            continue
+    raise RuntimeError("could not create a fresh attempt directory under %s" % parent)
+
+
+def run_case(binary, arm, root, mode, seed, ops, caps, out_dir, timeout, run_tag):
+    """One fsx run on one arm.
+
+    The case directory is inside the arm root, so the work happens on that filesystem and not on
+    whatever holds the evidence directory. It is brand new for this invocation, and the data file
+    must appear in it: an absent file is a failure, never a digest carried over from an earlier
+    attempt.
+    """
+    case_dir = fresh_attempt_dir(os.path.join(root, ".fsx-gate"),
+                                 "%s-seed%s-%s" % (mode["name"], seed, arm))
     data = os.path.join(case_dir, "fsx.dat")
+    data_real = os.path.realpath(data)
     argv = fsx_argv(binary, mode["flags"], seed, ops, caps, case_dir, "fsx.dat")
     started = time.monotonic()
     timed_out = False
+    spawn_error = None
     try:
         proc = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=timeout)
         code, out, err = proc.returncode, proc.stdout, proc.stderr
@@ -376,6 +426,11 @@ def run_case(binary, arm, root, mode, seed, ops, caps, out_dir, timeout):
         code = None
         out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         err = (e.stderr or b"").decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+    except (OSError, ValueError) as e:
+        # A tool that cannot be executed at all is a failed case with a named reason, not a
+        # traceback: the gate has to be able to say what happened.
+        spawn_error = "%s: %s" % (type(e).__name__, e)
+        code, out, err = None, "", ""
     seconds = time.monotonic() - started
 
     evidence = os.path.join(out_dir, "attempts", "%s-seed%s-%s" % (mode["name"], seed, arm))
@@ -403,50 +458,106 @@ def run_case(binary, arm, root, mode, seed, ops, caps, out_dir, timeout):
             shutil.copy2(src, os.path.join(evidence, name))
             after, _ = sha256_file(os.path.join(evidence, name))
             copied[name] = {"on_filesystem": digest, "in_evidence": after, "same": digest == after}
+    over_cap = []
+    if data_size is not None and data_size > caps["max_file_bytes"]:
+        over_cap.append("%s data file is %d bytes, over the declared %d"
+                        % (arm, data_size, caps["max_file_bytes"]))
+    # The witness is the file fsx wrote, not the directory it was asked to use: its realpath, the
+    # device its bytes live on, and the filesystem the kernel reports for that device.
+    witness = manifest_module().file_witness(data) if os.path.exists(data_real) else {
+        "path": data, "realpath": data_real, "st_dev": None, "exists": False,
+        "fstype": None, "mountpoint": None}
+    fstype = witness.get("fstype")
     return {
         "kind": "case", "time": now(), "mode": mode["name"], "seed": seed, "arm": arm,
-        "argv": argv, "cwd": root, "exit": code, "timed_out": timed_out, "seconds": round(seconds, 3),
-        "ops_declared": ops, "ops_executed": parse_ops_executed(out),
+        "run_tag": run_tag,
+        "argv": argv, "cwd": root, "exit": code, "timed_out": timed_out,
+        "spawn_error": spawn_error, "seconds": round(seconds, 3),
+        "ops_requested": ops, "ops_executed": parse_ops_executed(out),
         "log_dump_total": parse_log_dump_total(out),
-        "case_dir": case_dir, "data_path": data, "data_sha256": data_sha, "data_size": data_size,
+        "case_dir": case_dir, "case_dir_fresh": True,
+        "data_path": data, "data_realpath": data_real, "data_sha256": data_sha,
+        "data_size": data_size, "data_real_fstype": fstype, "data_witness": witness,
         "data_st_dev": st_dev(data), "root_st_dev": st_dev(root),
         "ops_file": opsfile, "ops_sha256": ops_sha, "op_counts": counts,
         "fsx_reported_unsupported": parse_disabled_modes(out + err),
+        "over_cap": over_cap,
         "evidence": evidence, "evidence_copy": copied, "log": log,
     }
 
 
 def capability_evidence(case, probe_by_arm):
-    """Which of the hole operations this filesystem is known not to have, with the source."""
-    names = set(OP_CAPABILITY)
-    have = {op for op in names if probe_by_arm.get(case["arm"], {}).get(op, True)}
+    """Which of the hole operations this filesystem is known not to have, with the source.
+
+    Two independent sources agree or neither counts: the runner's own probe of the syscall, and
+    fsx's own line saying it disabled the mode. fsx's message names the mode, not the operation,
+    so an op whose capability string is a substring of the message is treated as unsupported.
+    """
+    gaps = set()
     disabled = " ".join(case["fsx_reported_unsupported"])
-    for op in list(have):
-        if OP_CAPABILITY[op] in disabled:
-            have.discard(op)
-    return have
+    for op, capability in OP_CAPABILITY.items():
+        if capability == "":
+            # Plain fallocate(2): the probe's "fallocate" row is the only evidence for it.
+            if probe_by_arm.get(case["arm"], {}).get("fallocate", True) is False:
+                gaps.add(op)
+            continue
+        probe_name = {"PUNCH_HOLE": "punch_hole", "ZERO_RANGE": "zero_range",
+                      "WRITE_ZEROES": "write_zeroes", "COLLAPSE_RANGE": "collapse_range",
+                      "INSERT_RANGE": "insert_range"}.get(capability, capability.lower())
+        probe_says_no = probe_by_arm.get(case["arm"], {}).get(probe_name, True) is False
+        fsx_says_no = capability in disabled
+        if probe_says_no and fsx_says_no:
+            gaps.add(op)
+    return gaps
 
 
-def compare_case(mode, seed, ops, native, cowfs, fresh_open, probe_by_arm=None):
+def attribute_deltas(deltas, gaps):
+    """Split the operation-count differences into those a capability gap explains and those it does
+    not. Each delta is attributed on its own; there is no blanket excuse.
+
+    A delta counts as explained when the operation itself is in the gap set for one of the arms.
+    Everything else is unexplained, including a difference in the operations that carry the bytes,
+    which no hole capability can account for.
+    """
+    explained, unexplained = [], []
+    for op in sorted(deltas):
+        (explained if op in gaps else unexplained).append(op)
+    return explained, unexplained
+
+
+def counts_or_empty(case):
+    """The operation counts of a case, or an empty table with the reason kept apart."""
+    counts = case.get("op_counts")
+    return dict(counts) if isinstance(counts, dict) else {}
+
+
+def compare_case(mode, seed, ops, native, cowfs, fresh_open, probe_by_arm=None, restart=None):
     """The per-seed verdict for one seed on both arms.
 
     The matched part of the gate is the tool, the declared flags, the seed and the op count. The
     op stream is fsx's own output, and fsx picks operations after probing what the filesystem
-    supports, so it can legitimately differ between arms. Two rules follow from that:
+    supports, so it can legitimately differ between arms. Three verdicts are possible per pair:
 
-    * a mode declared to run the same mix on both arms must produce the same stream, and then
-      the bytes must match exactly;
-    * a mode that lets fsx use everything the filesystem offers is judged on fsx's own exit
-      status, and every stream difference must trace to a capability one arm is recorded as
-      lacking. A difference with no such capability behind it is a failure, never an excuse.
+    * PASS: the streams are byte-identical and so are the files;
+    * UNMEASURABLE: the streams differ and every difference is attributed to a capability one arm
+      is recorded as lacking, so the two arms did different work and their bytes are not
+      comparable. This is not a pass: fsx exiting 0 on its own is not execution equivalence;
+    * FAIL: the streams differ with a difference nothing explains, which includes any difference
+      in the byte-bearing operations.
+
+    A matched mode declares one operation mix for both arms, so any stream difference in it is a
+    failure rather than a capability question.
     """
     probe_by_arm = probe_by_arm or {}
     require_same_stream = bool(mode.get("require_identical_op_stream"))
     problems = []
+    unmeasurable = []
     if native["timed_out"] or cowfs["timed_out"]:
         problems.append("fsx timed out after %ss" % native["seconds"])
     for arm, case in (("native", native), ("cowfs", cowfs)):
-        if case["exit"] != 0:
+        if case.get("spawn_error"):
+            problems.append("%s fsx could not be executed: %s" % (arm, case["spawn_error"]))
+        elif case["exit"] != 0:
             problems.append("%s fsx exited %s" % (arm, case["exit"]))
         if case["ops_executed"] is None:
             problems.append("%s fsx never reported its op count" % arm)
@@ -456,14 +567,33 @@ def compare_case(mode, seed, ops, native, cowfs, fresh_open, probe_by_arm=None):
             problems.append("%s data file unreadable: %s" % (arm, case["data_size"]))
         elif case["data_size"] == 0:
             problems.append("%s data file is empty" % arm)
+        # The witness is the file fsx actually wrote: its device, its realpath and the
+        # filesystem type the kernel reports for that realpath. A path label is not evidence.
+        if case.get("data_st_dev") is None:
+            problems.append("%s data file has no stat device, so the arm cannot be identified" % arm)
+        for field in ("data_real_fstype", "data_realpath"):
+            if not case.get(field):
+                problems.append("%s data file has no %s witness" % (arm, field))
 
     devices = {arm: case.get("data_st_dev") for arm, case in (("native", native), ("cowfs", cowfs))}
-    if devices["native"] is not None and devices["native"] == devices["cowfs"]:
+    if devices["native"] is not None and devices["cowfs"] is not None and devices["native"] == devices["cowfs"]:
         problems.append("both arms ran on the same filesystem (st_dev %s), so the cowfs arm did not "
                         "touch the mount" % devices["native"])
+    fstypes = {arm: (case.get("data_real_fstype") or "") for arm, case in
+               (("native", native), ("cowfs", cowfs))}
+    if fstypes["cowfs"] and "cowfs" not in fstypes["cowfs"]:
+        problems.append("the cowfs arm's data file is on %s, which is not a cowfs mount; the "
+                        "directory label does not make it one" % fstypes["cowfs"])
+    if fstypes["cowfs"] and fstypes["native"] and fstypes["cowfs"] == fstypes["native"]:
+        problems.append("both arms are on %s, so there is no cowfs arm" % fstypes["cowfs"])
 
-    native_counts = native["op_counts"] if isinstance(native["op_counts"], dict) else {}
-    cowfs_counts = cowfs["op_counts"] if isinstance(cowfs["op_counts"], dict) else {}
+    native_counts = counts_or_empty(native)
+    cowfs_counts = counts_or_empty(cowfs)
+    for arm, counts in (("native", native_counts), ("cowfs", cowfs_counts)):
+        if counts.get("error"):
+            problems.append("%s op stream could not be read: %s" % (arm, counts["error"]))
+        if "error" in counts:
+            counts.pop("error")
     deltas = {}
     for op in sorted(set(native_counts) | set(cowfs_counts)):
         left, right = native_counts.get(op, 0), cowfs_counts.get(op, 0)
@@ -472,15 +602,29 @@ def compare_case(mode, seed, ops, native, cowfs, fresh_open, probe_by_arm=None):
     skip_delta = deltas.pop("skip", {"native": 0, "cowfs": 0})
     native_gaps = capability_evidence(native, probe_by_arm)
     cowfs_gaps = capability_evidence(cowfs, probe_by_arm)
-    gaps = {op for op in deltas if op in OP_CAPABILITY and (op in native_gaps or op in cowfs_gaps)}
-    consequent = sorted(op for op in deltas if op not in gaps)
+    both_gaps = native_gaps | cowfs_gaps
+    explained, unexplained = attribute_deltas(deltas, both_gaps)
     stream_match = native["ops_sha256"] is not None and native["ops_sha256"] == cowfs["ops_sha256"]
-    if require_same_stream and not stream_match:
-        problems.append("op stream differs although %s declares one operation mix for both arms "
-                        "(differs in %s)" % (mode["name"], ", ".join(sorted(deltas)) or "unknown"))
-    elif not gaps and consequent:
-        problems.append("op stream differs in %s with no capability gap on either arm"
-                        % ", ".join(consequent))
+    byte_bearing_unexplained = [op for op in unexplained if op in BYTE_BEARING_OPS]
+
+    if require_same_stream:
+        if not stream_match:
+            problems.append("op stream differs although %s declares one operation mix for both arms "
+                            "(differs in %s)" % (mode["name"], ", ".join(sorted(deltas)) or "unknown"))
+    elif unexplained:
+        # No capability accounts for these, so the gate cannot say what the two arms did.
+        problems.append("op stream differs in %s with no capability behind the difference%s"
+                        % (", ".join(unexplained),
+                           "" if byte_bearing_unexplained else
+                           " (a difference in the byte-bearing operations %s cannot be excused by a "
+                           "hole capability)" % ", ".join(BYTE_BEARING_OPS)
+                           if byte_bearing_unexplained else ""))
+    if not require_same_stream and explained and not unexplained and not stream_match:
+        # Every difference is a hole capability, so the arms did genuinely different work.
+        unmeasurable.append(
+            "the two arms ran different operations (%s) because of a capability one filesystem "
+            "does not have; fsx exiting 0 on both is not execution equivalence and the bytes are "
+            "not comparable" % ", ".join(explained))
 
     hashes_compared = False
     if stream_match:
@@ -489,25 +633,55 @@ def compare_case(mode, seed, ops, native, cowfs, fresh_open, probe_by_arm=None):
             if native["data_sha256"] != cowfs["data_sha256"]:
                 problems.append("identical op streams produced different bytes: native %s, cowfs %s"
                                 % (native["data_sha256"], cowfs["data_sha256"]))
+    # The fresh open is a separate process's digest and size, read through the filesystem.
     fresh = fresh_open.get("cowfs")
-    if fresh and cowfs["data_sha256"] and fresh != cowfs["data_sha256"]:
+    if isinstance(fresh, dict):
+        if cowfs["data_sha256"] and fresh.get("sha256") != cowfs["data_sha256"]:
+            problems.append("a separate process reopened the file and read %s, fsx left %s"
+                            % (fresh.get("sha256"), cowfs["data_sha256"]))
+        elif cowfs["data_size"] is not None and fresh.get("size") != cowfs["data_size"]:
+            problems.append("a separate process read %s bytes, fsx left %s"
+                            % (fresh.get("size"), cowfs["data_size"]))
+    elif fresh and cowfs["data_sha256"] and fresh != cowfs["data_sha256"]:
         problems.append("fresh open read %s, fsx left %s" % (fresh, cowfs["data_sha256"]))
+    if restart is not None:
+        problems.extend(restart)
+
+    if problems:
+        pair_status = "FAIL"
+    elif unmeasurable:
+        pair_status = "UNMEASURABLE"
+    else:
+        pair_status = "PASS"
     return {
         "kind": "compare", "time": now(), "mode": mode["name"], "seed": seed,
+        "status": pair_status,
         "require_identical_op_stream": require_same_stream,
-        "ops_declared": ops, "ops_executed": {"native": native["ops_executed"], "cowfs": cowfs["ops_executed"]},
+        "ops_requested": ops,
+        "ops_executed": {"native": native["ops_executed"], "cowfs": cowfs["ops_executed"]},
+        "ops_skipped": {"native": native_counts.get("skip", 0), "cowfs": cowfs_counts.get("skip", 0)},
+        "unsupported_reasons": {
+            "native": list(native["fsx_reported_unsupported"]),
+            "cowfs": list(cowfs["fsx_reported_unsupported"]),
+            "probe": sorted(r["detail"] for r in (probe_by_arm.get("_probe_rows") or [])
+                            if not r["ok"]),
+        },
         "data_sha256": {"native": native["data_sha256"], "cowfs": cowfs["data_sha256"]},
         "data_size": {"native": native["data_size"], "cowfs": cowfs["data_size"]},
         "data_st_dev": devices,
+        "data_fstype": fstypes,
         "ops_stream_sha256": {"native": native["ops_sha256"], "cowfs": cowfs["ops_sha256"]},
         "ops_stream_match": stream_match, "hashes_compared": hashes_compared,
         "hash_comparison": ("compared, streams identical" if hashes_compared else
-                            "not applicable: the two arms ran different operations"),
+                            "not comparable: the two arms ran different operations"),
         "op_count_deltas": deltas, "skip_delta": skip_delta,
-        "explained_by_capability": sorted(gaps), "consequent_deltas": consequent,
+        "deltas_explained_by_capability": explained,
+        "deltas_unexplained": unexplained,
+        "byte_bearing_deltas_unexplained": byte_bearing_unexplained,
         "cowfs_capability_gaps": sorted(cowfs_gaps),
         "native_capability_gaps": sorted(native_gaps),
         "fresh_open_sha256": fresh_open,
+        "unmeasurable": unmeasurable,
         "problems": problems,
     }
 
@@ -516,17 +690,23 @@ def verdict(cases, compares, restarts, required_ops, probe_rows):
     """The gate's decision, from the records only.
 
     A case that ran and produced the wrong bytes is FAIL, whatever the reason. A capability the
-    filesystem does not have is recorded as unsupported and does not become a pass by itself:
-    the case still has to match native on everything else.
+    filesystem does not have is recorded as unsupported and never becomes a pass by itself.
+    A pair whose operation streams legitimately differ because of such a capability is
+    UNMEASURABLE: fsx exiting 0 is not execution equivalence, so it cannot be a pass either.
+
+    FAIL outranks UNMEASURABLE. A run with one unexplained delta and one capability gap is FAIL,
+    because the unexplained delta is the part that has to be explained.
     """
     failures = []
-    ran = 0
-    for case in cases:
-        ran += 1
+    unmeasurable = []
+    ran = len(cases)
     if ran == 0:
         failures.append("no case ran")
     for compare in compares:
-        failures.extend("%s seed %s: %s" % (compare["mode"], compare["seed"], p) for p in compare["problems"])
+        failures.extend("%s seed %s: %s" % (compare["mode"], compare["seed"], p)
+                        for p in compare["problems"])
+        unmeasurable.extend("%s seed %s: %s" % (compare["mode"], compare["seed"], u)
+                           for u in compare.get("unmeasurable", []))
 
     unsupported = sorted({row["detail"] for row in probe_rows if not row["ok"]})
     missing = []
@@ -540,27 +720,40 @@ def verdict(cases, compares, restarts, required_ops, probe_rows):
             if seen:
                 continue
             entry = "%s: cowfs never performed %s" % (mode_name, op)
-            capability = OP_CAPABILITY.get(op)
+            capability = OP_CAPABILITY.get(op, None)
             # Quote the message that names this operation's capability. Every punch_hole message
             # also contains KEEP_SIZE, so matching on the first disabled mode would quote the
             # wrong one.
             named = [d for d in disabled_modes if capability and capability in d]
-            if capability and (op in unsupported_ops or named):
+            is_hole_family = op in OP_CAPABILITY
+            if is_hole_family and (op in unsupported_ops or named):
                 # The filesystem has no such capability. Recorded as a gap with its evidence,
                 # not counted as work done and not counted as a pass on its own.
                 gaps.append("%s, unsupported on this filesystem%s"
                             % (entry, " (fsx reported: %s)" % named[0] if named else
                                " (the runner's own %s probe reported it unsupported)" % op))
+            elif is_hole_family:
+                missing.append(entry)
             else:
+                # Not a hole operation: fsx must have performed it, and did not.
                 missing.append(entry)
     failures.extend(missing)
     for restart in restarts:
         if restart.get("exit") != 0:
             failures.append("daemon restart leg exited %s: %s" % (restart.get("exit"), restart.get("error")))
         failures.extend("after restart: %s" % p for p in restart.get("problems", []))
-    status = "PASS" if not failures else "FAIL"
+    if failures:
+        status = "FAIL"
+    elif unmeasurable:
+        status = "UNMEASURABLE"
+    else:
+        status = "PASS"
+    passed = sum(1 for c in compares if c.get("status") == "PASS")
     return {"kind": "verdict", "time": now(), "status": status, "cases": ran,
-            "failures": failures, "unsupported": unsupported,
+            "pairs_passed": passed,
+            "pairs_failed": sum(1 for c in compares if c.get("status") == "FAIL"),
+            "pairs_unmeasurable": sum(1 for c in compares if c.get("status") == "UNMEASURABLE"),
+            "failures": failures, "unmeasurable": unmeasurable, "unsupported": unsupported,
             "required_ops_missing": missing, "capability_gaps": gaps}
 
 
@@ -571,25 +764,169 @@ def summary(md_path, result, meta, compares):
              "binary sha256: %s" % meta.get("fsx", {}).get("sha256"),
              "cowfs root: %s" % json.dumps(meta.get("roots", {}).get("cowfs")),
              "native root: %s" % json.dumps(meta.get("roots", {}).get("native")),
-             "", "| mode | seed | ops | native sha256 | cowfs sha256 | st_dev native/cowfs | op stream | explained gaps | problems |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+             "pairs: %d passed, %d failed, %d unmeasurable"
+             % (result.get("pairs_passed", 0), result.get("pairs_failed", 0),
+                result.get("pairs_unmeasurable", 0)),
+             "", "| mode | seed | ops requested | ops executed n/c | ops skipped n/c | native sha256 | cowfs sha256 | st_dev n/c | fstype n/c | stream | unexplained | status |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for c in compares:
         dev = c.get("data_st_dev", {})
-        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
-            c["mode"], c["seed"], c["ops_declared"],
+        fst = c.get("data_fstype", {})
+        ex = c.get("ops_executed", {})
+        sk = c.get("ops_skipped", {})
+        lines.append("| %s | %s | %s | %s/%s | %s/%s | %s | %s | %s | %s | %s | %s | %s |" % (
+            c["mode"], c["seed"], c.get("ops_requested"),
+            ex.get("native"), ex.get("cowfs"), sk.get("native"), sk.get("cowfs"),
             (c["data_sha256"]["native"] or "-")[:12], (c["data_sha256"]["cowfs"] or "-")[:12],
             "%s/%s" % (dev.get("native"), dev.get("cowfs")),
+            "%s/%s" % (fst.get("native"), fst.get("cowfs")),
             "same" if c.get("ops_stream_match") else "differs",
-            ", ".join(c.get("explained_by_capability", [])) or "-",
-            "; ".join(c["problems"]) or "none"))
+            ", ".join(c.get("deltas_unexplained", [])) or "-",
+            c.get("status", "?")))
     lines += ["", "## unsupported capabilities", ""]
     lines += ["- %s" % u for u in result["unsupported"]] or ["- none"]
     lines += ["", "## capability gaps in a required op", ""]
     lines += ["- %s" % g for g in result.get("capability_gaps", [])] or ["- none"]
+    lines += ["", "## unmeasurable", ""]
+    lines += ["- %s" % u for u in result.get("unmeasurable", [])] or ["- none"]
     lines += ["", "## failures", ""]
     lines += ["- %s" % f for f in result["failures"]] or ["- none"]
     with open(md_path, "w") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def attest_arm(role, root, args_pid_file, expect_backend, expect_fstypes):
+    """One arm's identity, from the kernel and from the serving process, before any case runs.
+
+    Returns the attestation dict plus a list of reasons it is not acceptable. There is no path
+    fallback anywhere in here: an unresolvable mount table is UNKNOWN, and a directory that
+    resolves to the wrong filesystem type is refused rather than believed.
+    """
+    module = manifest_module()
+    result = module.attest(root, args_pid_file, expect_backend, expect_fstypes)
+    result["role"] = role
+    result["path_as_given"] = root
+    reasons = []
+    if result.get("status") == "UNKNOWN":
+        reasons.append("%s arm %s cannot be attested: %s" % (role, root, result.get("reason")))
+    elif not result.get("ok"):
+        reasons.append("%s arm %s: %s" % (role, root, result.get("reason")))
+    if result.get("st_dev") is None:
+        reasons.append("%s arm %s has no stat device, so the path does not resolve to a live "
+                       "filesystem" % (role, root))
+    return result, reasons
+
+
+def readback_in_new_process(path):
+    """Read a file from a separate process, so the digest is a filesystem read and not this
+    process's cached copy of its own expectation."""
+    code = "\n".join([
+        "import hashlib, sys",
+        "h = hashlib.sha256()",
+        "n = 0",
+        "with open(sys.argv[1], 'rb') as f:",
+        "    while True:",
+        "        block = f.read(1 << 20)",
+        "        if not block:",
+        "            break",
+        "        h.update(block)",
+        "        n += len(block)",
+        "print(h.hexdigest(), n)",
+    ])
+    proc = subprocess.run([sys.executable, "-c", code, path], capture_output=True, text=True,
+                          timeout=600)
+    if proc.returncode != 0:
+        return None, "separate-process readback of %s failed: %s" % (path, proc.stderr.strip()[-300:])
+    parts = proc.stdout.split()
+    if len(parts) != 2:
+        return None, "separate-process readback of %s printed %r" % (path, proc.stdout.strip()[:200])
+    return {"sha256": parts[0], "size": int(parts[1])}, None
+
+
+def daemon_generation(pidfile):
+    """pid and start time, which together identify one running generation of the daemon."""
+    module = manifest_module()
+    info = module.attest_daemon(pidfile) if pidfile else None
+    if not info or info.get("error"):
+        return None, "no daemon generation could be read from %s: %s" % (pidfile, info)
+    if info.get("starttime") is None:
+        return None, "daemon %s has no readable start time" % info.get("pid")
+    return {"pid": info.get("pid"), "starttime": info.get("starttime"),
+            "store": info.get("store"), "socket": info.get("socket"),
+            "mount": info.get("mount"), "backend": info.get("backend"),
+            "binary_sha256": info.get("binary_sha256")}, None
+
+
+def restart_leg(args, cases, before_generation, mount_before):
+    """Run the restart hook, then require that a real replacement generation is serving the same
+    declared store, socket and mount before any readback counts.
+
+    The command's own exit status is not evidence. A hook that does nothing leaves the pid and
+    start time unchanged, which is a failure, not a pass. The generation is read from the pid
+    file and /proc, never from anything the hook prints.
+    """
+    problems = []
+    before = {c["data_path"]: {"sha256": c["data_sha256"], "size": c["data_size"]}
+              for c in cases if c["arm"] == "cowfs"}
+    proc = subprocess.run(args.restart_cmd, shell=True, capture_output=True, text=True, timeout=900)
+    after_generation, gen_error = daemon_generation(args.daemon_pid_file)
+    mount_after = manifest_module().attest(args.cowfs_root, args.daemon_pid_file,
+                                           args.expect_backend)
+    if gen_error:
+        problems.append("after the restart hook: %s" % gen_error)
+    else:
+        if before_generation is None:
+            problems.append("there is no daemon generation before the restart to compare against")
+        else:
+            if after_generation["pid"] == before_generation["pid"]:
+                problems.append("daemon pid %s is unchanged after the restart hook, so nothing "
+                                "replaced it" % after_generation["pid"])
+            if after_generation["starttime"] == before_generation["starttime"]:
+                problems.append("daemon %s has start time %s before and after the restart hook, so "
+                                "it is the same generation"
+                                % (after_generation["pid"], after_generation["starttime"]))
+            for field in ("store", "socket", "mount"):
+                was, became = before_generation.get(field), after_generation.get(field)
+                if was != became:
+                    problems.append("daemon %s changed across the restart: %s was %s, now %s"
+                                    % (after_generation["pid"], field, was, became))
+            if before_generation.get("binary_sha256") != after_generation.get("binary_sha256"):
+                problems.append("the daemon binary changed across the restart: %s then %s"
+                                % (before_generation.get("binary_sha256"),
+                                   after_generation.get("binary_sha256")))
+    if not mount_after.get("ok"):
+        problems.append("the mount is not attested after the restart hook: %s"
+                        % mount_after.get("reason"))
+    elif mount_before.get("st_dev") != mount_after.get("st_dev"):
+        problems.append("the mount's device changed across the restart: %s then %s"
+                        % (mount_before.get("st_dev"), mount_after.get("st_dev")))
+
+    after, read_problems = {}, list(problems)
+    for path, want in before.items():
+        got, error = readback_in_new_process(path)
+        if error:
+            read_problems.append(error)
+            continue
+        after[path] = got
+        if got["sha256"] != want["sha256"] or got["size"] != want["size"]:
+            read_problems.append("%s read %s (%d bytes) after the restart, %s (%s bytes) before"
+                                 % (os.path.basename(path), got["sha256"], got["size"],
+                                    want["sha256"], want["size"]))
+        elif want["sha256"] is None or want["size"] in (None, 0):
+            read_problems.append("%s has no expected content to compare against" % path)
+    row = {"kind": "restart", "time": now(), "cmd": args.restart_cmd, "exit": proc.returncode,
+           "generation_before": before_generation, "generation_after": after_generation,
+           "mount_before_st_dev": mount_before.get("st_dev"),
+           "mount_after": mount_after,
+           "stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:],
+           "readback": "a separate process reopening each file through the mount",
+           "rehashed": after, "problems": read_problems,
+           "error": proc.stderr.strip()[-500:] if proc.returncode else ""}
+    print("restart leg: exit %s, generation %s -> %s, %d file(s) read back, problems %s"
+          % (proc.returncode,
+             (before_generation or {}).get("pid"), (after_generation or {}).get("pid"),
+             len(after), read_problems or "none"))
+    return row
 
 
 def main(argv=None):
@@ -602,14 +939,24 @@ def main(argv=None):
     p.add_argument("--mode", action="append", help="declared mode to run, repeatable (default: all)")
     p.add_argument("--seeds", help="override the declared seeds, comma separated")
     p.add_argument("--ops", type=int, help="override the declared op count")
-    p.add_argument("--restart-cmd", help="run once after the cases; the runner re-hashes the cowfs files after it returns")
+    p.add_argument("--restart-cmd", help="hook that replaces the daemon; the runner requires a new generation")
+    p.add_argument("--daemon-pid-file", help="pid file of the serving daemon, read for every attestation")
+    p.add_argument("--expect-backend", default="core", help="backend the serving daemon must declare")
+    p.add_argument("--expect-cowfs-fstype", action="append", help="filesystem type the cowfs arm must be, repeatable")
+    p.add_argument("--expect-native-fstype", action="append", help="filesystem type the native arm must be, repeatable")
+    p.add_argument("--allow-unpinned-fsx", action="store_true",
+                   help="run without the tool manifest. For a mutation control only; never for an "
+                        "acceptance claim, and the record says so")
     p.add_argument("--timeout", type=int, default=1800, help="seconds per fsx invocation")
     p.add_argument("--label", default="run")
     args = p.parse_args(argv)
 
+    cowfs_fstypes = tuple(args.expect_cowfs_fstype or manifest_module().COWFS_FSTYPES)
+    native_fstypes = tuple(args.expect_native_fstype or ())
     gate = json.load(open(args.config))
     os.makedirs(args.out, exist_ok=True)
     record = os.path.join(args.out, "cases.jsonl")
+    run_tag = "%s-%d" % (args.label, os.getpid())
 
     def emit(row):
         with open(record, "a") as f:
@@ -623,34 +970,76 @@ def main(argv=None):
         unmeasurable.append("native root %s is not a directory" % args.native_root)
     if not os.access(args.fsx_bin, os.X_OK):
         unmeasurable.append("fsx binary %s is missing or not executable" % args.fsx_bin)
-    roots = {"native": mount_identity(args.native_root), "cowfs": mount_identity(args.cowfs_root)}
-    # The native control is a directory on whatever local filesystem holds it. It must not be a
-    # cowfs mount: a control that is the thing under test measures nothing.
-    if roots["native"] and "fuse" in str(roots["native"].get("fstype", "")):
-        unmeasurable.append("native root %s is on %s, so the control is the thing under test"
-                            % (os.path.realpath(args.native_root), roots["native"].get("fstype")))
-    # The cowfs arm must be a mount of its own, not a plain directory under whatever holds it.
-    if roots["cowfs"] is None:
-        unmeasurable.append("cowfs root %s is not on any mount, so this would measure a directory "
-                            "rather than a mounted cowfs" % os.path.realpath(args.cowfs_root))
-    elif roots["cowfs"].get("mountpoint") == "/":
-        unmeasurable.append("cowfs root %s resolves to the root filesystem, not to a cowfs mount"
-                            % os.path.realpath(args.cowfs_root))
-    elif roots["native"] and roots["cowfs"]["mountpoint"] == roots["native"]["mountpoint"]:
-        unmeasurable.append("both arms are on the same mount %s, so there is no cowfs arm"
-                            % roots["cowfs"]["mountpoint"])
+
+    # F5: the tool is bound to a manifest approved before execution. A digest that is only
+    # recorded is not a pin.
+    manifest = gate["tool"].get("manifest")
     fsx = fsx_identity(args.fsx_bin)
-    if fsx and fsx.get("usage_exit") != 90:
+    tool_check = {"pinned": bool(manifest) and not args.allow_unpinned_fsx,
+                  "allow_unpinned": bool(args.allow_unpinned_fsx)}
+    if manifest:
+        tool_check["expected_binary_sha256"] = manifest["expected_binary_sha256"]
+        tool_check["expected_source_sha256"] = manifest["expected_source_sha256"]
+        tool_check["expected_compile"] = manifest["expected_compile"]
+        if not args.allow_unpinned_fsx:
+            if fsx and fsx.get("sha256") != manifest["expected_binary_sha256"]:
+                unmeasurable.append(
+                    "the fsx binary at %s hashes to %s but the approved manifest pins %s; refusing "
+                    "to run a tool that is not the one the manifest names"
+                    % (args.fsx_bin, fsx.get("sha256") or "nothing readable",
+                       manifest["expected_binary_sha256"]))
+            if fsx and fsx.get("usage_exit") != 90:
+                unmeasurable.append("the binary at %s exited %s on its own usage text, expected "
+                                    "90, so it does not behave like the pinned fsx"
+                                    % (args.fsx_bin, fsx.get("usage_exit")))
+    else:
+        unmeasurable.append("the gate config declares no tool manifest, so the fsx binary is not pinned")
+    if args.allow_unpinned_fsx:
+        tool_check["note"] = ("run without the tool pin; this is a mutation control and the result "
+                              "is not an acceptance claim")
+    if fsx and fsx.get("usage_exit") != 90 and not manifest:
         unmeasurable.append("fsx exited %s on its own usage text, expected 90" % fsx.get("usage_exit"))
 
-    meta = {"kind": "meta", "time": now(), "label": args.label, "gate": gate["gate"],
+    # F1: both arms are attested from the kernel and from the serving process before any case.
+    cowfs_att, cowfs_reasons = attest_arm("cowfs", args.cowfs_root, args.daemon_pid_file,
+                                          args.expect_backend, cowfs_fstypes)
+    native_att, native_reasons = attest_arm("native", args.native_root, None, None, ())
+    unmeasurable.extend(cowfs_reasons)
+    unmeasurable.extend(native_reasons)
+    if native_att.get("ok") and native_fstypes and native_att.get("fstype") not in native_fstypes:
+        unmeasurable.append("native arm %s is on %s, expected one of %s"
+                            % (args.native_root, native_att.get("fstype"), "/".join(native_fstypes)))
+    if native_att.get("ok") and "cowfs" in str(native_att.get("fstype", "")):
+        unmeasurable.append("native root %s is on %s, so the control is the thing under test"
+                            % (os.path.normpath(args.native_root), native_att.get("fstype")))
+    if cowfs_att.get("ok") and native_att.get("ok") and cowfs_att.get("st_dev") == native_att.get("st_dev"):
+        unmeasurable.append("both arms resolve to device %s, so there is no cowfs arm"
+                            % cowfs_att.get("st_dev"))
+    daemon_before, daemon_error = daemon_generation(args.daemon_pid_file)
+    if daemon_error:
+        unmeasurable.append("before any case: %s" % daemon_error)
+    elif daemon_before and daemon_before.get("mount") != os.path.normpath(args.cowfs_root) and \
+            not os.path.normpath(args.cowfs_root).startswith(
+                os.path.normpath(daemon_before.get("mount") or "/nonexistent") + "/"):
+        unmeasurable.append("the daemon serves %s but the cowfs arm is %s"
+                            % (daemon_before.get("mount"), args.cowfs_root))
+
+    meta = {"kind": "meta", "time": now(), "label": args.label, "run_tag": run_tag, "gate": gate["gate"],
             "argv": sys.argv, "platform": platform.platform(), "tool": gate["tool"],
-            "fsx": fsx, "roots": roots, "caps": gate["caps"],
-            "unmeasurable": unmeasurable}
+            "tool_check": tool_check, "fsx": fsx,
+            "cowfs_attestation": cowfs_att, "native_attestation": native_att,
+            "daemon_before": daemon_before,
+            "roots": {"native": {"mountpoint": native_att.get("resolved_mountpoint"),
+                                 "fstype": native_att.get("fstype"), "st_dev": native_att.get("st_dev")},
+                      "cowfs": {"mountpoint": cowfs_att.get("resolved_mountpoint"),
+                                "fstype": cowfs_att.get("fstype"), "st_dev": cowfs_att.get("st_dev")}},
+            "caps": gate["caps"], "unmeasurable": unmeasurable}
     emit(meta)
     if unmeasurable:
         result = {"kind": "verdict", "time": now(), "status": "UNMEASURABLE", "cases": 0,
-                  "failures": unmeasurable, "unsupported": [], "required_ops_missing": []}
+                  "pairs_passed": 0, "pairs_failed": 0, "pairs_unmeasurable": 0,
+                  "failures": unmeasurable, "unmeasurable": [], "unsupported": [],
+                  "required_ops_missing": [], "capability_gaps": []}
         emit(result)
         print("UNMEASURABLE")
         for u in unmeasurable:
@@ -668,12 +1057,13 @@ def main(argv=None):
                     if m["name"] in gate["required_op_types"]}
 
     probe_rows = []
-    probe_by_arm = {"native": {}, "cowfs": {}}
+    probe_by_arm = {"native": {}, "cowfs": {}, "_probe_rows": []}
     for arm, root in (("native", args.native_root), ("cowfs", args.cowfs_root)):
         for row in Probe(root, arm).run():
             probe_rows.append(row)
             probe_by_arm[arm][row["op"]] = row["ok"]
             emit(dict(row, kind="probe"))
+    probe_by_arm["_probe_rows"] = probe_rows
 
     cases, compares, restarts = [], [], []
     fresh_open = {}
@@ -684,56 +1074,78 @@ def main(argv=None):
             by_arm = {}
             for arm, root in (("native", args.native_root), ("cowfs", args.cowfs_root)):
                 case = run_case(args.fsx_bin, arm, root, mode, seed, ops, gate["caps"],
-                                args.out, args.timeout)
+                                args.out, args.timeout, run_tag)
                 cases.append(case)
                 emit(case)
                 by_arm[arm] = case
-                print("[%s] seed %s %s: exit %s, %s ops, %s bytes, sha256 %s, st_dev %s, %.1fs"
+                print("[%s] seed %s %s: exit %s, %s ops, %s bytes, sha256 %s, st_dev %s, fstype %s, %.1fs"
                       % (mode["name"], seed, arm, case["exit"], case["ops_executed"],
                          case["data_size"], (case["data_sha256"] or "-")[:12],
-                         case["data_st_dev"], case["seconds"]))
-            # The runner is a different process from fsx, so its open is a fresh open.
-            digest, size = sha256_file(by_arm["cowfs"]["data_path"])
-            fresh_open["cowfs"] = digest
-            native_digest, _ = sha256_file(by_arm["native"]["data_path"])
-            fresh_open["native"] = native_digest
-            fresh_open["cowfs_size"] = size
+                         case["data_st_dev"], case["data_real_fstype"], case["seconds"]))
+            # A separate process reopens each file, so the digest is a filesystem read rather than
+            # this process's own copy of what it expected.
+            fresh_open["cowfs"] = readback_in_new_process(by_arm["cowfs"]["data_path"])[0]
+            fresh_open["native"] = readback_in_new_process(by_arm["native"]["data_path"])[0]
             compare = compare_case(mode, seed, ops, by_arm["native"], by_arm["cowfs"],
                                    fresh_open, probe_by_arm)
             compares.append(compare)
             emit(compare)
-            stream = ("identical" if compare["ops_stream_match"]
-                      else "differs in " + ", ".join(sorted(compare["op_count_deltas"])))
-            print("    compare: st_dev %s/%s, op stream %s, explained %s, %s"
-                  % (compare["data_st_dev"]["native"], compare["data_st_dev"]["cowfs"], stream,
-                     ", ".join(compare["explained_by_capability"]) or "nothing",
-                     "ok" if not compare["problems"] else compare["problems"]))
+            print("    %s: st_dev %s/%s, fstype %s/%s, stream %s, unexplained %s"
+                  % (compare["status"], compare["data_st_dev"]["native"],
+                     compare["data_st_dev"]["cowfs"], compare["data_fstype"]["native"],
+                     compare["data_fstype"]["cowfs"],
+                     "identical" if compare["ops_stream_match"] else "differs in " +
+                     ", ".join(sorted(compare["op_count_deltas"])),
+                     ", ".join(compare["deltas_unexplained"]) or "nothing"))
+            if compare["problems"]:
+                print("      problems: %s" % compare["problems"])
+            if compare["unmeasurable"]:
+                print("      unmeasurable: %s" % compare["unmeasurable"])
 
     if args.restart_cmd:
-        before = {c["data_path"]: c["data_sha256"] for c in cases if c["arm"] == "cowfs"}
-        proc = subprocess.run(args.restart_cmd, shell=True, capture_output=True, text=True, timeout=900)
-        after, problems = {}, []
-        for path, want in before.items():
-            got, size = sha256_file(path)
-            after[path] = {"sha256": got, "size": size}
-            if got != want:
-                problems.append("%s read %s after the restart, %s before" % (os.path.basename(path), got, want))
-        row = {"kind": "restart", "time": now(), "cmd": args.restart_cmd, "exit": proc.returncode,
-               "stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:],
-               "rehashed": after, "problems": problems,
-               "error": proc.stderr.strip()[-500:] if proc.returncode else ""}
+        row = restart_leg(args, cases, daemon_before, cowfs_att)
         restarts.append(row)
         emit(row)
-        print("restart leg: exit %s, %d file(s) rehashed, problems %s"
-              % (proc.returncode, len(after), problems or "none"))
+
+    # F6: the byte budget is enforced against the caps the config declares, so a run that would
+    # exceed it is refused before it starts rather than reported after it grew.
+    caps = gate["caps"]
+    planned_files = sum(len(m["seeds"]) * (1 if args.seeds is None else len(args.seeds.split(",")))
+                        for m in modes)
+    planned_bytes = planned_files * 2 * caps["max_file_bytes"]
+    budget = caps.get("max_bytes_written_per_arm")
+    budget_valid = True
+    if budget and budget < caps["max_file_bytes"] * 2:
+        budget_valid = False
+        print("cap budget %d is smaller than two maximum files %d; the cap is declared wrongly"
+              % (budget, caps["max_file_bytes"] * 2))
+    written = {arm: sum(c["data_size"] or 0 for c in cases if c["arm"] == arm)
+               for arm in ("native", "cowfs")}
+    over_budget = [arm for arm, total in written.items() if budget and total > budget]
 
     result = verdict(cases, compares, restarts, required_ops, probe_rows)
+    if over_budget:
+        result["failures"].append(
+            "the cowfs arm wrote %d bytes against a declared per-arm budget of %d"
+            % (written["cowfs"], budget))
+        result["status"] = "FAIL"
+    result["bytes"] = {"written_per_arm": written, "budget_per_arm": budget,
+                       "planned_worst_case": planned_bytes, "planned_files": planned_files,
+                       "budget_matches_declared_caps": budget_valid}
     emit(result)
     summary(os.path.join(args.out, "summary.md"), result, meta, compares)
-    print("%s: %d cases, %d failures" % (result["status"], result["cases"], len(result["failures"])))
+    print("%s: %d cases, %d passed, %d failed, %d unmeasurable"
+          % (result["status"], result["cases"], result.get("pairs_passed", 0),
+             result.get("pairs_failed", 0), result.get("pairs_unmeasurable", 0)))
     for f in result["failures"]:
         print("  FAIL %s" % f)
-    return EXIT_PASS if result["status"] == "PASS" else EXIT_FAIL
+    for u in result.get("unmeasurable", []):
+        print("  UNMEASURABLE %s" % u)
+    if result["status"] == "PASS":
+        return EXIT_PASS
+    if result["status"] == "UNMEASURABLE":
+        return EXIT_UNMEASURABLE
+    return EXIT_FAIL
 
 
 if __name__ == "__main__":
