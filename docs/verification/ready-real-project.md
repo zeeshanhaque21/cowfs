@@ -1,9 +1,11 @@
 # Verification: real-project acceptance for mode (b) treehouse slots
 
 Status: **acceptance NOT met (NONACCEPTED).** The warm-base step that mode (b) rests on cannot run
-on the core backend at the commit this lane was assigned, and three further defects sit behind it.
-Everything below was measured on real binaries, a real `cowfs-core` daemon, a real mount and a real
-project. Nothing is asserted that was not executed, and no timing is claimed.
+on the core backend at the commit this lane was assigned, and three more links sit behind it in a
+four-link chain. Everything below was measured on real binaries, a real `cowfs-core` daemon, a real
+mount and a real project. Nothing is asserted that was not executed. This report carries no timing:
+the per-test figures live in the evidence file, each labelled with the commit that recorded it, and
+none of them is a performance claim.
 
 - Harness: `crates/cowfs-treehouse/tests/real_project_acceptance.rs`
 - Raw evidence, gitignored and private to this lane: `bench/out/ready-real-project/`
@@ -16,10 +18,22 @@ project. Nothing is asserted that was not executed, and no timing is claimed.
 This matters more than usual here, because the harness is itself the sample project: every edit to
 the harness changes the corpus it measures.
 
-| Receipt set | `workspace_head` / `sample_commit` | What it covers |
+| Receipt file | `workspace_head` / `sample_commit` | What it covers |
 | --- | --- | --- |
-| Controls, the representative Core run, and the blocker gates | `a64e1189ff5f8ac8d34b24aad5d820818f8eaf72` | the repaired tree, at the commit that carries it |
-| In-slot build and native control | `4a70c53ae4c7062458ae7e63dbe8619cce1458a1` | the two expensive builds |
+| `acceptance.jsonl` | `a64e1189ff5f8ac8d34b24aad5d820818f8eaf72` | controls, the representative Core run and the blocker gates, on the repaired tree |
+| `acceptance-a64e118-pre.jsonl` | `4a70c53ae4c7062458ae7e63dbe8619cce1458a1` | the same gates, plus the two expensive builds, run before the repair was committed |
+
+These are two different files. Their row counts are never added together and never compared as if
+one contradicted the other. Their digests:
+
+```
+acceptance.jsonl              sha256 88cb8cb879c40aea37eebceecca960134196da8ca9f18059d4b5907894f96ded   12,864 bytes
+acceptance-a64e118-pre.jsonl  sha256 ef9a2c3148eb2b3cee064a987a1d4211d10d98e18bcbd7cbaa412cc5302b4a12   17,468 bytes
+```
+
+The second file is named for when it was written, before `a64e118` existed as a commit; its
+`workspace_head` field says `4a70c53` for the same reason. Its 2508-entry figures belong to that
+file and to no other measurement here.
 
 The two expensive builds ran while the N1 to N7 repair was still uncommitted, so their receipts
 carry the last commit rather than the tree. The difference between that commit and the tree under
@@ -38,19 +52,30 @@ branch changes none.
 Per test, each run once on the repaired tree unless stated:
 
 ```
-default tests in the file                       15
-  executed and asserted for real                13
-  capability skips                                0
-  failed                                          0
-ignored, never executed                           1   warm_base_acceptance_over_a_real_core
-safe controls, no mount and no daemon              6
+tests in the file, from --list                   15   and 0 benchmarks
+  ignored, never executed                         1   warm_base_acceptance_over_a_real_core
+  executed on a full run                         14
+    of those, capability skips                    0
+    of those, failed                              0
+the six safe controls                             6   a SUBSET of those 14, not six more
 negative controls that must fail                  4   (F1, seeded boolean claim, seeded string claim, seeded undescribed row)
 ```
 
-The receipt file for this head is written only by the run recorded here: 28 rows, of which 24 carry
-`outcome: "measured"` and 4 carry `outcome: "cleanup"`, and **zero rows lack an outcome**, which
-`the_acceptance_receipt_states_what_was_measured` asserts. Earlier receipt files from the repair are
-kept beside it under distinct names and are **not** part of this count.
+The 15 and the 14 come from `--list` on the built binary, which reports one ignored test. A full
+run's libtest summary reports the same split, and that is the number to quote for executions.
+
+The four negative controls are **not four more tests**. Each seeds a receipt row and runs a test that
+otherwise passes, so it is counted inside the 14.
+
+`acceptance.jsonl` is the file the run recorded here wrote, and nothing else wrote to it: 28 rows,
+24 carrying `outcome: "measured"`, 4 carrying `outcome: "cleanup"`, and **zero rows without an
+outcome**, which `the_acceptance_receipt_states_what_was_measured` asserts. Its own summary row
+reads 27, because it counted before appending itself.
+
+`acceptance-a64e118-pre.jsonl` is a different file from an earlier run: 42 rows, 37 `measured`, 5
+`cleanup`, 0 without an outcome. **Neither row count is a count of tests.** Executions are counted
+by libtest and by `--list`; rows are counted by parsing, and the `cleanup` rows are teardown
+receipts rather than test outcomes.
 
 ## Safe controls, run before any mounted work
 
@@ -80,16 +105,32 @@ Old code failed and new code passes, on the same host and the same 3s bound:
 
 | Shape | Result |
 | --- | --- |
-| chatty, 4 MiB on stdout | exit 0, 4,194,304 bytes, **46ms** |
+| chatty, 4 MiB on stdout | exit 0, 4,194,304 bytes, **50ms** |
 | empty stdout, exits at once | exit 0, well under bound |
-| hangs | killed at its own bound, **3001ms**, only its own pid |
-| exits at once, helper holds the pipe open | **3005ms**, classified incomplete drain, direct child's exit status preserved |
+| hangs | killed at its own bound, **3010ms**, only its own pid |
+| exits at once, helper holds the pipe open | **3001ms**, classified incomplete drain, direct child's exit status preserved |
+
+Figures from `acceptance.jsonl`. Another run of the same control recorded 46ms, 3001ms and 3005ms;
+that is ordinary variation between runs on a shared host and neither set is a timing claim.
 
 The fourth shape returned **20,012ms** before the repair, four times its 3s bound, on a 3s bound:
 the phase that waits for the pipes was bounded by the caller's overall deadline instead of the
 command's own. Both the root cause and the number are recorded because the earlier receipt for the
 stranded daemon below is consistent with this path, though **that consistency is a hypothesis, not a
 diagnosis**: the receipt does not say which call consumed the time.
+
+That bound covers one call, the spawn, the child and the collection of its output, and it is
+`min(caller's remaining deadline, the call's own cap)`, which is why the receipt records
+`bound_ms: "3000"`.
+
+### What N2 bounds, and what it does not
+
+It does not cover the lifetime of the two reader threads the call starts. They are detached and never
+reclaimed, so a descendant holding a pipe open past the bound keeps them until the test binary exits.
+The call is classified and returns, so nothing hangs and no result is wrong, but the thread count
+grows with the number of such calls rather than being reclaimed. The only producer this harness can
+identify is this control's own `sleep` helper, which the control records about itself, verifies,
+cleans and then asserts on.
 
 The control's own helper is cleaned up by the pid it recorded about itself, verified to be exactly
 `sleep 20`, and the test fails if that cleanup does not happen, so a control cannot leave an orphan
@@ -111,7 +152,7 @@ and still report success.
 | Export is writable | PASS | write succeeded |
 | Real `cargo build` inside the export | PASS | exit 0, after mount identity readback |
 | Real `cargo test` inside the export | PASS | exit 0 |
-| Reset returns the slot to an untouched base | PASS | 2508 both sides, identical digest, write gone |
+| Reset returns the slot to an untouched base | PASS | 2573 both sides, identical digest, write gone |
 | Cache hook installed and read back | PASS | asserted `Added` then `AlreadyThere` |
 
 ## Identity of what ran
@@ -202,8 +243,10 @@ Deliberate and documented in the source:
 - `import` does not come through that flag; it goes through `Backend::ingest`, which is why a real
   ingest on the core works while `base_refresh` cannot.
 
-**This is the blocking dependency.** Provenance work cannot make `base_refresh` publish anything,
-because the call is refused before any persistence is attempted.
+**This is the blocking dependency, and it is the one link an issue now scopes: #123, open, "Define
+and implement tree-native Core warm-base publication for the companion".** Provenance work cannot
+make `base_refresh` publish anything, because the call is refused before any persistence is
+attempted. The refusal is intentional for the directory-import model and is not a new Core defect.
 
 ### Link 2: the worktree path
 
@@ -341,6 +384,8 @@ is when the incident happened, not because the whole file is a pre-fix run.
 - Every command runs under one absolute bound covering the spawn, the child **and** the collection of
   its output. Only the direct child is ever signalled, and only by the handle that owns it. No process
   group, no pattern match.
+- That bound is per call and does not reclaim the reader threads it starts. The one lifetime limit
+  that leaves is stated in full under "What N2 bounds, and what it does not" below.
 - A child reaped before its pipes reach EOF is not completion. That case is classified as an
   incomplete drain, carrying the real exit status and the partial output, and is never returned as
   success.
@@ -412,7 +457,7 @@ and also means this harness does not characterise it.
 
 | Seam | Owner |
 | --- | --- |
-| core `base_refresh` publication and the `can_ingest` gate | needs an issue that scopes it |
+| core `base_refresh` publication and the `can_ingest` gate | **#123, open**: define and implement tree-native Core warm-base publication for the companion |
 | provenance persistence and `BaseMeta` reconstruction | provenance lane |
 | `git worktree add` path resolution in `import.rs` | repair `b59bc3c`, unmerged; **not** touched here |
 | `CowfsMaterialiser` calling the real `mount_snapshot` | companion lane; **not** touched here |
@@ -425,7 +470,9 @@ No production source was changed in this lane.
 - Path-backend readback is not core `fsck` and says nothing about crash durability.
 - A surviving artifact proves nothing about publication, which is why the provenance gate exists.
 - No speed or overhead claim is made. The machine is shared with eleven other workers. The
-  build-overhead success criterion needs a quiet host and is still open.
+  build-overhead success criterion needs a quiet host and is still open. The wall-clock figures in the
+  evidence file are records of what ran, not measurements of anything, and none is offered as a
+  performance number.
 - Mode (a), unmodified treehouse against the mount, is not measured here.
 - The blocker reproductions are for this lane's head. The worktree-path repair and any provenance
   repair are later, unmerged heads and were not re-measured here.

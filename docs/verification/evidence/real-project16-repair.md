@@ -4,8 +4,9 @@ Lane: `verify/treehouse-real-project-16`, lease `cowfs-7c1bf8/4/cowfs`.
 Report: `docs/verification/ready-real-project.md`, which is the document to read.
 
 Warm-base acceptance for mode (b) is **NOT met (NONACCEPTED)**, and nothing in this file or in the
-harness claims otherwise. Tracking issues 15 and 16 stay open. This file records what was executed,
-what was refused, and what is unverified.
+harness claims otherwise. Tracking issues 15 and 16 stay open, and so does #123, which scopes the
+blocking link of the chain. This file records what was executed, what was refused, and what is
+unverified.
 
 ## Commit history of this lane's branch, and what each commit changed
 
@@ -13,8 +14,15 @@ what was refused, and what is unverified.
 | --- | --- |
 | `1ca8242` | the harness as first written |
 | `1b1f2e1` | safety and honesty repair of the harness |
-| `4a70c53` | the report rewrite: this head's numbers, the chain, the measured limits |
-| the N1 to N7 repair | the harness repairs this file documents, plus this file |
+| `4a70c53` | the report rewrite: that head's numbers, the chain, the measured limits |
+| `a64e118` | the N1 to N7 harness repair, this file, and the report rewrite |
+| `405cc3d` | docs only: rebind the receipts to the commit that carries the repair |
+| `c77461d` | docs only: pin this file to `a64e118` |
+
+`405cc3d` and `c77461d` changed documentation only. The harness blob is `7d7b0135` at `a64e118`,
+`405cc3d` and `c77461d` alike, so a runtime measured at any of those three commits is measuring
+`a64e118` code. Content sha256 of the harness at `c77461d` is
+`8023ddb4f37a66e57495b0d5972a1f6cc490971ca6dceb09c29b1d6681fd0e22`.
 
 The carry from `1b1f2e1` to `4a70c53` is **docs-only and structural**: the test file is
 byte-identical at those two commits, so a runtime measured at `4a70c53` is measuring `1b1f2e1` code.
@@ -26,6 +34,8 @@ That is stated here because a reader must not treat a `4a70c53` runtime as a dif
    `CoreBackend::ingests_directories()` is `false` by design. Nothing is published.
    Real receipt: exit 1, `unsupported: this backend stores snapshots as trees, not as directories`,
    `{"snapshots":[]}`, no git worktree left behind. A provenance fix alone cannot unblock this.
+   Scoped by issue #123, open: define and implement tree-native Core warm-base publication for the
+   companion. The refusal is intentional for the directory-import model, not a new Core defect.
 2. **Worktree path.** `import.rs` parsed the checkout from `git worktree add` stdout, which is
    `HEAD is now at <sha> <subject>` on git 2.56.0 and empty with `-q`. Neither is a path, and both
    forms leak a worktree at `<repo>/<sha>`. Repair is `b59bc3c`, unmerged, not an ancestor of this
@@ -44,24 +54,47 @@ cargo test -p cowfs-treehouse --test real_project_acceptance --no-run
                                                          0 errors, 0 warnings
 ```
 
-Executed per test, each once on the repaired tree:
+Executed per test, each once, grouped by the commit whose tree the receipts name:
 
 ```
-every_implemented_mode_b_postcondition_holds_over_the_real_core          exit 0    14.7s
+recorded at a64e1189, the commit that carries the repair
+every_implemented_mode_b_postcondition_holds_over_the_real_core          exit 0    11.5s
+the_core_daemon_refuses_base_refresh_and_publishes_nothing              exit 0    4.5s
+the_companion_never_calls_the_mount_snapshot_the_daemon_provides        exit 0    5.9s
+a_published_warm_base_must_be_discoverable_with_its_provenance          exit 0    4.1s
+git_never_prints_the_worktree_path_this_codebase_parses                 exit 0    1.1s
+the_cache_hook_is_installed_and_read_back_from_the_real_config          exit 0    0.06s
+the six safe controls, no mount and no daemon                            all exit 0
+warm_base_acceptance_over_a_real_core                                    ignored, never executed
+
+recorded at 4a70c53, before the repair was committed, so these are historical
 a_real_project_builds_and_tests_inside_an_exported_slot_snapshot         exit 0  151.9s
 native_control_builds_and_tests_the_sample_project                      exit 0   94.1s
-the_core_daemon_refuses_base_refresh_and_publishes_nothing              exit 0    4.8s
-the_companion_never_calls_the_mount_snapshot_the_daemon_provides        exit 0    6.0s
-a_published_warm_base_must_be_discoverable_with_its_provenance          exit 0    4.8s
-git_never_prints_the_worktree_path_this_codebase_parses                 exit 0    1.5s
-the_cache_hook_is_installed_and_read_back_from_the_real_config          exit 0    0.1s
-six safe controls, no mount and no daemon                                all exit 0
-warm_base_acceptance_over_a_real_core                                    ignored, never executed
+every_implemented_mode_b_postcondition_holds_over_the_real_core          exit 0    14.7s
 ```
 
-Default tests in the file 15: 13 executed and asserted for real, 0 capability skips, 1 ignored.
-The receipt file is append-only across several runs, so its 42 rows are not a count of tests; 37
-carry `outcome: "measured"`, 5 carry `outcome: "cleanup"`, and 0 lack an outcome.
+These are wall-clock records of what ran and nothing else. None is a performance or overhead figure,
+and the build-overhead success criterion stays open on a shared host.
+
+`--list` on the built binary reports 15 tests and 0 benchmarks: one is the ignored acceptance, so a
+full run executes 14. Of those 14, 0 were capability skips and 0 failed. The six safe controls are a
+**subset** of those 14, not six more tests. The four negative controls are also inside the 14: each
+seeds a receipt row and runs a test that otherwise passes.
+
+Two receipt files, named so their counts cannot be confused or added together:
+
+```
+acceptance.jsonl             28 rows  24 measured  4 cleanup  0 without an outcome
+                             sha256 88cb8cb879c40aea37eebceecca960134196da8ca9f18059d4b5907894f96ded
+                             the run at a64e118, the one this file documents
+
+acceptance-a64e118-pre.jsonl 42 rows  37 measured  5 cleanup  0 without an outcome
+                             sha256 ef9a2c3148eb2b3cee064a987a1d4211d10d98e18bcbd7cbaa412cc5302b4a12
+                             an earlier run whose workspace_head field says 4a70c53
+```
+
+Neither row count is a count of tests. Executions come from libtest and `--list`; rows come from
+parsing, and the `cleanup` rows are teardown receipts rather than test outcomes.
 
 The two expensive builds ran while the repair was still uncommitted, so their receipts name the
 previous commit. The difference is one test file and one document, with no production source change.
@@ -72,7 +105,7 @@ That is stated, not assumed.
 | Defect | Old behaviour | New behaviour | Control |
 | --- | --- | --- | --- |
 | N1 mount grammar | Linux `type` read as the filesystem type, `ubuntu-latest` red | both grammars decoded exactly, 16 synthetic cases, escapes decoded, 4 malformed shapes refused | `the_mount_grammar_of_both_platforms_is_decoded_exactly` |
-| N2 unbounded drain join | **20,012ms** against a 3s bound | **3,005ms**, classified incomplete drain, child's real exit status kept | `the_bounded_runner_finishes_inside_its_bound_for_every_child_shape` |
+| N2 unbounded drain join | **20,012ms** against a 3s bound | **3,001ms**, classified incomplete drain, child's real exit status kept | `the_bounded_runner_finishes_inside_its_bound_for_every_child_shape` |
 | N3 start time discarded | parsed then dropped, pid identity by argv alone | start time registered and compared; same argv with a different start refused | `a_recycled_pid_with_the_same_argv_is_refused` |
 | N4 vacuous store check | `ends_with("")` is true, so an unanswered status passed | `Result`, empty refused, exact canonical equality, no prefix or basename arm | exercised by the two gated tests that read the answering store |
 | N5 guard could not fire | guard compared a JSON boolean, writer emitted strings | typed writer, both shapes refused, five non-claims not read as claims | seeded boolean claim exit 101; seeded string claim exit **101**, previously 0 |
@@ -83,15 +116,33 @@ That is stated, not assumed.
 
 | Shape | Result |
 | --- | --- |
-| chatty, 4 MiB on stdout | exit 0, 4,194,304 bytes, 46ms |
+| chatty, 4 MiB on stdout | exit 0, 4,194,304 bytes, 50ms |
 | empty stdout, exits at once | exit 0 |
-| hangs | killed at its own pid, 3001ms |
-| exits at once, helper holds the pipe | 3005ms, incomplete drain, child status preserved, helper cleaned and the cleanup asserted |
+| hangs | killed at its own pid, 3010ms |
+| exits at once, helper holds the pipe | 3001ms, incomplete drain, child status preserved, helper cleaned and the cleanup asserted |
+
+Figures from `acceptance.jsonl`, the run at `a64e118`. Another run of the same control recorded
+46ms, 3001ms and 3005ms; that is ordinary variation between runs on a shared host and neither set is
+a timing claim.
 
 The control's helper is cleaned by the pid it recorded about itself, verified to be exactly
 `sleep 20`; if that verification or the cleanup fails, the test fails. A control cannot leave an
 orphan and still report success. One earlier revision of this control used a subshell, so `$!` was
 the subshell and the sleeper was orphaned; the orphan exited on its own and was verified gone.
+
+### What N2 bounds, and what it does not
+
+The bound covers one call: the spawn, the child, and the collection of its output. It is
+`min(caller's remaining deadline, the call's own cap)`, which is why the control's receipt records
+`bound_ms: "3000"`. Only `child.kill()` is ever called, on the handle that owns the child, and the
+status comes from `try_wait` rather than a second `wait`.
+
+It does **not** cover the lifetime of the two reader threads the call starts. They are detached and
+never reclaimed, so a descendant that holds a pipe open past the bound keeps those threads for the
+life of the test binary. The call itself is classified and returns, so nothing hangs and no result is
+wrong; the count of such threads grows with the count of such calls rather than being reclaimed. The
+only producer this harness can identify is the control's own `sleep` helper, recorded, verified and
+cleaned as described above. N2's source is unchanged by the later doc-only commits.
 
 ## The stranded daemon, disclosed
 
