@@ -48,7 +48,14 @@ const RESERVED_NAMES: &[&str] = &[
 ];
 
 /// Every legal name in [`TABLE`], sorted.
-const LEGAL: &[&str] = &["a", "caf\u{e9}", "conf_base", "conf_slot", "cowfs-swap", "slot-1"];
+const LEGAL: &[&str] = &[
+    "a",
+    "caf\u{e9}",
+    "conf_base",
+    "conf_slot",
+    "cowfs-swap",
+    "slot-1",
+];
 
 #[test]
 fn a_real_store_holds_exactly_the_names_the_control_api_accepts() {
@@ -88,11 +95,7 @@ fn a_real_store_holds_exactly_the_names_the_control_api_accepts() {
     // and again after the store is reopened from the directory, so nothing is answered from a cache
     drop(core);
     let reopened = open(dir.path());
-    assert_eq!(
-        held(&reopened),
-        LEGAL,
-        "a reopened store holds other names"
-    );
+    assert_eq!(held(&reopened), LEGAL, "a reopened store holds other names");
     for name in RESERVED_NAMES {
         assert!(reopened.create_snapshot(name).is_err(), "{name:?}");
         assert!(reopened.snapshot_view(name).is_err(), "{name:?}");
