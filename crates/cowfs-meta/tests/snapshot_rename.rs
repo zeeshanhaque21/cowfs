@@ -34,6 +34,24 @@ fn opts() -> Options {
     }
 }
 
+/// Options for the pending-tree case only.
+///
+/// `sync_every_ops` is left at the default `256` with `Ack::Applied`, which is what
+/// `cowfs_core::inner` opens meta with, so a single applied operation does not reach the commit
+/// threshold and stays pending. Every other test in this file relies on `sync_every_ops: 1` to make
+/// its setup deterministic, so this case cannot share `opts()`.
+///
+/// With `opts()` the pending case is untestable rather than hard: `s.create` is one applied op, so
+/// `pending_ops` becomes `1`, `1 >= 1` satisfies the inline commit, and the tree is already clean
+/// by the time the rename runs.
+fn opts_pending() -> Options {
+    Options {
+        node_size: 512,
+        background: false,
+        ..Options::default()
+    }
+}
+
 fn write_files(s: &Snapshot, n: u32) -> Vec<u64> {
     let mut inos = Vec::new();
     s.batch(|tx: &mut Tx| {
@@ -212,7 +230,7 @@ fn a_name_held_by_another_snapshot_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.redb");
     let m = Meta::open(&path, opts()).unwrap();
-    let (id, root, inos) = populated(&m);
+    let (id, root, _) = populated(&m);
     let other = m.new_snapshot("taken").unwrap();
     let other_id = other.id();
     let other_root = *other.info().unwrap().root.as_bytes();
@@ -307,35 +325,73 @@ fn a_missing_id_and_an_invalid_name_are_refused() {
 /// A snapshot with uncommitted writes keeps them: the rename is a commit like any other, so the
 /// data is flushed in the same transaction rather than dropped.
 #[test]
-fn a_rename_of_a_dirty_snapshot_keeps_its_uncommitted_writes() {
+fn a_rename_commits_a_pending_tree_change_and_leaves_the_row_readable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.redb");
-    let m = Meta::open(&path, opts()).unwrap();
-    let (id, _, _) = populated(&m);
+    let m = Meta::open(&path, opts_pending()).unwrap();
 
-    // Created but not synced: the snapshot's tree is dirty, and the rename's commit is the next
-    // durable commit, so it is what makes the new inode durable.
-    let s = m.snapshot("snap").unwrap();
-    let f = s.create(ROOT_INO, b"dirty", 0o644).unwrap();
-    let ino = f.ino;
+    // Establish a durable root first, so the pending change below has an old root to differ from,
+    // and so the row on disk before the rename is known good.
+    let s = m.new_snapshot("snap").unwrap();
+    let id = s.id();
+    let base = write_files(&s, 3);
+    m.sync().unwrap();
+    let old_root = *s.info().unwrap().root.as_bytes();
+
+    // A create that is NOT synced. With the default 256 ops per commit and Ack::Applied, one
+    // applied operation does not reach the threshold, so the tree stays dirty and the rename is the
+    // next durable commit. The entry is visible in the cached tree straight away, which is the
+    // public evidence that the tree really is pending at this point.
+    let pending = s.create(ROOT_INO, b"pending", 0o644).unwrap();
+    let pending_ino = pending.ino;
+    assert!(
+        s.lookup(ROOT_INO, b"pending").is_ok(),
+        "the pending entry is present in the cached tree before the rename"
+    );
 
     m.rename_snapshot(id, "renamed").unwrap();
 
     assert_eq!(s.id(), id, "the id must not move");
     assert_eq!(s.info().unwrap().name, "renamed");
-    assert!(
-        s.lookup(ROOT_INO, b"dirty").is_ok(),
-        "the uncommitted create is visible on the open handle"
-    );
 
     drop(s);
     drop(m);
-    let again = Meta::open(&path, opts()).unwrap();
-    let names = again.snapshot("renamed").unwrap();
-    let df = names
-        .lookup(ROOT_INO, b"dirty")
-        .expect("the uncommitted create was committed by the rename, not dropped");
-    assert_eq!(df.ino, ino, "with the inode number it was handed");
+
+    // After a reopen the row must still describe a tree that exists, and the pending entry must be
+    // in it.
+    //
+    // This is the discriminating step, and it is a read rather than a row comparison: the lookup
+    // walks the tree from the row's root. If the rename left the row on the root the same
+    // transaction freed, the walk fails with a missing tree node, which is the corruption the
+    // review traced in the source.
+    let again = Meta::open(&path, opts_pending()).unwrap();
+    let infos = again.snapshots().unwrap();
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].name, "renamed");
+    assert_eq!(infos[0].id, id);
+    assert_ne!(
+        infos[0].root.as_bytes(),
+        &old_root,
+        "the committed row must carry the flushed root, not the pre-flush one"
+    );
+
+    let reopened = again
+        .snapshot("renamed")
+        .expect("the renamed snapshot must reopen with a readable root");
+    let f = reopened
+        .lookup(ROOT_INO, b"pending")
+        .expect("the rename's commit must have made the pending create durable");
+    assert_eq!(f.ino, pending_ino, "with the inode number it was handed");
+    for (i, _) in base.iter().enumerate() {
+        let name = format!("f{i}");
+        assert!(
+            reopened.lookup(ROOT_INO, name.as_bytes()).is_ok(),
+            "{name} must still be in the renamed tree"
+        );
+    }
+    again
+        .check()
+        .expect("check after a rename that committed a pending tree");
 }
 
 /// The existing `before_sync` hook, fired at the rename's own commit, must leave everything as it
