@@ -276,10 +276,17 @@ fn accept_loop(
             // deadline plus three graces. The accept loop polls this branch every 10 ms, so this
             // instant is at most one poll interval after the real deadline.
             let grace_end = Instant::now() + opts.drain_deadline;
-            // Delivery takes the front of the one grace and the close the back half, so waiting for a
-            // frame can never starve the release. The halves are slices of the same grace, so both
-            // phases together still cost exactly one `drain_deadline`.
-            let release_start = grace_end - opts.drain_deadline / 2;
+            // The whole grace is the delivery window. `kill` runs at `grace_end`, so a client that
+            // resumes reading at any point inside `shutdown_deadline + drain_deadline` still gets its
+            // frame; the unwind after the resume plus the terminal write still fits in that window.
+            //
+            // Reserving a slice of the grace for the close does not buy a close-at-return property:
+            // the unsplit source already closed at the return in every shape an independent review
+            // measured. What a reserve actually buys is letting a killed parked handler unwind before
+            // the return, which is a weaker claim than the contract makes. `v1-control-api.md` detaches
+            // handler threads and lets them die with the process, so this hands that case back rather
+            // than pretending it is joined.
+            let release_start = grace_end;
             let left = |now: Instant, end: Instant| {
                 end.saturating_duration_since(now)
                     .max(Duration::from_millis(1))

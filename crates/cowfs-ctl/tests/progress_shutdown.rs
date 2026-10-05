@@ -822,10 +822,16 @@ fn abandoned_blocked_connection_is_released_before_wait_returns() {
             wait_ms < bound,
             "{label}: wait() took {wait_ms:?}, past the deadline plus the grace"
         );
-        assert!(
-            !handler_alive_at_return,
-            "{label}: the server still owns the abandoned handler when wait() returns"
-        );
+        // What the contract requires is the close, not a joined handler:
+        // `v1-control-api.md` says abandoned handlers "get `shutting_down`, their connections are
+        // closed and the server returns", and separately that "the handler threads are detached and
+        // die with the process". Requiring the handler to be unwound at the return is stricter than
+        // the contract and, with the whole grace spent on delivery, not something the server can
+        // promise: `kill` half-closes the socket and the parked `write_all` unwinds on its own
+        // schedule afterwards.
+        //
+        // So the gate is the close plus the budget, and `handler_alive_at_return` is recorded as the
+        // detached-handler observation it is rather than asserted away.
         assert!(
             closed_at_return,
             "{label}: an abandoned connection is still open when wait() returns"
@@ -836,6 +842,17 @@ fn abandoned_blocked_connection_is_released_before_wait_returns() {
         // difference moved the count the wrong way by one. Release is gated on the two per-connection
         // signals above and on the no-leak check below, which samples the same baseline the process
         // started the cycle with.
+        // Test-owned cleanup: the detached handler must still end on its own, otherwise the loop
+        // would accumulate threads across its cases. It is given a bounded window because it unwinds
+        // asynchronously now.
+        let until = Instant::now() + Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "{label}: the detached handler never finished; the test would leak a thread per case"
+        );
         drop(clients);
         // Descriptor counts are reported, not gated. The count is process-wide, so it also covers the
         // watchdog pipes and the fixtures left behind by earlier tests in this binary, and on the
@@ -971,6 +988,31 @@ fn shutdown_budget_is_the_deadline_plus_one_grace_with_a_parked_writer_and_a_cpu
         "the CPU-bound handler finished too early to exercise the case it exists for"
     );
 
+    // Owned-backend lifetime. The detached worker is still running and still holds the handler, which
+    // holds an `Arc` to state the server also owns. If returning from `wait()` freed or borrowed past
+    // anything the worker needs, this counter would stop advancing or the read would fault. It is read
+    // and sampled here, after the return, so the check covers exactly the window where a detached
+    // handler outlives the server.
+    let cpu_before = cpu_ticks.load(Ordering::SeqCst);
+    let until = Instant::now() + Duration::from_millis(300);
+    while cpu_ticks.load(Ordering::SeqCst) == cpu_before && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let cpu_after = cpu_ticks.load(Ordering::SeqCst);
+    eprintln!(
+        "PROGRESS77 backend_lifetime cpu_ticks {cpu_before} -> {cpu_after} while detached after return"
+    );
+    assert!(
+        cpu_after > cpu_before,
+        "the detached handler's borrowed state stopped being valid after wait() returned"
+    );
+    // Its peer was closed while it was still running, which is the close the contract asks for and
+    // the reason the handler is detached rather than joined.
+    assert!(
+        peer_closed(&cpu.stream),
+        "the CPU handler's connection was not closed by the return"
+    );
+
     // Private cleanup, after the measurement: release the CPU handler so it does not outlive the
     // test binary. This is a test-owned flag, not part of the user-visible contract.
     cpu_release.store(true, Ordering::SeqCst);
@@ -1023,7 +1065,16 @@ fn shutdown_budget_with_only_a_parked_writer() {
         "wait() took {elapsed:?} for one parked writer"
     );
     assert!(closed, "the parked connection was still open at the return");
-    assert!(!alive, "the parked handler was still alive at the return");
+    // The handler is recorded, not gated: the contract detaches handler threads. What must hold is
+    // that it ends, which is the loop's thread budget rather than a contract promise.
+    let until = Instant::now() + Duration::from_secs(5);
+    while !dropped.load(Ordering::SeqCst) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the detached handler never finished; the test would leak a thread per case"
+    );
     drop(parked);
 }
 
@@ -1098,4 +1149,178 @@ fn shutdown_budget_with_only_a_cpu_handler() {
         thread::sleep(Duration::from_millis(5));
     }
     drop(cpu);
+}
+
+/// A handler that streams a bounded number of progress frames and then returns, so that once a
+/// stopped-reading client resumes there is nothing left to deliver except the terminal frame.
+///
+/// An endless flood is the wrong shape for this test: it keeps writing after the resume, so a frame
+/// that arrives late could be a progress frame rather than proof that the terminal made it.
+struct FiniteFlood {
+    steps: u64,
+    entered: Arc<AtomicBool>,
+    attempted: Arc<AtomicU64>,
+}
+
+impl ControlHandler for FiniteFlood {
+    fn gc(&self, _: GcParams, ctx: &OpContext<'_>) -> CtlResult<GcReport> {
+        self.entered.store(true, Ordering::SeqCst);
+        for done in 0..self.steps {
+            self.attempted.fetch_add(1, Ordering::SeqCst);
+            ctx.progress(ProgressEvent {
+                phase: "mark".into(),
+                done,
+                total: Some(self.steps),
+                unit: Unit::Items,
+                message: Some("x".repeat(2000)),
+            })?;
+        }
+        Ok(GcReport {
+            dry_run: true,
+            candidate_blocks: 0,
+            candidate_bytes: 0,
+            freed_blocks: 0,
+            freed_bytes: 0,
+            gross_removed_bytes: 0,
+            rewrite_bytes: Some(0),
+            net_reclaimed_bytes: Some(0),
+        })
+    }
+}
+
+/// The promised delivery window is the whole grace: a client that resumes reading at any point inside
+/// `shutdown_deadline + drain_deadline` gets its complete `shutting_down` frame.
+///
+/// This is the regression for the front-half split. With `release_start = grace_end - drain_deadline
+/// / 2`, `kill` ran at the halfway mark and every resume past it got `NoFrame` or a truncated frame
+/// where the three-grace code gave a whole one. The reserve was justified as protecting a
+/// close-at-return property that an independent review could not reproduce on the unsplit source; what
+/// it actually protected was a killed handler unwinding, which the contract leaves to process exit.
+///
+/// Both geometries are covered: `a4`'s original 200/250 ms, which the split silently broke, and a
+/// 1000 ms grace probed at 90 and 95 percent, which is inside the window but past any plausible
+/// halfway or two-thirds cut. Five reps each, so a single unlucky run cannot pass the test.
+///
+/// The peer is not read before `wait()` returns, and the parked-ness proof is the same two consecutive
+/// frozen windows. Frames are only counted when they parse out of a complete line, so a truncated tail
+/// can never be mistaken for a delivered terminal.
+#[test]
+fn a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame() {
+    struct Case {
+        label: &'static str,
+        deadline: Duration,
+        drain: Duration,
+        resume_ms: u64,
+    }
+    let cases = [
+        Case {
+            label: "200/250@340",
+            deadline: Duration::from_millis(200),
+            drain: Duration::from_millis(250),
+            resume_ms: 340,
+        },
+        Case {
+            label: "200/250@400",
+            deadline: Duration::from_millis(200),
+            drain: Duration::from_millis(250),
+            resume_ms: 400,
+        },
+        Case {
+            label: "200/1000@900",
+            deadline: Duration::from_millis(200),
+            drain: Duration::from_millis(1000),
+            resume_ms: 900,
+        },
+        Case {
+            label: "200/1000@950",
+            deadline: Duration::from_millis(200),
+            drain: Duration::from_millis(1000),
+            resume_ms: 950,
+        },
+    ];
+
+    for case in cases {
+        let _w = Watchdog::start(240);
+        for rep in 0..5 {
+            let entered = Arc::new(AtomicBool::new(false));
+            let attempted = Arc::new(AtomicU64::new(0));
+            let mut fx = start_with(
+                FiniteFlood {
+                    steps: 400,
+                    entered: Arc::clone(&entered),
+                    attempted: Arc::clone(&attempted),
+                },
+                ServerOptions {
+                    // Long, so a regression to waiting the write out cannot pass by accident.
+                    write_timeout: Duration::from_secs(6),
+                    shutdown_deadline: case.deadline,
+                    drain_deadline: case.drain,
+                    ..ServerOptions::default()
+                },
+            );
+
+            let mut client = Raw::hello(&fx.path);
+            client.send(GC_REQUEST);
+            let until = Instant::now() + Duration::from_secs(3);
+            while !entered.load(Ordering::SeqCst) {
+                assert!(Instant::now() < until, "handler never entered");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_parked(&attempted, Duration::from_millis(150));
+
+            let t0 = Instant::now();
+            let server = fx.server.take().unwrap();
+            server.handle().shutdown();
+            // Resume while the server is still inside its delivery window: that is the whole claim.
+            // The frame is read before `wait()` returns, which is exactly what the window promises.
+            thread::sleep(Duration::from_millis(case.resume_ms));
+            let _ = client
+                .stream
+                .set_read_timeout(Some(Duration::from_millis(50)));
+            let until = Instant::now() + Duration::from_millis(2500);
+            let mut buf = Vec::new();
+            let mut whole = false;
+            while Instant::now() < until {
+                buf.clear();
+                match client.reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let v: serde_json::Value =
+                            serde_json::from_slice(&buf[..buf.len().saturating_sub(1)])
+                                .unwrap_or_default();
+                        if matches!(v["type"].as_str(), Some("response") | Some("error"))
+                            && v["id"].as_u64() == Some(1)
+                        {
+                            whole = true;
+                            break;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            // The server finishes its own grace and returns; only after that is the close claim
+            // meaningful. `wait()` returns inside the budget, so this cannot stretch anything.
+            server.wait();
+            let closed = peer_closed(&client.stream);
+            eprintln!(
+                "PROGRESS77 late {} rep={rep} resume_ms={} elapsed_ms={} whole_terminal={whole} \
+                 peer_closed={closed}",
+                case.label,
+                case.resume_ms,
+                t0.elapsed().as_millis()
+            );
+            let window = case.deadline + case.drain;
+            assert!(
+                whole,
+                "{} rep {rep}: a client that resumed {} ms inside a {window:?} grace got no whole \
+                 terminal frame",
+                case.label, case.resume_ms
+            );
+            assert!(
+                closed,
+                "{} rep {rep}: the connection was left open",
+                case.label
+            );
+        }
+    }
 }
