@@ -115,7 +115,9 @@ prior=$(ls -1 "$attempts" 2>/dev/null | grep -c . || true)
 say "run: repo=$repo attempt=$out ($prior earlier attempt(s) preserved)"
 # A Unix socket address is at most 108 bytes including its terminator, so this is checked before a
 # daemon is started rather than discovered from the kernel's refusal to bind.
-sock_len=${#sock}
+# Measured in bytes, because that is the unit the kernel limit is in and not every shell counts
+# characters. A pipe is needed since the value may hold characters a here-string would mangle.
+sock_len=$(printf %s "$sock" | wc -c | tr -d ' ')
 [ "$sock_len" -le 100 ] ||
   fail "the control socket path is $sock_len bytes, and a Unix socket path cannot exceed 107: $sock"
 say "run: the control socket path is $sock_len bytes of the 107 a Unix socket allows"

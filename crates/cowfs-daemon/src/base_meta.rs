@@ -27,9 +27,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The directory holding one subdirectory per base, inside the store.
-const DIR: &str = ".cowfs-base-meta";
+pub(crate) const DIR: &str = ".cowfs-base-meta";
 /// The file inside a base's directory.
-const FILE: &str = "base.json";
+pub(crate) const FILE: &str = "base.json";
+
+/// Where one base's record lives, from the store's own path. Exposed so a test can assert the record
+/// a caller is promised is the record that is there, instead of repeating the layout as a literal.
+#[cfg(test)]
+pub(crate) fn record_path(store: &Path, name: &str) -> PathBuf {
+    store.join(DIR).join(name).join(FILE)
+}
 
 /// Counts temporary files within one process, so two threads publishing the same base never choose the
 /// same temporary path. The store's own lock already serialises publication; this is what makes the
@@ -189,13 +196,18 @@ impl BaseMetaStore {
         )
     }
 
-    /// Forgets `name`, durably, before this returns.
+    /// Forgets `name` before this returns, or reports why it could not.
     ///
     /// The record is dropped from the map only when the store agrees it is gone. A deletion that fails
     /// leaves the map holding what is still on disk, so a live process and a process that reopens the
     /// store answer the same question the same way. A deletion that fails *after* the record file is
-    /// already unlinked is the other case: the durable truth is then "no record", so the map is
+    /// already unlinked is the other case: what the store holds is then "no record", so the map is
     /// dropped to match it. Either way the failure is reported and never silent.
+    ///
+    /// This is not crash-durable and does not claim to be. `write_locked` fsyncs the record and its
+    /// directory before the write returns; this path fsyncs nothing after the unlink, so a crash here
+    /// can leave a record on disk that the live map has already dropped. Nothing in the product depends
+    /// on a removal surviving a power loss, and no such guarantee is asserted here.
     pub(crate) fn remove(&self, name: &str) -> io::Result<()> {
         check_private_name(name)?;
         let mut records = self
@@ -336,6 +348,9 @@ fn remove_locked(
     name: &str,
 ) -> io::Result<()> {
     let dir = root.join(name);
+    // Refused explicitly rather than left to `remove_dir_all`'s own symlink handling, so the delete
+    // path says what it will not do instead of quietly unlinking a link.
+    no_symlinked_dir(&dir)?;
     match std::fs::remove_dir_all(&dir) {
         // Nothing to remove is the state being asked for, not a failure to reach it.
         Ok(()) => {

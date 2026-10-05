@@ -337,6 +337,12 @@ fn rollback_base(bases: &BaseMetaStore, moved_to: &str, was: &str, cause: io::Er
     }
 }
 
+/// The refusal for a name that is taken. One helper so both backends report a duplicate the same way,
+/// whichever one serves the store.
+fn name_taken() -> io::Error {
+    io::Error::new(io::ErrorKind::AlreadyExists, "name is taken")
+}
+
 fn missing(name: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
@@ -585,10 +591,28 @@ impl Snapshots for CoreSnapshots {
     }
 
     fn create(&self, name: &str, from: Option<&str>) -> io::Result<SnapshotInfo> {
+        // The name is checked before anything destructive, the way the path backend checks it. The core
+        // does refuse a duplicate itself, but it refuses it after this point, so clearing the record
+        // first cost a refused duplicate its base: the snapshot was left with no record on disk and none
+        // in the map, live and after a reopen.
+        if self.with(|c| Ok(CoreSnapshots::names(c)?.iter().any(|e| e.name == name)))? {
+            return Err(name_taken());
+        }
         // A new snapshot is never a base, so any record left under this name by a snapshot that has
         // since gone is cleared before it exists. Without this, a record orphaned by an interrupted
         // rename would attach itself to the next snapshot created with the same name and report a
         // commit that has nothing to do with its contents.
+        //
+        // Every failure after the pre-check is safe because of what the pre-check proved. If the record
+        // cannot be cleared this returns an error and no snapshot is created, so nothing half-exists. If
+        // the record was cleared and the core then refuses, the record that went belonged to a name with
+        // no snapshot behind it, which is the only kind this step is allowed to touch.
+        //
+        // This is a pre-check, not a transaction. It closes the case above and narrows the window in
+        // which a concurrent create of the same free name could clear a record another request has just
+        // published. It does not serialise: two concurrent creates of one free name can both pass here,
+        // and the loser is rejected by the core afterwards. Serialising namespace operations per name is
+        // a broader change than this repair and is not made here.
         self.bases.remove(name)?;
         self.with(|c| {
             let entry = match from {
@@ -803,11 +827,10 @@ impl Snapshots for PathSnapshots {
     }
 
     fn create(&self, name: &str, from: Option<&str>) -> io::Result<SnapshotInfo> {
+        // Same order as the core backend, and for the same reason: refusing a duplicate must cost the
+        // caller nothing, so it happens before the record is touched.
         if self.exists(name) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "name is taken",
-            ));
+            return Err(name_taken());
         }
         // A new snapshot is never a base, so a record left under this name by a snapshot that has since
         // gone is cleared before this one exists, or it would report a commit that has nothing to do
@@ -875,10 +898,7 @@ impl Snapshots for PathSnapshots {
             ));
         }
         if self.exists(to) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "name is taken",
-            ));
+            return Err(name_taken());
         }
         // The record moves first, so the commit is durable under the new name before the snapshot does,
         // and a snapshot that cannot move puts the record back where it was. The other order would
@@ -1237,6 +1257,174 @@ mod tests {
 
     /// A snapshot recreated under a name whose record outlived it is not a base. Both backends, because
     /// a forged fresh base is the one failure this must never produce.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Every core snapshot's name and Merkle root, which is the whole of its contents.
+    fn core_roots(b: &CoreBackend) -> Vec<(String, String)> {
+        with_core(&b.core, |c| {
+            Ok(CoreSnapshots::names(c)?
+                .into_iter()
+                .map(|e| (e.name.clone(), hex(e.root.as_bytes())))
+                .collect())
+        })
+        .expect("the core is open")
+    }
+
+    /// A refused duplicate must cost nothing. On the core backend the name check happened after the
+    /// record was cleared, so `create warm` on a base named `warm` exited 1 and left the snapshot with
+    /// no base at all, on disk and after a reopen: the record was gone. The path backend refused first
+    /// and kept everything, and both now behave the same way.
+    #[test]
+    fn a_refused_duplicate_create_keeps_a_core_snapshot_and_its_whole_record() {
+        let (d, b) = core();
+        let store = d.path().to_owned();
+        let s = b.snapshots();
+        s.create("warm", None).unwrap();
+        s.promote("warm").unwrap();
+        s.set_base_meta("warm", &meta("/r", "main", "abc")).unwrap();
+        let record_before = std::fs::read(crate::base_meta::record_path(&b.store, "warm")).unwrap();
+        let roots_before = core_roots(&b);
+
+        let e = s.create("warm", None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+
+        assert_eq!(core_roots(&b), roots_before, "the snapshot's root changed");
+        assert_eq!(
+            std::fs::read(crate::base_meta::record_path(&b.store, "warm")).unwrap(),
+            record_before,
+            "the record is byte-identical"
+        );
+        assert_eq!(commit_of(&s.create_meta("warm").unwrap()), Some("abc"));
+        drop(b);
+
+        let reopened = CoreBackend::open(&store, cowfs_core::Options::default()).unwrap();
+        assert_eq!(core_roots(&reopened), roots_before, "and after a reopen");
+        assert_eq!(
+            commit_of(&reopened.snapshots().create_meta("warm").unwrap()),
+            Some("abc"),
+            "a daemon that never saw this in memory still reports the base"
+        );
+        assert_eq!(
+            std::fs::read(crate::base_meta::record_path(&reopened.store, "warm")).unwrap(),
+            record_before
+        );
+    }
+
+    /// A create that cannot clear a stale record creates no snapshot. Both backends, because the record
+    /// and the snapshot have to agree about what exists, and a half-created snapshot whose name still
+    /// carries a record is worse than no snapshot.
+    ///
+    /// The record this leaves behind is not asserted on: with the metadata root read-only the unlink of
+    /// the record succeeds and only the removal of its directory fails, so the store really does lose the
+    /// record. That reconciliation is what the two removal tests in `base_meta` are for. What is
+    /// asserted here is that the namespace did not advance, and that the store's own view of the record
+    /// is stable across the failure rather than moving under the caller's feet.
+    #[test]
+    fn a_create_that_cannot_clear_a_stale_record_creates_no_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let arm =
+            |backend: &str, snapshots: &dyn Snapshots, store: &Path, snapshot_exists: bool| {
+                crate::base_meta::BaseMetaStore::open(store)
+                    .unwrap()
+                    .set("warm", &meta("/r", "main", "abc"))
+                    .unwrap();
+                let root = store.join(crate::base_meta::DIR);
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+                let refused = snapshots.create("warm", None).unwrap_err();
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+                assert!(
+                    refused
+                        .to_string()
+                        .contains("cannot remove the base record"),
+                    "{backend} backend: {refused}"
+                );
+                assert_eq!(
+                    snapshots.create_meta("warm").unwrap_err().kind(),
+                    io::ErrorKind::NotFound,
+                    "{backend} backend: a snapshot was created anyway"
+                );
+                assert!(
+                    !snapshot_exists || !store.join("warm").exists(),
+                    "{backend} backend: a snapshot directory was created anyway"
+                );
+                let view = crate::base_meta::BaseMetaStore::open(store)
+                    .unwrap()
+                    .get("warm");
+                assert_eq!(
+                    view,
+                    crate::base_meta::BaseMetaStore::open(store)
+                        .unwrap()
+                        .get("warm"),
+                    "{backend} backend: the store's view of the record is not stable"
+                );
+            };
+
+        let (d, c) = core();
+        arm("core", c.snapshots(), &c.store.clone(), false);
+        drop(c);
+        let reopened = CoreBackend::open(d.path(), cowfs_core::Options::default()).unwrap();
+        assert_eq!(
+            reopened.snapshots().create_meta("warm").unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "core backend: the failed create is still there after a reopen"
+        );
+
+        let (_d, b) = path();
+        let store = b.store.clone();
+        arm("path", b.snapshots(), &store, true);
+        drop(b);
+        let reopened = PathBackend::open(&store).unwrap();
+        assert_eq!(
+            reopened.snapshots().create_meta("warm").unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "path backend: the failed create is still there after a reopen"
+        );
+    }
+
+    /// The same refusal on the path backend, which is the control this has to match.
+    #[test]
+    fn a_refused_duplicate_create_keeps_a_path_snapshot_and_its_whole_record() {
+        let (_d, b) = path();
+        let s = b.snapshots();
+        s.create("warm", None).unwrap();
+        std::fs::write(b.store.join("warm").join("main.rs"), b"fn main() {}\n").unwrap();
+        s.promote("warm").unwrap();
+        s.set_base_meta("warm", &meta("/r", "main", "abc")).unwrap();
+        let record_before = std::fs::read(crate::base_meta::record_path(&b.store, "warm")).unwrap();
+        let tree_before = std::fs::read(b.store.join("warm").join("main.rs")).unwrap();
+
+        let e = s.create("warm", None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+
+        assert_eq!(
+            std::fs::read(b.store.join("warm").join("main.rs")).unwrap(),
+            tree_before,
+            "the snapshot's bytes changed"
+        );
+        assert_eq!(
+            std::fs::read(crate::base_meta::record_path(&b.store, "warm")).unwrap(),
+            record_before,
+            "the record is byte-identical"
+        );
+        assert_eq!(commit_of(&s.create_meta("warm").unwrap()), Some("abc"));
+        let store = b.store.clone();
+        drop(b);
+
+        let reopened = PathBackend::open(&store).unwrap();
+        assert_eq!(
+            commit_of(&reopened.snapshots().create_meta("warm").unwrap()),
+            Some("abc"),
+            "a daemon that never saw this in memory still reports the base"
+        );
+        assert_eq!(
+            std::fs::read(crate::base_meta::record_path(&reopened.store, "warm")).unwrap(),
+            record_before
+        );
+    }
+
     /// A snapshot created under a name whose record outlived it is not a base. A record can outlive its
     /// snapshot when an operation is interrupted, and if `create` adopted it, the new tree would
     /// report itself a base built from a commit it has nothing to do with.
