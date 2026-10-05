@@ -152,31 +152,88 @@ def statfs_fstype(path):
     return statfs_magic(path)[1]
 
 
-def mountinfo_for_device(dev):
-    """The mount table entry for a device number, which is what /proc/self/mountinfo records.
-
-    This is the fallback when statfs gives no name: the kernel's own table, keyed on the device,
-    with the filesystem type from the same line.
-    """
-    if dev is None or not isinstance(dev, int):
-        return None
-    want = "%d:%d" % (os.major(dev), os.minor(dev))
+def read_mountinfo():
+    """Every /proc/self/mountinfo entry, parsed. (rows, None) or (None, reason)."""
+    rows = []
     try:
         with open("/proc/self/mountinfo") as f:
             for line in f:
                 fields = line.split()
-                # fields: id parent maj:min root mountpoint options... - fstype source super
-                if len(fields) < 5 or fields[2] != want:
+                # id parent maj:min root mountpoint options... - fstype source super
+                if len(fields) < 5 or "-" not in fields:
                     continue
-                sep = fields.index("-") if "-" in fields else None
-                if sep is None:
+                sep = fields.index("-")
+                if sep + 2 >= len(fields):
                     continue
-                return {"mountpoint": fields[4], "fstype": fields[sep + 1],
-                        "source": fields[sep + 2], "device": want,
-                        "raw": line.strip()}
-    except (OSError, ValueError):
+                rows.append({"mountpoint": fields[4], "fstype": fields[sep + 1],
+                             "source": fields[sep + 2], "device": fields[2],
+                             "root": fields[3], "raw": line.strip()})
+    except OSError as e:
+        return None, "%s: %s" % (e.filename, e.strerror or e)
+    return rows, None
+
+
+def mount_entries_for_device(dev, rows):
+    """Every mount entry on one device. A device can back more than one mount, so this returns
+    all of them and never picks one silently."""
+    if dev is None or not isinstance(dev, int):
+        return []
+    want = "%d:%d" % (os.major(dev), os.minor(dev))
+    return [row for row in rows if row["device"] == want]
+
+
+def mountinfo_for_device(dev, path=None, rows=None):
+    """The mount table entry for a device, disambiguated by the path that asked for it.
+
+    A device can back several mounts, so returning the first line that matches the device reports
+    whichever one the kernel happened to list first, which may be a mount nowhere near the file.
+    With a path, the entry is the one that contains it: the longest matching mountpoint among the
+    entries on that device. That is the exact mount instance the caller named.
+
+    When the device backs more than one mount and none of them contains the path, or when no path
+    was given and the candidates disagree, the answer is AMBIGUOUS with every candidate listed.
+    There is no fallback to a foreign mount: a caller that cannot be told which mount it is on is
+    told so.
+    """
+    if rows is None:
+        rows, reason = read_mountinfo()
+        if rows is None:
+            # An unreadable table is not an ambiguity: it is an absence, and it is reported as one
+            # so no caller reads "ambiguous" as "several mounts matched".
+            return {"unreadable": True, "reason": "mountinfo unreadable: %s" % reason,
+                    "candidates": []}
+    entries = mount_entries_for_device(dev, rows)
+    if not entries:
         return None
-    return None
+    if path is not None:
+        clean = os.path.normpath(path)
+        best = None
+        for row in entries:
+            mnt = os.path.normpath(row["mountpoint"])
+            if clean == mnt or clean.startswith(mnt.rstrip("/") + "/"):
+                if best is None or len(mnt) > len(os.path.normpath(best["mountpoint"])):
+                    best = row
+        if best is not None:
+            return dict(best, matched_by="path")
+        return {"ambiguous": True, "device": "%d:%d" % (os.major(dev), os.minor(dev)),
+                "reason": ("device %d:%d backs %d mounts and none of them contains %s, so the "
+                           "mount this file is on cannot be named"
+                           % (os.major(dev), os.minor(dev), len(entries), clean)),
+                "candidates": [e["mountpoint"] for e in entries]}
+    if len({e["mountpoint"] for e in entries}) == 1:
+        return dict(entries[0], matched_by="device")
+    return {"ambiguous": True, "device": "%d:%d" % (os.major(dev), os.minor(dev)),
+            "reason": ("device %d:%d backs %d mounts and no path was given to say which one"
+                       % (os.major(dev), os.minor(dev), len(entries))),
+            "candidates": [e["mountpoint"] for e in entries]}
+
+
+def fstype_of_device(dev, path=None, rows=None):
+    """The filesystem type for a device, or None when the device's mount cannot be named."""
+    entry = mountinfo_for_device(dev, path, rows)
+    if entry is None or entry.get("ambiguous") or entry.get("unreadable"):
+        return None
+    return entry.get("fstype")
 
 
 def file_witness(path):
@@ -190,14 +247,29 @@ def file_witness(path):
     magic, name = statfs_magic(real)
     witness["statfs_magic"] = "0x%x" % magic if magic is not None else None
     witness["statfs_fstype"] = name
-    entry = mountinfo_for_device(witness["st_dev"])
-    witness["mountpoint"] = entry["mountpoint"] if entry else None
-    # The mount table's type wins: statfs says "fuse" for every FUSE filesystem, so it cannot
-    # tell cowfs from any other.
-    witness["fstype"] = (entry["fstype"] if entry else name)
-    witness["fstype_source"] = "mount table" if entry else ("statfs" if name else "unknown")
-    witness["mount_source"] = entry["source"] if entry else None
-    witness["mount_raw"] = entry["raw"] if entry else None
+    rows, _ = read_mountinfo()
+    entry = mountinfo_for_device(witness["st_dev"], real, rows)
+    if entry is None:
+        witness.update({"mountpoint": None, "fstype": name, "mount_source": None,
+                        "mount_raw": None, "mount_matched_by": None,
+                        "mount_ambiguous": False})
+        return witness
+    if entry.get("ambiguous") or entry.get("unreadable"):
+        # No fallback to another mount on the same device, and no fallback to the name statfs
+        # guesses. The type stays unstated, and a caller that requires one refuses the arm.
+        witness.update({"mountpoint": None, "fstype": None, "mount_source": None,
+                        "mount_raw": None, "mount_matched_by": None,
+                        "mount_ambiguous": bool(entry.get("ambiguous")),
+                        "mount_unreadable": bool(entry.get("unreadable")),
+                        "mount_ambiguity": entry.get("reason"),
+                        "mount_candidates": entry.get("candidates")})
+        return witness
+    witness["mountpoint"] = entry["mountpoint"]
+    witness["fstype"] = entry["fstype"]
+    witness["mount_source"] = entry["source"]
+    witness["mount_raw"] = entry["raw"]
+    witness["mount_matched_by"] = entry.get("matched_by")
+    witness["mount_ambiguous"] = False
     return witness
 
 
@@ -286,7 +358,7 @@ def attest(mountpoint, pidfile=None, expect_backend=None, expect_fstypes=None):
               "resolved_mountpoint": entry["mountpoint"], "fstype": entry["fstype"],
               "source": entry["source"], "raw": entry["raw"],
               "st_dev": device_of(mountpoint), "statfs_fstype": statfs_fstype(mountpoint),
-              "mount_entry": mountinfo_for_device(device_of(mountpoint))}
+              "mount_entry": mountinfo_for_device(device_of(mountpoint), os.path.normpath(mountpoint))}
     if expect_fstypes and entry["fstype"] not in expect_fstypes:
         result["ok"] = False
         result["status"] = "WRONG_FSTYPE"
@@ -310,11 +382,30 @@ def attest(mountpoint, pidfile=None, expect_backend=None, expect_fstypes=None):
     # declared. A path that resolves to the wrong filesystem is refused however it is named.
     # The mount table's type wins over statfs: statfs returns the generic "fuse" for every FUSE
     # filesystem, and the subtype that identifies cowfs is in the table's line, not in statfs.
-    fstype_seen = ((result.get("mount_entry") or {}).get("fstype")
-                   or result.get("statfs_fstype"))
+    mount_entry = result.get("mount_entry") or {}
+    # The device entry decides the answer only when the caller declared which filesystem type it
+    # expects. The native control declares none by default, so an unnameable device there is
+    # recorded and not fatal; --expect-native-fstype makes it fatal.
+    if mount_entry.get("ambiguous") and expect_fstypes:
+        result["ok"] = False
+        result["status"] = "AMBIGUOUS_MOUNT"
+        result.setdefault("notes", []).append(
+            "the device of %s backs more than one mount and the path does not say which: %s"
+            % (result["mountpoint"], mount_entry.get("reason")))
+    elif mount_entry.get("unreadable") and expect_fstypes:
+        result["ok"] = False
+        result["status"] = "MOUNT_TABLE_UNREADABLE"
+        result.setdefault("notes", []).append(
+            "the mount table could not be read, so the device of %s cannot be named: %s"
+            % (result["mountpoint"], mount_entry.get("reason")))
+    fstype_seen = (mount_entry.get("fstype") if not (mount_entry.get("ambiguous")
+                                                     or mount_entry.get("unreadable")) else None) \
+        or result.get("statfs_fstype")
     result["fstype_seen"] = fstype_seen
-    result["fstype_source"] = ("mount table" if (result.get("mount_entry") or {}).get("fstype")
-                               else "statfs" if result.get("statfs_fstype") else "unknown")
+    result["fstype_source"] = (
+        "mount table" if fstype_seen and not (mount_entry.get("ambiguous")
+                                               or mount_entry.get("unreadable"))
+        else "statfs" if result.get("statfs_fstype") else "unknown")
     if expect_fstypes and fstype_seen and fstype_seen not in expect_fstypes:
         result["ok"] = False
         result.setdefault("reasons", []).append(

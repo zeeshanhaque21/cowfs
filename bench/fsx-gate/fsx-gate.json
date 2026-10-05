@@ -86,10 +86,11 @@
   "caps": {
     "max_file_bytes": 262144,
     "max_op_bytes": 16384,
-    "max_bytes_written_per_arm": 7864320,
+    "max_bytes_written_per_arm": 3932160,
     "comment": "fsx's own defaults are a 256 KiB file and a 64 KiB operation; the op cap is lowered to 16 KiB so a seed stays modest. Byte caps are enforced by the runner, which refuses a data file over max_file_bytes and reports the total written per arm.",
-    "caps_note": "max_file_bytes and max_op_bytes reach fsx as -l and -o and the runner refuses a data file larger than max_file_bytes. max_bytes_written_per_arm is the whole-run budget per arm: the declared batch is 15 seed pairs, so 15 x 2 x max_file_bytes, and a run that exceeds it is reported FAIL after the fact rather than refused mid-run, because the per-file cap is the one fsx enforces and the total is this gate's own budget. recorded_op_window is fsx's own LOGSIZE, the ring buffer it keeps the recorded operations in. A mode whose difference has to be located runs within it; a mode compared by digest does not need to.",
-    "recorded_op_window": 10000
+    "caps_note": "max_file_bytes and max_op_bytes reach fsx as -l and -o and the runner reports a data file larger than max_file_bytes. max_bytes_written_per_arm is a whole-invocation total for ONE arm: one file per case on that arm, each at most max_file_bytes, which is 15 cases x 262144 = 3932160 bytes for the declared batch of 15 seed pairs. max_bytes_written_both_arms is the same figure for both arms together, 7864320. The plan is derived from the modes and seeds actually requested, so a narrowed run reports partial coverage rather than the batch's figure. A plan the per-arm total cannot hold is refused before any child exists, with both numbers in the refusal; an unexpected exceedance at run time is reported FAIL per arm, naming the arm, its bytes and its overage. Nothing is deleted to fit a budget.",
+    "recorded_op_window": 10000,
+    "max_bytes_written_both_arms": 7864320
   },
   "arms": [
     "native",
