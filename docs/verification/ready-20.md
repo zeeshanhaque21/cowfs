@@ -151,15 +151,34 @@ Reported, not silently taken.
   reason to stderr. Those two gates are still fail-open on an unavailable platform.
   They are not destructive, and they are not mine: report, do not widen.
 
+## Linux, on a real Linux
+
+The tree was copied to `moonscape@192.168.68.119` (Debian aarch64) under
+`/home/moonscape/cowfs-ready-wave/task-20/src`, 9.2 MB of source plus a 1.1 GB target directory, and
+run there under the wave's remote lock.
+
+`cargo check --locked -p cowfs-daemon -p cowfs-ctl -p cowfs-treehouse --all-targets -j2`: exit 0, no
+errors. This is what caught the `/proc` compile error a macOS-only check cannot see.
+
+`cargo test --locked -p cowfs-daemon --lib`: exit 0, **49 passed, 0 failed**.
+The four fewer than macOS are the `lsof`-specific cases, compiled out.
+The one that matters here is the same discriminating case, now driven entirely by `/proc`:
+
+```
+test holders::tests::a_holder_that_chdird_out_is_still_reported_and_only_by_its_descriptor ... ok
+```
+
+so the Linux scan does name a process whose working directory is elsewhere and does so through its
+open descriptor, and `a_prefix_that_cannot_be_resolved_is_unavailable_rather_than_clear` passes too,
+which is the fail-closed half on Linux.
+
 ## Remaining acceptance
 
-1. **Linux runtime behaviour.** The `/proc` and `/proc/locks` scan compiles and clippy-checks clean
-   on Linux, and `linux-fuse` CI is green, but the cowfs-daemon holder unit tests have not been
-   **run** on Linux: three bounded 600 s waits on the remote lane at
-   `/home/moonscape/cowfs-ready-wave/linux-heavy.lock` all returned exit 75.
-   Issue #20's work item "re-check on Linux (`gopsutil` reads `/proc`)" is therefore half done, and
-   FUSE, where there is no silly-rename, is untouched.
-2. **Independent review**, before merge. CI is green at the exact head.
+1. **FUSE.** The `fd`/`lock` scan has been run against the macOS NFS loopback, not against a real
+   FUSE mount, where there is no silly-rename and a held descriptor is a plain open file.
+   Issue #20's work item "re-check on Linux (`gopsutil` reads `/proc`) and on FUSE" is half done:
+   the `/proc` half is measured above, the FUSE half is not.
+2. **Independent review**, before merge. CI is green at the head.
 3. **The upstream proposal** is drafted at `docs/upstream-treehouse-proposal.md` section 3 and has
    **not** been sent. Section 3 gained one paragraph: an unanswered scan must not read as an empty
    one, which is the detail cowfs learned implementing it.
