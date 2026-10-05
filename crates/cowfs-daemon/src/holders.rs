@@ -940,36 +940,28 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         let inode = std::fs::metadata(&file).unwrap().ino().to_string();
 
-        // `flock FILE sleep` keeps one process for the whole run, so the descriptor and the lock
-        // belong to exactly the pid this test spawned, and killing it releases both.
-        let mut child = match Command::new("/usr/bin/flock")
-            .args(["-x", &file.to_string_lossy(), "sleep", "600"])
+        // One process, holding the descriptor and the lock, so killing it releases both and
+        // leaves nothing behind. `flock FILE sleep` is not that: util-linux forks, and the child
+        // inherits the open file description, so killing the wrapper does not release the lock.
+        let mut child = match Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys,time\nf=open(sys.argv[1],'r+')\nfcntl.flock(f,fcntl.LOCK_EX)\ntime.sleep(600)",
+                &file.to_string_lossy(),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
         {
             Ok(child) => child,
-            Err(_) => match Command::new("python3")
-                .args([
-                    "-c",
-                    "import fcntl,sys,time\nf=open(sys.argv[1],'r+')\nfcntl.flock(f,fcntl.LOCK_EX)\ntime.sleep(600)",
-                    &file.to_string_lossy(),
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(_) => {
-                    eprintln!(
-                        "skipping: neither /usr/bin/flock nor python3 is on this machine, so no \
-                         real lock can be taken here; the parser is covered by the captured rows"
-                    );
-                    return;
-                }
-            },
+            Err(_) => {
+                eprintln!(
+                    "skipping: no python3 on this machine, so no real lock can be taken here; the \
+                     parser is covered by the captured rows above"
+                );
+                return;
+            }
         };
         // Readiness from the kernel rather than from a sleep: the inode has to appear in the table
         // the parser reads. Only the last component of the device field is used here, so this does
