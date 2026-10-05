@@ -295,6 +295,7 @@ dependencies = [
 name = "cowfs-fuse"
 version = "0.0.0"
 dependencies = [
+ "cowfs-core",
  "cowfs-vfs",
  "cowfs-vfs-path",
  "cowfs-vfs-test",
