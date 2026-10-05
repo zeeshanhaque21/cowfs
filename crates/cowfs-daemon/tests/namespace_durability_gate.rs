@@ -20,6 +20,11 @@
 
 #![cfg(target_os = "macos")]
 
+#[path = "guard/reader.rs"]
+mod guard;
+
+use guard::{identity_matches, read_mount_table, signal_if_ours, MountState};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -96,7 +101,9 @@ struct Gate {
     store: PathBuf,
     mount: PathBuf,
     child: Option<Child>,
-    pids: Vec<u32>,
+    /// Every child this fixture spawned, with the identity it had at spawn time. A signal is only
+    /// ever sent after that identity is re-read and still matches.
+    identities: Vec<guard::ChildIdentity>,
 }
 
 impl Gate {
@@ -122,7 +129,7 @@ impl Gate {
             store,
             mount,
             child: None,
-            pids: Vec::new(),
+            identities: Vec::new(),
         }
     }
 
@@ -130,7 +137,8 @@ impl Gate {
         assert!(self.child.is_none(), "already running");
         let log = fs::File::create(self.dir.join("daemon.log")).expect("the daemon log");
         let err = log.try_clone().expect("a second log handle");
-        let child = Command::new(test_bin().join("cowfs-daemon"))
+        let bin = test_bin().join("cowfs-daemon");
+        let child = Command::new(&bin)
             .arg("--store")
             .arg(self.store.display().to_string())
             .arg("--mount")
@@ -146,10 +154,17 @@ impl Gate {
             .stderr(Stdio::from(log))
             .spawn()
             .expect("the daemon binary runs");
-        self.pids.push(child.id());
-        // Recorded before anything can fail, so a panic below still leaves `Drop` a pid to stop and
-        // a mounted filesystem it knows how to unmount. Asserting first leaked a live daemon and a
-        // live mount, and `Drop` then walked the mount.
+        // Identity captured here, before any mount wait and before anything can fail, so a panic
+        // below still leaves `Drop` a verified child to stop and a mount it knows how to unmount.
+        self.identities.push(guard::identity_for(
+            child.id(),
+            &bin,
+            &[OsStr::new("--store"), self.store.as_os_str()],
+            &self.store,
+            &self.socket,
+        ));
+        // Recorded before anything can fail. Asserting first leaked a live daemon and a live mount,
+        // and `Drop` then walked the mount.
         self.child = Some(child);
         let deadline = Instant::now() + SETTLE;
         while Instant::now() < deadline {
@@ -197,16 +212,19 @@ impl Gate {
     fn sigkill(&mut self) -> u32 {
         let mut child = self.child.take().expect("a running daemon");
         let pid = child.id();
-        debug_assert!(
-            self.pids.contains(&pid),
-            "every signalled pid was started here"
-        );
+        let identity = self
+            .identities
+            .iter()
+            .find(|i| i.pid == pid)
+            .cloned()
+            .unwrap_or_else(|| panic!("pid {pid} was never recorded as ours"));
         assert!(
-            Command::new("/bin/kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .status()
-                .is_ok_and(|s| s.success()),
+            identity_matches(&identity),
+            "refusing to SIGKILL {pid}: its identity no longer matches the daemon this test spawned"
+        );
+        assert_eq!(
+            signal_if_ours(&identity, "KILL"),
+            guard::SignalOutcome::Signalled,
             "could not SIGKILL {pid}"
         );
         let deadline = Instant::now() + SETTLE;
@@ -226,10 +244,12 @@ impl Gate {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let _ = Command::new("/bin/kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .status();
+        let pid = child.id();
+        // TERM only if the identity still matches; otherwise the handle below still stops a child
+        // this process owns, which needs no identity and cannot hit a stranger.
+        if let Some(id) = self.identities.iter().find(|i| i.pid == pid).cloned() {
+            let _ = signal_if_ours(&id, "TERM");
+        }
         let deadline = Instant::now() + SETTLE;
         while Instant::now() < deadline {
             if !running(&mut child) {
@@ -244,35 +264,75 @@ impl Gate {
 }
 
 impl Drop for Gate {
+    /// One absolute deadline for the whole teardown, computed once. A slow step cannot buy a later
+    /// step a fresh budget, which is how a fixture ends up taking minutes to fail.
     fn drop(&mut self) {
+        let deadline = Instant::now() + guard::TEARDOWN_BUDGET;
         self.stop();
-        // Only ever signal a pid this test started, by number, never a group.
-        for pid in &self.pids {
-            if running_pid(*pid) {
-                let _ = Command::new("/bin/kill")
-                    .arg("-KILL")
-                    .arg(pid.to_string())
-                    .status();
+
+        // Anything this fixture spawned that is still running. Each signal is preceded by a fresh
+        // identity read, and a mismatch is a preserve, not a signal. Children already reaped through
+        // their own handle have a free pid and are not signalled at all.
+        for id in &self.identities {
+            if !identity_matches(id) {
+                continue;
+            }
+            match signal_if_ours(id, "KILL") {
+                guard::SignalOutcome::Signalled => {}
+                guard::SignalOutcome::Refused(why) => {
+                    eprintln!("PRESERVE: pid {} not signalled: {why}", id.pid);
+                }
             }
         }
-        // macOS `umount` has no `-z`, so wait for the table to agree and never walk a live mount.
-        if cowfs_daemon::mounts::is_mounted(&self.mount) {
-            let _ = Command::new("/sbin/umount")
-                .arg("-f")
-                .arg(&self.mount)
-                .status();
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < deadline && cowfs_daemon::mounts::is_mounted(&self.mount) {
+
+        // Unmount, bounded, and only when the table actually names this path. macOS `umount` has no
+        // `-z`, so a successful exit must be confirmed against the table before anything is deleted.
+        let mut state = self.mount_state();
+        if state == MountState::Mounted {
+            let left = guard::CHILD_BUDGET.min(deadline.saturating_duration_since(Instant::now()));
+            if !left.is_zero() {
+                match guard::spawn_bounded(
+                    Path::new("/sbin/umount"),
+                    &[OsStr::new("-f"), self.mount.as_os_str()],
+                    &self.store,
+                    &self.socket,
+                    left,
+                ) {
+                    Ok(mut um) => {
+                        if !um.finished {
+                            eprintln!(
+                                "PRESERVE: umount of {} did not finish inside {left:?}, stopping it \
+                                 through its own handle",
+                                self.mount.display()
+                            );
+                            um.stop_owned();
+                        }
+                    }
+                    Err(e) => eprintln!("umount of {} could not start: {e}", self.mount.display()),
+                }
+            }
+            // Whatever happened above, the table decides whether this path is safe to walk.
+            let until = deadline.min(Instant::now() + Duration::from_secs(15));
+            while Instant::now() < until {
+                state = self.mount_state();
+                if state != MountState::Mounted {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-        if cowfs_daemon::mounts::is_mounted(&self.mount) {
+
+        // Fail closed. `Unknown` means the table could not be trusted, which means this path might
+        // still be a live mount, so nothing under it is touched.
+        if state != MountState::Absent {
             eprintln!(
-                "LEAK: {} is still in the mount table, leaving the tree alone",
+                "PRESERVE: {} is {state:?} in the mount table, leaving the store and fixture in \
+                 place rather than walking a filesystem that may still be mounted",
                 self.mount.display()
             );
             return;
         }
+
         for suffix in ["", ".lock"] {
             let _ = fs::remove_file(format!("{}{suffix}", self.socket.display()));
         }
@@ -282,18 +342,19 @@ impl Drop for Gate {
     }
 }
 
-/// True while a pid this test recorded is still there.
-///
-/// Output is discarded: `kill -0` on a pid this process already reaped prints "No such process"
-/// to stderr, which is a normal answer here rather than a problem worth putting in a test log.
-fn running_pid(pid: u32) -> bool {
-    Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+impl Gate {
+    /// Classifies this fixture's own mount point. Never used to decide anything on its own: the
+    /// answer decides whether `Drop` may delete, and only `Absent` allows that.
+    fn mount_state(&self) -> MountState {
+        let left = guard::CHILD_BUDGET;
+        let (state, reader) = read_mount_table(&self.mount, &self.store, &self.socket, left);
+        if let Some(mut r) = reader {
+            // The reader was spawned by this fixture and is finished or bounded; stopping it through
+            // its own handle cannot touch anything else.
+            r.stop_owned();
+        }
+        state
+    }
 }
 
 /// One rep: create the file, rename it, sync the way the case says, `SIGKILL` 2 to 6 ms later, and
