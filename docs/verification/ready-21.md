@@ -26,10 +26,17 @@ untouched, as the dispatch requires.
 
 ## What ran
 
+The script looks for `cowfs-daemon` and `cowfs` in `bench/out/ready-21/target/release` and exits 2
+without them, so the build must target that exact directory:
+
 ```sh
-cargo build --release -j4 -p cowfs-cli -p cowfs-daemon -p cowfs-gc   # private target dir
+export CARGO_TARGET_DIR="$PWD/bench/out/ready-21/target"
+cargo build --release --locked -j4 -p cowfs-cli -p cowfs-daemon -p cowfs-gc
 python3 scripts/verify-git-index-integrity.py --ops 42 --cookie-entries 2500
 ```
+
+Without `CARGO_TARGET_DIR` cargo writes to `./target/release` and the script exits 2 with
+`missing .../cowfs-daemon; build them into that directory first`.
 
 Both were run as one foreground invocation through the wave's `mac-heavy.lock`.
 
@@ -63,9 +70,14 @@ incompressible blobs so a zeroed region cannot hide inside plausible compressed 
 ## The declared window: 42 operations, bounded
 
 Not a soak.
-`--ops` is clamped to the 30..60 band and each operation is exactly one subprocess, or one
-deterministic fixture write, with its exit code read from `subprocess.returncode` directly, never
-through a pipeline.
+`--ops` selects the window size, and the usable range is 30..44, because `build_ops()` defines 44
+operations and is the authority on how many exist.
+The task text allows a band up to 60, but 45..60 does not exist.
+A request above 44 exits 3 and names the real ceiling rather than being silently sliced: a shortened
+window would report a smaller declared count than the caller asked for and then satisfy its own
+planned-equals-executed check.
+Each operation is exactly one subprocess, or one deterministic fixture write, with its exit code
+read from `subprocess.returncode` directly, never through a pipeline.
 
 | # | Operation | # | Operation | # | Operation |
 | --- | --- | --- | --- | --- | --- |
@@ -84,9 +96,22 @@ through a pipeline.
 | 13 | `verify-pack -v` | 27 | `add -A` | 41 | idx check |
 | 14 | write `src/main.txt` | 28 | `commit -m op4-topic` | 42 | `verify-pack -v` |
 
-"idx check" is `git show-index < every .idx`, which validates the idx magic and its own trailing
-SHA-1. "verify-pack" is `git verify-pack -v` on every idx, which reads every object the idx points
-at. Both are real git with real exit codes.
+"idx check" is `idx_integrity`, which requires `git show-index < every .idx` **and**
+`git verify-pack -v` **and** a present sibling `.pack` together.
+"verify-pack" is `git verify-pack -v` on every idx, which reads every object the idx points at.
+
+The combined requirement is load-bearing, and it was measured on git 2.56.0 and Apple's git 2.54.0:
+
+| idx mutation | `show-index` | `verify-pack` | `fsck --full` |
+| --- | --- | --- | --- |
+| pristine | 0 | 0 | 0 |
+| trailing SHA-1 last byte flipped | **0** | 1 | 1 |
+| whole idx zeroed, the historical shape | **0** | 1 | 27 |
+| truncated to half | 128 | 1 | 27 |
+
+`git show-index` returns **0 on a wholly zeroed idx** and 0 on a flipped trailing checksum byte,
+which is precisely the shape issue #21 describes.
+It is therefore a real check with a real exit code, but a weak one, and it never gates alone.
 
 **Executed / skipped: 42 / 0 on the native arm, 42 / 0 on the mount arm. Zero operations outside
 their declared exit codes on either arm.**
@@ -249,10 +274,82 @@ Recorded because they are the reason the harness is trustworthy: the native arm 
 "failure" both times, and only the control exposed them as harness bugs rather than cowfs bugs.
 A harness that ran the mount arm alone would have reported both as filesystem corruption.
 
+## Mount attestation, and why it is not a path check
+
+The mount arm has to be on a real Core NFS export, or two APFS runs of a deterministic seed agree
+with each other and the verdict reads clean for a run that never touched cowfs.
+`attest_mount_arm` fails closed unless all of the following hold, and records the evidence for each:
+
+- `mount`(8) has an exact parsed line for the mountpoint, not a substring hit
+- that line's fstype is `nfs`
+- the mount arm's `st_dev` differs from the native arm's
+- the mount arm's `st_dev` differs from the local scratch root the mountpoint sits in, which is the
+  real silent-fallback shape: a mount arm that is just a directory the harness made next to it
+- the serving process is alive, is this run's daemon by store, socket, start time and executable,
+  and its argv carries `--backend core`
+- a fresh write in the mount arm reads back the bytes written, on the foreign device
+
+Two negative controls run alongside it and must both hold their shape:
+two APFS directories with no mount line, and a mount arm that is a local directory while the native
+arm is a real repo.
+A detector that cannot fail there would let the false pass this gate exists to prevent through.
+
+The `mount` reader is tri-state and cannot read an absence out of a failed read.
+`PRESENT` requires an exact parsed match.
+`ABSENT` is reported only when the whole table read cleanly and every line parsed.
+`UNKNOWN` covers a reader that failed, timed out, returned nothing, or returned a line this parser
+cannot read.
+`stop()` keeps the process state and the mount state separate: a dead pid whose mount is still
+`PRESENT` or `UNKNOWN` is a quarantine, not a cleanup, and says so in the record.
+This harness never calls `umount` and never walks a mount, so it has no way to clear a mount it did
+not create.
+
+## Harness bugs the repair found
+
+Every one of these made the harness unable to report anything, and none of them is a cowfs bug.
+They were found by running it, not by reading it.
+
+1. **The mount parser could not parse this host's mount table at all.**
+   `split_mount_line` took the fstype from the source head, but a mount source carries no ` on ` of
+   its own, so all 17 real lines read as unparsed and the table degraded to `UNKNOWN` for every
+   target.
+   A one-character mountpoint was also rejected by an off-by-one.
+   fstype now comes from the first token inside the options list, which is where `mount`(8) prints
+   it.
+   Measured before: 17 of 17 lines unparsed. After: 0.
+2. **The attestation compared the mount arm against the mountpoint.**
+   The mountpoint is legitimately on the NFS device, so that comparison checked the export against
+   itself and rejected every correct run.
+   The first real private-mount run failed closed with "the arm resolved to local scratch" while
+   fstype was `nfs` and the device genuinely differed from the native arm.
+   It now compares against the mountpoint's parent, the local scratch directory.
+3. **The second operation of every window crashed the run.**
+   Recording an op's argv ended in `op['check']`, and a fixture write has neither a `git` nor a
+   `check` key, so `KeyError` aborted the run with a traceback.
+4. **Three gates read a top-level `rc` that a per-idx row does not carry.**
+   `run_idx_check` nests each single-kind exit code under that kind's key.
+   Both arms therefore failed `idx.show-index` and `idx.verify-pack` in the semantic checks and in
+   the reopen readback, so no run could ever report clean, and the verdict raised `KeyError` on
+   `idx_integrity` by reading the check dict at the wrong level.
+5. **A `pack.verify` op read the same missing key**, so every such op reported a false failure.
+6. **`tempfile` was used but never imported**, so the attestation's negative controls raised
+   `NameError` instead of running.
+7. **The window bounds were wrong.** `build_ops()` defines 44 operations, not 60, so a request for
+   45..60 was silently sliced to 44 and then compared against a planned-equals-executed check it
+   trivially satisfies. It now exits 3 and names the real ceiling.
+
+A post-repair run, its identity and its per-check exit codes are in
+`docs/verification/evidence/git-integrity21-repair.md`.
+
 ## Repeat
 
 `scripts/verify-git-index-integrity.py` is committed and runnable.
 It needs `cowfs-daemon` and `cowfs` built into `bench/out/ready-21/target/release`, `python3` with
 `blake3`, and `git`.
 It exits 0 only when every integrity check passed on both arms, and prints the per-check verdict.
-It accepts `--ops` in 30..60 and `--cookie-entries`.
+It accepts `--ops` in 30..44, `--cookie-entries`, `--bin-dir` and `--out`, and exits 0 clean,
+1 integrity failure, 2 prerequisite or refused invocation, 3 a window that does not exist, 4 the
+mount arm could not be proven so nothing was measured.
+
+Unit tests: `python3 scripts/test_verify_git_index_integrity.py`.
+They give every gate a negative control, and they start no daemon, mount nothing and send no signal.
