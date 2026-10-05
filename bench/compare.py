@@ -398,6 +398,13 @@ def main() -> int:
         else:
             print(f"{gate:<5} {len(a):>5} {len(b):>5} {ma:>9.4f} {mb:>9.4f} "
                   f"{'-':>7} {'-':>7} {'-':>7} {peak:>6.1f}  ", end="")
+        if math.isnan(la) or math.isnan(lb):
+            # max() and min() are not symmetric on NaN, so test the arms rather than the peak:
+            # max(quiet_finite, NaN) returns the quiet number and would launder the gap.
+            print(f"UNMEASURABLE: no finite load1 was recorded (native {la:.1f}, "
+                  f"cowfs {lb:.1f}), so the ceiling {LOAD_CEILING} cannot be checked")
+            unmeasurable += 1
+            continue
         if peak > LOAD_CEILING or skewed or math.isnan(med_r):
             print(f"UNMEASURABLE: load1 peak {peak:.1f} "
                   f"(native {la:.1f}, cowfs {lb:.1f}, ceiling {LOAD_CEILING}, "
