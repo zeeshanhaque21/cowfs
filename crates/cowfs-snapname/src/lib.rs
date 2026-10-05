@@ -92,7 +92,7 @@ pub fn validate_snapshot_name_bytes(name: &[u8]) -> Result<(), NameError> {
 /// Two names with the same key alias each other on a case-insensitive or normalising mount, so a
 /// backend refuses to hold both.
 ///
-/// Folding can grow a name past [`NAME_MAX`] (255 bytes of dotted capital I fold to 382 bytes), so
+/// Folding can grow a name past [`NAME_MAX`] (255 bytes of dotted capital I fold to 378 bytes), so
 /// a key longer than the bound is replaced by a hash of the folded form.
 /// That keeps the key a legal snapshot name, at the cost of a theoretical hash collision.
 pub fn name_key(name: &str) -> String {
