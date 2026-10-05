@@ -258,6 +258,21 @@ commits and the same compiler and the readback lane time was better spent on the
 | `cargo test -p cowfs-core --test chunks` | 4 passed, 0 failed | 0 |
 | `cargo test -p cowfs-gc --test regressions a_hole_is_never_swept` | 1 passed, 0 failed, 19 filtered out | 0 |
 
+CI, one snapshot, this exact head: run
+[37252542408](https://github.com/zeeshanhaque21/cowfs/actions/runs/37252542408) on `1afa4c3`, all three
+jobs `success`. Summing the run's own log archive, each job counted once:
+
+| job | suites | passed | failed | ignored |
+|---|---|---|---|---|
+| check (ubuntu-latest) | 134 | 1460 | 0 | 113 |
+| check (macos-latest) | 134 | 1458 | 0 | 61 |
+| linux-fuse | 8 | 103 | 0 | 0 |
+| total | 276 | **3021** | **0** | 174 |
+
+That run executed `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
+and `cargo test --workspace`. The previous head `4eac3a5`, which differs only by this record, ran
+[37250522681](https://github.com/zeeshanhaque21/cowfs/actions/runs/37250522681) with the same totals.
+
 Owned artifacts under `bench/out/ready-42/`: 2.3 GiB, inside the 8 GiB allowance.
 Free disk at the end: 391 GiB.
 
