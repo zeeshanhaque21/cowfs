@@ -503,13 +503,21 @@ fn a_created_name_is_barriered_even_when_the_attribute_step_fails() {
     );
 }
 
-/// The barrier is unconditional, so a refused `setattr` pays one.
+/// A refused `setattr` still issues exactly one namespace barrier.
 ///
-/// That is the honest cost and it is deliberate: the barrier commits whatever the snapshot already
-/// had queued, so a refusal arriving on top of earlier uncommitted writes still discharges them.
-/// Asserted here because the code and the documentation once disagreed about it.
+/// **What this pins, and what it does not.** It pins issuance and the caller's status: the barrier
+/// runs even though the RPC refuses, and exactly once. It does *not* pin a discharge, because
+/// `Watched` wraps `MemVfs`, which has no queue to inspect. An earlier name for this test,
+/// `..._what_was_already_queued`, promised more than the assertion could observe, which is the same
+/// over-claim this branch has been removing from the documentation.
+///
+/// The discharge claim is true, but it is verified structurally rather than here:
+/// `Vfs::sync_namespace` reaches `Inner::sync_ns_snapshot`, which calls `barrier`, which calls
+/// `flush_namespace_locked`, which drains that snapshot's queue. Observing it end to end would need
+/// a real `Core` with a queue that can be read back after a reopen, which this seam has no business
+/// standing up.
 #[test]
-fn a_refused_setattr_still_barriers_what_was_already_queued() {
+fn a_refused_setattr_still_issues_a_namespace_barrier() {
     let vfs = Watched::new();
     let (_s, mut c) = start(vfs.clone());
     let root = c.root.clone();
@@ -524,7 +532,7 @@ fn a_refused_setattr_still_barriers_what_was_already_queued() {
     assert_eq!(
         vfs.barriers(),
         vec![Call::SyncNs(c.attrs(&f).fileid)],
-        "the barrier runs on a refusal too, so a queued rename underneath it is not left behind"
+        "a refusal issues exactly one barrier, because the barrier is unconditional"
     );
 }
 

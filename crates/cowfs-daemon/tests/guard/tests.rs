@@ -289,6 +289,181 @@ fn a_command_that_outlives_its_budget_is_reported_not_awaited() {
     b.stop_owned();
 }
 
+/// The delete decision is the one that can destroy a live filesystem, so the controls below
+/// drive it with a counting closure and assert the counter never moves. No real mount is
+/// involved: every case is a synthetic `MountState`, which is what makes these safe to run
+/// before the fixture itself is exercised.
+#[test]
+fn a_mounted_or_untrusted_path_never_reaches_the_delete() {
+    for state in [MountState::Mounted, MountState::Unknown] {
+        for owned in [true, false] {
+            let calls = std::cell::Cell::new(0usize);
+            let out = cleanup(state, owned, "mnt", || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+            assert_eq!(
+                calls.get(),
+                0,
+                "{state:?} owned={owned} must never run the delete, got {out:?}"
+            );
+            assert!(
+                matches!(out, Cleanup::Preserved(_)),
+                "{state:?} must preserve, got {out:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn only_a_proven_absent_owned_path_is_deleted() {
+    let calls = std::cell::Cell::new(0usize);
+    let out = cleanup(MountState::Absent, true, "mnt", || {
+        calls.set(calls.get() + 1);
+        Ok(())
+    });
+    assert_eq!(calls.get(), 1);
+    assert_eq!(out, Cleanup::Removed);
+}
+
+#[test]
+fn an_absent_path_this_fixture_did_not_create_is_never_deleted() {
+    // The table proves nothing is mounted there, but that is not authority to delete a path
+    // belonging to someone else.
+    let calls = std::cell::Cell::new(0usize);
+    let out = cleanup(MountState::Absent, false, "mnt", || {
+        calls.set(calls.get() + 1);
+        Ok(())
+    });
+    assert_eq!(calls.get(), 0, "an unowned path must not be deleted");
+    assert!(matches!(out, Cleanup::Preserved(_)));
+}
+
+#[test]
+fn a_failed_remove_is_reported_as_preserved_not_as_removed() {
+    let out = cleanup(MountState::Absent, true, "mnt", || {
+        Err(std::io::Error::other("busy"))
+    });
+    assert!(
+        matches!(&out, Cleanup::Preserved(why) if why.contains("busy")),
+        "a failed remove must not read as a clean removal: {out:?}"
+    );
+}
+
+/// Startup must not contain a delete at all. A previous run that left a stale mount is exactly
+/// the case a fixed reused path created, and the old fixture answered it by walking that mount
+/// before anything had checked whether it was mounted.
+///
+/// Safe to run: the "old" directory is an ordinary private directory with a marker in it. If a
+/// delete ran, the marker would be gone, and the assertion says so.
+#[test]
+fn a_cancelled_previous_attempt_leaves_its_directory_untouched_at_startup() {
+    let base = std::env::temp_dir().join("d90-guard-cancelled");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).expect("a private base");
+
+    // What a cancelled run leaves behind: a directory at the exact path the next run would use.
+    let stale = base.join("mnt");
+    fs::create_dir_all(&stale).expect("the stale mount point");
+    let marker = stale.join("STALE-MARKER");
+    fs::write(&marker, b"a previous attempt left this").expect("a marker");
+
+    // A fresh name, which is what startup mints, and the stale path, which is what the old
+    // fixed-path fixture cleared. The refusal is asserted against the stale one.
+    let fresh = attempt(&base, "mnt");
+    assert!(
+        preflight(&fresh).is_ok(),
+        "a fresh unique root must pass preflight: {fresh:?}"
+    );
+    let collided = Attempt {
+        dir: stale.clone(),
+        store: stale.clone(),
+        mount: stale.clone(),
+        socket: fresh.socket.clone(),
+    };
+    let err = preflight(&collided).expect_err("a colliding path must refuse to start");
+    assert!(
+        err.contains("already exists"),
+        "the refusal must say what it found: {err}"
+    );
+    assert!(
+        marker.exists(),
+        "the stale directory must be exactly as it was found, marker and all"
+    );
+    assert_eq!(
+        fs::read(&marker).expect("the marker survives").as_slice(),
+        b"a previous attempt left this"
+    );
+    assert!(
+        !fresh.socket.exists(),
+        "a refused preflight must not have created the socket either"
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_fresh_attempt_mints_a_path_that_does_not_exist_yet() {
+    let base = std::env::temp_dir().join("d90-guard-fresh");
+    let _ = fs::remove_dir_all(&base);
+    let a = attempt(&base, "dirfsync");
+    let b = attempt(&base, "dirfsync");
+    assert_ne!(a.dir, b.dir, "two attempts must not share a root");
+    assert!(
+        preflight(&a).is_ok(),
+        "a fresh attempt must pass preflight: {a:?}"
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn the_socket_path_is_measured_in_bytes_not_characters() {
+    // Four 3-byte characters: 4 characters, 12 bytes. A limit checked in characters would pass
+    // this and the kernel would refuse the bind, because sun_path counts bytes.
+    let wide = "\u{4f60}\u{597d}\u{6d4b}\u{8bd5}";
+    let ascii = PathBuf::from("/tmp/abcd");
+    let wide_path = PathBuf::from(format!("/tmp/{wide}"));
+    assert_eq!(
+        socket_len(&ascii),
+        9,
+        "four ASCII characters plus the prefix"
+    );
+    assert_eq!(
+        socket_len(&wide_path),
+        17,
+        "four 3-byte characters plus the prefix"
+    );
+    assert!(
+        socket_len(&wide_path) > socket_len(&ascii),
+        "the byte count must differ from the character count, or the check proves nothing"
+    );
+    // The bound is applied to the byte count, and exactly at the limit is refused because the
+    // kernel needs a byte for its own terminator.
+    let just_under = PathBuf::from(format!("/tmp/{}", "a".repeat(SUN_PATH_MAX - 6)));
+    let just_over = PathBuf::from(format!("/tmp/{}", "a".repeat(SUN_PATH_MAX - 5)));
+    assert_eq!(socket_len(&just_under), SUN_PATH_MAX - 1);
+    assert!(socket_fits(&just_under));
+    assert_eq!(socket_len(&just_over), SUN_PATH_MAX);
+    assert!(
+        !socket_fits(&just_over),
+        "exactly at the limit must be refused"
+    );
+}
+
+/// The socket always lands on the short TMPDIR, whatever the attempt root is, which is the whole
+/// reason a long worktree path cannot push it past `sun_path`. Asserted rather than assumed.
+#[test]
+fn the_socket_stays_under_the_short_temp_dir_however_long_the_root_is() {
+    let base = std::env::temp_dir().join("deep".repeat(60));
+    let a = attempt(&base, "some-case-tag");
+    assert!(
+        a.socket.starts_with(std::env::temp_dir()),
+        "the socket must not be under the attempt root: {}",
+        a.socket.display()
+    );
+    assert!(socket_fits(&a.socket), "the minted socket path is too long");
+    println!("observed socket path: {} bytes", socket_len(&a.socket));
+}
+
 /// A command that finishes inside its budget is reported finished, so nothing signals it later.
 ///
 /// macOS only: it runs the real `/sbin/mount`, which does not exist on Linux, and the reader

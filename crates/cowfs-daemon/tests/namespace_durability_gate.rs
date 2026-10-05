@@ -23,7 +23,7 @@
 #[path = "guard/reader.rs"]
 mod guard;
 
-use guard::{identity_matches, read_mount_table, signal_if_ours, MountState};
+use guard::{cleanup, identity_matches, read_mount_table, signal_if_ours, MountState};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
@@ -107,27 +107,26 @@ struct Gate {
 }
 
 impl Gate {
+    /// Mints a fresh, unique attempt and only ever creates inside it.
+    ///
+    /// There is no cleanup here and that is the point. The previous version derived `dir`, `store`
+    /// and `mount` from a fixed name and recursively deleted any of them that already existed, which
+    /// meant a cancelled macOS CI job left a mount at exactly the path the next run walked, and it
+    /// walked it before the daemon, and therefore before any mount-state check, had a chance to run.
+    /// A fresh root means the question never arises, and `preflight` refuses a collision instead of
+    /// resolving it.
     fn new(case: &str) -> Gate {
         let tag = format!("gate-{case}");
-        let root = gate_dir();
-        let dir = root.join(&tag);
-        let store = root.join(format!("store-{tag}"));
-        let mount = root.join(format!("mnt-{tag}"));
-        for p in [&dir, &store, &mount] {
-            if p.exists() {
-                cowfs_vfs_path::force_remove_dir_all(p);
-            }
-        }
-        fs::create_dir_all(dir.join("pool")).expect("the export root");
-        fs::create_dir_all(&mount).expect("the mount point");
-        // `sun_path` is 104 bytes, so the socket goes on the short TMPDIR, not under this long path.
-        let socket =
-            std::env::temp_dir().join(format!("d90gate-{}-{tag}.sock", std::process::id()));
+        let paths = guard::attempt(&gate_dir(), &tag);
+        guard::preflight(&paths)
+            .unwrap_or_else(|why| panic!("refusing to start the fixture: {why}"));
+        fs::create_dir_all(paths.dir.join("pool")).expect("the export root");
+        fs::create_dir_all(&paths.mount).expect("the mount point");
         Gate {
-            dir,
-            socket,
-            store,
-            mount,
+            dir: paths.dir,
+            socket: paths.socket,
+            store: paths.store,
+            mount: paths.mount,
             child: None,
             identities: Vec::new(),
         }
@@ -169,9 +168,14 @@ impl Gate {
         let deadline = Instant::now() + SETTLE;
         while Instant::now() < deadline {
             if self.cli(&["status"]).is_ok() {
-                assert!(
-                    cowfs_daemon::mounts::is_mounted(&self.mount),
-                    "the daemon answered but nothing is mounted at {}",
+                // The local tri-state reader, not `cowfs_daemon::mounts::is_mounted`. That helper
+                // returns false both when `/sbin/mount` cannot be run and when its prefix match on
+                // unescaped output misses a path containing a space, and it belongs to another
+                // owner, so this fixture asserts readiness with the same reader it tears down with.
+                assert_eq!(
+                    self.mount_state(),
+                    MountState::Mounted,
+                    "the daemon answered but the mount table does not name {}",
                     self.mount.display()
                 );
                 return;
@@ -322,23 +326,25 @@ impl Drop for Gate {
             }
         }
 
-        // Fail closed. `Unknown` means the table could not be trusted, which means this path might
-        // still be a live mount, so nothing under it is touched.
-        if state != MountState::Absent {
+        // Fail closed, through the one seam that may authorise a recursive delete. `Mounted` and
+        // `Unknown` both preserve, and so does anything this fixture did not create.
+        let owned = true;
+        let verdict = cleanup(state, owned, "fixture", || {
+            for suffix in ["", ".lock"] {
+                let _ = fs::remove_file(format!("{}{suffix}", self.socket.display()));
+            }
+            cowfs_vfs_path::force_remove_dir_all(&self.dir);
+            cowfs_vfs_path::force_remove_dir_all(&self.store);
+            cowfs_vfs_path::force_remove_dir_all(&self.mount);
+            Ok(())
+        });
+        if let guard::Cleanup::Preserved(why) = verdict {
             eprintln!(
-                "PRESERVE: {} is {state:?} in the mount table, leaving the store and fixture in \
-                 place rather than walking a filesystem that may still be mounted",
+                "PRESERVE: {} is {state:?} in the mount table; {why}. The store and fixture are \
+                 left in place rather than walking a filesystem that may still be mounted",
                 self.mount.display()
             );
-            return;
         }
-
-        for suffix in ["", ".lock"] {
-            let _ = fs::remove_file(format!("{}{suffix}", self.socket.display()));
-        }
-        cowfs_vfs_path::force_remove_dir_all(&self.dir);
-        cowfs_vfs_path::force_remove_dir_all(&self.store);
-        cowfs_vfs_path::force_remove_dir_all(&self.mount);
     }
 }
 

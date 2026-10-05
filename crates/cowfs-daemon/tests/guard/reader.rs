@@ -12,12 +12,15 @@
 //! answers `Mounted`, `Absent` or `Unknown`, and only `Absent`, proven from a table that parsed and
 //! contained no entry for this exact path, permits a delete.
 //!
-//! Two rules hold throughout:
+//! Three rules hold throughout:
 //!
 //! - No signal is sent until the pid's identity is re-read and matches what this fixture recorded
 //!   when it spawned the child. A mismatch is a preserve, never a signal.
 //! - No destructive step runs on `Unknown`. An unreadable or unparseable mount table is treated as
 //!   "maybe mounted", which means the fixture keeps its store and reports a leak.
+//! - Startup never deletes anything. Every run mints a fresh unique root and only creates inside it,
+//!   so the destructive question does not arise at startup at all. A path that already exists is a
+//!   bug in the name generator, and the answer is a refusal, never a cleanup of the old one.
 
 #![allow(dead_code)]
 
@@ -63,7 +66,138 @@ pub const CHILD_BUDGET: Duration = Duration::from_secs(20);
 
 /// How long the whole teardown may take. Shared and absolute: it is computed once and never
 /// recreated per step, so a slow step cannot buy later steps a fresh budget.
+///
+/// This bounds a *test fixture* cleaning up after itself in `Drop`, nothing else. It is not a
+/// runtime deadline, not a timeout on the daemon or the filesystem, and not a promise to any
+/// caller: raising it does not change what a daemon does under load, and nothing in `cowfs-core`,
+/// `cowfs-nfs` or `cowfs-daemon` reads it. It exists so a wedged `umount` cannot hang a test run
+/// forever, and it was raised from 30 s to 60 s because a two-variant gate spends its teardown
+/// unmounting and re-reading the table, and 30 s left no headroom on a loaded host.
 pub const TEARDOWN_BUDGET: Duration = Duration::from_secs(60);
+
+/// The only decision that may authorise a recursive delete, and the only place a delete is
+/// performed. Everything that could destroy a live filesystem goes through here.
+///
+/// The two inputs are deliberately separate. `state` is what the mount table says, and `owned` is
+/// whether this fixture created the path. `Absent` alone is not enough: a fixture that never made
+/// the path has no business deleting it whatever the table says.
+pub fn cleanup(
+    state: MountState,
+    owned: bool,
+    label: &str,
+    remove: impl FnOnce() -> std::io::Result<()>,
+) -> Cleanup {
+    if state == MountState::Mounted {
+        return Cleanup::Preserved(format!(
+            "{label}: the mount table names this path, so it may be a live filesystem"
+        ));
+    }
+    if state == MountState::Unknown {
+        return Cleanup::Preserved(format!(
+            "{label}: the mount table could not be trusted, so this path may be a live filesystem"
+        ));
+    }
+    if !owned {
+        return Cleanup::Preserved(format!(
+            "{label}: absent, but this fixture did not create it"
+        ));
+    }
+    match remove() {
+        Ok(()) => Cleanup::Removed,
+        Err(e) => Cleanup::Preserved(format!("{label}: the remove failed, kept: {e}")),
+    }
+}
+
+/// What `cleanup` decided. `Removed` only ever means the fixture's own path, proven unmounted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Cleanup {
+    Removed,
+    Preserved(String),
+}
+
+/// The paths one attempt uses. Minted fresh per run, never reused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attempt {
+    /// The export root and everything this run writes.
+    pub dir: PathBuf,
+    pub store: PathBuf,
+    pub mount: PathBuf,
+    /// On the short TMPDIR, not under `dir`, because of `sun_path`.
+    pub socket: PathBuf,
+}
+
+/// `sun_path` is a fixed 104-byte buffer on macOS, and the limit is in *bytes* of the encoded path,
+/// not characters: a name with a multi-byte character in it is shorter in characters than the
+/// kernel measures. The daemon rejects a longer path at startup, so this is checked here first.
+pub const SUN_PATH_MAX: usize = 104;
+
+/// Mints a root that has not been used before, so startup has nothing to clear.
+///
+/// The name carries the pid, a nanosecond clock reading and a per-process counter, so two fixtures
+/// on one host, and two runs of the same fixture, cannot collide. It stays short on purpose: a
+/// long root is what pushes the socket past `SUN_PATH_MAX`.
+pub fn attempt(base: &Path, tag: &str) -> Attempt {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos() as u64 + d.as_secs());
+    let unique = format!("{}-{nanos:x}-{n:x}", std::process::id());
+    let root = base.join(format!("{tag}-{unique}"));
+    let socket = std::env::temp_dir().join(format!("d90-{unique}-{tag}.sock"));
+    Attempt {
+        dir: root.clone(),
+        store: root.join("store"),
+        mount: root.join("mnt"),
+        socket,
+    }
+}
+
+/// The length the kernel measures: the encoded bytes of the path, not its characters.
+pub fn socket_len(socket: &Path) -> usize {
+    socket.as_os_str().as_encoded_bytes().len()
+}
+
+/// Whether the kernel will accept this socket path.
+///
+/// Split out from `preflight` so the bound is a thing that can be asserted directly on any path,
+/// including ones `attempt` would never mint.
+pub fn socket_fits(socket: &Path) -> bool {
+    socket_len(socket) < SUN_PATH_MAX
+}
+
+/// Refuses to start inside a path that already exists, and never touches what is there.
+///
+/// This is the whole startup safety story: because every run mints a fresh root, the only way one
+/// can already exist is a name collision or a reused fixed path, and in both cases the right answer
+/// is to stop and say so. Cleaning it up would mean deleting a directory nobody has yet established
+/// is not a stale mount.
+pub fn preflight(a: &Attempt) -> Result<(), String> {
+    if !socket_fits(&a.socket) {
+        return Err(format!(
+            "the socket path is {} bytes, and sun_path holds {SUN_PATH_MAX}: {}",
+            socket_len(&a.socket),
+            a.socket.display()
+        ));
+    }
+    for (what, p) in [("dir", &a.dir), ("store", &a.store), ("mount", &a.mount)] {
+        if p.exists() {
+            return Err(format!(
+                "{what} already exists at {}: refusing to start rather than deleting a path this \
+                 fixture has not established is not a stale mount",
+                p.display()
+            ));
+        }
+    }
+    if a.socket.exists() {
+        return Err(format!(
+            "the socket already exists at {}: refusing to start",
+            a.socket.display()
+        ));
+    }
+    Ok(())
+}
 
 /// One attempt at running an external command, bounded, with its identity kept for a signal that
 /// may still be needed.

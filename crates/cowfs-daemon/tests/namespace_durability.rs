@@ -17,8 +17,11 @@
 
 #[path = "evidence/reader.rs"]
 mod evidence;
+#[path = "guard/reader.rs"]
+mod guard;
 
 use evidence::{Provenance, Row};
+use guard::{cleanup, MountState};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -129,27 +132,22 @@ struct Run {
 }
 
 impl Run {
+    /// Mints a fresh, unique attempt and only ever creates inside it.
+    ///
+    /// The previous version reused a fixed `{case}-rep{n}` name and recursively deleted whatever was
+    /// already there, mount point included, before the daemon and therefore before any mount-state
+    /// check could run. A cancelled run left exactly the path the next run walked.
     fn new(case: &str, rep: usize) -> Run {
         let tag = format!("{case}-rep{rep}");
-        let root = artifacts();
-        let dir = root.join(&tag);
-        let store = root.join(format!("store-{tag}"));
-        let mount = root.join(format!("mnt-{tag}"));
-        for p in [&dir, &store, &mount] {
-            if p.exists() {
-                cowfs_vfs_path::force_remove_dir_all(p);
-            }
-        }
-        fs::create_dir_all(dir.join("pool")).expect("the export root");
-        fs::create_dir_all(&mount).expect("the mount point");
-        // `sun_path` is 104 bytes, so the socket lives on the short TMPDIR, not under the long
-        // worktree path.
-        let socket = std::env::temp_dir().join(format!("d90-{}-{tag}.sock", std::process::id()));
+        let paths = guard::attempt(&artifacts(), &tag);
+        guard::preflight(&paths).unwrap_or_else(|why| panic!("refusing to start the run: {why}"));
+        fs::create_dir_all(paths.dir.join("pool")).expect("the export root");
+        fs::create_dir_all(&paths.mount).expect("the mount point");
         Run {
-            dir,
-            socket,
-            store,
-            mount,
+            dir: paths.dir,
+            socket: paths.socket,
+            store: paths.store,
+            mount: paths.mount,
             child: None,
         }
     }
@@ -179,9 +177,11 @@ impl Run {
         let deadline = Instant::now() + SETTLE;
         while Instant::now() < deadline {
             if self.cli(&["status"]).is_ok() {
-                assert!(
-                    cowfs_daemon::mounts::is_mounted(&self.mount),
-                    "the daemon answered but nothing is mounted"
+                assert_eq!(
+                    self.mount_state(),
+                    MountState::Mounted,
+                    "the daemon answered but the mount table does not name {}",
+                    self.mount.display()
                 );
                 self.child = Some(child);
                 return;
@@ -268,37 +268,78 @@ impl Run {
     }
 }
 
+impl Run {
+    /// Classifies this run's own mount point through the fail-closed reader, never through
+    /// `cowfs_daemon::mounts::is_mounted`, which reports `false` both when `/sbin/mount` cannot be
+    /// run and when its unescaped prefix match misses, and which belongs to another owner.
+    fn mount_state(&self) -> MountState {
+        let (state, reader) =
+            guard::read_mount_table(&self.mount, &self.store, &self.socket, guard::CHILD_BUDGET);
+        if let Some(mut r) = reader {
+            r.stop_owned();
+        }
+        state
+    }
+}
+
 impl Drop for Run {
+    /// One absolute deadline for the whole teardown, computed once. A slow step cannot buy a later
+    /// step a fresh budget. This bounds a test fixture cleaning up after itself and nothing else.
     fn drop(&mut self) {
+        let deadline = Instant::now() + guard::TEARDOWN_BUDGET;
         self.stop();
         // Never walk a tree that is still a mount point: a dead server turns the recursive delete
-        // into an unbounded hang. macOS `umount` has no `-z`, so wait for the table to agree.
-        let removable = if cowfs_daemon::mounts::is_mounted(&self.mount) {
-            let _ = Command::new("/sbin/umount")
-                .arg("-f")
-                .arg(&self.mount)
-                .status();
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < deadline && cowfs_daemon::mounts::is_mounted(&self.mount) {
+        // into an unbounded hang. macOS `umount` has no `-z`, so wait for the table to agree, and
+        // spawn it bounded, because `Command::status` has no timeout of its own.
+        let mut state = self.mount_state();
+        if state == MountState::Mounted {
+            let left = guard::CHILD_BUDGET.min(deadline.saturating_duration_since(Instant::now()));
+            if !left.is_zero() {
+                match guard::spawn_bounded(
+                    std::path::Path::new("/sbin/umount"),
+                    &[std::ffi::OsStr::new("-f"), self.mount.as_os_str()],
+                    &self.store,
+                    &self.socket,
+                    left,
+                ) {
+                    Ok(mut um) => {
+                        if !um.finished {
+                            eprintln!(
+                                "PRESERVE: umount of {} did not finish inside {left:?}",
+                                self.mount.display()
+                            );
+                            um.stop_owned();
+                        }
+                    }
+                    Err(e) => eprintln!("umount of {} could not start: {e}", self.mount.display()),
+                }
+            }
+            let until = deadline.min(Instant::now() + Duration::from_secs(15));
+            while Instant::now() < until {
+                state = self.mount_state();
+                if state != MountState::Mounted {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            !cowfs_daemon::mounts::is_mounted(&self.mount)
-        } else {
-            true
-        };
-        if !removable {
-            eprintln!(
-                "LEAK: {} is still in the mount table, leaving it alone",
-                self.mount.display()
-            );
         }
-        for suffix in ["", ".lock"] {
-            let _ = fs::remove_file(format!("{}{suffix}", self.socket.display()));
-        }
-        if removable {
+        // Fail closed. `Mounted` and `Unknown` both preserve, and the table decides, never a bool.
+        let owned = true;
+        let verdict = cleanup(state, owned, "run", || {
+            for suffix in ["", ".lock"] {
+                let _ = fs::remove_file(format!("{}{suffix}", self.socket.display()));
+            }
             cowfs_vfs_path::force_remove_dir_all(&self.dir);
             cowfs_vfs_path::force_remove_dir_all(&self.store);
             cowfs_vfs_path::force_remove_dir_all(&self.mount);
+            Ok(())
+        });
+        if let guard::Cleanup::Preserved(why) = verdict {
+            eprintln!(
+                "LEAK: {} is {state:?} in the mount table; {why}. The store and run are left in \
+                 place",
+                self.mount.display()
+            );
         }
     }
 }
@@ -512,10 +553,17 @@ fn native_helper() {
 #[test]
 #[ignore = "spawns and kills a helper; run with --ignored"]
 fn native_apfs_survives_the_same_recipe() {
-    let root = artifacts().join("native");
-    if root.exists() {
-        cowfs_vfs_path::force_remove_dir_all(&root);
-    }
+    // A fresh root each time. Nothing here is a mount point, so clearing a reused path would be
+    // harmless, but a fixed name that is cleared on sight is the pattern this repair removed
+    // everywhere else and it has no place left in this file.
+    let root = guard::attempt(&artifacts(), "native").dir;
+    guard::preflight(&guard::Attempt {
+        dir: root.clone(),
+        store: root.clone(),
+        mount: root.clone(),
+        socket: std::env::temp_dir().join("d90-native-control.sock"),
+    })
+    .unwrap_or_else(|why| panic!("refusing to start the native control: {why}"));
     fs::create_dir_all(&root).expect("the native directory");
     let mut child = Command::new(std::env::current_exe().expect("this test binary"))
         .args(["--exact", "native_helper", "--ignored", "--nocapture"])

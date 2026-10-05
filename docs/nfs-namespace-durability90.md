@@ -113,9 +113,15 @@ The price is one metadata sync on a refusal, observed around 4.6 ms on the host 
 from.
 `create` and `create_exclusive` do return before `durable_or` on a refusal, because they refuse
 before anything is mutated, so for those two the old claim happened to hold.
-`a_refused_setattr_still_barriers_what_was_already_queued` in
-`crates/cowfs-nfs/tests/ns_durability.rs` asserts the actual behaviour, so the code and this
-paragraph cannot drift apart again.
+
+`a_refused_setattr_still_issues_a_namespace_barrier` in
+`crates/cowfs-nfs/tests/ns_durability.rs` asserts the issuance and the caller's status, and it is
+named for exactly that.
+It does not assert a discharge, because the fake `Vfs` it wraps is `MemVfs` and has no queue to
+inspect; an earlier name for that test promised a discharge the assertion could not observe.
+The discharge claim rests on the structure instead: `Vfs::sync_namespace` reaches
+`Inner::sync_ns_snapshot`, which calls `barrier`, which calls `flush_namespace_locked`, which drains
+that snapshot's queue.
 
 The two statuses in that precedence are distinct on the wire, which is what makes it checkable.
 The attribute fault is `PermissionDenied`, which `nfsstat` maps to `NFS3ERR_ACCES`, and the barrier
