@@ -34,12 +34,13 @@ use super::{control_meta, validate_snapshot_name, ControlError, Core, SnapshotEn
 use crate::util::MutexExt as _;
 
 const SWAP_PREFIX: &str = "swap-";
-/// Reserved in snapshot names: see the module docs.
-pub(crate) const STAGING: &str = ".cowfs-swap";
+/// Reserved in snapshot names: see the module docs. The marker and the rule that refuses it live
+/// in `cowfs-snapname`, so the control API refuses these names too.
+pub(crate) const STAGING: &str = cowfs_snapname::RESERVED;
 
 /// True for a name only the swap may use.
 pub(crate) fn is_staging(name: &str) -> bool {
-    name.contains(STAGING)
+    cowfs_snapname::is_reserved(name)
 }
 
 fn intent_path(root: &Path, target: &str) -> PathBuf {

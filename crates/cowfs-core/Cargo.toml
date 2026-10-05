@@ -11,9 +11,9 @@ publish.workspace = true
 cowfs-store = { path = "../cowfs-store" }
 cowfs-gc = { path = "../cowfs-gc" }
 cowfs-meta = { path = "../cowfs-meta" }
+cowfs-snapname = { path = "../cowfs-snapname" }
 cowfs-vfs = { path = "../cowfs-vfs" }
 fs2 = "0.4"
-unicode-normalization = "0.1"
 thiserror.workspace = true
 
 [dev-dependencies]
