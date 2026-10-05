@@ -5,13 +5,14 @@
 //! lives in `cowfs-snapname`; this is the regression that fails if a copy comes back.
 //!
 //! No aliasing pair is in the table on purpose: two names that fold onto one another are one name,
-//! so the backend's answer would be `Exists` for a name the control API calls legal.
+//! so the backend would answer `Exists` for a name the control API calls legal.
 
 use cowfs_core::{name_key, Core, Options};
 
+/// The exact name `Core`'s swap derives for target `conf_base`, so the collision is the real one.
 const RESERVED: &str = "conf_base.cowfs-swap0";
 
-/// A real store, and the table of names both surfaces must judge the same way.
+/// Every name the two surfaces must judge the same way.
 const TABLE: &[&str] = &[
     "",
     ".",
@@ -29,6 +30,7 @@ const TABLE: &[&str] = &[
     "slot-1",
     "conf_base",
     "conf_slot",
+    // legal: the reserved marker needs its leading dot, so this is not one
     "cowfs-swap",
     RESERVED,
     "conf_base.cowfs-swap1",
@@ -36,17 +38,22 @@ const TABLE: &[&str] = &[
     "a.cowfs-swap0/repo",
 ];
 
+/// The names of [`TABLE`] the rule refuses and the leading-dot rule does not, so only the reserved
+/// marker refuses them.
+const RESERVED_NAMES: &[&str] = &[
+    "conf_base.cowfs-swap0",
+    "conf_base.cowfs-swap1",
+    "conf_base.cowfs-swap",
+    "a.cowfs-swap0/repo",
+];
+
+/// Every legal name in [`TABLE`], sorted.
+const LEGAL: &[&str] = &["a", "caf\u{e9}", "conf_base", "conf_slot", "cowfs-swap", "slot-1"];
+
 #[test]
 fn a_real_store_holds_exactly_the_names_the_control_api_accepts() {
     let dir = tempfile::tempdir().unwrap();
-    let core = Core::open(
-        dir.path(),
-        Options {
-            background: false,
-            ..Default::default()
-        },
-    )
-    .expect("a store opens");
+    let core = open(dir.path());
 
     for name in TABLE {
         let api = cowfs_ctl::validate_snapshot_name(name);
@@ -63,7 +70,7 @@ fn a_real_store_holds_exactly_the_names_the_control_api_accepts() {
         }
     }
 
-    // the reserved name is also unreachable through the other two entry points, and refusing it
+    // a reserved name is unreachable through the other two entry points too, and refusing it
     // leaves the snapshot it was derived from exactly as it was
     assert!(core.snapshot_view(RESERVED).is_err());
     assert!(core.rename_snapshot("conf_base", RESERVED).is_err());
@@ -72,26 +79,29 @@ fn a_real_store_holds_exactly_the_names_the_control_api_accepts() {
         .unwrap()
         .iter()
         .any(|e| e.name == "conf_base"));
-
-    let mut held: Vec<_> = core
-        .list_snapshots()
-        .unwrap()
-        .into_iter()
-        .map(|e| e.name)
-        .collect();
-    held.sort();
     assert_eq!(
-        held,
-        [
-            "a",
-            "caf\u{e9}",
-            "conf_base",
-            "conf_slot",
-            // legal: the marker needs its leading dot, so this is not a reserved name
-            "cowfs-swap",
-            "slot-1",
-        ],
-        "the store must hold every legal name in the table and nothing else",
+        held(&core),
+        LEGAL,
+        "the store must hold every legal name in the table and nothing else"
+    );
+
+    // and again after the store is reopened from the directory, so nothing is answered from a cache
+    drop(core);
+    let reopened = open(dir.path());
+    assert_eq!(
+        held(&reopened),
+        LEGAL,
+        "a reopened store holds other names"
+    );
+    for name in RESERVED_NAMES {
+        assert!(reopened.create_snapshot(name).is_err(), "{name:?}");
+        assert!(reopened.snapshot_view(name).is_err(), "{name:?}");
+        assert!(cowfs_ctl::validate_snapshot_name(name).is_err(), "{name:?}");
+    }
+    assert_eq!(
+        held(&reopened),
+        LEGAL,
+        "a refused name must not have been stored"
     );
 }
 
@@ -123,7 +133,6 @@ fn the_control_api_and_the_backend_produce_the_same_collision_key() {
 
 #[test]
 fn a_staging_name_is_refused_by_the_control_api_before_it_reaches_the_backend() {
-    // the exact name `Core`'s swap derives for target `conf_base`, so this is the real collision
     assert!(cowfs_core::validate_snapshot_name(RESERVED).is_err());
     let err = cowfs_ctl::validate_snapshot_name(RESERVED).expect_err("must be refused");
     assert_eq!(err.code, cowfs_ctl::ErrorCode::InvalidParams, "{err}");
@@ -146,6 +155,28 @@ fn bytes_from_a_wire_go_through_the_same_rule() {
         cowfs_core::validate_snapshot_name_bytes(&[0xff, 0xfe]).unwrap_err(),
         cowfs_core::ControlError::InvalidName("not valid UTF-8"),
     );
+}
+
+fn open(path: &std::path::Path) -> Core {
+    Core::open(
+        path,
+        Options {
+            background: false,
+            ..Default::default()
+        },
+    )
+    .expect("a store opens")
+}
+
+fn held(core: &Core) -> Vec<String> {
+    let mut names: Vec<_> = core
+        .list_snapshots()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    names
 }
 
 fn verdict<T, E: std::fmt::Debug>(r: &Result<T, E>) -> &'static str {
