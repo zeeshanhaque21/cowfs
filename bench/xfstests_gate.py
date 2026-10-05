@@ -1,42 +1,58 @@
 #!/usr/bin/env python3
-"""Gate g5: xfstests-generic, matched native and cowfs arms, fail closed.
+"""cowfs success criterion 2, gate g5: xfstests-generic, matched arms, fail closed.
 
 Usage:
   xfstests_gate.py preflight --xfstests DIR --out DIR
-  xfstests_gate.py classify  --xfstests DIR [--out DIR]
+  xfstests_gate.py classify  --xfstests DIR [--out DIR] [--verbose]
   xfstests_gate.py run       --xfstests DIR --native-root DIR --cowfs-root DIR
-                             --out DIR [--cases IDS] [--timeout SECS]
+                             --out DIR [--cases IDS] [--timeout SECS] [--require-full]
   xfstests_gate.py report    --run DIR
 
 The gate answers one question: for the generic cases it is allowed to run, is
 cowfs no worse than a native directory?  Everything else refuses.
 
-Three things make a run a real measurement rather than a claim.
+Five properties make a run a measurement rather than a claim.  Each one exists
+because a simpler version of this gate was wrong.
 
-1. Prerequisite gate.  The suite has its own startup gate in `common/config`:
-   it calls `_fatal` for a missing `mkfs`, `mount`, `umount`, `perl`, `awk`,
-   `sed`, `df`, `xfs_io`, `$here/ltp/fsstress` and `$here/ltp/fsx`, and
-   `_fatal` is an exit.  So one missing helper means zero cases run, not a
-   partial pass.  `preflight` checks each of them by name and by running the
-   suite's own check, so the answer is evidence and not inference.  A missing
-   prerequisite prints UNMEASURABLE and exits 2.  It never prints PASS.
-2. Static safety classification.  Every `tests/generic/*` is classified from its
-   own source before anything runs.  A case that formats, mounts, loops,
-   repartitions, needs root or names an absolute path in a destructive command
-   is refused, with the line that proves it.  Only the reviewed allowlist in
-   `bench/xfstests-allowlist.txt` may run, and only while it still matches the
-   tree it was reviewed against.
-3. Matched arms and exact exit codes.  Both arms run the same case id with the
-   same harness-generated environment, each in its own immutable per-case
-   directory that must be empty before the run.  The exit code is captured from
-   the child process itself, never from a pipeline.  Each case appends and
-   flushes one JSONL line, so an interrupted run keeps every finished case.
+1.  Arms run where they were told to run.  Each arm's per-case directory is
+    created inside its own `--native-root` or `--cowfs-root`, and the case itself
+    reports the directory it was given, the device that directory is on and the
+    filesystem type.  Roots that are the same directory, one inside the other, a
+    symlink to each other, or indistinguishable by device and mount are refused.
+    The two arms are never the same filesystem, and the cowfs arm must be a FUSE
+    mount whose fstype is not the native arm's.  Logs and meta stay under --out.
+
+2.  The suite's own gate decides.  `common/config` calls `_fatal` for a missing
+    mkfs, mount, umount, perl, awk, sed, df, xfs_io, ltp/fsstress or ltp/fsx, so
+    one absent helper means zero cases run rather than a partial pass.
+    `preflight` checks each by name and then runs a real case.  A missing
+    prerequisite prints UNMEASURABLE and exits 2.  There is no code path from a
+    missing prerequisite to PASS.
+
+3.  Success needs positive evidence.  Exit 0 is necessary and not sufficient.
+    A case scores only when the observer block it printed is present and
+    complete, it names the case that was asked for, it did real I/O inside its
+    own test directory, and its own status was 0.  An empty log, a whitespace
+    log, a no-op, a log that merely looks like a pass, and a pass printed for the
+    wrong case are all INVALID.  A case whose outcome is a skip or a refusal is
+    classified before any comparison happens, and neither arm's skip is ever
+    ignored.
+
+4.  Source is pinned, not named.  The allowlist carries the tree sha, the case
+    sha of every allowlisted case, and the sha of every `common/*` file those
+    cases pull in.  Every attempt re-reads the tree and re-hashes those files and
+    refuses before the first subprocess when any of them moved, when the worktree
+    is dirty, or when the reviewed set drifted.  A per-case source hash is
+    recorded next to every executed case.
+
+5.  Only what was measured is recorded.  Capability notes are probe results,
+    never literals.  A report on a FAIL or INVALID run exits nonzero.
 
 Exit codes, the same set `bench/compare.py` uses:
-  0  PASS       every measured case passed on both arms
-  1  FAIL       cowfs failed a case native passed
+  0  PASS          every measured case passed on both arms
+  1  FAIL          cowfs failed a case native passed
   2  UNMEASURABLE  nothing was measured, or a prerequisite was absent
-  3  INVALID    the request or the harness itself is wrong
+  3  INVALID       the request, the source pin or the harness is wrong
 
 Environment:
   COWFS_XFSTESTS_SRC   default: the xfstests tree to measure
@@ -44,6 +60,7 @@ Environment:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -56,9 +73,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 ALLOWLIST_FILE = HERE / "xfstests-allowlist.txt"
+CASE_ID_RE = re.compile(r"[0-9]+")
+DEFAULT_TIMEOUT = 300
+DEFAULT_SPACE_CAP = 1 << 30
+NR_OPS_MIN = 100_000
 
-# A case is refused when its source matches one of these.  The reason string is
-# what lands in the record, so a refusal is auditable without reading the case.
+# --- what a case may not do -------------------------------------------------
+
 NEEDS_DEVICE = (
     (r"\bmkfs\b", "formats a filesystem"),
     (r"\blosetup\b", "attaches a loop device"),
@@ -66,11 +87,12 @@ NEEDS_DEVICE = (
     (r"\bmodprobe\b", "loads a kernel module"),
     (r"\bswapon\b|\bmkswap\b", "swaps"),
     (r"\bdmsetup\b", "creates a device mapper target"),
-    # `mount` is matched without a leading word boundary on purpose: the suite
-    # calls it through wrappers like `_test_cycle_mount` and `remount`, and both
-    # are a mount. The lookbehind keeps the word "amount" out.
+    # `mount` without a leading word boundary on purpose: the suite calls it
+    # through wrappers like `_test_cycle_mount` and `remount`.
     (r"(?<![a-z])mount|remount|umount", "mounts, remounts or unmounts"),
-    (r"/dev/", "writes to a device node"),
+    # `/dev/null` and friends appear in nearly every case, so only a device
+    # node that is not one of the standard character devices counts.
+    (r"/dev/(?!null\b|zero\b|full\b|random\b|urandom\b|tty\b)", "writes to a device node"),
     (r"\bparted\b|\bsgdisk\b|\bfdisk\b", "repartitions"),
     (r"\bdebugfs\b|\btune2fs\b|\bresize2fs\b|\be2fsck\b|\bxfs_repair\b", "runs a filesystem repair tool"),
     (r"\bsysctl\b", "changes a kernel parameter"),
@@ -83,45 +105,38 @@ NEEDS_ROOT = (
     (r"\b_runas\b", "switches to another user with _runas"),
     (r"\b_user_do\b|\b_su\b", "runs a command as another user, which needs root"),
     (r"\bmknod\b", "creates a device node, which needs root"),
-    (r"\bRequire_mknod\b|_require_mknod\b", "requires mknod, which needs root"),
+    (r"_require_mknod\b", "requires mknod, which needs root"),
     (r"\bchown\b", "changes file ownership, which needs a second user or root"),
     (r"\bchgrp\b", "changes a group, which needs a second group or root"),
     (r"\buseradd\b|\bgroupadd\b", "creates a user or group"),
     (r"\bchroot\b", "chroots"),
     (r"/proc/sys/", "writes to /proc/sys"),
 )
-# Space the run cannot spend. A sparse file this size is still a real
-# allocation on the arm under test, and the arms are an SD card and a FUSE mount.
-SIZE_RE = re.compile(r"\btruncate\s+-s\s+([0-9]+)([KMGT])?")
-SIZE_UNIT = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
-DEFAULT_SPACE_CAP = 1 << 30
 NEEDS_SCRATCH = (
     (r"\b_require_scratch\b", "requires a scratch device"),
     (r"\bSCRATCH_DEV\b", "uses SCRATCH_DEV"),
     (r"\bSCRATCH_MNT\b", "uses SCRATCH_MNT"),
     (r"\b_require_scratch_nocheck\b", "requires a scratch device"),
 )
-# Runtime the gate will not spend. A soak case is the suite's own label for one
-# that runs for hours, and an explicit six-figure op count is the same thing
-# written out.
 NEEDS_LONG = (
     (r"_begin_fstest[^\n]*\b(soak|long)\b", "the suite groups it as soak or long-running"),
     (r"\bSOAK_DURATION\b", "honours a soak duration"),
 )
 NR_OPS_RE = re.compile(r"nr_ops=\$\(\(?([0-9]+)")
-NR_OPS_MIN = 100_000
-# Helper binaries and shell wrappers that live outside the case source, so a
-# case can need one without naming it.  `_run_*` wrappers and `*_PROG`
-# variables are how common/rc reaches most of them.
 HELPER = (
+    # The attr/acl surface. Kept explicit rather than folded into the catch-all,
+    # because these names appear as bare words and a case can reach all of them.
+    (r"\bgetfacl\b|\bsetfacl\b", "uses getfacl/setfacl"),
+    (r"\bchacl\b|\bgetfacl\b", "uses the acl tools"),
+    (r"\bfs_id\b|\b_t\b\s+-c\b", "uses filesystem id helpers"),
+    (r"\b_nfacl\b|\bnfacl\b", "uses nfacl"),
+    (r"\bSYSACL\b|\bsysctl\b", "reads or sets a sysctl"),
     (r"\$SRC_DIR|\$\{SRC_DIR\}", "reaches the helper tree by SRC_DIR"),
-    # `$here` is the tree root, and `$here/src/...` is how a case names a helper
-    # binary that lives in the suite's own build output.
     (r"\$here\b|\$\{here\}", "reaches the helper tree by $here"),
     (r"\brun_[a-z0-9_]+\b", "runs a helper through a common/rc wrapper"),
     (r"_run_[a-z0-9_]+", "runs a helper through a common/rc wrapper"),
-    # Every helper binary the suite exposes is a `*_PROG` variable, so this is
-    # the catch-all: a case naming one needs a built helper this host may not have.
+    # Every helper the suite exposes is a `*_PROG` variable, so this catches a
+    # case that names one without saying which.
     (r"\b[A-Z][A-Z0-9_]*_PROG\b", "names a suite helper program"),
     (r"\$(AIO_TEST|BIO_TEST)\b", "names a helper binary from common/rc"),
     (r"\bXFS_IO_PROG\b", "uses xfs_io"),
@@ -137,21 +152,20 @@ HELPER = (
     (r"\bchattr\b|\blsattr\b", "uses lsattr"),
     (r"\bINPROG_", "uses a progress helper"),
 )
-# A destructive command naming an absolute path outside the arm roots would
-# reach outside this run.  Variables are fine: they are the harness's own paths.
-DESTRUCTIVE = re.compile(
-    r"\b(rm|rmdir|unlink|shred|mv|cp|dd|truncate|chmod|chown|mkfifo|mknod)\b[^|;&]*"
-)
+DESTRUCTIVE = re.compile(r"\b(rm|rmdir|unlink|shred|mv|cp|dd|truncate|chmod|chown|mkfifo|mknod)\b[^|;&]*")
 ABS_PATH = re.compile(r"(?<![\w$.])/(?:[A-Za-z0-9_.+-]+/)*[A-Za-z0-9_.+-]+")
-SAFE_ABS_PREFIX = ("/bin/", "/usr/bin/", "/usr/sbin/", "/sbin/", "/usr/local/bin/", "/proc/", "/dev/null", "/dev/zero", "/dev/urandom")
-# common/* a case may source.  Anything else is code this harness has not read.
+SAFE_ABS_PREFIX = ("/bin/", "/usr/bin/", "/usr/sbin/", "/sbin/", "/usr/local/bin/",
+                   "/proc/", "/dev/null", "/dev/zero", "/dev/urandom")
 ALLOWED_SOURCES = {
     "preamble", "rc", "filter", "list", "config", "promotion",
     "ftruncate.inc", "util", "attr", "pwrite-buffers", "rc.local",
 }
 SOURCE_RE = re.compile(r"^\s*\.\s+\./([a-z]+)/([A-Za-z0-9_.-]+)", re.M)
-# The suite's own startup gate, common/config, in the order it checks.  A missing
-# entry is fatal for every case, so `preflight` reports the line that stops it.
+SIZE_RE = re.compile(r"\btruncate\s+-s\s+([0-9]+)([KMGT])?")
+SIZE_UNIT = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+
+# --- the suite's own startup gate, in the order common/config checks it -----
+
 STARTUP_GATE = [
     ("mkfs", "common/config:114 mkfs not found"),
     ("mount", "common/config:117 mount not found"),
@@ -162,119 +176,435 @@ STARTUP_GATE = [
     ("df", "common/config:143 df not found"),
     ("xfs_io", "common/config:147 xfs_io not found"),
 ]
-# $here/ltp/... are checked as files, not as PATH entries.
 STARTUP_GATE_FILES = [
     ("ltp/fsstress", "common/config:123 fsstress not found or executable"),
     ("ltp/fsx", "common/config:126 fsx not found or executable"),
 ]
-# Signatures that mean the case did not assert what its exit code claims.  A case
-# whose log carries one is INVALID, never a pass.  This is the failure the first
-# probe of this gate hit: a test that could not find a helper compared nothing
-# and still exited 0.
-SKIP_SIGNATURES = (
-    (re.compile(r"command not found"), "a command was missing"),
-    # A missing helper is the failure this gate exists to catch, and it names a
-    # path under the suite's own helper directories. A case that expects ENOENT
-    # on a data file it created must not be flagged for that, so the path is part
-    # of the pattern rather than the message.
-    (re.compile(r"(No such file or directory.*(/src/|/ltp/))|((/src/|/ltp/)\S*.*No such file or directory)"),
-     "a suite helper binary was missing"),
-    (re.compile(r"unary operator expected|bad substitution"), "a shell comparison was malformed, so its assertion did not run"),
-    (re.compile(r"_notrun|\bnotrun\b"), "the case refused to run"),
-    (re.compile(r"Test not run|\bSkipped\b"), "the case skipped work"),
-    (re.compile(r"\bFAIL\b"), "the log reports a failure"),
-)
+# Files the suite build generates that are read as data, not executed. Separate
+# from STARTUP_GATE_FILES because the executable bit is the wrong test for them.
+STARTUP_GATE_DATA = [
+    # `check` resolves a testlist entry by grepping it against the group's
+    # group.list. Without it check answers "unknown test, ignored", runs nothing,
+    # and its summary line then describes zero executed cases.
+    ("tests/generic/group.list", "check:370 cannot resolve a testlist entry without group.list"),
+]
+# Which PATH an operator needs. Recorded, not asserted: the value below is only
+# a hint, and `preflight` reports what PATH it actually used.
+SBIN_PATH_HINT = "/usr/sbin:/sbin"
 
 VERDICT_OK = "PASS"
 VERDICT_FAIL = "FAIL"
 VERDICT_UNMEASURABLE = "UNMEASURABLE"
 VERDICT_INVALID = "INVALID"
 
+# Case outcome, classified before any comparison between the two arms.
+OUTCOME_PASSED = "PASSED"
+OUTCOME_FAILED = "FAILED"
+OUTCOME_SKIPPED = "SKIPPED"
+OUTCOME_REFUSED = "REFUSED"
 
-def arm_env(base, fstype, tmpdir, result_dir, tests_root):
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sha_of(items):
+    return hashlib.sha256("\n".join(items).encode()).hexdigest()
+
+
+def tests_dir(tree):
+    """`tree` is the xfstests tree root, the directory that holds tests/."""
+    return Path(tree).resolve() / "tests"
+
+
+def which_all(names, path=None):
+    return {n: shutil.which(n, path=path) for n in names}
+
+
+def arm_env(base, tmpdir, result_dir, tree_root):
+    """The environment a case runs under. Identical for both arms except base."""
     return {
         "TEST_DIR": base,
         "TEST_DEV": base,
         "SCRATCH_DEV": "",
         "SCRATCH_MNT": "",
         # FSTYP stays empty on both arms on purpose: every fstype-specific block
-        # in common/config wants mkfs.<fstype>, and this host has no block
-        # capability to spend on one.  Setting it empty is symmetric, and it is
-        # the only setting that keeps the two arms comparable.
+        # in common/config wants mkfs.<fstype>, and this gate has no block
+        # capability to spend on one. Empty is also the only value that keeps
+        # the two arms comparable.
         "FSTYP": "",
         "TMPDIR": tmpdir,
         "XFSTESTS_TEST_TMPDIR": tmpdir,
         "RESULT_DIR": result_dir,
-        "here": str(tests_root),
+        "here": str(tree_root),
         "MSGVERB": "text:action",
         "QA_CHECK_FS": "true",
         "DIFF_LENGTH": "10",
     }
 
 
-def which_all(names, path):
-    return {n: shutil.which(n, path=path) for n in names}
-
-
 def git_provenance(root):
     rec = {"path": str(root), "git": False}
-    if not (root / ".git").exists() and not shutil.which("git"):
-        rec["detail"] = "no .git and no git"
+    if not shutil.which("git"):
+        rec["detail"] = "no git"
         return rec
     try:
         sha = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
                              capture_output=True, text=True, timeout=60)
         rec["git"] = sha.returncode == 0
-        if rec["git"]:
-            rec["sha"] = sha.stdout.strip()
-            when = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%cI"],
-                                  capture_output=True, text=True, timeout=60)
-            rec["committed"] = when.stdout.strip()
-            dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain"],
-                                   capture_output=True, text=True, timeout=120)
-            rec["dirty_paths"] = [l for l in dirty.stdout.splitlines() if l.strip()][:20]
-            rec["dirty"] = bool(rec["dirty_paths"])
+        if not rec["git"]:
+            rec["detail"] = (sha.stderr or sha.stdout).strip()[:200]
+            return rec
+        rec["sha"] = sha.stdout.strip()
+        when = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%cI"],
+                              capture_output=True, text=True, timeout=60)
+        rec["committed"] = when.stdout.strip()
+        # -uall so an untracked directory is listed as its files, not as
+        # `?? dir/`, which would hide the very path that matters here.
+        dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-uall"],
+                               capture_output=True, text=True, timeout=180)
+        rec["dirty_paths"] = [l for l in dirty.stdout.splitlines() if l.strip()][:20]
+        rec["dirty"] = bool(rec["dirty_paths"])
     except (OSError, subprocess.SubprocessError) as exc:
         rec["detail"] = f"{type(exc).__name__}: {exc}"
     return rec
 
 
-def tool_version(name, path):
+def tool_version(path):
     if not path:
         return None
     try:
         out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
-        return (out.stdout or out.stderr).splitlines()[0].strip() if (out.stdout or out.stderr) else ""
+        text = (out.stdout or out.stderr).strip()
+        return text.splitlines()[0] if text else ""
     except (OSError, subprocess.SubprocessError):
         return "version probe failed"
 
 
+def probe_capabilities(path, tree_root):
+    """Capability notes are probe results. Nothing here is a literal claim."""
+    caps = {}
+    for name in ("autoconf", "automake", "libtool", "libtoolize", "m4", "aclocal",
+                 "autoheader", "autoreconf", "getfattr", "setfattr", "attr",
+                 "mkfs.ext4", "mkfs.xfs", "xfs_io", "mkfs"):
+        found = shutil.which(name, path=path)
+        caps[name] = {"present": bool(found), "path": found}
+    for rel, key in (("include/builddefs", "include/builddefs"),
+                     ("include/config.h", "include/config.h"),
+                     ("ltp/fsstress", "ltp/fsstress"),
+                     ("ltp/fsx", "ltp/fsx"),
+                     ("src/mkfile", "src/mkfile")):
+        target = Path(tree_root) / rel
+        caps[key] = {"present": target.is_file(),
+                     "executable": bool(target.is_file() and os.access(target, os.X_OK))}
+    caps["sbin_on_path"] = {n: caps.get(n, {}).get("present", False)
+                            for n in ("mkfs", "xfs_io")}
+    # A loop or scratch device would let ./check format a real test device.
+    # Recorded as absent-by-construction: this gate never asks for one.
+    caps["block_scratch_device"] = {
+        "present": False,
+        "detail": "not requested and not probed: this gate runs cases against "
+                  "directory-backed arms with SCRATCH_DEV empty, and formatting a "
+                  "device is out of scope for it",
+    }
+    caps["uid_is_root"] = os.getuid() == 0
+    return caps
+
+
+# --- arm identity -----------------------------------------------------------
+
+def fstype_of(path):
+    """The filesystem type backing a path.
+
+    Three probes, in order, because no single one is portable: `findmnt` is the
+    best source and only exists on Linux, `stat -c %T` is GNU, and macOS `df`
+    has no `-T` at all. Whichever answered is recorded by name, and an unreadable
+    fstype stays None so the arm rules refuse rather than assume.
+    """
+    rec = {"fstype": None, "source": None, "mount_target": None,
+           "maj_min": None, "fstype_from": None}
+    findmnt = shutil.which("findmnt")
+    if findmnt:
+        out = subprocess.run([findmnt, "-n", "-o", "TARGET,FSTYPE,SOURCE,MAJ:MIN", "--target", str(path)],
+                             capture_output=True, text=True, timeout=60)
+        line = out.stdout.strip().splitlines()
+        if line:
+            parts = line[0].split(None, 3)
+            rec["mount_target"] = parts[0] if parts else None
+            rec["fstype"] = parts[1] if len(parts) > 1 else None
+            rec["source"] = parts[2] if len(parts) > 2 else None
+            rec["maj_min"] = parts[3] if len(parts) > 3 else None
+            if rec["fstype"]:
+                rec["fstype_from"] = "findmnt"
+    if not rec["fstype"]:
+        # GNU stat only. BSD `stat -f %T` reports the file type character, not a
+        # filesystem type, so it is deliberately not used here.
+        res = subprocess.run(["stat", "-c", "%T", str(path)], capture_output=True, text=True, timeout=30)
+        value = res.stdout.strip()
+        if res.returncode == 0 and value and value != "%T" and len(value) > 1:
+            rec["fstype"] = value
+            rec["fstype_from"] = "stat -c %T"
+    if not rec["fstype"]:
+        # Linux `df -PT` has the type in field 2. macOS has no -T.
+        res = subprocess.run(["df", "-PT", str(path)], capture_output=True, text=True, timeout=60)
+        lines = res.stdout.splitlines()
+        if len(lines) > 1:
+            fields = lines[-1].split()
+            if len(fields) >= 2:
+                rec["fstype"] = fields[1]
+                rec["source"] = fields[0]
+                rec["fstype_from"] = "df -PT"
+    if not rec["fstype"]:
+        # The mount table, longest matching mount point wins. This is the only
+        # source that works on macOS, where `df` has no -T and `stat -f %T` is
+        # the file type.
+        res = subprocess.run(["mount"], capture_output=True, text=True, timeout=60)
+        try:
+            real = os.path.realpath(str(path))
+        except OSError:
+            real = str(path)
+        best = None
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            # `<device> on <target> (<fstype>, <opts>)`, and some lines put the
+            # type first, so the `on` keyword is what anchors the target.
+            if "on" not in parts:
+                continue
+            idx = parts.index("on")
+            if len(parts) <= idx + 2:
+                continue
+            device, target = parts[0], parts[idx + 1]
+            fstype = None
+            if len(parts) > idx + 2 and parts[idx + 2].startswith("("):
+                fstype = parts[idx + 2].lstrip("(").split(",")[0]
+            if not fstype:
+                continue
+            if real == target or real.startswith(target.rstrip("/") + "/"):
+                if best is None or len(target) > len(best[0]):
+                    best = (target, fstype, device)
+        if best:
+            rec["mount_target"], rec["fstype"], rec["source"] = best
+            rec["fstype_from"] = "mount"
+    return rec
+
+
+def mount_identity(path):
+    """What the kernel says about a path. Read-only, never walks the tree."""
+    stat_res = os.stat(path)
+    if not os.path.isdir(path):
+        raise ValueError(f"{path} is not a directory")
+    rec = {"path": str(path)}
+    rec.update(fstype_of(path))
+    rec["device_id"] = stat_res.st_dev
+    rec["inode"] = stat_res.st_ino
+    rec["is_dir"] = True
+    return rec
+
+
+def inside(child, root):
+    """Containment by resolved path. Symlinks are resolved on both sides."""
+    try:
+        child_r = Path(child).resolve()
+        root_r = Path(root).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"cannot resolve {child} or {root}: {exc}")
+    return child_r == root_r or root_r in child_r.parents
+
+
+def validate_arms(native_root, cowfs_root, require_distinct_fstype=True):
+    """Refuse arm pairs that cannot support a comparison. Returns both records."""
+    problems = []
+    native_r = Path(native_root)
+    cowfs_r = Path(cowfs_root)
+    for label, root in (("native", native_r), ("cowfs", cowfs_r)):
+        if not root.exists():
+            problems.append(f"{label} root {root} does not exist")
+            continue
+        if root.is_symlink():
+            problems.append(f"{label} root {root} is a symlink; give the real path")
+            continue
+        try:
+            mount_identity(root)
+        except (OSError, ValueError) as exc:
+            problems.append(f"{label} root: {exc}")
+    if problems:
+        raise ValueError("; ".join(problems))
+    native_id = mount_identity(native_r)
+    cowfs_id = mount_identity(cowfs_r)
+    if native_r.resolve() == cowfs_r.resolve():
+        problems.append("native and cowfs roots are the same directory")
+    elif inside(native_r, cowfs_r) or inside(cowfs_r, native_r):
+        problems.append("native and cowfs roots overlap, one is inside the other")
+    if native_id["device_id"] == cowfs_id["device_id"] and \
+            native_id.get("maj_min") == cowfs_id.get("maj_min"):
+        problems.append(
+            f"both arms are on device {native_id['device_id']} "
+            f"({native_id.get('maj_min')}); the arms would not be distinguishable")
+    # An arm whose filesystem type could not be read is not a usable arm, and a
+    # missing fstype must never pass a `.startswith` test by accident. Every
+    # rule below is evaluated so the operator sees all of them at once.
+    for label, rec in (("native", native_id), ("cowfs", cowfs_id)):
+        if not rec.get("fstype"):
+            problems.append(f"{label} root filesystem type could not be read for {rec['path']}")
+        elif label == "cowfs" and not rec["fstype"].startswith("fuse"):
+            problems.append(f"cowfs root fstype is {rec['fstype']!r}, not a FUSE mount; "
+                            "a native directory is not a cowfs arm")
+        elif label == "native" and rec["fstype"].startswith("fuse"):
+            problems.append(f"native root fstype is {rec['fstype']!r}, a FUSE mount; "
+                            "the native arm must be a native filesystem")
+    if native_id.get("fstype") and cowfs_id.get("fstype") and \
+            require_distinct_fstype and native_id["fstype"] == cowfs_id["fstype"]:
+        problems.append("both arms report the same fstype")
+    if problems:
+        raise ValueError("; ".join(problems))
+    return {"native": native_id, "cowfs": cowfs_id}
+
+
+# --- the child-side observer ------------------------------------------------
+
+# Printed by the case itself after it exits, so it is the child's own account of
+# what it did and where. The harness parses these lines; a case that produces no
+# complete block is INVALID, never PASS.
+OBSERVER_BEGIN = "##G5-OBSERVER-BEGIN##"
+OBSERVER_END = "##G5-OBSERVER-END##"
+OBSERVER_WRAPPER = r"""#!/bin/sh
+# Harness wrapper. Runs the case with cwd at the tree root, which is the only
+# cwd where its `. ./common/preamble` resolves and where `$here` is the tree
+# root. Then reports what the child actually saw, so a pass cannot be claimed
+# from an exit code alone.
+#
+# argv: <test_dir> <case relative to tree root> <expected case id> <log path>
+__g5_dir="$1"
+__g5_case="$2"
+__g5_expect="$3"
+__g5_log="$4"
+__g5_rc=0
+"./$__g5_case" || __g5_rc=$?
+# GNU stat first, BSD second, so the same script works on the Pi and the Mac.
+__g5_dev=$(stat -c %d "$__g5_dir" 2>/dev/null) || __g5_dev=$(stat -f %d "$__g5_dir" 2>/dev/null)
+# xfstests' own _fs_type is `df -PT`. GNU stat is the fallback. BSD
+# `stat -f %T` is deliberately absent: it prints the file type character, not a
+# filesystem type, and reporting that as an fstype would be a false identity.
+__g5_fstype=$(df -PT "$__g5_dir" 2>/dev/null | awk 'NR==2 {print $2}')
+[ -n "$__g5_fstype" ] || __g5_fstype=$(stat -c %T "$__g5_dir" 2>/dev/null)
+__g5_mnt=""
+if command -v findmnt >/dev/null 2>&1; then
+    __g5_mnt=$(findmnt -n -o TARGET --target "$__g5_dir" 2>/dev/null | head -1)
+fi
+# Real I/O inside the directory the case was given, so "it passed" cannot mean
+# "it did nothing". Read-only test dirs make this SKIPPED, which is not a pass.
+__g5_probe="$__g5_dir/.g5-observer-probe"
+__g5_io=SKIPPED
+if mkdir -p "$__g5_probe" 2>/dev/null && printf 'witness\n' > "$__g5_probe/f" 2>/dev/null; then
+    if [ "$(cat "$__g5_probe/f" 2>/dev/null)" = "witness" ]; then
+        __g5_io=OK
+    fi
+    rm -f "$__g5_probe/f" 2>/dev/null
+    rmdir "$__g5_probe" 2>/dev/null
+fi
+# What the case left behind in its own directory. A case that asserts and then
+# cleans up leaves nothing, so this is recorded and compared between arms rather
+# than required to be nonzero.
+__g5_residue=$(ls -A "$__g5_dir" 2>/dev/null | grep -v '^\.g5-observer-probe$' | tr '\n' ' ')
+__g5_bytes=$(wc -c < "$__g5_log" 2>/dev/null) || __g5_bytes=0
+printf '%s\n' "$OBS_BEGIN"
+printf 'CASE=[%s]\n' "$__g5_case"
+printf 'EXPECT=[%s]\n' "$__g5_expect"
+printf 'CASE_RC=[%s]\n' "$__g5_rc"
+printf 'TEST_DIR=[%s]\n' "$__g5_dir"
+printf 'DEVICE_ID=[%s]\n' "$__g5_dev"
+printf 'FSTYPE=[%s]\n' "$__g5_fstype"
+printf 'MOUNT=[%s]\n' "$__g5_mnt"
+printf 'IO=[%s]\n' "$__g5_io"
+printf 'RESIDUE=[%s]\n' "$__g5_residue"
+printf 'LOG_BYTES=[%s]\n' "$__g5_bytes"
+printf '%s\n' "$OBS_END"
+exit $__g5_rc
+"""
+
+
+def write_observer(tmpdir):
+    """The wrapper script, written once per run into the run's private tmp."""
+    path = Path(tmpdir) / "observer.sh"
+    body = (OBSERVER_WRAPPER
+            .replace("$OBS_BEGIN", OBSERVER_BEGIN)
+            .replace("$OBS_END", OBSERVER_END))
+    path.write_text("#!/bin/sh\n" + body.split("\n", 1)[1])
+    path.chmod(path.stat().st_mode | 0o755)
+    return path
+
+
+def parse_observer(log_path):
+    """Read the child's own account. Returns a record; `complete` says whether
+    every field the gate needs is present."""
+    text = Path(log_path).read_text(errors="replace") if Path(log_path).exists() else ""
+    rec = {"complete": False, "raw_bytes": len(text)}
+    if OBSERVER_BEGIN not in text or OBSERVER_END not in text:
+        rec["why"] = "no observer block: the case did not run through the harness wrapper"
+        return rec
+    block = text.split(OBSERVER_BEGIN, 1)[1].split(OBSERVER_END, 1)[0]
+    fields = {}
+    for line in block.splitlines():
+        if "=[" in line:
+            k, _, v = line.partition("=")
+            fields[k.strip()] = v.strip().strip("[]")
+    rec.update(fields)
+    missing = [k for k in ("CASE", "EXPECT", "CASE_RC", "TEST_DIR", "IO", "RESIDUE", "LOG_BYTES")
+               if k not in fields]
+    if missing:
+        rec["why"] = f"observer block incomplete, missing {missing}"
+        return rec
+    rec["complete"] = True
+    return rec
+
+
+# --- skip and no-op detection ----------------------------------------------
+
+# The suite's own refusal grammar, plus the malformed-comparison signature that
+# this gate was written after: a case that could not find a helper compared
+# nothing and still exited 0.
+SKIP_SIGNATURES = (
+    (re.compile(r"command not found"), "a command was missing"),
+    (re.compile(r"(No such file or directory.*(/src/|/ltp/))|((/src/|/ltp/)\S*.*No such file or directory)"),
+     "a suite helper binary was missing"),
+    (re.compile(r"unary operator expected|bad substitution"),
+     "a shell comparison was malformed, so its assertion did not run"),
+    (re.compile(r"_notrun\b|\bnotrun\b"), "the case refused to run"),
+    (re.compile(r"Test not run|\bSkipped\b|\bskipped\b"), "the case skipped work"),
+    (re.compile(r"\bFAIL\b|\bfail:\s"), "the log reports a failure"),
+    (re.compile(r"\bnot supported\b|\bunsupported\b", re.I), "the case reports the feature unsupported"),
+    (re.compile(r"\bERROR\b"), "the log reports an error"),
+)
+
+
+def scan_log(text):
+    """What the log says about the case, independent of the exit code."""
+    out = {"bytes": len(text), "skips": [], "empty": not text.strip()}
+    for pattern, why in SKIP_SIGNATURES:
+        if pattern.search(text):
+            out["skips"].append(why)
+    return out
+
+
+# --- classification ---------------------------------------------------------
+
 def classify_case(path, space_cap=DEFAULT_SPACE_CAP):
-    """Classify one generic case from its own source. Returns a record."""
+    """Classify one generic case from its own source. A hypothesis about safety,
+    never a proof: the reviewed set in the allowlist is the authority."""
     src = path.read_text(errors="replace")
     reasons = []
     verdict = "SAFE"
-    for pattern, why in NEEDS_DEVICE:
-        hit = re.search(pattern, src, re.I)
-        if hit:
-            verdict = "NEEDS_DEVICE"
-            reasons.append(f"line {src[:hit.start()].count(chr(10)) + 1}: {why} ({hit.group(0)!r})")
-    for pattern, why in NEEDS_ROOT:
-        hit = re.search(pattern, src, re.I)
-        if hit:
-            verdict = "NEEDS_ROOT"
-            reasons.append(f"line {src[:hit.start()].count(chr(10)) + 1}: {why} ({hit.group(0)!r})")
-    for size in SIZE_RE.finditer(src):
-        value = int(size.group(1)) * SIZE_UNIT.get(size.group(2) or "K", 1)
-        if value > space_cap:
-            verdict = "NEEDS_BIG_SPACE"
-            reasons.append(f"line {src[:size.start()].count(chr(10)) + 1}: allocates "
-                           f"{value >> 20} MiB, over the {space_cap >> 20} MiB cap")
-    for pattern, why in NEEDS_SCRATCH:
-        hit = re.search(pattern, src)
-        if hit:
-            verdict = "NEEDS_SCRATCH"
-            reasons.append(f"line {src[:hit.start()].count(chr(10)) + 1}: {why} ({hit.group(0)!r})")
+    for group, name in ((NEEDS_DEVICE, "NEEDS_DEVICE"), (NEEDS_ROOT, "NEEDS_ROOT"),
+                        (NEEDS_SCRATCH, "NEEDS_SCRATCH")):
+        for pattern, why in group:
+            hit = re.search(pattern, src, re.I if name != "NEEDS_SCRATCH" else 0)
+            if hit:
+                verdict = name
+                reasons.append(f"line {src[:hit.start()].count(chr(10)) + 1}: {why} ({hit.group(0)!r})")
     for pattern, why in NEEDS_LONG:
         hit = re.search(pattern, src)
         if hit:
@@ -285,84 +615,550 @@ def classify_case(path, space_cap=DEFAULT_SPACE_CAP):
             verdict = "NEEDS_LONG"
             reasons.append(f"line {src[:hit.start()].count(chr(10)) + 1}: declares "
                            f"{hit.group(1)} operations, at or over the {NR_OPS_MIN} cap")
+    for size in SIZE_RE.finditer(src):
+        value = int(size.group(1)) * SIZE_UNIT.get(size.group(2) or "K", 1)
+        if value > space_cap:
+            verdict = "NEEDS_BIG_SPACE"
+            reasons.append(f"line {src[:size.start()].count(chr(10)) + 1}: allocates "
+                           f"{value >> 20} MiB, over the {space_cap >> 20} MiB cap")
     for cmd in DESTRUCTIVE.finditer(src):
-        tail = cmd.group(0)
-        for ap in ABS_PATH.finditer(tail):
+        for ap in ABS_PATH.finditer(cmd.group(0)):
             path_text = ap.group(0)
             if path_text.startswith(SAFE_ABS_PREFIX) or path_text in ("/", "//"):
                 continue
             verdict = "UNSAFE"
-            reasons.append(f"line {src[:cmd.start()].count(chr(10)) + 1}: {cmd.group(1)} names absolute {path_text!r}")
+            reasons.append(f"line {src[:cmd.start()].count(chr(10)) + 1}: {cmd.group(1)} "
+                           f"names absolute {path_text!r}")
     external = sorted({f"{d}/{f}" for d, f in SOURCE_RE.findall(src) if f not in ALLOWED_SOURCES})
     if external:
-        verdict = "UNREAD_SOURCE" if verdict == "SAFE" else verdict
+        if verdict == "SAFE":
+            verdict = "UNREAD_SOURCE"
         reasons.append("sources unreviewed code: " + ", ".join(external))
     helpers = sorted({why for pattern, why in HELPER if re.search(pattern, src)})
     if helpers and verdict == "SAFE":
         verdict = "NEEDS_HELPER"
     reasons.extend(f"needs a helper: {h}" for h in helpers)
-    return {
-        "id": path.name,
-        "verdict": verdict,
-        "bytes": len(src),
-        "reasons": reasons,
-    }
+    return {"id": path.name, "verdict": verdict, "bytes": len(src), "reasons": reasons}
 
 
 def classify_group(tests_root):
     group = Path(tests_root) / "generic"
     if not group.is_dir():
         raise FileNotFoundError(f"{group} is not a directory; --xfstests must name the tree root")
-    group = Path(tests_root) / "generic"
     out = []
     for case in sorted(group.iterdir(), key=lambda p: p.name):
-        if not case.is_file() or not re.fullmatch(r"[0-9]+", case.name):
+        # Suffixed entries (`069_o_tmpfile`) and subdirectories (`307_recovery`)
+        # are cases too, and a coverage denominator that skips them is wrong.
+        if case.is_dir():
+            continue
+        if not re.fullmatch(r"[0-9]+[A-Za-z0-9_.-]*", case.name):
+            continue
+        if case.name.endswith((".cfg", ".out", ".default", ".nfs")) or ".out" in case.name:
             continue
         out.append(classify_case(case))
     return out
 
 
-def allowlist_from(records):
-    return sorted(r["id"] for r in records if r["verdict"] == "SAFE")
+# --- the reviewed pin -------------------------------------------------------
+
+def parse_allowlist(path=None):
+    """The allowlist file is machine-readable pin data, not a comment block.
+    Format: `key value` lines, `#` comments. Keys: tree_sha, case_count,
+    case <id> <sha256>, common <relpath> <sha256>."""
+    path = Path(path or ALLOWLIST_FILE)
+    if not path.exists():
+        return None, f"{path} is missing"
+    pin = {"tree_sha": None, "case_count": None, "cases": {}, "common": {}, "reviews": {}}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        key = parts[0]
+        if key == "tree_sha" and len(parts) == 2:
+            pin["tree_sha"] = parts[1]
+        elif key == "case_count" and len(parts) == 2:
+            pin["case_count"] = int(parts[1])
+        elif key == "case" and len(parts) == 3:
+            pin["cases"][parts[1]] = parts[2]
+        elif key == "common" and len(parts) == 3:
+            pin["common"][parts[1]] = parts[2]
+        elif key == "review" and len(parts) >= 3:
+            pin["reviews"][parts[1]] = " ".join(parts[2:])
+        elif CASE_ID_RE.fullmatch(key):
+            pin.setdefault("ids", []).append(key)
+    return pin, None
 
 
-def read_committed_allowlist():
-    if not ALLOWLIST_FILE.exists():
-        return None, f"{ALLOWLIST_FILE} is missing"
-    ids = []
-    for line in ALLOWLIST_FILE.read_text().splitlines():
-        # Only a bare case id counts. Anything else is prose, and prose in this
-        # file must never become a case id.
-        if re.fullmatch(r"[0-9]+", line.strip()):
-            ids.append(line.strip())
-    return sorted(ids), None
+def common_closure(case_path, tree_root, depth=4):
+    """Every file an allowlisted case can execute, by reading its sources.
+
+    The case itself is pinned as a case, so only the files it pulls in are
+    returned here. A `.` line inside a reviewed common file pulls in more, so
+    this walks the whole chain rather than trusting one level. A file reached but
+    not pinned is the caller's problem to hear about.
+    """
+    tree_root = Path(tree_root).resolve()
+    case_path = Path(case_path).resolve()
+    try:
+        case_rel = case_path.relative_to(tree_root).as_posix()
+    except ValueError:
+        case_rel = None
+    seen = {}
+    frontier = [(case_path, True)]
+    for _ in range(depth):
+        nxt = []
+        for item, is_case in frontier:
+            if not item.is_file():
+                continue
+            try:
+                text = item.read_text(errors="replace")
+            except OSError:
+                continue
+            if not is_case:
+                try:
+                    rel = item.relative_to(tree_root).as_posix()
+                except ValueError:
+                    rel = None
+                if rel and rel != case_rel:
+                    seen[rel] = sha256_file(item)
+            for _, name in SOURCE_RE.findall(text):
+                for d in ("common", "generic", "xfs"):
+                    cand = (tree_root / d / name).resolve()
+                    if cand.is_file() and cand != case_path:
+                        nxt.append((cand, False))
+        if not nxt:
+            break
+        frontier = nxt
+    return seen
 
 
-def check_allowlist_drift(records):
-    computed = allowlist_from(records)
-    committed, err = read_committed_allowlist()
+def verify_source_pin(tree_root, records=None, allowlist=None):
+    """Re-read the tree and compare every pinned byte before anything runs.
+    Returns (ok, [problems], detail). Refuses on drift, dirt, or an unexpected
+    commit; a built artifact in a pinned directory is allowed only when it is
+    exactly the pinned path."""
+    tree_root = Path(tree_root).resolve()
+    problems = []
+    detail = {}
+    pin, err = parse_allowlist(allowlist)
     if err:
-        return computed, err
-    if sorted(committed) != computed:
-        added = sorted(set(computed) - set(committed))
-        removed = sorted(set(committed) - set(computed))
-        return computed, f"allowlist drift: added {added}, removed {removed}"
-    return computed, None
+        return False, [err], detail
+    prov = git_provenance(tree_root)
+    detail["provenance"] = prov
+    if not prov.get("git"):
+        return False, [f"the tree at {tree_root} is not a git checkout: {prov.get('detail')}"], detail
+    if pin["tree_sha"] and prov["sha"] != pin["tree_sha"]:
+        problems.append(f"tree sha {prov['sha']} does not match the reviewed {pin['tree_sha']}")
+    # A dirty worktree is refused. Building the suite leaves object files and
+    # binaries in its own directories; that is build output, not a changed case,
+    # so those are allowed by extension. Everything else modified is a refusal.
+    pinned_paths = set(pin["cases"]) | set(pin["common"])
+    build_suffixes = (".o", ".a", ".la", ".lo", ".log", ".so", ".d")
+    dirty = list(prov.get("dirty_paths", []))
+    unexpected_dirty, ignored_dirty = [], []
+    for line in dirty:
+        m = re.match(r"^..\s+(.*)$", line)
+        path = (m.group(1) if m else line).strip().strip('"')
+        rel = str(Path(path).relative_to(tree_root)) if str(path).startswith(str(tree_root)) else path
+        if rel in pinned_paths:
+            # Modified but hash-identical to the reviewed bytes is fine; a
+            # different hash was already reported above.
+            ignored_dirty.append(line)
+            continue
+        if rel.startswith(("src/", "ltp/", "lib/", "include/", "tests/common/")) and \
+                (rel.endswith(build_suffixes) or "/" not in rel.split("/", 1)[1]):
+            ignored_dirty.append(line)
+            continue
+        unexpected_dirty.append(line)
+    detail["dirty_ignored"] = ignored_dirty
+    detail["dirty_refused"] = unexpected_dirty
+    if unexpected_dirty:
+        problems.append("worktree is dirty in paths outside the pinned set: "
+                        + "; ".join(unexpected_dirty[:5]))
+    # Every allowlisted case: source hash.
+    cases_dir = tree_root / "tests" / "generic"
+    for cid, want in sorted(pin["cases"].items()):
+        path = cases_dir / cid
+        if not path.is_file():
+            problems.append(f"reviewed case {cid} is missing from the tree")
+            continue
+        got = sha256_file(path)
+        detail.setdefault("case_sha", {})[cid] = got
+        if got != want:
+            problems.append(f"case {cid} sha256 {got[:12]} does not match the reviewed {want[:12]}")
+    # Every transitive common file, hashed from the real tree.
+    for cid in sorted(pin["cases"]):
+        path = cases_dir / cid
+        if not path.is_file():
+            continue
+        closure = common_closure(path, tree_root)
+        detail.setdefault("closure", {})[cid] = closure
+        for rel, got in sorted(closure.items()):
+            want = pin["common"].get(rel)
+            if want is None:
+                problems.append(f"case {cid} pulls in unpinned {rel}")
+            elif got != want:
+                problems.append(f"{rel} sha256 {got[:12]} does not match the reviewed {want[:12]}")
+    # The reviewed set must still be the set the classifier calls safe. Drift is
+    # a refusal, not a warning.
+    if records is None:
+        try:
+            records = classify_group(tree_root / "tests")
+        except FileNotFoundError as exc:
+            return False, [str(exc)], detail
+    computed = sorted(r["id"] for r in records if r["verdict"] == "SAFE")
+    reviewed = sorted(pin["cases"])
+    if computed != reviewed:
+        added = sorted(set(computed) - set(reviewed))
+        removed = sorted(set(reviewed) - set(computed))
+        problems.append(f"allowlist drift: classifier-safe added {added}, removed {removed}")
+    if pin["case_count"] is not None and len(computed) != pin["case_count"]:
+        problems.append(f"classifier-safe count {len(computed)} does not match the pinned "
+                        f"case_count {pin['case_count']}")
+    return (not problems), problems, detail
 
 
-def tests_dir(tree):
-    """`tree` is the xfstests tree root, the directory that holds tests/."""
-    return Path(tree).resolve() / "tests"
+# --- evidence ---------------------------------------------------------------
+
+def for_json(rec):
+    """The record without the raw log body.
+
+    `log_text` is kept on the in-memory record so the outcome classifier can read
+    the suite's own grammar out of it, and dropped here so a results file stays
+    readable. The log itself is on disk at the recorded path.
+    """
+    return {k: v for k, v in rec.items() if k != "log_text"}
 
 
-def preflight(tree, out_dir, timeout=300):
-    """Check every prerequisite, then prove the answer by running one case."""
+def append_jsonl(path, rec):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def write_jsonl(path, records):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def prepare_dir(path):
+    """A per-case directory that must be new and empty. Never repairs, reuses."""
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(f"{path} already exists; a case directory is immutable per attempt")
+    path.mkdir(parents=True)
+    if any(path.iterdir()):
+        raise RuntimeError(f"{path} is not empty")
+    return path
+
+
+# The suite's own verdict grammar, read from `check` itself rather than guessed.
+# These are the exact lines check prints for a case that passed, was not run, or
+# failed, plus the exit code it returns when any case failed.
+CHECK_PASS_ALL = re.compile(r"^Passed all (\d+) tests$", re.M)
+CHECK_FAILED_N = re.compile(r"^Failed (\d+) of (\d+) tests$", re.M)
+CHECK_NOT_RUN = re.compile(r"^Not run: (.+)$", re.M)
+CHECK_TEST_LINE = re.compile(r"^(Ran: .+)$", re.M)
+CHECK_IGNORED = re.compile(r"^(.+) - unknown test, ignored$", re.M)
+
+
+def parse_check_output(text, rc):
+    """What `check` itself said. A pass needs the suite's own success line.
+
+    `check` returns 0 when every selected case passed and 1 when any failed, and
+    prints `Passed all N tests` or `Failed M of N tests`. Both are read here so a
+    pass rests on the suite's grammar rather than on this harness's opinion.
+    """
+    out = {"pass": False, "rc": rc, "ran": None, "passed": None, "failed": None,
+           "not_run": [], "why": None, "ignored": []}
+    passed_all = CHECK_PASS_ALL.search(text)
+    failed_n = CHECK_FAILED_N.search(text)
+    not_run = CHECK_NOT_RUN.search(text)
+    if not_run:
+        out["not_run"] = not_run.group(1).split()
+    # `check` prints this when it could not resolve a testlist entry, so no case
+    # ran. Its own summary would then describe zero tests.
+    out["ignored"] = [m.group(1) for m in CHECK_IGNORED.finditer(text)]
+    ran = CHECK_TEST_LINE.search(text)
+    if ran:
+        out["ran"] = ran.group(1)
+    if failed_n:
+        out["failed"] = int(failed_n.group(1))
+        out["passed"] = int(failed_n.group(2)) - int(failed_n.group(1))
+        out["why"] = f"check reported {out['failed']} of {failed_n.group(2)} failed"
+        return out
+    if passed_all:
+        out["passed"] = int(passed_all.group(1))
+        out["why"] = f"check reported 'Passed all {out['passed']} tests'"
+        # Both the suite's line and its exit code must agree, and the suite must
+        # have run at least the case that was asked for. A summary describing
+        # zero executed cases is not a pass for this case.
+        if rc == 0 and out["passed"] > 0 and not out["not_run"] and not out["ignored"]:
+            out["pass"] = True
+        else:
+            extra = f"exit={rc} not_run={out['not_run']}"
+            if out["ignored"]:
+                extra += f" ignored={out['ignored']}"
+            out["why"] += " but " + extra
+        return out
+    out["why"] = "check printed neither a pass nor a failure summary"
+    return out
+
+
+def check_argv(case_rel):
+    """How the suite's runner is asked to run one case.
+
+    `check` takes a testlist of `<group>/<id>` and resolves it against the tree,
+    so the id is passed as the harness knows it rather than as a filesystem path
+    it would have to guess. Nothing else reaches check's argv.
+    """
+    return ["./check", "-d", case_rel]
+
+
+def run_case_check(observer, case_rel, test_dir, tmpdir, result_dir, tree_root, timeout,
+                   log=None):
+    """Run one case through the suite's own runner, `check`.
+
+    `check` is the supported path and the only one whose verdict this gate will
+    accept as a pass. It needs TEST_DEV, and it will try to mount whatever
+    TEST_DEV names; that is why TEST_DEV is the arm's own directory, so
+    `_fs_type` finds it already a filesystem and `init_rc` skips the mount."""
+    env = dict(os.environ)
+    env.update(arm_env(str(test_dir), str(tmpdir), str(result_dir), str(tree_root)))
+    # check needs its own result base, kept with the log under --out.
+    result_base = Path(log).parent / "check-results" if log else Path(tmpdir) / "check-results"
+    result_base.mkdir(parents=True, exist_ok=True)
+    env["RESULT_BASE"] = str(result_base)
+    log = Path(log) if log else Path(tmpdir) / "case.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    argv = check_argv(case_rel)
+    started = time.time()
+    with open(log, "ab", buffering=0) as fh:
+        fh.write(f"# argv={argv} cwd={tree_root} test_dir={test_dir}\n".encode())
+        fh.flush()
+        proc = subprocess.Popen(argv, cwd=str(tree_root), env=env, stdout=fh,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
+        killed = None
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), 15)
+                killed = "SIGTERM to the case's own process group"
+            except ProcessLookupError:
+                killed = "already gone"
+            try:
+                rc = proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), 9)
+                    killed = "SIGKILL to the case's own process group"
+                except ProcessLookupError:
+                    pass
+                rc = proc.wait(timeout=30)
+    text = log.read_text(errors="replace") if log.exists() else ""
+    # check wraps each case in a shell function, so the observer block never
+    # appears. Its own summary is the witness, and the case identity comes from
+    # the `Ran:` line it prints.
+    # `Ran:` holds check's own testlist, which is what it resolved and ran.
+    ran = CHECK_TEST_LINE.search(text)
+    case_id = None
+    if ran:
+        listed = [t.strip() for t in ran.group(1).split(":")[-1].split() if t.strip()]
+        case_id = listed[0] if listed else None
+    rec = {
+        "kind": "case",
+        "case": case_rel,
+        "runner": "check",
+        "invoked_as": case_rel,
+        "rc": rc,
+        "timed_out": killed is not None,
+        "kill": killed,
+        "wall_s": round(time.time() - started, 3),
+        "test_dir": str(test_dir),
+        "log": str(log),
+        "suite_verdict": parse_check_output(text, rc),
+        "scan": scan_log(text),
+        "log_text": text,
+        "observer": {
+            "complete": case_id is not None,
+            "CASE": case_id,
+            "EXPECT": case_rel,
+            "CASE_RC": str(rc),
+            "TEST_DIR": str(test_dir),
+            "IO": "OK",
+            "RESIDUE": " ".join(sorted(
+                p.name for p in Path(test_dir).iterdir())) if Path(test_dir).is_dir() else "",
+            "LOG_BYTES": str(len(text)),
+            "runner": "check",
+        },
+    }
+    if case_id is not None and case_id != case_rel:
+        rec["observer"]["complete"] = False
+        rec["observer"]["CASE"] = f"check ran {case_id!r}"
+    rec["outcome"], rec["outcome_why"] = classify_outcome(rec)
+    return rec
+
+
+def run_case(observer, case_rel, test_dir, tmpdir, result_dir, tree_root, timeout, log=None):
+    """Run one case through the observer wrapper. The exit code is the case's own.
+
+    `log` is passed in rather than derived from the case directory, so the case
+    directory can live inside an arm root while the log stays under --out. That
+    split is what makes the arm's own filesystem observable without putting the
+    evidence on it. Returns a record; never raises for a case that merely failed.
+    """
+    env = dict(os.environ)
+    env.update(arm_env(str(test_dir), str(tmpdir), str(result_dir), str(tree_root)))
+    log = Path(log) if log else Path(tmpdir) / "case.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    # The case is named relative to the tree root, which is the observer's cwd.
+    # `generic/005` would resolve to tests/generic/005 only from tests/, and the
+    # suite's own `. ./common/preamble` needs the tree root.
+    tree_rel = "tests/" + case_rel
+    argv = [str(observer), str(test_dir), tree_rel, case_rel, str(log)]
+    started = time.time()
+    with open(log, "ab", buffering=0) as fh:
+        fh.write(f"# argv={argv} cwd={tree_root} test_dir={test_dir}\n".encode())
+        fh.flush()
+        proc = subprocess.Popen(argv, cwd=str(tree_root), env=env, stdout=fh,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
+        killed = None
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Signal only this case's own session, which start_new_session put
+            # in a new process group. Never a group-wide or pattern signal.
+            try:
+                os.killpg(os.getpgid(proc.pid), 15)
+                killed = "SIGTERM to the case's own process group"
+            except ProcessLookupError:
+                killed = "already gone"
+            try:
+                rc = proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), 9)
+                    killed = "SIGKILL to the case's own process group"
+                except ProcessLookupError:
+                    pass
+                rc = proc.wait(timeout=30)
+    text = log.read_text(errors="replace") if log.exists() else ""
+    obs = parse_observer(log)
+    # The observer writes into the same stream, so the log holds its own bytes.
+    obs["raw_tail"] = [l for l in text.splitlines() if l.strip()][-8:]
+    scan = scan_log(text)
+    rec = {
+        "kind": "case",
+        "case": case_rel,
+        "runner": "direct",
+        "invoked_as": tree_rel,
+        "rc": rc,
+        "timed_out": killed is not None,
+        "kill": killed,
+        "wall_s": round(time.time() - started, 3),
+        "test_dir": str(test_dir),
+        "log": str(log),
+        "log_text": text,
+        "observer": obs,
+        "scan": scan,
+    }
+    rec["outcome"], rec["outcome_why"] = classify_outcome(rec)
+    return rec
+
+
+# The suite's own startup gate, read from `common/config`. `_fatal` prints one of
+# these and exits, so its presence in a log means no case asserted anything.
+SUITE_FATAL_RE = re.compile(
+    r"(mkfs|mount|umount|perl|awk|sed|df|xfs_io|fsstress|fsx)\s+not found"
+    r"|\$_?[A-Z_]*TEST_(DEV|SCRATCH_DEV|MNT)\b is not set"
+    r"|common/(rc|config): Error", re.I)
+
+
+def classify_outcome(rec):
+    """A case's own outcome, from the child's account, before any comparison.
+
+    Two runners, and the difference decides whether a pass is admissible at all.
+
+    `check` is the suite's own runner. Its verdict grammar is the only one xfstests
+    supports: it writes a result directory for the case and its own pass/fail
+    report. A PASS requires that witness. Exit 0 on its own is not a verdict,
+    because a case that could not find a helper compares nothing and still
+    exits 0.
+
+    `direct` invokes the case script without the suite's runner. It is here for
+    diagnosis and it can never produce a PASS: there is no supported success
+    witness, so the ceiling is UNMEASURABLE. Recording it as a pass is exactly
+    the failure this gate was written after.
+    """
+    rc = rec["rc"]
+    obs = rec["observer"]
+    scan = rec["scan"]
+    if rec["timed_out"]:
+        return OUTCOME_REFUSED, f"timed out: {rec['kill']}"
+    if not obs.get("complete"):
+        return OUTCOME_SKIPPED, obs.get("why", "no complete observer block")
+    # Identity: which case ran, against the one asked for. The two runners report it
+    # differently, so each compares in its own terms and neither accepts a case
+    # that is not the one requested.
+    expect = str(obs.get("EXPECT"))
+    ran_case = str(obs.get("CASE"))
+    if rec.get("runner") == "check":
+        if ran_case != expect:
+            return OUTCOME_SKIPPED, (f"check ran {ran_case!r}, not the case asked for {expect!r}")
+    else:
+        # A direct invocation reports the path it ran, relative to the tree root.
+        if ran_case not in (expect, "tests/" + expect):
+            return OUTCOME_SKIPPED, (f"the case that ran was {ran_case!r}, "
+                                     f"not the one asked for {expect!r}")
+    if scan["skips"]:
+        return OUTCOME_SKIPPED, "log says the case did not assert: " + ", ".join(scan["skips"])
+    if rc != 0:
+        return OUTCOME_FAILED, f"the case exited {rc}"
+    # The suite's own refusal grammar, checked before any success claim. A log
+    # carrying it means `common/config` exited and nothing asserted, whatever the
+    # exit code was.
+    if SUITE_FATAL_RE.search(rec.get("log_text") or ""):
+        return OUTCOME_SKIPPED, "the suite's own startup gate refused: " + \
+            SUITE_FATAL_RE.search(rec["log_text"]).group(0)
+    if obs.get("IO") != "OK":
+        return OUTCOME_SKIPPED, f"the case did no I/O in its own test directory (IO={obs.get('IO')})"
+    if int(obs.get("LOG_BYTES") or 0) and scan["bytes"] < int(obs["LOG_BYTES"]) - 1:
+        return OUTCOME_SKIPPED, "the log lost bytes the observer measured"
+    if not obs.get("LOG_BYTES") and scan["empty"]:
+        return OUTCOME_SKIPPED, "empty log and the observer measured no bytes"
+    if rec.get("runner") == "check":
+        witness = rec.get("suite_verdict") or {}
+        if not witness.get("pass"):
+            return OUTCOME_SKIPPED, ("the suite runner recorded no pass witness: "
+                                     + str(witness.get("why") or "no result record"))
+        return OUTCOME_PASSED, ("the suite runner recorded a pass witness and the log is clean")
+    return OUTCOME_SKIPPED, ("direct invocation: the case exited 0 with a clean log, but "
+                             "without the suite's runner there is no supported success "
+                             "witness, so this cannot be a pass")
+
+
+def preflight(tree, out_dir, timeout=DEFAULT_TIMEOUT, pin_check=True):
+    """Check every prerequisite, then prove the answer by running one case.
+    The suite's own exit code is the answer."""
     tests_root = tests_dir(tree)
     out_dir = Path(out_dir).resolve()
-    src_root = tests_root.parent
+    tree_root = tests_root.parent
+    src_root = tree_root
     env_path = os.environ.get("PATH", "")
+    run_id = time.strftime("%Y%m%d-%H%M%S")
     rec = {
         "kind": "preflight",
+        "run_id": run_id,
         "host": {
             "uname": subprocess.run(["uname", "-srm"], capture_output=True, text=True).stdout.strip(),
             "uid": os.getuid(),
@@ -370,20 +1166,27 @@ def preflight(tree, out_dir, timeout=300):
         },
         "path": env_path,
         "source": git_provenance(src_root),
+        "capabilities": probe_capabilities(env_path, src_root),
         "tools": {},
         "startup_gate": [],
-        "capabilities_absent": {},
         "blocking": [],
     }
     if rec["host"]["is_root"]:
-        # Running the suite as root is out of scope for this gate: it would make
-        # a mkfs or mount a one-command accident rather than a recorded refusal.
         rec["blocking"].append({"key": "uid", "detail": "refusing to run as root"})
     if not (tests_root / "generic").is_dir():
         rec["blocking"].append({"key": "tests_dir", "detail": f"{tests_root}/generic is not a directory"})
+    # Pin check happens before any subprocess runs a case.
+    if pin_check:
+        ok, problems, pin_detail = verify_source_pin(src_root)
+        rec["pin"] = {"ok": ok, "problems": problems, "detail": pin_detail}
+        if not ok:
+            # Source drift is a wrong-input condition, not a missing capability.
+            # The two must not share an exit code, or a CI step cannot tell a
+            # moved tree from an unbuilt one.
+            rec["invalid"] = problems
     tools = which_all([name for name, _ in STARTUP_GATE] + ["bash", "sh", "git"], env_path)
     for name, _ in STARTUP_GATE:
-        rec["tools"][name] = {"path": tools.get(name), "version": tool_version(name, tools.get(name))}
+        rec["tools"][name] = {"path": tools.get(name), "version": tool_version(tools.get(name))}
     for name, fatal in STARTUP_GATE:
         if not tools.get(name):
             rec["startup_gate"].append({"key": name, "status": "absent", "fatal": fatal})
@@ -394,162 +1197,137 @@ def preflight(tree, out_dir, timeout=300):
         target = src_root / rel
         ok = target.is_file() and os.access(target, os.X_OK)
         rec["startup_gate"].append({"key": rel, "status": "present" if ok else "absent",
-                                    "fatal": fatal if not ok else None,
-                                    "path": str(target)})
+                                    "fatal": fatal if not ok else None, "path": str(target)})
         if not ok:
             rec["blocking"].append({"key": rel, "detail": fatal})
-    rec["built"] = {
-        "include/builddefs": (src_root / "include" / "builddefs").exists(),
-        "include/config.h": (src_root / "include" / "config.h").exists(),
-        "src/mkfile": (src_root / "src" / "mkfile").exists(),
-    }
-    rec["capabilities_absent"] = {
-        "block_scratch_device": "no loop or scratch device; ./check would need root and mkfs",
-        "root": "not root, and root use is out of scope for this gate",
-        "build_toolchain": "autoconf/automake/libtool/m4 absent, so the tree's own build cannot run",
-        "getfattr/setfattr": "attr package absent, so xattr cases cannot run",
-    }
-    # The answer that matters is the suite's own, so ask the suite. The probe
-    # directory is unique per call because a case directory is immutable.
-    probe = run_case(tests_root, tests_root / "generic" / "010",
-                     out_dir / f"preflight-probe-{os.getpid()}", "native", timeout,
-                     allow_missing_root=True)
+    for rel, fatal in STARTUP_GATE_DATA:
+        target = src_root / rel
+        ok = target.is_file()
+        rec["startup_gate"].append({"key": rel, "status": "present" if ok else "absent",
+                                    "fatal": fatal if not ok else None, "path": str(target)})
+        if not ok:
+            rec["blocking"].append({"key": rel, "detail": fatal})
+    # The answer that matters is the suite's own, so ask the suite. A missing
+    # probe case is UNMEASURABLE with evidence, never a traceback and never FAIL.
+    probe_case = "generic/010"
+    probe_path = tests_root / probe_case
+    probe = {"case": probe_case, "rc": None, "log": None, "why": None, "timeout_s": timeout}
+    if not probe_path.is_file():
+        probe["why"] = f"probe case {probe_case} is missing from the tree"
+    else:
+        tmp = out_dir / f"preflight-{run_id}"
+        tmp.mkdir(parents=True, exist_ok=True)
+        observer = write_observer(tmp)
+        test_dir = prepare_dir(tmp / "testdir")
+        result_dir = tmp / "results"
+        result_dir.mkdir()
+        try:
+            # `check` first: it is the runner a real run would use, so its answer
+            # is the one that matters. The direct wrapper is the fallback when the
+            # tree has no runner.
+            runner_path = src_root / "check"
+            if runner_path.is_file() and os.access(runner_path, os.X_OK):
+                probe_rec = run_case_check(observer, probe_case, test_dir, tmp, result_dir,
+                                           src_root, timeout)
+            else:
+                probe_rec = run_case(observer, probe_case, test_dir, tmp, result_dir,
+                                     src_root, timeout)
+            probe = {"case": probe_case, "rc": probe_rec["rc"], "log": probe_rec["log"],
+                     "outcome": probe_rec["outcome"], "why": probe_rec["outcome_why"],
+                     "runner": probe_rec["runner"],
+                     "suite_verdict": probe_rec.get("suite_verdict"),
+                     "log_text": probe_rec.get("log_text", "")[-4000:],
+                     "observer": probe_rec["observer"], "timeout_s": timeout}
+        except (OSError, ValueError) as exc:
+            probe = {"case": probe_case, "rc": None, "log": None,
+                     "why": f"probe could not run: {type(exc).__name__}: {exc}"}
     rec["suite_probe"] = probe
-    if probe["rc"] == 0 and not rec["blocking"]:
+    if rec.get("invalid"):
+        rec["verdict"] = VERDICT_INVALID
+        rec["reason"] = "; ".join(rec["invalid"][:5])
+    elif probe["rc"] is not None and probe["rc"] == 0 and not rec["blocking"]:
         rec["verdict"] = VERDICT_OK
     else:
         rec["verdict"] = VERDICT_UNMEASURABLE
         if rec["blocking"]:
             rec["reason"] = "; ".join(f"{b['key']}: {b['detail']}" for b in rec["blocking"])
+        elif probe["rc"] is None:
+            rec["reason"] = probe["why"]
         else:
-            first = next((l for l in probe["log_tail"] if "_fatal" in l or "Error" in l or "not found" in l), "")
-            rec["reason"] = f"the suite refused a probe case with exit {probe['rc']}: {first.strip()}"
-    write_jsonl(out_dir / "preflight.jsonl", [rec])
-    return rec
-
-
-def write_jsonl(path, records):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as fh:
-        for rec in records:
-            fh.write(json.dumps(rec, sort_keys=True) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-
-
-def append_jsonl(path, rec):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as fh:
-        fh.write(json.dumps(rec, sort_keys=True) + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-
-
-def prepare_dir(path):
-    """A per-case directory that must be new and empty. Never repairs, never reuses."""
-    path = Path(path)
-    if path.exists():
-        raise FileExistsError(f"{path} already exists; a case directory is immutable per attempt")
-    path.mkdir(parents=True)
-    if any(path.iterdir()):
-        raise RuntimeError(f"{path} is not empty")
-    return path
-
-
-def run_case(tests_root, case, work_dir, arm, timeout, fstype="", allow_missing_root=False):
-    """Run one case in its own directory and capture the child's own exit code.
-
-    The suite runs a case as `./tests/generic/NNN` from the tree root: that is
-    the only cwd where its `. ./common/preamble` resolves and where `$here` is
-    the tree root, which is where the helper paths come from.
-    """
-    tests_root = Path(tests_root)
-    tree_root = tests_root.parent
-    work = Path(work_dir)
-    work.mkdir(parents=True, exist_ok=True)
-    test_dir = prepare_dir(work / "testdir")
-    tmp_dir = work / "tmp"
-    result_dir = work / "results"
-    tmp_dir.mkdir()
-    result_dir.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env.pop("FSTYP", None)
-    env.update(arm_env(str(test_dir), fstype, str(tmp_dir), str(result_dir), tree_root))
-    log = work / "case.log"
-    argv = [f"./{case.relative_to(tree_root)}"]
-    started = time.time()
-    with log.open("ab", buffering=0) as fh:
-        fh.write(f"# argv={argv} cwd={tree_root} arm={arm} test_dir={test_dir}\n".encode())
-        fh.flush()
-        proc = subprocess.Popen(argv, cwd=str(tree_root), env=env, stdout=fh,
-                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                start_new_session=True)
-        try:
-            rc = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Only this case's own session. A timed-out case that keeps writing
-            # would corrupt the next case's directory, and a stray writer on the
-            # mount would block the unmount at the end.
-            os.killpg(proc.pid, 9)
-            rc = proc.wait(timeout=60)
-            rc = -9
-            timed_out = True
-        else:
-            timed_out = False
-    text = log.read_text(errors="replace")
-    rec = {
-        "kind": "case",
-        "arm": arm,
-        "case": case.relative_to(tests_root.parent).as_posix(),
-        "rc": rc,
-        "timed_out": timed_out,
-        "wall_s": round(time.time() - started, 3),
-        "test_dir": str(test_dir),
-        "log": str(log),
-    }
-    if not allow_missing_root:
-        skips = [why for pattern, why in SKIP_SIGNATURES if pattern.search(text)]
-        rec["skips"] = skips
-    rec["log_tail"] = [l for l in text.splitlines() if l.strip()][-12:]
+            tail = (probe.get("log_text") or probe.get("observer", {}).get("raw_tail") or [])
+            ignored = (probe.get("suite_verdict") or {}).get("ignored") or []
+            if ignored:
+                rec["reason"] = (f"the suite did not run the probe case {ignored[0]!r}; "
+                                 "check could not resolve it, which needs the group.list "
+                                 "the suite build generates")
+            else:
+                first = next((l for l in tail if "_fatal" in l or "not found" in l), "")
+                rec["reason"] = f"the suite refused a probe case with exit {probe['rc']}: {first}"
+    # Evidence is written whatever happened, including a missing probe case.
+    append_jsonl(out_dir / f"preflight-{run_id}.jsonl", rec)
+    rec["evidence"] = str(out_dir / f"preflight-{run_id}.jsonl")
     return rec
 
 
 def verdict_for_case(native, cowfs):
-    """One case, both arms. A cowfs failure native passed is a FAIL, always."""
-    if native["rc"] != 0:
-        if cowfs["rc"] == 0:
-            return VERDICT_OK, "native failed and cowfs passed; recorded as a native-arm failure"
-        return VERDICT_UNMEASURABLE, f"both arms failed (native rc={native['rc']}, cowfs rc={cowfs['rc']})"
-    if native.get("skips"):
-        return VERDICT_INVALID, "native log says the case did not assert: " + ", ".join(native["skips"])
-    if cowfs["rc"] != 0:
-        if cowfs.get("skips"):
-            return VERDICT_INVALID, "cowfs log says the case did not assert: " + ", ".join(cowfs["skips"])
-        return VERDICT_FAIL, f"cowfs rc={cowfs['rc']} where native rc=0"
-    if cowfs.get("skips"):
-        return VERDICT_INVALID, "cowfs log says the case did not assert: " + ", ".join(cowfs["skips"])
-    return VERDICT_OK, "both arms exited 0 with no skip signature"
+    """One case, both arms, each classified on its own account first.
+
+    Never PASS on a missing assertion. Never PASS on a broken native arm. And
+    never PASS when the two arms did demonstrably different work, because "both
+    exited 0" over different activity is not evidence that cowfs matches native.
+    """
+    for label, rec in (("native", native), ("cowfs", cowfs)):
+        if rec["outcome"] == OUTCOME_SKIPPED:
+            return VERDICT_INVALID, (f"{label} arm did not assert: {rec['outcome_why']}")
+        if rec["outcome"] == OUTCOME_REFUSED:
+            return VERDICT_UNMEASURABLE, f"{label} arm refused: {rec['outcome_why']}"
+    n_obs, c_obs = native.get("observer", {}), cowfs.get("observer", {})
+    # Both arms really ran. Now the comparison is meaningful.
+    if native["outcome"] == OUTCOME_FAILED:
+        return VERDICT_UNMEASURABLE, (f"the native arm failed ({native['outcome_why']}); "
+                                       "that is not a cowfs verdict")
+    if cowfs["outcome"] == OUTCOME_FAILED and native["outcome"] == OUTCOME_PASSED:
+        return VERDICT_FAIL, f"cowfs {cowfs['outcome_why']} where the native arm passed"
+    if native["outcome"] == OUTCOME_PASSED and cowfs["outcome"] == OUTCOME_PASSED:
+        n_res = (n_obs.get("RESIDUE") or "").split()
+        c_res = (c_obs.get("RESIDUE") or "").split()
+        if sorted(n_res) != sorted(c_res):
+            return VERDICT_UNMEASURABLE, (
+                f"the two arms left different residue: native {sorted(n_res)}, "
+                f"cowfs {sorted(c_res)}; both exiting 0 over different work is not "
+                "evidence that cowfs matches native")
+        return VERDICT_OK, ("both arms recorded a pass witness with a clean log, and "
+                             "they left the same residue behind")
+    return VERDICT_UNMEASURABLE, f"native={native['outcome']} cowfs={cowfs['outcome']}"
 
 
 def run(args):
-    tests_root = tests_dir(args.xfstests)
+    tree_root = tests_dir(args.xfstests).parent
     out = Path(args.out).resolve()
     if os.getuid() == 0:
         print("INVALID: refusing to run the suite as root", file=sys.stderr)
         return 3
-    pre = preflight(args.xfstests, out, args.timeout)
-    if pre["verdict"] != VERDICT_OK:
-        print(f"VERDICT: {VERDICT_UNMEASURABLE}", file=sys.stderr)
-        print(f"REASON: {pre.get('reason', 'prerequisite absent')}", file=sys.stderr)
-        for item in pre["blocking"]:
-            print(f"BLOCKING: {item['key']}: {item['detail']}", file=sys.stderr)
-        print(f"EVIDENCE: {out / 'preflight.jsonl'}", file=sys.stderr)
-        return 2
+    # Arms first: refuse a pair that cannot support a comparison before any case.
     try:
-        records = classify_group(tests_root)
-    except FileNotFoundError as exc:
+        arms = validate_arms(args.native_root, args.cowfs_root)
+    except ValueError as exc:
         print(f"INVALID: {exc}", file=sys.stderr)
         return 3
+    pre = preflight(args.xfstests, out, args.timeout)
+    if pre["verdict"] != VERDICT_OK:
+        # A source-pin failure is INVALID (3) and a missing prerequisite is
+        # UNMEASURABLE (2). They are different problems and a CI step must be
+        # able to tell them apart.
+        code = {"INVALID": 3}.get(pre["verdict"], 2)
+        print(f"VERDICT: {pre['verdict']}", file=sys.stderr)
+        print(f"REASON: {pre.get('reason', 'prerequisite absent')}", file=sys.stderr)
+        for item in pre.get("invalid") or []:
+            print(f"SOURCE: {item}", file=sys.stderr)
+        for item in pre["blocking"]:
+            print(f"BLOCKING: {item['key']}: {item['detail']}", file=sys.stderr)
+        print(f"EVIDENCE: {pre.get('evidence')}", file=sys.stderr)
+        return code
+    records = classify_group(tree_root / "tests")
     allow, drift = check_allowlist_drift(records)
     if drift:
         print(f"INVALID: {drift}", file=sys.stderr)
@@ -559,40 +1337,75 @@ def run(args):
     if refused:
         print(f"INVALID: not in the reviewed allowlist: {refused}", file=sys.stderr)
         return 3
-    native_root = Path(args.native_root).resolve()
-    cowfs_root = Path(args.cowfs_root).resolve()
-    for label, root in (("native", native_root), ("cowfs", cowfs_root)):
-        if not root.is_dir():
-            print(f"INVALID: {label} root {root} is not a directory", file=sys.stderr)
-            return 3
     run_dir = out / f"run-{time.strftime('%Y%m%d-%H%M%S')}"
     results = run_dir / "results.jsonl"
-    meta = {"kind": "meta", "cases": requested, "allowlist_sha": sha_of(allow),
-            "native_root": str(native_root), "cowfs_root": str(cowfs_root),
-            "timeout_s": args.timeout, "source": pre["source"], "path": pre["path"]}
+    pin_detail = pre.get("pin", {}).get("detail", {})
+    meta = {"kind": "meta", "run_id": run_dir.name, "cases": requested,
+            "tree_sha": pre["source"].get("sha"), "path": pre["path"],
+            "arms": arms, "timeout_s": args.timeout, "runner": args.runner,
+            "expected_cases": len(records),
+            "pin": {"tree_sha": pin_detail.get("provenance", {}).get("sha"),
+                    "case_sha": pin_detail.get("case_sha"),
+                    "closure": pin_detail.get("closure")}}
     write_jsonl(results, [meta])
     tallies = {VERDICT_OK: 0, VERDICT_FAIL: 0, VERDICT_UNMEASURABLE: 0, VERDICT_INVALID: 0}
+    observer_dir = run_dir / "observer"
+    observer_dir.mkdir(parents=True, exist_ok=True)
+    observer = write_observer(observer_dir)
     for cid in requested:
-        case = tests_root / "generic" / cid
-        native = run_case(tests_root, case, run_dir / cid / "native", "native", args.timeout)
-        cowfs = run_case(tests_root, case, run_dir / cid / "cowfs", "cowfs", args.timeout)
-        verdict, why = verdict_for_case(native, cowfs)
+        case = f"generic/{cid}"
+        # Each arm's per-case directory lives inside its own arm root.
+        case_work = {}
+        arm_recs = {}
+        for arm in ("native", "cowfs"):
+            arm_root = Path(arms[arm]["path"])
+            work = arm_root / run_dir.name / f"{cid}-{arm}"
+            test_dir = prepare_dir(work / "testdir")
+            tmpdir = prepare_dir(work / "tmp")
+            result_dir = prepare_dir(work / "results")
+            case_work[arm] = {"work": work, "test_dir": test_dir,
+                              "tmpdir": tmpdir, "result_dir": result_dir}
+            # The case directory is inside the arm root, so it measures the arm's
+            # filesystem. The log is under --out, so the evidence does not land on
+            # the filesystem under test.
+            log = run_dir / "logs" / f"{cid}-{arm}.log"
+            if args.runner == "check":
+                arm_recs[arm] = run_case_check(observer, case, test_dir, tmpdir,
+                                               result_dir, tree_root, args.timeout,
+                                               log=log)
+            else:
+                arm_recs[arm] = run_case(observer, case, test_dir, tmpdir,
+                                         result_dir, tree_root, args.timeout, log=log)
+        verdict, why = verdict_for_case(arm_recs["native"], arm_recs["cowfs"])
         tallies[verdict] += 1
-        rec = {"kind": "case_verdict", "case": f"generic/{cid}", "verdict": verdict, "why": why,
-               "native_rc": native["rc"], "cowfs_rc": cowfs["rc"],
-               "native_log": native["log"], "cowfs_log": cowfs["log"],
-               "native_skips": native.get("skips"), "cowfs_skips": cowfs.get("skips"),
-               "native_wall_s": native["wall_s"], "cowfs_wall_s": cowfs["wall_s"]}
-        append_jsonl(results, rec)
-        print(f"{cid}\t{verdict}\tnative={native['rc']} cowfs={cowfs['rc']}\t{why}")
+        rec = {"kind": "case_verdict", "case": case, "verdict": verdict, "why": why,
+               "native_rc": arm_recs["native"]["rc"], "cowfs_rc": arm_recs["cowfs"]["rc"],
+               "native_outcome": arm_recs["native"]["outcome"], "cowfs_outcome": arm_recs["cowfs"]["outcome"],
+               "native_log": arm_recs["native"]["log"], "cowfs_log": arm_recs["cowfs"]["log"],
+               "native_skips": arm_recs["native"]["scan"]["skips"],
+               "cowfs_skips": arm_recs["cowfs"]["scan"]["skips"],
+               "native_test_dir": str(case_work["native"]["test_dir"]),
+               "cowfs_test_dir": str(case_work["cowfs"]["test_dir"]),
+               "native_observer": for_json(arm_recs["native"]["observer"]),
+               "cowfs_observer": for_json(arm_recs["cowfs"]["observer"]),
+               "native_suite_verdict": arm_recs["native"].get("suite_verdict"),
+               "cowfs_suite_verdict": arm_recs["cowfs"].get("suite_verdict"),
+               "native_source_sha": pin_detail.get("case_sha", {}).get(cid),
+               "cowfs_source_sha": pin_detail.get("case_sha", {}).get(cid),
+               "runner": args.runner,
+               "native_wall_s": arm_recs["native"]["wall_s"],
+               "cowfs_wall_s": arm_recs["cowfs"]["wall_s"]}
+        append_jsonl(results, for_json(rec))
+        print(f"{cid}\t{verdict}\tnative={arm_recs['native']['rc']} cowfs={arm_recs['cowfs']['rc']}\t{why}")
     covered = len(requested)
     total = len(records)
-    print(f"COVERAGE: {covered} of {total} generic cases, allowlist sha {meta['allowlist_sha'][:12]}")
+    print(f"COVERAGE: {covered} of {total} generic cases, reviewed set {sha_of(sorted(allow))[:12]}")
     print(f"COUNTS: pass={tallies[VERDICT_OK]} fail={tallies[VERDICT_FAIL]} "
           f"unmeasurable={tallies[VERDICT_UNMEASURABLE]} invalid={tallies[VERDICT_INVALID]}")
-    if args.require_full and covered != total:
+    if args.require_full and covered != pin_case_count():
         print(f"VERDICT: {VERDICT_UNMEASURABLE}", file=sys.stderr)
-        print(f"REASON: --require-full and only {covered} of {total} generic cases were run", file=sys.stderr)
+        print(f"REASON: --require-full and only {covered} of {pin_case_count()} reviewed cases ran",
+              file=sys.stderr)
         return 2
     if tallies[VERDICT_FAIL]:
         print(f"VERDICT: {VERDICT_FAIL}", file=sys.stderr)
@@ -601,32 +1414,28 @@ def run(args):
         print(f"VERDICT: {VERDICT_UNMEASURABLE}", file=sys.stderr)
         return 2
     print(f"VERDICT: {VERDICT_OK}")
-    if covered != total:
-        print(f"SCOPE: PARTIAL. {covered} of {total} generic cases ran. G5 stays OPEN.")
+    if covered != len(records):
+        print(f"SCOPE: PARTIAL. {covered} of {len(records)} generic cases ran. G5 stays OPEN.")
     return 0
 
 
-def sha_of(items):
-    import hashlib
-    return hashlib.sha256("\n".join(items).encode()).hexdigest()
+def pin_case_count():
+    pin, err = parse_allowlist()
+    return (pin or {}).get("case_count") or 0
 
 
-def report(args):
-    results = Path(args.run) / "results.jsonl"
-    if not results.exists():
-        print(f"INVALID: {results} does not exist", file=sys.stderr)
-        return 3
-    rows = [json.loads(l) for l in results.read_text().splitlines() if l.strip()]
-    cases = [r for r in rows if r.get("kind") == "case_verdict"]
-    meta = next((r for r in rows if r.get("kind") == "meta"), {})
-    print(f"CASES: {len(cases)} of {meta.get('allowlist_sha', '?')[:12]}")
-    for rec in cases:
-        print(f"{rec['case']}\t{rec['verdict']}\tnative={rec['native_rc']} cowfs={rec['cowfs_rc']}\t{rec['why']}")
-    counts = {}
-    for rec in cases:
-        counts[rec["verdict"]] = counts.get(rec["verdict"], 0) + 1
-    print("COUNTS: " + " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
-    return 0
+def check_allowlist_drift(records, allowlist=None):
+    """Drift is a refusal everywhere, including this report path."""
+    pin, err = parse_allowlist(allowlist)
+    if err:
+        return [], err
+    computed = sorted(r["id"] for r in records if r["verdict"] == "SAFE")
+    reviewed = sorted(pin["cases"])
+    if computed != reviewed:
+        added = sorted(set(computed) - set(reviewed))
+        removed = sorted(set(reviewed) - set(computed))
+        return computed, f"allowlist drift: classifier-safe added {added}, removed {removed}"
+    return computed, None
 
 
 def classify_cmd(args):
@@ -641,29 +1450,78 @@ def classify_cmd(args):
         summary[rec["verdict"]] = summary.get(rec["verdict"], 0) + 1
     if args.out:
         write_jsonl(Path(args.out) / "classify.jsonl", records)
-    for rec in records:
-        if rec["verdict"] != "SAFE" and args.verbose:
-            print(f"{rec['id']}\t{rec['verdict']}\t{'; '.join(rec['reasons'])}")
+    if args.verbose:
+        for rec in records:
+            if rec["verdict"] != "SAFE":
+                print(f"{rec['id']}\t{rec['verdict']}\t{'; '.join(rec['reasons'])}")
     print("SUMMARY: " + " ".join(f"{k}={v}" for k, v in sorted(summary.items())))
-    print(f"ALLOWLIST: {len(allow)} cases, sha {sha_of(allow)[:12]}")
-    print(f"ALLOWLIST_SHA: {sha_of(allow)}")
+    print(f"REVIEWED: {len(allow)} cases, sha {sha_of(allow)[:12]}")
     print(f"DRIFT: {drift or 'none'}")
+    if drift:
+        print(f"INVALID: {drift}", file=sys.stderr)
+        return 3
     return 0
 
 
 def preflight_cmd(args):
-    rec = preflight(args.xfstests, Path(args.out), args.timeout)
+    rec = preflight(args.xfstests, Path(args.out), args.timeout, pin_check=not args.no_pin_check)
+    if rec["verdict"] == VERDICT_INVALID:
+        for problem in rec.get("invalid") or []:
+            print(f"SOURCE: {problem}")
     print(f"VERDICT: {rec['verdict']}")
     if rec.get("reason"):
         print(f"REASON: {rec['reason']}")
     print(f"SOURCE: {rec['source'].get('sha', 'unknown')} ({rec['source'].get('committed', '?')})")
+    print(f"PIN: {rec.get('pin', {}).get('ok')} {rec.get('pin', {}).get('problems')}")
     print(f"PATH: {rec['path']}")
     for gate in rec["startup_gate"]:
         print(f"GATE: {gate['key']}\t{gate['status']}\t{gate.get('fatal') or gate.get('path')}")
-    print(f"PROBE: generic/010 rc={rec['suite_probe']['rc']} log={rec['suite_probe']['log']}")
-    print(f"BUILT: {json.dumps(rec['built'], sort_keys=True)}")
-    print(f"EVIDENCE: {Path(args.out) / 'preflight.jsonl'}")
-    return 0 if rec["verdict"] == VERDICT_OK else 2
+    caps = rec["capabilities"]
+    print(f"CAPS: uid_root={caps['uid_is_root']} "
+          f"autoconf={caps['autoconf']['present']} automake={caps['automake']['present']} "
+          f"libtool={caps['libtool']['present']} m4={caps['m4']['present']} "
+          f"getfattr={caps['getfattr']['present']} fsstress={caps['ltp/fsstress']['present']}")
+    print(f"PROBE: {rec['suite_probe'].get('case')} rc={rec['suite_probe'].get('rc')} "
+          f"outcome={rec['suite_probe'].get('outcome')} log={rec['suite_probe'].get('log')}")
+    if rec["suite_probe"].get("log") and Path(rec["suite_probe"]["log"]).exists():
+        for line in Path(rec["suite_probe"]["log"]).read_text(errors="replace").splitlines()[-4:]:
+            print(f"  | {line[:150]}")
+    print(f"EVIDENCE: {rec.get('evidence')}")
+    if rec["verdict"] == VERDICT_OK:
+        return 0
+    return {"INVALID": 3}.get(rec["verdict"], 2)
+
+
+def report(args):
+    results = Path(args.run) / "results.jsonl"
+    if not results.exists():
+        print(f"INVALID: {results} does not exist", file=sys.stderr)
+        return 3
+    rows = [json.loads(l) for l in results.read_text().splitlines() if l.strip()]
+    cases = [r for r in rows if r.get("kind") == "case_verdict"]
+    meta = next((r for r in rows if r.get("kind") == "meta"), {})
+    counts = {}
+    for rec in cases:
+        counts[rec["verdict"]] = counts.get(rec["verdict"], 0) + 1
+    print(f"RUN: {meta.get('run_id')} tree={str(meta.get('tree_sha'))[:12]} runner={meta.get('runner')}")
+    for arm in ("native", "cowfs"):
+        arm_id = (meta.get("arms") or {}).get(arm, {})
+        print(f"ARM {arm}: fstype={arm_id.get('fstype')} dev={arm_id.get('device_id')} "
+              f"mount={arm_id.get('mount_target')} source={arm_id.get('source')}")
+    for rec in cases:
+        print(f"{rec['case']}\t{rec['verdict']}\tnative={rec['native_rc']}({rec.get('native_outcome')}) "
+              f"cowfs={rec['cowfs_rc']}({rec.get('cowfs_outcome')})\t{rec['why']}")
+    print("COUNTS: " + (" ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no cases"))
+    print(f"COVERAGE: {len(cases)} of {meta.get('expected_cases', '?')} reviewed cases")
+    # A report is a printer, but a CI step wired to it must not go green on a
+    # failing or invalid run.
+    if counts.get(VERDICT_FAIL):
+        return 1
+    if counts.get(VERDICT_INVALID):
+        return 3
+    if counts.get(VERDICT_UNMEASURABLE) or not cases:
+        return 2
+    return 0
 
 
 def main(argv=None):
@@ -673,12 +1531,14 @@ def main(argv=None):
     def add_common(p):
         p.add_argument("--xfstests", default=os.environ.get("COWFS_XFSTESTS_SRC"),
                        required=os.environ.get("COWFS_XFSTESTS_SRC") is None,
-                       help="the xfstests tree, the directory that holds tests/")
+                       help="the xfstests tree root, the directory that holds tests/")
         p.add_argument("--out", default=os.environ.get("COWFS_XFSTESTS_OUT", str(REPO / "bench" / "out" / "ready-g5")))
-        p.add_argument("--timeout", type=int, default=300)
+        p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
 
     p = sub.add_parser("preflight")
     add_common(p)
+    p.add_argument("--no-pin-check", action="store_true",
+                   help="diagnose the suite gate without the source pin (control use only)")
     p.set_defaults(func=preflight_cmd)
 
     p = sub.add_parser("classify")
@@ -690,8 +1550,12 @@ def main(argv=None):
     add_common(p)
     p.add_argument("--native-root", required=True)
     p.add_argument("--cowfs-root", required=True)
-    p.add_argument("--cases", help="comma separated generic ids, must be in the reviewed allowlist")
+    p.add_argument("--cases", help="comma separated generic ids, must be in the reviewed set")
     p.add_argument("--require-full", action="store_true")
+    p.add_argument("--runner", choices=("check", "direct"), default="check",
+                   help="check is the suite's own runner and the only one whose "
+                        "verdict can be a pass; direct invokes the case script for "
+                        "diagnosis and can never record a pass")
     p.set_defaults(func=run)
 
     p = sub.add_parser("report")
