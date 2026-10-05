@@ -510,8 +510,8 @@ class CompareRefuses(unittest.TestCase):
             self.assertNotIn("PASS", out)
 
     def test_a_nan_arm_cannot_launder_an_over_ceiling_run(self):
-        # loads() drops NaN before taking the peak, and max() is not symmetric on NaN:
-        # max(NaN, 31.0) is NaN but max(3.5, NaN) is 3.5. Both orders must be refused.
+        # max() is not symmetric on NaN: max(NaN, 31.0) is NaN but max(3.5, NaN) is 3.5,
+        # so the arms are tested rather than the peak. Both orders must be refused.
         nan = float("nan")
         with tempfile.TemporaryDirectory() as d:
             busy = self.write(d, "busy.jsonl", [meta(), {**g1(), "load1_before": 31.0, "load1_after": 31.0}])
@@ -525,6 +525,39 @@ class CompareRefuses(unittest.TestCase):
                 rc, _, out = self.run_compare([native], cowfs)
                 self.assertEqual(rc, 2, (name, out))
                 self.assertNotIn("PASS", out, name)
+
+    def test_a_partly_unknown_load_is_not_a_measurement(self):
+        # One unreadable observation leaves the arm's load unknown, so the peak over the samples
+        # that did land is not a measurement and must not certify quality. NaN stays valid input.
+        nan = float("nan")
+        with tempfile.TemporaryDirectory() as d:
+            quiet = self.write(d, "quiet.jsonl", [meta(), {**g1(), "load1_before": 3.5, "load1_after": 3.5}])
+            busy = self.write(d, "busy.jsonl", [meta(), {**g1(), "load1_before": 31.0, "load1_after": 31.0}])
+            mixed = {
+                "nan before, finite after": (nan, 3.5),
+                "finite before, nan after": (3.5, nan),
+            }
+            for name, (before, after) in mixed.items():
+                half = self.write(d, "half.jsonl",
+                                  [meta(), {**g1(), "load1_before": before, "load1_after": after}])
+                for peer, peer_name in ((quiet, "quiet peer"), (busy, "busy peer")):
+                    for arm, native, cowfs in (("native", half, peer), ("cowfs", peer, half)):
+                        label = f"native {name} with {peer_name}"
+                        if arm == "cowfs":
+                            label = f"cowfs {name} with {peer_name}"
+                        rc, err, out = self.run_compare([native], cowfs)
+                        self.assertEqual(rc, 2, (label, out))
+                        self.assertIn("UNMEASURABLE", out, label)
+                        self.assertNotIn("PASS", out, label)
+                        self.assertNotIn("INVALID", err, label)
+            # a multi-rep arm where only one rep is unreadable is the same situation
+            rows = [meta()]
+            for i, load in enumerate((3.5, 3.5, nan)):
+                rows.append({**g1(wall=2.0, rep=i), "load1_before": load, "load1_after": load})
+            one_bad_rep = self.write(d, "onerep.jsonl", rows)
+            rc, _, out = self.run_compare([one_bad_rep], one_bad_rep)
+            self.assertEqual(rc, 2, out)
+            self.assertNotIn("PASS", out)
 
     def test_finite_load_still_decides_the_verdict(self):
         # The do-nothing baseline for the case above: a finite load under the ceiling is scored

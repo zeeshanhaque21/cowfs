@@ -310,9 +310,16 @@ def spread(rows):
 
 
 def loads(rows):
+    """The arm's peak load1, or NaN when any observation is unknown.
+
+    A getloadavg failure on one sample means the load for that sample is not known, so the peak
+    over a partly unknown set is not a measurement. Returning NaN lets the caller's existing
+    guard refuse the comparison instead of scoring the samples that did land.
+    """
     vals = [r["load1_before"] for r in rows] + [r["load1_after"] for r in rows]
-    vals = [v for v in vals if not math.isnan(v)]
-    return max(vals) if vals else float("nan")
+    if any(math.isnan(v) for v in vals):
+        return float("nan")
+    return max(vals)
 
 
 def ratios(a, b):
@@ -401,6 +408,7 @@ def main() -> int:
         if math.isnan(la) or math.isnan(lb):
             # max() and min() are not symmetric on NaN, so test the arms rather than the peak:
             # max(quiet_finite, NaN) returns the quiet number and would launder the gap.
+            # loads() reports NaN for a partly unknown arm, so this also covers a mixed set.
             print(f"UNMEASURABLE: no finite load1 was recorded (native {la:.1f}, "
                   f"cowfs {lb:.1f}), so the ceiling {LOAD_CEILING} cannot be checked")
             unmeasurable += 1
