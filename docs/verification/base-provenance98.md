@@ -1,7 +1,10 @@
 # Issue #98: warm-base provenance, published durably and never lost
 
-Task: #98 on top of the issue #17 namespace PR (#92). Reviewed `f1529cc`, then `6929e63`; this file
-records both rounds, the second being the repair of what the review of `6929e63` found.
+Task: #98 on top of the issue #17 namespace PR (#92). Reviewed `f1529cc`, then `6929e63`, then `c3bafb7b`;
+this file records those rounds. The concurrency defect the review of `c3bafb7b` disclosed is issue 115 and
+has its own evidence file, `docs/verification/evidence/base-provenance115-interleaving.md`, which supersedes
+the "pre-check, not a transaction" limitation recorded below: the check and the record change are now one
+critical section, proven deterministically rather than argued from source.
 
 ## What #98 was
 
