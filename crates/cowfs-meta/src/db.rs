@@ -294,6 +294,10 @@ enum Extra<'a> {
         from: Option<SnapshotId>,
     },
     Remove(SnapshotId),
+    Rename {
+        id: SnapshotId,
+        name: &'a str,
+    },
 }
 
 fn corrupt(what: &str) -> Error {
@@ -484,6 +488,24 @@ impl Inner {
                     return Err(Error::NoSuchSnapshot);
                 }
             }
+            Extra::Rename { id, name } => {
+                let Some(e) = s.snaps.get(id) else {
+                    return Err(Error::NoSuchSnapshot);
+                };
+                // A name held by a different snapshot is refused, never replaced: the other
+                // snapshot's id and tree have to keep answering to it.
+                if let Some(taken) = s.names.get(*name) {
+                    if *taken != *id {
+                        return Err(Error::SnapshotExists);
+                    }
+                }
+                // Renaming to the name the snapshot already has changes nothing, so there is
+                // nothing to write. It is not an error either: the caller asked for the name it
+                // can already see.
+                if e.info.name == *name {
+                    return Ok(None);
+                }
+            }
             Extra::None => {}
         }
         self.run_hook()?;
@@ -575,6 +597,17 @@ impl Inner {
                         reap.insert(next, *e.info.root.as_bytes())?;
                         meta.insert("next_reap", next + 1)?;
                     }
+                    Extra::Rename { id, name } => {
+                        // One transaction moves the name in both tables: the row keeps its id, so
+                        // the snapshot's tree, its inode numbers and any handle already open on it
+                        // are untouched, and a name held by another snapshot is refused above.
+                        let e = s.snaps.get(id).ok_or(Error::NoSuchSnapshot)?;
+                        let mut info = e.info.clone();
+                        info.name = (*name).to_string();
+                        snaps.insert(id.0, encode_snap(&info).as_slice())?;
+                        names.remove(e.info.name.as_str())?;
+                        names.insert(*name, id.0)?;
+                    }
                 }
                 w.settle()?;
                 let reserved = if closing {
@@ -623,6 +656,18 @@ impl Inner {
                 }
                 self.reap_len.fetch_add(1, SeqCst);
                 self.wake_reaper();
+            }
+            Extra::Rename { id, name } => {
+                // The session mirrors the two tables, so it moves here too, and only after the
+                // transaction committed: a handle already open on this snapshot keeps working and
+                // reports the new name, because its id did not change.
+                if let Some(old) = s.snaps.get(&id).map(|e| e.info.name.clone()) {
+                    s.names.remove(&old);
+                    s.names.insert(name.to_string(), id);
+                }
+                if let Some(e) = s.snaps.get_mut(&id) {
+                    e.info.name = name.to_string();
+                }
             }
             Extra::None => {}
         }
@@ -881,6 +926,23 @@ impl Inner {
     fn remove_snapshot(&self, id: SnapshotId) -> Result<()> {
         let mut s = self.wlock()?;
         self.commit(&mut s, Extra::Remove(id), false, true)
+            .map(|_| ())
+    }
+
+    /// Moves a snapshot to a new name in one transaction, keeping its id.
+    ///
+    /// The name is the only thing that changes: the id, the tree, every inode number in it and any
+    /// handle already open on the snapshot all stay as they were, so a consumer needs one write
+    /// transaction instead of the two forks a rename otherwise costs.
+    ///
+    /// A name held by a different snapshot is refused with [`Error::SnapshotExists`] and changes
+    /// nothing. A name the snapshot already has is a no-op that writes nothing.
+    fn rename_snapshot(&self, id: SnapshotId, name: &str) -> Result<()> {
+        if name.is_empty() || name.len() > usize::from(u16::MAX) {
+            return Err(Error::Invalid("bad snapshot name"));
+        }
+        let mut s = self.wlock()?;
+        self.commit(&mut s, Extra::Rename { id, name }, false, true)
             .map(|_| ())
     }
 
@@ -1458,6 +1520,30 @@ impl Meta {
     /// held; the space returns as the steps run.
     pub fn remove_snapshot(&self, id: SnapshotId) -> Result<()> {
         self.h.inner.remove_snapshot(id)
+    }
+
+    /// Renames a snapshot in one transaction, keeping its id.
+    ///
+    /// `new_name` follows the same rule as [`Meta::new_snapshot`]: a name that is empty or longer
+    /// than `u16::MAX` bytes is [`Error::Invalid`]. This is meta's own rule and it is deliberately
+    /// the same one `new_snapshot` already applies, so a rename cannot produce a name a create
+    /// would have refused.
+    ///
+    /// What is preserved: the [`SnapshotId`], the tree and its Merkle root, every inode number in
+    /// it, the creation time and parent, the inode reservation high-water mark, the reap queue and
+    /// the `next_snapshot` counter. A [`Snapshot`] handle taken before the rename stays usable and
+    /// reports the new name.
+    ///
+    /// A name held by a different snapshot is refused with [`Error::SnapshotExists`]; the other
+    /// snapshot is not replaced, removed or renamed. A [`SnapshotId`] that is not present is
+    /// [`Error::NoSuchSnapshot`]. Renaming a snapshot to the name it already has succeeds and
+    /// writes nothing.
+    ///
+    /// This is the metadata API only. No consumer is wired to it yet, and `cowfs-core` still stages
+    /// its own rename through `src/swap.rs`, so nothing outside `cowfs-meta` changes behaviour
+    /// until a consumer adopts this.
+    pub fn rename_snapshot(&self, id: SnapshotId, new_name: &str) -> Result<()> {
+        self.h.inner.rename_snapshot(id, new_name)
     }
 
     /// Frees a bounded number of nodes of removed snapshots. Returns true when more remain.
