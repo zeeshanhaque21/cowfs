@@ -711,11 +711,14 @@ def semantic_checks(repo: Path, label: str, seed: dict) -> dict:
         "seed_head": seed["head"],
     }
 
+    # `run_idx_check` nests each single-kind exit code under that kind's key, so the gate has to read
+    # it there. A top-level read found no `rc` and failed every arm.
     for kind in ("show-index", "verify-pack"):
         rows = run_idx_check(repo, kind)
+        sub = kind.replace("-", "_")
         out["checks"][f"idx.{kind}"] = {
             "count": len(rows),
-            "pass": bool(rows) and all(x.get("rc") == 0 for x in rows),
+            "pass": bool(rows) and all(r["pack_present"] and r[sub]["rc"] == 0 for r in rows),
             "rows": rows,
         }
     strong = idx_integrity(repo, label)
@@ -1559,7 +1562,9 @@ def body(args, here, binaries, attempt, run, summary, win, seed, leak) -> int:
                                   "pass": g["rc"] == 0}
             for kind in ("show-index", "verify-pack", "idx_integrity"):
                 rows = run_idx_check(snap2 / "work", kind)
-                ok = all(x.get("pass") if kind == "idx_integrity" else x.get("rc") == 0
+                sub = kind.replace("-", "_")
+                ok = all(x.get("pass") if kind == "idx_integrity"
+                         else x["pack_present"] and x[sub]["rc"] == 0
                          for x in rows)
                 reread[f"idx_{kind}"] = {"count": len(rows), "pass": bool(rows) and ok,
                                          "idx": [x["idx"] for x in rows],
@@ -1601,8 +1606,8 @@ def body(args, here, binaries, attempt, run, summary, win, seed, leak) -> int:
                                    for a in ("native", "mount")),
         "mount_attested": att["pass"],
         "mount_attestation_negative_controls": all(c["pass"] for c in neg),
-        "idx_integrity_native": summary["checks"]["native"]["idx_integrity"]["pass"],
-        "idx_integrity_mount": summary["checks"]["mount"]["idx_integrity"]["pass"],
+        "idx_integrity_native": summary["checks"]["native"]["checks"]["idx_integrity"]["pass"],
+        "idx_integrity_mount": summary["checks"]["mount"]["checks"]["idx_integrity"]["pass"],
         "checks_native": summary["checks"]["native"]["pass"],
         "checks_mount": summary["checks"]["mount"]["pass"],
         "pack_compare": pack_cmp["pass"],

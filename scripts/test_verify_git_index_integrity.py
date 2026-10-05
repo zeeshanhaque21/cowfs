@@ -385,6 +385,22 @@ class IdxGate(unittest.TestCase):
             for name, b in saved.items():
                 (d / name).write_bytes(b)
 
+    def test_semantic_checks_pass_on_a_clean_repo(self):
+        """The per-kind idx gates read their exit code from the row's nested key. Reading a top-level
+        `rc` found none, so both arms failed idx.show-index and idx.verify-pack and the run could
+        never report clean."""
+        out = vgi.semantic_checks(self.repo, "t", self._seed())
+        for kind in ("idx.show-index", "idx.verify-pack", "idx_integrity"):
+            with self.subTest(check=kind):
+                self.assertTrue(out["checks"][kind]["pass"], out["checks"][kind])
+        self.assertTrue(out["pass"], {k: v for k, v in out["checks"].items()
+                                      if isinstance(v, dict) and v.get("pass") is False})
+
+    def _seed(self):
+        tracked = {rel: vgi.sha256_file(self.repo / rel) for rel in vgi.tracked_files(self.repo)}
+        head = vgi.proc(["git", "rev-parse", "HEAD"], cwd=self.repo)["stdout"].strip()
+        return {"head": head, "tree": "", "tracked": tracked, "init_rc": 0}
+
     def test_every_op_shape_can_be_recorded(self):
         """A fixture write carries neither a `git` nor a `check` key, and its result dict has no
         `argv`, so recording the op crashed the whole run on the second op."""
