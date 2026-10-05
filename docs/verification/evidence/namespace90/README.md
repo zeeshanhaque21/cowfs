@@ -35,6 +35,8 @@ So `git merge-base HEAD origin/main` reports `46b0f26` for as long as `main` sta
 merge, which is the commit the integration actually took.
 `ceb96c67033cbf97f79267d6af7db3fa204d77d1` was the branch point with `main` *before* that merge,
 and it is an ancestor of this head.
+`main` has since moved to `03bbec85626c26a85ee4f5791d3a413fe47725bc`, so "main stays ahead" is
+concrete: this branch has not taken anything newer than `46b0f26`.
 An earlier revision of this file called `ceb96c67` "the real merge-base"; that was true before the
 merge commit existed and is wrong after it, because the merge moved the merge-base to `46b0f26`.
 
@@ -115,6 +117,63 @@ Source: `docs/reviews/namespace-durability90-final.md` in critic slot 6's worktr
 full.
 Its harness was not reused here and its verdicts were not inherited.
 The two runs agree on the direction and differ on pids and absolute timings, as two hosts should.
+
+## Independent crash proof at `7da09dd`, run by the reviewer
+
+This is the reviewer's run, not this branch's, and it is recorded here as their evidence.
+Their harness is not this harness and their numbers are not merged into the table above.
+
+| case | verdict | digest, pre-rename == post-reopen | new present | old gone | fsck | kill | reopen pid |
+|---|---|---|---|---|---|---|---|
+| `fsync-parent-dir` | KEPT | `4f9fbadf30c3ee63` | yes | yes | 0 problems | -9 | differs |
+| `fsync-read-only-fd` | KEPT | `4f9fbadf30c3ee63` | yes | yes | 0 problems | -9 | differs |
+
+They also record, from their own harness, `cargo test -p cowfs-daemon --test guard` 16 passed,
+`--test evidence` 4 passed, `--test ns_durability` 8 passed, and the macOS gate 1 passed, 0 ignored,
+23.66 s, all under one 600 s hold of the shared mac-heavy lock each, with CI green.
+The digest differs from the one in this branch's receipts because the two harnesses use different
+payloads; neither is evidence for the other's bytes.
+They disclose that they ran their targeted batch before their crash proof, the reverse of the order
+they had been asked for.
+A first attempt of theirs returned ERROR on the read-only-fd case and was not reported as a result:
+its reopen socket path was 118 characters, past the 104-byte `sun_path`, and the daemon refused to
+start. They shortened the name to a 12-hex digest, 77 characters, and re-ran. That is their
+instrument's bug, recorded because the failure is instructive, not because it is a cowfs defect.
+
+**`SIGKILL` is a process crash, not power loss.** A process kill does not touch the page cache, so
+every readback here, theirs and this branch's, is equally consistent with data that never reached
+the platter. This shows a name survived a process death.
+
+## Crash proof at `9109b9d`, run by this branch under the shared lock
+
+The startup and teardown paths in this branch changed at `9109b9d`, so the fixture moved and the
+prior runs were not carried silently. This is a fresh, small, lock-compliant measurement: one rep of
+each of the two cases a caller actually reaches for, under one bounded 600 s hold of the shared
+mac-heavy lock, taken with a 0 s wait and released at the end.
+
+| case | verdict | digest | new present | old gone | fsck | kill gap |
+|---|---|---|---|---|---|---|
+| `fsync-parent-dir` | KEPT | `fcea6b5b0aa6faeb` | yes | yes | `ok: 2 blocks (382 B), 1 snapshots checked` | see log |
+| `fsync-read-only-fd` | KEPT | `fcea6b5b0aa6faeb` | yes | yes | `ok: 2 blocks (382 B), 1 snapshots checked` | see log |
+
+Both receipts carry `committed` revision `9109b9d0132ba931324734ab226e9e55b93a92ac` with ten source
+and binary bindings on each row, and both name
+`crates/cowfs-nfs/src/adapter.rs` blob `c9ff3862ea1647d2ca3825fc997159cd8b2e0172`.
+That adapter blob is identical to the one at `7da09dd`, which is the concrete reason the reviewer's
+crash proof at `7da09dd` still stands for this head: the durability mechanism did not move, only
+the fixture around it did.
+The macOS gate at the same head: 1 passed, 0 ignored, 21.60 s, exit 0, same lock.
+Zero leftover mounts, daemons or sockets after both runs.
+
+## Runs that were not lock-compliant, disclosed and not certified
+
+Before this branch adopted the shared mac-heavy lock, three gate or suite runs in this session
+executed without holding it: two `namespace_durability_gate` runs and one `cargo test -p
+cowfs-daemon` that included the gate.
+All passed and all left no residue, and none of them is presented as certified evidence.
+They are named here so that a reader who finds those logs in a local `bench/out/` knows why they
+were not quoted as results.
+The runs in the two sections above were taken under the lock and are the ones this branch stands on.
 
 ## Native APFS control, and what it does not show
 

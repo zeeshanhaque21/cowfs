@@ -140,6 +140,63 @@ against a 300ms budget returns in under 5s and is reported unfinished; `/sbin/mo
 table against a 10s budget is reported finished.
 No real mount is unmounted by any of these, and no kernel is wedged.
 
+## Finding 8, the startup path deleted a mount before anything checked whether it was one
+
+Found by the second review, and it is a bypass of the guard the first round added.
+
+`Gate::new` derived `dir`, `store` and `mount` from a fixed `gate-<case>` name and recursively
+deleted whichever already existed, mount point included, before the daemon started and therefore
+before any mount-state check could run.
+`crates/cowfs-daemon/tests/namespace_durability.rs` had the same shape in `Run::new`.
+The trigger is ordinary: the gate runs on every macOS `cargo test --workspace`, so a cancelled or
+timed-out macOS CI job leaves a mount at exactly the path the next run walks.
+
+**The fix.** Startup contains no delete at all.
+Each run mints a unique root from the pid, a nanosecond reading and a per-process counter, and only
+creates inside it, so the destructive question does not arise.
+`guard::preflight` refuses a collision and names what it found rather than resolving it by deletion.
+Where a delete is still needed, teardown, it goes through one seam, `guard::cleanup`, which requires
+a proven `Absent` *and* a path the fixture created.
+`Mounted` and `Unknown` both preserve, and so does an absent path the fixture did not make, because a
+table proving nothing is mounted there is not authority to delete it.
+
+**Mutation evidence, two mutants, no real mount involved.** One that deletes instead of refusing
+fails `a_cancelled_previous_attempt_leaves_its_directory_untouched_at_startup` on the missing
+refusal.
+The quieter one, which deletes *and still refuses*, fails the same test on the marker file it
+destroyed.
+Every case is a synthetic `MountState` and an ordinary private directory under `TMPDIR`, so no
+mounted recursive-deletion experiment was run and none is possible from these tests.
+
+**Also unified.** Both readiness asserts now use the same tri-state reader as teardown rather than
+`cowfs_daemon::mounts::is_mounted`, so the fixture no longer asserts with one primitive and tears
+down with another.
+The shared helper is another owner's and is unchanged; it stays fail-open for its other callers, and
+that is recorded as open below.
+
+## Finding 1b, the refused-setattr test promised a discharge it could not observe
+
+The second review marked `a_refused_setattr_still_barriers_what_was_already_queued` **PARTIAL**,
+correctly.
+
+`Watched` wraps `MemVfs`, which has no queue to inspect.
+Between `forget()` and the refused `setattr` the test establishes no pending work, and the refusal
+happens before the inner filesystem is touched, so nothing new is queued.
+The barrier therefore runs against a queue the test never made non-empty and no assertion observes
+any discharge.
+A name that promises a discharge the assertion cannot see is the same over-claim this repair has been
+removing from the prose.
+
+**The fix is the name and the documentation, not a new fixture.** The test is now
+`a_refused_setattr_still_issues_a_namespace_barrier`, which is exactly what it pins: one barrier
+issued on a refusal, and the caller's own `NFS3ERR_ACCES` reaching the caller.
+Its doc comment states the limit in the test file itself.
+The discharge claim is now stated as structural and names the path:
+`Vfs::sync_namespace` to `Inner::sync_ns_snapshot` to `barrier` to `flush_namespace_locked`, which
+drains that snapshot's queue.
+Standing up a real `Core` with a readable queue and a reopen read-back to observe it end to end
+would be a `cowfs-core` test, outside this branch's owned paths, and is recorded below as not done.
+
 ## Finding 7, the tracked evidence carried no provenance
 
 `results-this-commit.jsonl` had `case`, `rep`, `pid`, `new_name`, `old_name`, `fsck` and nothing
@@ -205,11 +262,44 @@ New files at `21d45f9`, none of which existed at `02dddf8`:
 is the point: none of the seven findings needed a `Core` change.
 The elide seed `9aa30bfa88a2438194d3b5ae7af55c7e2a59ff8a233abfe1cd0ddbec9d213900` is untouched.
 
+## PR 111, derived not merged
+
+PR 111 head `c5169e437d141978670684234bd4b5a47650e35d`, "fix(nfs): a real object may not take a
+live sidecar name (#43)", belongs to the ready-#43 lane and its security review is still running.
+
+It touches `crates/cowfs-nfs/src/adapter.rs` (+16, 0 deletions) and `crates/cowfs-nfs/src/sidecar.rs`
+(+5), adding `Adapter::not_a_view` returning `NFS3ERR_ACCES` and inserting `self.not_a_view(d.ino,
+name)?;` into `mkdir`, `symlink` and `link`, each after `new_name(name)?` and before the mutating
+`Vfs` call.
+
+There is no hunk overlap with this branch, whose hunks are `durable_or`, `setattr`, `purge_sidecars`
+and `rmdir`. Two things are still not settled, and this branch does not settle them:
+
+1. PR 111 is based on adapter blob `1cff2f6`, the *pre-barrier* adapter, so its diff context does
+   not contain the `self.durable(...)` lines this branch added to `mkdir`, `symlink` and `link`.
+   Disjoint hunks with differing context do not guarantee a conflict-free merge.
+2. **The guard-refusal rationale is inconsistent between the two.** This branch's rule is that a
+   refusal owes no barrier *only* when it happens before any mutation and any queued work, and that
+   `durable_or` is therefore called unconditionally elsewhere to discharge earlier pending writes.
+   PR 111's `not_a_view` is a bare `?` placed before the mutating call, which under this branch's own
+   rule means it correctly owes no barrier, because nothing in that RPC has been mutated or queued.
+   The two are compatible, but only if that is stated rather than assumed: a combined tree should say
+   why the refusal skips `durable`, or a later reader will read the asymmetry as an oversight.
+
+Neither branch is merged into the other here, and the coordinator pins the merge order and requires a
+combined actual run before acceptance.
+
 ## Unresolved, carried forward honestly
 
 - The shared mac-heavy resource lock was held for the whole bounded wait, so no new crash
   measurement was taken at `21d45f9`.
   `README.md` records the historical rows at `c644547` and this document records the gap.
+- The admission that a `Core`-backed test could observe a real discharge is not closed.
+  The claim is structural and named, not measured.
+- Three gate or suite runs earlier in this session executed without holding the shared mac-heavy
+  lock. They passed and left no residue and none is certified as evidence; `README.md` names them.
+- `preserve_orphan` queued-content and xattr-failure behaviour is unchanged and has no all-or-nothing
+  contract. It is not measured for loss here and is not claimed either way.
 - `cowfs_daemon::mounts::is_mounted` and `cowfs_nfs::is_listed` still fail open for other callers.
   Other owners, not this branch.
 - `docs/design.md` success criterion 2, build overhead within 1.5x of native, is not measured and

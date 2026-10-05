@@ -62,6 +62,31 @@ not depend on them.
 There is also no control-plane escape hatch: `cowfs_ctl::Request` has no `sync`, so a caller that
 knows the problem cannot ask the daemon for a barrier over the socket.
 
+## The test fixture's own safety, and why it is in this document
+
+The durability fix is one adapter change plus a test fixture that kills daemons and unmounts NFS
+mounts.
+The fixture's failure mode is destructive in its own right, so two rounds of independent review went
+into it and the result is recorded here rather than left implicit in the diff.
+
+Nothing is deleted at startup.
+Every run mints a unique root and only creates inside it, and a collision is refused by name rather
+than resolved by deleting whatever was there.
+A previous version reused a fixed name and recursively deleted the mount point if it existed, before
+the daemon and therefore before any mount-state check could run, which meant a cancelled CI job left
+exactly the path the next run walked.
+
+One seam may authorise a recursive delete: `guard::cleanup`.
+It requires a mount table that parsed, did not name this exact path, and a path this fixture created.
+`Mounted` and `Unknown` both preserve, and so does an absent path the fixture did not make.
+The mount table is read by a local fail-closed reader because
+`cowfs_daemon::mounts::is_mounted` reports `false` both when `/sbin/mount` cannot be run and when its
+unescaped prefix match misses a path containing a space.
+That helper belongs to another owner, is unchanged here, and remains fail-open for its other callers.
+
+No signal is sent until the child's identity is re-read and still matches what was recorded at spawn,
+and no `SIGKILL` ever targets a process group.
+
 ## What changed
 
 The reply is the last place the server can act, so the adapter acts there.
