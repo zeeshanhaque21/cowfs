@@ -10,8 +10,10 @@ none of them is a performance claim.
 - Harness: `crates/cowfs-treehouse/tests/real_project_acceptance.rs`
 - Raw evidence, gitignored and private to this lane: `bench/out/ready-real-project/`
 - Repair evidence: `docs/verification/evidence/real-project16-repair.md`
-  Committed on this branch at `a64e1189ff5f8ac8d34b24aad5d820818f8eaf72`, pinned link:
-  https://github.com/zeeshanhaque21/cowfs/blob/a64e1189ff5f8ac8d34b24aad5d820818f8eaf72/docs/verification/evidence/real-project16-repair.md
+  First committed at `a64e1189ff5f8ac8d34b24aad5d820818f8eaf72`, corrected at
+  `86554b48add2c1f2845289953c6487673f6fbd33`. **The link below points at the corrected version**;
+  the earlier commit is named only so a reader knows the file was not always committed.
+  https://github.com/zeeshanhaque21/cowfs/blob/86554b48add2c1f2845289953c6487673f6fbd33/docs/verification/evidence/real-project16-repair.md
 
 ## Which commit each receipt binds to
 

@@ -17,12 +17,16 @@ unverified.
 | `4a70c53` | the report rewrite: that head's numbers, the chain, the measured limits |
 | `a64e118` | the N1 to N7 harness repair, this file, and the report rewrite |
 | `405cc3d` | docs only: rebind the receipts to the commit that carries the repair |
-| `c77461d` | docs only: pin this file to `a64e118` |
+| `c77461d` | docs only: pin this file to the commit that first committed it |
+| `86554b4` | docs only: correct the executed count, name both receipt files, state the N2 limit |
 
-`405cc3d` and `c77461d` changed documentation only. The harness blob is `7d7b0135` at `a64e118`,
-`405cc3d` and `c77461d` alike, so a runtime measured at any of those three commits is measuring
-`a64e118` code. Content sha256 of the harness at `c77461d` is
+`405cc3d`, `c77461d` and `86554b4` changed documentation only. The harness blob is `7d7b0135` at
+`a64e118`, `405cc3d`, `c77461d` and `86554b4` alike, so a runtime measured at any of those four
+commits is measuring `a64e118` code. Content sha256 of the harness at `c77461d` is
 `8023ddb4f37a66e57495b0d5972a1f6cc490971ca6dceb09c29b1d6681fd0e22`.
+
+This file was first committed at `a64e118` and corrected at `86554b4`. The report's pinned link
+points at the corrected version, so a reader following it does not land on the superseded counts.
 
 The carry from `1b1f2e1` to `4a70c53` is **docs-only and structural**: the test file is
 byte-identical at those two commits, so a runtime measured at `4a70c53` is measuring `1b1f2e1` code.
