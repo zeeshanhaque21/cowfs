@@ -228,12 +228,49 @@ pub(crate) struct Inner {
     inflight: AtomicUsize,
     reap_len: AtomicU64,
     reap_steps: AtomicU64,
+    /// Why the last durable commit failed. Sticky, so a later success does not hide it.
+    last_error: Mutex<Option<String>>,
+    flush_failures: AtomicU64,
+    consecutive_flush_failures: AtomicU64,
+    bg_panics: AtomicU64,
+    /// Read from the file, so a rolled-back store keeps reporting how often it was rolled back.
+    recoveries: AtomicU64,
 }
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner").finish_non_exhaustive()
     }
+}
+
+/// What [`Meta::health`] reports: background failures and recovery accounting.
+///
+/// A store that never failed reports `None` and zeros. Every counter only ever grows, so a
+/// caller can compare two samples and tell progress from a stall.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Health {
+    /// Why the last durable commit failed, of any kind. Sticky: a later success does not clear
+    /// it, so a recovered stall stays visible.
+    pub last_flush_error: Option<String>,
+    /// Durable commits that failed since this handle opened, from any path: the background flush
+    /// timer, a background reap step, an inline commit under `Ack::Applied`, `sync`, `close` and
+    /// the durable wait.
+    pub flush_failures: u64,
+    /// Those in a row since the last one that worked. While this is non-zero the store refuses
+    /// further changes once too much is pending, rather than growing an unbounded backlog.
+    pub consecutive_flush_failures: u64,
+    /// Times a background job panicked, the flush timer or a reap step. The store keeps running
+    /// and retries instead of losing the thread silently.
+    pub background_panics: u64,
+    /// True once the store has seen corruption; it refuses writes until it is reopened.
+    pub poisoned: bool,
+    /// Times this file has been rolled back by [`Meta::open_recover`]. Durable, so a plain
+    /// reopen still reports it. 0 on a store that never lost a commit.
+    pub recoveries: u64,
+    /// Durable floor for inode numbers. Nothing at or above this has been handed out.
+    pub ino_floor: u64,
+    /// Durable floor for snapshot ids.
+    pub snapshot_floor: u64,
 }
 
 type Committed = (Vec<(SnapshotId, NodeId)>, Option<(SnapshotInfo, NodeId)>);
@@ -312,6 +349,46 @@ impl Inner {
     fn note(&self, e: &Error) {
         if matches!(e, Error::Corrupt(_)) {
             self.poisoned.store(true, SeqCst);
+        }
+    }
+
+    /// A durable commit did not happen. Counted and remembered so the caller can be told, from
+    /// anywhere, why its changes are not durable yet.
+    fn note_flush_failure(&self, why: String) {
+        self.flush_failures.fetch_add(1, SeqCst);
+        self.consecutive_flush_failures.fetch_add(1, SeqCst);
+        *lock(&self.last_error) = Some(why);
+    }
+
+    fn note_flush_ok(&self) {
+        self.consecutive_flush_failures.store(0, SeqCst);
+    }
+
+    /// A background job panicked. Recorded rather than swallowed: without it the job stops and
+    /// nothing says so.
+    fn note_bg_panic(&self, what: &str) {
+        self.bg_panics.fetch_add(1, SeqCst);
+        self.note_flush_failure(format!("the {what} panicked and was retried"));
+    }
+
+    /// Re-arms the flush timer after a background failure so the pending window is retried.
+    fn rearm_flush(&self) {
+        if let Some(d) = Instant::now().checked_add(self.opts.sync_interval) {
+            self.arm_timer(d);
+        }
+    }
+
+    fn health(&self) -> Health {
+        let s = self.session.read().unwrap_or_else(|e| e.into_inner());
+        Health {
+            last_flush_error: lock(&self.last_error).clone(),
+            flush_failures: self.flush_failures.load(SeqCst),
+            consecutive_flush_failures: self.consecutive_flush_failures.load(SeqCst),
+            background_panics: self.bg_panics.load(SeqCst),
+            poisoned: self.poisoned.load(SeqCst),
+            recoveries: self.recoveries.load(SeqCst),
+            ino_floor: s.ino.reserved,
+            snapshot_floor: s.next_snapshot,
         }
     }
 
@@ -545,6 +622,7 @@ impl Inner {
         s.pending_bytes = 0;
         s.pending_since = None;
         s.flush_err = None;
+        self.note_flush_ok();
         self.disarm_timer();
         self.durable_seq.store(s.durable, SeqCst);
         let _g = lock(&self.gc);
@@ -568,6 +646,46 @@ impl Inner {
             wtx.commit()?;
             Ok(())
         })
+    }
+
+    /// Records a rollback that lost the newest commit, and moves the two counter floors past
+    /// everything the lost commit could have handed out.
+    ///
+    /// A rollback returns the store to the previous commit, so the inode and snapshot counters go
+    /// back with it. Inode numbers are reserved one `ino_block` at a time, each reservation its
+    /// own durable commit, and redb's repair falls back exactly one commit, so the lost commit
+    /// advanced `ino_reserved` by at most one block. `next_snapshot` moves one per commit. Adding
+    /// those bounds to the recovered values keeps the never-reused rule: a number can be wasted,
+    /// never handed out twice. Carries no chunk references, so no hook.
+    fn record_recovery(&self, ino_block: u64) -> Result<(u64, u64, u64)> {
+        let block = ino_block.max(1);
+        let (recoveries, ino_floor, snapshot_floor) = guard(|| {
+            let mut wtx = self.db.begin_write()?;
+            wtx.set_two_phase_commit(true);
+            let mut meta = wtx.open_table(META)?;
+            let ino_floor = meta_get(&meta, "ino_reserved")?
+                .saturating_add(block)
+                .min(INO_LIMIT);
+            let snapshot_floor = meta_get(&meta, "next_snapshot")?
+                .saturating_add(1)
+                .min(SNAPSHOT_LIMIT);
+            let recoveries = meta
+                .get("recoveries")?
+                .map_or(0, |g| g.value())
+                .saturating_add(1);
+            meta.insert("ino_reserved", ino_floor)?;
+            meta.insert("next_snapshot", snapshot_floor)?;
+            meta.insert("recoveries", recoveries)?;
+            drop(meta);
+            wtx.commit()?;
+            Ok((recoveries, ino_floor, snapshot_floor))
+        })?;
+        let mut s = self.wlock()?;
+        s.ino.reserved = s.ino.reserved.max(ino_floor);
+        s.ino.next = s.ino.next.max(ino_floor);
+        s.next_snapshot = s.next_snapshot.max(snapshot_floor);
+        self.recoveries.store(recoveries, SeqCst);
+        Ok((recoveries, ino_floor, snapshot_floor))
     }
 
     pub(crate) fn mutate<T>(
@@ -631,7 +749,9 @@ impl Inner {
                             .is_some_and(|t| t.elapsed() >= self.opts.sync_interval);
                     if due {
                         if let Err(er) = self.commit(s, Extra::None, false, true) {
-                            s.flush_err = Some(er.to_string());
+                            let why = er.to_string();
+                            s.flush_err = Some(why.clone());
+                            self.note_flush_failure(why);
                         }
                     }
                 }
@@ -670,6 +790,9 @@ impl Inner {
                 Ok(mut s) => self.commit(&mut s, Extra::None, false, true).map(|_| ()),
                 Err(e) => Err(e),
             };
+            if let Err(e) = &r {
+                self.note_flush_failure(e.to_string());
+            }
             *lock(&self.gc) = false;
             self.gc_cv.notify_all();
             r?;
@@ -687,6 +810,9 @@ impl Inner {
             return Ok(());
         }
         let r = self.commit(&mut s, Extra::None, true, true).map(|_| ());
+        if let Err(e) = &r {
+            self.note_flush_failure(e.to_string());
+        }
         s.closed = true;
         r
     }
@@ -823,7 +949,9 @@ impl Inner {
             return;
         }
         if let Err(e) = self.commit(&mut s, Extra::None, false, true) {
-            s.flush_err = Some(e.to_string());
+            let why = e.to_string();
+            s.flush_err = Some(why.clone());
+            self.note_flush_failure(why);
             retry(self.opts.sync_interval);
         }
     }
@@ -869,16 +997,30 @@ fn bg_main(inner: Arc<Inner>) {
             }
         };
         match job {
-            Job::Flush => inner.timer_flush(),
-            Job::Reap => {
-                if matches!(
-                    catch_unwind(AssertUnwindSafe(|| inner.reap_step())),
-                    Ok(Ok(true))
-                ) {
+            // A panic in the sync hook must not unwind out of this loop: a dead timer thread
+            // silently stops flushing idle changes, so the reason is recorded and the flush
+            // re-armed instead.
+            Job::Flush => {
+                if catch_unwind(AssertUnwindSafe(|| inner.timer_flush())).is_err() {
+                    inner.note_bg_panic("background flush");
+                    inner.rearm_flush();
+                }
+            }
+            // Same for the reaper: a panic or an error used to stop it with no signal, so a
+            // removed snapshot's space never came back and nothing reported why.
+            Job::Reap => match catch_unwind(AssertUnwindSafe(|| inner.reap_step())) {
+                Ok(Ok(true)) => {
                     std::thread::sleep(Duration::from_micros(300));
                     lock(&inner.bg.m).reap = true;
                 }
-            }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => inner.note_flush_failure(format!("reap step failed: {e}")),
+                Err(_) => {
+                    inner.note_bg_panic("background reap");
+                    std::thread::sleep(Duration::from_micros(300));
+                    lock(&inner.bg.m).reap = true;
+                }
+            },
         }
     }
 }
@@ -907,6 +1049,9 @@ impl Drop for Handle {
 }
 
 /// What `Meta::open_recover` did.
+///
+/// Every field is additive. `rolled_back` false means nothing was lost, so the floors are `None`
+/// and only the durable count is reported.
 #[derive(Clone, Debug)]
 pub struct Recovery {
     /// True when the newest commit could not be read and the previous one was used.
@@ -915,7 +1060,19 @@ pub struct Recovery {
     pub backup: Option<PathBuf>,
     /// The snapshots of the recovered state.
     pub snapshots: Vec<SnapshotInfo>,
+    /// Times this file has been rolled back, including this one. Durable, so a later plain
+    /// reopen reports the same number. 0 when nothing was lost.
+    pub recoveries: u64,
+    /// New durable floor for inode numbers, when a rollback lost the commit that recorded the old
+    /// one. `None` when nothing was lost. No number at or above this has ever been handed out.
+    pub ino_floor: Option<u64>,
+    /// New durable floor for snapshot ids, likewise.
+    pub snapshot_floor: Option<u64>,
 }
+
+/// [`Error::Storage`] from a failed [`Meta::open_recover`] starts with this, so a caller can tell
+/// a recovery that failed closed from an ordinary I/O error.
+pub const RECOVERY_FAILED: &str = "recovery failed";
 
 /// The metadata store: one redb file holding every snapshot's tree.
 ///
@@ -953,18 +1110,26 @@ impl Meta {
     /// Never called automatically. The file is copied to `<path>.pre-recover` first, and restored
     /// from that copy if recovery fails. Everything committed after the previous commit is lost;
     /// the returned report lists the recovered snapshots so the caller can tell.
+    ///
+    /// A rollback also moves the inode and snapshot counters forward, past everything the lost
+    /// commit could have handed out, so no number is ever reused. That write failing is fatal
+    /// here: handing out a reused number is worse than refusing to open.
     pub fn open_recover(path: impl AsRef<Path>, opts: Options) -> Result<(Meta, Recovery)> {
         let path = path.as_ref();
         match catch_unwind(AssertUnwindSafe(|| builder(&opts).create(path))) {
             Ok(Ok(db)) => {
                 let m = guard(|| Self::init(db, opts.clone()))?;
                 let snapshots = m.snapshots()?;
+                let recoveries = m.health().recoveries;
                 return Ok((
                     m,
                     Recovery {
                         rolled_back: false,
                         backup: None,
                         snapshots,
+                        recoveries,
+                        ino_floor: None,
+                        snapshot_floor: None,
                     },
                 ));
             }
@@ -989,7 +1154,7 @@ impl Meta {
         let restore = |why: String| -> Error {
             let _ = std::fs::copy(&backup, path);
             Error::Storage(format!(
-                "recovery failed ({why}); file restored from {}",
+                "{RECOVERY_FAILED} ({why}); file restored from {}",
                 backup.display()
             ))
         };
@@ -1007,15 +1172,29 @@ impl Meta {
                 .map_err(|e| Error::Storage(e.to_string()))?;
             f.sync_all().map_err(|e| Error::Storage(e.to_string()))?;
         }
-        match Self::open(path, opts) {
+        match Self::open(path, opts.clone()) {
             Ok(m) => {
                 let snapshots = m.snapshots()?;
+                let (recoveries, ino_floor, snapshot_floor) = m
+                    .h
+                    .inner
+                    .record_recovery(opts.ino_block)
+                    .map_err(|e| {
+                        Error::Storage(format!(
+                            "{RECOVERY_FAILED} (the recovered counters could not be recorded: {e}); \
+                             the pre-recovery copy is at {}",
+                            backup.display()
+                        ))
+                    })?;
                 Ok((
                     m,
                     Recovery {
                         rolled_back: true,
                         backup: Some(backup),
                         snapshots,
+                        recoveries,
+                        ino_floor: Some(ino_floor),
+                        snapshot_floor: Some(snapshot_floor),
                     },
                 ))
             }
@@ -1076,6 +1255,7 @@ impl Meta {
             .filter(|&n| n >= 256)
             .ok_or_else(|| corrupt("bad node size"))?;
         let reserved = meta_get(&meta, "ino_reserved")?;
+        let recoveries = meta.get("recoveries")?.map_or(0, |g| g.value());
         let mut snaps = BTreeMap::new();
         let mut names = HashMap::new();
         for r in rtx.open_table(SNAPSHOTS)?.iter()? {
@@ -1126,6 +1306,11 @@ impl Meta {
             inflight: AtomicUsize::new(0),
             reap_len: AtomicU64::new(reap_len),
             reap_steps: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+            flush_failures: AtomicU64::new(0),
+            consecutive_flush_failures: AtomicU64::new(0),
+            bg_panics: AtomicU64::new(0),
+            recoveries: AtomicU64::new(recoveries),
             opts,
         });
         let thread = if background {
@@ -1222,6 +1407,15 @@ impl Meta {
     /// Number of removed-snapshot roots still waiting to be freed.
     pub fn pending_reap(&self) -> Result<u64> {
         Ok(self.h.inner.reap_len.load(SeqCst))
+    }
+
+    /// What the store knows about its own background work and its last recovery.
+    ///
+    /// Pollable and infallible. A store that never failed reports `None` and zeros; the counters
+    /// only grow, so two samples tell progress from a stall. Read it instead of inferring health
+    /// from `check()`, which says nothing about a flush that never happened.
+    pub fn health(&self) -> Health {
+        self.h.inner.health()
     }
 
     /// Runs `before_sync`, then makes every applied change durable. The hook runs on every call,
