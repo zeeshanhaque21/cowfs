@@ -9,6 +9,7 @@ Run: python3 scripts/test_verify_git_index_integrity.py
 """
 
 import importlib.util
+import json
 import shutil
 import subprocess
 import sys
@@ -383,6 +384,34 @@ class IdxGate(unittest.TestCase):
         finally:
             for name, b in saved.items():
                 (d / name).write_bytes(b)
+
+    def test_every_op_shape_can_be_recorded(self):
+        """A fixture write carries neither a `git` nor a `check` key, and its result dict has no
+        `argv`, so recording the op crashed the whole run on the second op."""
+        run = vgi.Run(self.root / "shapes.jsonl")
+        self.addCleanup(run.close)
+        win = SimpleNamespace(ops=[
+            {"name": "status.clean", "git": ["status", "--porcelain=v1"]},
+            {"name": "write.text", "write": ("text", "c.txt", "hello\n")},
+            {"name": "idx.check", "check": "idx_integrity"},
+            {"name": "pack.verify", "check": "verify-pack"},
+        ])
+        out = vgi.run_window(win, self.repo, "t", run)
+        self.assertEqual(out["executed"], 4)
+        self.assertEqual(out["failed_ops"], [])
+        recs = [json.loads(l) for l in run.path.read_text().splitlines()]
+        self.assertEqual([r["name"] for r in recs], ["status.clean", "write.text",
+                                                    "idx.check", "pack.verify"])
+        self.assertTrue(all(isinstance(r["argv"], list) for r in recs))
+
+    def test_a_failed_fixture_write_is_an_op_failure_not_a_crash(self):
+        run = vgi.Run(self.root / "writefail.jsonl")
+        self.addCleanup(run.close)
+        # `src` is a file in this repo, so creating a child under it raises NotADirectoryError.
+        win = SimpleNamespace(ops=[{"name": "write.bad", "write": ("text", "a.txt/x", "nope")}])
+        out = vgi.run_window(win, self.repo, "t", run)
+        self.assertEqual(out["failed_ops"], ["write.bad"])
+        self.assertIsNone(out["results"][0]["rc"])
 
     def test_pack_verify_op_reads_the_nested_exit_code(self):
         """`verify-pack` rows carry their rc inside `verify_pack`, so reading a top-level `rc`

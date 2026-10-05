@@ -635,19 +635,17 @@ def run_window(win: OpWindow, repo: Path, label: str, run: Run) -> dict:
         executed += 1
         results.append({"i": i, "name": op["name"], "rc": rc, "expect": expect,
                         "within_expectation": within})
-        run.rec(
-            "op",
-            arm=label,
-            i=i,
-            name=op["name"],
-            # `idx_integrity` returns a dict whose rows are the per-idx argv; the other check kinds
-            # return a plain list of per-idx dicts. Neither is a single argv, so the recorded argv
-            # is the op's own git command for those, and the rows carry the detail.
-            argv=r.get("argv") if isinstance(r, dict) and "argv" in r
-            else (["git"] + op["git"] if "git" in op else f"<{op['check']} check>"),
-            rc=rc,
-            detail=_trim(r),
-        )
+        # A failed fixture write leaves `r` as {"error": ...} with no argv and no git or check key,
+        # so the op's own shape is described rather than guessed from a key that may be absent.
+        if isinstance(r, dict) and "argv" in r:
+            argv = r["argv"]
+        elif "git" in op:
+            argv = ["git"] + op["git"]
+        elif "check" in op:
+            argv = [f"<{op['check']} check>"]
+        else:
+            argv = [f"<{op['name']} fixture write>"]
+        run.rec("op", arm=label, i=i, name=op["name"], argv=argv, rc=rc, detail=_trim(r))
     return {"arm": label, "declared": len(win.ops), "executed": executed,
             "skipped": skipped, "failed_ops": sorted(failed), "results": results}
 
