@@ -85,12 +85,14 @@ impl Inner {
                 break;
             }
         }
-        let now = Timestamp::now();
         {
             let mut st = node.st.wr();
             if let Some(e) = node.poisoned() {
                 return Err(e);
             }
+            // read under the node lock: a writer that parks here applies after, so its clock must be
+            // its own application point rather than a reading taken before the wait
+            let now = Timestamp::now();
             let NodeState { attr, file, .. } = &mut *st;
             let Some(f) = file.as_mut() else {
                 return Err(Error::Stale);
