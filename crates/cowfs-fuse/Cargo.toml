@@ -18,6 +18,7 @@ signal-hook = "0.3"
 fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
 
 [dev-dependencies]
+cowfs-core = { path = "../cowfs-core" }
 cowfs-vfs-path = { path = "../cowfs-vfs-path" }
 cowfs-vfs-test = { path = "../cowfs-vfs-test" }
 tempfile.workspace = true
