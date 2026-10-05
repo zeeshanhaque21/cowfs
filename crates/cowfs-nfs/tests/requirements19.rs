@@ -169,12 +169,11 @@ fn setattr_gives_a_symlink_its_own_times_over_the_real_filesystem() {
         b"missing",
         "a dangling link keeps its target string"
     );
-    assert_eq!(
-        fs::symlink_metadata(&s.backing.join("dangling"))
+    assert!(
+        fs::symlink_metadata(s.backing.join("dangling"))
             .unwrap()
             .file_type()
             .is_symlink(),
-        true,
         "and no target was created for it"
     );
 
