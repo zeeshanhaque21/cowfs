@@ -18,6 +18,9 @@ use common::*;
 use cowfs_nfs::MountOptions;
 use cowfs_vfs_path::PathVfs;
 use nfsserve::nfs::{ftype3, nfs_fh3};
+// The Linux branch below asks the backend directly whether it can store a symlink mode.
+#[cfg(target_os = "linux")]
+use cowfs_vfs::Vfs as _;
 #[cfg(target_os = "linux")]
 use nfsserve::nfs::{nfstime3, set_mtime};
 
