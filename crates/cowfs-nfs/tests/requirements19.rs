@@ -18,6 +18,8 @@ use common::*;
 use cowfs_nfs::MountOptions;
 use cowfs_vfs_path::PathVfs;
 use nfsserve::nfs::{ftype3, nfs_fh3};
+#[cfg(target_os = "linux")]
+use nfsserve::nfs::{nfstime3, set_mtime};
 
 struct Scratch {
     dir: tempfile::TempDir,
@@ -72,37 +74,66 @@ fn listing_nlink(c: &mut Nfs, name: &str) -> u32 {
 
 /// A native `chmod` through a symlink lands on the target. Without this the tests below would
 /// pass on any server that never touched the link at all, including one that ignored SETATTR.
+///
+/// The link's own mode is read before the chmod and compared after, never written as a literal:
+/// macOS stores one on a symlink and reports 0o755, Linux does not store one at all and reports
+/// 0o777. What this asserts is that a followed chmod moved the target and did not move the link.
 #[test]
 fn a_native_chmod_through_a_symlink_lands_on_the_target() {
     let s = scratch();
     fs::write(s.native.join("target"), b"x").unwrap();
     std::os::unix::fs::symlink("target", s.native.join("link")).unwrap();
+    let (link_before, target_before) = (
+        mode_of(&s.native.join("link")),
+        mode_of(&s.native.join("target")),
+    );
     fs::set_permissions(s.native.join("link"), fs::Permissions::from_mode(0o600)).unwrap();
+    let (link_after, target_after) = (
+        mode_of(&s.native.join("link")),
+        mode_of(&s.native.join("target")),
+    );
+    println!(
+        "NATIVE_CHMOD link {link_before:o} -> {link_after:o}, target {target_before:o} -> {target_after:o}"
+    );
     assert_eq!(
-        (
-            mode_of(&s.native.join("link")),
-            mode_of(&s.native.join("target"))
-        ),
-        (0o755, 0o600),
-        "a followed chmod changed the target and left the link alone"
+        target_before, 0o644,
+        "the fixture is 644 before anything touches it"
+    );
+    assert_eq!(target_after, 0o600, "a followed chmod landed on the target");
+    assert_eq!(
+        link_after, link_before,
+        "the link's own mode is not what changed"
+    );
+    assert_ne!(
+        target_before, target_after,
+        "the control must be a real change, not a no-op that passes twice"
     );
 }
 
+/// #19: SETATTR on a symlink must give the link its own times and must not touch the target.
+///
+/// Times are the portable half. macOS reaches the link through `utimensat` with
+/// `AT_SYMLINK_NOFOLLOW`, Linux through `utimensat` with `AT_EMPTY_PATH` on an `O_PATH`
+/// descriptor (`cowfs-vfs-path/src/sys.rs`). Both hosts run this. The mode half is not portable and
+/// has its own test below.
 #[test]
-fn setattr_gives_a_symlink_its_own_times_and_mode_over_the_real_filesystem() {
+fn setattr_gives_a_symlink_its_own_times_over_the_real_filesystem() {
     let s = scratch();
     let (_server, mut c) = serve_backing(&s.backing);
     let root = c.root.clone();
 
-    let target = c.create_file(&root, "target");
-    assert_eq!(c.setattr(&target, sattr_mode(0o644)).0, OK);
+    let target_file = c.create_file(&root, "target");
+    assert_eq!(c.write(&target_file, 0, b"payload", 2).0, OK);
     let (st, link) = c.symlink(&root, "link", "target");
     assert_eq!(st, OK);
     let link = link.unwrap();
-    let (_, dangling) = c.symlink(&root, "dangling", "missing");
+    let (st, dangling) = c.symlink(&root, "dangling", "missing");
+    assert_eq!(st, OK);
     let dangling = dangling.unwrap();
 
-    let before = mtime_of(&s.backing.join("target"));
+    let target = s.backing.join("target");
+    let target_before = (mtime_of(&target), fs::read(&target).unwrap());
+
     let (st, after) = c.setattr(&link, sattr_mtime(1000, 5));
     assert_eq!(st, OK, "a valid symlink takes its own times");
     assert_eq!(
@@ -110,14 +141,19 @@ fn setattr_gives_a_symlink_its_own_times_and_mode_over_the_real_filesystem() {
         (1000, 5)
     );
     assert_eq!(
-        mtime_of(&s.backing.join("target")),
-        before,
-        "the target's own mtime on disk is untouched"
-    );
-    assert_eq!(
         mtime_of(&s.backing.join("link")),
         (1000, 5),
         "the link's own mtime on disk is what was set"
+    );
+    assert_eq!(
+        (mtime_of(&target), fs::read(&target).unwrap()),
+        target_before,
+        "the target's mtime and its bytes on disk are both untouched"
+    );
+    assert_eq!(
+        c.readlink(&link).1,
+        b"target",
+        "the link still points where it did"
     );
 
     // #19: rsync of a tree with dangling links onto the mount exited 23 because this was ENOENT.
@@ -125,26 +161,158 @@ fn setattr_gives_a_symlink_its_own_times_and_mode_over_the_real_filesystem() {
     assert_eq!(st, OK, "a dangling link takes its own times");
     assert_eq!(a.unwrap().mtime.seconds, 3000);
     assert_eq!(mtime_of(&s.backing.join("dangling")), (3000, 0));
-
-    // #19 called the chmod path untested. It must reach the link, and only the link.
-    let (st, a) = c.setattr(&link, sattr_mode(0o600));
-    assert_eq!(st, OK);
-    assert_eq!(a.unwrap().mode, 0o600);
     assert_eq!(
-        (
-            mode_of(&s.backing.join("link")),
-            mode_of(&s.backing.join("target"))
-        ),
-        (0o600, 0o644),
-        "the link's mode changed on disk and the target's did not"
+        c.readlink(&dangling).1,
+        b"missing",
+        "a dangling link keeps its target string"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&s.backing.join("dangling"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        true,
+        "and no target was created for it"
     );
 
     let a = c.attrs(&link);
     assert_eq!(a.ftype, ftype3::NF3LNK, "the handle still names the link");
+    assert_eq!(a.size, 6, "the link reports its own target length");
+}
+
+/// #19 called the `chmod` path untested. Where the host stores a mode on a symlink, SETATTR must
+/// reach the link and only the link.
+///
+/// macOS does: `OPEN_SYMLINK` is `O_SYMLINK | O_RDONLY` and `fchmod` on that descriptor changes the
+/// link. The capability is checked on the host first, because it is observable without any new
+/// dependency: a host that stores no mode on a symlink reports 0o777 for every link, which is the
+/// Linux signature. A host with that signature records the fact instead of being asked for a
+/// mode it cannot hold.
+#[cfg(target_os = "macos")]
+#[test]
+fn setattr_gives_a_symlink_its_own_mode_where_the_host_stores_one() {
+    let s = scratch();
+    fs::write(s.native.join("probe_target"), b"x").unwrap();
+    std::os::unix::fs::symlink("probe_target", s.native.join("probe_link")).unwrap();
+    let probe_link = mode_of(&s.native.join("probe_link"));
+    println!("SYMLINK_MODE_CAPABILITY host=macos native_link_mode={probe_link:o}");
+    if probe_link == 0o777 {
+        println!(
+            "SKIP label=no-symlink-mode-in-host host=macos reason=native_link_mode_is_0o777 \
+             open_issue=19"
+        );
+        return;
+    }
+
+    let (_server, mut c) = serve_backing(&s.backing);
+    let root = c.root.clone();
+    let target_file = c.create_file(&root, "target");
+    assert_eq!(c.setattr(&target_file, sattr_mode(0o644)).0, OK);
+    let link = c.symlink(&root, "link", "target").1.unwrap();
+
+    let link_before = mode_of(&s.backing.join("link"));
+    let (st, a) = c.setattr(&link, sattr_mode(0o600));
+    let link_after = mode_of(&s.backing.join("link"));
+    let target_after = mode_of(&s.backing.join("target"));
+    println!(
+        "SYMLINK_MODE host=macos status={st} link {link_before:o} -> {link_after:o} \
+         target={target_after:o}"
+    );
+    assert_eq!(st, OK);
     assert_eq!(
-        (a.mode, a.size),
-        (0o600, 6),
-        "the link keeps its own attributes"
+        a.unwrap().mode,
+        0o600,
+        "the reply reports the link's new mode"
+    );
+    assert_eq!(link_after, 0o600, "the link's own mode changed on disk");
+    assert_eq!(target_after, 0o644, "and the target's did not");
+}
+
+/// #19's `chmod` requirement cannot be met where the host keeps no mode on a symlink, and this lane
+/// does not change production code to invent one.
+///
+/// Linux has no `chmod` for a symlink: there is no `fchmodat` without `AT_SYMLINK_NOFOLLOW`, and
+/// `cowfs-vfs-path` opens the link with `O_PATH | O_NOFOLLOW`, on which `fchmod` is `EBADF`
+/// (`crates/cowfs-vfs-path/src/sys.rs`). So the server answers an error. This asserts the refusal
+/// and that nothing was damaged, and names the status it saw rather than treating it as a contract:
+/// the error the backend reports today is an artefact of how the errno is mapped, and a later fix
+/// may legitimately answer `NOTSUPP` or succeed.
+#[cfg(target_os = "linux")]
+#[test]
+fn setattr_refuses_a_symlink_mode_where_the_host_cannot_store_one() {
+    let s = scratch();
+    // The capability, asked of the backend itself rather than of NFS, so the refusal is attributed
+    // to the host and backend rather than to the protocol layer inventing an error.
+    let direct = PathVfs::new(&s.backing).expect("open the backing directory");
+    let root_inode = cowfs_vfs::ROOT_INO;
+    let link_attr = direct
+        .symlink(root_inode, b"direct", b"target")
+        .expect("symlink through the backend");
+    let direct_mode = direct.setattr(
+        link_attr.ino,
+        cowfs_vfs::SetAttr {
+            mode: Some(0o600),
+            ..cowfs_vfs::SetAttr::default()
+        },
+    );
+    println!(
+        "SYMLINK_MODE host=linux backend_setattr={:?}",
+        direct_mode.as_ref().err().map(|e| e.to_string())
+    );
+    assert!(
+        direct_mode.is_err(),
+        "this host is expected to be unable to store a mode on a symlink; if it can, the mode \
+         assertions belong in a portable test instead of here"
+    );
+
+    let (_server, mut c) = serve_backing(&s.backing);
+    let root = c.root.clone();
+    let target_file = c.create_file(&root, "target");
+    assert_eq!(c.setattr(&target_file, sattr_mode(0o644)).0, OK);
+    let link = c.symlink(&root, "link", "target").1.unwrap();
+
+    let (mode_status, _) = c.setattr(&link, sattr_mode(0o600));
+    let link_after = mode_of(&s.backing.join("link"));
+    let target_after = mode_of(&s.backing.join("target"));
+    println!(
+        "SYMLINK_MODE host=linux nfs_status={mode_status} link={link_after:o} target={target_after:o} \
+         open_issue=19"
+    );
+    assert_ne!(
+        mode_status, OK,
+        "a symlink mode cannot be stored here, so the server must not report success"
+    );
+    assert_eq!(
+        target_after, 0o644,
+        "the refused mode did not land on the target either"
+    );
+    assert_eq!(
+        link_after,
+        mode_of(&s.backing.join("link")),
+        "the link's own mode is whatever the host reports, unchanged by the refusal"
+    );
+
+    // A combined times-and-mode call reports the order it actually applied them in. No atomicity is
+    // claimed for it either way: what is asserted is only that the target's mode is still intact.
+    let (combined, _) = {
+        let mut s3 = sattr_mode(0o600);
+        s3.mtime = set_mtime::SET_TO_CLIENT_TIME(nfstime3 {
+            seconds: 4000,
+            nseconds: 0,
+        });
+        c.setattr(&link, s3)
+    };
+    let times_applied = mtime_of(&s.backing.join("link")).0 == 4000;
+    println!(
+        "SYMLINK_MODE_COMBINED host=linux status={combined} times_applied_before_the_error={times_applied} \
+         target_mode={:o}",
+        mode_of(&s.backing.join("target"))
+    );
+    assert_ne!(combined, OK, "the mode half still fails");
+    assert_eq!(
+        mode_of(&s.backing.join("target")),
+        0o644,
+        "and the target is still untouched"
     );
 }
 
@@ -357,6 +525,10 @@ impl Drop for Watchdog {
 
 struct Mounted {
     mount: Option<cowfs_nfs::Mount>,
+    /// Printed on every successful mount, so a green run of these names says whether anything was
+    /// actually mounted. The two of them are the only coverage of the kernel client's attribute
+    /// cache and of `touch -h` becoming SETATTR on a link handle.
+    receipt: String,
     _dog: Watchdog,
     _dir: tempfile::TempDir,
 }
@@ -368,6 +540,11 @@ impl Mounted {
 
     fn finish(mut self) {
         let path = self.path();
+        println!(
+            "RECEIPT label=nfs-teardown path={} {}",
+            path.display(),
+            self.receipt
+        );
         self.mount.take().unwrap().unmount().unwrap();
         let table = Command::new("/sbin/mount").output().unwrap();
         assert!(
@@ -377,32 +554,112 @@ impl Mounted {
     }
 }
 
-fn mounted_backing(backing: &Path, opts: MountOptions) -> Option<(Mounted, PathBuf)> {
+/// True when this run was asked for a real mount. `COWFS_REQUIRE_MOUNT=1` is how a manual
+/// acceptance run says that a host without the capability is a failure rather than a skip.
+fn mount_required() -> bool {
+    std::env::var("COWFS_REQUIRE_MOUNT").is_ok_and(|v| v != "0")
+}
+
+/// Decides what a run of a mount test established.
+///
+/// A host that cannot mount is a legitimate skip in CI, where nothing can be done about it, and it
+/// must stay green there or the suite cannot run off macOS at all. A run that *asked* for the mount
+/// and did not get one is not a pass: it established nothing, so it is an error carrying
+/// `UNMEASURABLE` rather than a quiet green.
+fn accept<T>(outcome: Result<T, String>, required: bool) -> Result<Option<T>, String> {
+    match outcome {
+        Ok(v) => Ok(Some(v)),
+        Err(why) if required => Err(format!(
+            "UNMEASURABLE: {why}; this run asked for a mount and did not get one, so it \
+             established nothing"
+        )),
+        Err(why) => {
+            println!("SKIP label=no-mount-capability reason={why}");
+            Ok(None)
+        }
+    }
+}
+
+/// The negative case, with no filesystem and no mount: a requested mount that did not happen has to
+/// be an error, and an unrequested one has to be a labelled skip. If this passes, the two mount
+/// tests cannot report a green run that never mounted.
+#[test]
+fn a_requested_mount_that_did_not_happen_is_an_error_and_an_unrequested_one_is_a_skip() {
+    let refused = accept::<()>(Err("mount_nfs is not available".to_string()), true)
+        .expect_err("a requested mount must not become a green skip");
+    assert!(
+        refused.starts_with("UNMEASURABLE"),
+        "the failure names what it is: {refused}"
+    );
+    assert!(
+        accept(Ok(()), true)
+            .expect("a mount that happened is accepted")
+            .is_some(),
+        "asking for the mount and getting it is the normal case"
+    );
+    assert!(
+        accept::<()>(Err("mount_nfs is not available".to_string()), false)
+            .expect("an unrequested skip is not an error")
+            .is_none(),
+        "a CI host without the capability skips instead of failing"
+    );
+}
+
+fn mounted_backing(backing: &Path, opts: MountOptions) -> Result<Mounted, String> {
     if !cowfs_nfs::mount_nfs_available() {
-        eprintln!("SKIP: mount_nfs is not available");
-        return None;
+        return Err("mount_nfs is not available on this host".to_string());
     }
     let dir = tempfile::Builder::new()
         .prefix("cowfs-nfs-ready19-")
         .tempdir()
-        .unwrap();
+        .map_err(|e| format!("scratch directory: {e}"))?;
     let vfs = Arc::new(PathVfs::new(backing).expect("open the backing directory"));
-    match cowfs_nfs::Mount::new(vfs, &dir.path().join("mnt"), opts) {
-        Ok(m) => {
-            let p = m.mountpoint().to_path_buf();
-            Some((
-                Mounted {
-                    _dog: Watchdog::start(p.clone(), 900),
-                    mount: Some(m),
-                    _dir: dir,
-                },
-                p,
-            ))
+    let m = cowfs_nfs::Mount::new(vfs, &dir.path().join("mnt"), opts)
+        .map_err(|e| format!("cannot mount: {e}"))?;
+    let p = m.mountpoint().to_path_buf();
+    let line = String::from_utf8_lossy(
+        &Command::new("/sbin/mount")
+            .output()
+            .map_err(|e| format!("read the mount table: {e}"))?
+            .stdout,
+    )
+    .lines()
+    .find(|l| {
+        l.split(" on ")
+            .nth(1)
+            .is_some_and(|rest| rest.starts_with(&p.display().to_string()))
+    })
+    .unwrap_or_default()
+    .to_string();
+    // A real mount is a different device from the directory behind it. Without this, a green run
+    // could be a plain read of the backing directory reached by some other path.
+    let mount_dev = fs::metadata(&p).map(|m| m.dev()).unwrap_or(0);
+    let backing_dev = fs::metadata(backing).map(|m| m.dev()).unwrap_or(0);
+    assert_ne!(
+        mount_dev, backing_dev,
+        "the mountpoint is the same device as the backing directory, so nothing was mounted"
+    );
+    let receipt = format!("mount_dev={mount_dev} backing_dev={backing_dev} line={line}");
+    println!("RECEIPT label=nfs-mount {receipt}");
+    Ok(Mounted {
+        _dog: Watchdog::start(p, 900),
+        mount: Some(m),
+        receipt,
+        _dir: dir,
+    })
+}
+
+/// The two mount tests, once the mount question is settled.
+fn mount_or_account(backing: &Path) -> Option<(Mounted, PathBuf)> {
+    let outcome = mounted_backing(backing, MountOptions::default());
+    let required = mount_required();
+    match accept(outcome, required) {
+        Ok(Some(m)) => {
+            let p = m.path();
+            Some((m, p))
         }
-        Err(e) => {
-            eprintln!("SKIP: cannot mount: {e}");
-            None
-        }
+        Ok(None) => None,
+        Err(e) => panic!("{e}"),
     }
 }
 
@@ -453,7 +710,7 @@ fn find_links_counts_the_same_through_the_mount_as_natively() {
     assert!(native_ok, "native find failed: {native}");
     let native: u64 = native.trim().parse().expect("native count");
 
-    let Some((m, mnt)) = mounted_backing(&s.backing, MountOptions::default()) else {
+    let Some((m, mnt)) = mount_or_account(&s.backing) else {
         return;
     };
     let (ok1, first) = multi_linked(&mnt.join("tree"));
@@ -490,7 +747,7 @@ fn touching_a_symlink_on_the_mount_leaves_its_target_alone() {
     let (ok, out) = sh(&s.native, &format!("rsync -a {}/ dst/", src.display()));
     assert!(ok, "native rsync failed: {out}");
 
-    let Some((m, mnt)) = mounted_backing(&s.backing, MountOptions::default()) else {
+    let Some((m, mnt)) = mount_or_account(&s.backing) else {
         return;
     };
     let (ok, out) = sh(&mnt, &format!("rsync -a {}/ tree/", src.display()));
