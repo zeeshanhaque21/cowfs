@@ -46,7 +46,7 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// The on-disk shape. Every field is optional so a store written by an older build, or a file that
 /// lost a field, loads as "provenance unknown" rather than as a claim.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-struct Record {
+pub(crate) struct Record {
     #[serde(default)]
     repo: Option<String>,
     #[serde(default)]
@@ -65,6 +65,18 @@ impl From<&BaseMeta> for Record {
             repo: m.repo.clone(),
             git_ref: m.git_ref.clone(),
             commit: m.commit.clone(),
+            promoted: true,
+        }
+    }
+}
+
+impl Record {
+    /// What promoting a snapshot with no provenance records: a base whose fields are not known.
+    pub(crate) fn promoted_unknown() -> Record {
+        Record {
+            repo: None,
+            git_ref: None,
+            commit: None,
             promoted: true,
         }
     }
@@ -163,6 +175,30 @@ impl BaseMetaStore {
         })
     }
 
+    /// Where this store's records live, for the helpers that publish one.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Runs `f` with exclusive access to the record map.
+    ///
+    /// This is the store's own mutex, used as a critical section around a snapshot-namespace decision
+    /// and the record change that follows it. It is held for as long as `f` takes, including any backend
+    /// calls `f` makes, so `f` must reach the store only through the `*_locked` helpers: the public
+    /// methods here take this same lock and would deadlock.
+    ///
+    /// Why it exists: the decision that a name is free, and the clearing of a record under that name,
+    /// have to be one step. Separated, a second thread can publish a base for that name in between and
+    /// have its record deleted by a create that is then refused, which loses a live base's provenance
+    /// without losing any tree.
+    pub(crate) fn exclusive<T>(&self, f: impl FnOnce(&mut BTreeMap<String, Record>) -> T) -> T {
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut records)
+    }
+
     /// The provenance of `name`, or `None` when the store holds no record of it.
     pub(crate) fn get(&self, name: &str) -> Option<BaseMeta> {
         let records = self
@@ -182,75 +218,60 @@ impl BaseMetaStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         write_locked(&self.root, &mut records, name, &Record::from(meta))
     }
+}
 
-    /// Records that `name` is a base whose provenance is not known, which is what promoting a
-    /// snapshot without provenance means.
-    pub(crate) fn promote(&self, name: &str) -> io::Result<()> {
-        self.set(
-            name,
-            &BaseMeta {
-                repo: None,
-                git_ref: None,
-                commit: None,
-            },
-        )
-    }
-
-    /// Forgets `name` before this returns, or reports why it could not.
-    ///
-    /// The record is dropped from the map only when the store agrees it is gone. A deletion that fails
-    /// leaves the map holding what is still on disk, so a live process and a process that reopens the
-    /// store answer the same question the same way. A deletion that fails *after* the record file is
-    /// already unlinked is the other case: what the store holds is then "no record", so the map is
-    /// dropped to match it. Either way the failure is reported and never silent.
-    ///
-    /// This is not crash-durable and does not claim to be. `write_locked` fsyncs the record and its
-    /// directory before the write returns; this path fsyncs nothing after the unlink, so a crash here
-    /// can leave a record on disk that the live map has already dropped. Nothing in the product depends
-    /// on a removal surviving a power loss, and no such guarantee is asserted here.
-    pub(crate) fn remove(&self, name: &str) -> io::Result<()> {
-        check_private_name(name)?;
-        let mut records = self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        remove_locked(&self.root, &mut records, name)
-    }
-
-    /// Moves `from`'s record to `to`, so a rename does not lose the provenance.
-    ///
-    /// The destination is written and fsynced first, so the record is never absent: if the destination
-    /// cannot be written nothing is removed and the source is exactly as it was. If the source then
-    /// cannot be removed, both records exist and the map says so, which is what a reopened process
-    /// would read. A destination that already holds a different record is refused rather than
-    /// overwritten, because replacing it would destroy a record this call did not write.
-    pub(crate) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        check_private_name(from)?;
-        cowfs_ctl::validate_snapshot_name(to)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        let mut records = self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(record) = records.get(from).cloned() else {
-            return Ok(());
-        };
-        if let Some(existing) = records.get(to) {
-            if *existing != record {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("{to:?} already has a different base record"),
-                ));
-            }
+/// Forgets `name`'s record, or reports why it could not.
+///
+/// Reached through [`BaseMetaStore::exclusive`] as [`remove_locked`], never on its own: a removal and
+/// the namespace decision that leads to it are one step, and a caller that took the lock for the
+/// decision and then released it before the removal would be the defect this exists to prevent.
+///
+/// The record is dropped from the map only when the store agrees it is gone. A deletion that fails
+/// leaves the map holding what is still on disk, so a live process and a process that reopens the
+/// store answer the same question the same way. A deletion that fails *after* the record file is already
+/// unlinked is the other case: what the store holds is then "no record", so the map is dropped to match
+/// it. Either way the failure is reported and never silent.
+///
+/// This is not crash-durable and does not claim to be. `write_locked` fsyncs the record and its
+/// directory before the write returns; this path fsyncs nothing after the unlink, so a crash here can
+/// leave a record on disk that the live map has already dropped. Nothing in the product depends on a
+/// removal surviving a power loss, and no such guarantee is asserted here.
+/// Moves `from`'s record to `to`, so a rename does not lose the provenance.
+///
+/// The destination is written and fsynced first, so the record is never absent: if the destination
+/// cannot be written, nothing is removed and the source is exactly as it was. If the source then cannot
+/// be removed, both records exist and the map says so, which is what a reopened process would read. A
+/// destination that already holds a different record is refused rather than overwritten, because
+/// replacing it would destroy a record this call did not write.
+///
+/// Reached through [`BaseMetaStore::exclusive`], not called bare.
+pub(crate) fn rename_locked(
+    root: &Path,
+    records: &mut BTreeMap<String, Record>,
+    from: &str,
+    to: &str,
+) -> io::Result<()> {
+    check_private_name(from)?;
+    cowfs_ctl::validate_snapshot_name(to)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let Some(record) = records.get(from).cloned() else {
+        return Ok(());
+    };
+    if let Some(existing) = records.get(to) {
+        if *existing != record {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{to:?} already has a different base record"),
+            ));
         }
-        write_locked(&self.root, &mut records, to, &record)?;
-        match remove_locked(&self.root, &mut records, from) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(io::Error::new(
-                e.kind(),
-                format!("{to:?} now holds the record but {from:?} could not be removed: {e}"),
-            )),
-        }
+    }
+    write_locked(root, records, to, &record)?;
+    match remove_locked(root, records, from) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("{to:?} now holds the record but {from:?} could not be removed: {e}"),
+        )),
     }
 }
 
@@ -275,7 +296,7 @@ fn no_symlinked_dir(dir: &Path) -> io::Result<()> {
 /// Written to a temporary file and renamed, so a reader never sees a partial record and a crash leaves
 /// either the old record or the new one. The file is fsynced and so is its directory, so the record
 /// survives a power loss rather than only a process exit.
-fn write_locked(
+pub(crate) fn write_locked(
     root: &Path,
     records: &mut BTreeMap<String, Record>,
     name: &str,
@@ -342,11 +363,12 @@ fn write_locked(
 }
 
 /// Deletes `name`'s record and updates `records` only to match what the store now holds.
-fn remove_locked(
+pub(crate) fn remove_locked(
     root: &Path,
     records: &mut BTreeMap<String, Record>,
     name: &str,
 ) -> io::Result<()> {
+    check_private_name(name)?;
     let dir = root.join(name);
     // Refused explicitly rather than left to `remove_dir_all`'s own symlink handling, so the delete
     // path says what it will not do instead of quietly unlinking a link.
@@ -403,6 +425,16 @@ mod tests {
 
     fn commit_of(store: &BaseMetaStore, name: &str) -> Option<String> {
         store.get(name).and_then(|m| m.commit)
+    }
+
+    /// Removes a record the way production does: inside the critical section.
+    fn remove_record(store: &BaseMetaStore, name: &str) -> io::Result<()> {
+        store.exclusive(|records| remove_locked(store.root(), records, name))
+    }
+
+    /// Moves a record the way production does: inside the critical section.
+    fn rename_record(store: &BaseMetaStore, from: &str, to: &str) -> io::Result<()> {
+        store.exclusive(|records| rename_locked(store.root(), records, from, to))
     }
 
     /// Where a base's record is on disk, from the store's own path.
@@ -492,7 +524,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(dir.path());
         store.set("warm", &meta("/r", "main", "abc")).unwrap();
-        store.remove("warm").unwrap();
+        remove_record(&store, "warm").unwrap();
         assert_eq!(commit_of(&store, "warm"), None);
         assert_eq!(commit_of(&reopened(dir.path()), "warm"), None);
     }
@@ -503,7 +535,7 @@ mod tests {
         let store = store_in(dir.path());
         for name in ["..", ".", "../escape", "a/b", ""] {
             assert!(
-                store.remove(name).is_err(),
+                remove_record(&store, name).is_err(),
                 "{name:?} must be refused by remove"
             );
         }
@@ -532,7 +564,7 @@ mod tests {
         }
         std::fs::set_permissions(&record_dir, mode(0o500)).unwrap();
 
-        let e = store.remove("warm").unwrap_err();
+        let e = remove_record(&store, "warm").unwrap_err();
         assert!(
             e.to_string().contains("cannot remove the base record"),
             "the failure says what did not happen: {e}"
@@ -577,7 +609,7 @@ mod tests {
         let mode = |m: u32| std::fs::Permissions::from_mode(m);
         std::fs::set_permissions(&metadata_root, mode(0o500)).unwrap();
 
-        let e = store.remove("warm").unwrap_err();
+        let e = remove_record(&store, "warm").unwrap_err();
         assert!(
             e.to_string().contains("cannot remove the base record"),
             "{e}"
@@ -620,7 +652,7 @@ mod tests {
         }
         std::fs::set_permissions(&metadata_root, mode(0o500)).unwrap();
 
-        let e = store.rename("warm", "warmer").unwrap_err();
+        let e = rename_record(&store, "warm", "warmer").unwrap_err();
         assert!(
             e.to_string().contains("warmer"),
             "the refusal names the record it could not write: {e}"
@@ -649,7 +681,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(dir.path());
         store.set("warm", &meta("/r", "main", "abc")).unwrap();
-        store.rename("warm", "warmer").unwrap();
+        rename_record(&store, "warm", "warmer").unwrap();
         assert_eq!(commit_of(&store, "warm"), None);
         assert_eq!(commit_of(&store, "warmer").as_deref(), Some("abc"));
         assert!(!record_in(dir.path(), "warm").exists());
@@ -667,7 +699,7 @@ mod tests {
         store.set("warm", &meta("/r", "main", "aaa")).unwrap();
         store.set("warmer", &meta("/r", "main", "bbb")).unwrap();
         assert_eq!(
-            store.rename("warm", "warmer").unwrap_err().kind(),
+            rename_record(&store, "warm", "warmer").unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(commit_of(&store, "warm").as_deref(), Some("aaa"));

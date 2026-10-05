@@ -9,7 +9,6 @@
 //! it is one entry in a namespace whose root the mount shows. That is why the mount's root needs
 //! no synthetic layer here: the entries are already there.
 
-use crate::base_meta::BaseMetaStore;
 use cowfs_core::{Core, Ingested};
 use cowfs_ctl::{BaseMeta, CtlError, CtlResult, ErrorCode, SnapshotInfo};
 use cowfs_vfs::Vfs;
@@ -327,8 +326,14 @@ fn with_core<T>(slot: &CoreSlot, f: impl FnOnce(&Core) -> io::Result<T>) -> io::
 
 /// Puts a base record back where it was after a snapshot rename failed, and says so if even that
 /// fails, because a record left under the new name would describe a snapshot that is not there.
-fn rollback_base(bases: &BaseMetaStore, moved_to: &str, was: &str, cause: io::Error) -> io::Error {
-    match bases.rename(moved_to, was) {
+fn rollback_base(
+    root: &Path,
+    records: &mut std::collections::BTreeMap<String, crate::base_meta::Record>,
+    moved_to: &str,
+    was: &str,
+    cause: io::Error,
+) -> io::Error {
+    match crate::base_meta::rename_locked(root, records, moved_to, was) {
         Ok(()) => cause,
         Err(rollback) => io::Error::new(
             cause.kind(),
@@ -336,6 +341,47 @@ fn rollback_base(bases: &BaseMetaStore, moved_to: &str, was: &str, cause: io::Er
         ),
     }
 }
+
+/// A test-only point inside a backend operation, so two threads can be interleaved at a chosen
+/// instruction instead of by racing. Compiled only into the test binary: there is no production hook
+/// here, and no production path reaches this module.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    type Hook = Arc<dyn Fn(&str) + Send + Sync>;
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Removes the hook when it goes out of scope, so a test that panics with one installed cannot
+    /// leave it behind to park an unrelated test inside a lock it will never be given.
+    pub(crate) struct Guard(());
+
+    impl Guard {
+        pub(crate) fn install(hook: Hook) -> Guard {
+            *HOOK.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
+            Guard(())
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *HOOK.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// Announces that `point` has been reached. The store's own lock is released first, so a hook may
+    /// block here without holding anything but whatever the test itself is waiting on.
+    pub(crate) fn reach(point: &str) {
+        let hook = HOOK.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
+}
+
+/// Where a create has decided the name is free and has not yet touched the record.
+#[cfg(test)]
+const AFTER_PRECHECK: &str = "create:after-precheck";
 
 /// The refusal for a name that is taken. One helper so both backends report a duplicate the same way,
 /// whichever one serves the store.
@@ -595,39 +641,45 @@ impl Snapshots for CoreSnapshots {
         // does refuse a duplicate itself, but it refuses it after this point, so clearing the record
         // first cost a refused duplicate its base: the snapshot was left with no record on disk and none
         // in the map, live and after a reopen.
-        if self.with(|c| Ok(CoreSnapshots::names(c)?.iter().any(|e| e.name == name)))? {
-            return Err(name_taken());
-        }
-        // A new snapshot is never a base, so any record left under this name by a snapshot that has
-        // since gone is cleared before it exists. Without this, a record orphaned by an interrupted
-        // rename would attach itself to the next snapshot created with the same name and report a
-        // commit that has nothing to do with its contents.
         //
-        // Every failure after the pre-check is safe because of what the pre-check proved. If the record
-        // cannot be cleared this returns an error and no snapshot is created, so nothing half-exists. If
-        // the record was cleared and the core then refuses, the record that went belonged to a name with
-        // no snapshot behind it, which is the only kind this step is allowed to touch.
+        // The check, the clear and the creation are one critical section, so a name another thread takes
+        // in between cannot have the record it has just published deleted by this create. All four
+        // namespace mutations of a name go through one of these methods and each takes the same section,
+        // so nothing can slip between the decision and the record change.
         //
-        // This is a pre-check, not a transaction. It closes the case above and narrows the window in
-        // which a concurrent create of the same free name could clear a record another request has just
-        // published. It does not serialise: two concurrent creates of one free name can both pass here,
-        // and the loser is rejected by the core afterwards. Serialising namespace operations per name is
-        // a broader change than this repair and is not made here.
-        self.bases.remove(name)?;
-        self.with(|c| {
-            let entry = match from {
-                None => c.create_snapshot(name),
-                Some(from) => c.fork_snapshot(from, name),
-            };
-            entry.map_err(control_io).map(|_| ())
+        // Every failure inside the section is safe because of what the check proved. If the record cannot
+        // be cleared this returns an error and no snapshot is created, so nothing half-exists. If it was
+        // cleared and the core then refuses, the record that went belonged to a name with no snapshot
+        // behind it.
+        self.bases.exclusive(|records| {
+            if self.with(|c| Ok(CoreSnapshots::names(c)?.iter().any(|e| e.name == name)))? {
+                return Err(name_taken());
+            }
+            #[cfg(test)]
+            test_hook::reach(AFTER_PRECHECK);
+            // A new snapshot is never a base, so any record left under this name by a snapshot that has
+            // since gone is cleared before it exists. Without this, a record orphaned by an interrupted
+            // rename would attach itself to the next snapshot created with the same name and report a
+            // commit that has nothing to do with its contents.
+            crate::base_meta::remove_locked(self.bases.root(), records, name)?;
+            self.with(|c| {
+                let entry = match from {
+                    None => c.create_snapshot(name),
+                    Some(from) => c.fork_snapshot(from, name),
+                };
+                entry.map_err(control_io).map(|_| ())
+            })
         })?;
         self.info(name)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
-        self.with(|c| c.remove_snapshot(name).map_err(control_io).map(|_| ()))?;
-        self.bases.remove(name)?;
-        Ok(())
+        // One critical section, for the same reason as create: the tree going and its record going are
+        // one step, so a reader never sees a snapshot without its base, or a base without its snapshot.
+        self.bases.exclusive(|records| {
+            self.with(|c| c.remove_snapshot(name).map_err(control_io).map(|_| ()))?;
+            crate::base_meta::remove_locked(self.bases.root(), records, name)
+        })
     }
 
     fn swap(&self, name: &str, from: &str) -> io::Result<SnapshotInfo> {
@@ -656,27 +708,43 @@ impl Snapshots for CoreSnapshots {
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        // The record moves first, so the commit is durable under the new name before the snapshot does,
-        // and a snapshot that cannot move puts the record back where it was. The other order would
-        // leave the commit behind under a name that no longer exists.
-        self.bases.rename(from, to)?;
-        if let Err(e) = self.with(|c| c.rename_snapshot(from, to).map_err(control_io).map(|_| ())) {
-            return Err(rollback_base(&self.bases, to, from, e));
-        }
-        Ok(())
+        // One critical section: the record move, the tree move and the rollback share it, so a create
+        // of `to` cannot decide it is free between a record that has moved and a tree that has not.
+        self.bases.exclusive(|records| {
+            // The record moves first, so the commit is under the new name before the snapshot does, and a
+            // snapshot that cannot move puts the record back where it was. The other order would leave
+            // the commit behind under a name that no longer exists.
+            crate::base_meta::rename_locked(self.bases.root(), records, from, to)?;
+            if let Err(e) =
+                self.with(|c| c.rename_snapshot(from, to).map_err(control_io).map(|_| ()))
+            {
+                return Err(rollback_base(self.bases.root(), records, to, from, e));
+            }
+            Ok(())
+        })
     }
 
     fn promote(&self, name: &str) -> io::Result<SnapshotInfo> {
-        self.with(|c| {
-            Self::names(c)?
-                .into_iter()
-                .any(|e| e.name == name)
-                .then_some(())
-                .ok_or_else(|| missing(name))
+        // One critical section with the create that could be clearing this name's record, so a promote
+        // cannot publish a base and be deleted by a create that is deciding the name is free.
+        self.bases.exclusive(|records| {
+            self.with(|c| {
+                Self::names(c)?
+                    .into_iter()
+                    .any(|e| e.name == name)
+                    .then_some(())
+                    .ok_or_else(|| missing(name))
+            })?;
+            if records.get(name).is_none() {
+                crate::base_meta::write_locked(
+                    self.bases.root(),
+                    records,
+                    name,
+                    &crate::base_meta::Record::promoted_unknown(),
+                )?;
+            }
+            Ok::<(), io::Error>(())
         })?;
-        if self.bases.get(name).is_none() {
-            self.bases.promote(name)?;
-        }
         self.info(name)
     }
 
@@ -827,27 +895,33 @@ impl Snapshots for PathSnapshots {
     }
 
     fn create(&self, name: &str, from: Option<&str>) -> io::Result<SnapshotInfo> {
-        // Same order as the core backend, and for the same reason: refusing a duplicate must cost the
-        // caller nothing, so it happens before the record is touched.
-        if self.exists(name) {
-            return Err(name_taken());
-        }
-        // A new snapshot is never a base, so a record left under this name by a snapshot that has since
-        // gone is cleared before this one exists, or it would report a commit that has nothing to do
-        // with these contents.
-        self.bases.remove(name)?;
-        match from {
-            None => std::fs::create_dir(self.dir(name))?,
-            Some(from) => {
-                if !self.exists(from) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("snapshot {from:?} does not exist"),
-                    ));
-                }
-                copy_tree(&self.dir(from), &self.dir(name))?;
+        // Same order, the same critical section and the same reason as the core backend: refusing a
+        // duplicate must cost the caller nothing, and a name another thread takes in between must not
+        // lose the record it has just published.
+        self.bases.exclusive(|records| {
+            if self.exists(name) {
+                return Err(name_taken());
             }
-        }
+            #[cfg(test)]
+            test_hook::reach(AFTER_PRECHECK);
+            // A new snapshot is never a base, so a record left under this name by a snapshot that has
+            // since gone is cleared before this one exists, or it would report a commit that has nothing
+            // to do with these contents.
+            crate::base_meta::remove_locked(self.bases.root(), records, name)?;
+            match from {
+                None => std::fs::create_dir(self.dir(name))?,
+                Some(from) => {
+                    if !self.exists(from) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("snapshot {from:?} does not exist"),
+                        ));
+                    }
+                    copy_tree(&self.dir(from), &self.dir(name))?;
+                }
+            }
+            Ok(())
+        })?;
         Ok(self.info(name, from.map(str::to_owned)))
     }
 
@@ -858,9 +932,11 @@ impl Snapshots for PathSnapshots {
                 format!("snapshot {name:?} does not exist"),
             ));
         }
-        cowfs_vfs_path::force_remove_dir_all(&self.dir(name));
-        self.bases.remove(name)?;
-        Ok(())
+        // One critical section, as on the core: the tree going and its record going are one step.
+        self.bases.exclusive(|records| {
+            cowfs_vfs_path::force_remove_dir_all(&self.dir(name));
+            crate::base_meta::remove_locked(self.bases.root(), records, name)
+        })
     }
 
     fn swap(&self, name: &str, from: &str) -> io::Result<SnapshotInfo> {
@@ -900,25 +976,36 @@ impl Snapshots for PathSnapshots {
         if self.exists(to) {
             return Err(name_taken());
         }
-        // The record moves first, so the commit is durable under the new name before the snapshot does,
-        // and a snapshot that cannot move puts the record back where it was. The other order would
-        // leave the commit behind under a name that no longer exists.
-        self.bases.rename(from, to)?;
-        std::fs::rename(self.dir(from), self.dir(to))
-            .map_err(|e| rollback_base(&self.bases, to, from, e))?;
-        Ok(())
+        // One critical section: the record move, the tree move and the rollback share it, as on the core.
+        self.bases.exclusive(|records| {
+            // The record moves first, so the commit is under the new name before the snapshot does, and a
+            // snapshot that cannot move puts the record back where it was.
+            crate::base_meta::rename_locked(self.bases.root(), records, from, to)?;
+            std::fs::rename(self.dir(from), self.dir(to))
+                .map_err(|e| rollback_base(self.bases.root(), records, to, from, e))?;
+            Ok(())
+        })
     }
 
     fn promote(&self, name: &str) -> io::Result<SnapshotInfo> {
-        if !self.exists(name) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("snapshot {name:?} does not exist"),
-            ));
-        }
-        if self.bases.get(name).is_none() {
-            self.bases.promote(name)?;
-        }
+        // One critical section with the create that could be clearing this name's record, as on the core.
+        self.bases.exclusive(|records| {
+            if !self.exists(name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("snapshot {name:?} does not exist"),
+                ));
+            }
+            if records.get(name).is_none() {
+                crate::base_meta::write_locked(
+                    self.bases.root(),
+                    records,
+                    name,
+                    &crate::base_meta::Record::promoted_unknown(),
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(self.info(name, None))
     }
 
@@ -1312,6 +1399,256 @@ mod tests {
         );
     }
 
+    /// What a core snapshot's tree holds, read through the backend's own Vfs. Two empty core snapshots
+    /// have different Merkle roots, because each snapshot has its own inode numbers, so the root cannot
+    /// serve as the identity here; the entries can.
+    fn core_entries_of(b: &CoreBackend, name: &str) -> String {
+        let vfs = b.snapshot(name).expect("the snapshot's vfs");
+        let dir = vfs.readdir(cowfs_vfs::ROOT_INO, 0, 64).expect("readdir");
+        let mut names: Vec<String> = dir
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+            .collect();
+        names.sort();
+        names.join(",")
+    }
+
+    fn path_listing_of(b: &PathBackend, name: &str) -> String {
+        let mut entries: Vec<String> = std::fs::read_dir(b.store.join(name))
+            .map(|it| {
+                it.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort();
+        entries.join(",")
+    }
+
+    /// Parks one create at the instant it has decided the name is free and has not touched the record,
+    /// lets a second thread do a whole create-promote-publish for the same name, then lets the first
+    /// one continue.
+    ///
+    /// The hook is a test-only point in the real `create`, so the code under test is the production
+    /// order and not a reimplementation of it. It is the only synchronisation: two channels and a
+    /// bounded wait, no sleeps, no iterations and no shared daemon. The bound is what makes a mistake
+    /// here a test failure rather than a wedge, which is the failure the previous round's probe had.
+    ///
+    /// Returns whether the parked create was accepted and whether the second thread managed to publish
+    /// while it was parked. Both are reported in the assertions below, neither is the assertion.
+    fn interleave_create_against(
+        snaps: &dyn Snapshots,
+        name: &str,
+        publish: impl Fn(&dyn Snapshots) + Send + Sync,
+    ) -> (bool, bool) {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let (reached_tx, reached_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        // The hook is shared, and a receiver is `Send` but not `Sync`, so it is behind a mutex. Only the
+        // parked thread ever takes it, so nothing contends for it.
+        let go_rx = std::sync::Mutex::new(go_rx);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let a = s.spawn(|| {
+                // Installed by, and scoped to, the thread being parked. The hook is a single global
+                // point in `create`, so a hook that parked whichever thread arrived first would be
+                // armed by any other test running in parallel: this one only parks its own thread, and
+                // only that thread, and the guard removes it again when this closure returns.
+                let me = std::thread::current().id();
+                let hook: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |point| {
+                    if point != AFTER_PRECHECK || std::thread::current().id() != me {
+                        return;
+                    }
+                    let _ = reached_tx.send(());
+                    let released = go_rx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .recv_timeout(BOUND);
+                    if released.is_err() {
+                        panic!("the parked create was not released within {BOUND:?}");
+                    }
+                });
+                let _guard = test_hook::Guard::install(hook);
+                snaps.create(name, None).is_ok()
+            });
+            reached_rx
+                .recv_timeout(BOUND)
+                .expect("the first create reached the point after its name check");
+
+            let b = s.spawn(move || {
+                publish(snaps);
+                let _ = done_tx.send(());
+            });
+
+            // Whether B got in while A was parked is the observation, not the claim. Against the code
+            // this replaces, B completes here in microseconds. With the critical section it cannot start
+            // at all, so this bounded wait is the whole cost of the fix and nothing waits twice.
+            let b_ran_first = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+
+            let _ = go_tx.send(());
+            let a_accepted = a.join().expect("the parked create thread");
+            b.join().expect("the create-and-publish thread");
+            (a_accepted, b_ran_first)
+        })
+    }
+
+    /// What must be true whoever won the name: one snapshot called `warm`, still a base, still carrying
+    /// the commit the other thread published, and still an untouched empty tree.
+    fn assert_warm_is_the_published_base(snaps: &dyn Snapshots, identity: &dyn Fn(&str) -> String) {
+        let names = snaps.list().expect("list");
+        assert_eq!(
+            names.iter().filter(|n| n.as_str() == "warm").count(),
+            1,
+            "exactly one snapshot named warm, got {names:?}"
+        );
+        let info = snaps.create_meta("warm").expect("warm exists");
+        assert_eq!(
+            info.base.as_ref().and_then(|b| b.commit.as_deref()),
+            Some("abc"),
+            "the base another thread published is gone: {info:?}"
+        );
+        assert_eq!(
+            identity("warm"),
+            identity("control"),
+            "the snapshot's contents are not those of an untouched empty tree"
+        );
+    }
+
+    /// The interleaving hook is one global point inside `create`, so the two arms take turns rather than
+    /// run in parallel. The lock is held for one arm's whole duration, and each arm is bounded, so this
+    /// cannot wedge: the holder always finishes or panics.
+    static ARMS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Parks a create of `warm` at the point after its name check, lets another thread publish a base
+    /// for that same name, then lets the create continue.
+    fn interleave_promote(snaps: &dyn Snapshots) -> (bool, bool) {
+        // A snapshot created the same way with no parent, so "the contents are untouched" has something
+        // to be compared against that is not the value under test.
+        snaps.create("control", None).expect("the control snapshot");
+        let published = meta("/r", "main", "abc");
+        interleave_create_against(snaps, "warm", move |s| {
+            // The other thread's whole intent: take the name, make it a base, publish where it came from.
+            // Its create may legitimately be refused, which is the case under test.
+            let _ = s.create("warm", None);
+            let _ = s.promote("warm");
+            s.set_base_meta("warm", &published)
+                .expect("publish the base's provenance");
+        })
+    }
+
+    /// Parks a create of `target` while another thread renames an existing base onto that same name. The
+    /// record moves before the tree does, so a create that clears the record in between takes a base's
+    /// provenance with it, and the rename's own rollback has nothing left to put back. This is the case a
+    /// lock inside `create` alone would not cover.
+    fn interleave_rename_onto(snaps: &dyn Snapshots) -> (bool, bool) {
+        snaps.create("warm", None).expect("the base to be renamed");
+        snaps.promote("warm").expect("make it a base");
+        snaps
+            .set_base_meta("warm", &meta("/r", "main", "abc"))
+            .expect("give it provenance");
+        interleave_create_against(snaps, "target", move |s| {
+            let _ = s.rename("warm", "target");
+        })
+    }
+
+    /// Exactly one of `warm` and `target` carries the base's commit, and the name carrying it is a
+    /// snapshot that exists. Either the rename went first and `target` is the base, or the create went
+    /// first and the rename was refused so `warm` is. What must never happen is the record going
+    /// nowhere.
+    fn assert_the_base_survives_under_one_name(snaps: &dyn Snapshots) {
+        let mut carriers = Vec::new();
+        for name in ["warm", "target"] {
+            if let Ok(info) = snaps.create_meta(name) {
+                if info.base.as_ref().and_then(|b| b.commit.as_deref()) == Some("abc") {
+                    carriers.push(name.to_owned());
+                }
+            }
+        }
+        assert_eq!(
+            carriers.len(),
+            1,
+            "the base's record is not on exactly one of warm/target: {carriers:?}"
+        );
+        let names = snaps.list().expect("list");
+        assert!(
+            names.contains(&carriers[0]),
+            "the record is under {} but that snapshot does not exist: {names:?}",
+            carriers[0]
+        );
+    }
+
+    /// Issue 115, on the core backend. A create must not cost another thread the base it published for
+    /// the same name while that create was deciding the name was free.
+    #[test]
+    fn a_concurrent_published_base_survives_another_threads_create_on_core() {
+        let _turn = ARMS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (d, b) = core();
+        let (a_accepted, b_ran_first) = interleave_promote(b.snapshots());
+        eprintln!(
+            "core: parked create accepted={a_accepted}, publisher ran while parked={b_ran_first}"
+        );
+        assert_warm_is_the_published_base(b.snapshots(), &|n| core_entries_of(&b, n));
+        drop(b);
+
+        let reopened = CoreBackend::open(d.path(), cowfs_core::Options::default()).unwrap();
+        assert_warm_is_the_published_base(reopened.snapshots(), &|n| core_entries_of(&reopened, n));
+    }
+
+    /// Issue 115, on the path backend.
+    #[test]
+    fn a_concurrent_published_base_survives_another_threads_create_on_path() {
+        let _turn = ARMS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (_d, b) = path();
+        let store = b.store.clone();
+        let (a_accepted, b_ran_first) = interleave_promote(b.snapshots());
+        eprintln!(
+            "path: parked create accepted={a_accepted}, publisher ran while parked={b_ran_first}"
+        );
+        assert_warm_is_the_published_base(b.snapshots(), &|n| path_listing_of(&b, n));
+        drop(b);
+
+        let reopened = PathBackend::open(&store).unwrap();
+        assert_warm_is_the_published_base(reopened.snapshots(), &|n| path_listing_of(&reopened, n));
+    }
+
+    /// Issue 115 with a rename onto the name instead of a create-and-promote, on the core backend.
+    #[test]
+    fn a_concurrent_rename_onto_a_name_keeps_the_base_on_core() {
+        let _turn = ARMS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (d, b) = core();
+        let (a_accepted, b_ran_first) = interleave_rename_onto(b.snapshots());
+        eprintln!(
+            "core: parked create accepted={a_accepted}, renamer ran while parked={b_ran_first}"
+        );
+        assert_the_base_survives_under_one_name(b.snapshots());
+        drop(b);
+
+        let reopened = CoreBackend::open(d.path(), cowfs_core::Options::default()).unwrap();
+        assert_the_base_survives_under_one_name(reopened.snapshots());
+    }
+
+    /// And on the path backend.
+    #[test]
+    fn a_concurrent_rename_onto_a_name_keeps_the_base_on_path() {
+        let _turn = ARMS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (_d, b) = path();
+        let store = b.store.clone();
+        let (a_accepted, b_ran_first) = interleave_rename_onto(b.snapshots());
+        eprintln!(
+            "path: parked create accepted={a_accepted}, renamer ran while parked={b_ran_first}"
+        );
+        assert_the_base_survives_under_one_name(b.snapshots());
+        drop(b);
+
+        let reopened = PathBackend::open(&store).unwrap();
+        assert_the_base_survives_under_one_name(reopened.snapshots());
+    }
+
     /// A create that cannot clear a stale record creates no snapshot. Both backends, because the record
     /// and the snapshot have to agree about what exists, and a half-created snapshot whose name still
     /// carries a record is worse than no snapshot.
@@ -1433,7 +1770,7 @@ mod tests {
         // Path backend.
         let (_d, b) = path();
         // An orphan written straight to the store: a base record with no snapshot behind it.
-        BaseMetaStore::open(&b.store)
+        crate::base_meta::BaseMetaStore::open(&b.store)
             .unwrap()
             .set("warm", &meta("/r", "main", "abc"))
             .unwrap();
@@ -1442,7 +1779,7 @@ mod tests {
 
         // Core backend, the same orphan over the same kind of store.
         let (d, c) = core();
-        BaseMetaStore::open(&c.store)
+        crate::base_meta::BaseMetaStore::open(&c.store)
             .unwrap()
             .set("warm", &meta("/r", "main", "abc"))
             .unwrap();
@@ -1453,7 +1790,9 @@ mod tests {
         assert_eq!(recreated.base, None, "core backend: {recreated:?}");
         // And the record is gone from the store too, so a reopen agrees.
         assert_eq!(
-            BaseMetaStore::open(&reopened.store).unwrap().get("warm"),
+            crate::base_meta::BaseMetaStore::open(&reopened.store)
+                .unwrap()
+                .get("warm"),
             None
         );
     }
