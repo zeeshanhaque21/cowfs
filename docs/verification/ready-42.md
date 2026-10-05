@@ -3,7 +3,7 @@
 Task: issue #42, "cowfs-meta and ctl requests from cowfs-core (#26): atomic snapshot rename, shared name rule, hole flag, inode reservation, batch_at".
 Lease: `.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/6/cowfs`, branch `followup/core-meta-integration-42`.
 Base: `46b0f269d5bef4a2c204c25f5b3015da601d3beb`.
-Head delivered: `301fcc226d62e4b8568497fcea1b8b8a92302ccd`.
+Head delivered: `4eac3a51c9269f17ff39361a88e6edbc749b3cae`.
 PR: https://github.com/zeeshanhaque21/cowfs/pull/99
 Date: 2026-10-05.
 
@@ -113,7 +113,8 @@ fixture crates/cowfs-daemon/tests/snapname_drift.rs matches_head=True
 | build | `snapname_drift` | exit |
 |---|---|---|
 | base `46b0f26` plus the fixture | **0 passed, 4 failed** | 101 |
-| this head `301fcc2` | **4 passed, 0 failed** | 0 |
+| this head, lease tree | **4 passed, 0 failed** | 0 |
+| this head, fresh readback clone, from scratch | **4 passed, 0 failed** | 0 |
 
 The four failures on the base, verbatim from the log:
 
@@ -163,8 +164,8 @@ A fresh clone of the lease was made and checked out at the pushed head, then eve
 by blob hash and by sha256 of the bytes on disk (`bench/out/ready-42/source-hashes.txt`):
 
 ```
-clone_head=301fcc226d62e4b8568497fcea1b8b8a92302ccd
-checkout_head=301fcc226d62e4b8568497fcea1b8b8a92302ccd
+clone_head=4eac3a51c9269f17ff39361a88e6edbc749b3cae
+checkout_head=4eac3a51c9269f17ff39361a88e6edbc749b3cae
 paths=10 mismatched=0
 ```
 
@@ -188,7 +189,9 @@ UNTOUCHED crates/cowfs-core/src/ino.rs identical_to_base=True
 ### Test matrix
 
 Every exit code read directly, no `$?` from a `head`, `tail` or `tee` pipeline.
-Toolchain `rustc 1.99.0 (b940084d7 2026-09-28)`, macOS, at head `301fcc2`.
+Toolchain `rustc 1.99.0 (b940084d7 2026-09-28)`, macOS.
+These first rows ran in the lease tree, whose target dir already existed; the same rows were then repeated
+from scratch in the fresh readback clone and are listed again further down.
 
 | command | result | exit |
 |---|---|---|
@@ -209,7 +212,8 @@ Toolchain `rustc 1.99.0 (b940084d7 2026-09-28)`, macOS, at head `301fcc2`.
 `cargo fmt --all -- --check` was exit 1 on `3de5583`, the commit before this one, because the fixture was
 written by hand.
 CI runs that as its first step, so no test would have run for that head.
-`301fcc2` is the fmt-only commit that fixed it, and the check above is exit 0 on this head.
+`301fcc2` is the fmt-only commit that fixed it; `cargo fmt --all -- --check` is exit 0 on this head
+in the lease tree and in the fresh readback clone.
 
 ### Matched control
 
@@ -220,23 +224,50 @@ It passes on this head and on the base, so it is reported as a control, not as t
 `snapshot_names_follow_the_cli_rules` in `names_ino.rs` is the pre-existing test that asserts the
 relationship this change makes structural; it passed before and after.
 
+### From scratch, in the fresh readback, under the shared lane
+
+The shared lane `.treehouse-ready-wave/mac-heavy.lock` was held by another worker for most of the
+session, so the readback matrix waited it out: eight attempts through the dispatch recipe, each waiting
+the full 600 s, returned exit 75, and the ninth was granted at `2026-10-05T01:31:25Z`.
+Nothing was built without the lock.
+Everything below was then built from scratch, in a target dir that existed before this task:
+`bench/out/ready-42/readback` for the new head, `bench/out/ready-42/old-target` for the base.
+
+| command | result | exit |
+|---|---|---|
+| `cargo fmt --all -- --check` in the readback | clean | 0 |
+| `cargo clippy -p cowfs-snapname -p cowfs-ctl -p cowfs-core -p cowfs-daemon --all-targets -- -D warnings` in the readback | clean | 0 |
+| `cargo test -p cowfs-snapname` | 6 passed, 0 failed | 0 |
+| `cargo test -p cowfs-ctl --lib` | 10 passed, 0 failed | 0 |
+| `cargo test -p cowfs-daemon --lib` | 48 passed, 0 failed | 0 |
+| `cargo test -p cowfs-daemon --test snapname_drift` | 4 passed, 0 failed | 0 |
+| `cargo test -p cowfs-core --lib snapname` | 4 passed, 0 failed, 25 filtered out | 0 |
+| `cargo test -p cowfs-core --test names_ino` | 4 passed, 0 failed | 0 |
+| `cargo test -p cowfs-core --test swap` | 3 passed, 0 failed | 0 |
+| `cargo test -p cowfs-core --test critic2b staging_names_are_reserved_for_the_swap_protocol` | 1 passed, 0 failed, 27 filtered out | 0 |
+| `cargo test -p cowfs-daemon --test snapname_drift` on `git archive` of `46b0f26` plus the fixture, own target dir | **0 passed, 4 failed** | 101 |
+
+`old_src_files=529 mismatched=0`, checked by hashing every tracked file of the base against the extracted
+tree with `git hash-object`.
+
+Two more rows were run in the lease target dir rather than the readback one, because they are the same
+commits and the same compiler and the readback lane time was better spent on the drift proof:
+
+| command | result | exit |
+|---|---|---|
+| `cargo test -p cowfs-core --test chunks` | 4 passed, 0 failed | 0 |
+| `cargo test -p cowfs-gc --test regressions a_hole_is_never_swept` | 1 passed, 0 failed, 19 filtered out | 0 |
+
+Owned artifacts under `bench/out/ready-42/`: 2.3 GiB, inside the 8 GiB allowance.
+Free disk at the end: 391 GiB.
+
 ### Not run, and why
 
-`cargo test --workspace` was not run.
-CI runs it on the pushed head and is the authoritative full-suite check for this change.
-`cargo clippy --workspace --all-targets` was not run either; clippy was scoped to the four affected
-crates, per the dispatch rule against a full-workspace build.
+`cargo test --workspace` and `cargo clippy --workspace --all-targets` were not run locally; the dispatch
+rule is against a full-workspace build and CI runs both on the pushed head.
 The mutation run `scripts/mutants.py` was not run end to end; it is a local script and not a CI job.
-The one mutant this change moves, `n16`, was not re-run.
-
-A from-scratch rebuild of both trees in fresh target dirs under `bench/out/ready-42/` was blocked: the
-shared lane `.treehouse-ready-wave/mac-heavy.lock` was held by another worker for the whole session.
-Seven attempts through the dispatch recipe, each waiting the full 600 s, all returned exit 75
-"resource lane busy; blocked".
-No build was run without the lock.
-The proof above therefore comes from the lease's own target dir, which is the same compiler and the same
-dependency versions as the readback clone; the readback identity check is git-only and did not need the
-lane.
+The one mutant this change moves, `n16`, was not re-run, so the claim made about it is only that its
+patch target and its focus list are correct, not that the mutant was observed to die.
 
 ## Overlap and ownership
 
