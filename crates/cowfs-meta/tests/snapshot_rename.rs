@@ -583,8 +583,7 @@ fn a_rename_keeps_real_file_bytes_readable_after_a_drop_and_reopen() {
     }
 
     assert_eq!(
-        read_back,
-        body,
+        read_back, body,
         "every byte must come back identical through the renamed snapshot's root"
     );
     again
