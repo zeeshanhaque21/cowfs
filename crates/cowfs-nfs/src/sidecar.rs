@@ -166,6 +166,11 @@ impl Adapter {
         if is_appledouble(target) {
             return Err(nfsstat3::NFS3ERR_NOENT);
         }
+        // `.` and `..` are the two names a `Vfs` refuses to look up and no client can create, so
+        // `._.` and `._..` are real files. Looking one up is a missing name, not a bad one.
+        if target == b"." || target == b".." {
+            return Err(nfsstat3::NFS3ERR_NOENT);
+        }
         self.peek(dir, target).map_err(stat)
     }
 

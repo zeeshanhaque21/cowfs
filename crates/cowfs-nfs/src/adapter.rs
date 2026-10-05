@@ -540,10 +540,24 @@ impl Adapter {
         }
     }
 
+    /// A name that is a live sidecar view belongs to another file's extended attributes, so no
+    /// real directory, symlink or hard link may take it: a real object under that name would
+    /// shadow the view for the rest of the mount, and a hard link would hand the view the bytes
+    /// of the file it names. `ACCES` is what [`Adapter::rename`] already answers when a real
+    /// file is moved onto a view.
+    fn not_a_view(&self, dir: Ino, name: &[u8]) -> NfsResult<()> {
+        if self.side_of(dir, name) {
+            Err(nfsstat3::NFS3ERR_ACCES)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn mkdir(&self, dir: fileid3, name: &[u8], attr: &sattr3) -> NfsResult<(fileid3, fattr3)> {
         let d = self.ident(dir);
         not_side(d)?;
         new_name(name)?;
+        self.not_a_view(d.ino, name)?;
         let mode = match attr.mode {
             set_mode3::mode(m) => m,
             set_mode3::Void => 0o755,
@@ -562,6 +576,7 @@ impl Adapter {
         let d = self.ident(dir);
         not_side(d)?;
         new_name(name)?;
+        self.not_a_view(d.ino, name)?;
         if target.is_empty() || target.contains(&0) {
             return Err(nfsstat3::NFS3ERR_INVAL);
         }
@@ -581,6 +596,7 @@ impl Adapter {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
         new_name(name)?;
+        self.not_a_view(d.ino, name)?;
         let a = self.vfs.link(f.ino, d.ino, name).map_err(stat)?;
         self.handed_out(None, &a);
         self.fa(&a, Kind::Plain)
