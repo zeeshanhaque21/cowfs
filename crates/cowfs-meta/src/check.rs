@@ -635,10 +635,7 @@ mod tests {
     #[test]
     fn extent_gap_is_reported() {
         let (_d, m) = open();
-        let c = cowfs_store::ChunkRef {
-            id: cowfs_store::BlockId::of(b"x"),
-            len: 4,
-        };
+        let c = cowfs_store::ChunkRef::block(cowfs_store::BlockId::of(b"x"), 4);
         m.snapshot("s")
             .unwrap()
             .set_content(Ino(3), &[c], 4)
@@ -647,7 +644,7 @@ mod tests {
             t.insert(
                 src,
                 &key(Ino(3), K_CHUNK, &99u64.to_be_bytes()),
-                encode_chunks(&[c]),
+                encode_chunks(&[c]).unwrap(),
             )
             .unwrap();
         });

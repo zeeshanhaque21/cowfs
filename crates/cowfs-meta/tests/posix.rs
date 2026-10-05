@@ -9,10 +9,7 @@ fn open() -> (tempfile::TempDir, Meta) {
 }
 
 fn chunk(n: u8, len: u32) -> ChunkRef {
-    ChunkRef {
-        id: BlockId::of(&[n]),
-        len,
-    }
+    ChunkRef::block(BlockId::of(&[n]), len)
 }
 
 fn names(s: &Snapshot, dir: Ino) -> Vec<String> {
@@ -394,10 +391,7 @@ fn live_blocks_skips_shared_subtrees() {
         let f = s
             .create(ROOT_INO, format!("f{i}").as_bytes(), 0o644)
             .unwrap();
-        let c = ChunkRef {
-            id: BlockId::of(&i.to_le_bytes()),
-            len: 1,
-        };
+        let c = ChunkRef::block(BlockId::of(&i.to_le_bytes()), 1);
         s.set_content(f.ino, &[c], 1).unwrap();
         expect.push(c.id);
     }
@@ -416,10 +410,7 @@ fn live_blocks_skips_shared_subtrees() {
 
     let c = s.fork("c").unwrap();
     let f = c.create(ROOT_INO, b"new", 0o644).unwrap();
-    let extra = ChunkRef {
-        id: BlockId::of(b"extra"),
-        len: 1,
-    };
+    let extra = ChunkRef::block(BlockId::of(b"extra"), 1);
     c.set_content(f.ino, &[extra], 1).unwrap();
     let again: Vec<BlockId> = c
         .live_blocks(&mut marker)

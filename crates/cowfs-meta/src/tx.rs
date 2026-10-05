@@ -440,7 +440,7 @@ impl Tx<'_> {
     fn put_extent(&mut self, ino: Ino, off: u64, c: &ChunkRef) -> Result<()> {
         self.put(
             key(ino, K_CHUNK, &off.to_be_bytes()),
-            encode_chunks(std::slice::from_ref(c)),
+            encode_chunks(std::slice::from_ref(c))?,
         )
     }
 

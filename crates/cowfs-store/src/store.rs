@@ -1385,12 +1385,7 @@ impl Store {
     /// Blocks stored before an error stay in the store as unreferenced blocks.
     pub fn ingest_bytes(&self, data: &[u8]) -> Result<Vec<ChunkRef>> {
         chunks(data)
-            .map(|c| {
-                Ok(ChunkRef {
-                    id: self.put(c)?,
-                    len: c.len() as u32,
-                })
-            })
+            .map(|c| Ok(ChunkRef::block(self.put(c)?, c.len() as u32)))
             .collect()
     }
 
@@ -1416,10 +1411,7 @@ impl Store {
                 return Ok(out);
             }
             let n = chunker.cut(&buf[start..]);
-            out.push(ChunkRef {
-                id: self.put(&buf[start..start + n])?,
-                len: n as u32,
-            });
+            out.push(ChunkRef::block(self.put(&buf[start..start + n])?, n as u32));
             start += n;
         }
     }

@@ -332,13 +332,17 @@ pub(crate) fn decode_cookie_val(b: &[u8]) -> Result<(Ino, FileType, &[u8])> {
     ))
 }
 
-pub(crate) fn encode_chunks(chunks: &[ChunkRef]) -> Vec<u8> {
+pub(crate) fn encode_chunks(chunks: &[ChunkRef]) -> Result<Vec<u8>> {
     let mut b = Vec::with_capacity(chunks.len() * 36);
     for c in chunks {
+        // the flag and the sentinel must agree before anything reaches the medium: a hole that
+        // named a stored block would lose that block from every walk
+        c.validate()
+            .map_err(|_| Error::Invalid("chunk ref is neither a hole nor a block"))?;
         b.extend_from_slice(c.id.as_bytes());
         b.extend(c.len.to_le_bytes());
     }
-    b
+    Ok(b)
 }
 
 pub(crate) fn decode_chunks(b: &[u8]) -> Result<Vec<ChunkRef>> {
@@ -349,10 +353,18 @@ pub(crate) fn decode_chunks(b: &[u8]) -> Result<Vec<ChunkRef>> {
         .0
         .iter()
         .map(|c| {
-            Ok(ChunkRef {
-                id: BlockId::from_bytes(rd(c, 0)?),
-                len: u32::from_le_bytes(rd(c, 32)?),
-            })
+            let id = BlockId::from_bytes(rd(c, 0)?);
+            let len = u32::from_le_bytes(rd(c, 32)?);
+            // a store written before the flag existed still says "hole" with the sentinel, so the
+            // flag comes from the id here and costs nothing on the medium
+            let r = ChunkRef {
+                id,
+                len,
+                hole: id == cowfs_store::HOLE,
+            };
+            r.validate()
+                .map_err(|_| Error::Corrupt("chunk ref is not a hole or a block".into()))?;
+            Ok(r)
         })
         .collect()
 }

@@ -326,10 +326,7 @@ fn crash_every_event_snapshot_rm_workload() {
                 let dir = tx.mkdir(ROOT_INO, format!("d{d}").as_bytes(), 0o755)?;
                 for i in 0..25u32 {
                     let f = tx.create(dir.ino, format!("f{i}").as_bytes(), 0o644)?;
-                    let c = ChunkRef {
-                        id: BlockId::of(&[d as u8, i as u8]),
-                        len: 3,
-                    };
+                    let c = ChunkRef::block(BlockId::of(&[d as u8, i as u8]), 3);
                     tx.set_content(f.ino, &[c], 3)?;
                 }
                 Ok(())
@@ -371,10 +368,7 @@ fn crash_every_event_reap_steps() {
         a.batch(|tx| {
             for i in 0..400u32 {
                 let f = tx.create(ROOT_INO, format!("f{i}").as_bytes(), 0o644)?;
-                let c = ChunkRef {
-                    id: BlockId::of(&i.to_le_bytes()),
-                    len: 3,
-                };
+                let c = ChunkRef::block(BlockId::of(&i.to_le_bytes()), 3);
                 tx.set_content(f.ino, &[c], 3)?;
             }
             Ok(())
@@ -440,7 +434,7 @@ fn dangling(inside_batch: bool) -> (usize, usize) {
             s.batch(|tx| {
                 let id = fs.put(&[i]);
                 let a = tx.create(ROOT_INO, format!("f{i}").as_bytes(), 0o644)?;
-                tx.set_content(a.ino, &[ChunkRef { id, len: 1 }], 1)?;
+                tx.set_content(a.ino, &[ChunkRef::block(id, 1)], 1)?;
                 Ok(())
             })
             .unwrap();
@@ -449,7 +443,7 @@ fn dangling(inside_batch: bool) -> (usize, usize) {
             let a = s
                 .create(ROOT_INO, format!("f{i}").as_bytes(), 0o644)
                 .unwrap();
-            s.set_content(a.ino, &[ChunkRef { id, len: 1 }], 1).unwrap();
+            s.set_content(a.ino, &[ChunkRef::block(id, 1)], 1).unwrap();
         }
     }
     let log = be.log();
@@ -791,10 +785,7 @@ fn semantics_probes() {
     let s = m.new_snapshot("s").unwrap();
     let f = s.create(ROOT_INO, b"f", 0o644).unwrap().ino;
     let cs: Vec<ChunkRef> = (0..3)
-        .map(|i| ChunkRef {
-            id: BlockId::of(&[i]),
-            len: 100,
-        })
+        .map(|i| ChunkRef::block(BlockId::of(&[i]), 100))
         .collect();
     s.set_content(f, &cs, 300).unwrap();
     eprintln!(
@@ -867,24 +858,15 @@ fn semantics_probes() {
     let fb = sb.create(ROOT_INO, b"only-b", 0o644).unwrap().ino;
     eprintln!("inode numbers after fork: a {fa:?} b {fb:?}");
     let a1 = s.create(ROOT_INO, b"cas", 0o644).unwrap().ino;
-    let c0 = ChunkRef {
-        id: BlockId::of(b"base"),
-        len: 1,
-    };
+    let c0 = ChunkRef::block(BlockId::of(b"base"), 1);
     s.set_content(a1, &[c0], 1).unwrap();
     let (s1, s2) = (s.clone(), s.clone());
     let l1 = s1.chunks(a1).unwrap();
     let l2 = s2.chunks(a1).unwrap();
     let mut n1 = l1.clone();
-    n1.push(ChunkRef {
-        id: BlockId::of(b"writer1"),
-        len: 1,
-    });
+    n1.push(ChunkRef::block(BlockId::of(b"writer1"), 1));
     let mut n2 = l2.clone();
-    n2.push(ChunkRef {
-        id: BlockId::of(b"writer2"),
-        len: 1,
-    });
+    n2.push(ChunkRef::block(BlockId::of(b"writer2"), 1));
     s1.set_content(a1, &n1, 2).unwrap();
     s2.set_content(a1, &n2, 2).unwrap();
     let fin = s.chunks(a1).unwrap();
