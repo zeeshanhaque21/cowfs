@@ -425,34 +425,66 @@ GOOD_IDENTITY = {
 
 
 class VerdictStates(unittest.TestCase):
-    def run_verdict(self, native_cases, cowfs_cases, identity=None, extra=None):
+    def pinned_context(self):
+        """The committed curated closure, verified against its pins.
+
+        A verdict that can say FAIL or UNMEASURABLE needs a verified source: without one the
+        classification prerequisite refuses, and a refusal cannot be read as either of those. The
+        integrity properties below need no such context, and are exercised without one on purpose.
+        """
+        verified = p.verify_tool(FIXTURE / "tool")
+        self.assertEqual(verified["problems"], [], "the committed closure must verify")
+        return verified, FIXTURE / "tool" / "tests"
+
+    def run_verdict(self, native_cases, cowfs_cases, identity=None, extra=None, test="x.t",
+                    context=False, cowfs_plan=None):
+        tool, tests_root = self.pinned_context() if context else (None, None)
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
             lines = []
-            for arm, cases in (("native", native_cases), ("cowfs", cowfs_cases)):
-                record_ = record(arm, "x.t", cases)
+            for arm, cases, plan in (("native", native_cases, None),
+                                     ("cowfs", cowfs_cases, cowfs_plan)):
+                record_ = record(arm, test, cases, plan=plan)
                 record_.pop("synthetic")
                 record_.update({"bail_out": 0, "malformed": []})
                 if extra:
                     record_.update(extra)
                 lines.append(json.dumps(record_, sort_keys=True))
             (run / "cases.jsonl").write_text("\n".join(lines) + "\n")
-            return p.verdict(run, identity=identity if identity is not None else GOOD_IDENTITY)
+            return p.verdict(run, tool, tests_root,
+                             identity if identity is not None else GOOD_IDENTITY)
 
-    def established_regression_is_fail(self):
-        good = case(True, "tried 'unlink pjdfstest_a', expected 0, got 0")
-        bad = case(False, "tried 'unlink pjdfstest_b', expected 0, got EPERM")
-        report = self.run_verdict([good], [bad])
-        self.assertEqual(report["state"], p.FAIL)
-        self.assertEqual(report["exit_status"], 1)
+    def test_established_regression_is_fail(self):
+        # open/17.t makes three assertions in a fixed order and prints no operation text, which is
+        # what the real transcript looks like, so the pairs come from the pinned script's slots.
+        native = [case(True, n=1), case(True, n=2), case(True, n=3)]
+        cowfs = [case(True, n=1), case(False, n=2), case(True, n=3)]
+        report = self.run_verdict(native, cowfs, test="open/17.t", context=True)
+        self.assertEqual(len(report["comparison"]["established_regressions"]), 1)
+        self.assertEqual((report["state"], report["exit_status"]), (p.FAIL, 1))
 
-    def a_pass_needs_a_pairable_scope(self):
-        good = case(True, "tried 'unlink pjdfstest_a', expected 0, got 0")
-        report = self.run_verdict([good], [case(True, "tried 'unlink pjdfstest_b', expected 0, got 0")])
-        self.assertEqual(report["state"], p.UNMEASURABLE)
-        self.assertTrue(any("cannot be paired" in r or "not established" in r for r in report["reasons"]))
+    def test_a_pass_with_nothing_pairable_is_disclosed_as_coverage(self):
+        """Nothing pairable is a limit, and the settled taxonomy discloses it without moving the exit.
 
-    def synthetic_records_are_refused_by_the_verdict_itself(self):
+        This method was written before the coverage rule was settled and expected UNMEASURABLE. The
+        settled rule discloses coverage and lets no other kind change the exit, so with a verified
+        source and nothing pairable the verdict is PASS and the disclosure carries the limit. Whether
+        an entirely empty scope should read as a pass is a question for the gate's owner, recorded
+        here rather than settled by a test, and it is the same shape as the false pass this harness
+        already refuses elsewhere: evidence that could not be read.
+        """
+        # The cowfs arm emitted fewer assertions than the pinned script makes, so nothing pairs.
+        native = [case(True, n=1), case(True, n=2), case(True, n=3)]
+        cowfs = [case(True, n=1), case(True, n=2)]
+        report = self.run_verdict(native, cowfs, test="open/17.t", context=True, cowfs_plan=2)
+        self.assertEqual(report["comparison"]["established_regressions"], [])
+        self.assertTrue(report["comparison"]["unpairable"])
+        self.assertEqual((report["state"], report["exit_status"]), (p.PASS, 0))
+        self.assertTrue(any("cannot be paired" in r["message"] for r in report["reasons"]))
+        without_source = self.run_verdict(native, cowfs, test="open/17.t", cowfs_plan=2)
+        self.assertEqual((without_source["state"], without_source["exit_status"]), (p.INVALID, 3))
+
+    def test_synthetic_records_are_refused_by_the_verdict_itself(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
             lines = []
@@ -464,13 +496,13 @@ class VerdictStates(unittest.TestCase):
             self.assertEqual((report["state"], report["exit_status"]), (p.INVALID, 3))
             self.assertTrue(any("synthetic fixture" in problem for problem in report["guard_problems"]))
 
-    def malformed_json_is_invalid_input_not_a_pass(self):
+    def test_malformed_json_is_invalid_input_not_a_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
             (run / "cases.jsonl").write_text("{not json\n")
             self.assertEqual(p.verdict(run, identity=GOOD_IDENTITY)["exit_status"], 3)
 
-    def mixed_raw_formats_are_refused(self):
+    def test_mixed_raw_formats_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
             first = record("native", "x.t", [case(True, "tried 'unlink pjdfstest_a'")])
