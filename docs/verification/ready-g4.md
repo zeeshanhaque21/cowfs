@@ -172,7 +172,8 @@ Nothing here is a throughput or ratio claim.
 The raw per-case seconds are in `bench/out/ready-g4/repair-batch/run.log`: at 20000 operations the
 matched seeds ran 7.1 to 8.6 s on native and 9.3 to 11.1 s on cowfs, and the sync seed ran 10.3 s
 and 13.1 s, on a host with other workers and other cowfs daemons running.
-The review's own re-runs on a busier host were 24.2 to 30.1 s against 8.9 to 9.0 s.
+The review recorded re-runs of 24.2 to 30.1 s against 8.9 to 9.0 s on a host running two other
+cowfs daemons and several workers.
 Neither is a quiet measurement and neither is used as one.
 The 1.5x criterion in `docs/design.md` is not what this gate measures, and no claim here touches it.
 
