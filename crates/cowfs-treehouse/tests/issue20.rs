@@ -328,9 +328,8 @@ fn force_refuses_a_holder_it_may_not_signal_and_leaves_the_descriptor_open() {
         &["--force", "--nfs-timeout", "2"],
     );
     let out = run_companion(&args);
-    assert_ne!(
-        out.status.success(),
-        true,
+    assert!(
+        !out.status.success(),
         "a holder this process may not signal must stop the return: {}",
         stdout_of(&out)
     );

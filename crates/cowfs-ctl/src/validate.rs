@@ -82,8 +82,9 @@ pub fn validate_mount_relative(name: &str) -> CtlResult<()> {
     if first == "." {
         return bad("must not name the mount itself");
     }
-    // A component of `..` is the only way out, and an empty one would name a directory twice.
-    if components.clone().any(|c| c.is_empty() || c == "..") {
+    // `..` is the only way out, in any position including the first, and an empty component would
+    // name a directory twice.
+    if first == ".." || components.any(|c| c.is_empty() || c == "..") {
         return bad("must not contain a `..` or empty component");
     }
     if name.ends_with('/') {
