@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "signal"] }
 
 [dev-dependencies]
+cowfs-vfs-path = { path = "../cowfs-vfs-path" }
 cowfs-vfs-test = { path = "../cowfs-vfs-test" }
 tempfile.workspace = true
 
