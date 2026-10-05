@@ -719,18 +719,17 @@ impl Snapshots for CoreSnapshots {
         // that did not produce the tree now under its name.
         self.bases.exclusive(|records| {
             // Refusals that are decided before anything is touched, while the old tree and the old
-            // record are both still there: a swap with itself, and a source or target that does not
-            // exist. `promote_base` would refuse these too, but only after the record was cleared,
+            // record are both still there: a source or target that does not exist, and a swap with
+            // itself. `promote_base` would refuse these too, but only after the record was cleared,
             // and a refusal is not a replacement, so it must leave the record alone. Holding this
             // section across the check and the swap is what makes that safe: create, remove, rename
             // and promote all mutate the namespace inside this same section, so nothing can appear
             // or disappear between the check and the swap.
-            if name == from {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot swap a snapshot with itself",
-                ));
-            }
+            //
+            // Existence is checked before the same-name refusal, because that is the order the core
+            // itself used: `promote_base` looks the source up first, so a swap of a name with itself
+            // reported `not_found` before anything else ran. Checking existence first keeps that
+            // answer, and keeps the two backends agreeing on it.
             self.with(|c| {
                 for n in [name, from] {
                     Self::names(c)?
@@ -741,6 +740,12 @@ impl Snapshots for CoreSnapshots {
                 }
                 Ok::<(), io::Error>(())
             })?;
+            if name == from {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot swap a snapshot with itself",
+                ));
+            }
 
             // Past this point the swap may have replaced the tree, so the record is cleared and
             // stays cleared.
@@ -1191,6 +1196,225 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = PathBackend::open(dir.path().join("store")).expect("a path backend");
         (dir, backend)
+    }
+
+    /// A `CoreSnapshots` over `dir`, holding a `Core` whose k-th durable commit fails.
+    ///
+    /// This is the production struct and the production `swap`. `CoreBackend` exposes no
+    /// meta-options hook, so the fault cannot be injected through it; the two fields are private,
+    /// which is why this test lives in this module rather than in `tests/`.
+    fn core_snaps_with_failing_commit(dir: &Path, fail_at: usize) -> CoreSnapshots {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let seen = AtomicUsize::new(0);
+        // `open_with_meta` wires the store sync hook into the options it hands `make_meta`, so the
+        // hook is wrapped here rather than replaced, and the store's own durability is kept.
+        let core = cowfs_core::Core::open_with_meta(
+            dir,
+            cowfs_core::Options {
+                background: false,
+                ..Default::default()
+            },
+            move |d, mut o| {
+                let inner = o.before_sync.take();
+                o.before_sync = Some(std::sync::Arc::new(move || {
+                    let k = seen.fetch_add(1, SeqCst) + 1;
+                    if let Some(h) = inner.clone() {
+                        h()?;
+                    }
+                    if k == fail_at {
+                        return Err(std::io::Error::other("injected meta sync failure"));
+                    }
+                    Ok(())
+                }) as cowfs_meta::SyncHook);
+                cowfs_meta::Meta::open(d.join("meta.redb"), o)
+            },
+        )
+        .expect("a core with an injectable sync hook");
+        CoreSnapshots {
+            core: Arc::new(Mutex::new(Some(core))),
+            bases: crate::base_meta::BaseMetaStore::open(dir).expect("the base records"),
+        }
+    }
+
+    /// A promoted base built from `srcA` with its provenance, and a distinct `srcB`, through
+    /// whichever backend is handed in, so a path store is never seeded with core structures.
+    fn seeded_pair(b: &dyn Backend) {
+        let s = b.snapshots();
+        for (name, text) in [
+            ("srcA", &b"AAAA-from-srcA"[..]),
+            ("srcB", &b"BBBB-from-srcB"[..]),
+        ] {
+            s.create(name, None)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let v = b.snapshot(name).unwrap();
+            let f = v.create(cowfs_vfs::ROOT_INO, b"only", 0o644).unwrap();
+            v.write(f.ino, 0, text).unwrap();
+            v.fsync(f.ino, false).unwrap();
+        }
+        s.create("base", Some("srcA")).unwrap();
+        s.promote("base").unwrap();
+        s.set_base_meta("base", &meta("/repoA", "refs/heads/main", "commit-AAA"))
+            .unwrap();
+        assert_eq!(
+            commit_of(&s.create_meta("base").unwrap()),
+            Some("commit-AAA")
+        );
+    }
+
+    /// #124: a swap that fails past the staged swap's point of no return must not leave the old
+    /// commit describing the tree that ends up under the name.
+    ///
+    /// The fault is the third durable commit, which is the fork of the staging snapshot into the
+    /// target. Past that point the core rolls forward, so the swap returns `Err` with the intent
+    /// file pending and the next open installs the new tree. The record must read unknown, because
+    /// the error alone cannot tell that rollback from a failed roll-forward.
+    ///
+    /// On the unsafe code this fails with `commit-AAA` over `BBBB-from-srcB`, which is the defect
+    /// this issue was filed for.
+    #[test]
+    fn a_core_swap_that_fails_past_the_point_of_no_return_never_restores_the_old_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().to_owned();
+        {
+            let seed = CoreBackend::open(&store, cowfs_core::Options::default()).unwrap();
+            seeded_pair(&seed);
+        }
+
+        let s = core_snaps_with_failing_commit(&store, 3);
+        let res = s.swap("base", "srcB");
+        assert!(
+            res.is_err(),
+            "the third commit must fail, so the swap reports the failure"
+        );
+        let intent_pending = store.join("swap-base").exists();
+        drop(s);
+        assert!(
+            intent_pending,
+            "the failure has to have landed past the point of no return, or this proves nothing"
+        );
+
+        // Reopen through the production backend, so `swap::recover` runs as it would for a caller.
+        let reopened = CoreBackend::open(&store, cowfs_core::Options::default()).unwrap();
+        let info = reopened.snapshots().create_meta("base").unwrap();
+        let v = reopened.snapshot("base").unwrap();
+        let a = v.lookup(cowfs_vfs::ROOT_INO, b"only").unwrap();
+        let content = String::from_utf8_lossy(&v.read(a.ino, 0, 4096).unwrap()).into_owned();
+        assert_eq!(
+            content, "BBBB-from-srcB",
+            "the roll-forward installed the new tree, so the old commit cannot describe it"
+        );
+        assert!(
+            !store.join("swap-base").exists(),
+            "the reopen finished the swap, so the intent file is gone"
+        );
+        assert_eq!(
+            commit_of(&info),
+            None,
+            "the record still names a commit that did not produce this tree: {info:?}"
+        );
+        assert_eq!(
+            info.base.as_ref().and_then(|b| b.repo.clone()),
+            None,
+            "and the rest of the record went with it: {info:?}"
+        );
+        assert_eq!(
+            info.base.as_ref().and_then(|b| b.git_ref.clone()),
+            None,
+            "and the ref: {info:?}"
+        );
+    }
+
+    /// The refusal order is the one the core used, so the two backends answer a name-with-itself
+    /// swap of a snapshot that does not exist the same way.
+    #[test]
+    fn a_swap_of_a_nonexistent_name_with_itself_is_not_found_on_both_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        // A store per backend, seeded before either is opened: a core store holds a lock, so a
+        // second open of the same store, or a store inside another one, is refused outright.
+        let core_store = dir.path().join("corestore");
+        let path_store = dir.path().join("pathstore");
+        seeded_pair(&CoreBackend::open(&core_store, cowfs_core::Options::default()).unwrap());
+        seeded_pair(&PathBackend::open(&path_store).unwrap());
+        let core = CoreBackend::open(&core_store, cowfs_core::Options::default()).unwrap();
+        let path = PathBackend::open(&path_store).unwrap();
+        for (which, b) in [
+            ("core", &core as &dyn Backend),
+            ("path", &path as &dyn Backend),
+        ] {
+            let e = b.snapshots().swap("nosuch", "nosuch").unwrap_err();
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "{which}: existence is checked before the same-name refusal, as `promote_base` did"
+            );
+        }
+    }
+
+    /// A refusal leaves the full old state, on both backends, for both refusal shapes.
+    #[test]
+    fn a_refused_swap_keeps_the_full_old_tree_and_record_on_both_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        // A store per backend, seeded before either is opened, for the reason above.
+        let core_store = dir.path().join("corestore");
+        let path_store = dir.path().join("pathstore");
+        seeded_pair(&CoreBackend::open(&core_store, cowfs_core::Options::default()).unwrap());
+        seeded_pair(&PathBackend::open(&path_store).unwrap());
+        let core = CoreBackend::open(&core_store, cowfs_core::Options::default()).unwrap();
+        let path = PathBackend::open(&path_store).unwrap();
+        for (which, b) in [
+            ("core", &core as &dyn Backend),
+            ("path", &path as &dyn Backend),
+        ] {
+            // `seeded_pair` already made `base` a promoted base with this provenance.
+            let s = b.snapshots();
+            let before = {
+                let v = b.snapshot("base").unwrap();
+                let a = v.lookup(cowfs_vfs::ROOT_INO, b"only").unwrap();
+                String::from_utf8_lossy(&v.read(a.ino, 0, 4096).unwrap()).into_owned()
+            };
+
+            // Same name: refused, and the base is untouched.
+            let e = s.swap("base", "base").unwrap_err();
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{which}: an existing name swapped with itself is refused"
+            );
+            // Missing source: refused.
+            let e = s.swap("base", "nosuch").unwrap_err();
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "{which}: missing source"
+            );
+
+            let kept = s.create_meta("base").unwrap();
+            assert_eq!(
+                commit_of(&kept),
+                Some("commit-AAA"),
+                "{which}: record kept: {kept:?}"
+            );
+            assert_eq!(
+                kept.base.as_ref().and_then(|b| b.repo.clone()).as_deref(),
+                Some("/repoA"),
+                "{which}: repo kept"
+            );
+            assert_eq!(
+                kept.base
+                    .as_ref()
+                    .and_then(|b| b.git_ref.clone())
+                    .as_deref(),
+                Some("refs/heads/main"),
+                "{which}: ref kept"
+            );
+            let v = b.snapshot("base").unwrap();
+            let a = v.lookup(cowfs_vfs::ROOT_INO, b"only").unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&v.read(a.ino, 0, 4096).unwrap()).into_owned(),
+                before,
+                "{which}: the tree is untouched by a refusal"
+            );
+        }
     }
 
     fn meta(repo: &str, git_ref: &str, commit: &str) -> BaseMeta {
