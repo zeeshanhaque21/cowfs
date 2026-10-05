@@ -3,6 +3,8 @@
 Task: issue [#20](https://github.com/zeeshanhaque21/cowfs/issues/20).
 Lease: `.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/2/cowfs`, branch `fix/open-fd-holders-20`.
 Base: `46b0f269d5bef4a2c204c25f5b3015da601d3beb`.
+PR: [#112](https://github.com/zeeshanhaque21/cowfs/pull/112).
+Head at the time of writing: `c82bb359ba8de069f6f4a211536435792cb4a7c5`.
 
 ## What was broken
 
@@ -82,6 +84,34 @@ ignored at the base commit.
 
 `cargo clippy --locked -p cowfs-treehouse -p cowfs-ctl -p cowfs-daemon --all-targets -j2 -- -D warnings`
 exit 0.
+`cargo clippy --workspace --all-targets -j2 -- -D warnings` exit 0, the same command CI runs.
+
+CI at `c82bb35`, run 37256710176, all three jobs green: `check (ubuntu-latest)`, `check (macos-latest)`,
+`linux-fuse`.
+
+### The one thing a scoped macOS check cannot see
+
+The first push was red twice, and both were mine.
+
+`cargo fmt --all --check` wanted rustfmt's line breaking in three files.
+Fixed in `38ac3f1`.
+
+Then ubuntu failed `cargo clippy --workspace --all-targets -- -D warnings` with
+`error[E0308]: mismatched types` at `crates/cowfs-daemon/src/holders.rs:123`: `locked()` had been
+changed to return `Result` for the fail-closed scan, and the `/proc` module returned the bare set at
+the end. **macOS never compiles that module**, so the scoped macOS check, the scoped macOS clippy and
+the workspace macOS clippy were all green and CI was the first thing to look at it.
+Fixed in `c82bb35`.
+
+Not left to inspection this time: the tree was copied to moonscape (aarch64 Linux) under
+`/home/moonscape/cowfs-ready-wave/task-20/src` and
+`cargo check --locked -p cowfs-daemon -p cowfs-ctl -p cowfs-treehouse --all-targets -j2` ran there
+under the wave's remote lock. Exit 0, no errors.
+Cross-compiling from the Mac to `x86_64-unknown-linux-gnu` was tried first and cannot work here:
+`zstd-sys` has a build script that needs `x86_64-linux-gnu-gcc`, and installing a cross toolchain is
+not permitted.
+`cargo clippy` on the box is not a usable signal: its clippy is 1.95.0 and reports a pre-existing
+`collapsible_match` in `crates/cowfs-meta/src/tx.rs`, a file this task never touched.
 
 ### The four new cases
 
@@ -123,11 +153,13 @@ Reported, not silently taken.
 
 ## Remaining acceptance
 
-1. **Linux and FUSE.** `/proc` and `/proc/locks` are implemented and every failure path is tested,
-   but the `fd`/`lock` scan has not been run against a real FUSE mount.
-   Issue #20's own work item, "re-check on Linux (`gopsutil` reads `/proc`) and on FUSE, where there
-   is no silly-rename", is still open.
-2. **Independent review and exact-head green CI**, before merge.
+1. **Linux runtime behaviour.** The `/proc` and `/proc/locks` scan compiles and clippy-checks clean
+   on Linux, and `linux-fuse` CI is green, but the cowfs-daemon holder unit tests have not been
+   **run** on Linux: three bounded 600 s waits on the remote lane at
+   `/home/moonscape/cowfs-ready-wave/linux-heavy.lock` all returned exit 75.
+   Issue #20's work item "re-check on Linux (`gopsutil` reads `/proc`)" is therefore half done, and
+   FUSE, where there is no silly-rename, is untouched.
+2. **Independent review**, before merge. CI is green at the exact head.
 3. **The upstream proposal** is drafted at `docs/upstream-treehouse-proposal.md` section 3 and has
    **not** been sent. Section 3 gained one paragraph: an unanswered scan must not read as an empty
    one, which is the detail cowfs learned implementing it.
