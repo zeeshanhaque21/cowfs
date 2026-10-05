@@ -3,7 +3,9 @@
 Companion to `docs/verification/base-provenance98.md`, for the interleaving the review of `c3bafb7b`
 disclosed and issue 115 now tracks. Everything here was measured; nothing is projected.
 
-Branch: `feat/linux-namespaces-17`. Code under test: `8602040`.
+Branch: `feat/linux-namespaces-17`. Code under test: `8602040`, corrected at `38111b4` + this
+comment-only revision; the executable tree is unchanged by this revision.
+Residual scope: Refs #124. This document does not claim #124 is implemented.
 Platform: macOS, `rustc 1.99.0 (b940084d7 2026-09-28)`, `clippy 0.1.99`. In-process, no daemon, no mount,
 no SSH, no FUSE. Each exit captured directly.
 
@@ -57,7 +59,17 @@ fresh reopen.
 
 `cargo test -p cowfs-daemon --lib -- --nocapture`, whole library, default test threads.
 
-| | old create order | this head |
+Two different older orders are in play and they do not fail the same number of tests, so they are named
+rather than lumped together:
+
+- **Mutant A, the true `c3bafb7b` order.** `create` checks the name, then clears the record outside any
+  critical section and propagates the deletion error with `?`. This is the head that was reviewed, and it
+  fails the **four interleaving arms**. Measured by the reviewer, not regenerated here.
+- **Mutant B, the deletion error additionally discarded.** The `f1529cc`-era shape, and the one this
+  branch's own captured log is taken against. It fails the four arms **and**
+  `a_create_that_cannot_clear_a_stale_record_creates_no_snapshot`.
+
+| | mutant B: error discarded (this branch's log) | this head |
 |---|---|---|
 | result | **84 passed, 5 failed**, exit 101 | **89 passed, 0 failed**, exit 0 |
 | core promote arm | `accepted=false, publisher ran while parked=true`, base gone: `base: None` | `accepted=true, publisher ran while parked=false` |
@@ -65,8 +77,8 @@ fresh reopen.
 | core rename arm | record on **neither** `warm` nor `target`: `[]` | `accepted=true, renamer ran while parked=false` |
 | path rename arm | same | same |
 
-The old run is the same tree with the two `create` bodies reverted to the pre-fix order: the name check,
-then the record clear outside any critical section, with the deletion error discarded. Its failures:
+The captured old run is this tree with the two `create` bodies reverted to mutant B: the name check, then
+the record clear outside any critical section, with the deletion error discarded. Its failures:
 
 ```
 a_concurrent_published_base_survives_another_threads_create_on_core   FAILED
@@ -76,8 +88,11 @@ a_concurrent_rename_onto_a_name_keeps_the_base_on_path                FAILED
 a_create_that_cannot_clear_a_stale_record_creates_no_snapshot         FAILED
 ```
 
-The fifth is a bonus discriminator: the old order discarded the deletion error, so a create that could not
-clear a stale record reported success instead of refusing.
+The fifth is the tell that this log is mutant B and not the reviewed parent: only a shape that discards
+the deletion error makes a create that cannot clear a stale record report success instead of refusing. At
+the `c3bafb7b` order that test passes and the count is 4. The interleaving defect is present at both, so the
+repair addresses a real defect at the head that was reviewed; the four-versus-five distinction is about which
+older shape the log was taken against, not about whether the defect was real.
 
 Raw logs, gitignored: `bench/out/provenance115/AB-old-create-order.log` and `AB-new-create-order.log`.
 
@@ -127,9 +142,40 @@ this defect; leaving them would leave the trap in place. The name validation tha
 `remove` moved into `remove_locked`, so traversal and symlink refusals are unchanged, and `rename_locked`
 keeps its own validation.
 
-Lock ordering: the record mutex is taken before the core's own lock, never the reverse, and no existing
-path nested them. `swap` is deliberately *not* wrapped, because it reaches `create` internally and the
-mutex is not re-entrant; it never reads or writes a record for the name it swaps.
+### Lock ordering, and what is left out of the section
+
+The record mutex is taken before the core's own lock on every route, and no path nests them the other way
+round. The four wrapped methods hold the record mutex across their core call, so the order is always
+record-then-core.
+
+`swap` is deliberately **not** wrapped, and the reason is not re-entrancy. Reading both bodies:
+
+- Core's `swap` calls `self.with(|c| … c.promote_base(from, name) …)` and closes that block, and only then
+  calls `self.info(name)`. Neither body reaches `Snapshots::create`, so there is no recursive acquisition to
+  avoid.
+- Path's `swap` does `force_remove_dir_all`, `copy_tree` and two `std::fs::rename`, and ends with
+  `self.info(name, …)`. Again no `create` and no section.
+
+Both do read a record: `self.info` consults the store for the name. So `swap` takes the core lock and the
+record lock **in sequence and never nested**, which means wrapping it would *serialise* it against the
+other four rather than prevent a deadlock. Leaving it out is therefore safe, and that is the whole of the
+reason. No atomicity guarantee is claimed for `swap` by this document.
+
+What leaving it out does leave open, stated precisely:
+
+- `swap` mutates the namespace without the section, so its tree renames can interleave with a concurrent
+  `create`, `remove` or `rename` on that name. The exposure is at the tree level, not the record level:
+  every record mutation is inside the section and paired with its own decision, and a `create` against a
+  name that already exists is refused at its own check and so never reaches the clear. This is pre-existing
+  and not introduced here.
+- `swap` replaces a snapshot's tree without touching its record, so a **base** that is swapped keeps a
+  record naming a commit its new tree was not built from. That is stale provenance, it is tracked as issue
+  #124, it was found by reading the source and **has not been forced at runtime**, and this delivery does
+  not implement it. Wrapping `swap` would not fix it either: it is not an interleaving, it is the operation
+  itself leaving a record that no longer describes the tree.
+
+Neither point is a claim that `swap` is correct. It is a statement of what this change did and did not
+cover.
 
 ## Preserved, and still passing
 
@@ -160,6 +206,10 @@ mutex is not re-entrant; it never reads or writes a record for the name it swaps
 - **Not** Core warm-base publication: `base_refresh` refuses directory ingest on the core by design.
 - **Not** mode (b) acceptance, and the Path publication acceptance is not re-run by this change: it
   exercises blobs this does not touch.
+- **Not** `swap` coherence, which is issue #124 and is not implemented here.
+- **Not** a completed #98. The lifecycle work in `base-provenance98.md` and this file cover the record and
+  the namespace ordering; the residual in #124 stands, and the Path publication acceptance, the Core
+  publication path and mode (b) remain where the previous rounds left them.
 
 ## Counts at `8602040`, measured
 
@@ -193,8 +243,8 @@ Issue 17 stays open, and this change does not reference it as closed.
 Runtime and test logs, gitignored, inside this lease:
 
 ```
-bench/out/provenance115/AB-old-create-order.log    84 passed, 5 failed, with the traces
-bench/out/provenance115/AB-new-create-order.log    89 passed, 0 failed, with the traces
+bench/out/provenance115/AB-old-create-order.log    mutant B: 84 passed, 5 failed, with the traces
+bench/out/provenance115/AB-new-create-order.log    this head: 89 passed, 0 failed, with the traces
 bench/out/provenance115/backend.rs.final           the exact source the A/B was taken against
 ```
 

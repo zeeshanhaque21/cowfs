@@ -6,6 +6,14 @@ has its own evidence file, `docs/verification/evidence/base-provenance115-interl
 the "pre-check, not a transaction" limitation recorded below: the check and the record change are now one
 critical section, proven deterministically rather than argued from source.
 
+Scope of this file and its companion: the base record's lifecycle and the ordering of the four namespace
+mutations that touch it. **This is not a completed #98.** Residual scope is Refs #124: `swap` replaces a
+snapshot's tree without touching its record, so a base that is swapped keeps a record naming a commit its
+new tree was not built from. That was found by reading the source, has not been forced at runtime, and is
+not implemented here. `swap` is also outside the critical section, which is safe because it takes the core
+lock and the record lock in sequence rather than nested, and is stated in the companion file rather than
+implied here.
+
 ## What #98 was
 
 `base refresh` exited 0 and returned a `SnapshotInfo` carrying `repo`, `git_ref` and `commit`, and
