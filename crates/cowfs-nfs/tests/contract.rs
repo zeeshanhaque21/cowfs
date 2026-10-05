@@ -100,6 +100,11 @@ impl Vfs for Watched {
         self.fsyncs.lock().unwrap().push((i, data_only));
         self.inner.fsync(i, data_only)
     }
+    /// Recorded apart from `fsync`, so these tests stay about COMMIT. What the namespace barrier
+    /// does, and when, is `ns_durability`'s subject.
+    fn sync_namespace(&self, ino: u64) -> Result<()> {
+        self.inner.sync_namespace(ino)
+    }
     fn readdir(&self, d: u64, c: u64, m: usize) -> Result<ReadDir> {
         self.inner.readdir(d, c, m)
     }

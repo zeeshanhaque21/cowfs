@@ -458,6 +458,8 @@ that takes a lock is not listed here.
 | `inner::commit` | aliases, snap. | 3 then leaf |
 | `inner::sync_all` | unsynced | leaf |
 | `inner::fsync_snapshot` | unsynced | leaf |
+| `inner::sync_ns_snapshot` | unsynced | leaf |
+| `inner::finish_sync` | last_error, unsynced | leaf |
 | `inner::barrier` | sc.flush, last_error | 1 then leaf |
 | `inner::flush_namespace_locked` | sc.q | 1 |
 | `inner::tick` | sc.q, unsynced | 1 then leaf |

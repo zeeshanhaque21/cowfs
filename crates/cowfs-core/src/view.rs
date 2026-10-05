@@ -134,6 +134,10 @@ impl Vfs for SnapshotView {
         self.core.fsync(self.i(ino), data_only)
     }
 
+    fn sync_namespace(&self, ino: Ino) -> Result<()> {
+        self.core.sync_namespace(self.i(ino))
+    }
+
     fn readdir(&self, dir: Ino, cookie: u64, max: usize) -> Result<ReadDir> {
         let mut r = self.core.readdir(self.i(dir), cookie, max)?;
         r.entries = r

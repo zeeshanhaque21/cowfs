@@ -1,0 +1,12 @@
+{"case": "fsync-parent-dir", "rep": 1, "pid": 23184, "new_name": true, "old_name": false, "fsck": "ok: 2 blocks (382 B), 1 snapshots checked"}
+{"case": "fsync-parent-dir", "rep": 2, "pid": 24540, "new_name": true, "old_name": false, "fsck": "ok: 2 blocks (382 B), 1 snapshots checked"}
+{"case": "fsync-parent-dir", "rep": 3, "pid": 25742, "new_name": true, "old_name": false, "fsck": "ok: 2 blocks (382 B), 1 snapshots checked"}
+{"case": "fsync-read-only-fd", "rep": 1, "pid": 27884, "new_name": true, "old_name": false, "fsck": "ok: 2 blocks (382 B), 1 snapshots checked"}
+{"case": "fsync-read-only-fd", "rep": 2, "pid": 29834, "new_name": true, "old_name": false, "fsck": "ok: 2 blocks (382 B), 1 snapshots checked"}
+{"case": "fsync-read-only-fd", "rep": 3, "pid": 31526, "new_name": true, "old_name": false, "fsck": "ok: 2 blocks (382 B), 1 snapshots checked"}
+{"case": "no-sync-at-all", "rep": 1, "pid": 32876, "new_name": true, "old_name": false, "fsck": "ok: 2 blocks (382 B), 1 snapshots checked"}
+{"case": "no-sync-at-all", "rep": 2, "pid": 34057, "new_name": true, "old_name": false, "fsck": "ok: 2 blocks (382 B), 1 snapshots checked"}
+{"case": "no-sync-at-all", "rep": 3, "pid": 35137, "new_name": true, "old_name": false, "fsck": "ok: 2 blocks (382 B), 1 snapshots checked"}
+{"case": "write-fsync-sibling", "rep": 1, "pid": 36137, "new_name": true, "old_name": false, "fsck": "ok: 3 blocks (446 B), 1 snapshots checked"}
+{"case": "write-fsync-sibling", "rep": 2, "pid": 37586, "new_name": true, "old_name": false, "fsck": "ok: 3 blocks (446 B), 1 snapshots checked"}
+{"case": "write-fsync-sibling", "rep": 3, "pid": 38876, "new_name": true, "old_name": false, "fsck": "ok: 3 blocks (446 B), 1 snapshots checked"}

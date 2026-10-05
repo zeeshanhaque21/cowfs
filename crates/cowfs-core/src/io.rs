@@ -305,6 +305,18 @@ impl Inner {
         Ok(())
     }
 
+    /// Makes `ino`'s snapshot's queued names and attributes durable without writing the file data
+    /// that is still dirty. `ROOT_INO` stays the whole-mount barrier, because a client that asks
+    /// for the mount is asking for everything in it.
+    pub(crate) fn op_sync_namespace(&self, ino: Ino) -> Result<()> {
+        if ino == ROOT_INO {
+            return self.sync_all();
+        }
+        self.live(ino)?;
+        let sc = self.snapctx(ino)?;
+        self.sync_ns_snapshot(&sc)
+    }
+
     /// Meta inode number of `node`, committing pending work first when it has none yet.
     fn committed_meta(&self, sc: &SnapCtx, node: &Node) -> Result<u64> {
         if let Some(m) = self.meta_of(node.ino) {

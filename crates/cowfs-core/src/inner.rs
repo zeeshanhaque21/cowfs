@@ -970,17 +970,39 @@ impl Inner {
         for sc in self.all_snaps() {
             self.flush_snapshot(&sc)?;
         }
-        self.meta.sync().map_err(from_meta)?;
-        *self.unsynced.lk() = None;
-        Ok(())
+        self.finish_sync()
     }
 
     /// Flushes and syncs until this snapshot's work is durable.
     pub(crate) fn fsync_snapshot(&self, sc: &SnapCtx) -> Result<()> {
         self.flush_snapshot(sc)?;
-        self.meta.sync().map_err(from_meta)?;
-        *self.unsynced.lk() = None;
-        Ok(())
+        self.finish_sync()
+    }
+
+    /// Makes this snapshot's names and attributes durable, leaving file data that is still dirty
+    /// alone.
+    ///
+    /// A namespace commit names only blocks the store already has: [`Inner::queue_content`] runs
+    /// after the flush that wrote them, and a file with unflushed bytes has no content operation
+    /// queued at all. `finish_sync` then syncs the store before the metadata, so nothing that
+    /// becomes durable here can point at a block that is not.
+    pub(crate) fn sync_ns_snapshot(&self, sc: &SnapCtx) -> Result<()> {
+        self.barrier(sc)?;
+        self.finish_sync()
+    }
+
+    /// Makes everything applied to the metadata durable and clears the unsynced mark. A failure is
+    /// recorded where [`Core::health`] reports it, so a caller that is told the sync worked is
+    /// never the only thing that knows it did not.
+    fn finish_sync(&self) -> Result<()> {
+        let r = self.meta.sync().map_err(from_meta);
+        if let Err(e) = &r {
+            self.ctr.flush_errors.fetch_add(1, Ordering::Relaxed);
+            *self.last_error.lk() = Some(e.to_string());
+        } else {
+            *self.unsynced.lk() = None;
+        }
+        r
     }
 
     /// Commits the snapshot's namespace so an operation that needs meta to be current can go on.
