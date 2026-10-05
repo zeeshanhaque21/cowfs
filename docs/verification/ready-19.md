@@ -1,171 +1,277 @@
 # Verification: ready task #19, NFS server requirements
 
-Task #19 is a requirement list, not one defect.
-Most of it was implemented by earlier work, and this task reconciles it: what is already
-covered, what is still open, and what was never actually measured.
-The additions here are the regressions #19's own failures would have been caught by, written at
-the layer the failures lived in.
+Refs #19. That issue is a requirement list, not one defect, and it stays open.
+This is the harness that checks those requirements plus a statement of what is still open.
 
 Lease: `.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/1/cowfs` (slot 1).
-Base: `46b0f269d5bef4a2c204c25f5b3015da601d3beb`.
-Raw logs: `bench/out/ready-19/**`, ignored.
-Machine: Apple M3 Max Mac, macOS 26, APFS.
+Portability delta reviewed against head `395c2361b0c2bfcae41aa8d949fae53b9eb830eb`.
+Head carrying this document: `4dc63ff7ce1b795d63265fc40a99b6434f8bc65d`.
+Raw logs: `bench/out/ready-19/**`, ignored. Portability evidence:
+`docs/verification/evidence/server-requirements19-portability.md`.
 
-## What this lane owns and what it does not
+## What backend these figures are about
 
-Owned: the NFS server requirement list in issue #19, and narrow vendored-server fixes.
+Every number here is `cowfs_vfs_path::PathVfs` over a scratch directory on the host, reached
+through a real in-process NFSv3 server over a real TCP socket, or through a real kernel NFS client
+mounting that server.
 
-Not owned, not touched:
+- Not `MemVfs`. `common::serve` starts a real `Server` and the client opens a real connection and
+  performs a real MNT.
+- **Not the Core backend.** These are Path-backend cases. Nothing here is real-Core acceptance for
+  issue #15 or for any pjdfstest gate.
+- `common::serve` sets `opts.check_peer_uid = false`, a test-only relaxation, acceptable for a
+  one-shot server on 127.0.0.1 behind a secret export name.
 
-- AppleDouble `Translate`, authorization, dead-server sweep. Slot 7 has issue #43.
-- Namespace barriers and NFS durability adapter sites. The original build-train worker has those.
-- `crates/cowfs-daemon/src/import.rs` and import/refresh #97. The original build train has those.
+## Hosts
 
-The one place this lane touches shared source is `crates/cowfs-nfs/Cargo.toml`, which gains one
-dev-dependency (`cowfs-vfs-path`) so an NFS test can run against a real backing filesystem instead
-of `MemVfs`.
-That is additive and changes no production build.
+| | macOS | Linux |
+| --- | --- | --- |
+| what | Apple M3 Max, macOS 26, APFS | `moonscapenas`, Debian aarch64, 6.12.109 |
+| rustc | 1.99.0 | 1.95.0 |
+| how reached | directly | `git archive` of the exact head into `/home/moonscape/cowfs-ready-wave/task-19/src-4dc63ff` |
 
-## Why the existing tests were not enough
+The Linux source is an archive of the commit, not a working tree of it. 531 files extracted.
+Archive sha256 matched on both ends, `3bfabf87673eb785…`.
+`Cargo.lock` sha256 `706645b958fb89e4b90f56a4c31f9c04e68816e0a652137aec7960479628de63` was identical
+before and after every cargo command on both hosts, and identical to the value the review recorded.
+`cargo metadata --locked` exited 0 on Linux and rewrote nothing.
 
-`crates/cowfs-nfs/tests/protocol.rs` already proves `setattr_never_follows_symlinks`.
-It runs against `MemVfs`, which answers whatever it is asked.
-It cannot get a syscall wrong, so it never exercises the code that caused the bug.
+## Test inventory, measured
 
-The bug in #19 was the server's own syscalls: `fs::metadata` and `filetime::set_file_times`, both
-of which follow a final symlink.
-In the v1 code that means `cowfs-vfs-path/src/lib.rs` (`setattr`) calling `sys::utimensat` and
-`sys::fchmod` (`crates/cowfs-vfs-path/src/sys.rs`).
-No test reached that path from NFS.
+macOS discovers 10 tests, 7 default and 3 ignored.
+Linux discovers 10 tests, 7 default and 3 ignored.
+The difference is which symlink-mode test exists: `setattr_gives_a_symlink_its_own_mode_where_the_host_stores_one`
+is macOS-only, `setattr_refuses_a_symlink_mode_where_the_host_cannot_store_one` is Linux-only.
+Both hosts run the other six.
 
-## What was added
+Default battery, one run each, `--test-threads=1`:
 
-`crates/cowfs-nfs/tests/requirements19.rs`, five tests over the raw protocol client and three more
-behind `--ignored`: two over a real `mount_nfs`, and one that measures readdir paging.
+| | passed | failed | ignored | time |
+| --- | --- | --- | --- | --- |
+| macOS | 7 | 0 | 3 | 27.91s |
+| Linux | 7 | 0 | 3 | 27.97s |
 
-Every group has a native control, so a test cannot pass by the server doing nothing:
+## What the portability delta changed
 
-- `a_native_chmod_through_a_symlink_lands_on_the_target` proves the harness can see a symlink
-  being followed. Without it, a server that ignored SETATTR entirely would pass the tests below.
-- `setattr_gives_a_symlink_its_own_times_and_mode_over_the_real_filesystem` checks the result by
-  `lstat` on the backing directory, not by trusting the server's own reply.
-- `readdir_replies_carry_the_link_count_of_the_moment` and
-  `hardlinked_names_in_one_directory_are_listed_once_each` compare the reply against `lstat`.
-- `namespace_churn_over_the_real_filesystem_stays_bounded` reads this process back with `ps`.
-- `a_large_directory_is_read_once_per_listing` compares page cost against the cost of one native
-  directory read, which is the only comparison that separates a cached listing from a re-read one.
-- `touching_a_symlink_on_the_mount_leaves_its_target_alone` applies the same stamp to a native copy
-  and to the mount, so the expected value needs no hardcoded epoch.
+CI run `37253685951` failed 2 of 8 tests on `ubuntu-latest`, both asserting macOS symlink semantics
+with no host gate. Both were real test defects, in a suite whose whole point is a syscall.
 
-The two mounted tests are `#[ignore]`d, like every other mount test in this crate.
+`a_native_chmod_through_a_symlink_lands_on_the_target` compared a symlink's own mode against a
+literal `0o755`. macOS stores a mode on a symlink and reports 755, Linux stores none and reports
+777. The control's purpose is that a followed `chmod` moved the target, so the link's mode is now
+read before the `chmod` and compared after, and the target's move is asserted to be a real change
+rather than a no-op that passes twice.
 
-## Independent syscall probe
+Measured, both hosts, from the run logs:
 
-Before writing anything, the two syscalls the fix depends on were checked on this machine directly,
-because a Linux-only answer would have been worthless.
+```
+macOS  NATIVE_CHMOD link 755 -> 755, target 644 -> 600
+Linux  NATIVE_CHMOD link 777 -> 777, target 644 -> 600
+```
 
-`AT_SYMLINK_NOFOLLOW` on a dangling name succeeds; the same call without it is `ENOENT`.
-That is exactly the #19 symptom, and it is why `rsync` exited 23.
+`setattr_gives_a_symlink_its_own_times_and_mode_over_the_real_filesystem` asked one call to do both,
+which cannot hold on a host with no `chmod` for a symlink. It is split into three.
 
-`futimens` and `fchmod` on an `O_SYMLINK|O_RDONLY` descriptor both succeed on macOS and both land
-on the link, not the target.
-That is why `cowfs-vfs-path` can use a descriptor for `chmod` on both platforms, and why the Linux
-`AT_EMPTY_PATH` branch in `sys::utimens_fd` is not a macOS gap.
+**Times, both hosts.** This is the portable half and the one #19's `rsync` failure was about. It
+checks that the link takes its own times, that a dangling link does too, and that the target's mtime,
+its bytes and the link's target string are all unchanged, read natively.
+
+**Mode where the host stores one, macOS only.** Behind a capability check that reads the host's own
+symlink mode instead of assuming it, so a host that stopped storing one records that rather than
+failing on a Mac-only expectation. Measured:
+
+```
+SYMLINK_MODE_CAPABILITY host=macos native_link_mode=755
+SYMLINK_MODE host=macos status=0 link 755 -> 600 target=644
+```
+
+**Mode where the host cannot store one, Linux only.** This is an open limitation, recorded, not
+fixed, because fixing it means changing production code this lane does not own. Linux has no
+`chmod` for a symlink: there is no `fchmodat` that takes `AT_SYMLINK_NOFOLLOW`, and
+`cowfs-vfs-path` opens the link `O_PATH | O_NOFOLLOW`, on which `fchmod` is `EBADF`
+(`crates/cowfs-vfs-path/src/sys.rs`). Measured on Linux:
+
+```
+SYMLINK_MODE host=linux backend_setattr=Some("i/o error: errno 9")
+SYMLINK_MODE host=linux nfs_status=5 link=777 target=644 open_issue=19
+SYMLINK_MODE_COMBINED host=linux status=5 times_applied_before_the_error=true target_mode=644
+```
+
+Three things follow from those three lines.
+
+- The backend asked directly refuses too, so the refusal belongs to the host and the backend, not
+  to the protocol layer inventing an error.
+- `nfs_status=5` is `NFS3ERR_IO`, which is what the errno mapping produces today. The test names
+  the status it saw and calls it an artefact of that mapping, **not a contract**: a later fix may
+  legitimately answer `NOTSUPP`, or succeed on a host that grows the capability. The test asserts
+  only that the server does not report success and that the target is untouched.
+- A combined times-and-mode call applies the times and then fails on the mode.
+  `times_applied_before_the_error=true` is the measured order on this host. No atomicity is claimed
+  for that call in either direction, and none is asserted.
 
 ## Requirement matrix
 
 | #19 requirement | State | Where it is answered | Evidence |
 | --- | --- | --- | --- |
-| `NFSPROC3_LINK` implemented | landed before this task | `crates/nfsserve/src/nfs_handlers.rs:708`, `vfs.rs:114` | `protocol.rs` LINK cases; `hardlinked_names_in_one_directory_are_listed_once_each` |
-| Retransmission tracker lock | landed before this task, replaced not throttled | `crates/nfsserve/src/reply_cache.rs`, tracker deleted | `PATCHES.md`; `dupcache.rs` (7 tests) |
-| readdir page cookie is a position | landed before this task | `crates/nfsserve/src/vfs.rs:140`, `nfs_handlers.rs:733` | `hardlinked_names_in_one_directory_are_listed_once_each`; `mount.rs` `hardlink_pair_readdir` |
-| Hardlink readdir test in the main battery | landed before this task | `crates/cowfs-nfs/tests/mount.rs:349`, `protocol.rs:339` | both present in the suite |
-| `-o locallocks` required | landed before this task | `crates/cowfs-nfs/src/mount.rs:129` | `mount.rs::option_string_has_the_required_options` |
-| SETATTR never follows a symlink | implemented, was untested at the real backend | `cowfs-vfs-path/src/sys.rs:311,325` | added `setattr_gives_a_symlink_its_own_times_and_mode_over_the_real_filesystem` and `touching_a_symlink_on_the_mount_leaves_its_target_alone` |
-| `chmod` never follows a symlink | implemented, was untested | `cowfs-vfs-path/src/lib.rs:200-211` | same two tests, mode half |
-| AppleDouble `._*` policy | out of this lane | `crates/cowfs-nfs/src/appledouble.rs`, `sidecar.rs` | slot 7, issue #43 |
-| Fresh `nlink` in readdir replies | implemented, never measured through a kernel client | `cowfs-vfs-path/src/table.rs:204` | added `readdir_replies_carry_the_link_count_of_the_moment` and `find_links_counts_the_same_through_the_mount_as_natively` |
-| Server resident memory | bounded here, cause never diagnosed | adapter `parents` map plus `PathVfs` table | added `namespace_churn_over_the_real_filesystem_stays_bounded` |
-| readdir cost per page | closed by the listing cache, now measured | `cowfs-vfs-path/src/table.rs:169` | added `a_large_directory_is_read_once_per_listing` |
-| Path map never shrinks | closed | adapter `reap` / `reap_if_last`, `handle.rs` `bury` | the churn test above; `hardening.rs` staleness cases |
+| `NFSPROC3_LINK` implemented | landed before this lane | `nfs_handlers.rs:708`, `vfs.rs:114` | `protocol.rs` LINK cases; `hardlinked_names_in_one_directory_are_listed_once_each` |
+| Retransmission tracker lock | landed, tracker replaced by a reply cache | `reply_cache.rs` | `PATCHES.md`; `dupcache.rs` |
+| readdir page cookie is a position | landed before this lane | `vfs.rs:140`, `nfs_handlers.rs:733` | `hardlinked_names_in_one_directory_are_listed_once_each`; `mount.rs` `hardlink_pair_readdir` |
+| Hardlink readdir test in the battery | landed before this lane | `mount.rs:349`, `protocol.rs:339` | both present |
+| `-o locallocks` required | landed before this lane | `mount.rs:129` | `option_string_has_the_required_options` |
+| SETATTR never follows a symlink, times | implemented, untested at the real backend until this lane | `cowfs-vfs-path/src/sys.rs` | `setattr_gives_a_symlink_its_own_times_over_the_real_filesystem`, both hosts |
+| SETATTR never follows a symlink, mode | implemented on macOS, **unavailable on Linux** | `cowfs-vfs-path/src/lib.rs`, `sys.rs` | macOS: `setattr_gives_a_symlink_its_own_mode_where_the_host_stores_one`. Linux: refusal recorded, open |
+| AppleDouble `._*` policy | out of this lane | `appledouble.rs`, `sidecar.rs` | slot 7, issue #43 |
+| Fresh `nlink` in readdir replies | implemented, never measured through a kernel client | `table.rs:204` | `readdir_replies_carry_the_link_count_of_the_moment`; `find_links_counts_the_same_through_the_mount_as_natively` |
+| Server resident memory | bounded in one bounded run per host, cause undiagnosed | adapter `parents`, `PathVfs` table | `namespace_churn_over_the_real_filesystem_stays_bounded` |
+| readdir cost per page | closed by the listing cache, measured not gated | `table.rs:169` | `a_large_directory_is_read_once_per_listing` |
+| Path map never shrinks | closed | adapter `reap`, `handle.rs` `bury` | the churn test; `hardening.rs` staleness cases |
 | Upstream contribution or maintained fork | open, needs the maintainer | `crates/nfsserve/PATCHES.md` | see "Still open" |
 
-## Measured
+## The mounted cases, and why they are manual
 
-Counts are exact and from the logs in `bench/out/ready-19/`.
-Exit codes are the exit code of the command, never of a pipeline.
+Two tests mount a real filesystem, and no CI job runs them. `.github/workflows/ci.yml` runs
+`cargo test --workspace`, which does not pass `--ignored`; the only job that runs ignored tests
+names `-p cowfs-vfs-path --test native` and `-p cowfs-fuse`. So for `-p cowfs-nfs` these two are
+manual-only, and a green default run says nothing about them.
 
-RPC battery, private server over `PathVfs` on a scratch directory, no mount:
+They are also the only coverage of two things only a kernel client can get wrong: its attribute
+cache, and a `touch` of a symlink becoming SETATTR on the link's own handle.
 
-- 5 passed, 0 failed, 3 ignored, 11.38s.
-- Churn: 6,000 namespace cycles over the real filesystem. Resident set 9 MiB at iteration 600,
-  11 MiB at 6,000, growth 2 MiB. An earlier run of the same battery reported 1 MiB.
+Both used to `return` when the mount was unavailable, which made a green run of those two names
+mean nothing. Now:
 
-Mounted, private server, private mountpoint, private backing directory:
+- every successful mount prints a receipt with the mount line and the device ids of the mountpoint
+  and of the backing directory, and asserts the two differ, so a green run cannot be a plain read
+  of the backing directory;
+- a mount that did not happen is an error when `COWFS_REQUIRE_MOUNT=1` is set, carrying
+  `UNMEASURABLE`, so a manual acceptance run cannot pass without a mount;
+- without that variable it stays a labelled `SKIP label=no-mount-capability`, which is what a CI
+  host off macOS needs;
+- a unit test covers that decision with no filesystem involved, so the guard cannot rot.
 
-- `find -links +1` on a fixture of 200 files where 60 have two names and 30 of those have three:
-  native 151, mount cold 151, mount cached 151.
-  The cached pass is the one the kernel answers from its own attribute cache, which is the shape
-  #19 reported as undercounting.
-- `rsync -a` of a tree holding a valid symlink and a dangling one, in a `node_modules/.bin`
-  layout, onto the mount: exit 0. #19 recorded exit 23 on exactly this shape.
-- `touch -h` on a mounted symlink sets the link's own mtime, seen identically through the mount and
-  by `lstat` on the backing directory, and leaves the target's mtime as `rsync` left it.
+macOS, `COWFS_REQUIRE_MOUNT=1`, one run:
 
-readdir paging, 12,000 entries in one directory, 64 entries per page, over the protocol.
-Two runs, on a machine other workers were using:
+```
+RECEIPT label=nfs-mount mount_dev=436209696 backing_dev=16777234 line=localhost:/cowfs-95ddcd… on /…/mnt (nfs, nodev, nosuid, mounted by zeeshanhaque)
+LINKS native=151 mount_first=151 mount_cached=151
+RSYNC ok=true out=""
+RECEIPT label=nfs-teardown … (per test)
+```
 
-| Figure | run 1 | run 2 (head) |
+`find -links +1` on a fixture of 200 files where 60 carry a second name and 30 of those a third:
+native 151, mount cold 151, mount cached 151. The cached pass is the one the kernel answers from
+its own attribute cache, which is the shape #19 reported as undercounting.
+`rsync -a` of a tree holding a valid symlink and a dangling one, in a `node_modules/.bin` layout,
+onto the mount: exit 0, where #19 recorded exit 23 on exactly that shape.
+
+The same run on Linux, with `COWFS_REQUIRE_MOUNT=1` and no `mount_nfs` on the host, is the negative
+proof that the guard is real rather than a claim:
+
+```
+UNMEASURABLE: mount_nfs is not available on this host; this run asked for a mount and did not get one, so it established nothing
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+That exit is 101 and it is correct. It is not a defect in this lane.
+
+## Resident memory: one bounded observation, not a leak result
+
+`namespace_churn_over_the_real_filesystem_stays_bounded` churns 6,000 namespace cycles over the real
+filesystem and reads this process back with `ps`.
+
+| | warm at iteration 600 | at 6,000 | growth |
+| --- | --- | --- | --- |
+| macOS | 9 MiB | 11 MiB | 2 MiB |
+| Linux | 8 MiB | 10 MiB | 1 MiB |
+
+The assertion is `growth < 64 MiB`, against an observed 1 to 2 MiB.
+
+That is a single bounded run per host on a shared machine. It is **not** a proof that nothing leaks,
+and it does not diagnose anything. The adapter `parents` map plus the `PathVfs` table, named as the
+suspect, is a hypothesis. The spike's own memory growth was never diagnosed and no soak longer than
+about a minute was ever run there. Root cause stays open.
+
+## readdir paging: measured, not a budget
+
+12,000 entries in one directory, 64 entries requested per page, 204 pages, two author runs on a
+shared machine:
+
+| Figure | run 1 | run 2 |
 | --- | --- | --- |
-| pages | 204 | 204 |
 | first page | 40.64 ms | 28.97 ms |
 | mean of pages two onwards | 1.61 ms | 1.05 ms |
 | native read of the same directory | 7.81 ms | 7.00 ms |
 | native read plus one `lstat` per entry | 57.03 ms | 43.12 ms |
 
-#19 recorded 23 to 71 ms per page on a 10,000 to 15,000 entry directory. Pages after the first now
-cost 1.05 to 1.61 ms, and the assertion that keeps them there compares that figure with the 7.00 ms
-it would have to exceed to mean the directory is being re-read.
+#19 recorded 23 to 71 ms per page on a 10,000 to 15,000 entry directory.
 
-Every figure above comes from a run at `b4b3f37905d7f571a38c55d8ae37a83c26df9a23`.
+The single asserted bound is `mean of pages two onwards < one native directory read`. That
+comparison separates a cached listing from a re-read one on its own: a page from a cache pays for
+its own entries, and a page that re-reads pays at least one whole read. It is deliberately loose and
+it is **not** a performance budget. No quiet-machine claim is made anywhere: the wave has other
+workers running, two runs is not a distribution, and the 1.5x build-overhead criterion in
+`AGENTS.md` is not touched by any of this. The 23 to 71 ms figure is the old spike reading from a
+different machine and different code.
 
-Regressions run at the same head:
+## Regressions, and two failures that are not this lane's
 
-- `cargo test -p cowfs-nfs --test protocol`: 23 passed, 0 failed.
-- `cargo test -p cowfs-vfs-path --lib`: 33 passed, 0 failed.
-- `cargo clippy -p cowfs-nfs --all-targets -- -D warnings`: exit 0.
-- `cargo fmt --all -- --check`: exit 0.
+At `4dc63ff`, exit codes taken from the command itself:
 
-## Not claimed
+| | macOS | Linux |
+| --- | --- | --- |
+| `cargo test -p cowfs-nfs --test requirements19` | 0 | 0 |
+| `cargo test -p cowfs-nfs --test requirements19 -- --ignored find_links touching` | 0 | 101, the required-mount guard |
+| `cargo test -p cowfs-nfs --test protocol` | 0 | 0 |
+| `cargo test -p cowfs-vfs-path --lib` | 0 | 101, see below |
+| `cargo clippy -p cowfs-nfs --all-targets -- -D warnings` | 0 | 101, see below |
+| `cargo clippy -p cowfs-nfs --test requirements19 -- -D warnings` | n/a | 0 |
+| `cargo fmt --all -- --check` | 0 | 0 |
 
-- No performance acceptance is claimed. The wave has other workers running, and the dispatch
-  forbids a quiet-machine claim while they are active. The readdir figures above are one run on a
-  shared machine, reported as measured, not as an accepted budget.
-- The readdir measurement is one run, not a distribution. Its bound is the only one asserted, and
-  that bound is the one that separates the two designs rather than a tuned threshold.
-- `rss_soak` in `crates/cowfs-nfs/tests/mount.rs` is a 10 minute manual soak over `MemVfs`.
-  It was not run here. The added churn test is bounded, runs in the normal battery, and uses the
-  real backend, which is the gap that mattered: `MemVfs` has no inode table to grow.
+Both Linux failures are in files this lane does not touch. `git diff --name-only 395c236 4dc63ff` is
+exactly one path, `crates/cowfs-nfs/tests/requirements19.rs`.
 
-## Still open
+- `cowfs-vfs-path/src/tests.rs:328`, `readdir_sees_a_name_created_outside_the_vfs_while_a_listing_is_paged`,
+  fails on this particular host. The suite passes in CI on `ubuntu-latest`, so this is a property of
+  this machine's filesystem, not a code change. Not investigated further here: it is another lane's
+  file and the assertion is not this lane's to change.
+- `cargo clippy` on Linux fails in `crates/cowfs-nfs/tests/contract.rs:233` on
+  `assert!(post.is_none() || true)`, a tautology that rustc 1.95's clippy flags and 1.99's does not.
+  It is outside this lane's diff and outside its ownership, so it is proposed here rather than
+  rewritten: `contract.rs` wants a real assertion, and the barrier work in the original build train
+  owns that file.
 
-1. **Upstream contribution or maintained fork.** `crates/nfsserve` is a vendored fork of
+## Still open on #19
+
+1. **The fork or upstream contribution decision** for vendored `nfsserve`. It is a fork of
    huggingface/nfsserve 0.11.0 carrying the LINK procedure, the cookie fix and the reply cache.
-   The fork is the de facto answer and `PATCHES.md` records every patch.
-   Whether to send a subset upstream is a maintainer decision with a maintenance cost attached,
-   not something this lane can settle.
-2. **AppleDouble `._*` policy for v1.** Delivered as `AppleDoubleMode::Hide` with `Translate`
-   opt-in. Slot 7 owns the review that issue #43 asks for before flipping the default.
-3. **Cause of the spike's memory growth.** The spike never diagnosed it and never ran a soak
-   longer than about a minute. The added churn test shows the adapter and the real backend stay
-   bounded over 6,000 cycles, which narrows the suspect to whatever the spike's own mirror did
-   that this server does not, but it does not name a cause.
+   `PATCHES.md` records every patch. Sending a subset upstream is a maintainer decision with a
+   maintenance cost attached.
+2. **AppleDouble `._*` policy.** `AppleDoubleMode::Hide` is the default and `Translate` is opt-in.
+   Slot 7 owns the review issue #43 asks for. No default may move on this evidence.
+3. **Symlink `chmod` on Linux.** `fchmod` on the `O_PATH | O_NOFOLLOW` descriptor is `EBADF` and
+   the server answers `NFS3ERR_IO`. #19's requirement is unmet on Linux. Closing it needs a
+   production decision in `cowfs-vfs-path`, which is not this lane's surface.
+4. **Server resident-memory root cause.** Undiagnosed, as above.
+5. **A store-side growth question**, referred to in review as a Store leak. No issue in the open list
+   tracks it and nothing in `docs/` records it. If it is real it needs filing; issue #10 is the
+   nearest subject.
+6. **#107 typed `create` for FIFO and socket**, **#108 `pathconf`**, **#109 `rmdir` of a trailing
+   `..` plus `nlink` after unlinking an open file**, **#110 `chown` to another uid**. New gate
+   findings, assigned to the requirement lane, untouched here.
 
-## Lane dependencies, stated
+## What this lane owns
 
-- Nothing in this delivery depends on slot 7, on the namespace-barrier work, or on import/refresh.
-- The `Cargo.toml` dev-dependency line is the only shared-file edit and can be rebased onto any of
-  them without conflict, since it adds a new key inside an existing table.
-- Shared daemon PID 15263, its store, socket and mount at `~/.cowfs/mnt` were not signalled,
-  read, mounted, or used as a fixture. The mounted tests here run their own server on their own
-  port with their own mountpoint and unmount only that.
+The #19 requirement list and narrow vendored-server fixes.
+
+Not owned and not touched: AppleDouble `Translate`, authorization and the dead-server sweep (slot 7,
+issue #43); the namespace barriers and NFS durability adapter sites (original build train);
+`crates/cowfs-daemon/src/import.rs` and import/refresh #97 (original build train).
+
+The only shared-file change in the whole PR is one dev-dependency,
+`cowfs-vfs-path` in `crates/cowfs-nfs/Cargo.toml`, so an NFS test can run against a real filesystem.
+It is additive and changes no production build. The portability delta adds no manifest or lock edit
+at all.
+
+Shared daemon PID 15263, its store, socket and mount at `~/.cowfs/mnt` were never signalled, read,
+mounted or used as a fixture. The mounted tests run their own server on their own port with their own
+mountpoint and unmount only that, verified against the native mount table.
