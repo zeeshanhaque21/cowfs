@@ -12,7 +12,7 @@
 use cowfs_ctl::{Hold, HoldKind, ProcessInfo};
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long the whole scan may take: resolving the prefix, running `lsof`, and draining both of its
 /// pipes. A deadline that only covers the child wait is not a deadline, because the resolver and
@@ -251,11 +251,12 @@ mod imp {
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    use super::{finish, hold, Duration, Hold, HoldKind, Instant, Path, ProcessInfo};
+    use super::{finish, hold, Duration, Hold, HoldKind, Path, ProcessInfo};
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
+    use std::time::Instant;
 
     pub const LSOF: &str = "/usr/sbin/lsof";
 
@@ -550,6 +551,8 @@ mod tests {
     use super::*;
     #[cfg(not(target_os = "linux"))]
     use std::process::{Command, Stdio};
+    #[cfg(not(target_os = "linux"))]
+    use std::time::Instant;
 
     #[test]
     fn a_directory_nobody_holds_has_no_holders() {
