@@ -86,6 +86,12 @@ pub struct BaseRefreshParams {
 }
 
 /// Parameters of `ps`.
+///
+/// The name is resolved against the daemon's mount, so it may be a snapshot name or a directory
+/// inside one: a treehouse mode (a) slot is a worktree directory under a snapshot, and issue #20
+/// needs a scan of that directory rather than of the whole snapshot around it. The daemon refuses
+/// a name that does not resolve inside the mount, and answers `unsupported` when the platform
+/// cannot list open files at all, because an unanswered scan is not an empty one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PsParams {
     pub snapshot: String,

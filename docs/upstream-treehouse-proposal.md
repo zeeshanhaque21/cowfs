@@ -248,6 +248,24 @@ Two details worth preserving from the existing code:
 If a per-pid fd walk is judged too slow on some platform, `lsof +D` is the fallback and the numbers
 above say it is affordable: under a second for a 10,000-file tree.
 
+### One detail worth copying: an unanswered scan is not an empty one
+
+cowfs has since implemented this detector for its own slots, and the failure mode worth avoiding
+upstream is the quiet one. `lsof` can be absent, can fail, and can hang on a wedged mount, and a
+scan that reports "nothing found" in any of those cases hands the caller a false all-clear that
+stops exactly where it should have refused. The implementation separates the two answers:
+
+- `lsof` exiting 0 or 1 is an answer. Exit 1 is its "matched no file", which is the common clean
+  case and must not be treated as a failure.
+- A missing binary, any other exit status, a scan that outran its deadline, or an unreadable
+  `/proc` or `/proc/locks` is `unavailable`, and the caller blocks rather than proceeding.
+- The child's pipes are drained off the thread that waits for it. Reading a pipe to end before
+  checking the deadline makes the deadline unreachable, so a wedged mount hangs the caller instead
+  of being reported.
+
+The same applies to `/proc/locks` on Linux: an unreadable lock table is not an empty lock table, and
+a lock alone is enough to block an unmount.
+
 ## Why this is not urgent, and what happens if it is declined
 
 cowfs does not need any of the three to ship. It needs a `cowfs mount_snapshot {name, path}`

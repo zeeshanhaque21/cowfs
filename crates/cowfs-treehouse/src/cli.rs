@@ -292,7 +292,6 @@ fn dispatch(cli: &Cli, env: &Env) -> Result<i32> {
                     a.mode
                 )));
             }
-            // Mode (a) needs no daemon, so nothing connects before the pool is named.
             let root = match a.root.clone() {
                 Some(r) => r,
                 None => {
@@ -303,7 +302,16 @@ fn dispatch(cli: &Cli, env: &Env) -> Result<i32> {
                     ))
                 }
             };
-            let mut daemon = if mode_b { Some(connect(env)?) } else { None };
+            // A mode (a) slot on a cowfs mount is scanned through the daemon's `ps` before the
+            // release, which is what catches the open descriptors and flocks `treehouse return`
+            // cannot see (issue #20). That scan needs a daemon, so a named `--socket` is
+            // required to be reachable rather than quietly ignored; without the flag mode (a)
+            // still needs no cowfs at all, which is the off-mount case.
+            let mut daemon = if mode_b || env.socket.is_some() {
+                Some(connect(env)?)
+            } else {
+                None
+            };
             let out = do_return(cli, &mut daemon, a, &root, mode_b, discard)?;
             emit(env, &out)?;
             Ok(EXIT_OK)
