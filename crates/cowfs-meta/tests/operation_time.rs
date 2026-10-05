@@ -138,7 +138,8 @@ fn set_now_does_not_replace_an_explicit_atime_or_mtime() {
 
     let asked = t(9_000_000);
     s.batch(|tx| {
-        // the stamp moves ctime only: a caller statement about mtime is not a clock reading
+        // on an inode that already exists the stamp moves ctime only: a caller statement about
+        // mtime is not a clock reading
         tx.set_now(T2);
         tx.setattr(
             f.ino,
@@ -155,7 +156,26 @@ fn set_now_does_not_replace_an_explicit_atime_or_mtime() {
     let a = s.getattr(f.ino).unwrap();
     assert_eq!(a.mtime, asked, "an explicit mtime must survive set_now");
     assert_eq!(a.atime, asked, "an explicit atime must survive set_now");
-    assert_eq!(a.ctime, T2, "ctime is the only field the stamp owns");
+    assert_eq!(a.ctime, T2, "ctime follows the stamp on an existing inode");
+}
+
+/// The create path is the one place `set_now` drives `atime` and `mtime` as well as `ctime`.
+#[test]
+fn a_created_inode_takes_all_three_times_from_the_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = store(dir.path());
+    let s = meta.new_snapshot("s").unwrap();
+    let f = s
+        .batch(|tx| {
+            tx.set_now(T1);
+            tx.create(cowfs_meta::ROOT_INO, b"f", 0o644)
+        })
+        .unwrap();
+
+    let a = s.getattr(f.ino).unwrap();
+    assert_eq!(a.atime, T1, "a new inode's atime comes from the stamp");
+    assert_eq!(a.mtime, T1, "a new inode's mtime comes from the stamp");
+    assert_eq!(a.ctime, T1, "a new inode's ctime comes from the stamp");
 }
 
 #[test]

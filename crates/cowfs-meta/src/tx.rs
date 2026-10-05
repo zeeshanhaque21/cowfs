@@ -220,8 +220,11 @@ impl Tx<'_> {
     /// Defaults to the wall clock at the moment the transaction opened, which is what a caller that
     /// applies changes as it makes them wants. A caller replaying operations that happened earlier
     /// sets it per operation, so a deferred change records when it happened rather than when the
-    /// batch that carried it committed. Only `ctime` follows this value: `atime` and `mtime` are
-    /// whatever the caller asked for, and an explicit time in a `setattr` is never replaced.
+    /// batch that carried it committed.
+    ///
+    /// A newly created inode takes all three of its times from this value. An inode that already
+    /// exists takes only its `ctime` from it, and its `atime` and `mtime` are whatever the caller
+    /// asked for. A time given explicitly in a `setattr` is never replaced, including on a create.
     pub fn set_now(&mut self, now: Timestamp) {
         self.now = now;
     }
