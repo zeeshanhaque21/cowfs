@@ -1198,8 +1198,17 @@ class DeviceDisambiguation(unittest.TestCase):
         self.assertIn("unreadable", got["reason"])
         self.assertIsNone(kind)
         # And with the real reader restored the same question is answered, so the test above was
-        # exercising the patch and not the absence of /proc.
-        self.assertIsNotNone(module.mountinfo_for_device(self.dev("8:2"), "/x"))
+        # exercising the patch and not the absence of a mount table. The device comes from the real
+        # table rather than being invented: 8:2 does not exist on every Linux, and a fixture that
+        # assumes a device number fails on a host without it.
+        rows, _ = module.read_mountinfo()
+        if rows:
+            real = rows[0]
+            major, minor = (int(part) for part in real["device"].split(":"))
+            inside = os.path.join(real["mountpoint"], "cowfs-gate-probe")
+            got = module.mountinfo_for_device(os.makedev(major, minor), inside)
+            self.assertIsNotNone(got, real)
+            self.assertFalse(got.get("ambiguous"), got)
 
 
 class SeparateProcessReadback(unittest.TestCase):
