@@ -150,10 +150,177 @@ impl Deadline {
     }
 }
 
-/// Runs one command under an absolute deadline, killing only its own child if the deadline passes.
+/// Why a bounded command did not produce a plain result. Classified, never collapsed into
+/// success, and carrying whatever real evidence the run did collect.
+#[derive(Clone, Debug)]
+enum RunFailure {
+    /// The child was still running at the bound and only its own pid was killed.
+    ChildTimedOut {
+        pid: u32,
+        bound_ms: u128,
+        stderr_so_far: Vec<u8>,
+    },
+    /// The child exited and its status is real, but a pipe stayed open past the bound, usually
+    /// because a grandchild inherited it. The output is partial and is reported as partial.
+    DrainTimedOut {
+        status: std::process::ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        waiting_on: &'static str,
+        bound_ms: u128,
+    },
+    /// The command could not be run at all.
+    Spawn(String),
+}
+
+impl RunFailure {
+    fn why(&self) -> String {
+        match self {
+            RunFailure::ChildTimedOut {
+                pid,
+                bound_ms,
+                stderr_so_far,
+            } => format!(
+                "child pid {pid} was still running at its {bound_ms}ms bound and only its own pid \
+                 was killed; stderr so far: {}",
+                String::from_utf8_lossy(stderr_so_far).trim()
+            ),
+            RunFailure::DrainTimedOut {
+                status,
+                stdout,
+                stderr,
+                waiting_on,
+                bound_ms,
+            } => format!(
+                "the child exited with {status} but {waiting_on} stayed open past the {bound_ms}ms \
+                 bound, so the output is partial ({} stdout bytes, {} stderr bytes) and this is \
+                 NOT a completed command",
+                stdout.len(),
+                stderr.len()
+            ),
+            RunFailure::Spawn(why) => why.clone(),
+        }
+    }
+}
+
+/// Runs one command so that the whole operation, output collection included, finishes inside one
+/// absolute deadline.
 ///
-/// No timeout argument exists for `umount` on macOS, and `umount` against a server that is gone is
-/// the case that hangs, so every teardown command goes through here.
+/// Three things this has to get right, each of which was a defect first:
+/// the pipes must be drained *while* the child runs, or a chatty child deadlocks on a full pipe
+/// buffer; the drain must *not* be joined unbounded, or a grandchild holding the pipe makes this
+/// return long after the bound; and a child reaped before its pipes reach EOF is not completion, so
+/// that case is reported as a classified failure carrying the real status and the partial output.
+///
+/// Only the direct child is ever signalled, and only by the handle that owns it. No process group
+/// and no pattern match: a grandchild is not this function's to kill.
+fn run_bounded_detailed(
+    deadline: Deadline,
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    cap: Duration,
+) -> Result<Output, RunFailure> {
+    let bound = deadline.remaining().min(cap);
+    if bound.is_zero() {
+        return Err(RunFailure::Spawn(format!(
+            "deadline already spent before spawning {program}"
+        )));
+    }
+    let started = Instant::now();
+    // One absolute end for the WHOLE command: spawn, the child, and the collection of its output.
+    // Phase two used the caller's overall deadline instead of this, so a grandchild holding the
+    // pipe could hold the function for as long as the grandchild lived: measured at 20.0s against
+    // a 3s bound before this was fixed.
+    let hard_end = started + bound;
+    let mut child = match Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(RunFailure::Spawn(format!(
+                "cannot spawn {program} {args:?}: {e}"
+            )))
+        }
+    };
+    let pid = child.id();
+
+    // Bounded handoff: a reader never blocks the waiter, and the waiter never blocks past the bound.
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = out_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = tx_out.send(buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = err_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = tx_err.send(buf);
+    });
+
+    // Phase 1: the child itself, bounded.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= bound => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let so_far = rx_err
+                    .recv_timeout(Duration::from_millis(200))
+                    .unwrap_or_default();
+                return Err(RunFailure::ChildTimedOut {
+                    pid,
+                    bound_ms: bound.as_millis(),
+                    stderr_so_far: so_far,
+                });
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(RunFailure::Spawn(format!("cannot wait for {program}: {e}"))),
+        }
+    };
+
+    // Phase 2: the pipes, bounded by the SAME absolute deadline. A child reaped above is not
+    // completion while its output is still open.
+    let left = hard_end.saturating_duration_since(Instant::now());
+    let got_out = rx_out.recv_timeout(left).ok();
+    let left = hard_end.saturating_duration_since(Instant::now());
+    let got_err = rx_err.recv_timeout(left).ok();
+    let stdout = got_out.clone().unwrap_or_default();
+    let stderr = got_err.clone().unwrap_or_default();
+    let waiting_on = if got_out.is_none() {
+        "stdout"
+    } else {
+        "stderr"
+    };
+    match (got_out, got_err) {
+        (Some(out), Some(err)) => Ok(Output {
+            status,
+            stdout: out,
+            stderr: err,
+        }),
+        (out, err) => Err(RunFailure::DrainTimedOut {
+            status,
+            stdout: out.unwrap_or(stdout),
+            stderr: err.unwrap_or(stderr),
+            waiting_on,
+            bound_ms: bound.as_millis(),
+        }),
+    }
+}
+
+/// `run_bounded_detailed` flattened to the shape most call sites want.
 fn run_bounded(
     deadline: Deadline,
     dir: &Path,
@@ -161,64 +328,8 @@ fn run_bounded(
     args: &[&str],
     cap: Duration,
 ) -> Result<Output, String> {
-    let left = deadline.remaining().min(cap);
-    if left.is_zero() {
-        return Err(format!("deadline already spent before spawning {program}"));
-    }
-    let started = Instant::now();
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot spawn {program} {args:?}: {e}"))?;
-    // Drained while the child runs. Draining only after it exits deadlocks any command whose
-    // output fills the pipe buffer, which every importing cowfs call does with its progress frames.
-    let drain = |pipe: Option<std::process::ChildStdout>| {
-        pipe.map(|mut p| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = p.read_to_end(&mut buf);
-                buf
-            })
-        })
-    };
-    let out_reader = drain(child.stdout.take());
-    let err_reader = child.stderr.take().map(|mut p| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = p.read_to_end(&mut buf);
-            buf
-        })
-    });
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() >= left => {
-                let pid = child.id();
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{program} {args:?} exceeded its {}ms bound and its own pid {pid} was killed",
-                    left.as_millis()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => return Err(format!("cannot wait for {program}: {e}")),
-        }
-    }
-    let out = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
-    let err = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
-    let status = child
-        .wait()
-        .map_err(|e| format!("cannot reap {program}: {e}"))?;
-    Ok(Output {
-        status,
-        stdout: out,
-        stderr: err,
-    })
+    run_bounded_detailed(deadline, dir, program, args, cap)
+        .map_err(|f| format!("{program} {args:?}: {}", f.why()))
 }
 
 /// `run_bounded` with a panic on failure, for read-only commands in a test body.
@@ -241,7 +352,61 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// Appends one record and flushes it, so an interrupted run keeps what it measured.
+/// One receipt field, typed.
+///
+/// `record` used to take `&str` for every value and serialise it as a JSON string, so a row
+/// written as `warm_base_published: "true"` could never satisfy a guard comparing against a JSON
+/// boolean. The guard was then unreachable for anything this harness wrote. Values are typed now,
+/// and the guard accepts both shapes strictly.
+#[derive(Clone, Copy, Debug)]
+pub enum Field<'a> {
+    Text(&'a str),
+    Flag(bool),
+    Num(i64),
+}
+
+impl serde::Serialize for Field<'_> {
+    fn serialize<S: serde::Serializer>(&self, out: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Field::Text(t) => out.serialize_str(t),
+            Field::Flag(b) => out.serialize_bool(*b),
+            Field::Num(n) => out.serialize_i64(*n),
+        }
+    }
+}
+
+/// Appends a typed row to the run's own receipt file and flushes it.
+///
+/// Used by any gate that needs a real boolean or a real number in the receipt, and covered by
+/// the warm-claim control, which proves the serialisation rather than assuming it.
+fn record_typed(test: &str, fields: &[(&str, Field<'_>)]) {
+    let mut body = String::from("{\"test\":");
+    body.push_str(&serde_json::to_string(test).expect("a test name is a string"));
+    for (k, v) in fields {
+        body.push(',');
+        body.push_str(&serde_json::to_string(k).expect("a key is a string"));
+        body.push(':');
+        body.push_str(&serde_json::to_string(v).expect("a field is a value"));
+    }
+    body.push_str("}\n");
+    write_record(&body);
+}
+
+/// A typed row written to a named file, for a control that has to prove the serialisation.
+fn record_typed_to(path: &Path, test: &str, fields: &[(&str, Field<'_>)]) {
+    let mut body = String::from("{\"test\":");
+    body.push_str(&serde_json::to_string(test).expect("a test name is a string"));
+    for (k, v) in fields {
+        body.push(',');
+        body.push_str(&serde_json::to_string(k).expect("a key is a string"));
+        body.push(':');
+        body.push_str(&serde_json::to_string(v).expect("a field is a value"));
+    }
+    body.push_str("}\n");
+    write_record_to(path, &body);
+}
+
+/// Convenience for the common all-text row.
 fn record(test: &str, fields: &[(&str, String)]) {
     let mut body = String::from("{\"test\":");
     body.push_str(&serde_json::to_string(test).expect("a test name is a string"));
@@ -252,11 +417,20 @@ fn record(test: &str, fields: &[(&str, String)]) {
         body.push_str(&serde_json::to_string(v).expect("a value is a string"));
     }
     body.push_str("}\n");
-    let path = evidence_dir().join("acceptance.jsonl");
+    write_record(&body);
+}
+
+fn write_record(body: &str) {
+    write_record_to(&evidence_dir().join("acceptance.jsonl"), body);
+}
+
+/// Appends to a named receipt file. Controls use this so their synthetic rows never mix with the
+/// run's real receipts.
+fn write_record_to(path: &Path, body: &str) {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
         .expect("the evidence file is writable");
     f.write_all(body.as_bytes()).expect("the record is written");
     f.flush().expect("the record is flushed");
@@ -372,13 +546,98 @@ impl Sample {
     }
 }
 
+/// One parsed line of the native mount table.
+///
+/// Both platform grammars are decoded here, because this harness runs on both and a parser that
+/// encodes one platform's shape reads the other's filesystem type as the literal word `type`:
+///
+///   macOS   server:/export on /point (nfs, nodev, nosuid, mounted by user)
+///   Linux   source on /point type fuse (rw,nosuid,nodev,relatime)
+///   Linux   source on /point type fuse.cowfs (rw,nosuid,nodev,relatime)
+///
+/// So the rule is: after the mount point, a bare `type` keyword means the next token is the
+/// filesystem type, and otherwise the first item inside the parentheses is it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MountEntry {
+    source: String,
+    point: PathBuf,
+    fstype: String,
+}
+
+/// Decodes the octal escapes `mount` uses for characters that would break its own grammar.
+fn unescape_mount_field(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let bytes = field.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let octal = &field[i + 1..i + 4];
+            if let Ok(n) = u8::from_str_radix(octal, 8) {
+                out.push(n as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Parses one line, in either grammar. `None` means this line is not a mount entry.
+fn parse_mount_line(line: &str) -> Option<MountEntry> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (source, rest) = line.split_once(" on ")?;
+    let mut parts = rest.split_whitespace();
+    let point = unescape_mount_field(parts.next()?);
+    if point.is_empty() {
+        return None;
+    }
+    let fstype = match parts.next() {
+        // Linux grammar: an explicit `type` keyword, then the filesystem type.
+        Some("type") => {
+            let name = unescape_mount_field(parts.next()?);
+            // An option group where a name belongs means the line is not the shape it claims to be,
+            // for example `src on /point type (rw)`. Refusing beats inventing a name.
+            if name.starts_with('(') || name.is_empty() {
+                return None;
+            }
+            name
+        }
+        // macOS grammar: the option list opens with the filesystem type.
+        Some(word) if word.starts_with('(') => {
+            let inner = word.trim_start_matches('(');
+            let first = inner.split(&[',', ')'][..]).next().unwrap_or_default();
+            let first = first.trim();
+            if first.is_empty() {
+                return None;
+            }
+            unescape_mount_field(first)
+        }
+        // No grammar this harness knows. Refusing is the point: a wrong filesystem type here would
+        // make an unverified export look verified.
+        _ => return None,
+    };
+    if fstype.is_empty() {
+        return None;
+    }
+    Some(MountEntry {
+        source: unescape_mount_field(source.trim()),
+        point: PathBuf::from(unescape_mount_field(&point)),
+        fstype,
+    })
+}
+
 /// What the native mount table said. Three states, because two are not enough: an unreadable table
-/// must never be reported as a clean readback.
+/// must never be reported as a clean readback, and there is deliberately no fallback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MountVerdict {
-    /// The table was read. `under_base` holds this runtime root's mount points.
+    /// The table was read and every entry was understood.
     Known {
-        under_base: Vec<PathBuf>,
+        entries: Vec<MountEntry>,
         parsed: usize,
         unparsed: usize,
     },
@@ -386,30 +645,37 @@ enum MountVerdict {
     Unknown(String),
 }
 
-/// Parses `mount` output. Only mount points under `base` are ever returned, so a foreign mount is
-/// out of reach by construction rather than by a later check.
+impl MountVerdict {
+    /// The entries whose mount point is under `base`. Foreign mounts are out of reach by
+    /// construction rather than by a later check.
+    fn under_base(&self, base: &Path) -> Vec<&MountEntry> {
+        let prefix = format!("{}/", base.display());
+        match self {
+            MountVerdict::Known { entries, .. } => entries
+                .iter()
+                .filter(|e| e.point.to_string_lossy().starts_with(&prefix))
+                .collect(),
+            MountVerdict::Unknown(_) => Vec::new(),
+        }
+    }
+}
+
+/// Parses `mount` output into entries.
 fn parse_mount_table(raw: &str, base: &Path) -> MountVerdict {
+    let _ = base;
     if raw.trim().is_empty() {
         return MountVerdict::Unknown("the mount table was empty".to_owned());
     }
-    let prefix = format!("{}/", base.display());
-    let mut under_base = Vec::new();
+    let mut entries = Vec::new();
     let (mut parsed, mut unparsed) = (0usize, 0usize);
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        // `mount` prints `server:/export on /point (nfs, ...)`, so the point follows " on ".
-        match line
-            .split(" on ")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next())
-        {
-            Some(point) => {
+        match parse_mount_line(line) {
+            Some(entry) => {
                 parsed += 1;
-                if point.starts_with(&prefix) {
-                    under_base.push(PathBuf::from(point));
-                }
+                entries.push(entry);
             }
             None => unparsed += 1,
         }
@@ -420,7 +686,7 @@ fn parse_mount_table(raw: &str, base: &Path) -> MountVerdict {
         ));
     }
     MountVerdict::Known {
-        under_base,
+        entries,
         parsed,
         unparsed,
     }
@@ -454,47 +720,31 @@ struct MountIdentity {
 
 fn mount_identity(deadline: Deadline, base: &Path, point: &Path) -> Result<MountIdentity, String> {
     let verdict = read_mount_table(deadline, base);
-    let under_base = match &verdict {
-        MountVerdict::Known { under_base, .. } => under_base.clone(),
-        MountVerdict::Unknown(why) => return Err(format!("the mount table is unknown: {why}")),
-    };
-    let found = under_base
-        .iter()
-        .find(|p| p.as_path() == point)
-        .ok_or_else(|| {
-            format!(
-                "{} is not in the mount table under {base:?}",
-                point.display()
-            )
-        })?;
-    let raw = stdout(&sh(deadline, Path::new("/"), "mount", &[]));
-    let line = raw
-        .lines()
-        .find(|l| {
-            l.split(" on ")
-                .nth(1)
-                .and_then(|r| r.split_whitespace().next())
-                == Some(found.to_str().unwrap_or_default())
-        })
-        .ok_or_else(|| format!("no mount line for {}", found.display()))?;
-    let rest = line
-        .split(" on ")
-        .nth(1)
-        .ok_or_else(|| format!("unparsable mount line: {line}"))?;
-    let mut parts = rest.split_whitespace();
-    let _ = parts.next();
-    let options = parts.next().unwrap_or_default();
-    let fstype = options
-        .trim_start_matches('(')
-        .split(',')
-        .next()
-        .unwrap_or_default()
-        .to_owned();
+    let entries = verdict.under_base(base);
+    let found = entries.iter().find(|e| e.point == point).ok_or_else(|| {
+        format!(
+            "{} is not in the mount table under {}",
+            point.display(),
+            base.display()
+        )
+    })?;
     Ok(MountIdentity {
-        point: found.clone(),
-        source: line.split(" on ").next().unwrap_or_default().to_owned(),
-        fstype,
+        point: found.point.clone(),
+        source: found.source.clone(),
+        fstype: found.fstype.clone(),
     })
+}
+
+/// The filesystem types this harness will accept for an export it is about to build in.
+///
+/// Exact names, compared exactly. A substring or prefix match would let the Linux grammar's
+/// literal `type` through, which is precisely the defect this list exists to prevent.
+fn accepted_export_fstypes() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["nfs"]
+    } else {
+        &["fuse", "fuse.cowfs", "cowfs"]
+    }
 }
 
 /// What was registered when the daemon was spawned, re-checked immediately before any signal.
@@ -504,10 +754,20 @@ struct Registered {
     exe: String,
     store: String,
     socket: String,
+    /// The kernel's own start time for this pid, read back at registration. A pid on its own is
+    /// not an identity, because pids are recycled; the start time is what makes one.
+    start: String,
 }
 
-/// Re-reads a pid's identity from the process table. `None` when it is gone.
-fn read_identity(deadline: Deadline, pid: u32) -> Option<(String, String)> {
+/// A process as the kernel currently describes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Live {
+    start: String,
+    argv: String,
+}
+
+/// Re-reads a pid's identity from the process table. `None` when it is gone or unreadable.
+fn read_identity(deadline: Deadline, pid: u32) -> Option<Live> {
     let out = run_bounded(
         deadline,
         Path::new("/"),
@@ -521,20 +781,35 @@ fn read_identity(deadline: Deadline, pid: u32) -> Option<(String, String)> {
     }
     let text = stdout(&out);
     let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
-    // `lstart` is five fields, the rest is the command line.
+    // `lstart` is five whitespace-separated fields, the rest is the command line.
     let mut parts = line.split_whitespace();
     let stamp: Vec<&str> = parts.by_ref().take(5).collect();
     let args: Vec<&str> = parts.collect();
     if stamp.len() != 5 || args.is_empty() {
         return None;
     }
-    Some((stamp.join(" "), args.join(" ")))
+    Some(Live {
+        start: stamp.join(" "),
+        argv: args.join(" "),
+    })
+}
+
+/// The shared daemon on this host. It is not a fixture and this harness never signals it.
+const SHARED_DAEMON_PID: u32 = 15263;
+
+fn pid_is_15263(pid: u32) -> bool {
+    pid == SHARED_DAEMON_PID
 }
 
 /// Whether the live process is still the one this harness started.
-fn identity_matches(want: &Registered, got: &(String, String)) -> bool {
-    let (_stamp, args) = got;
-    args.contains(&want.store) && args.contains(&want.socket) && args.contains(&want.exe)
+///
+/// The start time is compared, not parsed and discarded. Without it a recycled pid that happens to
+/// carry the same argv would pass, which is the whole reason the start time was read.
+fn identity_matches(want: &Registered, got: &Live) -> bool {
+    got.start == want.start
+        && got.argv.contains(&want.store)
+        && got.argv.contains(&want.socket)
+        && got.argv.contains(&want.exe)
 }
 
 /// A real `cowfs-daemon` over the real core backend, on a private store, socket and mount.
@@ -618,14 +893,20 @@ impl Core {
             .stderr(Stdio::from(log))
             .spawn()
             .expect("the daemon starts");
-        let registered = Registered {
-            pid: child.id(),
-            exe: daemon
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            store: store.display().to_string(),
-            socket: socket.display().to_string(),
+        // Registered from the kernel's own view of the child, not from what this harness meant to
+        // spawn, so the comparison later is against the process that actually exists.
+        let registered = match read_identity(Deadline::after(20), child.id()) {
+            Some(live) => Registered {
+                pid: child.id(),
+                exe: daemon
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                store: store.display().to_string(),
+                socket: socket.display().to_string(),
+                start: live.start,
+            },
+            None => panic!("the spawned daemon has no readable identity; refusing to continue"),
         };
 
         // Bounded wait that exits on failure as well as on success.
@@ -684,15 +965,34 @@ impl Core {
     }
 
     /// The store that answers, read back from the daemon rather than assumed.
-    fn status_store(&self, deadline: Deadline) -> String {
-        self.cli(deadline, &["status"])
-            .map(|o| {
-                serde_json::from_str::<serde_json::Value>(stdout(&o).trim())
-                    .ok()
-                    .and_then(|v| v["store_path"].as_str().map(str::to_owned))
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
+    ///
+    /// `Err` rather than an empty string on any failure, because the check this feeds compared
+    /// with `ends_with`, and in Rust `"anything".ends_with("")` is true: an unanswered status
+    /// satisfied the assertion it was supposed to falsify.
+    fn status_store(&self, deadline: Deadline) -> Result<String, String> {
+        let out = self
+            .cli(deadline, &["status"])
+            .ok_or_else(|| "the cowfs binary is not beside this test binary".to_owned())?;
+        if code(&out) != 0 {
+            return Err(format!("status exited {}", code(&out)));
+        }
+        let value: serde_json::Value = serde_json::from_str(stdout(&out).trim())
+            .map_err(|e| format!("status printed no JSON: {e}"))?;
+        let path = value["store_path"]
+            .as_str()
+            .ok_or_else(|| "status reported no store_path".to_owned())?;
+        if path.is_empty() {
+            return Err("status reported an empty store_path".to_owned());
+        }
+        Ok(path.to_owned())
+    }
+
+    /// The canonical store path this harness started, which is the only one that may answer.
+    fn owned_store(&self) -> String {
+        std::fs::canonicalize(&self.store)
+            .unwrap_or_else(|_| self.store.clone())
+            .display()
+            .to_string()
     }
 
     fn cli(&self, deadline: Deadline, args: &[&str]) -> Option<Output> {
@@ -811,7 +1111,7 @@ impl Core {
                         "ACCEPTANCE: not signalling pid {}: identity {:?} does not match the \
                          registered store and socket. Quarantined.",
                         self.registered.pid,
-                        other.map(|g| g.1)
+                        other.map(|g| g.argv)
                     );
                 }
             }
@@ -821,16 +1121,18 @@ impl Core {
         //    instead, and nothing is deleted in either case while the table is unknown.
         let mut unmounted: Vec<String> = Vec::new();
         let mut quarantined: Vec<String> = Vec::new();
-        match read_mount_table(deadline, &self.base) {
+        let table_first = read_mount_table(deadline, &self.base);
+        match &table_first {
             MountVerdict::Unknown(why) => quarantined.push(format!("mount table unknown: {why}")),
-            MountVerdict::Known { under_base, .. } => {
-                for path in under_base {
+            MountVerdict::Known { .. } => {
+                for entry in table_first.under_base(&self.base) {
+                    let path = entry.point.clone();
                     // Re-read immediately before each umount: never a stale decision, never a
                     // path that is not mounted now.
-                    let still = matches!(
-                        read_mount_table(deadline, &self.base),
-                        MountVerdict::Known { under_base, .. } if under_base.contains(&path)
-                    );
+                    let still = read_mount_table(deadline, &self.base)
+                        .under_base(&self.base)
+                        .iter()
+                        .any(|e| e.point == path);
                     if !still {
                         continue;
                     }
@@ -855,10 +1157,12 @@ impl Core {
 
         // 5. Readback, recorded rather than assumed.
         let verdict_after = read_mount_table(deadline, &self.base);
+        let table_known = matches!(verdict_after, MountVerdict::Known { .. });
         let left = match &verdict_after {
-            MountVerdict::Known { under_base, .. } => under_base
+            MountVerdict::Known { .. } => verdict_after
+                .under_base(&self.base)
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(|e| e.point.display().to_string())
                 .collect::<Vec<_>>()
                 .join(","),
             MountVerdict::Unknown(why) => format!("unknown: {why}"),
@@ -867,6 +1171,10 @@ impl Core {
         record(
             "teardown",
             &[
+                // Not a gate: a teardown row records what cleanup did, and saying so keeps a
+                // reader counting outcomes from reading it as a measurement.
+                ("outcome", "cleanup".to_owned()),
+                ("record_kind", "teardown".to_owned()),
                 ("daemon_argv", argv),
                 ("daemon_pid", self.registered.pid.to_string()),
                 ("daemon_exited", exited.to_string()),
@@ -883,10 +1191,7 @@ impl Core {
 
         // 6. Remove the temporary tree only when the table is known and nothing of ours is
         //    mounted under it. Never a recursive delete over an unknown table or a live mount.
-        let safe = matches!(
-            read_mount_table(deadline, &self.base),
-            MountVerdict::Known { .. }
-        ) && left.is_empty();
+        let safe = table_known && left.is_empty();
         if safe && deadline.remaining() > Duration::from_secs(5) {
             let _ = run_bounded(
                 deadline,
@@ -1409,14 +1714,14 @@ fn every_implemented_mode_b_postcondition_holds_over_the_real_core() {
         "the slot is a clone of the base, not of the empty tree: {list}"
     );
 
-    // Which store answered, read back from the daemon rather than assumed.
-    let answered = core.status_store(deadline);
+    // Which store answered, read back from the daemon rather than assumed. Exact equality against
+    // the canonical path of the store this harness opened: no suffix, prefix or basename match.
+    let answered = core
+        .status_store(deadline)
+        .unwrap_or_else(|e| panic!("cannot establish which store answered: {e}"));
     assert_eq!(
         answered,
-        std::fs::canonicalize(&core.store)
-            .unwrap_or_else(|_| core.store.clone())
-            .display()
-            .to_string(),
+        core.owned_store(),
         "the answering daemon is not the one this harness started"
     );
 
@@ -1433,6 +1738,11 @@ fn every_implemented_mode_b_postcondition_holds_over_the_real_core() {
     // An API's own `mounted: true` is not a readback.
     let identity = mount_identity(deadline, &core.base, &slot)
         .unwrap_or_else(|e| panic!("the export is not in the native mount table: {e}"));
+    assert!(
+        accepted_export_fstypes().contains(&identity.fstype.as_str()),
+        "the export is on {:?}, which is not an accepted cowfs filesystem type: {identity:?}",
+        identity.fstype
+    );
     record(
         "mode-b-mount-identity",
         &[
@@ -1635,22 +1945,19 @@ fn a_real_project_builds_and_tests_inside_an_exported_slot_snapshot() {
     let identity = mount_identity(deadline, &core.base, &slot).unwrap_or_else(|e| {
         panic!("refusing to build: the export is not verified in the mount table: {e}")
     });
-    let expected_fs = if cfg!(target_os = "macos") {
-        "nfs"
-    } else {
-        "fuse"
-    };
+    let accepted = accepted_export_fstypes();
     assert!(
-        identity.fstype.starts_with(expected_fs),
-        "the slot is on {} not {expected_fs}: {:?}",
-        identity.fstype,
-        identity
+        accepted.contains(&identity.fstype.as_str()),
+        "the slot is on {:?}, which is not one of {accepted:?}: {identity:?}",
+        identity.fstype
     );
-    let answered = core.status_store(deadline);
-    let store = core.store.display().to_string();
-    assert!(
-        answered.ends_with(&store) || store.ends_with(&answered),
-        "the answering daemon is not the one this harness started: {answered} vs {store}"
+    let answered = core
+        .status_store(deadline)
+        .unwrap_or_else(|e| panic!("cannot establish which store answered: {e}"));
+    assert_eq!(
+        answered,
+        core.owned_store(),
+        "the answering daemon is not the one this harness started: {answered}"
     );
 
     let in_slot = |deadline: Deadline, args: &[&str]| -> Output {
@@ -1965,26 +2272,29 @@ localhost:/cowfs-abc on /private/tmp/cowfs-synthetic-base/mnt (nfs, nodev, nosui
 localhost:/cowfs-def on /private/tmp/cowfs-synthetic-base/th/.treehouse/p/1/sample (nfs, nodev, nosuid, mounted by zeeshanhaque)
 localhost:/elsewhere on /Users/somebody/elsewhere (nfs, nodev, nosuid, mounted by zeeshanhaque)
 ";
-    match parse_mount_table(good, base) {
-        MountVerdict::Known {
-            under_base,
-            parsed,
-            unparsed,
-        } => {
-            assert_eq!(unparsed, 0, "every synthetic line should parse");
-            assert!(parsed >= 4, "parsed {parsed} lines");
-            assert_eq!(
-                under_base,
-                vec![base.join("mnt"), base.join("th/.treehouse/p/1/sample"),],
-                "only mount points under this root may be returned"
-            );
-            assert!(
-                !under_base.iter().any(|p| p.starts_with("/Users")),
-                "a foreign mount leaked into the scoped list"
-            );
-        }
-        other => panic!("a well formed table must be Known, got {other:?}"),
-    }
+    let good_verdict = parse_mount_table(good, base);
+    let MountVerdict::Known {
+        parsed, unparsed, ..
+    } = &good_verdict
+    else {
+        panic!("a well formed table must be Known, got {good_verdict:?}");
+    };
+    assert_eq!(*unparsed, 0, "every synthetic line should parse");
+    assert!(*parsed >= 4, "parsed {parsed} lines");
+    let scoped: Vec<PathBuf> = good_verdict
+        .under_base(base)
+        .iter()
+        .map(|e| e.point.clone())
+        .collect();
+    assert_eq!(
+        scoped,
+        vec![base.join("mnt"), base.join("th/.treehouse/p/1/sample"),],
+        "only mount points under this root may be returned"
+    );
+    assert!(
+        !scoped.iter().any(|p| p.starts_with("/Users")),
+        "a foreign mount leaked into the scoped list"
+    );
 
     // Empty is Unknown, not "nothing is mounted".
     assert!(
@@ -2001,16 +2311,14 @@ localhost:/elsewhere on /Users/somebody/elsewhere (nfs, nodev, nosuid, mounted b
     );
     // A sibling directory that merely shares a name prefix is not under this root. The prefix
     // carries its trailing separator, so `...-base-2` cannot pass as `...-base`.
-    match parse_mount_table(
-        "localhost:/x on /private/tmp/cowfs-synthetic-base-2/mnt (nfs, nosuid)\n",
+    let sibling = parse_mount_table(
+        "cowfs on /private/tmp/cowfs-synthetic-base-2/mnt type fuse (rw,relatime)\n",
         base,
-    ) {
-        MountVerdict::Known { under_base, .. } => assert!(
-            under_base.is_empty(),
-            "a sibling directory sharing a name prefix leaked in: {under_base:?}"
-        ),
-        other => panic!("expected Known with no scoped entries, got {other:?}"),
-    }
+    );
+    assert!(
+        sibling.under_base(base).is_empty(),
+        "a sibling directory sharing a name prefix leaked into the scoped entries"
+    );
     record(
         "mount-readback-control",
         &[("outcome", MEASURED.to_owned()), ("cases", "5".to_owned())],
@@ -2061,15 +2369,439 @@ fn the_acceptance_receipt_states_what_was_measured() {
             "COWFS_ACCEPTANCE_REQUIRED=1 was set, so a capability skip must have been a failure"
         );
     }
-    // The receipt must never claim a warm base was published while the chain is still broken.
-    let claimed_warm = records
+    // A published warm base must never be claimed while the chain is still broken. Both shapes are
+    // refused, and an unrecognised shape is refused rather than read as false: the previous
+    // comparison was against a JSON boolean only, so a row written as the string "true" passed it.
+    let claimed = records
         .iter()
-        .any(|r| r["warm_base_published"] == true || r["base_status_fresh"] == true);
+        .filter(|r| claims_published_warm_base(r))
+        .count();
+    assert_eq!(
+        claimed, 0,
+        "the receipt claims a published warm base in {claimed} row(s), which no gate at this \
+         base established"
+    );
+    // Every row is self-describing: an outcome, or an explicit statement that it is not a gate.
+    let undescribed: Vec<&str> = records
+        .iter()
+        .filter(|r| r["outcome"].as_str().is_none())
+        .filter_map(|r| r["test"].as_str())
+        .collect();
     assert!(
-        !claimed_warm,
-        "the receipt claims a published warm base, which no gate at this base established"
+        undescribed.is_empty(),
+        "receipt rows without an outcome, so counting outcomes undercounts rows: {undescribed:?}"
     );
     let _ = deadline;
+}
+
+/// Whether one receipt row claims a warm base was published and is fresh.
+///
+/// Strict on purpose. A JSON boolean `true` and the string `"true"` both count, because the
+/// writer has used both shapes and a guard that only understands one of them fails open on the
+/// other. Anything else, including a missing key, is not a claim.
+fn claims_published_warm_base(row: &serde_json::Value) -> bool {
+    const KEYS: [&str; 2] = ["warm_base_published", "base_status_fresh"];
+    KEYS.iter().any(|k| match row.get(*k) {
+        Some(serde_json::Value::Bool(true)) => true,
+        Some(serde_json::Value::String(s)) => s.trim() == "true",
+        _ => false,
+    })
+}
+
+/// Both platform grammars for the mount table, with no mount and no daemon involved.
+///
+/// The Linux line shape is here because the previous parser read its filesystem type as the
+/// literal word `type` and turned `ubuntu-latest` red. A parser that only knows one platform's
+/// grammar is a parser that will eventually certify the wrong filesystem.
+#[test]
+fn the_mount_grammar_of_both_platforms_is_decoded_exactly() {
+    let base = Path::new("/private/tmp/cowfs-grammar-base");
+    let point = base.join("th/.treehouse/p/1/sample");
+    let macos = "map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)\n\
+                 localhost:/cowfs-abc on /private/tmp/cowfs-grammar-base/mnt (nfs, nodev, nosuid, mounted by zeeshanhaque)\n\
+                 localhost:/cowfs-def on /private/tmp/cowfs-grammar-base/th/.treehouse/p/1/sample (nfs, nodev, nosuid, mounted by zeeshanhaque)\n";
+    let linux = "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n\
+                 cowfs on /private/tmp/cowfs-grammar-base/mnt type fuse (rw,nosuid,nodev,relatime)\n\
+                 cowfs on /private/tmp/cowfs-grammar-base/th/.treehouse/p/1/sample type fuse.cowfs (rw,nosuid,nodev,relatime)\n";
+
+    for (label, raw, want_slot, want_default) in [
+        ("macos", macos, "nfs", "nfs"),
+        ("linux", linux, "fuse.cowfs", "fuse"),
+    ] {
+        let verdict = parse_mount_table(raw, base);
+        let entries = verdict.under_base(base);
+        let slot = entries
+            .iter()
+            .find(|e| e.point == point)
+            .unwrap_or_else(|| panic!("{label}: the slot export is missing from the parsed table"));
+        assert_eq!(
+            slot.fstype, want_slot,
+            "{label}: the slot filesystem type must be read exactly"
+        );
+        assert_ne!(
+            slot.fstype, "type",
+            "{label}: 'type' is a keyword, never a filesystem type"
+        );
+        let default_mount = entries
+            .iter()
+            .find(|e| e.point == base.join("mnt"))
+            .unwrap_or_else(|| panic!("{label}: the default export is missing"));
+        assert_eq!(
+            default_mount.fstype, want_default,
+            "{label}: the default export filesystem type must be read exactly"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.point.starts_with("/System") || e.point == Path::new("/sys")),
+            "{label}: a foreign mount leaked into the scoped entries"
+        );
+    }
+
+    // Octal escapes, which mount uses for spaces and would otherwise split a field.
+    let escaped = parse_mount_table(
+        "cowfs on /private/tmp/cowfs-grammar-base/a\\040b type fuse (rw,relatime)\n",
+        base,
+    );
+    let entries = escaped.under_base(base);
+    assert_eq!(entries.len(), 1, "the escaped line must parse");
+    assert_eq!(
+        entries[0].point,
+        base.join("a b"),
+        "the escape must be decoded"
+    );
+    assert_eq!(entries[0].fstype, "fuse");
+
+    // Neither platform's grammar, or a missing table: Unknown, and no fallback that invents one.
+    for (label, raw) in [
+        ("unparsable", "garbage\nmore garbage\n"),
+        ("empty", ""),
+        (
+            "no fstype",
+            "src on /private/tmp/cowfs-grammar-base/x whatever\n",
+        ),
+        (
+            "empty fstype",
+            "src on /private/tmp/cowfs-grammar-base/x type (rw)\n",
+        ),
+    ] {
+        assert!(
+            matches!(parse_mount_table(raw, base), MountVerdict::Unknown(_)),
+            "{label}: must be Unknown, never a guessed filesystem type"
+        );
+    }
+
+    // The accepted list is exact names, and never contains the keyword.
+    let accepted = accepted_export_fstypes();
+    assert!(
+        !accepted.contains(&"type"),
+        "the accepted list must never contain the Linux grammar keyword"
+    );
+    assert!(
+        accepted.iter().all(|f| !f.contains("type")),
+        "accepted types are exact names, not prefixes: {accepted:?}"
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(accepted, &["nfs"], "macOS accepts the NFS loopback export");
+    } else {
+        assert!(
+            accepted.contains(&"fuse") && accepted.contains(&"fuse.cowfs"),
+            "Linux accepts the fuse exports: {accepted:?}"
+        );
+    }
+    record(
+        "mount-grammar-control",
+        &[
+            ("outcome", MEASURED.to_owned()),
+            ("cases", "16".to_owned()),
+            ("accepted", accepted.join(",")),
+        ],
+    );
+}
+
+/// Four child shapes against the bounded runner, with no mount and no daemon.
+///
+/// Each shape is a process this test starts, and each helper is a process this test starts, so the
+/// cleanup here is by owned pid and owned identity. No shared process is signalled.
+#[test]
+fn the_bounded_runner_finishes_inside_its_bound_for_every_child_shape() {
+    let deadline = Deadline::after(300);
+    let bound = Duration::from_secs(3);
+    let me = std::process::id();
+
+    // 1. Chatty: 4 MiB on stdout. Must not deadlock on a full pipe buffer.
+    let started = Instant::now();
+    let chatty = run_bounded(
+        deadline,
+        Path::new("/"),
+        "sh",
+        &[
+            "-c",
+            "i=0; while [ $i -lt 4096 ]; do printf '%1024s' '' ; i=$((i+1)); done",
+        ],
+        bound,
+    )
+    .unwrap_or_else(|e| panic!("chatty child must succeed: {e}"));
+    let chatty_elapsed = started.elapsed();
+    assert_eq!(code(&chatty), 0, "chatty child status");
+    assert!(
+        chatty.stdout.len() >= 4 * 1024 * 1024,
+        "chatty child stdout was {} bytes, expected at least 4 MiB",
+        chatty.stdout.len()
+    );
+    assert!(
+        chatty_elapsed < bound,
+        "chatty child took {chatty_elapsed:?} against a {bound:?} bound"
+    );
+
+    // 2. Empty output, exits at once.
+    let started = Instant::now();
+    let empty = run_bounded(deadline, Path::new("/"), "sh", &["-c", "exit 0"], bound)
+        .unwrap_or_else(|e| panic!("empty child must succeed: {e}"));
+    assert_eq!(code(&empty), 0, "empty child status");
+    assert!(empty.stdout.is_empty(), "empty child stdout");
+    assert!(started.elapsed() < bound, "empty child overran");
+
+    // 3. Hangs. Must be killed at its own bound, and only its own pid.
+    let started = Instant::now();
+    let hung = run_bounded_detailed(deadline, Path::new("/"), "sh", &["-c", "sleep 30"], bound);
+    let hung_elapsed = started.elapsed();
+    match &hung {
+        Err(RunFailure::ChildTimedOut { pid, bound_ms, .. }) => {
+            assert!(
+                *pid > 0,
+                "the classified timeout must name the pid it killed"
+            );
+            assert!(
+                *bound_ms >= bound.as_millis(),
+                "the reported bound {bound_ms}ms is shorter than the {bound:?} it enforced"
+            );
+            assert!(
+                !pid_is_15263(*pid),
+                "the harness must never signal the shared daemon"
+            );
+        }
+        other => panic!("a hung child must be a classified timeout, got {other:?}"),
+    }
+    assert!(
+        hung_elapsed >= bound,
+        "a hung child returned after {hung_elapsed:?}, before its {bound:?} bound"
+    );
+    assert!(
+        hung_elapsed < bound * 3,
+        "a hung child overran its bound by too much: {hung_elapsed:?}"
+    );
+
+    // 4. The child exits at once and a helper it started holds the pipe open. The child's own exit
+    //    status is real and must be reported, the run must be classified as an incomplete drain
+    //    rather than a success, and it must finish inside the bound.
+    let marker = evidence_dir().join("drain-helper.pid");
+    let started = Instant::now();
+    let grandchild = run_bounded_detailed(
+        deadline,
+        Path::new("/"),
+        "sh",
+        &[
+            "-c",
+            // A direct background command, not a subshell: `$!` is then the sleeper itself, so
+            // recording that pid is enough to clean it up. A subshell would leave the sleeper
+            // orphaned once its parent was gone.
+            &format!("sleep 20 & echo $! > {}; exit 0", marker.display()),
+        ],
+        bound,
+    );
+    let grandchild_elapsed = started.elapsed();
+    match &grandchild {
+        Err(f @ RunFailure::DrainTimedOut { .. }) => {
+            let why = f.why();
+            assert!(
+                why.contains("partial") && why.contains("NOT a completed command"),
+                "an incomplete drain must say so: {why}"
+            );
+            // The direct child's real status is preserved even though the command failed.
+            if let RunFailure::DrainTimedOut { status, .. } = f {
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "the direct child's exit status must be preserved"
+                );
+            }
+        }
+        other => {
+            panic!(
+                "a child whose helper holds the pipe must be an incomplete drain, but it \\
+                 returned after {grandchild_elapsed:?} against a {bound:?} bound: {other:?}"
+            )
+        }
+    }
+    assert!(
+        grandchild_elapsed < bound * 3,
+        "the drain overran its bound: {grandchild_elapsed:?}"
+    );
+
+    // Cleanup of the helper this test started, by the pid it recorded about itself and
+    // no other. Fail closed: if the pid cannot be read, or does not identify as the sleeper
+    // this test started, it is left alone and this test fails rather than reporting success
+    // over an orphan it did not clean up.
+    let mut helper_cleaned = false;
+    let recorded = std::fs::read_to_string(&marker).unwrap_or_default();
+    match recorded.trim().parse::<u32>() {
+        Ok(pid) => {
+            let live = read_identity(deadline, pid);
+            let is_our_sleeper = live
+                .as_ref()
+                .is_some_and(|l| l.argv.split_whitespace().collect::<Vec<_>>() == ["sleep", "20"]);
+            if is_our_sleeper {
+                let _ = run_bounded(
+                    deadline,
+                    Path::new("/"),
+                    "kill",
+                    &[&pid.to_string()],
+                    Duration::from_secs(10),
+                );
+                helper_cleaned = read_identity(deadline, pid).is_none();
+            } else {
+                eprintln!(
+                    "ACCEPTANCE QUARANTINE: helper pid {pid} did not identify as the sleeper this \
+                     test started ({live:?}); not signalling it"
+                );
+            }
+        }
+        Err(_) => eprintln!("ACCEPTANCE QUARANTINE: the helper recorded no usable pid"),
+    }
+    let _ = std::fs::remove_file(&marker);
+    assert!(
+        helper_cleaned,
+        "the helper this test started was not cleaned up, so it would be left running"
+    );
+
+    record(
+        "bounded-runner-control",
+        &[
+            ("outcome", MEASURED.to_owned()),
+            ("cases", "4".to_owned()),
+            ("bound_ms", bound.as_millis().to_string()),
+            ("harness_pid", me.to_string()),
+            ("chatty_stdout_bytes", chatty.stdout.len().to_string()),
+            (
+                "chatty_elapsed_under_bound",
+                chatty_elapsed.as_millis().to_string(),
+            ),
+            ("hung_elapsed_ms", hung_elapsed.as_millis().to_string()),
+            (
+                "grandchild_elapsed_ms",
+                grandchild_elapsed.as_millis().to_string(),
+            ),
+            ("helper_cleaned", helper_cleaned.to_string()),
+        ],
+    );
+}
+
+/// A recycled pid carrying the same argv must still be refused, because the start time differs.
+#[test]
+fn a_recycled_pid_with_the_same_argv_is_refused() {
+    let want = Registered {
+        pid: 4242,
+        exe: "cowfs-daemon".to_owned(),
+        store: "/private/store".to_owned(),
+        socket: "/private/run/c.sock".to_owned(),
+        start: "Sun Oct  4 19:45:49 2026".to_owned(),
+    };
+    let same_argv_other_start = Live {
+        start: "Sun Oct  4 21:02:03 2026".to_owned(),
+        argv: "/usr/local/bin/cowfs-daemon --store /private/store --socket /private/run/c.sock"
+            .to_owned(),
+    };
+    assert!(
+        !identity_matches(&want, &same_argv_other_start),
+        "identical argv with a different start time is a different process and must be refused"
+    );
+    let same_start_same_argv = Live {
+        start: want.start.clone(),
+        argv: "/usr/local/bin/cowfs-daemon --store /private/store --socket /private/run/c.sock"
+            .to_owned(),
+    };
+    assert!(
+        identity_matches(&want, &same_start_same_argv),
+        "the registered process must still match"
+    );
+    record(
+        "identity-control",
+        &[("outcome", MEASURED.to_owned()), ("cases", "2".to_owned())],
+    );
+}
+
+/// A receipt row claiming a published warm base must be refused in both shapes.
+#[test]
+fn a_claim_of_a_published_warm_base_is_refused_in_both_shapes() {
+    let bool_true: serde_json::Value =
+        serde_json::from_str(r#"{"test":"seed","warm_base_published":true}"#).expect("json");
+    let string_true: serde_json::Value =
+        serde_json::from_str(r#"{"test":"seed","warm_base_published":"true"}"#).expect("json");
+    let fresh_bool: serde_json::Value =
+        serde_json::from_str(r#"{"test":"seed","base_status_fresh":true}"#).expect("json");
+    let fresh_string: serde_json::Value =
+        serde_json::from_str(r#"{"test":"seed","base_status_fresh":"true"}"#).expect("json");
+    for (label, row) in [
+        ("boolean true", bool_true),
+        ("string true", string_true),
+        ("fresh boolean true", fresh_bool),
+        ("fresh string true", fresh_string),
+    ] {
+        assert!(
+            claims_published_warm_base(&row),
+            "{label}: a claim of a published warm base must be recognised, or the guard fails open"
+        );
+    }
+    // Shapes that are not a claim must not be read as one.
+    for raw in [
+        r#"{"test":"seed","warm_base_published":"false"}"#,
+        r#"{"test":"seed","warm_base_published":false}"#,
+        r#"{"test":"seed","warm_base_published":"TRUE"}"#,
+        r#"{"test":"seed","warm_base_published":1}"#,
+        r#"{"test":"seed"}"#,
+    ] {
+        let row: serde_json::Value = serde_json::from_str(raw).expect("json");
+        assert!(
+            !claims_published_warm_base(&row),
+            "{raw} is not a claim of a published warm base"
+        );
+    }
+    // And the typed writer really does emit a JSON boolean, so the boolean arm is reachable.
+    // The in-run typed writer, exercised so the serialisation the guards rely on is proven.
+    record_typed(
+        "typed-shape-probe",
+        &[
+            ("outcome", Field::Text(MEASURED)),
+            ("warm_base_published", Field::Flag(false)),
+            ("files", Field::Num(0)),
+        ],
+    );
+    let dir = evidence_dir().join("typed-shape.jsonl");
+    record_typed_to(
+        &dir,
+        "typed-shape",
+        &[
+            ("outcome", Field::Text(MEASURED)),
+            ("warm_base_published", Field::Flag(false)),
+            ("files", Field::Num(7)),
+        ],
+    );
+    let written = std::fs::read_to_string(&dir).unwrap_or_default();
+    let last = written.lines().last().unwrap_or_default();
+    assert!(
+        last.contains(r#""warm_base_published":false"#),
+        "a Flag must serialise as a JSON boolean, not a string: {last}"
+    );
+    assert!(
+        last.contains(r#""files":7"#),
+        "a Num must serialise as a JSON number: {last}"
+    );
+    let _ = std::fs::remove_file(&dir);
+    record(
+        "warm-claim-control",
+        &[("outcome", MEASURED.to_owned()), ("cases", "9".to_owned())],
+    );
 }
 
 /// The acceptance itself, `#[ignore]`d because it cannot pass until the chain is broken.
