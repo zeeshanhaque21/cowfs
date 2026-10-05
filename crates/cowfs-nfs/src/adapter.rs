@@ -414,6 +414,12 @@ impl Adapter {
     /// When both the change's own step and the barrier failed, the barrier's `NFS3ERR_IO` is the
     /// honest one, because the change's status would read as "that did not happen" and the caller
     /// would have no way to learn that it did.
+    ///
+    /// The barrier is unconditional, and deliberately so. It is never "nothing to do because this
+    /// RPC changed nothing": it commits whatever the snapshot already had queued, so a refusal that
+    /// arrives on top of earlier uncommitted writes still discharges them. Callers reach this only
+    /// once they have passed prevalidation and may already have mutated, so the cost is one metadata
+    /// sync on a refusal rather than a name left unbarriered.
     fn durable_or<T>(&self, dir: Ino, made: &NfsResult<T>) -> NfsResult<()> {
         match (self.durable(dir), made) {
             (Ok(()), Ok(_)) => Ok(()),
@@ -430,7 +436,9 @@ impl Adapter {
         let out = self
             .apply(i.ino, set_attr(s))
             .and_then(|a| self.fa(&a, Kind::Plain));
-        // A refused `setattr` changed nothing, so it owes no barrier; a failed barrier outranks it.
+        // Unconditional, and that is the point: the barrier commits whatever this snapshot already
+        // had queued, so a refused `setattr` still discharges earlier uncommitted writes. It costs
+        // one metadata sync on a refusal. A failed barrier outranks the refusal's own status.
         self.durable_or(i.ino, &out)?;
         out
     }
@@ -686,6 +694,10 @@ impl Adapter {
     }
 
     /// Removes every entry of `dir` if all of them are AppleDouble sidecars.
+    ///
+    /// Each removal is a real name change, so a failure part way through has already mutated and the
+    /// caller owes the barrier. That is why this returns a `Result` rather than acting through `?`
+    /// into an early return that would skip it.
     fn purge_sidecars(&self, dir: Ino) -> NfsResult<()> {
         let mut names = Vec::new();
         let mut cookie = 0;
@@ -702,6 +714,8 @@ impl Adapter {
                 _ => break,
             }
         }
+        // Stop at the first failure and report it. Some names may already be gone, which the
+        // caller's barrier covers; this function does not pretend the directory is untouched.
         for name in names {
             self.remove_one(dir, &name)?;
         }
@@ -716,16 +730,24 @@ impl Adapter {
             return Err(nfsstat3::NFS3ERR_NOTDIR);
         }
         let target = self.peek(d.ino, name).map_err(stat)?;
-        match self.vfs.rmdir(d.ino, name) {
+        // The purge removes real names, so every exit from here owes the barrier, including the ones
+        // that answer with an error. The arm therefore yields a value instead of propagating with
+        // `?`: a `?` after `purge_sidecars` returned before the barrier while sidecar names were
+        // already removed, which is the same defect the `create` arms had.
+        let made: NfsResult<()> = match self.vfs.rmdir(d.ino, name) {
             Err(Error::NotEmpty) if self.opts.appledouble == AppleDoubleMode::Hide => {
-                self.purge_sidecars(target.ino)?;
-                self.vfs.rmdir(d.ino, name).map_err(stat)?;
+                match self.purge_sidecars(target.ino) {
+                    Ok(()) => self.vfs.rmdir(d.ino, name).map_err(stat),
+                    Err(e) => Err(e),
+                }
             }
-            r => r.map_err(stat)?,
+            r => r.map_err(stat),
+        };
+        self.durable_or(d.ino, &made)?;
+        if made.is_ok() {
+            self.reap_if_last(target.ino);
         }
-        self.reap_if_last(target.ino);
-        self.durable(d.ino)?;
-        Ok(())
+        made
     }
 
     pub fn rename(

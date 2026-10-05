@@ -7,7 +7,7 @@
 //! barrier that fails is an error rather than a success.
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::*;
@@ -39,6 +39,13 @@ struct Watched {
     fail_mutation: AtomicBool,
     /// Fail `setattr`, which is the step after a name exists, without failing the create.
     fail_setattr: AtomicBool,
+    /// Fail `rmdir` from the Nth call on, so the Hide-mode purge has already removed sidecars.
+    /// `usize::MAX` never fires.
+    fail_rmdir_after: AtomicUsize,
+    /// Fail the Nth `unlink`, so a purge fails part way through.
+    fail_unlink_at: AtomicUsize,
+    unlinks: AtomicUsize,
+    rmdirs: AtomicUsize,
 }
 
 impl Watched {
@@ -50,6 +57,10 @@ impl Watched {
             fail_ns: AtomicBool::new(false),
             fail_mutation: AtomicBool::new(false),
             fail_setattr: AtomicBool::new(false),
+            fail_rmdir_after: AtomicUsize::new(usize::MAX),
+            fail_unlink_at: AtomicUsize::new(0),
+            unlinks: AtomicUsize::new(0),
+            rmdirs: AtomicUsize::new(0),
         })
     }
 
@@ -71,6 +82,12 @@ impl Watched {
         self.created.lock().unwrap().clone()
     }
 
+    /// How many `unlink`s reached the inner filesystem, so a test can prove a purge really removed
+    /// names before the failure it is testing.
+    fn unlinks(&self) -> usize {
+        self.unlinks.load(Ordering::Relaxed)
+    }
+
     /// Every barrier seen since the last `forget`.
     fn barriers(&self) -> Vec<Call> {
         self.calls()
@@ -88,8 +105,10 @@ impl Vfs for Watched {
         self.inner.getattr(i)
     }
     fn setattr(&self, i: u64, c: SetAttr) -> Result<Attr> {
+        // `PermissionDenied`, not `Io`: `nfsstat` maps it to `NFS3ERR_ACCES`, so a reply carrying it
+        // is distinguishable from the barrier's `NFS3ERR_IO` and the precedence is observable.
         if self.fail_setattr.load(Ordering::Relaxed) {
-            return Err(Error::Io("injected setattr fault".into()));
+            return Err(Error::PermissionDenied);
         }
         self.inner.setattr(i, c)
     }
@@ -121,9 +140,18 @@ impl Vfs for Watched {
             return Err(Error::PermissionDenied);
         }
         self.note(Call::Unlink);
+        let seen = self.unlinks.fetch_add(1, Ordering::Relaxed);
+        if seen + 1 == self.fail_unlink_at.load(Ordering::Relaxed) {
+            return Err(Error::PermissionDenied);
+        }
         self.inner.unlink(p, n)
     }
     fn rmdir(&self, p: u64, n: &[u8]) -> Result<()> {
+        // Counted so a test can fail the retry after `purge_sidecars` has already removed names.
+        let seen = self.rmdirs.fetch_add(1, Ordering::Relaxed);
+        if seen >= self.fail_rmdir_after.load(Ordering::Relaxed) {
+            return Err(Error::PermissionDenied);
+        }
         self.inner.rmdir(p, n)
     }
     fn rename(
@@ -193,6 +221,18 @@ impl Vfs for Watched {
 
 fn start(vfs: Arc<Watched>) -> (cowfs_nfs::Server, Nfs) {
     serve(vfs, translated())
+}
+
+/// Hide mode, where a directory's `._name` sidecars are real files and `rmdir` purges them.
+fn start_hidden(vfs: Arc<Watched>) -> (cowfs_nfs::Server, Nfs) {
+    let mut opts = cowfs_nfs::MountOptions {
+        appledouble: cowfs_nfs::AppleDoubleMode::Hide,
+        ..cowfs_nfs::MountOptions::default()
+    };
+    opts.check_peer_uid = false;
+    let server = cowfs_nfs::Server::start(vfs.clone(), &opts, None).unwrap();
+    let c = Nfs::connect(server.port(), server.export_name());
+    (server, c)
 }
 
 fn translated() -> cowfs_nfs::MountOptions {
@@ -398,10 +438,14 @@ fn a_failed_barrier_is_an_error_not_a_success() {
 /// `durable`, which the old head does: remove the barrier and this test fails.
 ///
 /// The three routes are the ones a caller can hit. The attribute step succeeds and the barrier
-/// succeeds: one barrier, the attributes reported. The attribute step fails: the barrier still
-/// runs, so the name it already created is not left queued and unacknowledged. The barrier fails:
-/// `NFS3ERR_IO` wins over the attribute error, because a status that reads as "that did not
-/// happen" would be a lie about a name that exists.
+/// succeeds: one barrier, the attributes reported. The attribute step fails and the barrier is
+/// healthy: the barrier still runs, and the caller's own status comes back, so a caller can tell an
+/// attribute problem from a durability one. Both fail: the barrier's `NFS3ERR_IO` wins, because a
+/// status reading as "that did not happen" would be a lie about a name that exists.
+///
+/// The attribute fault is `PermissionDenied` and the barrier fault is `Io` on purpose.
+/// `nfsstat` maps those to `NFS3ERR_ACCES` and `NFS3ERR_IO`, so the reply says which failure it is.
+/// With both mapped to `IO` the precedence assertion below would pass whichever order the code used.
 #[test]
 fn a_created_name_is_barriered_even_when_the_attribute_step_fails() {
     let vfs = Watched::new();
@@ -418,7 +462,8 @@ fn a_created_name_is_barriered_even_when_the_attribute_step_fails() {
         "a successful create barriers exactly once"
     );
 
-    // The attribute step fails after the name exists. The barrier is still owed.
+    // The attribute step fails after the name exists, and the barrier is healthy. The barrier is
+    // still owed, and the caller's own status comes back so the two failures stay distinguishable.
     vfs.forget();
     vfs.fail_setattr.store(true, Ordering::Relaxed);
     let st = c.create(&root, "attrfail", 1, sattr_mtime(7, 0), [0; 8]).0;
@@ -426,10 +471,6 @@ fn a_created_name_is_barriered_even_when_the_attribute_step_fails() {
     assert_eq!(
         vfs.created(),
         vec!["ok".to_string(), "attrfail".to_string()]
-    );
-    assert_eq!(
-        st, IO,
-        "the caller is told the attribute step failed, not that the create did not happen"
     );
     assert_eq!(
         vfs.barriers(),
@@ -440,8 +481,14 @@ fn a_created_name_is_barriered_even_when_the_attribute_step_fails() {
         c.lookup(&root, "attrfail").0 == OK,
         "the name the server created is real, which is why the barrier was owed"
     );
+    assert_eq!(
+        st, ACCES,
+        "with a healthy barrier the caller's own status must survive, or it cannot tell an \
+         attribute problem from a durability one"
+    );
 
-    // Both fail at once: the barrier's IO is the honest status.
+    // Both fail at once. The barrier's IO is the honest status, and ACCES would mean the reply hid
+    // the fact that durability could not be promised.
     vfs.forget();
     vfs.fail_setattr.store(true, Ordering::Relaxed);
     vfs.fail_ns.store(true, Ordering::Relaxed);
@@ -452,7 +499,100 @@ fn a_created_name_is_barriered_even_when_the_attribute_step_fails() {
     assert_eq!(vfs.barriers(), vec![Call::SyncNs(c.attrs(&root).fileid)]);
     assert_eq!(
         st, IO,
-        "when the barrier fails the status must not read as if the create had not happened"
+        "the barrier's status must outrank the attribute error, and the two are distinguishable"
+    );
+}
+
+/// The barrier is unconditional, so a refused `setattr` pays one.
+///
+/// That is the honest cost and it is deliberate: the barrier commits whatever the snapshot already
+/// had queued, so a refusal arriving on top of earlier uncommitted writes still discharges them.
+/// Asserted here because the code and the documentation once disagreed about it.
+#[test]
+fn a_refused_setattr_still_barriers_what_was_already_queued() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start(vfs.clone());
+    let root = c.root.clone();
+    let f = c.create_file(&root, "f");
+    vfs.forget();
+
+    vfs.fail_setattr.store(true, Ordering::Relaxed);
+    let st = c.setattr(&f, sattr_mtime(7, 0)).0;
+    vfs.fail_setattr.store(false, Ordering::Relaxed);
+
+    assert_eq!(st, ACCES, "the refusal's own status reaches the caller");
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&f).fileid)],
+        "the barrier runs on a refusal too, so a queued rename underneath it is not left behind"
+    );
+}
+
+/// `rmdir` in Hide mode purges sidecar names, which are real name changes.
+///
+/// If the retry then fails, or the purge itself fails part way through, the names that were already
+/// removed still owe the barrier. This is the same shape the `create` arms had, and the same shape
+/// the fix exists to eliminate.
+#[test]
+fn an_rmdir_that_purged_sidecars_is_barriered_even_when_it_fails() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start_hidden(vfs.clone());
+    let root = c.root.clone();
+    let d = c.mkdir(&root, "d").1.expect("mkdir");
+
+    // Two sidecars and nothing else, so the purge is allowed to run and then the retry fails.
+    for n in ["._a", "._b"] {
+        let f = c.create_file(&d, n);
+        c.write(&f, 0, b"sidecar", 2);
+    }
+    vfs.forget();
+
+    // The first `rmdir` returns NotEmpty, the purge removes both sidecars, and the retry fails.
+    vfs.fail_rmdir_after.store(1, Ordering::Relaxed);
+    let st = c.rmdir(&root, "d");
+    vfs.fail_rmdir_after.store(usize::MAX, Ordering::Relaxed);
+
+    assert_eq!(st, ACCES, "the retry's own status reaches the caller");
+    assert_eq!(
+        vfs.unlinks(),
+        2,
+        "the purge really removed both sidecar names before the retry failed"
+    );
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&root).fileid)],
+        "removed sidecar names still owe the barrier when the RPC answers with an error"
+    );
+}
+
+/// The same route where the purge itself fails part way through: one sidecar is gone and the second
+/// removal is refused. The one that was removed must not be left queued.
+#[test]
+fn a_purge_that_fails_midway_still_barriers() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start_hidden(vfs.clone());
+    let root = c.root.clone();
+    let d = c.mkdir(&root, "d").1.expect("mkdir");
+    for n in ["._a", "._b"] {
+        let f = c.create_file(&d, n);
+        c.write(&f, 0, b"sidecar", 2);
+    }
+    vfs.forget();
+
+    // Fail the second unlink, so the first has already happened.
+    vfs.fail_unlink_at.store(2, Ordering::Relaxed);
+    let st = c.rmdir(&root, "d");
+    vfs.fail_unlink_at.store(0, Ordering::Relaxed);
+
+    assert_eq!(
+        st, ACCES,
+        "the refused removal's own status reaches the caller"
+    );
+    assert_eq!(vfs.unlinks(), 2, "one sidecar went, the second was refused");
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&root).fileid)],
+        "a half-finished purge owes the barrier for what it already removed"
     );
 }
 
