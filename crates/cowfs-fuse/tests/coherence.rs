@@ -22,7 +22,11 @@
 //!    while nothing is writing is corruption no interleaving allows, so this is the assertion that
 //!    a concurrent tear rate alone cannot stand in for.
 //!
-//! Run: `cargo test -p cowfs-fuse -j4 --test coherence -- --ignored --nocapture --test-threads=1`
+//! Run: `cargo test -p cowfs-fuse -j4 --test coherence -- --nocapture --test-threads=1`
+//!
+//! No `--ignored`: none of these tests is `#[ignore]`d, and adding that flag filters all four out,
+//! so it prints `running 0 tests` and still exits 0. Assert `running 4 tests` before believing a
+//! green result from this target.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -53,7 +57,10 @@ const CAP: Duration = Duration::from_secs(20);
 /// reaches.
 const FLUSH_BYTES: usize = PG as usize;
 /// Every writer's value for round `i` on thread `t`. The three ranges are disjoint and never
-/// include `PREFILL`, so a block still holding the pre-fill names a lost write.
+/// include `PREFILL`, so a block that received no write at all and still reads `PREFILL` is caught.
+/// This detects a never-written block only. It does not detect a lost write that left an older
+/// acknowledged value behind: the at-rest oracle below is membership in the acknowledged set, not
+/// last-write-wins, so it is a safety property and not a durability one.
 const PREFILL: u8 = 1;
 
 fn fill(t: usize, i: usize) -> u8 {
