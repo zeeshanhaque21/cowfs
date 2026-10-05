@@ -290,6 +290,10 @@ fn a_command_that_outlives_its_budget_is_reported_not_awaited() {
 }
 
 /// A command that finishes inside its budget is reported finished, so nothing signals it later.
+///
+/// macOS only: it runs the real `/sbin/mount`, which does not exist on Linux, and the reader
+/// parses the macOS table format. The synthetic cases above pin the parser on every runner.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_command_that_finishes_inside_its_budget_is_reported_finished() {
     let b = spawn_bounded(
@@ -305,6 +309,10 @@ fn a_command_that_finishes_inside_its_budget_is_reported_finished() {
 
 /// Reading the real table here is safe: it runs, parses, and classifies. What it must never do
 /// is delete, and this test does not.
+///
+/// macOS only, for the same reason as the test above: `/sbin/mount` and the table format are both
+/// macOS-shaped, and Linux `mount` prints a `type <fstype>` field this reader does not read.
+#[cfg(target_os = "macos")]
 #[test]
 fn the_real_table_is_readable_and_classifies_a_private_path() {
     let dir = std::env::temp_dir().join("d90-guard-table");

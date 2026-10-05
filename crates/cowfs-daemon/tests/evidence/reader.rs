@@ -93,11 +93,19 @@ pub fn sha256_of_file(path: &Path) -> Option<String> {
     sha256_of(&std::fs::read_to_string(path).ok()?)
 }
 
-/// sha256 via the system `shasum`, which is present on macOS and avoids a dependency for a test.
+/// sha256 via whichever hashing tool the host has, which avoids a dependency for a test.
+///
+/// `shasum` is macOS and Perl; `sha256sum` is coreutils and is what a Linux runner has. Hardcoding
+/// either absolute path means the receipts silently degrade to `"unknown"` on the other platform.
 pub fn sha256_of(text: &str) -> Option<String> {
     use std::io::Write as _;
-    let mut child = Command::new("/usr/bin/shasum")
-        .args(["-a", "256"])
+    let (program, args): (&str, &[&str]) = if Path::new("/usr/bin/shasum").exists() {
+        ("/usr/bin/shasum", &["-a", "256"])
+    } else {
+        ("sha256sum", &["-"])
+    };
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
