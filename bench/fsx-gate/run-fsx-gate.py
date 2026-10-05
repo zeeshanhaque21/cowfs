@@ -186,9 +186,9 @@ def fsx_identity(binary):
         proc = subprocess.run([binary], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         return {"error": str(e)}
+    # A flag line is a tab, the flag, then a colon or a space: "-H: ..." and "-u Do not ...".
     flags = sorted(set(
-        tok.lstrip("-")
-        for tok in re.findall(r"(?m)^\t-([A-Za-z0-9_]+):", proc.stdout)
+        tok for tok in re.findall(r"(?m)^\t-([A-Za-z0-9_]+)[: ]", proc.stdout)
     ))
     return {"path": binary, "sha256": digest, "size": size, "usage_exit": proc.returncode, "flags": flags}
 
@@ -541,13 +541,16 @@ def verdict(cases, compares, restarts, required_ops, probe_rows):
                 continue
             entry = "%s: cowfs never performed %s" % (mode_name, op)
             capability = OP_CAPABILITY.get(op)
-            if capability and (op in unsupported_ops or
-                               any(capability in d for d in disabled_modes)):
+            # Quote the message that names this operation's capability. Every punch_hole message
+            # also contains KEEP_SIZE, so matching on the first disabled mode would quote the
+            # wrong one.
+            named = [d for d in disabled_modes if capability and capability in d]
+            if capability and (op in unsupported_ops or named):
                 # The filesystem has no such capability. Recorded as a gap with its evidence,
                 # not counted as work done and not counted as a pass on its own.
                 gaps.append("%s, unsupported on this filesystem%s"
-                            % (entry, " (fsx reported: %s)" % disabled_modes[0]
-                               if any(capability in d for d in disabled_modes) else ""))
+                            % (entry, " (fsx reported: %s)" % named[0] if named else
+                               " (the runner's own %s probe reported it unsupported)" % op))
             else:
                 missing.append(entry)
     failures.extend(missing)

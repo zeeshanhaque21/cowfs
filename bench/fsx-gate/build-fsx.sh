@@ -80,7 +80,8 @@ gate, work, commit, ref, cc_id, cc_sha = sys.argv[1:7]
 tool = json.load(open(gate))["tool"]
 binary = os.path.join(work, "build", "fsx")
 usage = open(os.path.join(work, "build", "usage.txt")).read()
-flags = sorted(set(re.findall(r"(?m)^\t-([A-Za-z0-9_]+):", usage)))
+# A flag line is a tab, the flag, then a colon or a space: -H: ... but also -u Do not use ...
+flags = sorted(set(re.findall(r"(?m)^\t-([A-Za-z0-9_]+)[: ]", usage)))
 identity = {
     "tool": "fsx",
     "upstream": tool["upstream"],

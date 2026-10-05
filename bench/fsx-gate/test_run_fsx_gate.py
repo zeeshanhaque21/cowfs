@@ -288,6 +288,20 @@ class Verdict(unittest.TestCase):
         self.assertIn("never performed punch_hole", got["capability_gaps"][0])
         self.assertIn("fsx reported", got["capability_gaps"][0])
 
+    def test_the_gap_names_the_message_for_that_operation_not_the_first_one(self):
+        # Every punch_hole disable line also contains KEEP_SIZE, so quoting the first disabled
+        # mode would blame the wrong capability.
+        cases = [case(op_counts={"write": 4, "read": 3},
+                      fsx_reported_unsupported=[
+                          "fallocate mode FALLOC_FL_KEEP_SIZE: filesystem does not support "
+                          "fallocate mode FALLOC_FL_KEEP_SIZE, disabling",
+                          "fallocate mode FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE: filesystem "
+                          "does not support fallocate mode FALLOC_FL_PUNCH_HOLE | "
+                          "FALLOC_FL_KEEP_SIZE, disabling"])]
+        got = self.verdict(cases=cases, required={"mixed": ["punch_hole"]})
+        self.assertEqual(len(got["capability_gaps"]), 1)
+        self.assertIn("FALLOC_FL_PUNCH_HOLE", got["capability_gaps"][0])
+
     def test_the_probe_alone_can_explain_a_missing_hole_op(self):
         probe = [{"arm": "cowfs", "op": "punch_hole", "ok": False, "detail": "EOPNOTSUPP"}]
         got = self.verdict(probe=probe, required={"mixed": ["punch_hole"]})
@@ -338,11 +352,13 @@ class FsxIdentity(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="fsx-gate-fakefsx-") as tmp:
             fake = os.path.join(tmp, "fsx")
             with open(fake, "w") as f:
-                f.write("#!/bin/sh\nprintf 'usage: fsx [-ad]\\n\\t-H: no punch hole\\n\\t-z: no zero range\\n'\nexit 90\n")
+                f.write("#!/bin/sh\nprintf 'usage: fsx [-ad]\\n\\t-H: no punch hole\\n"
+                        "\\t-u Do not use unshare range\\n'\nexit 90\n")
             os.chmod(fake, 0o755)
             identity = gate.fsx_identity(fake)
         self.assertEqual(identity["usage_exit"], 90)
-        self.assertEqual(identity["flags"], ["H", "z"])
+        # -u has no colon after it, and it is still a flag the binary compiled in.
+        self.assertEqual(identity["flags"], ["H", "u"])
         self.assertEqual(len(identity["sha256"]), 64)
 
 
