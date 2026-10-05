@@ -44,6 +44,28 @@ CASE_TIMEOUT = 600
 
 PASS, FAIL, UNMEASURABLE, INVALID = "PASS", "FAIL", "UNMEASURABLE", "INVALID"
 EXIT_STATUS = {PASS: 0, FAIL: 1, UNMEASURABLE: 2, INVALID: 3}
+# Why a verdict is what it is, kept apart from the wording of the message.
+#   INTEGRITY   the run's own records or provenance cannot be trusted: INVALID, exit 3
+#   CAPABILITY  the tool, a prerequisite or a capability is absent: UNMEASURABLE, exit 2
+#   COVERAGE    a limit on what the transcript can conclude, disclosed, not an exit on its own
+#   DIVERGENCE  an established assertion passes on one arm and fails on the other: FAIL, exit 1
+INTEGRITY, CAPABILITY, COVERAGE, DIVERGENCE = "INTEGRITY", "CAPABILITY", "COVERAGE", "DIVERGENCE"
+
+
+def reason(kind: str, message: str) -> dict:
+    return {"kind": kind, "message": message}
+
+
+def state_from(reasons: list[dict]) -> str:
+    """Integrity outranks everything, then a real divergence, then an absent capability."""
+    kinds = {r["kind"] for r in reasons}
+    if INTEGRITY in kinds:
+        return INVALID
+    if DIVERGENCE in kinds:
+        return FAIL
+    if CAPABILITY in kinds:
+        return UNMEASURABLE
+    return PASS
 MOUNTED, NOT_MOUNTED, UNKNOWN = "MOUNTED", "NOT_MOUNTED", "UNKNOWN"
 # How a pair of arms was matched. Only ESTABLISHED can carry a defect; the rest are reported as
 # scope this transcript cannot adjudicate.
@@ -167,6 +189,45 @@ def mount_state(path: Path, timeout: int = 15) -> tuple[str, str]:
         if mountpoint == target:
             return MOUNTED, f"{source} on {mountpoint} ({options})"
     return NOT_MOUNTED, f"{target} is absent from a complete mount table of {len(table.splitlines())} lines"
+
+
+def validate_runtime_identity(identity: dict | None,
+                              expected_cowfs_mount: str | None = None) -> list[dict]:
+    """Refuse to score unless both arms are on a filesystem we actually identified.
+
+    An absent device, an absent type, a stat that failed or a missing mount point is not a
+    measurement, and two arms that report the same device are one arm. Every one of those is an
+    integrity failure, so this runs before any child process exists.
+    """
+    problems: list[dict] = []
+    if not identity:
+        return [reason(INTEGRITY, "no runtime identity was supplied, so no arm can be placed")]
+    for arm in ("native", "cowfs"):
+        record = identity.get(arm) or {}
+        where = record.get("path") or arm
+        if record.get("problem"):
+            problems.append(reason(INTEGRITY, f"{arm} arm identity is unusable: {record['problem']}"))
+        device = record.get("st_dev")
+        if device is None:
+            problems.append(reason(INTEGRITY, f"{arm} arm reported no st_dev for {where}"))
+        elif not isinstance(device, int) or isinstance(device, bool) or device <= 0:
+            problems.append(reason(INTEGRITY, f"{arm} arm st_dev {device!r} is not a device number"))
+        fstype = record.get("fstype")
+        if not fstype or not isinstance(fstype, str):
+            problems.append(reason(INTEGRITY, f"{arm} arm reported no filesystem type for {where}"))
+        if not record.get("mountpoint"):
+            problems.append(reason(INTEGRITY, f"{arm} arm has no mount point in the mount table"))
+    if expected_cowfs_mount:
+        cowfs_mount = (identity.get("cowfs") or {}).get("mountpoint")
+        if cowfs_mount and cowfs_mount != str(expected_cowfs_mount):
+            problems.append(reason(INTEGRITY, f"cowfs arm is mounted at {cowfs_mount}, not at the "
+                                              f"path this run asked the daemon for, "
+                                              f"{expected_cowfs_mount}"))
+    native, cowfs = identity.get("native") or {}, identity.get("cowfs") or {}
+    if isinstance(native.get("st_dev"), int) and native.get("st_dev") == cowfs.get("st_dev"):
+        problems.append(reason(INTEGRITY, f"both arms report st_dev {native['st_dev']}, so they are "
+                                          "not two filesystems"))
+    return problems
 
 
 def fs_identity(path: Path, timeout: int = 15) -> dict:
@@ -859,11 +920,13 @@ def arm_totals(records: list[dict]) -> dict:
     return totals
 
 
-def verdict(run_dir: Path, tool: dict | None = None, tests_root: Path | None = None) -> dict:
+def verdict(run_dir: Path, tool: dict | None = None, tests_root: Path | None = None,
+            identity: dict | None = None) -> dict:
     """Re-read the run's own records, re-parse every raw stream, and refuse anything malformed."""
     jsonl = Path(run_dir) / "cases.jsonl"
     if not jsonl.is_file():
-        return {"state": INVALID, "reasons": [f"{jsonl} does not exist"]}
+        return {"state": INVALID, "exit_status": EXIT_STATUS[INVALID],
+                "reasons": [reason(INTEGRITY, f"{jsonl} does not exist")]}
     arms: dict = {}
     problems: list[str] = []
     parsed: list[dict] = []
@@ -905,50 +968,48 @@ def verdict(run_dir: Path, tool: dict | None = None, tests_root: Path | None = N
             elif "script_text" in arm_records[test]:
                 profiles[test] = script_profile(arm_records[test]["script_text"])
     diff = compare(arms, profiles)
-    summary_path = Path(run_dir) / "summary.json"
-    summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
     executed = {arm: t["executed"] for arm, t in totals.items()}
-    reasons, unmeasurable, failed = [], [], []
+    reasons: list[dict] = []
+    # A record set that cannot be trusted is INVALID, not unmeasurable: the difference matters to
+    # whoever reads the exit status, so the two are never merged into one bucket.
+    reasons += [reason(INTEGRITY, message) for message in problems]
+    reasons += validate_runtime_identity(identity)
     if not arms or set(arms) != {"native", "cowfs"}:
-        unmeasurable.append(f"the run has arms {sorted(arms)}, not a matched native and cowfs pair")
+        reasons.append(reason(CAPABILITY,
+                              f"the run has arms {sorted(arms)}, not a matched native and cowfs pair"))
     if any(count == 0 for count in executed.values()):
-        unmeasurable.append(f"an arm executed no assertion: {executed}")
-    if any(t["timeouts"] or t["nonzero_rc"] or t["bail_out"] for t in totals.values()):
-        unmeasurable.append("a case timed out, exited non-zero or bailed out")
-    if any(record.get("_guard_problems") for records in arms.values() for record in records.values()):
-        unmeasurable.append(f"{len(problems)} guard problem(s) in the run's own records")
-    native_fs = (summary.get("host") or {}).get("native_fs") or {}
-    cowfs_fs = (summary.get("host") or {}).get("cowfs_fs") or {}
-    if native_fs.get("st_dev") is not None and cowfs_fs.get("st_dev") is not None and \
-            native_fs["st_dev"] == cowfs_fs["st_dev"]:
-        unmeasurable.append("both arms report the same st_dev, so the arms are not separated")
+        reasons.append(reason(CAPABILITY, f"an arm executed no assertion: {executed}"))
     if diff["unpairable"]:
-        unmeasurable.append(f"{len(diff['unpairable'])} assertion(s) cannot be paired across the arms")
+        reasons.append(reason(COVERAGE, f"{len(diff['unpairable'])} assertion(s) cannot be paired "
+                                        "across the arms"))
     established = diff["established_regressions"]
     outside_gate = [r for r in established if not r["root_required"]]
     textless_unpairable = sum(1 for u in diff["unpairable"] if "no operation text" in u["reason"])
     if textless_unpairable:
-        unmeasurable.append(
-            f"identity is unrecoverable for {textless_unpairable} assertion(s) with no operation "
-            "text in a case whose script cannot prove a slot order: the suite prints no operation "
-            "text on a pass, so those pairs are unknown rather than matched")
+        reasons.append(reason(COVERAGE,
+                             f"identity is unrecoverable for {textless_unpairable} assertion(s) with "
+                             "no operation text in a case whose script cannot prove a slot order: the "
+                             "suite prints no operation text on a pass, so those pairs are unknown "
+                             "rather than matched"))
     if diff["candidate_regressions"]:
-        unmeasurable.append(f"{len(diff['candidate_regressions'])} paired assertion(s) are candidates, "
-                            "not established")
+        reasons.append(reason(COVERAGE, f"{len(diff['candidate_regressions'])} paired assertion(s) "
+                                        "are candidates, not established"))
     if outside_gate:
-        failed.append(f"{len(outside_gate)} established assertion(s) pass natively and fail on the mount")
-    reasons = unmeasurable + failed
-    # An established divergence is a result; an unpairable scope is a limit on what can be
-    # concluded. The result stands and the limit is reported with it.
-    state = FAIL if failed else (UNMEASURABLE if unmeasurable else PASS)
+        reasons.append(reason(DIVERGENCE, f"{len(outside_gate)} established assertion(s) pass "
+                                          "natively and fail on the mount"))
+    # An established divergence is a result and an unpairable scope is a limit on what can be
+    # concluded, so coverage never changes the exit on its own.
+    state = state_from(reasons)
     return {
         "state": state, "exit_status": EXIT_STATUS[state], "reasons": reasons,
         "totals": totals, "comparison": diff, "guard_problems": problems,
         "record_format": "legacy: parsed records only, no raw streams on disk" if legacy
                          else "raw-attested: every case keeps its stream and its hash",
         "historical_ordinal_diagnostic": ordinal_diagnostic(arms, profiles),
+        "runtime_identity": identity,
         "provenance": {"jsonl": str(jsonl), "jsonl_sha256": sha256(jsonl),
-                       "summary_sha256": sha256(summary_path) if summary_path.is_file() else None},
+                       "identity_receipt": str(Path(run_dir) / "identity.json")
+                       if (Path(run_dir) / "identity.json").is_file() else None},
     }
 
 
@@ -1033,16 +1094,28 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         "bench" / "out" / "ready-g3" / "tool" / "pjdfstest"
     if (src / "tests").is_dir():
         tool, tests_root = verify_tool_source(src), src / "tests"
-    report = verdict(run_dir, tool, tests_root)
+    # The identity comes from the run's own receipt, written while its mount was up. A run without
+    # one cannot be placed on a filesystem, so it is INVALID rather than quietly unpairable.
+    receipt = run_dir / "identity.json"
+    identity = json.loads(receipt.read_text()).get("runtime_identity") if receipt.is_file() else None
+    report = verdict(run_dir, tool, tests_root, identity)
+    # A run directory this harness never created has nowhere to write its receipt, so the refusal
+    # is printed and the exit status is the answer.
+    if not run_dir.is_dir():
+        for item in report["reasons"]:
+            log(f"  - [{item['kind']}] {item['message']}")
+        log(f"state {report['state']} exit {report['exit_status']}")
+        return report["exit_status"]
     out = run_dir / "reconciliation.json"
     out.write_text(json.dumps(report, indent=2, sort_keys=True, default=str))
     log(f"state {report['state']} exit {report['exit_status']}")
-    for reason in report["reasons"]:
-        log(f"  - {reason}")
-    diff = report["comparison"]
-    log(f"established regressions {len(diff['established_regressions'])}, "
-        f"candidates {len(diff['candidate_regressions'])}, unpairable {len(diff['unpairable'])}, "
-        f"looser {len(diff['looser_not_a_pass'])}")
+    for item in report["reasons"]:
+        log(f"  - [{item['kind']}] {item['message']}")
+    diff = report.get("comparison")
+    if diff:
+        log(f"established regressions {len(diff['established_regressions'])}, "
+            f"candidates {len(diff['candidate_regressions'])}, unpairable {len(diff['unpairable'])}, "
+            f"looser {len(diff['looser_not_a_pass'])}")
     log(f"wrote {out}")
     return report["exit_status"]
 
@@ -1109,12 +1182,27 @@ def main() -> int:
         # has nothing to compare and silently proves nothing.
         native_root.mkdir(parents=True, exist_ok=True)
         native_fs, cowfs_fs = fs_identity(native_root), fs_identity(cowfs_root)
+        arm_fs = {"native": native_fs, "cowfs": cowfs_fs}
         log(f"native arm on {native_fs['fstype']} {native_fs['mountpoint']} dev={native_fs['st_dev']}")
         log(f"cowfs arm on {cowfs_fs['fstype']} {cowfs_fs['mountpoint']} dev={cowfs_fs['st_dev']}")
-        if native_fs["st_dev"] is not None and native_fs["st_dev"] == cowfs_fs["st_dev"]:
-            log("both arms are on one filesystem: refusing to score")
+        # Fail closed before a single case runs: an arm we could not place, or two arms on one
+        # device, is not a measurement. The receipt is written here, while the mount is up, so the
+        # identity survives teardown.
+        identity_problems = validate_runtime_identity(arm_fs, expected_cowfs_mount=mount)
+        (run_dir / "identity.json").write_text(json.dumps({
+            "runtime_identity": arm_fs,
+            "validated": not identity_problems,
+            "problems": identity_problems,
+            "mount_table_line": identity["mount_table_line"],
+            "daemon": {k: identity[k] for k in ("pid", "argv", "registered_at", "store", "socket")},
+            "cowfs_build": cowfs_build,
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        }, indent=2, sort_keys=True, default=str))
+        if identity_problems:
+            for problem in identity_problems:
+                log(f"runtime identity: {problem['message']}")
+            log(f"refusing to score: no case ran. receipt {run_dir / 'identity.json'}")
             return EXIT_STATUS[INVALID]
-        arm_fs = {"native_fs": native_fs, "cowfs_fs": cowfs_fs}
         log("native arm")
         run_arm(registry, "native", tests, tests_root, native_root, run_dir / "raw", jsonl,
                 args.case_timeout)
@@ -1134,13 +1222,13 @@ def main() -> int:
                 if sock.parent.is_dir() and not any(sock.parent.iterdir()):
                     sock.parent.rmdir()
 
-    summary = verdict(run_dir, verify_tool_source(src), tests_root)
+    summary = verdict(run_dir, verify_tool_source(src), tests_root, arm_fs or None)
     summary["host"] = {
         "uname": subprocess.run(["uname", "-srm"], capture_output=True, text=True,
                                 check=False).stdout.strip(),
         # The identity each arm was measured on, read while the mount was up. Reading it again
         # after teardown would report a filesystem that is no longer there.
-        **arm_fs,
+        "native_fs": arm_fs.get("native"), "cowfs_fs": arm_fs.get("cowfs"),
         "mount_table_line": identity["mount_table_line"] if identity else None,
         "daemon": {k: identity[k] for k in ("pid", "argv", "registered_at", "store", "socket")}
         if identity else None,
@@ -1149,8 +1237,9 @@ def main() -> int:
     summary["tool"] = tool
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True, default=str))
     log(f"state {summary['state']} exit {summary['exit_status']}")
-    for reason in summary["reasons"]:
-        log(f"  - {reason}")
+    for item in summary["reasons"]:
+        log(f"  - [{item['kind']}] {item['message']}")
+    log(f"identity receipt {run_dir / 'identity.json'}")
     log(f"evidence {run_dir}")
     return summary["exit_status"]
 

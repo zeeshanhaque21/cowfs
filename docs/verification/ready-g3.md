@@ -12,7 +12,8 @@ derivation is re-runnable.
 | record set | what it is | what it can support |
 | --- | --- | --- |
 | historical | `bench/out/ready-g3/run/20261005T004337Z`, the author's full 238-case run at head `025bde2`, 476 records, `cases.jsonl` sha256 `bb55fe4912a36302980c9a1b0f8214a44f2af83afb4cfa3f60b96f36db6a8259` | an ordinal-position differential, and 77 script-proven assertion pairs |
-| repaired small run | `bench/out/ready-g3/run/20261005T022515Z`, 5 cases per arm at the repaired head, raw streams and hashes kept, `cases.jsonl` sha256 `1d64dabcca863b16162c94fc15ae52d4c4d4bfe4e71674a6fae070225b7a90ad` | a complete matched verdict with raw evidence for every case |
+| receipted small run | `bench/out/ready-g3/run/20261005T025742Z`, 5 cases per arm at this head, raw streams and hashes kept, `identity.json` written before teardown, `cases.jsonl` sha256 `eb2ff1245baa4aa306b2a6458cdde6e32abced1120987283898d5c03ff51ecdc` | a complete matched verdict with a live identity receipt and raw evidence for every case |
+| superseded small runs | `20261005T022439Z` and `20261005T022515Z`, raw records preserved untouched | nothing about the filesystem: both recorded `cowfs_fs` as unusable, with `stat failed`, so a machine verdict on either is INVALID |
 
 The historical records are preserved byte for byte.
 Nothing in them was rewritten, and `reconciliation.json` sits beside them as the derived artifact.
@@ -181,18 +182,24 @@ its raw stream and its hash.
 | Established regressions | 25, all in `mkfifo/00.t` (22) and `open/17.t` (3) |
 | Ordinal differential for the same five cases | 27, of which 22 structurally different |
 | Unpairable | 26, of which 24 assertions with no operation text |
-| Arm separation | native `apfs` at `/`, `st_dev` 16777234; cowfs `nfs` at the mount, `st_dev` 436209625 |
+| Arm separation | from `identity.json`, written while the mount was up: native `apfs` at `/`, `st_dev` 16777234, source `/dev/disk3s1s1`; cowfs `nfs` at the run's own mount, `st_dev` 436209661, source `localhost:/cowfs-de4387245f4a6633cfc77c43fa2d25bd`, `problem` null |
 | Daemon | pid 79659, registered before the mount wait, SIGTERM after its argv was re-verified, mount absence proven from a complete 14-line table |
 | Measured cowfs build | head `025bde2f3ccea609f54edf67a9d86d66d28abeca`, `cowfs-daemon` sha256 `4804a16546a87679...`, `cowfs` sha256 `33055fed260adfc...` |
 
-The same five cases were run twice under the repaired harness and produced the same counts.
+The same five cases produced the same counts on every run of the repaired harness.
 
-One gap in that run's record, stated rather than hidden: `summary.json` for that run recorded the
-cowfs arm's filesystem identity after teardown, so its `fstype` reads null.
-The in-run identity was read while the mount was up and is in the run log, and the separation check
-ran and passed on the two `st_dev` values.
-A later repair records the in-run identity in the summary instead; that change is not exercised by
-a third run, because the shared Mac lock is taken once per attempt by agreement.
+**Withdrawn: the `st_dev` 436209625 that the previous revision of this document reported for the
+cowfs arm.** It is in no preserved file.
+Both earlier runs recorded `cowfs_fs` with `fstype`, `mountpoint`, `st_dev`, `source` all null and
+`problem` set to a `stat failed` line, because the identity was read after the mount was torn down.
+A device number that exists only in a chat message is not a receipt, and it was the single number
+that was supposed to prove the two arms are on different filesystems.
+The raw records of both runs are preserved byte for byte and are not rewritten; they simply cannot
+carry a verdict, and reconciling either now returns INVALID 3.
+The receipted run above is the replacement, and the independent review's own five-case sample
+carries the same receipt with `st_dev` 436209639 (`docs/reviews/pjdfstest-g3-repair-final.md`).
+NFS `st_dev` is assigned per mount, so the three numbers differing in the last digits is expected
+and means nothing on its own; what matters is that each is inside its own run's receipt.
 
 ## What the harness now refuses
 
@@ -210,7 +217,20 @@ case, which is how the historical set is scored.
 An unmeasurable run is UNMEASURABLE and a malformed one is INVALID.
 Neither is a pass, and an established divergence is reported as FAIL even when part of the scope is
 unpairable, because that is a result and the unpairable part is a limit.
-Exit status: 0 PASS, 1 FAIL, 2 UNMEASURABLE, 3 INVALID.
+Reasons are typed, so the exit status follows from what went wrong rather than from wording:
+
+| kind | means | exit |
+| --- | --- | --- |
+| INTEGRITY | the run's own records or provenance cannot be trusted: malformed or truncated stream, a raw hash that moved, a synthetic fixture, a case-integrity failure, a mixed record format, tool-source drift, a missing or invalid runtime identity | 3 INVALID |
+| CAPABILITY | the tool, a prerequisite or a capability is absent, so nothing ran | 2 UNMEASURABLE |
+| DIVERGENCE | an established assertion passes on one arm and fails on the other | 1 FAIL |
+| COVERAGE | a limit on what the transcript can conclude: unpairable assertions, identity unrecoverable | disclosed, never an exit on its own |
+
+So exit 0 PASS, 1 FAIL, 2 UNMEASURABLE, 3 INVALID, integrity outranks everything, and partial
+coverage never turns a real divergence into a pass or into an unmeasurable.
+Both the verdict function and the command line are covered: the test suite runs the module as a
+child process and reads its real exit status, so a refusal proven only by a predicate would fail
+that test.
 
 Two more things the old harness got wrong and no longer does:
 
@@ -220,8 +240,16 @@ Two more things the old harness got wrong and no longer does:
   read whole is UNKNOWN, which blocks any unmount, walk or deletion.
 - the native arm's filesystem was recorded with `df -T`, which macOS does not support, so the
   record was empty and nothing asserted the arms were on different filesystems.
-  Identity now comes from the mount table plus `st_dev`, and equal `st_dev` is refused before any
-  case runs.
+  Identity now comes from the mount table plus `st_dev`, and a run is refused before any child
+  process exists unless **both** arms report a positive integer `st_dev`, a filesystem type, a
+  mount point and no `problem`, the cowfs mount point is the path this run asked the daemon for,
+  and the two devices differ.
+  An earlier version compared the two devices only when both were present, so two null devices
+  compared equal and passed; that is closed, and the negatives are named tests in which the spawn
+  callback is never reached.
+  The validated identity is written to `identity.json` while the mount is up, so it survives
+  teardown, and it is passed to `verdict()` explicitly rather than read back from a summary that
+  does not exist yet.
 
 Tool integrity is enforced, not just recorded: the checkout must be clean at the pinned commit,
 `pjdfstest.c` and every case script must hash to the pinned commit's own blob rather than to a

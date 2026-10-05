@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Checks for bench/pjdfstest.py.
 
 Every record here is marked synthetic. The verdict refuses synthetic records, so a fixture can
@@ -10,6 +9,7 @@ duplicated result is the property the whole gate rests on.
 """
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -259,8 +259,19 @@ class Guards(unittest.TestCase):
         self.assertTrue(p.guard_case(legacy, "x.t", None, legacy=False))
 
 
+GOOD_IDISTRY = {"path": "/tmp/mnt/pjd", "st_dev": 436207620,
+              "fstype": "nfs", "mountpoint": "/tmp/mnt",
+              "source": "localhost:/cowfs-x", "problem": None}
+GOOD_IDENTITY = {
+    "native": {"path": "/tmp/native", "st_dev": 16777234, "fstype": "apfs", "mountpoint": "/",
+               "source": "/dev/disk3s1s1", "problem": None},
+    "cowfs": {"path": "/tmp/mnt/pjd", "st_dev": 436207620, "fstype": "nfs",
+              "mountpoint": "/tmp/mnt", "source": "localhost:/cowfs-x", "problem": None},
+}
+
+
 class VerdictStates(unittest.TestCase):
-    def run_verdict(self, native_cases, cowfs_cases, extra=None):
+    def run_verdict(self, native_cases, cowfs_cases, identity=None, extra=None):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
             lines = []
@@ -272,7 +283,7 @@ class VerdictStates(unittest.TestCase):
                     record_.update(extra)
                 lines.append(json.dumps(record_, sort_keys=True))
             (run / "cases.jsonl").write_text("\n".join(lines) + "\n")
-            return p.verdict(run)
+            return p.verdict(run, identity=identity if identity is not None else GOOD_IDENTITY)
 
     def established_regression_is_fail(self):
         good = case(True, "tried 'unlink pjdfstest_a', expected 0, got 0")
@@ -295,15 +306,15 @@ class VerdictStates(unittest.TestCase):
                 lines.append(json.dumps(record(arm, "x.t", [case(True, "tried 'unlink pjdfstest_a'")]),
                                          sort_keys=True))
             (run / "cases.jsonl").write_text("\n".join(lines) + "\n")
-            report = p.verdict(run)
-            self.assertEqual(report["state"], p.UNMEASURABLE)
+            report = p.verdict(run, identity=GOOD_IDENTITY)
+            self.assertEqual((report["state"], report["exit_status"]), (p.INVALID, 3))
             self.assertTrue(any("synthetic fixture" in problem for problem in report["guard_problems"]))
 
     def malformed_json_is_invalid_input_not_a_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
             (run / "cases.jsonl").write_text("{not json\n")
-            self.assertEqual(p.verdict(run)["state"], p.INVALID)
+            self.assertEqual(p.verdict(run, identity=GOOD_IDENTITY)["exit_status"], 3)
 
     def mixed_raw_formats_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,8 +328,8 @@ class VerdictStates(unittest.TestCase):
             first["raw_sha256"] = p.sha256(run / "a.tap")
             (run / "cases.jsonl").write_text(json.dumps(first, sort_keys=True) + "\n" +
                                               json.dumps(second, sort_keys=True) + "\n")
-            report = p.verdict(run)
-            self.assertEqual(report["state"], p.UNMEASURABLE)
+            report = p.verdict(run, identity=GOOD_IDENTITY)
+            self.assertEqual((report["state"], report["exit_status"]), (p.INVALID, 3))
             self.assertTrue(any("mixes cases" in problem for problem in report["guard_problems"]))
 
 
@@ -332,6 +343,99 @@ class TestList(unittest.TestCase):
             self.assertEqual(p.test_list(root, ["link"], None), ["link/00.t"])
             self.assertEqual(p.test_list(root, None, ["open/00.t"]), ["open/00.t"])
             self.assertEqual(p.test_list(root, ["nope"], None), [])
+
+
+class RuntimeIdentityIsFailClosed(unittest.TestCase):
+    """A run is refused before any child exists unless both arms are on identified filesystems."""
+
+    def setUp(self):
+        self.spawned = []
+
+    def spawn(self, *args, **_kwargs):
+        """Stands in for the first case process. A refused identity must never reach it."""
+        self.spawned.append(args)
+
+    def check(self, identity, expected_cowfs_mount=None):
+        """What main() does: refuse before anything is spawned, or proceed to run cases."""
+        problems = p.validate_runtime_identity(identity, expected_cowfs_mount)
+        if not problems:
+            self.spawn("native", "cowfs")
+            return p.PASS
+        for problem in problems:
+            self.assertEqual(problem["kind"], p.INTEGRITY)
+        return p.state_from(problems)
+
+    def test_a_valid_identity_passes_and_proceeds(self):
+        self.assertEqual(self.check(GOOD_IDENTITY), p.PASS)
+        self.assertEqual(self.spawned, [("native", "cowfs")])
+
+    def test_no_identity_at_all_is_invalid(self):
+        self.assertEqual(self.check(None), p.INVALID)
+
+    def test_missing_native_arm_is_invalid(self):
+        identity = {"native": GOOD_IDENTITY["native"]}
+        self.assertEqual(self.check(identity), p.INVALID)
+
+    def test_missing_cowfs_arm_is_invalid(self):
+        self.assertEqual(self.check({"native": GOOD_IDENTITY["native"]}), p.INVALID)
+
+    def test_a_stat_problem_is_invalid(self):
+        identity = {"native": GOOD_IDENTITY["native"],
+                    "cowfs": {**GOOD_IDENTITY["cowfs"], "problem": "stat failed: No such file"}}
+        self.assertEqual(self.check(identity), p.INVALID)
+
+    def test_a_null_device_is_invalid_and_equal_devices_alone_would_have_passed(self):
+        identity = {"native": {**GOOD_IDENTITY["native"], "st_dev": None},
+                    "cowfs": {**GOOD_IDENTITY["cowfs"], "st_dev": None}}
+        # Both null devices are equal, so an equality check alone would have accepted this.
+        self.assertEqual(self.check(identity), p.INVALID)
+        self.assertTrue(any("no st_dev" in problem["message"] for problem in
+                            p.validate_runtime_identity(identity)))
+
+    def test_a_null_type_is_invalid(self):
+        identity = {"native": GOOD_IDENTITY["native"], "cowfs": {**GOOD_IDISTRY, "fstype": None}}
+        self.assertEqual(self.check(identity), p.INVALID)
+
+    def test_a_missing_mount_point_is_invalid(self):
+        identity = {"native": GOOD_IDENTITY["native"],
+                    "cowfs": {**GOOD_IDISTRY, "mountpoint": None}}
+        self.assertEqual(self.check(identity), p.INVALID)
+
+    def test_a_nonpositive_or_noninteger_device_is_invalid(self):
+        for device in (0, -1, "16777234", True):
+            identity = {"native": {**GOOD_IDENTITY["native"], "st_dev": device},
+                        "cowfs": GOOD_IDISTRY}
+            self.assertEqual(self.check(identity), p.INVALID, f"device {device!r} was accepted")
+
+    def test_the_wrong_mount_is_invalid(self):
+        identity = {"native": GOOD_IDENTITY["native"],
+                    "cowfs": {**GOOD_IDISTRY, "mountpoint": "/somewhere/else"}}
+        self.assertEqual(self.check(identity, expected_cowfs_mount="/tmp/mnt"), p.INVALID)
+        # The same identity is fine when nothing says where the mount should have been.
+        self.assertEqual(p.validate_runtime_identity(identity), [])
+
+    def test_equal_devices_are_invalid(self):
+        identity = {"native": GOOD_IDENTITY["native"],
+                    "cowfs": {**GOOD_IDISTRY, "st_dev": GOOD_IDENTITY["native"]["st_dev"]}}
+        self.assertEqual(self.check(identity), p.INVALID)
+
+
+class ExitTaxonomy(unittest.TestCase):
+    def test_integrity_outranks_divergence_and_capability(self):
+        self.assertEqual(p.state_from([{"kind": p.INTEGRITY}, {"kind": p.DIVERGENCE}]), p.INVALID)
+        self.assertEqual(p.state_from([{"kind": p.DIVERGENCE}, {"kind": p.CAPABILITY}]), p.FAIL)
+        self.assertEqual(p.state_from([{"kind": p.CAPABILITY}]), p.UNMEASURABLE)
+        self.assertEqual(p.state_from([{"kind": p.COVERAGE}]), p.PASS)
+
+    def test_statuses(self):
+        self.assertEqual(p.EXIT_STATUS, {p.PASS: 0, p.FAIL: 1, p.UNMEASURABLE: 2, p.INVALID: 3})
+
+    def test_cli_exit_codes_are_read_from_the_process_not_from_a_predicate(self):
+        done = subprocess.run([sys.executable, str(Path(p.__file__)), "--reconcile",
+                               "/nonexistent-run-dir-for-the-exit-check"],
+                              capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("INVALID", done.stdout + done.stderr)
 
 
 if __name__ == "__main__":

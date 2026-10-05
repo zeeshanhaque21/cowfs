@@ -14,7 +14,8 @@ No generated record was rewritten.
 | historical record set | the author's full 238-case run at head `025bde2`, 476 records | `cases.jsonl` `bb55fe4912a36302980c9a1b0f8214a44f2af83afb4cfa3f60b96f36db6a8259` |
 | historical summary | the author's own `summary.json` from that run | `399807` bytes, read but not rewritten |
 | historical reconciliation | derived by the repaired harness from the record set above | `run/20261005T004337Z/reconciliation.json` |
-| repaired small run | 5 cases per arm at the repaired head, raw streams and hashes kept | `cases.jsonl` `1d64dabcca863b16162c94fc15ae52d4c4d4bfe4e71674a6fae070225b7a90ad` |
+| receipted small run | 5 cases per arm at this head, `identity.json` written before teardown, raw streams and hashes kept | `cases.jsonl` `eb2ff1245baa4aa306b2a6458cdde6e32abced1120987283898d5c03ff51ecdc` |
+| superseded small runs | `20261005T022439Z` and `20261005T022515Z`, raw records preserved untouched | `cases.jsonl` `1d64dabc...`; both recorded `cowfs_fs` as `stat failed`, so neither can carry a verdict |
 | pinned tool | `pjd/pjdfstest` at `85a8aea9e685999ef0540392fd80535f873d7ff7` | `pjdfstest.c` `a6c354f2c42015a1...`, binary `5fa40986f39bb903...` |
 
 The historical record set keeps no raw per-case stream, so it is labelled legacy: the parsed
@@ -106,9 +107,18 @@ They are diagnostics over the transcript, not a root-cause analysis and not a de
 | ordinal differential for the same cases | 27, 22 structurally different |
 | unpairable | 26, of which 24 with no operation text |
 | guard problems | 0 |
-| arm separation | native `apfs` `/` `st_dev` 16777234, cowfs `nfs` `st_dev` 436209625 |
+| arm separation, from `identity.json` written while the mount was up | native `apfs` `/` `st_dev` 16777234 source `/dev/disk3s1s1`; cowfs `nfs` `st_dev` 436209661 source `localhost:/cowfs-de4387245f4a6633cfc77c43fa2d25bd`, `problem` null, `validated` true |
 | raw streams | 10 files under `raw/`, each hashed in `cases.jsonl` |
-| repeat run | same counts on a second locked invocation |
+| repeat runs | same counts on every locked invocation of the repaired harness |
+| measured build | `cowfs-daemon` `4804a16546a87679...`, `cowfs` `33055fed260adfc...`, identical to the reviewed manifest, `crates/` unchanged since `025bde2` |
+| socket path | 98 bytes against the 103-byte `sun_path` limit, checked before creation |
+
+Withdrawn: the `st_dev` 436209625 the earlier revision reported for the cowfs arm.
+It is in no preserved file: both superseded runs recorded `cowfs_fs` as `stat failed`, and the
+number existed only in a chat message.
+The independent review's own sample carries its own receipt with `st_dev` 436209639
+(`docs/reviews/pjdfstest-g3-repair-final.md`), cited here as reviewer evidence with its provenance.
+NFS `st_dev` is per mount, so those last digits differing is expected and means nothing alone.
 
 Named controls inside that run:
 
@@ -124,12 +134,27 @@ hash moved, a record set mixing raw and raw-less cases, and a synthetic fixture.
 Mount inspection is tri-state, with UNKNOWN blocking any unmount, walk or deletion.
 Both arms must report different `st_dev` values or the run is refused before any case executes.
 
-| state | exit |
-| --- | --- |
-| PASS | 0 |
-| FAIL | 1 |
-| UNMEASURABLE | 2 |
-| INVALID | 3 |
+Reasons are typed and the exit follows the kind, not the wording:
+
+| kind | covers | exit |
+| --- | --- | --- |
+| INTEGRITY | malformed or truncated stream, raw hash moved, synthetic fixture, case-integrity failure, mixed record format, tool-source drift, missing or invalid runtime identity | 3 |
+| CAPABILITY | tool, prerequisite or capability absent, so nothing ran | 2 |
+| DIVERGENCE | an established assertion passes on one arm and fails on the other | 1 |
+| COVERAGE | unpairable assertions, identity unrecoverable | disclosed only |
+
+A real divergence keeps exit 1 even where part of the scope is unpairable, integrity outranks both,
+and coverage never decides an exit.
+The command line is covered too: the suite runs the module as a child process and reads its real
+exit status, so a refusal that only a predicate can see fails the test.
+
+### Fail-closed runtime identity
+
+Refused before any child process exists, each with a named negative test whose spawn callback is
+never reached: no identity at all, a missing native arm, a missing cowfs arm, a `problem` set, a
+null `st_dev` on both arms, a null filesystem type, a missing mount point, a non-integer or
+non-positive device, the wrong mount point, and two arms reporting the same device.
+A valid identity keeps the independent FAIL precedence.
 
 ## Tool provenance enforcement
 
@@ -142,7 +167,14 @@ compiler, not treated as a source identity.
 
 ## Lint
 
-`ruff check` on the two owned files: 17 findings at the reviewed head, 0 at this head.
+`ruff check` on the two owned files: 17 findings at the first reviewed head, and 0 at this head.
+The two `EXE001` findings that survived the first repair were the file modes, and the fix follows
+the repository's own convention rather than a suppression: `bench/pjdfstest.py` is a script, so it
+keeps its shebang and its executable bit like `bench/compare.py` and `bench/gates.py`, while
+`bench/test_pjdfstest.py` is a unittest module, so it loses the shebang and the executable bit like
+`bench/test_gates.py`.
+Verified at the tree level rather than in one working copy: `git ls-tree` shows the mode recorded
+in the commit, not the mode on whichever disk the check ran on.
 The repo has no ruff configuration and CI does not run ruff, so this is a standing-rule fix rather
 than a project gate.
 No `noqa` was added and no dependency was introduced.
