@@ -8,13 +8,16 @@ The pairing tests come first on purpose: an identity that survives a shifted, ad
 duplicated result is the property the whole gate rests on.
 """
 
+import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -440,122 +443,256 @@ class ExitTaxonomy(unittest.TestCase):
 
 
 class ReconcileNeverOverwrites(unittest.TestCase):
-    """An analysis reads evidence; it never writes into it.
+    """An analysis reads evidence; it never writes into it, and it never skips.
 
-    Every case here runs against a fixture copied into this lane's own tree, never against a real
-    run directory, so a mistake in the writer cannot touch preserved evidence.
+    Every check here builds its own copy of the tracked fixture under `bench/pjdfstest-fixture`
+    inside a private temporary directory, so no check depends on the ignored tool cache, on another
+    check having run first, or on a file it does not own. Nothing here touches a preserved run.
     """
 
-    FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "bench" / "out" / "ready-g3" / \
-        "reconcile-safety"
+    FIXTURE = Path(__file__).resolve().parents[1] / "bench" / "pjdfstest-fixture"
     SENTINEL = "this file is evidence and must not change\n"
+    # What the pinned closure makes of the fixture's records: the receipted run 20261005T025742Z
+    # scored 25 established regressions and 26 unpairable assertions on exactly these bytes.
+    ESTABLISHED = 25
+    UNPAIRABLE = 26
 
     def setUp(self):
-        self.run_dir = self.FIXTURE_ROOT / "fixture-run"
-        if not (self.run_dir / "cases.jsonl").is_file():
-            self.skipTest("fixture run is missing; copy a receipted run into " + str(self.FIXTURE_ROOT))
-        self.before = self.hashes(self.run_dir)
+        self.work = Path(tempfile.mkdtemp(prefix="pjdfstest-reconcile-"))
+        self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        (self.work / "analysis").mkdir()
+        self.run, self.tool = self.stage()
 
-    @staticmethod
-    def hashes(root: Path) -> dict:
-        return {str(p.relative_to(root)): p.stat().st_size for p in sorted(root.rglob("*")) if p.is_file()}
+    @classmethod
+    def stage(cls, root: Path | None = None) -> tuple[Path, Path]:
+        """Copy the tracked fixture and re-point its raw streams at that copy.
+
+        The committed records name the run they came from, so the copy points each record at its own
+        raw file. The bytes are identical, so every recorded raw_sha256 still verifies.
+        """
+        work = root or Path(tempfile.mkdtemp(prefix="pjdfstest-reconcile-"))
+        run = work / "run"
+        shutil.copytree(cls.FIXTURE / "run", run)
+        tool = work / "tool"
+        shutil.copytree(cls.FIXTURE / "tool", tool)
+        rows = [json.loads(line) for line in (run / "cases.jsonl").read_text().splitlines()]
+        for row in rows:
+            row["raw"] = str((run / row["raw"]).resolve())
+        (run / "cases.jsonl").write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+        return run, tool
 
     @staticmethod
     def digests(root: Path) -> dict:
-        return {str(p.relative_to(root)): p.sha256 if hasattr(p, "sha256") else
-                __import__("hashlib").sha256(p.read_bytes()).hexdigest()
+        return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in sorted(root.rglob("*")) if p.is_file()}
 
-    def reconcile(self, *extra):
-        return subprocess.run([sys.executable, str(Path(p.__file__)), "--reconcile",
-                               str(self.run_dir), *extra], capture_output=True, text=True,
-                              timeout=300, check=False)
+    def cli(self, *args: str, repo: Path | None = None,
+            script: Path | None = None) -> subprocess.CompletedProcess:
+        """The published CLI as a child process, which is how a reader meets it."""
+        command = [sys.executable, str(script or Path(p.__file__)), "--reconcile", str(self.run)]
+        if repo is not None:
+            command += ["--repo", str(repo)]
+        return subprocess.run(command + list(args), capture_output=True, text=True, timeout=600,
+                              check=False)
 
-    def test_an_existing_default_receipt_is_refused_and_not_one_byte_changes(self):
-        sentinel = self.run_dir / "reconciliation.json"
-        self.assertFalse(sentinel.exists(), "the fixture is expected to start without one")
-        sentinel.write_text(self.SENTINEL)
-        before = (sentinel.read_bytes(), self.digests(self.run_dir))
-        try:
-            done = self.reconcile()
-            self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
-            self.assertIn("already exists", done.stdout + done.stderr)
-            self.assertEqual(sentinel.read_bytes(), before[0], "the sentinel was modified")
-            self.assertEqual(self.digests(self.run_dir), before[1], "a byte of the run changed")
-        finally:
-            sentinel.unlink()
+    def git_repo(self, name: str, tracked: Path) -> Path:
+        """A private git repo holding one tracked file, so provenance can be exercised at all."""
+        root = self.work / name
+        root.mkdir()
+        target = root / tracked
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(Path(p.__file__), target)
+        subprocess.run(["git", "init", "--quiet", str(root)], check=True, timeout=120)
+        subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@x",
+                        "add", str(target.relative_to(root))], check=True, timeout=120)
+        subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@x",
+                        "commit", "--quiet", "-m", "track"], check=True, timeout=120)
+        return root
 
-    def test_the_input_run_is_unchanged_by_a_successful_fresh_analysis(self):
-        out_dir = self.FIXTURE_ROOT / "analysis-out"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / "fresh.json"
-        if out.exists():
-            out.unlink()
-        before = self.digests(self.run_dir)
-        done = self.reconcile("--output", str(out))
+    def bare_repo(self) -> Path:
+        """A checkout with no tool cache, which is what a fresh clone looks like."""
+        bare = self.work / "fresh-clone"
+        (bare / "bench").mkdir(parents=True)
+        shutil.copy(Path(p.__file__), bare / "bench" / "pjdfstest.py")
+        return bare
+
+    def test_the_pinned_closure_classifies_the_record_set_and_fails(self):
+        out = self.work / "analysis" / "fresh.json"
+        before = self.digests(self.run)
+        done = self.cli("--tool", str(self.tool), "--output", str(out))
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("FAIL", done.stdout)
-        self.assertEqual(self.digests(self.run_dir), before, "the analysis touched its own input")
+        self.assertIn("state FAIL exit 1", done.stdout)
         payload = json.loads(out.read_text())
         self.assertEqual(payload["state"], p.FAIL)
-        self.assertEqual(payload["exit_status"], 1)
-        self.assertTrue(payload["analysis"]["analyser_sha256"])
+        self.assertEqual(len(payload["comparison"]["established_regressions"]), self.ESTABLISHED)
+        self.assertEqual(len(payload["comparison"]["unpairable"]), self.UNPAIRABLE)
+        self.assertEqual(sorted(r["kind"] for r in payload["reasons"] if r["kind"] != "COVERAGE"),
+                         ["DIVERGENCE"])
+        self.assertEqual(self.digests(self.run), before, "the analysis touched its own input")
         self.assertEqual(payload["analysis"]["inputs"]["cases.jsonl"],
-                         p.sha256(self.run_dir / "cases.jsonl"))
+                         hashlib.sha256((self.run / "cases.jsonl").read_bytes()).hexdigest())
         self.assertIn("fresh reading", payload["analysis"]["note"])
-        out.unlink()
+
+    def test_a_reconciliation_without_the_pinned_scripts_is_invalid_not_pass(self):
+        done = self.cli("--output", str(self.work / "analysis" / "none.json"), repo=self.bare_repo())
+        self.assertNotEqual(done.returncode, 0, "a gate that never ran must not read as a pass")
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("state INVALID exit 3", done.stdout)
+        self.assertIn("not a pjdfstest checkout", done.stdout)
+        self.assertIn("nothing was classified and nothing was written", done.stdout)
+
+    def test_verdict_without_the_pinned_scripts_refuses_before_classifying(self):
+        identity = json.loads((self.run / "identity.json").read_text())["runtime_identity"]
+        report = p.verdict(self.run, None, None, identity)
+        self.assertEqual(report["state"], p.INVALID)
+        self.assertEqual(report["exit_status"], 3)
+        self.assertIn("so no assertion can be classified",
+                      " ".join(r["message"] for r in report["reasons"]))
+
+    def test_an_altered_curated_closure_is_refused(self):
+        script = self.tool / "tests" / "open" / "17.t"
+        script.write_text(script.read_text() + "# tampered\n")
+        done = self.cli("--tool", str(self.tool), "--output", str(self.work / "analysis" / "bad.json"))
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("is not the pinned blob", done.stdout)
+
+    def test_an_existing_default_receipt_is_refused_and_not_one_byte_changes(self):
+        sentinel = self.run / "reconciliation.json"
+        sentinel.write_text(self.SENTINEL)
+        before = self.digests(self.run)
+        done = self.cli("--tool", str(self.tool))
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("already exists", done.stdout)
+        self.assertEqual(self.digests(self.run), before, "a byte of the run changed")
 
     def test_an_output_inside_the_run_is_refused(self):
-        done = self.reconcile("--output", str(self.run_dir / "cases.jsonl"))
+        before = hashlib.sha256((self.run / "cases.jsonl").read_bytes()).hexdigest()
+        done = self.cli("--tool", str(self.tool), "--output", str(self.run / "cases.jsonl"))
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
-        self.assertIn("inside the run directory", done.stdout + done.stderr)
+        self.assertIn("inside the run directory", done.stdout)
+        self.assertEqual(hashlib.sha256((self.run / "cases.jsonl").read_bytes()).hexdigest(), before)
 
-    def test_an_output_equal_to_a_raw_stream_is_refused(self):
-        raw = min((self.run_dir / "raw").iterdir(), key=lambda q: q.name)
-        before = raw.read_bytes()
-        done = self.reconcile("--output", str(raw))
+    def test_an_output_named_like_a_raw_stream_is_refused(self):
+        raw = min((self.run / "raw").iterdir(), key=lambda q: q.name)
+        before = hashlib.sha256(raw.read_bytes()).hexdigest()
+        done = self.cli("--tool", str(self.tool), "--output", str(raw))
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
-        self.assertEqual(raw.read_bytes(), before, "a raw stream was overwritten")
+        self.assertEqual(hashlib.sha256(raw.read_bytes()).hexdigest(), before)
+
+    def test_a_symlinked_output_is_refused_rather_than_followed(self):
+        foreign = self.work / "foreign.json"
+        foreign.write_text(self.SENTINEL)
+        for name, target in (("link.json", foreign), ("dead.json", self.work / "nowhere.json")):
+            link = self.work / name
+            link.symlink_to(target)
+            done = self.cli("--tool", str(self.tool), "--output", str(link))
+            self.assertEqual(done.returncode, 3, f"{name}: " + done.stdout + done.stderr)
+            self.assertTrue(link.is_symlink(), f"{name} was replaced rather than refused")
+        self.assertEqual(foreign.read_text(), self.SENTINEL)
+        self.assertFalse((self.work / "nowhere.json").exists())
+
+    def test_a_missing_parent_directory_is_a_typed_refusal(self):
+        done = self.cli("--tool", str(self.tool),
+                        "--output", str(self.work / "absent" / "deep" / "fresh.json"))
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("could not be staged", done.stdout)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+
+    def test_a_parent_that_is_a_file_is_a_typed_refusal(self):
+        parent = self.work / "not-a-directory"
+        parent.write_text("a file where a directory was wanted\n")
+        done = self.cli("--tool", str(self.tool), "--output", str(parent / "fresh.json"))
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("could not be staged", done.stdout)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertEqual(parent.read_text(), "a file where a directory was wanted\n")
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory write permissions")
+    def test_an_unwritable_directory_is_a_typed_refusal(self):
+        locked = self.work / "locked"
+        locked.mkdir()
+        self.addCleanup(os.chmod, locked, 0o700)
+        os.chmod(locked, 0o500)
+        done = self.cli("--tool", str(self.tool), "--output", str(locked / "fresh.json"))
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("could not be staged", done.stdout)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertEqual(list(locked.iterdir()), [])
+
+    def test_a_link_failure_keeps_the_staged_evidence_and_says_so(self):
+        out = self.work / "staged.json"
+        with mock.patch.object(p.os, "link", side_effect=PermissionError(13, "Permission denied")):
+            written, message = p.write_exclusive(out, "{}\n")
+        self.assertFalse(written)
+        self.assertIn("Permission denied", message)
+        staged = list(out.parent.glob("staged.json.staged-*"))
+        self.assertEqual(len(staged), 1, "a failed publication must leave its evidence behind")
+        for path in staged:
+            path.unlink()
 
     def test_an_existing_explicit_output_is_refused(self):
-        out_dir = self.FIXTURE_ROOT / "analysis-out"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / "taken.json"
+        out = self.work / "taken.json"
         out.write_text(self.SENTINEL)
-        done = self.reconcile("--output", str(out))
+        done = self.cli("--tool", str(self.tool), "--output", str(out))
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
-        self.assertEqual(out.read_text(), self.SENTINEL, "an existing output was overwritten")
-        out.unlink()
+        self.assertEqual(out.read_text(), self.SENTINEL)
 
-    def test_a_run_without_an_identity_receipt_stays_invalid_three(self):
-        run_dir = self.FIXTURE_ROOT / "no-identity-run"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(self.run_dir / "cases.jsonl", run_dir / "cases.jsonl")
-        shutil.copytree(self.run_dir / "raw", run_dir / "raw", dirs_exist_ok=True)
-        out = self.FIXTURE_ROOT / "analysis-out" / "no-identity.json"
-        if out.exists():
-            out.unlink()
-        done = subprocess.run([sys.executable, str(Path(p.__file__)), "--reconcile", str(run_dir),
-                               "--output", str(out)], capture_output=True, text=True, timeout=300,
-                              check=False)
+    def test_a_run_without_an_identity_receipt_is_invalid_three(self):
+        (self.run / "identity.json").unlink()
+        done = self.cli("--tool", str(self.tool), "--output", str(self.work / "analysis" / "x.json"))
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
-        self.assertIn("INVALID", done.stdout)
+        self.assertIn("no runtime identity was supplied", done.stdout)
 
-    def test_write_exclusive_leaves_no_staged_file_behind_on_success(self):
-        out_dir = self.FIXTURE_ROOT / "analysis-out"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / "exclusive.json"
-        if out.exists():
-            out.unlink()
+    def test_write_exclusive_never_replaces_and_leaves_no_staging_file(self):
+        out = self.work / "once.json"
         written, message = p.write_exclusive(out, "{}\n")
         self.assertTrue(written, message)
         self.assertEqual(out.read_text(), "{}\n")
-        self.assertEqual([q.name for q in out_dir.glob("*.staged-*")], [])
-        ok, message = p.write_exclusive(out, "second\n")
-        self.assertFalse(ok)
+        self.assertEqual(list(self.work.glob("once.json.staged-*")), [])
+        self.assertFalse(p.write_exclusive(out, "second\n")[0])
         self.assertEqual(out.read_text(), "{}\n", "the second write changed the file")
-        out.unlink()
+        self.assertEqual(list(self.work.glob("once.json.staged-*")), [])
 
+    def test_the_revision_is_unknown_in_a_checkout_that_does_not_track_the_script(self):
+        elsewhere = self.git_repo("unrelated", Path("tools/pjdfstest.py"))
+        subprocess.run(["git", "-C", str(elsewhere), "rm", "--quiet", "-r", "--cached", "tools"],
+                       capture_output=True, text=True, timeout=120, check=False)
+        subprocess.run(["git", "-C", str(elsewhere), "-c", "user.name=t", "-c", "user.email=t@x",
+                        "commit", "--quiet", "--allow-empty", "-m", "untrack"], check=True,
+                       timeout=120)
+        script = elsewhere / "tools" / "pjdfstest.py"
+        done = self.cli("--tool", str(self.tool), "--output", str(self.work / "analysis" / "v.json"),
+                        repo=elsewhere, script=script)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        analysis = json.loads((self.work / "analysis" / "v.json").read_text())["analysis"]
+        self.assertEqual(analysis["analyser_revision"], "UNKNOWN")
+        self.assertEqual(analysis["analyser_sha256"],
+                         hashlib.sha256(script.read_bytes()).hexdigest(),
+                         "the analysis must bind the bytes that actually ran")
+        self.assertIn("not the origin of this analysis",
+                      analysis["ambient_checkout"]["relevance"])
+        self.assertNotIn("source_head", analysis, "a checkout HEAD is not the analyser's origin")
+
+    def test_the_revision_is_the_head_that_tracks_these_exact_bytes(self):
+        elsewhere = self.git_repo("elsewhere", Path("bench/pjdfstest.py"))
+        script = elsewhere / "bench" / "pjdfstest.py"
+        head = subprocess.run(["git", "-C", str(elsewhere), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, timeout=120, check=True).stdout.strip()
+        done = self.cli("--tool", str(self.tool), "--output", str(self.work / "analysis" / "t.json"),
+                        repo=elsewhere, script=script)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        analysis = json.loads((self.work / "analysis" / "t.json").read_text())["analysis"]
+        self.assertEqual(analysis["analyser_revision"], head)
+        self.assertIn("is the script on disk", analysis["analyser_revision_evidence"])
+        self.assertEqual(analysis["ambient_checkout"]["head"], head)
+        script.write_text(script.read_text() + "\n# edited after the commit\n")
+        again = self.cli("--tool", str(self.tool),
+                         "--output", str(self.work / "analysis" / "u.json"), repo=elsewhere,
+                        script=script)
+        self.assertEqual(again.returncode, 1, again.stdout + again.stderr)
+        self.assertEqual(
+            json.loads((self.work / "analysis" / "u.json").read_text())["analysis"]
+            ["analyser_revision"], "UNKNOWN", "an edited script must not claim a revision")
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

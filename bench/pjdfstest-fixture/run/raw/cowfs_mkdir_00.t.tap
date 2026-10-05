@@ -1,0 +1,39 @@
+1..36
+ok 1
+ok 2
+ok 3
+ok 4
+ok 5
+ok 6
+ok 7
+ok 8
+ok 9
+ok 10
+ok 11
+ok 12
+ok 13
+ok 14
+ok 15
+ok 16
+ok 17
+not ok 18 - tried '-u 65534 -g 65534 mkdir pjdfstest_6c0f32cbced24d110bc718dce6ef2cca 0755', expected 0, got 
+not ok 19 - tried 'lstat pjdfstest_6c0f32cbced24d110bc718dce6ef2cca uid,gid', expected 65534,65534, got ENOENT
+not ok 20 - tried 'rmdir pjdfstest_6c0f32cbced24d110bc718dce6ef2cca', expected 0, got ENOENT
+not ok 21 - tried '-u 65534 -g 65533 mkdir pjdfstest_6c0f32cbced24d110bc718dce6ef2cca 0755', expected 0, got 
+not ok 22 - tried 'lstat pjdfstest_6c0f32cbced24d110bc718dce6ef2cca uid,gid', expected 65534,6553[34], got ENOENT
+not ok 23 - tried 'rmdir pjdfstest_6c0f32cbced24d110bc718dce6ef2cca', expected 0, got ENOENT
+ok 24
+not ok 25 - tried '-u 65533 -g 65532 mkdir pjdfstest_6c0f32cbced24d110bc718dce6ef2cca 0755', expected 0, got 
+not ok 26 - tried 'lstat pjdfstest_6c0f32cbced24d110bc718dce6ef2cca uid,gid', expected 65533,6553[24], got ENOENT
+not ok 27 - tried 'rmdir pjdfstest_6c0f32cbced24d110bc718dce6ef2cca', expected 0, got ENOENT
+ok 28
+ok 29
+ok 30
+ok 31
+ok 32
+ok 33
+ok 34
+ok 35
+ok 36
+
+--- stderr ---

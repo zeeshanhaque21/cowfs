@@ -324,6 +324,53 @@ def pinned_blob_sha(src: Path, relpath: str) -> str:
     return sha256_text(blob.stdout.decode("utf-8", "surrogateescape"))
 
 
+# The scripts a curated closure may carry, pinned here by the sha256 each file has in
+# PINNED_COMMIT. A closure is checked against these values and refused otherwise, so the fallback
+# is a fixed auditable set rather than a way to approve whatever source a caller supplies.
+CURATED_CASES = {
+    "tests/mkdir/00.t": "bd017018a17cbaed6d0197ec9ee072a5a23f20edc0938f37d410b233e912ba35",
+    "tests/mkfifo/00.t": "f631099ba6afbf0f23ee03759278166b332127d649ed99aaffed2c9cf7a6f866",
+    "tests/open/17.t": "b2aa69d1662b85b4bb473c0831097a6d83a4b2087eff3d4a6ada2ace1639bab8",
+    "tests/rmdir/12.t": "0078ce2fb06a08d51895a15d126da79319194e8447cb9610466d27cd6a235e03",
+    "tests/unlink/14.t": "ce168a45c3fa61352f9f26f81dcc2fe17f77a460328c59fc9822a34bc39ac007",
+}
+
+
+def verify_curated_closure(src: Path) -> dict:
+    """Verify a curated script directory against the closure pinned in this file.
+
+    This is what a clean archive has, where no pinned checkout exists. It can only ever prove the
+    cases it pins, so a run reaching beyond them is refused later by the classification
+    prerequisite instead of being scored from guesswork.
+    """
+    problems: list[str] = []
+    cases: dict[str, str] = {}
+    present = {str(p.relative_to(src)) for p in sorted((src / "tests").glob("*/*.t"))} \
+        if (src / "tests").is_dir() else set()
+    if not present:
+        problems.append(f"{src} has no tests directory")
+    for rel, want in CURATED_CASES.items():
+        path = src / rel
+        if not path.is_file():
+            problems.append(f"{rel} is missing from the curated closure")
+            continue
+        actual = sha256(path)
+        if actual != want:
+            problems.append(f"{rel} sha256 {actual} is not the pinned blob {want}")
+        cases[rel] = actual
+    extra = present - set(CURATED_CASES)
+    if extra:
+        problems.append(f"a curated closure carries only the pinned cases, not {sorted(extra)[:3]}")
+    return {"problems": problems, "source_sha256": None, "cases": cases}
+
+
+def verify_tool(src: Path) -> dict:
+    """Verify a tool root: the pinned checkout when it is one, else a curated closure."""
+    if (src / ".git").is_dir():
+        return verify_tool_source(src)
+    return verify_curated_closure(src)
+
+
 def verify_tool_source(src: Path) -> dict:
     """Refuse a checkout that is not exactly the pinned commit's bytes, before any case runs."""
     dirty = git_out(src, "status", "--porcelain").strip()
@@ -535,6 +582,29 @@ def parse_tap(text: str) -> dict:
         "malformed": malformed,
         "ok": sum(1 for c in cases if c["ok"]), "not_ok": sum(1 for c in cases if not c["ok"]),
     }
+
+
+def classification_prerequisite(tool: dict | None, tests_root: Path | None, compared: list[str],
+                                profiles: dict) -> list[str]:
+    """Why this run cannot be classified, if it cannot be. Empty means the gate can run.
+
+    Pairing is proved from the upstream case scripts. Without them every assertion falls through to
+    the text route, which needs operation text the suite does not print on a pass, so a run with no
+    scripts pairs almost nothing and can find no regression. Reading that as PASS would report a
+    gate that never ran, so the missing prerequisite is an integrity failure, not coverage, and it
+    is discovered before anything is classified rather than after the damage is counted.
+    """
+    if tool is None:
+        return ["the pinned pjdfstest source was not verified, so no assertion can be classified"]
+    if tool.get("problems"):
+        return [f"the pjdfstest source is not the pinned {PINNED_COMMIT}: {tool['problems'][0]}"]
+    if tests_root is None:
+        return ["no pinned test directory was read, so no assertion can be classified"]
+    missing = sorted(test for test in compared if test not in profiles)
+    if missing:
+        return [(f"{len(missing)} compared case(s) have no script profile, first {missing[0]}: "
+                 "a missing script cannot prove an assertion's position")]
+    return []
 
 
 def guard_case(record: dict, expected_test: str, raw_text: str | None, legacy: bool = False) -> list[str]:
@@ -977,6 +1047,9 @@ def verdict(run_dir: Path, tool: dict | None = None, tests_root: Path | None = N
     # A record set that cannot be trusted is INVALID, not unmeasurable: the difference matters to
     # whoever reads the exit status, so the two are never merged into one bucket.
     reasons += [reason(INTEGRITY, message) for message in problems]
+    compared = sorted(set(arms.get("native", {})) & set(arms.get("cowfs", {})))
+    reasons += [reason(INTEGRITY, message) for message in
+                classification_prerequisite(tool, tests_root, compared, profiles)]
     reasons += validate_runtime_identity(identity)
     if not arms or set(arms) != {"native", "cowfs"}:
         reasons.append(reason(CAPABILITY,
@@ -1097,6 +1170,26 @@ def reseal(report: dict) -> dict:
     return report
 
 
+def resolve_output(raw: str | Path) -> Path:
+    """Resolve a destination's parent but never its last component.
+
+    Resolving the whole path would follow a symlink at the destination and write somewhere else
+    entirely, so a link named as the output could redirect an analysis onto a foreign path. A
+    dangling link is refused the same way a real file is, because link replaces neither.
+    """
+    path = Path(raw).expanduser()
+    parent = path.parent if str(path.parent) else Path(".")
+    return parent.resolve() / path.name
+
+
+def _discard_staged(staged: Path) -> None:
+    """Remove our own staging file, whose name carries our pid. Failing to do so is not fatal."""
+    try:
+        staged.unlink()
+    except OSError:
+        pass
+
+
 def write_exclusive(path: Path, payload: str) -> tuple[bool, str]:
     """Create `path` with the bytes `payload`, or change nothing at all.
 
@@ -1107,19 +1200,65 @@ def write_exclusive(path: Path, payload: str) -> tuple[bool, str]:
     evidence of the failure rather than deleted, so nothing this run produced disappears silently.
     """
     staged = path.with_name(f"{path.name}.staged-{os.getpid()}")
-    with staged.open("x") as f:
-        f.write(payload)
-        f.flush()
-        os.fsync(f.fileno())
+    try:
+        with staged.open("x") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+    except FileExistsError:
+        return False, f"the staging path {staged} already exists, so nothing was written"
+    except OSError as exc:
+        return False, f"{path} could not be staged: {exc}; nothing was written"
     try:
         os.link(staged, path)
     except FileExistsError:
-        staged.unlink()
+        _discard_staged(staged)
         return False, f"{path} already exists, so nothing was written"
     except OSError as exc:
         return False, f"{path} could not be created: {exc}; the staged copy is kept at {staged}"
-    staged.unlink()
+    _discard_staged(staged)
     return True, str(path)
+
+
+def git_optional(repo: Path, *argv: str) -> str:
+    """git's answer, or an empty string. Absence is a fact here, not an error."""
+    done = subprocess.run(["git", "-C", str(repo), *argv], capture_output=True, text=True,
+                          timeout=60, check=False)
+    return "" if done.returncode != 0 else done.stdout.strip()
+
+
+def script_revision(repo: Path, script: Path) -> dict:
+    """The revision of this harness, but only where the bytes can prove it.
+
+    A checkout's HEAD says nothing about which bytes ran, so it is recorded as ambient context and
+    never as the origin of an analysis. The revision is believed only when the blob HEAD records for
+    this path is the same object as the script actually on disk. No repository, an unrelated
+    checkout, or a modified script all give UNKNOWN, because a guess would misattribute the result
+    to code that did not produce it.
+    """
+    ambient = {"top_level": None, "head": None,
+               "relevance": "the checkout this ran in, not the origin of this analysis"}
+    try:
+        ambient["top_level"] = git_optional(repo, "rev-parse", "--show-toplevel") or None
+        ambient["head"] = git_optional(repo, "rev-parse", "HEAD") or None
+    except (OSError, subprocess.SubprocessError):
+        ambient["top_level"] = ambient["head"] = None
+    if not ambient["head"] or not ambient["top_level"]:
+        return {"analyser_revision": "UNKNOWN", "ambient_checkout": ambient,
+                "analyser_revision_evidence": "no git checkout, so no revision can be proved"}
+    try:
+        rel = str(script.resolve().relative_to(Path(ambient["top_level"]).resolve()))
+    except ValueError:
+        return {"analyser_revision": "UNKNOWN", "ambient_checkout": ambient,
+                "analyser_revision_evidence": "the script is outside the checkout this ran in"}
+    blob = git_optional(repo, "rev-parse", f"HEAD:{rel}")
+    actual = git_optional(repo, "hash-object", str(script.resolve()))
+    if blob and actual and blob == actual:
+        return {"analyser_revision": ambient["head"], "ambient_checkout": ambient,
+                "analyser_revision_evidence": f"the blob HEAD records for {rel} is the script on disk",
+                "tracked_path": rel}
+    return {"analyser_revision": "UNKNOWN", "ambient_checkout": ambient,
+            "analyser_revision_evidence": f"the script on disk is not the blob HEAD records for {rel}"}
 
 
 def analysis_provenance(repo: Path, run_dir: Path, tests_root: Path | None, tool: dict | None) -> dict:
@@ -1137,12 +1276,9 @@ def analysis_provenance(repo: Path, run_dir: Path, tests_root: Path | None, tool
     raw = run_dir / "raw"
     if raw.is_dir():
         inputs["raw/"] = {p.name: sha256(p) for p in sorted(raw.iterdir()) if p.is_file()}
-    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True,
-                          text=True, timeout=60, check=False).stdout.strip()
-    return {
+    provenance = {
         "analyser": "bench/pjdfstest.py",
         "analyser_sha256": sha256(Path(__file__).resolve()),
-        "source_head": head,
         "pinned_tool_commit": PINNED_COMMIT,
         "tool_source_problems": (tool or {}).get("problems", []),
         "tests_root": str(tests_root) if tests_root else None,
@@ -1150,16 +1286,37 @@ def analysis_provenance(repo: Path, run_dir: Path, tests_root: Path | None, tool
         "note": "This file is a fresh reading of the inputs above. It says nothing about the runtime "
                 "that captured them, and it does not replace any receipt in the run directory.",
     }
+    provenance.update(script_revision(repo, Path(__file__).resolve()))
+    return provenance
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
     """Re-derive a verdict from a run directory's own records. No mount, no daemon, no build."""
     run_dir = Path(args.reconcile).resolve()
     repo = Path(args.repo).resolve()
-    tool, tests_root = None, None
+    # Pairing is proved from the pinned case scripts, so they are a prerequisite and are verified
+    # before anything is classified. Silence here would let a run with no scripts pair nothing,
+    # find no divergence and report PASS for a gate that never ran.
     src = Path(args.tool) if args.tool else repo / "bench" / "out" / "ready-g3" / "tool" / "pjdfstest"
-    if (src / "tests").is_dir():
-        tool, tests_root = verify_tool_source(src), src / "tests"
+    tool, tests_root, tool_problem = None, None, None
+    if not (src / "tests").is_dir():
+        tool_problem = (f"{src} is not a pjdfstest checkout. A reconciliation pairs assertions by "
+                        f"reading the pinned case scripts, so pass --tool with a checkout of "
+                        f"{PINNED_COMMIT} or with the curated closure.")
+    else:
+        tool, tests_root = verify_tool(src), src / "tests"
+        if tool["problems"]:
+            tool_problem = (f"the pjdfstest source at {src} is not the pinned {PINNED_COMMIT}: "
+                            f"{tool['problems'][0]}")
+    if tool_problem:
+        refused = {"state": INVALID, "exit_status": EXIT_STATUS[INVALID],
+                   "reasons": [reason(INTEGRITY, tool_problem)],
+                   "analysis": analysis_provenance(repo, run_dir, None, tool)}
+        for item in refused["reasons"]:
+            log(f"  - [{item['kind']}] {item['message']}")
+        log(f"state {refused['state']} exit {refused['exit_status']}")
+        log("refused: nothing was classified and nothing was written")
+        return refused["exit_status"]
     # The identity comes from the run's own receipt, written while its mount was up. A run without
     # one cannot be placed on a filesystem, so it is INVALID rather than quietly unpairable.
     receipt = run_dir / "identity.json"
@@ -1181,7 +1338,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     # An analysis never writes into the evidence it reads, so an explicit destination has to sit
     # outside the run directory. The default sits beside the records for convenience and is
     # refused the moment anything is there.
-    out = Path(args.output).resolve() if args.output else run_dir / "reconciliation.json"
+    out = resolve_output(args.output) if args.output else run_dir / "reconciliation.json"
     if args.output and (out == run_dir or run_dir in out.parents):
         report["reasons"].insert(0, reason(
             INTEGRITY, f"{out} is inside the run directory it reads, so an analysis would land among "

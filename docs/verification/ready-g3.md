@@ -243,6 +243,117 @@ without an identity receipt.
 Those tests run against a fixture copied into this lane's own
 `bench/out/ready-g3/reconcile-safety/**`, never against a preserved run.
 
+## A reconciliation without the pinned scripts returned PASS
+
+The previous repair fixed the identity guard and the writer.
+It left a hole that made the gate unsound in the one direction that matters, found by the
+independent review and reproduced here before anything was changed.
+
+Pairing is proved from the upstream case scripts.
+Without them every assertion falls through to the text route, which needs operation text the suite
+does not print on a pass, so a run with no scripts pairs almost nothing, finds no regression, and
+reaches PASS.
+A reader would take that for a clean bill of health on a filesystem nobody tested.
+
+`bench/out/pjdfstest-fresh-clone-spike/` holds the spike, the copied run it reads and both of its
+recordings.
+One input, three readings, the boundary instrumented before anything is classified:
+
+| reading | profiles built | established | unpairable | exit |
+| --- | --- | --- | --- | --- |
+| with the pinned scripts | 5 of 5 compared cases | 25 | 26 | 1 FAIL |
+| without them, a checkout with no cache | 0 of 5 | 0 | 170 | 0 PASS, the bug |
+| without them, after the repair | 0 of 5 | 0 | 170 | 3 INVALID |
+
+Calling `verdict()` directly with `tests_root=None` returned `PASS exit 0` with 170 unpairable and
+no kind of reason but coverage, which is the same hole seen from inside.
+The number that matters is the exit, not the count: 170 unpairable on its own is a limitation, and
+170 unpairable with nothing else present was a pass.
+
+The repair treats the pinned scripts as a prerequisite, checked before anything is classified:
+
+- a run whose compared cases have no verified script, or no verified source at all, is INVALID 3
+- a source that is not the pinned commit is INVALID 3, whether it is a modified checkout or a
+  curated closure whose bytes moved
+- coverage that is genuinely unpairable is still disclosed, and only disclosed, on top of a
+  classification that actually ran
+
+A record set that reaches beyond a curated closure therefore cannot be scored from it: the gate
+requires a profile for every compared case, and the closure proves five.
+
+## Every refusal is typed, and no refusal follows a symlink
+
+The writer was already exclusive and staged.
+It was not closed against the ways a filesystem says no.
+Each of these is now an INTEGRITY refusal with a message and no traceback, and each is a named
+check that runs the CLI as a child process:
+
+| condition | refusal |
+| --- | --- |
+| the default destination already exists | 3, not one byte of the input changes |
+| an explicit destination inside the run it reads | 3, `cases.jsonl` unchanged |
+| an explicit destination naming a raw stream | 3, that stream unchanged |
+| an explicit destination that is a symlink, live or dangling | 3, the link is still a link and its target is untouched |
+| a destination whose parent does not exist | 3, `could not be staged` |
+| a destination whose parent is a file | 3, `could not be staged` |
+| a destination in a directory without write permission | 3, nothing written, no staging file left |
+| a `link` that fails for any other reason | 3, and the staged copy is kept as the evidence |
+| a destination that already exists, explicitly | 3, that file unchanged |
+
+The destination's parent is resolved and its last component is not, so a symlink named as the
+output cannot redirect an analysis onto a foreign path.
+Publication is a `link`, which is the one creation call that refuses an existing name atomically,
+so there is no window between checking and writing for a second writer to be lost in.
+Only this run's own staging file is ever removed, and only after the bytes are published.
+
+## What a receipt can and cannot claim about its own code
+
+The provenance block used to carry a `source_head` read from the nearest git checkout.
+That is not where the analysis came from.
+It recorded this lease's HEAD while the analyser was some commits ahead, so it attributed the result
+to code that did not produce it.
+
+- `analyser_sha256` is authoritative: the sha256 of the script that actually ran.
+- `analyser_revision` is a commit only when the blob HEAD records for this path is the same object
+  as the script on disk, and `UNKNOWN` otherwise: an unrelated checkout, an edited script, or no
+  repository at all.
+- `ambient_checkout` carries the checkout with its head and says in the block itself that it is not
+  the origin of the analysis.
+- The `source_head` field is gone, and a named check fails if it ever comes back.
+
+A reconciliation is a fresh reading of preserved records, so it also carries the sha256 of every
+input it read, which is what makes two readings of the same run distinguishable.
+
+## The checks no longer need a developer machine
+
+Seven of the previous checks were collected but skipped unless the gitignored tool cache happened to
+exist, which meant the writer was untested in a clean tree and a green run did not say so.
+They now build their own copy of a tracked fixture and none of them can skip for want of a cache.
+
+`bench/pjdfstest-fixture/` holds the record set of the receipted run `20261005T025742Z`, byte for
+byte: the ten transcripts, the identity receipt, and the ten case records whose only edit is the
+raw path, made relative so the fixture is portable.
+Each record's `raw_sha256` still verifies.
+It also holds the five upstream case scripts those records name, and the harness pins each of them
+by the sha256 it has in the pinned commit, so a closure whose bytes moved is refused rather than
+trusted.
+
+What the fixture is not, stated in its own README: it is not new filesystem evidence, it is not
+acceptance, and it is not a substitute for the live receipt.
+The transcripts were captured once, on 2026-10-05, and the live run directory remains the source of
+truth.
+
+Counts from this repair:
+
+- 56 checks in `bench/test_pjdfstest.py`, none skipped, ruff and py_compile clean
+- 92 checks from `python3 -m unittest discover -s bench` in a clean copy of the tracked files with
+  no `bench/out` and no `.git`: all pass, no skips. 56 are this lane's and 36 belong to
+  `bench/test_gates.py`, which another lane owns
+- 17 checks in the writer and classification class, run as written, reversed, in three seeded
+  shuffles, and each alone in its own process: no failures and no order coupling
+- the two classification checks fail against the previous source in a tree with no cache, one with
+  exit 0 and one with `PASS`, so they test the gate rather than the machine it ran on
+
 ## What the harness now refuses
 
 A verdict is a conclusion about the filesystem, so anything that would make it a conclusion about
@@ -347,7 +458,9 @@ success and then reads back an answer it did not ask for.
 
 ```sh
 # Re-derive the historical verdict from the preserved records. No mount, no daemon, no build.
-python3 bench/pjdfstest.py --reconcile bench/out/ready-g3/run/20261005T004337Z
+# The pinned scripts are a prerequisite, so they are named; the default is only a convenience.
+python3 bench/pjdfstest.py --reconcile bench/out/ready-g3/run/20261005T004337Z \
+  --tool bench/out/ready-g3/tool/pjdfstest --output /tmp/g3-004337.json
 
 # A small matched run. The whole invocation holds the shared Mac lock.
 rtk proxy python3 -c 'import fcntl,os,subprocess,sys,time; p=sys.argv[1]; os.makedirs(os.path.dirname(p),exist_ok=True); f=open(p,"a"); until=time.monotonic()+600
@@ -359,9 +472,15 @@ while True:
 sys.exit(subprocess.run(sys.argv[2:]).returncode)' /Users/zeeshanhaque/Projects/cowfs/.treehouse-ready-wave/mac-heavy.lock \
   python3 bench/pjdfstest.py --tests mkfifo/00.t,open/17.t,mkdir/00.t,rmdir/12.t,unlink/14.t
 
-# The comparator's own checks, all synthetic fixtures.
+# The comparator's own checks. 56 of them, none of which needs the tool cache or a mount.
 python3 bench/test_pjdfstest.py
+python3 -m unittest discover -s bench
+
+# The bounded spike that found the false PASS, in both directions.
+SPIKE_WITHOUT_TOOL_EXIT=3 python3 bench/out/pjdfstest-fresh-clone-spike/spike.py
 ```
 
 The curated repair evidence, with per-number provenance, is in
 `docs/verification/evidence/pjdfstest-g3-repair.md`.
+The spike that found the false PASS is written up in
+`docs/verification/evidence/pjdfstest-g3-spike.md`.

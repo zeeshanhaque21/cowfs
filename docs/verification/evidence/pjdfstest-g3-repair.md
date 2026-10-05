@@ -213,6 +213,87 @@ recoverable and are not reconstructed.
 Their file times, 20:06 to 20:07 against capture times of 17:51, 19:25 and 19:57, are what shows the
 rewrite rather than an original write.
 
+## A false PASS, found by spike before the next patch
+
+| number | source |
+| --- | --- |
+| exit 1 with 25 established and 26 unpairable, 5 of 5 profiles | `bench/out/pjdfstest-fresh-clone-spike/spike-finding-old.json`, `with_tool_exit` and `with_tool_established` |
+| exit 0 PASS with 0 of 5 profiles and 170 unpairable | the same file, `old_without_tool_exit` 0 and `old_without_tool_state` PASS |
+| exit 3 INVALID with 0 of 5 profiles, kinds coverage and integrity | `spike-finding.json`, `without_tool_exit` 3, `matches_expectation` true |
+| direct `verdict(tests_root=None)` INVALID 3 | the same file, `direct_without_tool` |
+| the copied record set hashes `eb2ff124` on the original, `8c6dea69` in the copy | recomputed at each spike run, printed by it |
+| the original run's `cases.jsonl` still `eb2ff124` after every spike and every check | printed by the spike and re-verified after each direct CLI run |
+
+The spike's oracle is literal: the expected exits, the expected count of established regressions
+and the raw stream count are written into it by hand, and the only thing imported from the harness
+is the call whose behaviour is in question.
+The copied run's ten raw paths were re-pointed at the copy's own files, whose bytes are identical,
+so each recorded `raw_sha256` still verifies and the original run was never written to.
+The spike ran first, reproduced the false PASS three ways, and only then was the harness changed.
+
+Both classification checks were then run against the previous source in a tree with no tool cache
+and no `.git`, so nothing about the machine's cache could make them pass:
+
+| check | previous source | this source |
+| --- | --- | --- |
+| a reconciliation without the pinned scripts must not read as a pass | failed, exit 0 | passes, exit 3 |
+| `verdict` without the pinned scripts must refuse before classifying | failed, `PASS` | passes, `INVALID` |
+
+## Refusals, all of them typed
+
+Every line here is a check that spawns the CLI and reads the real exit status.
+
+| condition | exit | evidence it leaves |
+| --- | --- | --- |
+| default destination exists | 3 | the input's every file hash unchanged, sentinel byte for byte |
+| explicit destination inside the run | 3 | `cases.jsonl` unchanged |
+| explicit destination naming a raw stream | 3 | that stream unchanged |
+| live symlink as destination | 3 | the link is still a link, the foreign target unchanged |
+| dangling symlink as destination | 3 | nothing created at the link's target |
+| parent directory absent | 3 | `could not be staged`, no traceback |
+| parent is a file | 3 | `could not be staged`, the file unchanged, no traceback |
+| parent without write permission | 3 | nothing written, no staging file left, no traceback |
+| `link` failing for another reason | 3 | the staged copy kept, named in the message |
+| explicit destination already existing | 3 | that file unchanged |
+| run with no identity receipt | 3 | `no runtime identity was supplied` |
+| pinned source that is not the pinned commit | 3 | `is not the pinned blob`, nothing written |
+| no pinned source at all | 3 | `nothing was classified and nothing was written` |
+| the pinned closure present and honest | 1 | 25 established, 26 unpairable, one divergence reason |
+
+Real exits from the CLI over the receipted run itself, whose bytes were unchanged afterwards:
+default destination 3, fresh destination outside the run 1 with 25 established and 26 unpairable, a
+tool directory that is not a checkout 3.
+
+## Receipts bind their own bytes
+
+| field | source | failure mode it closes |
+| --- | --- | --- |
+| `analyser_sha256` | the script that ran | none, this is the fact |
+| `analyser_revision` | only when the blob HEAD records for the path is the script on disk | `UNKNOWN` for an unrelated checkout, an edited script or no repository |
+| `ambient_checkout` | the nearest checkout, labelled not the origin of the analysis | a reader mistaking it for provenance |
+| `inputs` | sha256 of every file the analysis read | two readings of one run looking like one |
+
+`source_head` was removed and a check fails if it returns.
+Against the receipted run at this head the block reads `UNKNOWN` for the revision with the lease's
+HEAD `22340a9` in the ambient block, because the working tree is ahead of its own commit, which is
+exactly the attribution the old field got wrong.
+
+## The checks, and the machines they ran on
+
+| check | source | result |
+| --- | --- | --- |
+| `python3 bench/test_pjdfstest.py` | this lane | 56 checks, exit 0 |
+| `python3 -m unittest discover -s bench` in a copy of the tracked files with no `bench/out` and no `.git` | this lane | 92 checks, exit 0, no skips, of which 56 are this lane's and 36 are `bench/test_gates.py` |
+| the writer class as written, reversed, three seeded shuffles, and each check alone | this lane | 17 checks, 0 failures each way, 0 skips |
+| the two classification checks against the previous source | this lane, in a cache-free tree | both fail |
+| `ruff check` on both files | this lane | clean |
+| `python3 -m py_compile` on both files | this lane | clean |
+
+The fixture is 18 files: a README, the identity receipt, ten transcripts, ten records and five
+upstream scripts.
+The five scripts hash to what the pinned commit holds for them, verified against the checkout at
+`85a8aea9` before they were copied.
+
 ## What was not done
 
 - No production source was patched.
