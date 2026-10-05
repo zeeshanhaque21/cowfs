@@ -4,9 +4,9 @@
 //! still stages its own rename through `src/swap.rs`, so nothing outside `cowfs-meta` changes
 //! behaviour. These tests drive `Meta` directly.
 //!
-//! Content is compared through the public content identity meta actually exposes, `chunks` and
-//! `content_version`, rather than through file bytes, because `Snapshot` has no read API: reading is
-//! `chunks` plus the store, and `chunks` is the fingerprint a rename must not disturb.
+//! Most cases compare content through the public content identity meta actually exposes, `chunks`
+//! and `content_version`, because `Snapshot` has no read API. One case goes further and reads real
+//! `cowfs-store` bytes back through those chunks, so the rename is checked against data.
 //!
 //! What has to hold, and is asserted rather than assumed:
 //!
@@ -482,4 +482,189 @@ fn a_rename_frees_the_old_name_and_keeps_the_new_one_busy() {
     m.rename_snapshot(id, "renamed").unwrap();
     let e = m.rename_snapshot(reused.id(), "renamed").unwrap_err();
     assert!(matches!(e, Error::SnapshotExists), "{e:?}");
+}
+
+/// Real `cowfs-store` bytes, not a metadata fingerprint.
+///
+/// The other pending-tree case reads the row and the tree. This one reads data: bytes are ingested
+/// into a real store, attached through the public `set_content`, and read back block by block after
+/// the snapshot was renamed, dropped and reopened. Every block must still be in the store and every
+/// byte must come back identical, so a rename that leaves the row on the wrong root cannot pass by
+/// returning plausible metadata.
+///
+/// The body is deliberately larger than one maximum chunk so the survivor check is not a single
+/// block in disguise.
+#[test]
+fn a_rename_keeps_real_file_bytes_readable_after_a_drop_and_reopen() {
+    const BODY_LEN: usize = 512 * 1024;
+
+    let dir = tempfile::tempdir().unwrap();
+    let meta_path = dir.path().join("m.redb");
+    let store_path = dir.path().join("store");
+
+    // Deterministic and irregular, so content-defined chunking has real boundaries to find.
+    let body: Vec<u8> = (0..BODY_LEN)
+        .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9) >> 24) as u8)
+        .collect();
+
+    let store =
+        cowfs_store::Store::open(&store_path, cowfs_store::Options::default()).expect("open store");
+    let m = Meta::open(&meta_path, opts_pending()).unwrap();
+
+    let s = m.new_snapshot("snap").unwrap();
+    let id = s.id();
+
+    // Bytes land in the store before metadata references them, which is the order a writer uses.
+    let chunks = store.ingest_bytes(&body).expect("ingest the body");
+    assert!(
+        chunks.len() > 1,
+        "the body must chunk into more than one block, got {}",
+        chunks.len()
+    );
+    store.sync().unwrap();
+
+    s.batch(|tx: &mut Tx| {
+        let f = tx.create(ROOT_INO, b"payload", 0o644)?;
+        tx.set_content(f.ino, &chunks, body.len() as u64)?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Durable root first, so the pending write below has an old root to differ from.
+    m.sync().unwrap();
+    let old_root = *s.info().unwrap().root.as_bytes();
+
+    // One applied operation, not synced: below the default threshold, so the tree stays dirty and
+    // the rename is the next durable commit.
+    s.create(ROOT_INO, b"pending", 0o644).unwrap();
+
+    m.rename_snapshot(id, "renamed").unwrap();
+
+    drop(s);
+    drop(m);
+
+    let again = Meta::open(&meta_path, opts_pending()).unwrap();
+    let reopened = again
+        .snapshot("renamed")
+        .expect("the renamed snapshot must reopen with a readable root");
+    let f = reopened
+        .lookup(ROOT_INO, b"payload")
+        .expect("the file must survive the rename and the reopen");
+
+    let after = reopened.chunks(f.ino).expect("chunks must still resolve");
+    assert_eq!(
+        after.len(),
+        chunks.len(),
+        "the rename must not change how many blocks the file is made of"
+    );
+    let covered: u32 = after.iter().map(|c| c.len).sum();
+    assert_eq!(
+        covered as usize,
+        body.len(),
+        "the chunk lengths must still cover the original body exactly"
+    );
+
+    let mut read_back = Vec::new();
+    for (i, c) in after.iter().enumerate() {
+        assert_ne!(
+            c.id,
+            cowfs_store::BlockId::of(b""),
+            "chunk {i} must not be a placeholder id"
+        );
+        assert!(
+            store.contains(c.id),
+            "chunk {i} must still be in the store after the rename"
+        );
+        assert_eq!(
+            c.id, chunks[i].id,
+            "chunk {i} must be the same block, not a rewritten one"
+        );
+        read_back.extend_from_slice(&store.get(c.id).expect("the block must still read"));
+    }
+
+    assert_eq!(
+        read_back,
+        body,
+        "every byte must come back identical through the renamed snapshot's root"
+    );
+    again
+        .check()
+        .expect("check after a rename that kept real bytes readable");
+    assert_ne!(
+        again.snapshots().unwrap()[0].root.as_bytes(),
+        &old_root,
+        "the committed row must carry the flushed root, not the pre-flush one"
+    );
+}
+
+/// A rename whose old root is still shared with a fork.
+///
+/// Here the pre-flush root has a second referrer, so the transaction only decrements it and never
+/// frees the tree. A stale row therefore does not surface as a missing node the way it does in the
+/// unshared case; it surfaces as stale content, because the renamed snapshot would still be missing
+/// the write that was pending when it was renamed. The fork also has to survive untouched.
+#[test]
+fn a_rename_of_a_dirty_snapshot_keeps_a_forked_old_root_live_and_the_renamed_one_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.redb");
+    let m = Meta::open(&path, opts_pending()).unwrap();
+
+    let base = m.new_snapshot("base").unwrap();
+    let base_id = base.id();
+    write_files(&base, 2);
+    m.sync().unwrap();
+    let base_root = *base.info().unwrap().root.as_bytes();
+
+    // A fork is a second row on the same root, which is what keeps the old tree alive below.
+    let forked = base.fork("forked").unwrap();
+    assert_eq!(
+        forked.info().unwrap().root.as_bytes(),
+        &base_root,
+        "the fork must start on the base root"
+    );
+
+    // Dirty only the base, so the fork stays on the old root and the base does not.
+    base.create(ROOT_INO, b"pending", 0o644).unwrap();
+
+    m.rename_snapshot(base_id, "renamed").unwrap();
+
+    drop(base);
+    drop(forked);
+    drop(m);
+
+    let again = Meta::open(&path, opts_pending()).unwrap();
+
+    // The fork is not the rename target and must be exactly as it was.
+    let f = again
+        .snapshot("forked")
+        .expect("the fork must still be readable after the base was renamed");
+    assert_eq!(
+        f.info().unwrap().root.as_bytes(),
+        &base_root,
+        "the fork keeps the old root, which the rename only decremented"
+    );
+    assert!(
+        f.lookup(ROOT_INO, b"f0").is_ok(),
+        "the fork's own content must be intact"
+    );
+    assert!(
+        f.lookup(ROOT_INO, b"pending").is_err(),
+        "the fork must not gain the write that was pending on the base"
+    );
+
+    // The renamed base carries the flushed root, and with it the write that was pending.
+    let renamed = again
+        .snapshot("renamed")
+        .expect("the renamed base must reopen with a readable root");
+    assert!(
+        renamed.lookup(ROOT_INO, b"pending").is_ok(),
+        "the renamed base must carry the write that was pending when it was renamed"
+    );
+    assert!(
+        renamed.lookup(ROOT_INO, b"f0").is_ok(),
+        "the renamed base must keep the content it already had"
+    );
+    again
+        .check()
+        .expect("check after a rename with a live forked root");
 }

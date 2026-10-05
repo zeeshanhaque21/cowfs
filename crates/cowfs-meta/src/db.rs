@@ -602,7 +602,18 @@ impl Inner {
                         // the snapshot's tree, its inode numbers and any handle already open on it
                         // are untouched, and a name held by another snapshot is refused above.
                         let e = s.snaps.get(id).ok_or(Error::NoSuchSnapshot)?;
+                        // The flush loop above may have written this snapshot's dirty tree and
+                        // moved its root, while this session copy still holds the pre-flush root.
+                        // Resolve the root through new_roots the way Extra::Add does, or this
+                        // insert writes the pre-flush root back over the flushed one and the
+                        // freed tree's successor is unreachable from the row.
+                        let root = new_roots
+                            .iter()
+                            .find(|(i, _)| i == id)
+                            .map(|(_, r)| *r)
+                            .unwrap_or(e.info.root);
                         let mut info = e.info.clone();
+                        info.root = root;
                         info.name = (*name).to_string();
                         snaps.insert(id.0, encode_snap(&info).as_slice())?;
                         names.remove(e.info.name.as_str())?;
