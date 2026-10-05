@@ -18,9 +18,13 @@ Tracked source state at this head:
 | item | sha256 |
 | --- | --- |
 | `Cargo.lock` (tracked, committed) | `0b47cb02a7fe7f6bdf0447286e512d43fae04201df8f3a7e93e97833d45696b9` |
-| `crates/cowfs-fuse/tests/coherence.rs` | `88577bfdf0ba5c917c9ca3ea64e3f91170d1b908577cf1065d489bb3730dd213` |
+| `crates/cowfs-fuse/tests/coherence.rs` | `559147ca8708e6160dbf879895cd1b725fd41cf0f8c9b02464060b393e2604ed` |
 | `crates/cowfs-fuse/tests/conformance.rs` | `7c0c72fc3cd7e9b9299e0c4063474ad8cdb2ca67d98f60bbe4d06a7679b92213` |
 
+`coherence.rs` differs from the first commit `45fcebff` (`88577bfd...`) in comments only: with every
+`//`, `//!` and blank line stripped, both revisions hash to
+`8f505571542a84b75b6c4d7f17af7430a1f56f4ff69f7dc042603f232adac829`, 8753 bytes each. The test logic
+is unchanged, so the mutation and run results below describe the same code.
 `conformance.rs` is byte-identical to base `46b0f26`, so the pre-existing `fd5ec1f` skip is unchanged
 and this PR adds no skip, retry or serialization.
 
@@ -84,6 +88,11 @@ VERDICT=PASS (rc=0, 4 tests executed and passed)
 The old green result carried no coverage. `--ignored` is now removed from the test's doc comment,
 which also states to assert `running 4 tests` before trusting a green result from this target.
 
+Those `VERDICT=` lines are transcript text, not a committed verifier.
+No check in the branch asserts the executed test count and no CI step does either, so this is
+documented, operator-checked guidance rather than an enforced gate, and the `--ignored` trap remains
+live for a future edit.
+
 ## F3: rate withdrawn, each figure attributed to its own experiment
 
 The repository's own check has no read counter and its per-rep read count is time-capped, so its
@@ -144,6 +153,9 @@ Every exit code was 0. Three of six reps tore. Any result read from that exit co
 
 Each writer's single 4 KiB block write replaced by two half-block writes carrying two different values
 from that writer's own sequence, then rebuilt and run.
+This run was performed at commit `45fcebff5eabdbe97766659cb0c929571f08b17f` on binary
+`coherence-a198afafd2e72431`, so the `88577bfd...` hashes below are that commit's source, not the
+current tracked `559147ca...`.
 
 ```
 baseline: coherence.rs sha256 88577bfdf0ba5c917c9ca3ea64e3f91170d1b908577cf1065d489bb3730dd213
@@ -169,10 +181,16 @@ both the mount and the `Core` and reopening the store fresh.
 ## Lint
 
 ```
-cargo clippy -p cowfs-fuse --all-targets                     -> rc 0, no cowfs-fuse or coherence.rs warning
-cargo clippy -p cowfs-fuse --all-targets -- -D warnings       -> rc 0 on the owned surface
-cargo clippy --workspace --all-targets -- -D warnings        -> rc 101, cowfs-meta/src/tx.rs:314
+cargo clippy -p cowfs-fuse --all-targets                                  -> rc 0, no cowfs-fuse or coherence.rs warning
+cargo clippy -p cowfs-fuse --all-targets --no-deps -- -D warnings         -> rc 0, owned targets only
+cargo clippy -p cowfs-fuse --all-targets -- -D warnings                    -> rc 101, cowfs-meta in the dependency closure
+cargo clippy --workspace --all-targets -- -D warnings                      -> rc 101, cowfs-meta/src/tx.rs:314
 ```
+
+`--no-deps` is load-bearing for the second line's claim. `-p cowfs-fuse` selects which package's targets
+are the subject, but the dependency closure is still compiled and a trailing `-- -D warnings` applies
+to everything compiled, so without `--no-deps` that command reports on `cowfs-meta` too and says
+nothing about this crate alone. Only the `--no-deps` form is a statement about the owned surface.
 
 The workspace-wide `-D warnings` failure is one file, `crates/cowfs-meta/src/tx.rs:314`,
 `clippy::collapsible_match`, unmodified at base and owned by the #42 lane. It fires on rustc/clippy

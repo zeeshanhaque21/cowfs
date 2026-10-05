@@ -92,6 +92,11 @@ The oracle fired, named the block and the mixed bytes.
 Source was restored from the pristine bytes, rebuilt, and re-run: 4 passed, and the restored source
 hash equals the pre-mutation hash `88577bfdf0ba5c917c9ca3ea64e3f91170d1b908577cf1065d489bb3730dd213`.
 
+This mutation run was performed at commit `45fcebff5eabdbe97766659cb0c929571f08b17f` on binary
+`coherence-a198afafd2e72431`, which is why `88577bfd...` appears here.
+That is the first commit's hash, not the current tracked one; see "F4: source identity" for the
+current value.
+
 ## F1: the branch now builds under `--locked`
 
 Adding `cowfs-core` to `crates/cowfs-fuse`'s dev-dependencies required a `Cargo.lock` refresh that
@@ -133,7 +138,12 @@ was not a property of any committed state.
 It is now a tracked artifact and legitimately part of the source identity.
 
 - tracked `Cargo.lock` at this head: `0b47cb02a7fe7f6bdf0447286e512d43fae04201df8f3a7e93e97833d45696b9`
-- `coherence.rs`: `88577bfdf0ba5c917c9ca3ea64e3f91170d1b908577cf1065d489bb3730dd213`
+- `coherence.rs`: `559147ca8708e6160dbf879895cd1b725fd41cf0f8c9b02464060b393e2604ed`
+
+The `coherence.rs` change from the first commit to this head is comments only: stripping every `//`
+and `//!` line and every blank line from both revisions leaves byte-identical bodies, sha256
+`8f505571542a84b75b6c4d7f17af7430a1f56f4ff69f7dc042603f232adac829`, 8753 bytes each.
+So the test logic is unchanged and the earlier mutation and run results still describe the same code.
 
 Binary digests are build-specific and are not reproducible proof of a source revision; each is
 labelled with the build it came from in the evidence file.
@@ -161,6 +171,11 @@ VERDICT=PASS  (rc=0, 4 tests executed and passed)
 The old "4 passed" result in the earlier document therefore could not have come from the command it
 printed. The flag is removed from the doc comment, and the correct invocation asserts test
 *discovery*, not just a green exit code.
+
+The `VERDICT=` lines above are transcript text from a manual run, not a committed verifier: nothing in
+the branch asserts the executed test count, and no CI step does either.
+So this is documented, operator-checked guidance, not an enforced gate, and the trap is still live: a
+future edit that reintroduces `--ignored` would again produce a silent green.
 
 ## F8: the conformance harness's exit code lies, so results are parsed from its output
 
@@ -203,7 +218,6 @@ No timing or quiet-performance claim is made.
 | experiment | filesystem | source of the number | reps | result |
 | --- | --- | --- | --- | --- |
 | repository's own check body, unskipped, builder | tmpfs | `FAIL` line count, no read counter exists | 40 | 11 reps tore, 7 distinct offsets |
-| repository's own check body, unskipped, builder | tmpfs | same | 40 | reported alongside the above |
 | repository's own check body, unskipped, independent reviewer | ext4 | same | 40 | 17 reps tore, 11 distinct offsets |
 | repository's own check body, unskipped, this revision | ext4 | `FAIL` line count | 6 | 3 reps tore, offsets 4096 and 12288 |
 | `coherence.rs` native arm, counting harness | tmpfs | the test's own read counter | 20 | 2 tears in 120000 reads |
@@ -265,8 +279,13 @@ different denominators and are not folded together.
   It is unmodified at base and belongs to the #42 lane, which owns the other Core/meta API residuals.
   It is a toolchain-version finding, not a repo breakage: main's CI is green.
   I did not edit it.
-- Under `-D warnings` restricted to my own surface, `cargo clippy -p cowfs-fuse --all-targets`
+- Restricted to my own targets, `cargo clippy -p cowfs-fuse --all-targets --no-deps -- -D warnings`
   exits 0 and emits no warning from `cowfs-fuse` or `coherence.rs`.
+  `--no-deps` is required for that claim to be true of the command as printed: `-p` alone selects
+  which package's targets are the subject but still builds the dependency closure, and a trailing
+  `-- -D warnings` applies to everything compiled, so `cargo clippy -p cowfs-fuse --all-targets --
+  -D warnings` exits 101 on `cowfs-meta` rather than reporting on this crate alone.
+  Without `--no-deps` that command is not a statement about my surface at all.
   The workspace-wide `-D warnings` failure is entirely that one dependency file.
   Reporting the workspace default as if it were `-D warnings` would be a false pass, so both numbers
   are given.
