@@ -57,8 +57,7 @@ fn fixture_root() -> PathBuf {
     std::env::temp_dir()
 }
 
-/// A measured flake in this file, and five fixes that did not hold it down. Read before changing
-/// this fixture.
+/// The failure this fixture used to have, and why it writes the way it does. Read before changing it.
 ///
 /// On the Linux host used for issue 17 (kernel 6.12, `/tmp` on tmpfs, several other agents' toolchains
 /// running on the same machine), running this test binary repeatedly at 8 test threads fails
@@ -83,14 +82,18 @@ fn fixture_root() -> PathBuf {
 /// |---|---|
 /// | write then exec, `posix_spawn`, 8 threads, on tmpfs | 40 / 1600 |
 /// | write then exec, `posix_spawn`, 8 threads, on ext4 | 73 / 1600 |
-/// | write then exec, `fork` + `exec`, 8 threads | 1 / 1600 |
 /// | exec only, no write at all, `posix_spawn`, 8 threads | 0 / 1600 |
 /// | exec only, no write at all, `posix_spawn`, 1 thread | 0 / 400 |
+/// | write-open and close, zero bytes written, then exec, 8 threads | 4 / 3200 |
+/// | write-open and close by a waited-for child, then exec, 8 threads | 0 / 3200 |
 ///
-/// So it needs all three: a write to the file, concurrency, and the `posix_spawn` path glibc uses
-/// when Rust's `Command` has nothing to intercept. It is not the filesystem, it is not the shebang,
-/// and it is not the loader: a statically linked binary with no interpreter or libraries fails the
-/// same way and a differently shaped one fails more often.
+/// It needs two of them together: a write-open of that file, and concurrency. It is not the
+/// `posix_spawn` path, because forcing `fork` + `exec` fails the same, 2 / 400 against 4 / 400.
+/// Publishing by `rename` does not help either, 3 / 400, so the inode being exec'd was never open
+/// for write and the refusal is not a writer this test can see. Serialising these tests does not
+/// help, 4 / 150, because one test execs its own stub twice, back to back. It is not the
+/// filesystem, not the shebang and not the loader: a statically linked binary with no interpreter
+/// or libraries fails the same way and a differently shaped one fails more often.
 ///
 /// Two earlier claims in this comment were wrong and are withdrawn. The write handle was not ruled
 /// out, because the probe mode labelled "no write in the loop" created a fresh directory and wrote
@@ -99,28 +102,226 @@ fn fixture_root() -> PathBuf {
 /// the moment of each failure no process holds the file open and no write-mode descriptor on the box
 /// is a library or an executable.
 ///
-/// What is left is a characterisation, not a mechanism. The layer the evidence points at is the spawn
-/// call, `CLONE_VM|CLONE_VFORK` under concurrent spawns on this kernel, and this file's tests and the
-/// product's `run_build` both go through it. Nothing here establishes that as the kernel's reason, so
-/// no fix is claimed.
+/// What is left is a characterisation, not a mechanism, and none is claimed. The write-open on that
+/// inode is still in flight when the exec lands, which is consistent with every row above and was
+/// inferred from them, not observed. No kernel behaviour is claimed either. The product is not
+/// implicated: `run_build` is right to report a helper it cannot exec, and this is a fixture defect.
 ///
-/// This is deliberately not `#[ignore]`d, not retried, not given a longer timeout, and not worked
-/// around with a global serial harness. All four were ruled out by the brief and none would address
-/// an unexplained kernel answer. The flake is reported instead, with the numbers above, because
-/// claiming it fixed would be false: it was not fixed here.
+/// So the bytes go to a short-lived child and the parent waits for it, because process exit releases
+/// the write-open. Nothing is retried, serialised, slept, ignored or accepted as an error.
+/// `write_stub_is_safe_under_concurrent_exec` is the control, `#[ignore]`d because it spawns
+/// thousands of processes.
 ///
-/// Writes an executable stub, closing the write handle before anything exec's it.
+/// Writes an executable stub from a short-lived child, and does not return until that child is gone.
+///
+/// The bytes go over stdin and the path is a positional argument, so nothing a caller supplies is
+/// ever shell source. The parent holds no descriptor on the target once the pipe is dropped, and the
+/// wait cannot outlive the child: `cat` reads to end of input and then exits.
 fn write_stub(path: &Path, body: &str) {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    {
-        let mut f = std::fs::File::create(path).expect("create the stub");
-        f.write_all(body.as_bytes()).expect("write the stub");
-        f.flush().expect("flush the stub");
-    }
+
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cat > \"$1\"")
+        .arg("stub-writer")
+        .arg(path.as_os_str())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the stub writer");
+    let mut pipe = child.stdin.take().expect("the stub writer takes a pipe");
+    let written = pipe.write_all(body.as_bytes());
+    drop(pipe); // the write end closes here, which is what lets `cat` reach end of input
+    let out = child.wait_with_output().expect("wait for the stub writer");
+    // The status is checked before the write result, so a writer that could not open the file
+    // reports the shell's own message instead of a bare broken pipe.
+    assert!(
+        out.status.success(),
+        "the stub writer exited {:?}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    written.expect("the stub writer took every byte");
+    assert_eq!(
+        std::fs::read(path).expect("read the stub back"),
+        body.as_bytes(),
+        "the stub on disk is not the bytes that were written"
+    );
     #[cfg(unix)]
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod the stub");
+    {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the stub");
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("stat the stub")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755,
+            "the stub is not executable"
+        );
+    }
+}
+
+/// The stub on disk is exactly the bytes given, and it is executable, once the writer has exited.
+#[test]
+fn a_stub_is_byte_exact_and_executable_after_the_writer_exits() {
+    let t = Tmp::new("writer-bytes");
+    let p = t.dir("bin").join("ns-stub");
+    let body = "#!/bin/sh\nexit 0\n";
+    write_stub(&p, body);
+    assert_eq!(
+        std::fs::read(&p).expect("read the stub"),
+        body.as_bytes(),
+        "the bytes are verbatim"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&p)
+                .expect("stat the stub")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755,
+            "the stub is executable"
+        );
+    }
+    assert!(
+        Command::new(&p).status().expect("exec the stub").success(),
+        "and it runs"
+    );
+}
+
+/// A path is a path. Spaces, a quote, a glob and a substitution are characters in a filename,
+/// because the path is an argument and never part of the command: had it been pasted into the
+/// command, `$(exit 3)` would have made the redirect fail and `write_stub` would have panicked
+/// before this assertion was reached.
+#[test]
+fn a_stub_path_is_never_shell_source() {
+    let t = Tmp::new("writer-path");
+    let dir = t.dir("bin ' quote; * $(exit 3)");
+    let p = dir.join("ns-stub");
+    write_stub(&p, "#!/bin/sh\nexit 0\n");
+    assert!(p.exists(), "the stub is at the literal path {p:?}");
+    assert!(
+        Command::new(&p).status().expect("exec the stub").success(),
+        "and it runs"
+    );
+}
+
+/// Arbitrary bytes survive the pipe. The first body carries a NUL and is checked for round trip only,
+/// because a shell is not required to read a NUL as an ordinary byte. The second carries shell
+/// metacharacters and non-ASCII text, and is executed as well.
+#[test]
+fn arbitrary_stub_bytes_survive_the_pipe() {
+    let t = Tmp::new("writer-bytes-arbitrary");
+    let p = t.dir("bin").join("ns-stub");
+    let with_nul = "#!/bin/sh\n# \0 a\0b\nexit 0\n";
+    write_stub(&p, with_nul);
+    assert_eq!(
+        std::fs::read(&p).expect("read the stub"),
+        with_nul.as_bytes(),
+        "a NUL round trips byte for byte"
+    );
+
+    let body =
+        "#!/bin/sh\n# ' \" $ ` \\ * ? | & ; > < ( ) { } [ ] ~ #! \u{e9}\u{4e2d}\u{6587}\nexit 0\n";
+    write_stub(&p, body);
+    assert_eq!(
+        std::fs::read(&p).expect("read the stub"),
+        body.as_bytes(),
+        "metacharacters round trip byte for byte"
+    );
+    assert!(
+        Command::new(&p).status().expect("exec the stub").success(),
+        "and a stub carrying them still runs"
+    );
+}
+
+/// A writer that cannot create the file must fail the test: never leave a stub behind for a later
+/// exec to run, and never report success.
+#[test]
+fn a_stub_the_writer_cannot_create_is_refused() {
+    let t = Tmp::new("writer-refused");
+    let p = t.0.join("no-such-directory").join("ns-stub");
+    let refused = std::panic::catch_unwind(|| write_stub(&p, "#!/bin/sh\nexit 0\n"))
+        .expect_err("a writer that cannot create the file must not pass");
+    let message = refused
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or("a non-string panic");
+    assert!(
+        message.contains("stub writer"),
+        "the failure names the writer, so a silent stub is impossible: {message}"
+    );
+    assert!(!p.exists(), "nothing may be left behind at {p:?}");
+}
+
+/// The control for the failure this fixture used to have, at the seam that had it: many threads each
+/// writing their own stub through `write_stub` and exec'ing it. Ignored by default because it spawns
+/// thousands of processes; run it with `--ignored` when changing how a stub is written.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "spawns thousands of processes; opt in with --ignored"]
+fn write_stub_is_safe_under_concurrent_exec() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    let threads = 8;
+    let rounds = 400;
+    let t = Tmp::new("writer-concurrent");
+    let execs = Arc::new(AtomicUsize::new(0));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(threads));
+    let mut handles = Vec::new();
+    for i in 0..threads {
+        let root = t.0.clone();
+        let execs = Arc::clone(&execs);
+        let refused = Arc::clone(&refused);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            let dir = root.join(format!("t{i}"));
+            std::fs::create_dir_all(&dir).expect("the thread directory");
+            let stub = dir.join("ns-stub");
+            barrier.wait();
+            for _ in 0..rounds {
+                write_stub(&stub, "#!/bin/sh\nexit 0\n");
+                match Command::new(&stub).status() {
+                    Ok(s) if s.success() => {
+                        execs.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(s) => panic!("the stub exited {s}"),
+                    Err(e) => {
+                        refused.fetch_add(1, Ordering::SeqCst);
+                        eprintln!("thread {i} could not exec its own stub: {e}");
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        if let Err(panic) = h.join() {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or("a writer thread panicked");
+            panic!("{message}");
+        }
+    }
+    let refused = refused.load(Ordering::SeqCst);
+    let execs = execs.load(Ordering::SeqCst);
+    assert_eq!(
+        refused,
+        0,
+        "{refused} of {} execs were refused after write_stub",
+        execs + refused
+    );
+    assert_eq!(execs, threads * rounds, "every exec must have run: {execs}");
 }
 
 /// A helper that behaves like `scripts/cowfs-ns-run.sh` but records its argv, so the wiring can be
