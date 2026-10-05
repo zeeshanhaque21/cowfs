@@ -1,0 +1,6 @@
+1..3
+not ok 1 - tried 'mkfifo pjdfstest_5cc329e5d094ffaeae09004b99c4de36 0644', expected 0, got EIO
+not ok 2 - tried 'open pjdfstest_5cc329e5d094ffaeae09004b99c4de36 O_WRONLY,O_NONBLOCK', expected ENXIO, got ENOENT
+not ok 3 - tried 'unlink pjdfstest_5cc329e5d094ffaeae09004b99c4de36', expected 0, got ENOENT
+
+--- stderr ---

@@ -1,0 +1,42 @@
+1..36
+ok 1
+not ok 2 - tried 'mkfifo pjdfstest_4f829aef425ef549bc715dea5b72b15b 0755', expected 0, got EIO
+not ok 3 - tried 'lstat pjdfstest_4f829aef425ef549bc715dea5b72b15b type,mode', expected fifo,0755, got ENOENT
+not ok 4 - tried 'unlink pjdfstest_4f829aef425ef549bc715dea5b72b15b', expected 0, got ENOENT
+not ok 5 - tried 'mkfifo pjdfstest_4f829aef425ef549bc715dea5b72b15b 0151', expected 0, got EIO
+not ok 6 - tried 'lstat pjdfstest_4f829aef425ef549bc715dea5b72b15b type,mode', expected fifo,0151, got ENOENT
+not ok 7 - tried 'unlink pjdfstest_4f829aef425ef549bc715dea5b72b15b', expected 0, got ENOENT
+not ok 8 - tried '-U 077 mkfifo pjdfstest_4f829aef425ef549bc715dea5b72b15b 0151', expected 0, got EIO
+not ok 9 - tried 'lstat pjdfstest_4f829aef425ef549bc715dea5b72b15b type,mode', expected fifo,0100, got ENOENT
+not ok 10 - tried 'unlink pjdfstest_4f829aef425ef549bc715dea5b72b15b', expected 0, got ENOENT
+not ok 11 - tried '-U 070 mkfifo pjdfstest_4f829aef425ef549bc715dea5b72b15b 0345', expected 0, got EIO
+not ok 12 - tried 'lstat pjdfstest_4f829aef425ef549bc715dea5b72b15b type,mode', expected fifo,0305, got ENOENT
+not ok 13 - tried 'unlink pjdfstest_4f829aef425ef549bc715dea5b72b15b', expected 0, got ENOENT
+not ok 14 - tried '-U 0501 mkfifo pjdfstest_4f829aef425ef549bc715dea5b72b15b 0345', expected 0, got EIO
+not ok 15 - tried 'lstat pjdfstest_4f829aef425ef549bc715dea5b72b15b type,mode', expected fifo,0244, got ENOENT
+not ok 16 - tried 'unlink pjdfstest_4f829aef425ef549bc715dea5b72b15b', expected 0, got ENOENT
+ok 17
+not ok 18 - tried '-u 65534 -g 65534 mkfifo pjdfstest_4f829aef425ef549bc715dea5b72b15b 0755', expected 0, got 
+not ok 19 - tried 'lstat pjdfstest_4f829aef425ef549bc715dea5b72b15b uid,gid', expected 65534,65534, got ENOENT
+not ok 20 - tried 'unlink pjdfstest_4f829aef425ef549bc715dea5b72b15b', expected 0, got ENOENT
+not ok 21 - tried '-u 65534 -g 65533 mkfifo pjdfstest_4f829aef425ef549bc715dea5b72b15b 0755', expected 0, got 
+not ok 22 - tried 'lstat pjdfstest_4f829aef425ef549bc715dea5b72b15b uid,gid', expected 65534,6553[34], got ENOENT
+not ok 23 - tried 'unlink pjdfstest_4f829aef425ef549bc715dea5b72b15b', expected 0, got ENOENT
+ok 24
+not ok 25 - tried '-u 65533 -g 65532 mkfifo pjdfstest_4f829aef425ef549bc715dea5b72b15b 0755', expected 0, got 
+not ok 26 - tried 'lstat pjdfstest_4f829aef425ef549bc715dea5b72b15b uid,gid', expected 65533,6553[24], got ENOENT
+not ok 27 - tried 'unlink pjdfstest_4f829aef425ef549bc715dea5b72b15b', expected 0, got ENOENT
+ok 28
+not ok 29 - tried 'mkfifo pjdfstest_4f829aef425ef549bc715dea5b72b15b 0755', expected 0, got EIO
+not ok 30
+not ok 31
+not ok 32
+not ok 33
+not ok 34
+not ok 35 - tried 'unlink pjdfstest_4f829aef425ef549bc715dea5b72b15b', expected 0, got ENOENT
+ok 36
+
+--- stderr ---
+stat returned -1
+stat returned -1
+stat returned -1
