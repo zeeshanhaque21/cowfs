@@ -222,18 +222,56 @@ fn readdirplus_asks_the_vfs_for_the_attributes_in_one_call() {
     assert_eq!(vfs.list_attrs.load(Ordering::Relaxed), before);
 }
 
+/// The status a client is told, and that it stops being told once the fault is gone.
+///
+/// The first half is the mapping: a `Vfs` that says "worth repeating" becomes `NFS3ERR_JUKEBOX`.
+///
+/// The second half is the state after the fault is cleared, which is where this test used to carry
+/// `assert!(post.is_none() || true)`. That expression cannot reject any value, and worse, `post` was
+/// not what its name implied: the fourth element of the helper's tuple is the *post-op directory*
+/// attributes, not the object's, and it is always `Some` on an error reply. So the assertion was
+/// `false || true` and was checking nothing at all.
+///
+/// What replaces it is the contract that is actually there and is worth pinning. A retry status is a
+/// consequence of the injected fault, not state the adapter keeps: once the `Vfs` stops asking for a
+/// retry, the same client, on the same connection, must get the truth. An NFS error reply also has to
+/// carry the post-op directory attributes, which is the field the old assertion was aimed at.
+///
+/// Nothing here claims atomicity. `LOOKUP` mutates nothing, and this branch adds no guarantee about
+/// partially applied operations; the barrier and error-precedence guarantees from #90 are asserted
+/// elsewhere and are untouched.
 #[test]
 fn an_error_the_vfs_asks_to_retry_becomes_the_retry_status() {
     let (vfs, _s, mut c) = setup();
     let root = c.root.clone();
     *vfs.fail_with.lock().unwrap() = Some(Error::Retry);
-    let (st, _, _, _) = c.lookup(&root, "anything");
+    let (st, fh, obj, _) = c.lookup(&root, "anything");
     assert_eq!(
         st,
         nfsstat3::NFS3ERR_JUKEBOX as u32,
         "the client must be told to come back, not that the file is missing"
     );
+    assert!(
+        fh.is_none() && obj.is_none(),
+        "a JUKEBOX reply carries no object, so a client cannot mistake it for a hit"
+    );
+
+    // The fault is gone. The retry status must go with it.
     *vfs.fail_with.lock().unwrap() = None;
-    let (_, _, _, post) = c.lookup(&root, "nope");
-    assert!(post.is_none() || true);
+    let (st, fh, obj, dir) = c.lookup(&root, "nope");
+    assert_eq!(
+        st,
+        nfsstat3::NFS3ERR_NOENT as u32,
+        "with the fault cleared an absent name is NOENT, not JUKEBOX: a cached retry status would \
+         tell a client to keep coming back for a name that will never exist"
+    );
+    assert!(
+        fh.is_none() && obj.is_none(),
+        "an absent name has no handle and no attributes"
+    );
+    assert!(
+        dir.is_some(),
+        "an error reply still carries the post-op directory attributes, which is the field the \
+         removed tautology was pointing at and the reason it read as false"
+    );
 }
