@@ -11,7 +11,7 @@ This is not a replay fix and touches no replay code.
 | implementation head | `e9dc1066a5601bde3bcca439d8df71e03c1972ea` |
 | lease | `.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/6/cowfs` |
 | clarification read, sha256 verified | `docs/reviews/pr136-clock-observation-clarification.md`, `965d9c732882aed380df8c5dc4d4365e35a71997d58a621d1be765065f0ba59d` |
-| PR | opened after this record was written; see the pull request link |
+| PR | https://github.com/zeeshanhaque21/cowfs/pull/139 |
 | prior hole-flag branch preserved | `fix/meta-hole-flag-42` at `99bf7a5efd28a80bc024f040efa2ae6fe0ca6c67`, PR #138, untouched |
 | `cde5930` preserved | unchanged |
 
