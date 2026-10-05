@@ -77,6 +77,16 @@ visible, so the caller's retry finds its own work rather than having to undo it,
 ### An error reply does not get to skip the barrier
 
 The barrier is owed as soon as the change exists, not when the reply is a success.
+That includes an RPC that ends in an error after it has already changed something.
+`rmdir` in Hide mode is the case that needs saying out loud: it calls `purge_sidecars`, which
+unlinks real `._name` sidecars, and then retries the `rmdir`.
+If the purge or the retry fails, names have already been removed, so the barrier is still owed even
+though the reply is an error.
+The arm therefore yields a value that goes through `durable_or` rather than propagating with `?`,
+which is the same shape the `create` arms had and the reason the earlier version of them was wrong.
+This is not a measured production loss: no crash measurement reproduced a name lost through that
+path.
+It is a code shape that owes a barrier, fixed on that basis.
 `Vfs::create` has made the name before the attribute step runs, so an attribute step that fails
 must not return early and leave that name queued and unacknowledged: the caller could not tell
 whether the name was there, and if the daemon then died it was not.
@@ -88,8 +98,30 @@ The attribute error reads as "that did not happen", which is a lie about a name 
 the caller would have no way to learn what state the namespace is in.
 The applied change is still not rolled back: a rollback is a second mutation that can fail the same
 way, and the reply says plainly that it did not.
-A refused mutation, by contrast, owes no barrier, because nothing changed.
-`setattr` uses the same helper so a refused `setattr`, which changed nothing, does not pay for one.
+A refused mutation is a different question, and the honest answer is that it still pays a barrier.
+An earlier revision of this document claimed a refusal owes none, because nothing changed.
+That was wrong, in the code and in the prose.
+`durable_or` evaluates the barrier as the first element of the tuple it matches, so a `setattr`
+that ends in an error still runs the full barrier, and an earlier revision of this file said it did
+not.
+The barrier is unconditional on purpose.
+It is not "nothing to do because this RPC changed nothing": it commits whatever the snapshot
+already had queued, so a refusal arriving on top of earlier uncommitted writes still discharges
+them, and a short-circuit would leave those queued writes behind, which is the bug this change
+exists to fix.
+The price is one metadata sync on a refusal, observed around 4.6 ms on the host these numbers came
+from.
+`create` and `create_exclusive` do return before `durable_or` on a refusal, because they refuse
+before anything is mutated, so for those two the old claim happened to hold.
+`a_refused_setattr_still_barriers_what_was_already_queued` in
+`crates/cowfs-nfs/tests/ns_durability.rs` asserts the actual behaviour, so the code and this
+paragraph cannot drift apart again.
+
+The two statuses in that precedence are distinct on the wire, which is what makes it checkable.
+The attribute fault is `PermissionDenied`, which `nfsstat` maps to `NFS3ERR_ACCES`, and the barrier
+fault is `Io`, which maps to `NFS3ERR_IO`.
+With a healthy barrier the caller still receives `NFS3ERR_ACCES` and can tell an attribute problem
+from a durability one; with both failing it receives `NFS3ERR_IO`.
 
 `a_created_name_is_barriered_even_when_the_attribute_step_fails` in
 `crates/cowfs-nfs/tests/ns_durability.rs` records the names the fake `Vfs` was told to create, so it

@@ -8,16 +8,39 @@ not quoted as though they were public.
 
 ## commit
 
+The rows in `results-this-commit.jsonl` were produced at
+
 ```
-c6445476e6c9882e975638f2e6d829a7dd304443
+c6445476e6c9882e975638f2e6d829a7dd304443   2026-10-04T15:58:06-07:00
 ```
 
-`origin/main` was `46b0f269d5bef4a2c204c25f5b3015da601d3beb` when this branch merged it.
-`ceb96c67033cbf97f79267d6af7db3fa204d77d1`, the real merge-base, is an ancestor of this head.
+That is the commit whose barrier call sites the rows exercise, not the current tip.
+The file was first tracked in `02dddf8`, two commits later, so the rows are older than the
+commit that ships them.
+The file's sha256 is `5b89dd986049fd7143796fc2d9ecc886a389b293099b9d0ad03194bac6c703b7`, which is
+what a reader can check it against, since it carries no revision of its own.
+See `repair.md` for what the three repair commits after `02dddf8` changed and what they did not
+re-measure.
+
+## Integration with main
+
+This branch took `main` with a merge, not a rebase.
+The merge is `4142ede4c1dd081b98200af7f64ac528f53e5092`, first parent `82f370b`, second parent
+
+```
+46b0f269d5bef4a2c204c25f5b3015da601d3beb   Merge pull request #95 from zeeshanhaque21/fix/core-model-94
+```
+
+So `git merge-base HEAD origin/main` reports `46b0f26` for as long as `main` stays ahead of that
+merge, which is the commit the integration actually took.
+`ceb96c67033cbf97f79267d6af7db3fa204d77d1` was the branch point with `main` *before* that merge,
+and it is an ancestor of this head.
+An earlier revision of this file called `ceb96c67` "the real merge-base"; that was true before the
+merge commit existed and is wrong after it, because the merge moved the merge-base to `46b0f26`.
 
 ## source-binding
 
-Blob ids at that commit, for the files the receipts depend on.
+Blob ids at `c644547`, for the files the receipts depend on.
 
 | file | blob |
 |---|---|
@@ -30,6 +53,8 @@ Blob ids at that commit, for the files the receipts depend on.
 | `crates/cowfs-core/tests/model.proptest-regressions` | `caadf6bac71585c0fa4cffd95e25ebec34db194f` |
 
 The last two are the issue 94 fix that came from `main`, byte-identical to `main`.
+The `ns.rs` row is `crates/cowfs-core/src/ns.rs`; an earlier revision of this file printed the same
+blob against a `tests/ns.rs` path that does not exist in the tree.
 The elide regression seed `9aa30bfa88a2438194d3b5ae7af55c7e2a59ff8a233abfe1cd0ddbec9d213900` is
 still in `model.proptest-regressions` and still re-run by `cargo test -p cowfs-core --test model`.
 
@@ -120,12 +145,32 @@ it and not the harness looking in the wrong place.
 
 Gitignored, on the machine that produced them, not public proof:
 
-- `bench/out/durability90/results.jsonl`: one line per rep at this commit, appended and flushed
+- `bench/out/durability90/results.jsonl`: one line per rep at `c644547`, appended and flushed
   per rep.
 - `bench/out/durability90-repair/results-baseline.jsonl`: the same harness against the pre-fix
   daemon.
-- `bench/out/durability90-repair/repair-*.log`: one full run per case at this commit.
+- `bench/out/durability90-repair/repair-*.log`: one full run per case at `c644547`.
 - `bench/out/durability90-repair/prefix-*.log`: the same cases against the pre-fix daemon.
 - `bench/out/durability90-repair/gate-*.log`: the CI gate runs, including the two deliberate
   mutations that fail it.
+
+## Receipts that carry their own provenance
+
+`crates/cowfs-daemon/tests/evidence/` was added after the rows above were produced, so
+`results-this-commit.jsonl` cannot carry a revision: it was written before the writer existed.
+Any run made from `21d45f9` onward writes a different shape.
+
+```
+DURABILITY90_ATTEMPT=<label> DURABILITY90_REPS=<n> \
+  cargo test -p cowfs-daemon --test namespace_durability -- --ignored --test-threads=1
+```
+
+That writes `bench/out/durability90/repair/<label>/rows-<label>.jsonl` and
+`manifest-<label>.json` under the gitignored artifacts directory.
+Every row repeats the revision, the git blob of each source file the outcome depends on, and the
+sha256 of both fixture binaries, so a reader of the rows alone is not relying on the manifest having
+been shipped alongside.
+A dirty working tree is recorded as `code-under-test (uncommitted)` with a sha256 of the diff, not
+as committed source.
+See `repair.md`.
 
