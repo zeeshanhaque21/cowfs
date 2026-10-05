@@ -40,10 +40,10 @@ Identity of what produced the numbers:
 | git | `git version 2.56.0` |
 | platform | `macOS-26.6.2-arm64-arm-64bit` |
 | python | 3.12.2 |
-| `cowfs-daemon` | sha256 `6273f72478025d49...` |
-| `cowfs` | sha256 `4da060426e96b555...` |
+| `cowfs-daemon` | sha256 `6273f72478025d49911898d20a67f8bacdc375f2544b34fe6887d2e8e11abfa1` |
+| `cowfs` | sha256 `4da060426e96b555e80fd36b48fcdc1270fd3345cf29c731795ea48dcc148667` |
 | backend | `--backend core`, the real store, not the path backend |
-| evidence | `bench/out/ready-21/20261004T163143-attempt/{log.jsonl,summary.json}` |
+| evidence | `bench/out/ready-21/20261004T173127-attempt/{log.jsonl,summary.json}` |
 
 `log.jsonl` is append-and-flush per record, so the run is inspectable step by step.
 
@@ -153,7 +153,7 @@ a different process than the one that wrote it:
 
 1. private daemon A stopped, SIGTERM to a pid whose argv carried this run's exact store and socket
 2. private daemon B started on **the same store**, new mount, new socket
-3. `cowfs --socket B fsck` → `{"blocks_checked":2672,"bytes_checked":2617430,"ok":true,"problems":[],"snapshots_checked":1}`, rc 0
+3. `cowfs --socket B fsck` → `{"blocks_checked":2672,"bytes_checked":2617453,"ok":true,"problems":[],"snapshots_checked":1}`, rc 0
 4. `git fsck --full` through the fresh mount → rc 0
 5. every tracked worktree file re-read and compared to the mount arm's own post-window state,
    7 checked, 0 bad
@@ -187,10 +187,27 @@ Raw `__getdirentries64` with a harness-chosen buffer, unlinking **every** name a
 the directory shifts completely under the scan.
 This matters because `os.scandir` chooses its own buffer, and a directory that fits one libc buffer
 never makes the kernel resume a scan at all, so the cookie is never exercised.
-Calibration on APFS at 1,200 entries and a 512-byte buffer gives **76 pages**, 1,200 names,
-1,200 unlinked, 0 remaining, which is the proof that the resume really happened rather than an
-inference from a zero.
-The probe is in `cookie_probe_at` and the grid runs as `cookie_sweep`.
+A grid of buffer size against entry count, 16 cells, `pages` counted directly:
+
+| buffer | entries | N pages | M pages | N remaining | M remaining | diverges |
+| --- | --- | --- | --- | --- | --- | --- |
+| 512 | 64 | 5 | 13 | 0 | 0 | no |
+| 512 | 256 | 17 | 52 | 0 | 0 | no |
+| 512 | 1,024 | 65 | 205 | 0 | 0 | no |
+| 512 | 2,500 | 157 | **500** | 0 | 0 | no |
+| 1,024 | 2,500 | 81 | 228 | 0 | 0 | no |
+| 4,096 | 2,500 | 20 | 55 | 0 | 0 | no |
+| 16,384 | 2,500 | 5 | 14 | 0 | 0 | no |
+
+**`pages` is the load-bearing column.**
+The hardest cell is 512 bytes against 2,500 entries: the kernel resumed the scan **500 times over
+the NFS mount**, unlinking every name as it went, and left 0.
+That is the proof the cookie path was actually exercised rather than an inference from a zero.
+The mount takes more pages than APFS because an NFS READDIR reply carries fewer bytes than a local
+`getdirentries` does, so the same entry count costs more round trips, which means more cookie
+resumes.
+Zero divergence in all 16 cells.
+The probe is `cookie_probe_at`, the grid is `cookie_sweep`.
 
 Why I believe the historical result cannot recur without a regression, as source evidence and not
 as a substitute for the probes above:
