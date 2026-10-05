@@ -491,16 +491,91 @@ class CompareRefuses(unittest.TestCase):
             f = self.write(d, "a.jsonl", [{"kind": "meta", "counts": {"big_bytes": 21474836}}, rep(21474836, written_bytes=None, read_bytes=None, read_matches=False)])
             self.assertEqual(self.run_compare([f], f)[0], 3)
 
-    def test_nan_load_is_allowed_but_zero_wall_is_unmeasurable(self):
+    def test_nan_load_is_valid_input_but_cannot_support_a_verdict(self):
+        # gates.py records NaN when getloadavg fails, so NaN stays valid input and must not
+        # become INVALID. It cannot stand in for a load, though: with no finite number recorded
+        # the load precondition is unknown, which is unmeasurable rather than a clean pass.
         nan = float("nan")
         with tempfile.TemporaryDirectory() as d:
             ok = self.write(d, "ok.jsonl", [meta(), {**g1(), "load1_before": nan, "load1_after": nan}])
-            self.assertEqual(self.run_compare([ok], ok)[0], 0)
+            rc, err, out = self.run_compare([ok], ok)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("UNMEASURABLE", out)
+            self.assertNotIn("PASS", out)
+            self.assertNotIn("INVALID", err)
             zero = self.write(d, "zero.jsonl", [meta(), g1(wall=0.0)])
             rc, err, out = self.run_compare([zero], zero)
             self.assertEqual(rc, 2, out)
             self.assertIn("unmeasurable", out)
             self.assertNotIn("PASS", out)
+
+    def test_a_nan_arm_cannot_launder_an_over_ceiling_run(self):
+        # max() is not symmetric on NaN: max(NaN, 31.0) is NaN but max(3.5, NaN) is 3.5,
+        # so the arms are tested rather than the peak. Both orders must be refused.
+        nan = float("nan")
+        with tempfile.TemporaryDirectory() as d:
+            busy = self.write(d, "busy.jsonl", [meta(), {**g1(), "load1_before": 31.0, "load1_after": 31.0}])
+            quiet = self.write(d, "quiet.jsonl", [meta(), {**g1(), "load1_before": 3.5, "load1_after": 3.5}])
+            unreadable = self.write(d, "unreadable.jsonl",
+                                    [meta(), {**g1(), "load1_before": nan, "load1_after": nan}])
+            for native, cowfs, name in ((unreadable, busy, "nan native, busy cowfs"),
+                                        (busy, unreadable, "busy native, nan cowfs"),
+                                        (quiet, unreadable, "quiet native, nan cowfs"),
+                                        (unreadable, quiet, "nan native, quiet cowfs")):
+                rc, _, out = self.run_compare([native], cowfs)
+                self.assertEqual(rc, 2, (name, out))
+                self.assertNotIn("PASS", out, name)
+
+    def test_a_partly_unknown_load_is_not_a_measurement(self):
+        # One unreadable observation leaves the arm's load unknown, so the peak over the samples
+        # that did land is not a measurement and must not certify quality. NaN stays valid input.
+        nan = float("nan")
+        with tempfile.TemporaryDirectory() as d:
+            quiet = self.write(d, "quiet.jsonl", [meta(), {**g1(), "load1_before": 3.5, "load1_after": 3.5}])
+            busy = self.write(d, "busy.jsonl", [meta(), {**g1(), "load1_before": 31.0, "load1_after": 31.0}])
+            mixed = {
+                "nan before, finite after": (nan, 3.5),
+                "finite before, nan after": (3.5, nan),
+            }
+            for name, (before, after) in mixed.items():
+                half = self.write(d, "half.jsonl",
+                                  [meta(), {**g1(), "load1_before": before, "load1_after": after}])
+                for peer, peer_name in ((quiet, "quiet peer"), (busy, "busy peer")):
+                    for arm, native, cowfs in (("native", half, peer), ("cowfs", peer, half)):
+                        label = f"native {name} with {peer_name}"
+                        if arm == "cowfs":
+                            label = f"cowfs {name} with {peer_name}"
+                        rc, err, out = self.run_compare([native], cowfs)
+                        self.assertEqual(rc, 2, (label, out))
+                        self.assertIn("UNMEASURABLE", out, label)
+                        self.assertNotIn("PASS", out, label)
+                        self.assertNotIn("INVALID", err, label)
+            # a multi-rep arm where only one rep is unreadable is the same situation
+            rows = [meta()]
+            for i, load in enumerate((3.5, 3.5, nan)):
+                rows.append({**g1(wall=2.0, rep=i), "load1_before": load, "load1_after": load})
+            one_bad_rep = self.write(d, "onerep.jsonl", rows)
+            rc, _, out = self.run_compare([one_bad_rep], one_bad_rep)
+            self.assertEqual(rc, 2, out)
+            self.assertNotIn("PASS", out)
+
+    def test_finite_load_still_decides_the_verdict(self):
+        # The do-nothing baseline for the case above: a finite load under the ceiling is scored
+        # and one above it is refused, so refusing a non-finite load is not just refusing always.
+        with tempfile.TemporaryDirectory() as d:
+            low = self.write(d, "low.jsonl", [meta(), {**g1(), "load1_before": 3.5, "load1_after": 3.5}])
+            rc, _, out = self.run_compare([low], low)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("PASS", out)
+            high = self.write(d, "high.jsonl", [meta(), {**g1(), "load1_before": 31.0, "load1_after": 31.0}])
+            rc, _, out = self.run_compare([high], high)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("UNMEASURABLE", out)
+            # one arm finite and quiet, the other finite and busy, is still a refusal
+            skew = self.write(d, "skew.jsonl", [meta(), {**g1(), "load1_before": 20.0, "load1_after": 20.0}])
+            rc, _, out = self.run_compare([low], skew)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("UNMEASURABLE", out)
 
     def test_genuine_performance_failure_is_exit_1_not_a_pass(self):
         with tempfile.TemporaryDirectory() as d:

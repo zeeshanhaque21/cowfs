@@ -34,6 +34,11 @@ fn garbage() -> Fixture {
     f
 }
 
+/// The collector's recorded incremental set, or `None` when it has none yet.
+fn marks(f: &Fixture) -> Option<Vec<u8>> {
+    std::fs::read(f.gc_dir().join("mark.bin")).ok()
+}
+
 /// A dry run leaves the store directory byte-identical, and says what it would have freed.
 #[test]
 fn a_dry_run_changes_nothing_and_still_reports() {
@@ -41,6 +46,7 @@ fn a_dry_run_changes_nothing_and_still_reports() {
     let roots = Roots::new();
     let before = f.store_files();
     let packs_before = f.store.stats().packs;
+    let marks_before = marks(&f);
 
     let g = cowfs_gc::Gc::open(
         f.gc_dir(),
@@ -72,7 +78,45 @@ fn a_dry_run_changes_nothing_and_still_reports() {
 
     // The collector's own state is untouched too, so a dry run does not consume the incremental
     // set a real cycle would have built.
-    assert!(!f.gc_dir().join("mark.bin").exists() || true);
+    assert_eq!(
+        marks(&f),
+        marks_before,
+        "a dry run leaves the recorded set exactly as it found it"
+    );
+}
+
+/// A dry run over a set an earlier cycle recorded leaves those exact bytes, so the set is read and
+/// not consumed: the second cycle still skips the root the first one walked.
+#[test]
+fn a_dry_run_does_not_consume_a_recorded_set() {
+    let f = garbage();
+    let roots = Roots::new();
+
+    // A real cycle records the set a following cycle can seed from.
+    f.gc.collect(Some(&*roots)).expect("real collect");
+    let recorded = marks(&f).expect("a real cycle records the set it walked");
+
+    let g = cowfs_gc::Gc::open(
+        f.gc_dir(),
+        Arc::clone(&f.store),
+        Arc::clone(&f.meta),
+        Options {
+            dry_run: true,
+            ..eager()
+        },
+    )
+    .expect("gc");
+    let r = g.collect(Some(&*roots)).expect("collect");
+
+    assert_eq!(
+        r.marked_skipped_roots, 1,
+        "the dry run seeded from the recorded set instead of walking again: {r:?}"
+    );
+    assert_eq!(
+        marks(&f).as_deref(),
+        Some(recorded.as_slice()),
+        "the recorded set is byte-identical after a dry run read it"
+    );
 }
 
 /// Removing a snapshot and collecting frees exactly the bytes the report says it does.
