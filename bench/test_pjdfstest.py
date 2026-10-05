@@ -9,6 +9,7 @@ duplicated result is the property the whole gate rests on.
 """
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -436,6 +437,124 @@ class ExitTaxonomy(unittest.TestCase):
                               capture_output=True, text=True, timeout=120, check=False)
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
         self.assertIn("INVALID", done.stdout + done.stderr)
+
+
+class ReconcileNeverOverwrites(unittest.TestCase):
+    """An analysis reads evidence; it never writes into it.
+
+    Every case here runs against a fixture copied into this lane's own tree, never against a real
+    run directory, so a mistake in the writer cannot touch preserved evidence.
+    """
+
+    FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "bench" / "out" / "ready-g3" / \
+        "reconcile-safety"
+    SENTINEL = "this file is evidence and must not change\n"
+
+    def setUp(self):
+        self.run_dir = self.FIXTURE_ROOT / "fixture-run"
+        if not (self.run_dir / "cases.jsonl").is_file():
+            self.skipTest("fixture run is missing; copy a receipted run into " + str(self.FIXTURE_ROOT))
+        self.before = self.hashes(self.run_dir)
+
+    @staticmethod
+    def hashes(root: Path) -> dict:
+        return {str(p.relative_to(root)): p.stat().st_size for p in sorted(root.rglob("*")) if p.is_file()}
+
+    @staticmethod
+    def digests(root: Path) -> dict:
+        return {str(p.relative_to(root)): p.sha256 if hasattr(p, "sha256") else
+                __import__("hashlib").sha256(p.read_bytes()).hexdigest()
+                for p in sorted(root.rglob("*")) if p.is_file()}
+
+    def reconcile(self, *extra):
+        return subprocess.run([sys.executable, str(Path(p.__file__)), "--reconcile",
+                               str(self.run_dir), *extra], capture_output=True, text=True,
+                              timeout=300, check=False)
+
+    def test_an_existing_default_receipt_is_refused_and_not_one_byte_changes(self):
+        sentinel = self.run_dir / "reconciliation.json"
+        self.assertFalse(sentinel.exists(), "the fixture is expected to start without one")
+        sentinel.write_text(self.SENTINEL)
+        before = (sentinel.read_bytes(), self.digests(self.run_dir))
+        try:
+            done = self.reconcile()
+            self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+            self.assertIn("already exists", done.stdout + done.stderr)
+            self.assertEqual(sentinel.read_bytes(), before[0], "the sentinel was modified")
+            self.assertEqual(self.digests(self.run_dir), before[1], "a byte of the run changed")
+        finally:
+            sentinel.unlink()
+
+    def test_the_input_run_is_unchanged_by_a_successful_fresh_analysis(self):
+        out_dir = self.FIXTURE_ROOT / "analysis-out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / "fresh.json"
+        if out.exists():
+            out.unlink()
+        before = self.digests(self.run_dir)
+        done = self.reconcile("--output", str(out))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("FAIL", done.stdout)
+        self.assertEqual(self.digests(self.run_dir), before, "the analysis touched its own input")
+        payload = json.loads(out.read_text())
+        self.assertEqual(payload["state"], p.FAIL)
+        self.assertEqual(payload["exit_status"], 1)
+        self.assertTrue(payload["analysis"]["analyser_sha256"])
+        self.assertEqual(payload["analysis"]["inputs"]["cases.jsonl"],
+                         p.sha256(self.run_dir / "cases.jsonl"))
+        self.assertIn("fresh reading", payload["analysis"]["note"])
+        out.unlink()
+
+    def test_an_output_inside_the_run_is_refused(self):
+        done = self.reconcile("--output", str(self.run_dir / "cases.jsonl"))
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("inside the run directory", done.stdout + done.stderr)
+
+    def test_an_output_equal_to_a_raw_stream_is_refused(self):
+        raw = min((self.run_dir / "raw").iterdir(), key=lambda q: q.name)
+        before = raw.read_bytes()
+        done = self.reconcile("--output", str(raw))
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertEqual(raw.read_bytes(), before, "a raw stream was overwritten")
+
+    def test_an_existing_explicit_output_is_refused(self):
+        out_dir = self.FIXTURE_ROOT / "analysis-out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / "taken.json"
+        out.write_text(self.SENTINEL)
+        done = self.reconcile("--output", str(out))
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertEqual(out.read_text(), self.SENTINEL, "an existing output was overwritten")
+        out.unlink()
+
+    def test_a_run_without_an_identity_receipt_stays_invalid_three(self):
+        run_dir = self.FIXTURE_ROOT / "no-identity-run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(self.run_dir / "cases.jsonl", run_dir / "cases.jsonl")
+        shutil.copytree(self.run_dir / "raw", run_dir / "raw", dirs_exist_ok=True)
+        out = self.FIXTURE_ROOT / "analysis-out" / "no-identity.json"
+        if out.exists():
+            out.unlink()
+        done = subprocess.run([sys.executable, str(Path(p.__file__)), "--reconcile", str(run_dir),
+                               "--output", str(out)], capture_output=True, text=True, timeout=300,
+                              check=False)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("INVALID", done.stdout)
+
+    def test_write_exclusive_leaves_no_staged_file_behind_on_success(self):
+        out_dir = self.FIXTURE_ROOT / "analysis-out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / "exclusive.json"
+        if out.exists():
+            out.unlink()
+        written, message = p.write_exclusive(out, "{}\n")
+        self.assertTrue(written, message)
+        self.assertEqual(out.read_text(), "{}\n")
+        self.assertEqual([q.name for q in out_dir.glob("*.staged-*")], [])
+        ok, message = p.write_exclusive(out, "second\n")
+        self.assertFalse(ok)
+        self.assertEqual(out.read_text(), "{}\n", "the second write changed the file")
+        out.unlink()
 
 
 if __name__ == "__main__":

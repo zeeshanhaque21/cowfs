@@ -201,6 +201,48 @@ carries the same receipt with `st_dev` 436209639 (`docs/reviews/pjdfstest-g3-rep
 NFS `st_dev` is assigned per mount, so the three numbers differing in the last digits is expected
 and means nothing on its own; what matters is that each is inside its own run's receipt.
 
+## Disclosure: an independent reviewer regenerated three derived files in this lane's tree
+
+Running `--reconcile` against this lane's preserved run directories wrote `reconciliation.json`
+into `20261005T004337Z`, `20261005T022515Z` and `20261005T025742Z`, overwriting files that were
+already there.
+That was the reviewer's error to make and this lane's error to have made possible: the command wrote
+into the directory it was reading.
+
+What is intact, verified by hash and unchanged on disk:
+
+| input | sha256 |
+| --- | --- |
+| `20261005T004337Z/cases.jsonl` | `bb55fe4912a36302...` |
+| `20261005T022515Z/cases.jsonl` | `1d64dabcca863b16...` |
+| `20261005T025742Z/cases.jsonl` | `eb2ff1245baa4aa3...` |
+| `20261005T025742Z/identity.json` | `31d92ea0d2bd89d7...` |
+| all ten raw streams of the receipted run | present, hashes match their records |
+| pinned `pjdfstest.c` and built binary | `a6c354f2c42015a1...`, `5fa40986f39bb903...` |
+
+What was lost is derived: three `reconciliation.json` files whose content now reflects a later head.
+Their bytes at the time they were written are not recoverable, and they are not reconstructed here
+as though they were.
+The files present now are the reviewer's regenerations, kept as they are, and every analysis this
+lane produces from now on carries its own revision and input hashes so a reader can tell which
+reading is in front of them.
+
+The classifier numbers are unaffected, because they derive from the intact `cases.jsonl`.
+
+`--reconcile` no longer writes into the evidence it reads.
+The default destination is refused the moment anything is there, an explicit `--output` must sit
+outside the run directory it reads and must not exist, and the write itself is staged and then
+`link`ed into place, which is the one creation call that refuses an existing name atomically, so
+there is no window between checking and writing for a second writer to be overwritten.
+A staged file that cannot be linked is kept as evidence of the failure.
+Every analysis carries an `analysis` block: this analyser's sha256, the source head, the pinned
+tool commit, and the sha256 of every input it read.
+Named tests cover the sentinel case, the unchanged input run, the fresh isolated output, an output
+pointed at `cases.jsonl`, an output pointed at a raw stream, an existing explicit output, and a run
+without an identity receipt.
+Those tests run against a fixture copied into this lane's own
+`bench/out/ready-g3/reconcile-safety/**`, never against a preserved run.
+
 ## What the harness now refuses
 
 A verdict is a conclusion about the filesystem, so anything that would make it a conclusion about
@@ -247,6 +289,10 @@ Two more things the old harness got wrong and no longer does:
   An earlier version compared the two devices only when both were present, so two null devices
   compared equal and passed; that is closed, and the negatives are named tests in which the spawn
   callback is never reached.
+  The guard runs before any **case** child process exists, not before any child: the cowfs arm's
+  filesystem only exists once the mount is up, so the daemon and its snapshot are already serving
+  when the identity is taken. What is guaranteed is that no case runs and no receipt is trusted on
+  an unplaceable arm.
   The validated identity is written to `identity.json` while the mount is up, so it survives
   teardown, and it is passed to `verdict()` explicitly rather than read back from a summary that
   does not exist yet.

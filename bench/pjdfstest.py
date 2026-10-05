@@ -196,8 +196,12 @@ def validate_runtime_identity(identity: dict | None,
     """Refuse to score unless both arms are on a filesystem we actually identified.
 
     An absent device, an absent type, a stat that failed or a missing mount point is not a
-    measurement, and two arms that report the same device are one arm. Every one of those is an
-    integrity failure, so this runs before any child process exists.
+    measurement, and two arms that report the same device are one arm.
+
+    This runs before any **case** child process exists and before the identity receipt is trusted.
+    It cannot run before the daemon does: the cowfs arm's filesystem only exists once the mount is
+    up, so the daemon and its snapshot are already serving when this is called. What it guarantees
+    is that no case is run, and no receipt is accepted, on an unplaceable arm.
     """
     problems: list[dict] = []
     if not identity:
@@ -1086,12 +1090,74 @@ def run_arm(registry: Registry, arm: str, tests: list[str], tests_root: Path, ro
     return totals
 
 
+def reseal(report: dict) -> dict:
+    """Recompute the state and exit status after a refusal added a reason to a finished verdict."""
+    report["state"] = state_from(report["reasons"])
+    report["exit_status"] = EXIT_STATUS[report["state"]]
+    return report
+
+
+def write_exclusive(path: Path, payload: str) -> tuple[bool, str]:
+    """Create `path` with the bytes `payload`, or change nothing at all.
+
+    The write is staged in the target directory and then linked into place, because `link` is the
+    one creation call that refuses an existing name atomically. A separate existence check followed
+    by a write would leave a window in which a concurrent writer, including another lane's
+    reconcile of the same run, could be overwritten. A staged file that cannot be linked is kept as
+    evidence of the failure rather than deleted, so nothing this run produced disappears silently.
+    """
+    staged = path.with_name(f"{path.name}.staged-{os.getpid()}")
+    with staged.open("x") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.link(staged, path)
+    except FileExistsError:
+        staged.unlink()
+        return False, f"{path} already exists, so nothing was written"
+    except OSError as exc:
+        return False, f"{path} could not be created: {exc}; the staged copy is kept at {staged}"
+    staged.unlink()
+    return True, str(path)
+
+
+def analysis_provenance(repo: Path, run_dir: Path, tests_root: Path | None, tool: dict | None) -> dict:
+    """What this analysis is, and which bytes it read.
+
+    The result belongs to this output, not to the runtime that captured the run: a reconciliation
+    is a fresh reading of preserved records, so it carries its own revision and its own input
+    hashes, and a reader can tell which reading it is looking at.
+    """
+    inputs = {}
+    for name in ("cases.jsonl", "identity.json", "summary.json", "daemon.json"):
+        candidate = run_dir / name
+        if candidate.is_file():
+            inputs[name] = sha256(candidate)
+    raw = run_dir / "raw"
+    if raw.is_dir():
+        inputs["raw/"] = {p.name: sha256(p) for p in sorted(raw.iterdir()) if p.is_file()}
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, timeout=60, check=False).stdout.strip()
+    return {
+        "analyser": "bench/pjdfstest.py",
+        "analyser_sha256": sha256(Path(__file__).resolve()),
+        "source_head": head,
+        "pinned_tool_commit": PINNED_COMMIT,
+        "tool_source_problems": (tool or {}).get("problems", []),
+        "tests_root": str(tests_root) if tests_root else None,
+        "inputs": inputs,
+        "note": "This file is a fresh reading of the inputs above. It says nothing about the runtime "
+                "that captured them, and it does not replace any receipt in the run directory.",
+    }
+
+
 def cmd_reconcile(args: argparse.Namespace) -> int:
     """Re-derive a verdict from a run directory's own records. No mount, no daemon, no build."""
     run_dir = Path(args.reconcile).resolve()
+    repo = Path(args.repo).resolve()
     tool, tests_root = None, None
-    src = Path(args.tool) if args.tool else Path(__file__).resolve().parents[1] / \
-        "bench" / "out" / "ready-g3" / "tool" / "pjdfstest"
+    src = Path(args.tool) if args.tool else repo / "bench" / "out" / "ready-g3" / "tool" / "pjdfstest"
     if (src / "tests").is_dir():
         tool, tests_root = verify_tool_source(src), src / "tests"
     # The identity comes from the run's own receipt, written while its mount was up. A run without
@@ -1099,18 +1165,38 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     receipt = run_dir / "identity.json"
     identity = json.loads(receipt.read_text()).get("runtime_identity") if receipt.is_file() else None
     report = verdict(run_dir, tool, tests_root, identity)
+    report["analysis"] = analysis_provenance(repo, run_dir, tests_root, tool)
+
+    def emit() -> None:
+        log(f"state {report['state']} exit {report['exit_status']}")
+        for item in report["reasons"]:
+            log(f"  - [{item['kind']}] {item['message']}")
+
     # A run directory this harness never created has nowhere to write its receipt, so the refusal
     # is printed and the exit status is the answer.
     if not run_dir.is_dir():
-        for item in report["reasons"]:
-            log(f"  - [{item['kind']}] {item['message']}")
-        log(f"state {report['state']} exit {report['exit_status']}")
+        emit()
         return report["exit_status"]
-    out = run_dir / "reconciliation.json"
-    out.write_text(json.dumps(report, indent=2, sort_keys=True, default=str))
-    log(f"state {report['state']} exit {report['exit_status']}")
-    for item in report["reasons"]:
-        log(f"  - [{item['kind']}] {item['message']}")
+
+    # An analysis never writes into the evidence it reads, so an explicit destination has to sit
+    # outside the run directory. The default sits beside the records for convenience and is
+    # refused the moment anything is there.
+    out = Path(args.output).resolve() if args.output else run_dir / "reconciliation.json"
+    if args.output and (out == run_dir or run_dir in out.parents):
+        report["reasons"].insert(0, reason(
+            INTEGRITY, f"{out} is inside the run directory it reads, so an analysis would land among "
+                       f"the evidence it derives from; pass --output with a path outside {run_dir}"))
+        reseal(report)
+        emit()
+        return report["exit_status"]
+    written, message = write_exclusive(out, json.dumps(report, indent=2, sort_keys=True, default=str))
+    if not written:
+        report["reasons"].insert(0, reason(INTEGRITY, message))
+        reseal(report)
+        emit()
+        log(f"refused: {message}")
+        return report["exit_status"]
+    emit()
     diff = report.get("comparison")
     if diff:
         log(f"established regressions {len(diff['established_regressions'])}, "
@@ -1131,6 +1217,8 @@ def main() -> int:
     ap.add_argument("--keep-mount", action="store_true")
     ap.add_argument("--reconcile", help="re-derive a verdict from an existing run directory")
     ap.add_argument("--tool", help="pjdfstest checkout to verify the pinned source against")
+    ap.add_argument("--output", help="where --reconcile writes; must be outside the run it reads, "
+                                     "and must not already exist")
     args = ap.parse_args()
 
     if args.reconcile:
