@@ -9,6 +9,7 @@
 //! it is one entry in a namespace whose root the mount shows. That is why the mount's root needs
 //! no synthetic layer here: the entries are already there.
 
+use crate::base_meta::BaseMetaStore;
 use cowfs_core::{Core, Ingested};
 use cowfs_ctl::{BaseMeta, CtlError, CtlResult, ErrorCode, SnapshotInfo};
 use cowfs_vfs::Vfs;
@@ -324,6 +325,18 @@ fn with_core<T>(slot: &CoreSlot, f: impl FnOnce(&Core) -> io::Result<T>) -> io::
     }
 }
 
+/// Puts a base record back where it was after a snapshot rename failed, and says so if even that
+/// fails, because a record left under the new name would describe a snapshot that is not there.
+fn rollback_base(bases: &BaseMetaStore, moved_to: &str, was: &str, cause: io::Error) -> io::Error {
+    match bases.rename(moved_to, was) {
+        Ok(()) => cause,
+        Err(rollback) => io::Error::new(
+            cause.kind(),
+            format!("{cause}; and the base record could not be moved back: {rollback}"),
+        ),
+    }
+}
+
 fn missing(name: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
@@ -572,6 +585,11 @@ impl Snapshots for CoreSnapshots {
     }
 
     fn create(&self, name: &str, from: Option<&str>) -> io::Result<SnapshotInfo> {
+        // A new snapshot is never a base, so any record left under this name by a snapshot that has
+        // since gone is cleared before it exists. Without this, a record orphaned by an interrupted
+        // rename would attach itself to the next snapshot created with the same name and report a
+        // commit that has nothing to do with its contents.
+        self.bases.remove(name)?;
         self.with(|c| {
             let entry = match from {
                 None => c.create_snapshot(name),
@@ -584,7 +602,7 @@ impl Snapshots for CoreSnapshots {
 
     fn remove(&self, name: &str) -> io::Result<()> {
         self.with(|c| c.remove_snapshot(name).map_err(control_io).map(|_| ()))?;
-        self.bases.remove(name);
+        self.bases.remove(name)?;
         Ok(())
     }
 
@@ -614,8 +632,14 @@ impl Snapshots for CoreSnapshots {
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        self.with(|c| c.rename_snapshot(from, to).map_err(control_io).map(|_| ()))?;
-        self.bases.rename(from, to)
+        // The record moves first, so the commit is durable under the new name before the snapshot does,
+        // and a snapshot that cannot move puts the record back where it was. The other order would
+        // leave the commit behind under a name that no longer exists.
+        self.bases.rename(from, to)?;
+        if let Err(e) = self.with(|c| c.rename_snapshot(from, to).map_err(control_io).map(|_| ())) {
+            return Err(rollback_base(&self.bases, to, from, e));
+        }
+        Ok(())
     }
 
     fn promote(&self, name: &str) -> io::Result<SnapshotInfo> {
@@ -785,6 +809,10 @@ impl Snapshots for PathSnapshots {
                 "name is taken",
             ));
         }
+        // A new snapshot is never a base, so a record left under this name by a snapshot that has since
+        // gone is cleared before this one exists, or it would report a commit that has nothing to do
+        // with these contents.
+        self.bases.remove(name)?;
         match from {
             None => std::fs::create_dir(self.dir(name))?,
             Some(from) => {
@@ -808,7 +836,7 @@ impl Snapshots for PathSnapshots {
             ));
         }
         cowfs_vfs_path::force_remove_dir_all(&self.dir(name));
-        self.bases.remove(name);
+        self.bases.remove(name)?;
         Ok(())
     }
 
@@ -852,8 +880,13 @@ impl Snapshots for PathSnapshots {
                 "name is taken",
             ));
         }
-        std::fs::rename(self.dir(from), self.dir(to))?;
-        self.bases.rename(from, to)
+        // The record moves first, so the commit is durable under the new name before the snapshot does,
+        // and a snapshot that cannot move puts the record back where it was. The other order would
+        // leave the commit behind under a name that no longer exists.
+        self.bases.rename(from, to)?;
+        std::fs::rename(self.dir(from), self.dir(to))
+            .map_err(|e| rollback_base(&self.bases, to, from, e))?;
+        Ok(())
     }
 
     fn promote(&self, name: &str) -> io::Result<SnapshotInfo> {
@@ -1091,6 +1124,149 @@ mod tests {
             commit_of(&s.create_meta("warm").unwrap()),
             None,
             "a failed write must not look like a published commit"
+        );
+    }
+
+    /// P-1 at the namespace level: a removal whose record cannot be deleted is reported, and the
+    /// record it could not delete is not inherited by whatever takes the name next.
+    #[test]
+    fn a_removal_whose_record_cannot_be_deleted_is_reported_and_loses_no_commit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, b) = path();
+        let s = b.snapshots();
+        s.create("warm", None).unwrap();
+        std::fs::write(b.store.join("warm").join("main.rs"), b"fn main() {}\n").unwrap();
+        s.promote("warm").unwrap();
+        s.set_base_meta("warm", &meta("/r", "main", "abc")).unwrap();
+        let record_dir = b.store.join(".cowfs-base-meta").join("warm");
+        std::fs::set_permissions(&record_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let e = s.remove("warm").unwrap_err();
+        assert!(
+            e.to_string().contains("cannot remove the base record"),
+            "the failure names what did not happen: {e}"
+        );
+        assert!(
+            record_dir.join("base.json").is_file(),
+            "the record survived"
+        );
+        // The snapshot itself was asked to go, so its absence is the requested outcome, and both views
+        // agree that there is no such snapshot.
+        assert_eq!(
+            s.create_meta("warm").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let store = b.store.clone();
+        drop(b);
+        let reopened = PathBackend::open(&store).unwrap();
+        assert_eq!(
+            reopened.snapshots().create_meta("warm").unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "a live process and a restarted one must not disagree"
+        );
+
+        // And the commit that is still recorded cannot attach itself to a new snapshot of the same
+        // name: that would report a base built from a commit this tree has nothing to do with.
+        std::fs::set_permissions(&record_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fresh = reopened.snapshots().create("warm", None).unwrap();
+        assert_eq!(
+            fresh.base, None,
+            "a new snapshot inherited a commit it was not built from: {fresh:?}"
+        );
+    }
+
+    /// P-2 at the namespace level: a rename whose record cannot be moved reports failure and changes
+    /// nothing, rather than half-renaming the snapshot and losing the commit.
+    #[test]
+    fn a_rename_whose_record_cannot_be_moved_reports_failure_and_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, b) = path();
+        let s = b.snapshots();
+        s.create("warm", None).unwrap();
+        std::fs::write(b.store.join("warm").join("main.rs"), b"fn main() {}\n").unwrap();
+        s.promote("warm").unwrap();
+        s.set_base_meta("warm", &meta("/r", "main", "abc")).unwrap();
+        let before = std::fs::read(
+            b.store
+                .join(".cowfs-base-meta")
+                .join("warm")
+                .join("base.json"),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            b.store.join(".cowfs-base-meta"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+
+        let e = s.rename("warm", "warmer").unwrap_err();
+        assert!(e.to_string().contains("warmer"), "{e}");
+
+        // No data loss: the snapshot is where it was, with its contents.
+        assert!(
+            b.store.join("warm").join("main.rs").is_file(),
+            "the tree survived"
+        );
+        assert_eq!(
+            std::fs::read(b.store.join("warm").join("main.rs")).unwrap(),
+            b"fn main() {}\n"
+        );
+        // No dangling destination: nothing was created under the new name, in the store or the records.
+        assert!(!b.store.join("warmer").exists());
+        assert!(!b.store.join(".cowfs-base-meta").join("warmer").exists());
+        // And the source record is byte-identical, so the base keeps the commit it was published with.
+        assert_eq!(
+            std::fs::read(
+                b.store
+                    .join(".cowfs-base-meta")
+                    .join("warm")
+                    .join("base.json")
+            )
+            .unwrap(),
+            before
+        );
+        assert_eq!(commit_of(&s.create_meta("warm").unwrap()), Some("abc"));
+        std::fs::set_permissions(
+            b.store.join(".cowfs-base-meta"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    /// A snapshot recreated under a name whose record outlived it is not a base. Both backends, because
+    /// a forged fresh base is the one failure this must never produce.
+    /// A snapshot created under a name whose record outlived it is not a base. A record can outlive its
+    /// snapshot when an operation is interrupted, and if `create` adopted it, the new tree would
+    /// report itself a base built from a commit it has nothing to do with.
+    #[test]
+    fn a_recreated_snapshot_is_never_a_base_even_when_a_record_outlived_it() {
+        // Path backend.
+        let (_d, b) = path();
+        // An orphan written straight to the store: a base record with no snapshot behind it.
+        BaseMetaStore::open(&b.store)
+            .unwrap()
+            .set("warm", &meta("/r", "main", "abc"))
+            .unwrap();
+        let recreated = b.snapshots().create("warm", None).unwrap();
+        assert_eq!(recreated.base, None, "path backend: {recreated:?}");
+
+        // Core backend, the same orphan over the same kind of store.
+        let (d, c) = core();
+        BaseMetaStore::open(&c.store)
+            .unwrap()
+            .set("warm", &meta("/r", "main", "abc"))
+            .unwrap();
+        let store = d.path().to_owned();
+        drop(c);
+        let reopened = CoreBackend::open(&store, cowfs_core::Options::default()).unwrap();
+        let recreated = reopened.snapshots().create("warm", None).unwrap();
+        assert_eq!(recreated.base, None, "core backend: {recreated:?}");
+        // And the record is gone from the store too, so a reopen agrees.
+        assert_eq!(
+            BaseMetaStore::open(&reopened.store).unwrap().get("warm"),
+            None
         );
     }
 

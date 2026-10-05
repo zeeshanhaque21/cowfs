@@ -653,24 +653,31 @@ mod tests {
     /// it does not leave something behind that reports itself fresh.
     #[test]
     fn a_refresh_that_cannot_record_its_provenance_fails_and_leaves_no_fresh_base() {
+        use std::os::unix::fs::PermissionsExt;
+
         let (_d, b) = backend();
         let (_rd, repo) = repo("unrecordable");
-        // The provenance directory cannot be created, so no write can ever land.
-        std::fs::write(b.store_path().join(".cowfs-base-meta"), b"not a directory").unwrap();
+        // The provenance directory exists but cannot be written, so no record can ever land. Putting a
+        // file where the directory belongs refuses earlier still, at the first attempt to clear a
+        // stale record, and that is a refusal too rather than a success.
+        let root = b.store_path().join(".cowfs-base-meta");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
 
         let e = refresh(b.as_ref(), &repo, "warm").unwrap_err();
         assert!(
             e.to_string().contains("warm"),
             "the refusal names the base: {e}"
         );
-        let info = b
-            .snapshots()
-            .create_meta("warm")
-            .expect("the tree is there");
-        assert_eq!(
-            info.base, None,
-            "nothing reports itself fresh after a failed publication"
-        );
+        // Where the refusal lands depends on which write fails first, so what is asserted is the
+        // postcondition: nothing anywhere reports itself a base with a commit.
+        if let Ok(info) = b.snapshots().create_meta("warm") {
+            assert_eq!(
+                info.base, None,
+                "nothing reports itself fresh after a failed publication: {info:?}"
+            );
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
             worktree_paths(&repo),
             vec![resolved(&repo)],

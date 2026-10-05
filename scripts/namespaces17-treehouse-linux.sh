@@ -8,20 +8,31 @@
 # helper directly; this one drives `cowfs-treehouse base refresh --build --canonical`, which is the
 # path a pool owner actually uses, and it reads the store back afterwards.
 #
-# Everything lives under REPO_ROOT/bench/out/namespaces17-treehouse: its own store, mount point,
-# control socket, daemon, treehouse HOME and canonical directory. Nothing outside that directory is
-# created or removed, and the only processes this script signals are the ones it started itself.
+# Every run gets its own immutable attempt directory under REPO_ROOT/bench/out/ns17/, holding its own
+# store, mount point, control socket, daemon, treehouse HOME, canonical directory, fixture repository and
+# logs. The path components are short on purpose: a Unix socket path is limited to about 108 bytes, and
+# a longer one is refused by the kernel at bind time with nothing but "path must be shorter than
+# SUN_LEN", which is why the length is checked here first. An earlier run's
+# attempt is never read, written or removed, so this script can be run again in the same checkout and
+# each run stands on its own fixtures: without that, the second run recreated the fixture repository
+# while the store persisted, the seed import collided, and the run failed for a reason that had nothing
+# to do with the product. Nothing outside that attempts directory is created or removed, apart from the
+# shared cargo build cache, and the only processes this script signals are the ones it started itself.
 #
 # The verdict is PASS, FAIL or UNMEASURABLE. A real failure of the product is FAIL; only a missing
 # prerequisite is UNMEASURABLE.
 set -eu
 
 repo=${1:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}
-out=$repo/bench/out/namespaces17-treehouse
+root=$repo/bench/out/ns17
+attempts=$root
+# The attempt is named for when it started and which process started it, so it cannot already exist and
+# two runs can never share one.
+out=$attempts/a$(date -u +%m%dT%H%M%S)-$$
 canonical=$out/canonical
 store=$out/store
 mnt=$out/mnt
-sock=$out/control.sock
+sock=$out/c.sock
 log=$out/serve.log
 pidfile=$out/serve.pid
 helper=$repo/scripts/cowfs-ns-run.sh
@@ -92,18 +103,31 @@ save_mountinfo() {
   cat /proc/self/mountinfo >"$1"
 }
 
+mkdir -p "$attempts"
+# A refusal, not an overwrite: if this attempt exists, something is wrong with the naming and the run
+# must not adopt a directory it did not create.
+[ ! -e "$out" ] || fail "$out already exists, refusing to run inside it"
 mkdir -p "$out"
 # The daemon refuses a control socket whose directory is not private to this user.
 chmod 700 "$out"
 : >"$out/run.log"
-say "run: repo=$repo out=$out"
+prior=$(ls -1 "$attempts" 2>/dev/null | grep -c . || true)
+say "run: repo=$repo attempt=$out ($prior earlier attempt(s) preserved)"
+# A Unix socket address is at most 108 bytes including its terminator, so this is checked before a
+# daemon is started rather than discovered from the kernel's refusal to bind.
+sock_len=${#sock}
+[ "$sock_len" -le 100 ] ||
+  fail "the control socket path is $sock_len bytes, and a Unix socket path cannot exceed 107: $sock"
+say "run: the control socket path is $sock_len bytes of the 107 a Unix socket allows"
 [ "$(uname -s)" = Linux ] || unmeasurable "this run needs Linux, this is $(uname -s)"
 [ -x "$helper" ] || fail "$helper is missing or not executable"
 command -v cargo >/dev/null || unmeasurable "cargo is not on PATH"
 command -v rustc >/dev/null || unmeasurable "rustc is not on PATH"
 [ -c /dev/fuse ] || unmeasurable "/dev/fuse is not a character device, so no cowfs mount is possible"
 
-export CARGO_TARGET_DIR="$out/target"
+# The build cache is shared between attempts on purpose: it is a cargo target directory, not a fixture,
+# and rebuilding it per run would cost minutes for no extra evidence.
+export CARGO_TARGET_DIR="$root/target"
 bin=$CARGO_TARGET_DIR/debug/cowfs
 # The build is pinned to this repository, never to whatever workspace the caller happens to be
 # standing in. Without `--manifest-path`, running this script from another directory built the wrong
@@ -183,9 +207,9 @@ companion_run() { HOME=$thhome RUSTUP_HOME=$RUSTUP_HOME CARGO_HOME=$CARGO_HOME "
 # The warm base, built through the seam. This is the delivery run: a real repo, a real git commit, a
 # real companion invocation with --canonical, and a real warm base snapshot afterwards.
 repo_dir=$out/repo
-# Recreated every run, so a second run in the same directory starts from nothing rather than
-# inheriting the last run's commit.
-rm -rf "$repo_dir"
+# Never recreated over: the attempt directory is new, so this repository is this run's alone and its
+# commits mean what this run says they mean.
+[ ! -e "$repo_dir" ] || fail "$repo_dir already exists, refusing to recreate it"
 mkdir -p "$repo_dir"
 cp "$out/fixture/main.rs" "$repo_dir/main.rs"
 git -C "$repo_dir" init -q -b main 2>/dev/null
@@ -489,7 +513,7 @@ say "control: the same base, the same commit, and fresh=false because the reposi
 # And a repository that was never refreshed must not borrow another repository's base.
 say "control: a repository that was never refreshed has no base"
 other=$out/other-repo
-rm -rf "$other"
+[ ! -e "$other" ] || fail "$other already exists, refusing to recreate it"
 mkdir -p "$other"
 cp "$out/fixture/main.rs" "$other/main.rs"
 git -C "$other" init -q -b main 2>/dev/null
@@ -515,4 +539,5 @@ PYOTHER
 say "control: an unrefreshed repository has no commit and is not fresh"
 
 say "VERDICT: PASS: warm base published with durable provenance, surviving a daemon reopen, and two fresh slots built through cowfs-treehouse at one canonical path over a real cowfs FUSE mount"
+say "attempt: $out is this run's own; earlier attempts under $attempts are untouched"
 say "artifacts: $out"
