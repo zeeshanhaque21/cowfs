@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use common::*;
 use cowfs_nfs::MountOptions;
@@ -213,7 +213,76 @@ fn hardlinked_names_in_one_directory_are_listed_once_each() {
     );
 }
 
-/// #19: "server resident memory grows" and "the path map never shrinks". Both are claims about
+/// #19: "readdir re-reads and re-sorts the whole directory per page, 23 to 71 ms per page on a
+/// 10,000 to 15,000 entry `deps/`". The listing cache in `cowfs-vfs-path` was meant to close that.
+///
+/// The one bound asserted here is the one that separates the two designs: a page taken from a
+/// cached listing costs the attributes of its own entries, and a page that re-read the directory
+/// costs at least one whole directory read. So the mean of pages two onwards must stay under the
+/// cost of a single native directory read of the same directory. That holds with a wide margin
+/// either way, and no tighter number is claimed, because this machine is shared.
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn a_large_directory_is_read_once_per_listing() {
+    const ENTRIES: usize = 12_000;
+    const PER_PAGE: usize = 64;
+    let s = scratch();
+    fs::create_dir(s.backing.join("deps")).unwrap();
+    for i in 0..ENTRIES {
+        fs::write(s.backing.join(format!("deps/f{i:05}")), b"x").unwrap();
+    }
+    let native = s.backing.join("deps");
+
+    // Two native baselines: what a re-reading server pays per page, and what a whole listing costs.
+    let t = Instant::now();
+    let listed = fs::read_dir(&native).unwrap().count();
+    let native_read_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t = Instant::now();
+    for e in fs::read_dir(&native).unwrap() {
+        let _ = fs::symlink_metadata(e.unwrap().path()).unwrap();
+    }
+    let native_read_stat_ms = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(listed, ENTRIES);
+
+    let (_server, mut c) = serve_backing(&s.backing);
+    let deps = c.must_lookup(&c.root.clone(), "deps");
+    let mut pages: Vec<f64> = Vec::new();
+    let mut cookie = 0u64;
+    let mut seen = 0usize;
+    loop {
+        let t = Instant::now();
+        let (st, page, eof) = c.readdir_page(&deps, cookie, true, (PER_PAGE * 24) as u32);
+        pages.push(t.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(st, OK);
+        seen += page.len();
+        match page.last() {
+            Some(l) => cookie = l.cookie,
+            None => assert!(eof, "an empty page must end the listing"),
+        }
+        if eof {
+            break;
+        }
+    }
+    assert_eq!(seen, ENTRIES, "every entry exactly once");
+    assert!(
+        pages.len() > 4,
+        "{} pages is not a paged listing",
+        pages.len()
+    );
+    let first = pages[0];
+    let mean_rest = pages[1..].iter().sum::<f64>() / (pages.len() - 1) as f64;
+    println!(
+        "PAGES entries={ENTRIES} pages={} first={first:.2}ms mean_rest={mean_rest:.2}ms \
+         native_read={native_read_ms:.2}ms native_read_stat={native_read_stat_ms:.2}ms",
+        pages.len()
+    );
+    assert!(
+        mean_rest < native_read_ms,
+        "a page costs {mean_rest:.2}ms and reading the directory once costs {native_read_ms:.2}ms: \
+         the listing is being re-read per page"
+    );
+    let _ = native_read_stat_ms;
+}
 /// what the adapter and the inode table still hold after a namespace churn, so this churns the
 /// real filesystem and reads the process back.
 #[test]
