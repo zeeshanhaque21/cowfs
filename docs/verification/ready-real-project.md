@@ -8,6 +8,8 @@ project. Nothing is asserted that was not executed, and no timing is claimed.
 - Harness: `crates/cowfs-treehouse/tests/real_project_acceptance.rs`
 - Raw evidence, gitignored and private to this lane: `bench/out/ready-real-project/`
 - Repair evidence: `docs/verification/evidence/real-project16-repair.md`
+  Committed on this branch at `a64e1189ff5f8ac8d34b24aad5d820818f8eaf72`, pinned link:
+  https://github.com/zeeshanhaque21/cowfs/blob/a64e1189ff5f8ac8d34b24aad5d820818f8eaf72/docs/verification/evidence/real-project16-repair.md
 
 ## Which commit each receipt binds to
 
