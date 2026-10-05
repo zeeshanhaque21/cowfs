@@ -713,8 +713,37 @@ mod tests {
         }
     }
 
+    /// Fill a file, shrink it to a size that is not page aligned, grow it again, then read the region
+    /// the shrink vacated. That region must read back as zeros.
+    ///
+    /// The random sweep alone did not find this: CI run 37266648495 failed at `4c2d7ec` with
+    /// `TruncateNoZeroFill was not detected`, and 5 of 5 runs of the unmodified test passed here, so
+    /// catching it depended on the generator happening to emit a shrink, a grow and a read of the
+    /// gap. Written out, the oracle's answer is fixed, and every byte `pattern` writes is `| 1`, so
+    /// the stale tail is never zero by luck.
+    fn truncate_tail_witness() -> Vec<Op> {
+        vec![
+            Op::Create(vec![0], 0o644),
+            Op::Write(vec![0], 0, 8_000, 7),
+            Op::Truncate(vec![0], 5_000),
+            Op::Truncate(vec![0], 6_000),
+            Op::Read(vec![0], 5_000, 1_000),
+        ]
+    }
+
     #[test]
     fn oracle_catches_broken_backends() {
+        // A fault that a fixed sequence witnesses must be caught by that sequence, and the same
+        // sequence must pass on a healthy backend, or catching it would prove nothing. This goes
+        // through the same `run` and the same oracle as the sweep below, with neither changed. A
+        // second fault that flakes this way gets its own witness here.
+        let witness = truncate_tail_witness();
+        run(&MemVfs::new(), &witness).expect("the witness is valid on a healthy backend");
+        assert!(
+            run(&MemVfs::with_fault(Fault::TruncateNoZeroFill), &witness).is_err(),
+            "TruncateNoZeroFill survives its own witness"
+        );
+
         let faults = [
             Fault::RenameNoReplace,
             Fault::NoHardlinkNlink,

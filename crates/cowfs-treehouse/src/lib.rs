@@ -32,10 +32,10 @@ pub use mode_a::{
     ReturnOptions, ReturnOutcome, Setup,
 };
 pub use mode_b::{
-    base_promote, base_status, get, hooks_install, plan_git_link, rewrite_git_link,
+    base_promote, base_status, get, hooks_install, plan_git_link, rewrite_git_link, run_build,
     user_config_path_for, worktree_git_dir, Acquired, BaseRefresh, BaseRefreshed, BaseStatus,
-    CowfsMaterialiser, GitLink, HookAction, LeaseGuard, Materialiser, PromoteOptions, Provision,
-    RecordingMaterialiser, DEFAULT_NFS_TIMEOUT, DEFAULT_TREEHOUSE_TIMEOUT,
+    Canonical, CowfsMaterialiser, GitLink, HookAction, LeaseGuard, Materialiser, PromoteOptions,
+    Provision, RecordingMaterialiser, DEFAULT_NFS_TIMEOUT, DEFAULT_TREEHOUSE_TIMEOUT,
 };
 pub use naming::{
     assert_in_pool, base_snapshot, empty_snapshot, from_client_error, from_ctl_error,

@@ -488,6 +488,8 @@ pub struct BaseRefresh<'a> {
     pub build: Option<String>,
     /// An already-leased slot to build in, instead of acquiring one.
     pub slot: Option<PathBuf>,
+    /// The pool's canonical build path. `None` builds at the slot's own path, as before.
+    pub canonical: Option<Canonical>,
 }
 
 impl std::fmt::Debug for BaseRefresh<'_> {
@@ -497,6 +499,7 @@ impl std::fmt::Debug for BaseRefresh<'_> {
             .field("git_ref", &self.git_ref)
             .field("build", &self.build)
             .field("slot", &self.slot)
+            .field("canonical", &self.canonical)
             .finish_non_exhaustive()
     }
 }
@@ -511,7 +514,11 @@ impl BaseRefresh<'_> {
         let (built_in_slot, slot) = match (&self.build, &self.slot) {
             (None, _) => (false, None),
             (Some(_), Some(p)) => {
-                run_build(p, self.build.as_deref().unwrap_or_default())?;
+                run_build(
+                    p,
+                    self.build.as_deref().unwrap_or_default(),
+                    self.canonical.as_ref(),
+                )?;
                 (true, Some(p.clone()))
             }
             (Some(_), None) => {
@@ -524,7 +531,11 @@ impl BaseRefresh<'_> {
                 let slot = guard.slot().to_path_buf();
                 // The `?` runs while the guard is still armed, so a failed build hands the slot
                 // back on the way out instead of burning one of the pool's.
-                run_build(&slot, self.build.as_deref().unwrap_or_default())?;
+                run_build(
+                    &slot,
+                    self.build.as_deref().unwrap_or_default(),
+                    self.canonical.as_ref(),
+                )?;
                 guard.keep();
                 (true, Some(slot))
             }
@@ -547,11 +558,118 @@ impl BaseRefresh<'_> {
     }
 }
 
-fn run_build(dir: &Path, command: &str) -> Result<()> {
-    let status = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(dir)
+/// Where a build should appear, when the pool owner has opted into canonical paths.
+///
+/// Opt-in and Linux-only. Absent, the build runs at the slot's own path exactly as before, so
+/// existing macOS and Linux behaviour and every existing config file keep working unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Canonical {
+    /// The path every build of this pool appears at. Must already exist and be a directory: the
+    /// companion never creates it, because a global path is the pool owner's decision.
+    pub dir: PathBuf,
+    /// `scripts/cowfs-ns-run.sh`. Explicit rather than searched for, so a distributed binary does
+    /// not depend on the caller's working directory.
+    pub helper: PathBuf,
+}
+
+impl Canonical {
+    /// Checks what can be checked without running anything.
+    pub fn validate(&self) -> Result<()> {
+        // The path checks come first: a relative or missing path is a usage error on every
+        // platform, and reporting that is more useful than reporting the platform.
+        if !self.dir.is_absolute() {
+            return Err(Error::Usage(format!(
+                "--canonical must be an absolute path, not: {}",
+                self.dir.display()
+            )));
+        }
+        if !self.dir.is_dir() {
+            return Err(Error::Usage(format!(
+                "--canonical {} must already exist as a directory the pool owner created. This \
+                 companion will not create it, and will not guess a system path for one",
+                self.dir.display()
+            )));
+        }
+        if !self.helper.is_file() {
+            return Err(Error::Usage(format!(
+                "--ns-helper {} is not a file. Pass the path to scripts/cowfs-ns-run.sh, so the \
+                 helper is found explicitly rather than through the working directory",
+                self.helper.display()
+            )));
+        }
+        if !cfg!(target_os = "linux") {
+            return Err(Error::Unsupported(
+                "canonical build paths need Linux mount namespaces. macOS normalises embedded \
+                 paths with compiler flags such as --remap-path-prefix instead, and the design \
+                 keeps that. Drop --canonical to build at the slot's own path"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The arguments for a build, without the program name and without running anything.
+    ///
+    /// The helper is the program, so it is not repeated here: `Command::new` already supplies it,
+    /// and passing it again would make the helper read its own path as the first argument.
+    ///
+    /// `sh -c` is kept for the build command itself, because that command is user configuration and
+    /// has always been a shell string. It is passed as one argv element, so nothing in it is ever
+    /// re-split, and the canonical directory is a separate argv element rather than part of it.
+    pub fn args(&self, dir: &Path, command: &str) -> Vec<std::ffi::OsString> {
+        vec![
+            "--src".into(),
+            dir.as_os_str().to_owned(),
+            "--canonical".into(),
+            self.dir.as_os_str().to_owned(),
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            command.into(),
+        ]
+    }
+}
+
+/// Runs a build command in `dir`.
+///
+/// With a `canonical`, the command runs inside a mount namespace where `dir` also appears at the
+/// pool's canonical path, so artifacts that embed an absolute path come out identical across slots.
+/// Without one, the command runs at `dir` itself, which is what every existing caller gets.
+pub fn run_build(dir: &Path, command: &str, canonical: Option<&Canonical>) -> Result<()> {
+    let mut cmd = match canonical {
+        None => {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c").arg(command).current_dir(dir);
+            c
+        }
+        Some(c) => {
+            c.validate()?;
+            // One exit code, two meanings: the helper forwards the command's own code, and it also
+            // uses 77 for its own refusal. A probe with a command that must succeed tells them
+            // apart, so a namespace this host cannot create is reported as unmeasurable and a real
+            // build failure stays a failure. Never the other way round.
+            let probe = Command::new(&c.helper)
+                .args(c.args(dir, "exit 0"))
+                .output()
+                .map_err(|e| {
+                    Error::Io(format!(
+                        "cannot run the namespace helper {}: {e}",
+                        c.helper.display()
+                    ))
+                })?;
+            if !probe.status.success() {
+                return Err(Error::Unsupported(format!(
+                    "UNMEASURABLE: no mount namespace on this host, so the build did not run. {}",
+                    crate::th::tail(&String::from_utf8_lossy(&probe.stderr))
+                )));
+            }
+            let argv = c.args(dir, command);
+            let mut child = Command::new(&c.helper);
+            child.args(argv).current_dir(dir);
+            child
+        }
+    };
+    let status = cmd
         .status()
         .map_err(|e| Error::Io(format!("cannot run the build command: {e}")))?;
     if !status.success() {
