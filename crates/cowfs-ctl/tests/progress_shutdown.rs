@@ -977,9 +977,19 @@ fn shutdown_budget_is_the_deadline_plus_one_grace_with_a_parked_writer_and_a_cpu
         parked_closed_at_return,
         "the parked writer's connection was still open when wait() returned"
     );
+    // `handler_alive_at_return` is recorded, not gated, for the same reason as in
+    // `abandoned_blocked_connection_is_released_before_wait_returns`: with the whole grace spent on
+    // delivery, `kill` runs at `grace_end` and the parked `write_all` unwinds afterwards, so this is
+    // normally `true` and gating it asserts a scheduler, not a contract. What the contract requires,
+    // a closed connection at a `wait()` inside the budget, is asserted above. That the detached
+    // handler still ends is asserted below.
+    let until = Instant::now() + Duration::from_secs(5);
+    while !dropped.load(Ordering::SeqCst) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
-        !handler_alive_at_return,
-        "the parked handler was still alive when wait() returned"
+        dropped.load(Ordering::SeqCst),
+        "the detached handler never finished; the test would leak a thread per case"
     );
     // The CPU-bound handler has no socket, so nothing can force it out. It is expected to be alive
     // and that is documented, not asserted as a failure: the contract detaches handler threads.
@@ -1156,6 +1166,14 @@ fn shutdown_budget_with_only_a_cpu_handler() {
 ///
 /// An endless flood is the wrong shape for this test: it keeps writing after the resume, so a frame
 /// that arrives late could be a progress frame rather than proof that the terminal made it.
+///
+/// One mebibyte per event, the same payload every other parking fixture in this file uses. An earlier
+/// revision used 2000 bytes for 400 events, 781 KiB in total, which is not reliably more than a Linux
+/// AF_UNIX send buffer plus its peer's receive buffer: on the ubuntu runner the handler kept
+/// advancing its step counter instead of parking, so `assert_parked` failed before any assertion about
+/// frames ran. That the socket buffer absorbed it is inference from the counter advancing 37 to 50,
+/// not a measurement; the fix is robust to the inference being somewhat off because one event now
+/// dwarfs the buffers on its own.
 struct FiniteFlood {
     steps: u64,
     entered: Arc<AtomicBool>,
@@ -1172,7 +1190,7 @@ impl ControlHandler for FiniteFlood {
                 done,
                 total: Some(self.steps),
                 unit: Unit::Items,
-                message: Some("x".repeat(2000)),
+                message: Some("x".repeat(1 << 20)),
             })?;
         }
         Ok(GcReport {
@@ -1197,9 +1215,27 @@ impl ControlHandler for FiniteFlood {
 /// close-at-return property that an independent review could not reproduce on the unsplit source; what
 /// it actually protected was a killed handler unwinding, which the contract leaves to process exit.
 ///
-/// Both geometries are covered: `a4`'s original 200/250 ms, which the split silently broke, and a
-/// 1000 ms grace probed at 90 and 95 percent, which is inside the window but past any plausible
-/// halfway or two-thirds cut. Five reps each, so a single unlucky run cannot pass the test.
+/// Every committed point is past the cut the half-split head used and has real room left in the window
+/// for the unwind plus the handler return plus the terminal write. Resume is measured from the start
+/// of shutdown, so the window closes at `deadline + drain_deadline`; the labels carry both figures
+/// rather than a percentage, because a 900 ms resume is 90 percent of a 1000 ms grace but 75 percent
+/// of the 1200 ms window.
+///
+/// | case | window closes | resume | room left | half-split cut was |
+/// |---|---|---|---|---|
+/// | 200/250 | 450 ms | 340 ms | 110 ms | 325 ms |
+/// | 200/1000 | 1200 ms | 900 ms | 300 ms | 700 ms |
+/// | 200/1000 | 1200 ms | 950 ms | 250 ms | 700 ms |
+///
+/// The 200/250 geometry resuming at 400 ms was a committed point and deliberately is not one any more.
+/// It left 50 ms, and one hosted macOS rep in six missed it at `elapsed_ms=547` against a 450 ms
+/// window. A hard `whole` assertion that close to the edge fails intermittently on a loaded runner and
+/// gets blamed on something else next time. Resuming at 340 ms in that geometry still sits past the
+/// 325 ms cut the half-split head used, which is the property under test, with more than twice the
+/// room. Resuming at 400 to 449 ms there stays worth probing by hand and appears in the review
+/// evidence; it is not a hosted correctness gate, because no scheduler can promise 50 ms.
+///
+/// Five reps each, so a single unlucky run cannot pass the test.
 ///
 /// The peer is not read before `wait()` returns, and the parked-ness proof is the same two consecutive
 /// frozen windows. Frames are only counted when they parse out of a complete line, so a truncated tail
@@ -1212,27 +1248,22 @@ fn a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame() {
         drain: Duration,
         resume_ms: u64,
     }
+    // Labels carry the window-closing time and the resume, both measured from the start of shutdown.
     let cases = [
         Case {
-            label: "200/250@340",
+            label: "window450/resume340",
             deadline: Duration::from_millis(200),
             drain: Duration::from_millis(250),
             resume_ms: 340,
         },
         Case {
-            label: "200/250@400",
-            deadline: Duration::from_millis(200),
-            drain: Duration::from_millis(250),
-            resume_ms: 400,
-        },
-        Case {
-            label: "200/1000@900",
+            label: "window1200/resume900",
             deadline: Duration::from_millis(200),
             drain: Duration::from_millis(1000),
             resume_ms: 900,
         },
         Case {
-            label: "200/1000@950",
+            label: "window1200/resume950",
             deadline: Duration::from_millis(200),
             drain: Duration::from_millis(1000),
             resume_ms: 950,
@@ -1246,7 +1277,17 @@ fn a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame() {
             let attempted = Arc::new(AtomicU64::new(0));
             let mut fx = start_with(
                 FiniteFlood {
-                    steps: 400,
+                    // One mebibyte per event parks on the first write on every runner where the
+                    // sibling 1 MiB fixtures park. Two events is the minimum that still parks if a
+                    // runner's buffers happen to absorb the first one: the second has to block.
+                    //
+                    // Deliberately not more. Every extra event is backlog the client must drain after
+                    // it resumes, and that drain is charged against the room left in the window. Eight
+                    // events left up to 7 MiB to drain in the 110 ms the 450 ms geometry allows, and
+                    // that failed locally at `elapsed_ms=456` with no whole terminal frame. Two events
+                    // leaves at most 1 MiB, which is the shape this test needs: parked before the
+                    // resume, one event plus the terminal after it.
+                    steps: 2,
                     entered: Arc::clone(&entered),
                     attempted: Arc::clone(&attempted),
                 },
