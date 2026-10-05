@@ -54,14 +54,7 @@ fn a_hole_chunk_is_never_demanded_of_the_store() {
     // Over the 16 KiB minimum chunk, so this is more than one block and real[1] exists.
     let real = f.store.ingest_bytes(&body(90_000, 3)).unwrap();
     assert!(real.len() >= 2, "the fixture needs two real chunks");
-    let chunks = vec![
-        real[0],
-        cowfs_store::ChunkRef {
-            id: HOLE,
-            len: 4096,
-        },
-        real[1],
-    ];
+    let chunks = vec![real[0], cowfs_store::ChunkRef::hole(4096), real[1]];
     let ino = snap
         .batch(|tx| tx.create(cowfs_meta::ROOT_INO, b"sparse", 0o644))
         .unwrap()

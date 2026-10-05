@@ -63,14 +63,109 @@ impl fmt::Debug for BlockId {
     }
 }
 
-/// One chunk of a file: which block holds it and how many uncompressed bytes it covers.
+/// One chunk of a file: which block holds it and how many uncomcompressed bytes it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkRef {
     /// The block holding the chunk.
     pub id: BlockId,
     /// Uncompressed length of the chunk.
     pub len: u32,
+    /// This ref is a hole: the bytes are zeros that were never stored.
+    ///
+    /// A hole's `id` is the all-zero sentinel and its length is at most [`HOLE_MAX`]. The flag is
+    /// what lets a walker of a chunk list tell a hole from a stored block without comparing ids
+    /// against the sentinel itself. It carries no information the sentinel does not: a ref decoded
+    /// from a store written before the flag existed gets it from the sentinel, and a ref with it
+    /// set re-encodes to the same 32 zero bytes and length.
+    pub hole: bool,
 }
+
+/// The block id a hole ref carries. BLAKE3 never produces it, so it can never name a stored block.
+pub const HOLE: BlockId = BlockId::from_bytes([0; BLOCK_ID_LEN]);
+
+/// The longest run a hole ref may claim. A zero id with a longer length is a corrupt entry, not a
+/// hole, and is refused by [`ChunkRef::validate`].
+pub const HOLE_MAX: u32 = 1 << 30;
+
+impl ChunkRef {
+    /// A ref to a stored block.
+    pub const fn block(id: BlockId, len: u32) -> Self {
+        Self {
+            id,
+            len,
+            hole: false,
+        }
+    }
+
+    /// A hole ref: `len` bytes of zeros that are not in the store. `len` must be at most
+    /// [`HOLE_MAX`]; use [`ChunkRef::hole_refs`] to cover a longer run.
+    pub const fn hole(len: u32) -> Self {
+        Self {
+            id: HOLE,
+            len,
+            hole: true,
+        }
+    }
+
+    /// True for a hole ref, whether it was built by [`ChunkRef::hole`] or decoded from the
+    /// sentinel.
+    pub const fn is_hole(&self) -> bool {
+        self.hole
+    }
+
+    /// Hole refs covering `len` bytes, split at [`HOLE_MAX`] because one ref cannot claim more.
+    pub fn hole_refs(mut len: u64) -> Vec<Self> {
+        let mut out = Vec::new();
+        while len > 0 {
+            let n = len.min(u64::from(HOLE_MAX));
+            out.push(Self::hole(n as u32));
+            len -= n;
+        }
+        out
+    }
+
+    /// Whether the flag, the id and the length agree.
+    ///
+    /// A ref that is a hole and names a stored block would be skipped by a walker while the block
+    /// it names is live, and a ref that is a stored block with the sentinel id would put the
+    /// sentinel in front of a collector. Both are refused at the seam that writes chunk lists.
+    pub fn validate(&self) -> std::result::Result<(), ChunkRefError> {
+        if self.hole {
+            if self.id != HOLE {
+                return Err(ChunkRefError::HoleWithBlockId);
+            }
+            if self.len > HOLE_MAX {
+                return Err(ChunkRefError::HoleTooLong);
+            }
+        } else if self.id == HOLE {
+            return Err(ChunkRefError::BlockWithHoleId);
+        }
+        Ok(())
+    }
+}
+
+/// Why a [`ChunkRef`] is not a legal chunk ref.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkRefError {
+    /// Flagged a hole but named a stored block.
+    HoleWithBlockId,
+    /// A hole longer than [`HOLE_MAX`].
+    HoleTooLong,
+    /// Named the hole sentinel without the hole flag.
+    BlockWithHoleId,
+}
+
+impl fmt::Display for ChunkRefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::HoleWithBlockId => "a hole cannot name a stored block",
+            Self::HoleTooLong => "a hole is longer than a hole may claim",
+            Self::BlockWithHoleId => "a stored block cannot have the hole id",
+        })
+    }
+}
+
+impl std::error::Error for ChunkRefError {}
 
 #[cfg(test)]
 mod tests {

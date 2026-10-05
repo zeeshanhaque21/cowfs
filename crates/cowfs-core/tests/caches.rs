@@ -76,7 +76,8 @@ fn a_directory_barrier_does_not_flush_unrelated_file_data() {
     assert_eq!(names.len(), 6, "{names:?}");
 }
 
-/// F8: `live_blocks` never yields a hole, and every block it yields is in the store.
+/// F8: `live_blocks` never yields a hole, every block it yields is in the store, and the
+/// metadata walk it builds on no longer yields the hole either.
 #[test]
 fn live_blocks_filters_holes_and_yields_only_stored_blocks() {
     let dir = tempfile::tempdir().unwrap();
@@ -100,10 +101,11 @@ fn live_blocks_filters_holes_and_yields_only_stored_blocks() {
             "a yielded block is not in the store"
         );
     }
-    // meta's own walker still yields the hole, which is why the filter lives here
+    // the hole is filtered where the chunk list is decoded now, so the walk in meta does not hand
+    // the sentinel to this caller either, and both walks agree exactly
     let sid = c.list_snapshots().unwrap()[0].id;
     let mut m = cowfs_meta::Marker::default();
-    let raw: Vec<_> = c
+    let mut raw: Vec<_> = c
         .meta()
         .snapshot_by_id(cowfs_meta::SnapshotId(sid))
         .unwrap()
@@ -111,14 +113,15 @@ fn live_blocks_filters_holes_and_yields_only_stored_blocks() {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
-    assert!(
-        raw.iter().any(|b| b.as_bytes() == &[0u8; 32]),
-        "the hole is not a hole any more?"
+    raw.sort();
+    let mut got = ids.clone();
+    got.sort();
+    assert_eq!(
+        raw, got,
+        "the metadata walk and Core::live_blocks must agree now that the flag filters holes"
     );
     assert!(
-        raw.len() > ids.len(),
-        "the filter dropped nothing: {} vs {}",
-        raw.len(),
-        ids.len()
+        !raw.iter().any(|b| b.as_bytes() == &[0u8; 32]),
+        "the hole sentinel reached a caller: {raw:?}"
     );
 }
