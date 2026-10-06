@@ -39,7 +39,7 @@ fn a_u64_max_block_is_clamped_in_the_ordinary_allocator() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.redb");
 
-    let created = {
+    let (sid, created) = {
         let m = Meta::open(&path, opts_with_block(u64::MAX)).unwrap();
         let s = m.new_snapshot("s0").unwrap();
 
@@ -68,7 +68,7 @@ fn a_u64_max_block_is_clamped_in_the_ordinary_allocator() {
         );
         m.check()
             .expect("check after an ordinary create under u64::MAX");
-        f.ino
+        (s.id(), f.ino)
     };
 
     // Drop every handle, then reopen. A clean close collapses the durable floor to `next`, since
@@ -87,12 +87,16 @@ fn a_u64_max_block_is_clamped_in_the_ordinary_allocator() {
         created.0
     );
 
-    let s = m.new_snapshot("s1").unwrap();
+    // The reopened file lives in the original snapshot, by id, so the persistence check reads the
+    // same snapshot `f` was created in. A fresh empty snapshot would prove nothing about `f`.
+    let s = m.snapshot_by_id(sid).unwrap();
     let back = s.lookup(ROOT_INO, b"f").unwrap();
     assert_eq!(
         back.ino, created,
         "the created inode is not reused after a reopen"
     );
+    assert_eq!(back.kind, FileType::File, "the file survives the reopen");
+    assert_eq!(back.mode & 0o777, 0o644);
 
     let g = s
         .create(ROOT_INO, b"g", 0o644)
