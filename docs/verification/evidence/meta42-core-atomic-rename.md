@@ -7,7 +7,8 @@ Issue #42 stays open; requests 2, 3, 4 and 5 are untouched by this change.
 | what | value |
 |---|---|
 | branch | `fix/core-atomic-snapshot-rename-42`, cut from the reviewed dependency head |
-| dependency, and base of this branch | `b5e6f785eeee62f4a60401cf3ebbd113693d3872` (`fix/meta-snapshot-rename-42`, PR #137) |
+| dependency, and first base of this branch | `b5e6f785eeee62f4a60401cf3ebbd113693d3872` (`fix/meta-snapshot-rename-42`, PR #137) |
+| head | `f4ce53ac29b43674b4349455d956eb7f7bd0f719`, `main` merged in, see "The merge" |
 | PR | https://github.com/zeeshanhaque21/cowfs/pull/139 |
 | lease | `.treehouse-ready-wave/.treehouse/cowfs-7c1bf8/3/cowfs` |
 | accepted metadata review | `docs/reviews/pr137-meta42-snapshot-rename-runtime-final.md`, sha256 `a552af900706a3eb5565db245c810c9f46a9ba5adff6991e30bf7ad74b6a2c0a` |
@@ -15,8 +16,25 @@ Issue #42 stays open; requests 2, 3, 4 and 5 are untouched by this change.
 | accepted residual, immutable | `docs/verification/evidence/meta42-residual-verification.md`, sha256 `fbc6a078137b0fab370638d27dcaf64ff3ad283de37d8e7e970e4b10faac53ba` |
 | toolchain | `rustc 1.99.0 (b940084d7 2026-09-28)`, macOS |
 
-PR #137 is a dependency and is **not** claimed as merged.
+PR #137 was a dependency and was **not** merged while this work was written.
+It merged during the work, as `cf67e8a`, and `main` now contains `b5e6f78`.
+`main` was brought into this branch rather than rebased onto, and the whole scoped suite was
+re-run against the merged tree. The dependency is therefore satisfied by `main` and the claim
+is stated as a fact rather than as an assumption.
 The branch base is that exact commit, fetched by name into `refs/remotes/origin/fix/meta-snapshot-rename-42`, never by `FETCH_HEAD`.
+
+## The merge
+
+While this was in flight, `main` moved: #136, #137 and #138 all merged, so `main` went from `b486d45` to `cf67e8a`.
+Two of those touch this work.
+
+`#138` corrected the `Core::live_blocks` doc comment in the same file this change edits, at the line the stale-comment review had flagged.
+The two changes are disjoint: `live_blocks` is a different method from `rename_snapshot`.
+A read-only merge-tree of this head against `main` was clean, and the merge was then made with `--no-ff` so both lines of history are kept rather than rebased away.
+After the merge, the corrected comment from `main` is present verbatim in the merged file, and `git diff main HEAD -- crates/cowfs-core/src/lib.rs` contains only this change's own 45 insertions and 11 deletions, so nothing of `main`'s is reverted.
+The whole scoped suite was then re-run against the merged tree, which now also carries the hole flag from #138 and the clock work from #136: 18 gates, all green.
+
+The branch adds two commits over `main`: the change, and the merge.
 
 ## What was wrong, in the words of the tree
 
@@ -119,8 +137,30 @@ Both now assert what is actually true.
 
 ### Everything that was run
 
-`cargo fmt --all -- --check` exit 0.
-`cargo clippy -p cowfs-core --lib --test core_atomic_rename --test swap --test critic2b -- -D warnings` exit 0.
+Against the **merged** tree, which is the tree that ships, 18 gates all exit 0:
+
+| gate | result |
+|---|---|
+| `cowfs-core --test core_atomic_rename` | 10 passed, 0 failed |
+| `cowfs-core --test swap` | 3 passed, 0 failed |
+| `cowfs-core --test critic2b` | 27 passed, 0 failed, 1 ignored |
+| `cowfs-core --test core` | 20 passed, 0 failed |
+| `cowfs-core --test names_ino` | 4 passed, 0 failed |
+| `cowfs-core --test caches` | 2 passed, 0 failed |
+| `cowfs-core --test durability` | 6 passed, 0 failed |
+| `cowfs-core --test alias` | 3 passed, 0 failed, 1 ignored |
+| `cowfs-core --test fsck` | 3 passed, 0 failed |
+| `cowfs-core --test invariant` | 4 passed, 0 failed |
+| `cowfs-core --test locks` | 2 passed, 0 failed |
+| `cowfs-core --test hole_walk`, from #138 | 3 passed, 0 failed |
+| `cowfs-meta --test snapshot_rename` | 10 passed, 0 failed |
+| `cowfs-meta --test hole_flag`, from #138 | 14 passed, 0 failed |
+| `cowfs-meta --test critic` | 12 passed, 0 failed |
+| `cowfs-gc --test mark` | 11 passed, 0 failed |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy -p cowfs-core --lib --test core_atomic_rename --test swap --test critic2b -- -D warnings` | exit 0 |
+
+`hole_walk`, `hole_flag` and `cowfs-gc --test mark` are run because the merged tree carries #138 and this change shares `cowfs-core`, not as a claim about #138's own review scope.
 
 | target | result |
 |---|---|
@@ -137,7 +177,7 @@ Both now assert what is actually true.
 | `cowfs-core --test locks` | 2 passed, 0 failed |
 | `cowfs-meta --test snapshot_rename` | 10 passed, 0 failed |
 
-`cowfs-meta --test snapshot_rename` is run because the dependency is load-bearing here, not as a claim about PR #137's own review scope.
+The same scope was run once before the merge, on the pre-merge tree, with identical results for every gate that does not depend on #138; that run is what produced the RED and the first GREEN above.
 
 ### Three existing `critic2b` cases re-pointed, and why
 
@@ -163,12 +203,16 @@ sha256, at the head this record describes, of every file the result rests on.
 
 | file | sha256 |
 |---|---|
-| `crates/cowfs-core/src/lib.rs` | `589bdbe734d56d90d810e8cb2da69628c370774c70490b8d012643fec9506db6` |
+| `crates/cowfs-core/src/lib.rs` | `c9fa761aadfa066888fe4bf24ef2a47f18110b89677dea6e748a1bdd99a52d5d` |
 | `crates/cowfs-core/src/queue.rs` | `8bba9c1a0bf1c5208af18ab35c43fb04ec495b6a4faefa0a827d52930d233efe` |
 | `crates/cowfs-core/src/swap.rs` | `a9bd79ccce6f1830c9e97ea1de375304ab94c1e34a872554e134398652b15dfc` |
-| `crates/cowfs-core/tests/critic2b.rs` | `6b7f14b137ab0b45aad5dc5701e3c17c2a10dfb424e3d10b98d90e219ab65e09` |
+| `crates/cowfs-core/tests/critic2b.rs` | `4d389b7032e71c129a9e2f0782eca371cbfd2937119bf85bd1d66dd8f7cde6a9` |
 | `crates/cowfs-core/tests/core_atomic_rename.rs` | `5bdfe20d6b14e166e410b73b78131a960ee825b9db751b584a6d0860e91fae43` |
 | `crates/cowfs-meta/src/db.rs`, the dependency, unmodified | `da41c8e70c4b7a7e7f9116b11f6476acc21f6d92216f863e5416dd9212843cae` |
+| `crates/cowfs-store/src/lib.rs`, from #138, unmodified here | `4613a829bc5bd384e731c16fcdf726e200ea5624736cf1b5afcc342d95672fba` |
+
+`lib.rs` and `critic2b.rs` digests differ from the pre-merge values because `main` corrected the `live_blocks` comment in the first and because rustfmt reflowed the re-pointed cases in the second.
+`queue.rs`, `swap.rs` and the fixture are byte-identical across the merge, which is the evidence that this change did not disturb anything of `main`'s.
 
 Digests are of file content, not of anything derived from a file name.
 The branch base is a full commit id and was fetched by ref name.
@@ -178,7 +222,7 @@ The branch base is a full commit id and was fetched by ref name.
 `bench/out` held 6,370,416 KiB before this work began, against an 8 GiB cap, leaving 2,018,192 KiB.
 Free floor 291 GiB against a 20 GiB floor.
 One target directory was built, `bench/out/meta42-core-atomic-rename/target-red`, and reused across the red and green runs by building the old consumer first and then patching the same tree in place, so the dependencies compiled once rather than once per arm.
-Peak `bench/out` 7,210,340 KiB, still under the cap.
+Peak `bench/out` 7,450,168 KiB after the merged-tree rebuild, still under the cap, checked before every gate of every batch.
 Every batch ran under one foreground `mac-heavy.lock` acquisition, appended and flushed per gate, and checked the cap before each gate.
 No cleanup, no deletion, no move, no offload and no cap waiver.
 
