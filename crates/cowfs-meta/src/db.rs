@@ -2416,6 +2416,16 @@ mod tests {
             "the recovered floor ({floor}) must cover the reserved range end ({})",
             original.end().0
         );
+        // Which commit was lost. The bound commit `ino_reserved_intent = end` is the floor move's
+        // immediate predecessor, and recovery prefers the bound. If the rollback lost only the
+        // floor move, the recovered floor IS the range end; a deeper rollback that lost the bound
+        // too would fall back to `old_floor + block` and land strictly below the end. So equality
+        // here is the observable that pins "newest commit only", not merely "some rollback".
+        assert_eq!(
+            floor,
+            original.end().0,
+            "the rollback lost exactly the floor move: the recovered floor lands on the bound"
+        );
         assert_eq!(
             m.health().ino_floor,
             floor,
@@ -2437,19 +2447,23 @@ mod tests {
             "a reserved number was reissued after recovery"
         );
         m.check().unwrap();
+        // This reservation raised the durable floor; the reopened floor must be at or above it,
+        // never below the recovered value.
+        let raised = next.end().0;
         drop(m);
 
         let again = Meta::open(&path, opts()).unwrap();
         assert_eq!(again.health().recoveries, 1, "the count is durable");
-        assert_eq!(
-            again.health().ino_floor,
-            floor,
-            "and so is the recovered floor"
+        assert!(
+            again.health().ino_floor >= raised,
+            "the reopened floor ({}) must not fall below the floor after recovery ({raised})",
+            again.health().ino_floor
         );
         let reopened = again.reserve_inodes(1).unwrap();
         assert!(
-            reopened.start().0 >= floor,
-            "a plain reopen still respects the recovered floor"
+            reopened.start().0 >= raised,
+            "a plain reopen still respects the raised floor: {} < {raised}",
+            reopened.start().0
         );
         again.check().unwrap();
 
@@ -2468,7 +2482,23 @@ mod tests {
     // comparison.
     #[test]
     fn a_large_reservation_is_measured_against_a_single_one() {
+        use std::io::Write as _;
         use std::time::Instant;
+
+        // libtest captures the Rust-level `std::io::stdout` and shows it only on failure, so a
+        // passing timing test prints nothing in a normal CI log. Opening `/dev/stdout` (which
+        // resolves to fd 1) in write mode gives an independent handle to the process's real
+        // stdout, which libtest does not capture and CI does collect. Falls back to `println!` if
+        // the device cannot be opened, so the measurement never fails for want of a sink.
+        fn emit(line: &str) {
+            match std::fs::File::options().write(true).open("/dev/stdout") {
+                Ok(mut f) => {
+                    let _ = f.write_all(line.as_bytes());
+                    let _ = f.write_all(b"\n");
+                }
+                Err(_) => println!("{line}"),
+            }
+        }
 
         fn measure(n: u64) -> (Duration, u64) {
             let dir = tempfile::tempdir().unwrap();
@@ -2501,10 +2531,10 @@ mod tests {
 
         // Representative full case first, so the deliverable is validated before the comparison.
         let (full, floor) = measure(1_000_000);
-        println!(
+        emit(&format!(
             "inode reservation timing: env CI={ci} reps={reps} node_size=512 ino_block=8 \
              n=1000000 -> {full:?} (floor {floor})"
-        );
+        ));
 
         // Bounded comparison: the same fresh-store conditions for one number and for a million.
         for n in [1u64, 1_000_000] {
@@ -2520,10 +2550,10 @@ mod tests {
                 s.sort();
                 s[s.len() / 2]
             };
-            println!(
+            emit(&format!(
                 "inode reservation timing: n={n} reps={reps} min={min:?} median={median:?} \
                  max={max:?}"
-            );
+            ));
         }
     }
 }
