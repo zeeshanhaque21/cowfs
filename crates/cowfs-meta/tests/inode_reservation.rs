@@ -46,7 +46,7 @@ fn a_reservation_returns_numbers_without_creating_anything() {
     assert!(!r.is_empty(), "a range this crate hands out is never empty");
     assert_ne!(r.start(), ROOT_INO, "the root is never handed out");
     assert!(
-        r.start().0 >= ROOT_INO.0 + 1,
+        r.start().0 > ROOT_INO.0,
         "reservation starts above the root, got {}",
         r.start().0
     );
@@ -130,7 +130,6 @@ fn numbers_reserved_and_never_used_are_not_reissued_after_a_reopen() {
     };
     assert_eq!(reserved.len(), 11);
 
-    drop(reserved);
     let m = Meta::open(&path, opts()).unwrap();
     let after = m.reserve_inodes(11).unwrap();
 
