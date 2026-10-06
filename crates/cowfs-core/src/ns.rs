@@ -165,6 +165,17 @@ impl Inner {
         if parent == ROOT_INO {
             return Err(Error::ReadOnly);
         }
+        // Refuse at the session ceiling before reserving: the number would be handed out now and
+        // released later, and a client still holding it would see `Stale`, so the create fails
+        // here instead. Every live inode keeps one alias, so the alias count is the live count.
+        let live = self.aliases.rd().len();
+        if live >= self.opts.alias_limit {
+            *self.last_error.lk() = Some(format!(
+                "session inode limit reached: {live} inodes are live, the ceiling is {}",
+                self.opts.alias_limit
+            ));
+            return Err(Error::NoSpace);
+        }
         // Reserve before any Core lock: the refill opens a meta reservation, and no lock of ours
         // may be held across a meta transaction. A ticket popped and then unused (an early
         // `Exists`/`NotFound` below) is wasted, never reused.

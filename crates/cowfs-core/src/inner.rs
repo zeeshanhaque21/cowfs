@@ -785,13 +785,13 @@ impl Inner {
             Ok(created) => {
                 {
                     let mut al = self.aliases.wr();
-                    // Only a virtual child needs the bridge to its meta number. A create at a
-                    // reserved number already holds the packed meta number, so aliasing it would be
-                    // a self-entry that inflates the table and counts against the alias ceiling.
+                    // Every live inode keeps one alias, so the table tracks the live count and the
+                    // session ceiling stays honest. A reserved create's child is already the packed
+                    // meta number, so its alias is the identity bridge `meta_of`/`canon` need; the
+                    // key is that packed number and the value is the bare meta number, so it is a
+                    // real entry, not a self-map.
                     for (v, m) in &created {
-                        if matches!(classify(*v), Id::Virt { .. }) {
-                            al.insert(*v, sc.id, *m);
-                        }
+                        al.insert(*v, sc.id, *m);
                     }
                 }
                 sc.flushed.store(batch.seq, Ordering::Release);

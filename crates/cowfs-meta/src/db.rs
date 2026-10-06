@@ -2480,22 +2480,39 @@ mod tests {
             "the durable commit was expected to fail: {failed:?}"
         );
 
-        // Nothing was persisted, so no inode exists yet at the number.
-        assert!(
-            matches!(s.getattr(want), Err(Error::NotFound)),
-            "the failed durable commit left an inode behind"
+        // The create stays pending in the session tree even though the durable commit failed, so
+        // the number resolves to the pending inode rather than being absent.
+        let pending = s
+            .getattr(want)
+            .expect("the pending create must still resolve in the session tree");
+        assert_eq!(
+            pending.ino, want,
+            "the pending inode is not at the reserved number"
+        );
+        assert_eq!(
+            pending.kind,
+            FileType::File,
+            "the pending inode is not the file that was created"
         );
 
-        // The number is still owned by the session, so the retry is stopped by the create still
-        // pending in the tree, never by a reservation the session lost.
-        let retry = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
-        if let Err(e) = &retry {
-            assert!(
-                !e.to_string().contains("was not issued"),
-                "the failed durable commit stranded the reserved number: {e:?}"
-            );
-        }
-        m.check().unwrap();
+        // The number is still owned by the session, so the retry is stopped by the pending inode,
+        // never by a reservation the session lost. A different name is used so the refusal can
+        // only come from the inode number already being taken, not from the name.
+        let retry = s.batch(|tx| tx.create_at(ROOT_INO, b"b", 0o644, &tickets[0]));
+        assert!(
+            matches!(retry, Err(Error::Exists)),
+            "the retry was not stopped by the pending inode: {retry:?}"
+        );
+
+        // The commit failed before it reached redb, so a fresh reopen holds no inode at the number.
+        drop(s);
+        drop(m);
+        let again = Meta::open(dir.path().join("m.redb"), opts_durable()).unwrap();
+        assert!(
+            matches!(again.getattr(want), Err(Error::NotFound)),
+            "the pre-persist failure left an inode behind across a reopen"
+        );
+        again.check().unwrap();
     }
 
     // T14: a durable commit that fails after it persisted must not let the number be created twice.
