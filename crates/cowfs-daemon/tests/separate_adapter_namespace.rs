@@ -28,7 +28,8 @@
 //! `create(doc)` then `mkdir(._doc)` - run through the same topology. The race must equal at least
 //! one actual serial product on every user-observable field (exact RPC statuses, returned-handle
 //! presence, the final kind of each name, the `fileid` identity within the run, handle stability,
-//! `doc` bytes, and the sidecar channel bytes). `depth`/`peak`/`overlap` and the two mid-operation
+//! `doc` bytes written through adapter A and read back through *B's own* handle, and the sidecar
+//! channel bytes). `depth`/`peak`/`overlap` and the two mid-operation
 //! probes are diagnostics only and are never the pass criterion.
 //!
 //! A PASS therefore says the race produced one of the two legal serial outcomes; it does not claim
@@ -629,8 +630,10 @@ struct Observation {
     side_kind_rpc: Option<u32>,
     /// `doc`'s `fileid3` re-read after the requests stayed the same (identity is stable).
     main_identity_stable: bool,
-    /// `doc` written through one adapter and read back through the other, byte for byte.
-    main_roundtrip: bool,
+    /// `doc` written through adapter A and read back through adapter B, resolving MAIN through
+    /// *B's own* root: B's handle for the same inode, then the exact bytes. A is written through
+    /// A's handle; B never decodes A's handle.
+    main_cross_adapter_bytes: bool,
     /// When `._doc` is a live sidecar channel (`ftype` regular): a valid AppleDouble image written to
     /// it reads back unchanged. `None` when `._doc` is a real directory, so no channel exists.
     channel_roundtrips: Option<bool>,
@@ -662,7 +665,7 @@ impl Observation {
         cmp!(main_kind_rpc);
         cmp!(side_kind_rpc);
         cmp!(main_identity_stable);
-        cmp!(main_roundtrip);
+        cmp!(main_cross_adapter_bytes);
         cmp!(channel_roundtrips);
         cmp!(channel_refuses_junk);
         d
@@ -763,32 +766,62 @@ fn observe(mkdir_first: bool, race: bool) -> Observation {
         id1 == id2
     };
 
-    // One shared namespace: write `doc` through adapter A, read it back through adapter B.
-    let main_roundtrip = if main_fh.is_empty() {
-        false
-    } else {
-        let wrote = ca.write(&main_fh, 0, DOC_BYTES);
-        let (rs, got) = cb.read(&main_fh, 0, 1 << 16);
-        wrote == OK && rs == OK && got == DOC_BYTES
+    // Cross-adapter byte proof without crossing capability: resolve `doc` through *B's own* root so
+    // B holds B's valid handle for the shared inode; write through A's handle, read through B's.
+    // B never decodes A's opaque handle (each adapter mints its own BLAKE3 key). The two adapters
+    // must also agree on the shared inode id, so a per-adapter cache cannot masquerade as one
+    // namespace. Absent in both the failing-create and the MAIN-absent failed-mkdir cases, where the
+    // byte claim does not apply.
+    let main_cross_adapter_bytes = match (ca.lookup("doc"), cb.lookup("doc")) {
+        ((OK, a_fh, Some(_)), (OK, b_fh, Some(_))) => {
+            let wrote = ca.write(&a_fh, 0, DOC_BYTES);
+            let (rs, got) = cb.read(&b_fh, 0, 1 << 16);
+            wrote == OK && rs == OK && got == DOC_BYTES && ca.fileid(&a_fh) == cb.fileid(&b_fh)
+        }
+        _ => false,
     };
 
     // The sidecar channel exists only when `._doc` is a live view (a regular file), not a real
     // directory. When it does, a valid AppleDouble image must round-trip through the handle the
     // product returned for that name, and junk must be refused with NOTSUPP, non-destructively.
-    let (channel_roundtrips, channel_refuses_junk) =
-        if side_kind_rpc == Some(FTYPE_REG) && !side_fh.is_empty() {
-            let blob = valid_sidecar();
-            let wrote = ca.write(&side_fh, 0, &blob);
-            let (rs, got) = ca.read(&side_fh, 0, 1 << 16);
-            let roundtrips = wrote == OK && rs == OK && got == blob;
+    // The channel is inherent to a main file, which both adapters can see, so a valid sidecar
+    // resolved through B's own root tolerates a MAIN-name arrangement; elsewhere it stays A's.
+    let side_is_channel = side_kind_rpc == Some(FTYPE_REG);
+    let blob = valid_sidecar();
+    let (side_write_st, side_got, side_junk_st, side_recovered) =
+        if side_is_channel && !side_fh.is_empty() {
+            let slot = ca.write(&side_fh, 0, &blob);
+            let got = match cb.lookup("._doc") {
+                (OK, b_side, Some(FTYPE_REG)) if !b_side.is_empty() => {
+                    match cb.read(&b_side, 0, 1 << 16) {
+                        (OK, g) => Some(g),
+                        _ => None,
+                    }
+                }
+                _ => match ca.read(&side_fh, 0, 1 << 16) {
+                    (OK, g) => Some(g),
+                    _ => None,
+                },
+            };
             let junk = vec![0u8; 4096];
-            let refused = ca.write(&side_fh, 0, &junk) == NOTSUPP;
+            let junk_st = ca.write(&side_fh, 0, &junk);
+            // The refused junk write must never corrupt the good bytes: read back (A's handle).
             let (rs2, got2) = ca.read(&side_fh, 0, 1 << 16);
             let recovered = rs2 == OK && got2 == blob;
-            (Some(roundtrips), Some(refused && recovered))
+            (Some(slot), got, Some(junk_st), recovered)
         } else {
-            (None, None)
+            (None, None, None, false)
         };
+
+    // The sidecar oracle compares booleans, never raw statuses: an absent channel reads as `None`,
+    // matching the serial histories, rather than a raw RPC failure that would falsely diverge.
+    let channel_roundtrips =
+        side_write_st.map(|st| st == OK && side_got.as_deref() == Some(&blob[..]));
+    let channel_refuses_junk = side_junk_st.map(|st| {
+        st == NOTSUPP
+            && matches!(side_got.as_deref(), Some(g) if g == blob.as_slice())
+            && side_recovered
+    });
 
     let obs = Observation {
         mkdir_status,
@@ -798,7 +831,7 @@ fn observe(mkdir_first: bool, race: bool) -> Observation {
         main_kind_rpc,
         side_kind_rpc,
         main_identity_stable,
-        main_roundtrip,
+        main_cross_adapter_bytes,
         channel_roundtrips,
         channel_refuses_junk,
     };
@@ -856,6 +889,60 @@ fn two_adapters_over_one_snapshot_namespace_match_a_serial_product_under_the_rac
         matches!(race.side_kind_rpc, Some(FTYPE_DIR) | Some(FTYPE_REG)),
         "._doc is neither a real directory nor a live view after the race: {race:?}"
     );
+
+    // The successful serial history whose `create(doc)` landed must actually *show* one shared
+    // namespace: MAIN resolves through both adapters, writing through A and reading through B's own
+    // handle returns the exact bytes, and the two adapters agree on the shared inode id. If this
+    // were a bug it could never hold; asserting it TRUE stops the oracle from passing on the
+    // always-false equality (false == false). The `MAIN`-absent failed-mkdir product legitimately
+    // has no `doc` and no byte claim, so it is exempt.
+    let successful_serial = if serial_mkdir_first.create_status == OK {
+        (serial_mkdir_first, "mkdir-first")
+    } else {
+        (serial_create_first, "create-first")
+    };
+    assert_eq!(
+        successful_serial.0.main_kind_rpc,
+        Some(FTYPE_REG),
+        "the successful serial history ({}) did not leave doc a regular file: {:?}",
+        successful_serial.1,
+        successful_serial.0
+    );
+    assert!(
+        successful_serial.0.main_cross_adapter_bytes,
+        "the successful serial history ({}) did not prove the byte round-trip through B's own handle: {:?}",
+        successful_serial.1,
+        successful_serial.0
+    );
+    assert!(
+        successful_serial.0.main_identity_stable,
+        "the successful serial history ({}) reported an unstable doc fileid: {:?}",
+        successful_serial.1, successful_serial.0
+    );
+    assert!(
+        race.main_cross_adapter_bytes,
+        "the race did not prove the cross-adapter byte round-trip it must share with a legal product: {race:?}"
+    );
+    assert!(
+        race.main_identity_stable,
+        "the race reported an unstable doc fileid across two GETATTRs: {race:?}"
+    );
+    // Since the byte proof is TRUE in the successful serial product, the race matching it must also
+    // be TRUE; a `false == false` coincidence is impossible.
+    if let Some(channel) = successful_serial.0.channel_roundtrips {
+        assert!(
+            channel,
+            "the successful serial history ({}) did not round-trip a valid sidecar through the channel: {:?}",
+            successful_serial.1,
+            successful_serial.0
+        );
+    }
+    if let Some(refused) = race.channel_refuses_junk {
+        assert!(
+            refused,
+            "the race channel did not refuse junk non-destructively: {race:?}"
+        );
+    }
 }
 
 /// The premise: the two adapters really do reach one namespace through the one `Core`. A file
