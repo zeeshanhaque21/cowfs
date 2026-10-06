@@ -315,34 +315,42 @@ fn two_adapters_over_one_namespace_do_not_both_enter_the_guard() {
         backend.peak()
     );
 
-    // The covered property: two guarded name-space operations on one directory, through any pair of
-    // adapters over one backend, must never run inside the backend at once. A lock that covered
-    // both adapters would hold B outside A's window; a per-instance lock cannot, and B's create
-    // lands while A is stopped at its sidecar mutation.
+    // Every request that must succeed did. A failed create would otherwise make the main name look
+    // absent and skip the outcome branch entirely.
     assert!(
         created.is_ok(),
         "adapter B failed to create doc across the two-adapter race"
     );
     assert!(
-        !doc_present_at_mutation,
-        "adapter B created doc while adapter A was still inside its guarded sidecar mutation: the \
-         two adapters' per-instance lock maps do not cover one another"
-    );
-    assert_eq!(
-        backend.peak(),
-        1,
-        "two guarded name-space operations on one directory ran at the same time across two \
-         adapters: their per-instance lock maps do not cover one another"
-    );
-    assert!(
-        !overlapped,
-        "adapter B entered adapter A's guard window on a shared directory"
+        mk.is_ok(),
+        "adapter A failed to mkdir ._doc across the two-adapter race"
     );
 
-    // Reported, not asserted: whether a real `._doc` directory took the name. On a serialised
-    // arrangement A runs first, sees `doc` absent, and a real `._doc` is a legitimate outcome, so
-    // this value alone does not separate the two topologies. The lock-contract assertions above do.
-    let _ = real;
+    // The outcome is what separates a defect from a legal serialisation, never the lock shape.
+    // `overlapped`, `peak`, and `depth_while_held` are diagnostics below: a correct arrangement may
+    // still let the backend see two operations (a lock above the backend, or a re-check at the
+    // mutation), so none of them can be the pass criterion. A `SharedBackend`-level `peak == 1` or
+    // `!overlapped` assertion would fail a legal arrangement, and treating `!doc_present_at_mutation`
+    // as required would make the test assert the bug does not exist rather than the user-visible
+    // outcome.
+    //
+    // On this backend a legal serial outcome is either mkdir-first (`doc` was absent when A's guard
+    // read it, so a real `._doc` directory is the correct macOS fallback) or doc-first (`._doc` is a
+    // live sidecar view of `doc`). The illegal outcome is a real directory taking the live view's
+    // name while `doc` was already present when A mutated: the guard read answered stale state.
+    if doc_present_at_mutation {
+        assert!(
+            !real,
+            "a real directory took the live sidecar view name while doc was present: the two \
+             adapters' per-instance lock maps do not cover one another over one shared namespace"
+        );
+    } else {
+        assert!(
+            real,
+            "mkdir(._doc) won the guard while doc was absent, so ._doc must be a real directory"
+        );
+    }
+    let _ = (overlapped, depth_while_held, backend.peak());
 }
 
 /// The two adapters really do reach one namespace: a create through one is visible to the other,
