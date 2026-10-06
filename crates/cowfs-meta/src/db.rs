@@ -712,6 +712,42 @@ impl Inner {
         })
     }
 
+    /// Reserves `n` contiguous inode numbers, durably, before any of them names an inode.
+    ///
+    /// Takes the same lock and draws on the same allocator as `mutate`, so a reservation and an
+    /// ordinary create can never overlap and no number is handed out twice.
+    ///
+    /// The floor is committed in block-sized steps, the same shape as `Tx::alloc`, because
+    /// `record_recovery` bounds a lost commit by one block. Committing the whole range at once
+    /// would move `ino_reserved` further than that bound and could reissue a number after a
+    /// rollback. `next` is advanced only after the floor is durable, so a failure here exposes no
+    /// number and a reopen starts at or above the whole range.
+    pub(crate) fn reserve_inodes(&self, n: u64) -> Result<InoRange> {
+        let _flight = Inflight::enter(&self.inflight);
+        let mut s = self.wlock()?;
+        self.check_writable(&s)?;
+        if n == 0 {
+            return Err(Error::Invalid(
+                "a reservation must ask for at least one inode",
+            ));
+        }
+        if s.ino.next >= INO_LIMIT || n > INO_LIMIT - s.ino.next {
+            return Err(Error::LimitExceeded("inode numbers exhausted"));
+        }
+        while s.ino.next + n > s.ino.reserved {
+            // At most one block per commit, and never past the limit. Both sums stay well inside
+            // u64 because every term is bounded by INO_LIMIT.
+            let step = (s.ino.next + n)
+                .min(s.ino.reserved + s.ino.block.max(1))
+                .min(INO_LIMIT);
+            self.reserve_durable(step)?;
+            s.ino.reserved = step;
+        }
+        let start = s.ino.next;
+        s.ino.next += n;
+        Ok(InoRange::new(Ino(start), Ino(s.ino.next)))
+    }
+
     /// Records a rollback that lost the newest commit, and moves the two counter floors past
     /// everything the lost commit could have handed out.
     ///
@@ -1581,6 +1617,26 @@ impl Meta {
     /// Runs `before_sync`, then makes every applied change durable. The hook runs on every call,
     /// also when nothing is pending, so a caller can use this as "sync the store, then the
     /// metadata". Returns the hook's or the commit's error.
+    /// Reserves `n` inode numbers before any inode exists, and hands them back.
+    ///
+    /// The numbers come from the same allocator [`Snapshot::batch`] creation draws on, so an
+    /// ordinary create never receives one of them and this never receives one from a create.
+    /// Numbers are contiguous and `end` is exclusive.
+    ///
+    /// The durable floor is committed before this returns, so a number is never reissued after a
+    /// reopen, including one that was reserved and then never used. Because it commits, it is a
+    /// durable operation rather than an applied one: it runs under the same lock as a batch and
+    /// runs no `before_sync` hook, since it carries no chunk references.
+    ///
+    /// Asking for zero is [`Error::Invalid`], and asking for more than the remaining numbers below
+    /// [`INO_LIMIT`] is [`Error::LimitExceeded`]. Neither writes anything.
+    ///
+    /// This hands out numbers; it does not create inodes. Creating an inode at a reserved number is
+    /// a separate concern and is not provided here.
+    pub fn reserve_inodes(&self, n: u64) -> Result<InoRange> {
+        self.h.inner.reserve_inodes(n)
+    }
+
     pub fn sync(&self) -> Result<()> {
         self.h.inner.sync()
     }

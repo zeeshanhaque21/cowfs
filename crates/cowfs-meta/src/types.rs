@@ -11,6 +11,55 @@ pub struct Ino(pub u64);
 /// The root directory of every snapshot.
 pub const ROOT_INO: Ino = Ino(1);
 
+/// A contiguous half-open range of inode numbers reserved before any of them names an inode.
+///
+/// `end` is exclusive, so the range holds `end - start` numbers and a one-number range is
+/// `start..start + 1`. The numbers come from the same allocator ordinary creation draws on, so no
+/// other caller is handed one of them, and the durable floor is committed before the range is
+/// returned, so a number is not reissued after a reopen even if it never gets used.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InoRange {
+    start: Ino,
+    end: Ino,
+}
+
+impl InoRange {
+    /// Builds a range whose first number is `start` and whose end is one past the last.
+    pub const fn new(start: Ino, end: Ino) -> Self {
+        Self { start, end }
+    }
+
+    /// The lowest number in the range.
+    pub const fn start(&self) -> Ino {
+        self.start
+    }
+
+    /// One past the highest number, exclusive.
+    pub const fn end(&self) -> Ino {
+        self.end
+    }
+
+    /// How many numbers the range holds.
+    pub const fn len(&self) -> u64 {
+        self.end.0 - self.start.0
+    }
+
+    /// Always false for a range this crate hands out: asking for zero numbers is refused.
+    pub const fn is_empty(&self) -> bool {
+        self.end.0 == self.start.0
+    }
+
+    /// Whether `ino` is one of the numbers in the range.
+    pub const fn contains(&self, ino: Ino) -> bool {
+        ino.0 >= self.start.0 && ino.0 < self.end.0
+    }
+
+    /// Every number in the range, lowest first.
+    pub fn iter(&self) -> impl Iterator<Item = Ino> + '_ {
+        (self.start.0..self.end.0).map(Ino)
+    }
+}
+
 /// Snapshot id. Never reused.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct SnapshotId(pub u64);
