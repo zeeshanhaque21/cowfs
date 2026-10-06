@@ -12,22 +12,28 @@
 //! of the SAME snapshot -> two `Server::start` (each an `Adapter` over its view, over one `Core`)
 //! -> the `mkdir(._doc)` versus `create(doc)` race, driven as real RPCs on two connections.
 //!
-//! The window is observable, not timing-dependent: a `Vfs` wrapper under adapter A holds its
-//! sidecar mutation after its guard read of `doc` has already answered, exactly where a lock shared
-//! across the two adapters that serve one snapshot namespace would have to sit.
+//! The window is made observable, not timing-dependent: a `Vfs` wrapper under adapter A holds its
+//! sidecar mutation after its guard read of `doc` has already answered.
 //!
-//! Assertion semantics (the review of the nfs-crate fixture, `docs/reviews/pr145-...`): the outcome
-//! is what matters, not the lock shape. `peak`/`overlap` are reported as diagnostics only. The
-//! illegal outcome is a real object taking a live sidecar view's name while the main name is present
-//! (the guard read stale state); the legal serial outcomes are mkdir-first (`._doc` a real directory
-//! because `doc` was absent) and doc-first (`._doc` a live view of `doc`).
+//! Assertion semantics (the final review of this file, `docs/reviews/pr145-real-core-outcome-final-
+//! wbuddy-review.md`): the earlier revision asserted an "illegal" outcome from a mid-operation
+//! observer, `main_at_mutation == true`, and thereby forbade a legal result. That observer is a
+//! third-party read injected at one instant, not the result of any operation in the history; a
+//! `mkdir(._doc)` request legitimately spans `[guard read, mutation]`, so a concurrent `create(doc)`
+//! may land inside that span while A is still correctly ordered before it at A's guard read.
 //!
-//! Honest result: the source hypothesis, that the guard read (`core.lookup`) does not take the
-//! per-snapshot namespace lock `SnapCtx.ns` that `core.mkdir` takes, is stated in
-//! `docs/verification/evidence/translate43-real-core-separate-adapter-regression.md`. If the run
-//! shows the illegal outcome the hypothesis is reproduced at runtime through a real `Core`; if the
-//! run shows the legal serial outcome the Core already prevents it and this file reports PASS with
-//! no production change (the source hypothesis is then not reproduced).
+//! This revision is a serial-oracle regression instead. It drives the same real-Core, two-adapter,
+//! public-RPC race, then compares the normalized observation of the race against the normalized
+//! observations of BOTH actual serial histories - `mkdir(._doc)` then `create(doc)`, and
+//! `create(doc)` then `mkdir(._doc)` - run through the same topology. The race must equal at least
+//! one actual serial product on every user-observable field (exact RPC statuses, returned-handle
+//! presence, the final kind of each name, the `fileid` identity within the run, handle stability,
+//! `doc` bytes, and the sidecar channel bytes). `depth`/`peak`/`overlap` and the two mid-operation
+//! probes are diagnostics only and are never the pass criterion.
+//!
+//! A PASS therefore says the race produced one of the two legal serial outcomes; it does not claim
+//! an internal linearization instant. A true counterexample is an observation that matches neither
+//! serial product, which would be reported with its actual returned statuses and bytes.
 //!
 //! macOS only: the real topology is the NFS loopback, and `cowfs-nfs` is a `cfg(target_os =
 //! "macos")` dependency of this crate, so the file compiles to nothing elsewhere.
@@ -78,7 +84,7 @@ impl Args {
     fn opaque(mut self, v: &[u8]) -> Self {
         self = self.u32(v.len() as u32);
         self.0.extend_from_slice(v);
-        while self.0.len() % 4 != 0 {
+        while !self.0.len().is_multiple_of(4) {
             self.0.push(0);
         }
         self
@@ -308,10 +314,14 @@ impl Client {
     }
 
     /// GETATTR's `fileid3`, the identity the two adapters must agree on for one shared name.
+    ///
+    /// `fattr3` is `ftype, mode, nlink, uid, gid, size(u64), used(u64), rdev(2 words), fsid(u64),
+    /// fileid(u64), ...`, so `fileid3` starts at word 13. Skipping 11 would read `fsid`, a constant
+    /// `FSID` for the whole file system, and any two handles would compare equal.
     fn fileid(&mut self, fh: &[u8]) -> u64 {
         let (st, mut r) = self.call(1, Args::new().opaque(fh));
         assert_eq!(st, OK, "getattr for the file id");
-        skip_fattr_words(&mut r, 11);
+        skip_fattr_words(&mut r, 13);
         ru64(&mut r)
     }
 }
@@ -598,22 +608,79 @@ fn translated() -> MountOptions {
     }
 }
 
-/// Two adapters over one snapshot's namespace, driven through a real `Core`.
+/// The normalised, user-observable product of one scenario, captured through real RPCs on a real
+/// `Core`. Every field is a fact the product returns to a client, never an internal probe.
 ///
-/// If the run enters the guard window across the two adapters (`doc_present_at_mutation`) and a real
-/// `._doc` directory then takes the live view name, that is the user-visible defect: on a correct
-/// arrangement the second adapter serialises against the first, or the mutation re-checks the name.
-/// If the run never enters the window, the Core already serialises it and this reports the legal
-/// outcome with no production change.
-#[test]
-fn two_adapters_over_one_snapshot_namespace_do_not_shadow_a_live_view() {
+/// Numeric `fileid`s are compared only *within* one run (the two adapters must agree on one shared
+/// name's id); they are never compared across runs, because two fresh stores assign independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Observation {
+    /// Exact RPC status of `mkdir(._doc)`.
+    mkdir_status: u32,
+    /// Exact RPC status of `create(doc)`.
+    create_status: u32,
+    /// Whether the `mkdir(._doc)` reply carried a file handle.
+    mkdir_handle: bool,
+    /// Whether the `create(doc)` reply carried a file handle.
+    create_handle: bool,
+    /// `ftype` of `doc` after both requests, read by LOOKUP through an adapter.
+    main_kind_rpc: Option<u32>,
+    /// `ftype` of `._doc` after both requests, read by LOOKUP through an adapter.
+    side_kind_rpc: Option<u32>,
+    /// `doc`'s `fileid3` re-read after the requests stayed the same (identity is stable).
+    main_identity_stable: bool,
+    /// `doc` written through one adapter and read back through the other, byte for byte.
+    main_roundtrip: bool,
+    /// When `._doc` is a live sidecar channel (`ftype` regular): a valid AppleDouble image written to
+    /// it reads back unchanged. `None` when `._doc` is a real directory, so no channel exists.
+    channel_roundtrips: Option<bool>,
+    /// When the channel exists: junk is refused with `NOTSUPP` and the channel still reads the good
+    /// bytes afterwards. `None` when there is no channel.
+    channel_refuses_junk: Option<bool>,
+}
+
+impl Observation {
+    /// Human-readable fields where the race and a serial history disagree, for the failure message.
+    fn diff(&self, other: &Observation) -> Vec<String> {
+        let mut d = Vec::new();
+        macro_rules! cmp {
+            ($f:ident) => {
+                if self.$f != other.$f {
+                    d.push(format!(
+                        "{}: race={:?} serial={:?}",
+                        stringify!($f),
+                        self.$f,
+                        other.$f
+                    ));
+                }
+            };
+        }
+        cmp!(mkdir_status);
+        cmp!(create_status);
+        cmp!(mkdir_handle);
+        cmp!(create_handle);
+        cmp!(main_kind_rpc);
+        cmp!(side_kind_rpc);
+        cmp!(main_identity_stable);
+        cmp!(main_roundtrip);
+        cmp!(channel_roundtrips);
+        cmp!(channel_refuses_junk);
+        d
+    }
+}
+
+/// What to write into `doc` and read back through the *other* adapter, so the bytes prove one shared
+/// namespace rather than a per-adapter cache.
+const DOC_BYTES: &[u8] = b"cowfs-separate-adapter-doc-payload";
+
+/// Run one scenario on a fresh real `Core`: two `snapshot_view`s of one snapshot, two `Server`s, two
+/// raw-NFS clients. `mkdir_first` chooses the serial order; `race` runs the two requests concurrently
+/// with adapter A held at its sidecar mutation after its guard read of `doc` has answered.
+fn observe(mkdir_first: bool, race: bool) -> Observation {
     let dir = tempfile::tempdir().unwrap();
     let core = Core::open(dir.path(), Options::default()).expect("open a core over a fresh store");
     core.create_snapshot("s").expect("create snapshot s");
 
-    // Two `Vfs` from the SAME snapshot of the SAME `Core`. Each is served by its own `Server`, so
-    // each is its own `Adapter` over one shared namespace, exactly as two exports of one snapshot
-    // are in the daemon (`exports.rs` `mount_snapshot` -> `backend.snapshot`).
     let view_a = core.snapshot_view("s").expect("snapshot view a");
     let view_b = core.snapshot_view("s").expect("snapshot view b");
     let a = GuardedView::new(Arc::new(view_a) as Arc<dyn Vfs>);
@@ -622,129 +689,173 @@ fn two_adapters_over_one_snapshot_namespace_do_not_shadow_a_live_view() {
     let server_a = Server::start(a.clone() as Arc<dyn Vfs>, &translated(), None).expect("server a");
     let server_b = Server::start(b.clone() as Arc<dyn Vfs>, &translated(), None).expect("server b");
 
-    let ca = Client::connect(server_a.port(), server_a.export_name());
-    let cb = Client::connect(server_b.port(), server_b.export_name());
-
-    // Hold adapter A at its mutation of `._doc`, after its guard read of `doc` has answered.
-    a.arm(SIDE);
+    let mut ca = Client::connect(server_a.port(), server_a.export_name());
+    let mut cb = Client::connect(server_b.port(), server_b.export_name());
     let root_a = ca.fh();
     let root_b = cb.fh();
 
-    let mk = {
-        let root = root_a.clone();
-        std::thread::spawn(move || {
-            // A second connection, because a client's calls are synchronous: this is the request
-            // that opens the window.
-            let mut c = Client::connect(server_a.port(), server_a.export_name());
-            c.root = root;
-            c.mkdir("._doc")
-        })
-    };
-
-    assert!(
-        a.wait_reached(10),
-        "adapter A never reached its sidecar mutation; the window could not be opened"
-    );
-
-    // B creates the main name while A is stopped between its guard read and its sidecar write.
-    let created = {
-        let root = root_b.clone();
-        std::thread::spawn(move || {
-            let mut c = Client::connect(server_b.port(), server_b.export_name());
-            c.root = root;
-            c.create("doc", 0o644)
-        })
-    };
-
-    let overlapped = a.wait_peak(2, 1000);
-    let depth_while_held = a.peak();
-
-    // The fact the outcome turns on, read through the same `Core` the adapters serve: is the main
-    // name in the tree while A's sidecar mutation has not run yet? B's create is a separate
-    // connection that is not serialised against A here, so poll until it lands or the deadline
-    // passes; a bounded wait keeps the test from reading the tree before B has done anything.
-    let doc_present_during_window = {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let c = core.clone();
-            let vfs = c.snapshot_view("s").unwrap();
-            if vfs.lookup(ROOT_INO, MAIN).is_ok() {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(2));
+    let (mkdir_status, mkdir_handle, create_status, create_handle) = if !race {
+        // A serial history: the two requests run one after the other, no hold, no overlap.
+        if mkdir_first {
+            let (ms, mfh) = ca.mkdir("._doc");
+            let (cs, cfh) = cb.create("doc", 0o644);
+            (ms, !mfh.is_empty(), cs, !cfh.is_empty())
+        } else {
+            let (cs, cfh) = cb.create("doc", 0o644);
+            let (ms, mfh) = ca.mkdir("._doc");
+            (ms, !mfh.is_empty(), cs, !cfh.is_empty())
         }
+    } else {
+        // The controlled race. Hold adapter A at its mutation of `._doc` after its guard read of
+        // `doc` has answered; run B's `create(doc)` inside that window.
+        a.arm(SIDE);
+        let mk = {
+            let root = root_a.clone();
+            let port = server_a.port();
+            let export = server_a.export_name().to_string();
+            std::thread::spawn(move || {
+                let mut c = Client::connect(port, &export);
+                c.root = root;
+                c.mkdir("._doc")
+            })
+        };
+        assert!(
+            a.wait_reached(10),
+            "adapter A never reached its sidecar mutation; the window could not be opened"
+        );
+        let created = {
+            let root = root_b.clone();
+            let port = server_b.port();
+            let export = server_b.export_name().to_string();
+            std::thread::spawn(move || {
+                let mut c = Client::connect(port, &export);
+                c.root = root;
+                c.create("doc", 0o644)
+            })
+        };
+        a.release();
+        let mk = mk.join().unwrap();
+        let created = created.join().unwrap();
+        (mk.0, !mk.1.is_empty(), created.0, !created.1.is_empty())
     };
 
-    a.release();
-    let mk = mk.join().unwrap();
-    let created = created.join().unwrap();
+    // Diagnostics only: did the two guarded operations overlap inside the adapters. Never an
+    // acceptance constraint: a legal arrangement may show either. Only meaningful under the race.
+    let overlapped = race && a.wait_peak(2, 1000);
 
-    // Ground truth, recorded inside the wrapper at the two moments that matter: what A's own guard
-    // read of `doc` returned, and whether `doc` was live at the instant A's mutation ran.
-    let guard_saw_main = a.guard_saw_main();
-    let main_at_mutation = a.main_present_at_mutation();
-
-    // The final names, read through the real Core: is `._doc` a real directory (shadowing a live
-    // `doc` view) or a sidecar view, and is `doc` a real regular file?
-    let (doc_kind, side_kind) = {
-        let vfs = core.snapshot_view("s").unwrap();
-        let doc = vfs.lookup(ROOT_INO, MAIN).ok().map(|a: Attr| a.kind);
-        let side = vfs.lookup(ROOT_INO, SIDE).ok().map(|a: Attr| a.kind);
-        (doc, side)
+    // User-observable final state, read by LOOKUP through adapter A (a real RPC), plus the doc
+    // handle from a fresh LOOKUP so its `fileid` is compared within this run, not across runs.
+    let (main_kind_rpc, main_fh) = match ca.lookup("doc") {
+        (OK, fh, Some(k)) => (Some(k), fh),
+        (_, _, k) => (k, Vec::new()),
     };
-    let real_dir_took_side = matches!(side_kind, Some(FileKind::Directory));
-    let doc_is_regular = matches!(doc_kind, Some(FileKind::Regular));
+    let (side_kind_rpc, side_fh) = match ca.lookup("._doc") {
+        (OK, fh, Some(k)) => (Some(k), fh),
+        (_, _, k) => (k, Vec::new()),
+    };
 
+    // Identity within one run: the same name's `fileid3` must be stable across two GETATTRs.
+    let main_identity_stable = if main_fh.is_empty() {
+        false
+    } else {
+        let id1 = ca.fileid(&main_fh);
+        let id2 = ca.fileid(&main_fh);
+        id1 == id2
+    };
+
+    // One shared namespace: write `doc` through adapter A, read it back through adapter B.
+    let main_roundtrip = if main_fh.is_empty() {
+        false
+    } else {
+        let wrote = ca.write(&main_fh, 0, DOC_BYTES);
+        let (rs, got) = cb.read(&main_fh, 0, 1 << 16);
+        wrote == OK && rs == OK && got == DOC_BYTES
+    };
+
+    // The sidecar channel exists only when `._doc` is a live view (a regular file), not a real
+    // directory. When it does, a valid AppleDouble image must round-trip through the handle the
+    // product returned for that name, and junk must be refused with NOTSUPP, non-destructively.
+    let (channel_roundtrips, channel_refuses_junk) =
+        if side_kind_rpc == Some(FTYPE_REG) && !side_fh.is_empty() {
+            let blob = valid_sidecar();
+            let wrote = ca.write(&side_fh, 0, &blob);
+            let (rs, got) = ca.read(&side_fh, 0, 1 << 16);
+            let roundtrips = wrote == OK && rs == OK && got == blob;
+            let junk = vec![0u8; 4096];
+            let refused = ca.write(&side_fh, 0, &junk) == NOTSUPP;
+            let (rs2, got2) = ca.read(&side_fh, 0, 1 << 16);
+            let recovered = rs2 == OK && got2 == blob;
+            (Some(roundtrips), Some(refused && recovered))
+        } else {
+            (None, None)
+        };
+
+    let obs = Observation {
+        mkdir_status,
+        create_status,
+        mkdir_handle,
+        create_handle,
+        main_kind_rpc,
+        side_kind_rpc,
+        main_identity_stable,
+        main_roundtrip,
+        channel_roundtrips,
+        channel_refuses_junk,
+    };
+
+    // Diagnostics only, never acceptance: the overlap gauge, the funnel depth, and the two
+    // mid-operation probes. None of these are the pass criterion.
     eprintln!(
-        "REAL-CORE mkdir(._doc)_st={} create(doc)_st={} overlapped={} doc_present_during_window={} \
-         guard_saw_main={} main_at_mutation={} real_dir_took_the_name={} doc_regular={} \
-         depth_while_held={} peak_depth={}",
-        mk.0,
-        created.0,
-        overlapped,
-        doc_present_during_window,
-        guard_saw_main,
-        main_at_mutation,
-        real_dir_took_side,
-        doc_is_regular,
-        depth_while_held,
+        "REAL-CORE race={race} mkdir_first={mkdir_first} obs={obs:?} \
+         overlapped={overlapped} guard_saw_main={} main_at_mutation={} peak_depth={}",
+        a.guard_saw_main(),
+        a.main_present_at_mutation(),
         a.peak()
     );
 
-    // Every request that must succeed did. A failed create would otherwise make the main name look
-    // absent and skip the outcome branch.
-    assert_eq!(created.0, OK, "create(doc) failed under the race");
-    assert_eq!(mk.0, OK, "mkdir(._doc) failed under the race");
+    obs
+}
 
-    // Diagnostics only, never the product requirement. A correct arrangement may still let the
-    // backend see two operations if the lock moved above the backend; the outcome below is what
-    // separates a defect from a legal serialisation.
-    let _ = (overlapped, depth_while_held, a.peak());
+/// The separate-adapter race against the serial oracle, driven through a real `Core`.
+///
+/// Three runs: the two actual serial histories and the race. The race must equal at least one serial
+/// history on every user-observable field. A run that matches neither is the counterexample; the
+/// assertion reports both serial observations it was compared against, so the failure is the actual
+/// returned statuses and kinds, not a label.
+///
+/// This does not assert the race matched a *particular* serial history: if the request interval
+/// overlaps, `mkdir` cannot be forced to linearize at the mutation instant, and both serial orders
+/// are legal products. It asserts only that the race landed on one of the two real serial products.
+#[test]
+fn two_adapters_over_one_snapshot_namespace_match_a_serial_product_under_the_race() {
+    // Each serial history is a fresh store, so its numeric `fileid`s never cross-compare.
+    let serial_mkdir_first = observe(true, false);
+    let serial_create_first = observe(false, false);
+    let race = observe(true, true);
 
-    if main_at_mutation {
-        // The guard read stale state: `doc` was a live file at the instant A's mutation ran, so A's
-        // `mkdir(._doc)` ran on an answer from before it existed. No real object may take the live
-        // view name.
-        assert!(
-            !real_dir_took_side,
-            "a real directory took the live sidecar view name while doc was present at the \
-             mutation: the two adapters' guard reads are not serialised against each other over \
-             one Core snapshot namespace (guard_saw_main={guard_saw_main})"
-        );
-        assert!(doc_is_regular, "doc is not a regular file after the race");
-    } else {
-        // The legal mkdir-first serialisation: `doc` was absent when A's guard read it, so a real
-        // `._doc` directory is the correct macOS fallback, and `doc` must still be a regular file.
-        assert!(
-            real_dir_took_side,
-            "mkdir(._doc) won the guard while doc was absent, so ._doc must be a real directory"
-        );
-        assert!(doc_is_regular, "doc is not a regular file after the race");
-    }
-    let _ = doc_present_during_window;
+    let vs_mkdir = race.diff(&serial_mkdir_first);
+    let vs_create = race.diff(&serial_create_first);
+
+    assert!(
+        vs_mkdir.is_empty() || vs_create.is_empty(),
+        "the race produced a state matching NEITHER actual serial product. \
+         vs mkdir-first {vs_mkdir:?}; vs create-first {vs_create:?}. \
+         race={race:?} mkdir-first={serial_mkdir_first:?} create-first={serial_create_first:?}"
+    );
+
+    // A `doc` must exist as a regular file in both legal products, so the race observation must too
+    // if it matched one of them. This is implied by the equality above; kept as a direct statement.
+    assert_eq!(
+        race.main_kind_rpc,
+        Some(FTYPE_REG),
+        "doc is not a regular file after the race: {race:?}"
+    );
+    // Whichever legal product the race matched, `._doc` is either a real directory (mkdir-first) or a
+    // live regular-file view (create-first); it is never absent or a third kind.
+    assert!(
+        matches!(race.side_kind_rpc, Some(FTYPE_DIR) | Some(FTYPE_REG)),
+        "._doc is neither a real directory nor a live view after the race: {race:?}"
+    );
 }
 
 /// The premise: the two adapters really do reach one namespace through the one `Core`. A file

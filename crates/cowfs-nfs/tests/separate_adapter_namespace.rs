@@ -13,6 +13,17 @@
 //! uses. The window is made observable, not timing-dependent: the shared backend holds adapter A's
 //! guard read of the main name until adapter B has run, which is exactly the interleaving a lock
 //! shared between the two adapters would forbid and a per-instance lock cannot.
+//!
+//! Assertion semantics (the final review of the sibling real-Core fixture,
+//! `docs/reviews/pr145-real-core-outcome-final-wbuddy-review.md`): a mid-operation observer is not a
+//! product outcome, so an assertion must not forbid a legal result. The race is judged against the
+//! serial oracle: the same adapter pair is run in both serial orders, and the race must equal one of
+//! those actual products on every user-observable field. The surrogate has no per-snapshot
+//! `SnapCtx.ns` and a writable root, so it stays a fixture for the assertion discipline only; the
+//! real-Core regression in `crates/cowfs-daemon/tests/separate_adapter_namespace.rs` is the product
+//! topology.
+//!
+//! Both adapters are built with the public `Adapter::new` over the same `Arc<dyn Vfs>`.
 
 mod common;
 
@@ -246,111 +257,123 @@ impl Vfs for SharedBackend {
     }
 }
 
-fn is_real_dir(vfs: &dyn Vfs) -> bool {
-    matches!(vfs.lookup(ROOT_INO, SIDE), Ok(a) if a.kind == FileKind::Directory)
+/// The normalised, user-observable product of one scenario on the surrogate backend.
+///
+/// Every field is what the adapter returns to a caller, never an internal probe. As on the
+/// real-Core fixture, the surrogate must match an actual serial product on all of these, so a legal
+/// serial outcome is accepted and only a third product is a counterexample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Observation {
+    /// Whether `mkdir(._doc)` returned `Ok`.
+    mkdir_ok: bool,
+    /// Whether `create(doc)` returned `Ok`.
+    create_ok: bool,
+    /// Kind of `doc` after both requests.
+    main_kind: Option<FileKind>,
+    /// Kind of `._doc` after both requests.
+    side_kind: Option<FileKind>,
 }
 
-/// The separate-adapter topology: two adapters over one backend, one snapshot namespace.
-///
-/// Adapter A runs `mkdir(._doc)` and stops at its sidecar mutation, after its guard read of `doc`
-/// has already returned. Adapter B then creates `doc` on the same directory through its own lock
-/// map. On a shared lock the two guarded operations cannot overlap: B waits outside A's window
-/// until A leaves, so the backend never sees depth two and A's guard answer stays the truthful one
-/// for as long as the directory is guarded. With a per-instance lock the two run together, the
-/// backend sees depth two, and B's `create(doc)` lands inside A's guard window.
-///
-/// Both adapters are built with the public `Adapter::new` over the same `Arc<dyn Vfs>`. That is
-/// the same construction the daemon uses when a default mount and an exported snapshot both serve
-/// one core.
-#[test]
-fn two_adapters_over_one_namespace_do_not_both_enter_the_guard() {
+fn kind_of(inner: &dyn Vfs, name: &[u8]) -> Option<FileKind> {
+    inner.lookup(ROOT_INO, name).ok().map(|a| a.kind)
+}
+
+/// One scenario on a fresh surrogate backend: two adapters over one `MemVfs`-backed shared backend.
+/// `mkdir_first` chooses the serial order; `race` runs the two requests concurrently with adapter A
+/// held at its sidecar mutation after its guard read of `doc` has answered.
+fn observe(mkdir_first: bool, race: bool) -> Observation {
     let inner = memfs();
     let backend = SharedBackend::new(inner.clone());
-    // Two independent adapters, one shared backend. `Adapter::new` builds a separate lock map per
-    // instance, so the two do not share the per-directory lock by construction.
     let a = adapter_with(backend.clone() as Arc<dyn Vfs>);
     let b = adapter_with(backend.clone() as Arc<dyn Vfs>);
-
     let root_a = a.root_id();
     let root_b = b.root_id();
 
-    // Hold adapter A at its mutation of the sidecar name, after its guard read of `doc`.
-    backend.arm(SIDE);
-
-    let mk = {
-        let a = a.clone();
-        std::thread::spawn(move || a.mkdir(root_a, SIDE, &sattr3::default()))
-    };
-
-    assert!(
-        backend.wait_reached(10),
-        "adapter A never reached its sidecar mutation; the window could not be opened"
-    );
-
-    // Adapter B creates the main name while adapter A is stopped between its guard read and its
-    // sidecar write. Adapter B does not share A's lock, so nothing serialises this against A's
-    // window. On a lock shared between the two adapters B could not create `doc` until A left, and
-    // A's guard answer (doc absent) would still be the truthful one.
-    let created = {
-        let b = b.clone();
-        std::thread::spawn(move || b.create(root_b, MAIN, &sattr3::default(), true))
-    };
-    let overlapped = backend.wait_peak(2, 1000);
-    let depth_while_held = backend.peak();
-
-    // The fact the outcome turns on: the main name is in the tree while adapter A's sidecar write
-    // has not run yet.
-    let doc_present_at_mutation = inner.lookup(ROOT_INO, MAIN).is_ok();
-    backend.release();
-    let mk = mk.join().unwrap();
-    let created = created.join().unwrap();
-
-    let real = is_real_dir(inner.as_ref());
-    eprintln!(
-        "SEPARATE-ADAPTER mkdir(._doc)_ok={} create(doc)_ok={} overlapped={overlapped} \
-         doc_present_at_mutation={doc_present_at_mutation} real_dir_took_the_name={real} \
-         depth_while_held={depth_while_held} peak_depth={}",
-        mk.is_ok(),
-        created.is_ok(),
-        backend.peak()
-    );
-
-    // Every request that must succeed did. A failed create would otherwise make the main name look
-    // absent and skip the outcome branch entirely.
-    assert!(
-        created.is_ok(),
-        "adapter B failed to create doc across the two-adapter race"
-    );
-    assert!(
-        mk.is_ok(),
-        "adapter A failed to mkdir ._doc across the two-adapter race"
-    );
-
-    // The outcome is what separates a defect from a legal serialisation, never the lock shape.
-    // `overlapped`, `peak`, and `depth_while_held` are diagnostics below: a correct arrangement may
-    // still let the backend see two operations (a lock above the backend, or a re-check at the
-    // mutation), so none of them can be the pass criterion. A `SharedBackend`-level `peak == 1` or
-    // `!overlapped` assertion would fail a legal arrangement, and treating `!doc_present_at_mutation`
-    // as required would make the test assert the bug does not exist rather than the user-visible
-    // outcome.
-    //
-    // On this backend a legal serial outcome is either mkdir-first (`doc` was absent when A's guard
-    // read it, so a real `._doc` directory is the correct macOS fallback) or doc-first (`._doc` is a
-    // live sidecar view of `doc`). The illegal outcome is a real directory taking the live view's
-    // name while `doc` was already present when A mutated: the guard read answered stale state.
-    if doc_present_at_mutation {
-        assert!(
-            !real,
-            "a real directory took the live sidecar view name while doc was present: the two \
-             adapters' per-instance lock maps do not cover one another over one shared namespace"
-        );
+    let (mkdir_ok, create_ok) = if !race {
+        if mkdir_first {
+            let m = a.mkdir(root_a, SIDE, &sattr3::default());
+            let c = b.create(root_b, MAIN, &sattr3::default(), true);
+            (m.is_ok(), c.is_ok())
+        } else {
+            let c = b.create(root_b, MAIN, &sattr3::default(), true);
+            let m = a.mkdir(root_a, SIDE, &sattr3::default());
+            (m.is_ok(), c.is_ok())
+        }
     } else {
+        // Hold adapter A at its mutation of `._doc`, after its guard read of `doc` returned.
+        backend.arm(SIDE);
+        let mk = {
+            let a = a.clone();
+            std::thread::spawn(move || a.mkdir(root_a, SIDE, &sattr3::default()))
+        };
         assert!(
-            real,
-            "mkdir(._doc) won the guard while doc was absent, so ._doc must be a real directory"
+            backend.wait_reached(10),
+            "adapter A never reached its sidecar mutation; the window could not be opened"
         );
+        let created = {
+            let b = b.clone();
+            std::thread::spawn(move || b.create(root_b, MAIN, &sattr3::default(), true))
+        };
+        let overlapped = backend.wait_peak(2, 1000);
+        let depth_while_held = backend.peak();
+        backend.release();
+        let mk = mk.join().unwrap();
+        let created = created.join().unwrap();
+        // Diagnostics only, never acceptance.
+        eprintln!(
+            "SURROGATE race=1 overlapped={overlapped} depth_while_held={depth_while_held} \
+             peak_depth={}",
+            backend.peak()
+        );
+        (mk.is_ok(), created.is_ok())
+    };
+
+    Observation {
+        mkdir_ok,
+        create_ok,
+        main_kind: kind_of(inner.as_ref(), MAIN),
+        side_kind: kind_of(inner.as_ref(), SIDE),
     }
-    let _ = (overlapped, depth_while_held, backend.peak());
+}
+
+/// The separate-adapter topology on the `MemVfs` surrogate, judged against the serial oracle.
+///
+/// The surrogate has no per-snapshot `SnapCtx.ns` and a writable root, so it can never prove a
+/// product defect. What it can prove is the assertion discipline: the race must equal one of the two
+/// actual serial products of the same adapter pair, so an assertion never forbids a legal result.
+///
+/// Adapter A runs `mkdir(._doc)` and stops at its sidecar mutation, after its guard read of `doc`
+/// has returned. Adapter B then creates `doc` through its own lock map. Both build through the public
+/// `Adapter::new` over the same `Arc<dyn Vfs>`, the construction the daemon uses for a default mount
+/// and an exported snapshot that serve one core.
+#[test]
+fn two_adapters_over_one_namespace_match_a_serial_product_under_the_race() {
+    let serial_mkdir_first = observe(true, false);
+    let serial_create_first = observe(false, false);
+    let race = observe(true, true);
+
+    let vs_mkdir = race != serial_mkdir_first;
+    let vs_create = race != serial_create_first;
+    assert!(
+        !(vs_mkdir && vs_create),
+        "the race produced a state matching NEITHER actual serial product: \
+         race={race:?} mkdir-first={serial_mkdir_first:?} create-first={serial_create_first:?}"
+    );
+
+    // `doc` is a regular file in both legal serial products, so the race must show it too.
+    assert_eq!(
+        race.main_kind,
+        Some(FileKind::Regular),
+        "doc is not a regular file after the race: {race:?}"
+    );
+    // `._doc` is either a real directory (mkdir-first) or a live regular-file view (create-first).
+    assert!(
+        matches!(
+            race.side_kind,
+            Some(FileKind::Directory) | Some(FileKind::Regular)
+        ),
+        "._doc is neither a real directory nor a live view after the race: {race:?}"
+    );
 }
 
 /// The two adapters really do reach one namespace: a create through one is visible to the other,
