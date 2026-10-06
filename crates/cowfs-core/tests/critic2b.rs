@@ -824,35 +824,45 @@ fn try_content(c: &Core, snap: &str, name: &str) -> Option<String> {
 /// B3: a refused rename leaves the mount exactly as it was, with no staging snapshot visible, and
 /// the next open does not complete it.
 #[test]
-fn a_refused_rename_leaves_the_mount_exactly_as_it_was() {
+fn a_refused_promotion_leaves_the_mount_exactly_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
     let names;
     {
         let c = Core::open(dir.path(), test_opts()).unwrap();
+        c.create_snapshot("src").unwrap();
+        let src_root = root_entry(&c, "src").ino;
+        mkfile(&c.snapshot_view("src").unwrap(), src_root, "x", b"payload");
         c.create_snapshot("old").unwrap();
+        let target = root_entry(&c, "old").ino;
         let fs = c.snapshot_view("old").unwrap();
-        let a = fs.create(ROOT_INO, b"x", 0o644).unwrap();
-        fs.write(a.ino, 0, b"payload").unwrap();
+        let a = mkfile(&fs, target, "y", b"doomed");
         c.sync().unwrap();
+        // the handle is on the snapshot promotion would destroy, which is what makes it refuse
         let h = fs.open(a.ino).unwrap();
-        let r = c.rename_snapshot("old", "new");
-        println!("rename with an open handle -> {r:?}");
+        let r = c.promote_base("src", "old");
+        println!("promotion with an open handle -> {r:?}");
         names = snap_names(&c);
         println!("snapshots after the refusal: {names:?}");
         assert!(r.is_err(), "setup: {r:?}");
         fs.release(h).unwrap();
-        assert_eq!(names, ["old".to_string()], "the mount changed on a refusal");
-        assert_eq!(content(&c, "old", "x"), "payload");
+        assert_eq!(
+            names,
+            ["old".to_string(), "src".to_string()],
+            "the mount changed on a refusal"
+        );
+        assert_eq!(content(&c, "src", "x"), "payload");
+        assert_eq!(content(&c, "old", "y"), "doomed");
+        drop(fs);
         assert!(
-            !dir.path().join("swap-new").exists(),
+            !dir.path().join("swap-old").exists(),
             "a refusal left an intent file behind"
         );
     }
     let c = Core::open(dir.path(), test_opts()).unwrap();
     assert_eq!(
         snap_names(&c),
-        ["old".to_string()],
-        "the refused rename completed at the next open"
+        ["old".to_string(), "src".to_string()],
+        "the refused promotion completed at the next open"
     );
     c.check().unwrap();
 }
@@ -862,26 +872,29 @@ fn a_step_three_refusal_removes_the_intent_and_staging_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     {
         let c = Core::open(dir.path(), test_opts()).unwrap();
-        c.create_snapshot("old").unwrap();
-        mkfile(&c.snapshot_view("old").unwrap(), ROOT_INO, "x", b"OLD");
+        c.create_snapshot("base").unwrap();
+        mkfile(&c.snapshot_view("base").unwrap(), ROOT_INO, "x", b"OLD");
+        c.create_snapshot("src").unwrap();
+        mkfile(&c.snapshot_view("src").unwrap(), ROOT_INO, "y", b"NEW");
         c.sync().unwrap();
         c.set_swap_fault(3);
-        assert!(c.rename_snapshot("old", "new").is_err());
+        assert!(c.promote_base("src", "base").is_err());
         c.set_swap_fault(0);
         assert!(
-            !dir.path().join("swap-new").exists(),
+            !dir.path().join("swap-base").exists(),
             "refusal retained its intent"
         );
         assert_eq!(
             c.meta().snapshots().unwrap().len(),
-            1,
+            2,
             "hidden staging state survived"
         );
-        assert_eq!(snap_names(&c), ["old"]);
+        assert_eq!(snap_names(&c), ["base", "src"]);
     }
     let c = Core::open(dir.path(), test_opts()).unwrap();
-    assert_eq!(snap_names(&c), ["old"]);
-    assert_eq!(content(&c, "old", "x"), "OLD");
+    assert_eq!(snap_names(&c), ["base", "src"]);
+    assert_eq!(content(&c, "base", "x"), "OLD");
+    assert_eq!(content(&c, "src", "y"), "NEW");
     c.check().unwrap();
 }
 
@@ -891,14 +904,15 @@ fn every_pre_removal_refusal_stays_refused_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
             let c = Core::open(dir.path(), test_opts()).unwrap();
-            c.create_snapshot("old").unwrap();
+            c.create_snapshot("base").unwrap();
+            c.create_snapshot("src").unwrap();
             c.set_swap_fault(step);
-            assert!(c.rename_snapshot("old", "new").is_err());
+            assert!(c.promote_base("src", "base").is_err());
         }
         let c = Core::open(dir.path(), test_opts()).unwrap();
         assert_eq!(
             snap_names(&c),
-            ["old"],
+            ["base", "src"],
             "refusal at step {step} completed on reopen"
         );
     }

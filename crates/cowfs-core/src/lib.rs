@@ -344,21 +344,50 @@ impl Core {
         self.inner.unregister(&sc)
     }
 
-    /// Renames a snapshot. Crash-safe and error-safe (see `src/swap.rs`): a failure before the
-    /// old name is removed leaves it untouched, and a crash in between is finished on the next
-    /// open. Its snapshot id and every inode number in it change.
+    /// Renames a snapshot by moving its name in one metadata transaction, so the snapshot id, every
+    /// inode number in it and any handle open on it all survive. The name is validated, the target
+    /// name is checked, and only then is anything written, so a refused rename leaves no name
+    /// added, removed or half-moved. Replaces a snapshot rather than moving it? That is
+    /// [`Core::promote_base`], which keeps the staging swap in `src/swap.rs`.
     pub fn rename_snapshot(&self, old: &str, new: &str) -> Result<SnapshotEntry, ControlError> {
-        self.inner.snap_by_name(old)?;
-        self.swap_snapshot(old, Some(old), new)
+        let sc = self.inner.snap_by_name(old)?;
+        validate_snapshot_name(new)?;
+        if old == new {
+            return Err(ControlError::InvalidName(
+                "source and target are the same snapshot",
+            ));
+        }
+        // the name this snapshot is giving up cannot collide with itself
+        self.inner.check_new_name_except(new, Some(old))?;
+        let id = SnapshotId(sc.id);
+        self.inner
+            .meta
+            .rename_snapshot(id, new)
+            .map_err(control_meta)?;
+        let info = self
+            .inner
+            .meta
+            .snapshot_by_id(id)
+            .map_err(control_meta)?
+            .info()
+            .map_err(control_meta)?;
+        // every fallible step is behind us, so the live registry is brought in line with what
+        // metadata now says rather than being left to describe a name that has moved
+        let mut s = self.inner.snaps.wr();
+        s.by_name.remove(old);
+        s.by_name.insert(new.to_string(), sc.id);
+        drop(s);
+        *self.inner.root_time.lk() = Timestamp::now();
+        Ok(entry(&info)?)
     }
 
     /// Makes `base` a clone of `src`, replacing an existing `base`.
     ///
-    /// Crash-safe and error-safe like [`Core::rename_snapshot`]: if anything fails, the old `base`
-    /// is still there.
+    /// Crash-safe and error-safe (see `src/swap.rs`): if anything fails before the point of no
+    /// return the old `base` is still there, and past it the swap is rolled forward instead.
     pub fn promote_base(&self, src: &str, base: &str) -> Result<SnapshotEntry, ControlError> {
         self.inner.snap_by_name(src)?;
-        self.swap_snapshot(src, None, base)
+        self.swap_snapshot(src, base)
     }
 
     /// All snapshots in id order.
@@ -641,7 +670,7 @@ fn entry(info: &SnapshotInfo) -> Result<SnapshotEntry, Error> {
 
 impl Inner {
     fn add_snap(&self, info: &SnapshotInfo, snap: cowfs_meta::Snapshot) -> Arc<SnapCtx> {
-        let sc = Arc::new(SnapCtx::new(info.id.0, info.name.clone(), snap));
+        let sc = Arc::new(SnapCtx::new(info.id.0, snap));
         let mut s = self.snaps.wr();
         s.by_id.insert(info.id.0, sc.clone());
         s.by_name.insert(info.name.clone(), info.id.0);
@@ -716,7 +745,8 @@ impl Inner {
             {
                 let mut s = self.snaps.wr();
                 s.by_id.remove(&sc.id);
-                s.by_name.remove(&sc.name);
+                // by id, not by name: the name a snapshot answers to is the registry's to say
+                s.by_name.retain(|_, id| *id != sc.id);
             }
             *sc.q.lk() = queue::Queue::default();
             let mut freed = 0usize;
@@ -820,11 +850,15 @@ impl Inner {
         });
         files.sort_by_key(|f| f.ino);
         let mut lanes = Vec::new();
+        let names: HashMap<u64, String> = {
+            let s = self.snaps.rd();
+            s.by_name.iter().map(|(n, id)| (*id, n.clone())).collect()
+        };
         for sc in self.all_snaps() {
             let stuck = sc.q.lk().dirty_file_count();
             if stuck != 0 {
                 lanes.push(LaneHealth {
-                    snapshot: sc.name.clone(),
+                    snapshot: names.get(&sc.id).cloned().unwrap_or_default(),
                     id: sc.id,
                     files_stuck: stuck,
                 });
