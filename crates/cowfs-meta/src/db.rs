@@ -2480,6 +2480,14 @@ mod tests {
             "the durable commit was expected to fail: {failed:?}"
         );
 
+        // Nothing was persisted, so no inode exists yet at the number.
+        assert!(
+            matches!(s.getattr(want), Err(Error::NotFound)),
+            "the failed durable commit left an inode behind"
+        );
+
+        // The number is still owned by the session, so the retry is stopped by the create still
+        // pending in the tree, never by a reservation the session lost.
         let retry = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
         if let Err(e) = &retry {
             assert!(
