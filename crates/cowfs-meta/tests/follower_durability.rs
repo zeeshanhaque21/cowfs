@@ -9,22 +9,24 @@
 //! durable when its `Ack::Durable` call returns.
 //!
 //! Invariant under test: an `Ack::Durable` call returns only after the change is durable, including
-//! when it is a follower in a commit led by another caller. This harness asserts that at the exact
-//! return instant of every call, by comparing the caller's applied root with the root in the file's
-//! committed snapshot table (`durable_snapshots`, what a crash right now would leave). It also
-//! reopens from the crash image and requires every acknowledged write to survive.
+//! when it is a follower in a commit led by another caller. This harness asserts, at the exact
+//! return instant of every call, that the created name is already present in the tree the file
+//! holds (`durable_snapshots`/`snapshot`, what a crash right now would leave). Presence is
+//! monotonic under later commits, so the assertion cannot false-fail when another writer advances
+//! the root after this call returned. It also reopens from the crash image and requires every
+//! acknowledged write to survive.
 //!
-//! Boundary note: the follower/leader split is decided inside `wait_durable` by a private
-//! lock in `db.rs`. There is no public seam that forces a caller into the follower branch at a
-//! chosen instant (every path that makes a caller count as in-flight also holds the session write
-//! lock the leader needs), so the follower branch is *exercised* concurrently while the durability
-//! *assertion* stays deterministic per call. The harness does not sleep to fake a pass and it does
-//! not check only the leader.
+//! Boundary note: the follower/leader split is decided inside `wait_durable` by a private lock in
+//! `db.rs`. The deterministic, forced-follower proof is the crate-internal unit test
+//! `db::tests::follower_wait_does_not_ack_before_the_leader_publishes_durable_seq`; this
+//! integration test drives real concurrent durable callers through the shared-commit path and
+//! checks the crash image, so it is the end-to-end port rather than the discriminating gate. The
+//! harness does not sleep to fake a pass and it does not check only the leader.
 
 use cowfs_meta::*;
 use redb::StorageBackend;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,7 +36,7 @@ use std::time::Duration;
 enum Ev {
     W(u64, Vec<u8>),
     L(u64),
-    S(usize),
+    S,
 }
 
 #[derive(Default, Debug)]
@@ -46,7 +48,6 @@ struct Rec {
 #[derive(Clone, Default, Debug)]
 struct Be {
     r: Arc<Mutex<Rec>>,
-    tag: Arc<AtomicUsize>,
 }
 
 fn apply(img: &mut Vec<u8>, ev: &Ev) {
@@ -59,7 +60,7 @@ fn apply(img: &mut Vec<u8>, ev: &Ev) {
             img[*off as usize..end].copy_from_slice(d);
         }
         Ev::L(n) => img.resize(*n as usize, 0),
-        Ev::S(_) => {}
+        Ev::S => {}
     }
 }
 
@@ -84,8 +85,7 @@ impl StorageBackend for Be {
         Ok(())
     }
     fn sync_data(&self) -> Result<(), io::Error> {
-        let t = self.tag.load(SeqCst);
-        self.r.lock().unwrap().log.push(Ev::S(t));
+        self.r.lock().unwrap().log.push(Ev::S);
         Ok(())
     }
     fn write(&self, offset: u64, data: &[u8]) -> Result<(), io::Error> {
@@ -111,7 +111,7 @@ impl Be {
         let mut img = Vec::new();
         let mut pending: Vec<Ev> = Vec::new();
         for ev in self.log() {
-            if matches!(ev, Ev::S(_)) {
+            if matches!(ev, Ev::S) {
                 for e in pending.drain(..) {
                     apply(&mut img, &e);
                 }
@@ -143,8 +143,8 @@ fn yielding_hook(calls: &Arc<AtomicUsize>) -> SyncHook {
     })
 }
 
-/// The root of `name` as recorded in the file's last commit, or `None` if the snapshot is not yet
-/// durable at all.
+/// The root of `name` as recorded in the file's last durable commit, or `None` if the snapshot is
+/// not durable at all.
 fn durable_root(m: &Meta, name: &str) -> Option<NodeId> {
     m.durable_snapshots()
         .unwrap()
@@ -153,8 +153,29 @@ fn durable_root(m: &Meta, name: &str) -> Option<NodeId> {
         .map(|i| i.root)
 }
 
+/// True when `fname` is present in `name`'s tree as the file holds it right now.
+///
+/// Presence is monotonic under more commits, so this cannot false-fail the way comparing an exact
+/// durable root can: a later commit from another writer advances the root but keeps every entry a
+/// previous commit published. Under `follower-acked-early` a follower returns before the leader's
+/// commit, so its name is absent and this fires.
+fn durable_has(m: &Meta, name: &str, fname: &str) -> bool {
+    let Ok(snap) = m.snapshot(name) else {
+        return false;
+    };
+    match snap.readdir(ROOT_INO, 0, 10_000) {
+        Ok(rd) => rd.entries.iter().any(|e| e.name == fname.as_bytes()),
+        Err(_) => false,
+    }
+}
+
 /// Every acknowledged `Ack::Durable` create is durable at the instant its call returns, even when
 /// the commit was led by another caller (the follower path).
+///
+/// The authoritative, deterministic kill of `follower-acked-early` is the crate-internal
+/// `db::tests::follower_wait_does_not_ack_before_the_leader_publishes_durable_seq`, which forces the
+/// follower branch against a held leader. This test is the end-to-end port: it drives real
+/// concurrent durable callers through the shared-commit path and reopens from the crash image.
 #[test]
 fn every_durable_ack_is_durable_on_return_including_followers() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -171,7 +192,7 @@ fn every_durable_ack_is_durable_on_return_including_followers() {
 
     let threads = 8usize;
     let per = 200usize;
-    // Disjoint snapshots so each thread's root is its own; the commit is shared.
+    // Disjoint snapshots so each thread's create names its own snapshot; the commit is shared.
     let snaps: Vec<Snapshot> = (0..threads)
         .map(|t| m.new_snapshot(&format!("s{t}")).unwrap())
         .collect();
@@ -189,16 +210,11 @@ fn every_durable_ack_is_durable_on_return_including_followers() {
                     if snap.create(ROOT_INO, fname.as_bytes(), 0o644).is_err() {
                         break;
                     }
-                    // The applied root now includes this write.
-                    let applied = snap.root().unwrap();
-                    let committed = m.durable_snapshots().unwrap();
-                    let d = committed.iter().find(|s| s.name == name);
-                    let durable = d.map(|s| s.root);
-                    if durable != Some(applied) {
-                        // This call returned before its write was durable. Under a shared commit
-                        // that means this caller was a follower that acked early.
+                    // At the instant the ack returned, this create must already be in the durable
+                    // tree. Presence cannot false-fail from a later writer advancing the root.
+                    if !durable_has(&m, &name, &fname) {
                         failures.lock().unwrap().push(format!(
-                            "{name}/{fname}: durable root {durable:?} != applied {applied:?} at return"
+                            "{name}/{fname}: ack returned before the create was durable"
                         ));
                         if failures.lock().unwrap().len() >= 5 {
                             return;

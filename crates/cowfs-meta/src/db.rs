@@ -2556,4 +2556,123 @@ mod tests {
             ));
         }
     }
+
+    // The follower branch of `wait_durable` (the `follower-acked-early` mutant target), forced
+    // deterministically rather than left to timing. A real leader thread is held inside its
+    // `before_sync` hook, so the gc flag is set and `durable_seq` is below the target: any caller
+    // that now reaches `wait_durable(target)` must take the follower wait. A follower that returns
+    // before the target is published is exactly the defect (`if *led { return Ok(()); }`).
+    //
+    // The follower runs the real private `wait_durable`; nothing about the branch is reimplemented.
+    // The "did it return early" check is a bounded, failure-aware receive: the real code cannot
+    // return while the leader is held (the leader withholds the only wake), the mutant returns at
+    // once. After release the follower must return, observe `durable_seq >= target`, and the
+    // leader's committed create must survive a reopen.
+    #[test]
+    fn follower_wait_does_not_ack_before_the_leader_publishes_durable_seq() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+
+        // The leader blocks in the hook until released, so its commit cannot publish `durable_seq`.
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let hook: SyncHook = Arc::new(move || {
+            let _ = entered_tx.send(());
+            // Bounded receive: a buggy test must not hang forever waiting for the release.
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30));
+            Ok(())
+        });
+        let mut o = opts();
+        o.ack = Ack::Durable;
+        o.before_sync = Some(hook);
+        let m = Meta::open(&path, o).unwrap();
+        m.new_snapshot("s").unwrap();
+
+        let follower_saw: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let target;
+        {
+            let m_leader = m.clone();
+            let lead = std::thread::spawn(move || {
+                m_leader
+                    .snapshot("s")
+                    .unwrap()
+                    .create(ROOT_INO, b"lead", 0o644)
+            });
+
+            entered_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("leader never reached the before_sync hook");
+
+            // Precondition for the follower branch, read from the real state: the leader holds the gc
+            // flag and its commit has not yet published `durable_seq`.
+            target = m.h.inner.durable_seq.load(SeqCst) + 1;
+            {
+                let led = lock(&m.h.inner.gc);
+                assert!(
+                    *led,
+                    "a leader must be running for this to be a follower test"
+                );
+                assert!(
+                    m.h.inner.durable_seq.load(SeqCst) < target,
+                    "the target must not be durable yet"
+                );
+            }
+
+            // The follower runs the real private `wait_durable` under the leader-held flag.
+            let (done_tx, done_rx) = mpsc::channel::<u64>();
+            let inner = m.h.inner.clone();
+            let saw = follower_saw.clone();
+            let follower = std::thread::spawn(move || {
+                let r = inner.wait_durable(target);
+                let seq = inner.durable_seq.load(SeqCst);
+                *saw.lock().unwrap() = Some(seq);
+                let _ = done_tx.send(seq);
+                r
+            });
+
+            // Bounded, failure-aware: with the leader held, the only wake is the leader's
+            // `notify_all`, so a real follower cannot return here; the mutant returns at once.
+            if let Ok(seq_at_return) = done_rx.recv_timeout(Duration::from_millis(150)) {
+                panic!(
+                    "follower acked before the leader published durable_seq: returned with \
+                     durable_seq={seq_at_return} < target={target}"
+                );
+            }
+
+            // Release the leader; its commit carries the follower's target into `durable_seq`.
+            release_tx.send(()).unwrap();
+            lead.join().unwrap().unwrap();
+            follower.join().unwrap().unwrap();
+        }
+
+        let saw = follower_saw
+            .lock()
+            .unwrap()
+            .expect("follower never returned");
+        assert!(
+            saw >= target,
+            "the follower returned before durable_seq reached the target: {saw} < {target}"
+        );
+
+        // Genuine durability: reopen from the file and require the acked create to survive.
+        m.close().unwrap();
+        drop(m);
+        let again = Meta::open(&path, opts()).unwrap();
+        let entries = again
+            .snapshot("s")
+            .unwrap()
+            .readdir(ROOT_INO, 0, 1000)
+            .unwrap();
+        assert_eq!(
+            entries.entries.len(),
+            1,
+            "the acked create was lost after reopen"
+        );
+    }
 }
