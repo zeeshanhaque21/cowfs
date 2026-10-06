@@ -2035,22 +2035,33 @@ mod tests {
         m.check().expect("check after a large reservation");
     }
 
-    // T2: a range the cached floor already covers must commit nothing at all.
+    // T2: a range the cached floor already covers must commit nothing at all. The cached floor
+    // leads `next` after an ordinary create, which is the only way `next < reserved`.
     #[test]
     fn a_range_the_cached_floor_covers_commits_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let m = open(dir.path(), "m.redb");
 
-        let first = m.reserve_inodes(64).unwrap();
+        let s = m.new_snapshot("s").unwrap();
+        s.create(ROOT_INO, b"f", 0o644).unwrap();
+        m.sync().unwrap();
+        let covered_to = durable_reserved(&m);
+        let next = s.create(ROOT_INO, b"g", 0o644).unwrap();
+        assert!(
+            next.ino.0 + 4 <= covered_to,
+            "the cached floor must lead next for this case to exist"
+        );
+
         reset_reserve_probe();
-        let second = m.reserve_inodes(8).unwrap();
+        let r = m.reserve_inodes(4).unwrap();
 
         assert_eq!(
             reserve_commits(),
             0,
             "a covered range must not touch the store at all"
         );
-        assert_eq!(second.start().0, first.end().0, "still contiguous");
+        assert_eq!(r.start().0, next.ino.0 + 1, "hands out from next");
+        assert!(r.end().0 <= covered_to, "and stays inside the cached floor");
     }
 
     // T3: the reason the bound is written first. A bound left behind by a lost floor move is what
@@ -2163,6 +2174,7 @@ mod tests {
 
         // Reopening must not hand the skipped range back, even though the caller saw an error and
         // believes it holds nothing.
+        reset_reserve_probe();
         drop(m);
         let again = Meta::open(dir.path().join("m.redb"), opts()).unwrap();
         let r = again.reserve_inodes(8).unwrap();
@@ -2202,7 +2214,7 @@ mod tests {
         let r = m.reserve_inodes(50_000).unwrap();
         m.sync().unwrap();
 
-        let s = m.snapshot("s").unwrap();
+        let s = m.new_snapshot("s").unwrap();
         let f = s.create(ROOT_INO, b"f", 0o644).unwrap();
         assert!(
             f.ino.0 >= r.end().0,
