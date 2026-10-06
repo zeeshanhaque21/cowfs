@@ -22,7 +22,7 @@ mod common;
 
 use common::*;
 use cowfs_core::Core;
-use cowfs_vfs::{Error, Vfs, XattrFlags, ROOT_INO};
+use cowfs_vfs::{Error, Vfs, XattrFlags};
 
 /// A freshly created directory whose create is still uncommitted must list
 /// empty, not fail with `Stale`. `readdir_empty_directory` is the simplest hit
