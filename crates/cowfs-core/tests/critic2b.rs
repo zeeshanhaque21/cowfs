@@ -508,10 +508,7 @@ fn a_zero_id_chunk_ref_is_a_hole_only_if_the_store_does_not_hold_it() {
         let snap = meta.snapshot_by_id(info.id).unwrap();
         snap.batch(|tx| {
             let a = tx.create(cowfs_meta::ROOT_INO, b"forged", 0o644)?;
-            let refs = vec![cowfs_store::ChunkRef {
-                id: cowfs_store::BlockId::from_bytes([0; 32]),
-                len: 4096,
-            }];
+            let refs = vec![cowfs_store::ChunkRef::hole(4096)];
             tx.set_content(a.ino, &refs, 4096)?;
             Ok::<(), cowfs_meta::Error>(())
         })
@@ -555,27 +552,27 @@ fn the_zero_id_is_never_a_real_block_and_a_hole_is_length_bounded() {
         snap.batch(|tx| {
             let a = tx.create(cowfs_meta::ROOT_INO, b"forged", 0o644)?;
             let refs = vec![cowfs_store::ChunkRef {
-                id: cowfs_store::BlockId::from_bytes([0; 32]),
+                id: cowfs_store::HOLE,
                 // longer than any hole ref a sparse file can hold
                 len: (1 << 30) + 1,
+                hole: true,
             }];
             tx.set_content(a.ino, &refs, u64::from(refs[0].len))?;
             Ok::<(), cowfs_meta::Error>(())
         })
-        .unwrap();
+        // the metadata store refuses it now: a hole longer than a hole may claim is not a legal
+        // chunk ref, and a walk that yielded it would hand a collector a block the store cannot hold
+        .expect_err("a hole longer than a hole may claim must be refused");
         drop(c);
     }
+    // the refusal rolled the whole batch back, so the forged file is not there at all. A store
+    // written before the flag existed could still hold such a ref; that read path is covered in
+    // cowfs-meta's `hole_flag` fixture, where it is a decode failure rather than a write failure.
     let c = Core::open(dir.path(), test_opts()).unwrap();
-    let fs = c.snapshot_view("s").unwrap();
-    let a = fs.lookup(ROOT_INO, b"forged").unwrap();
-    let got = fs.read(a.ino, 0, 64);
-    println!(
-        "read of a zero-id ref longer than HOLE_MAX -> {:?}",
-        got.as_ref().err()
-    );
+    let snap = c.meta().snapshot("s").unwrap();
     assert!(
-        matches!(got, Err(cowfs_vfs::Error::Corrupt(_))),
-        "a zero id with a length no hole can hold is not a hole: {got:?}"
+        snap.lookup(cowfs_meta::ROOT_INO, b"forged").is_err(),
+        "the refused batch must have left nothing behind"
     );
 }
 

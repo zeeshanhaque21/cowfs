@@ -17,10 +17,7 @@ mod util;
 use util::{load1, measure, Rng};
 
 fn chunk(seed: u64) -> ChunkRef {
-    ChunkRef {
-        id: BlockId::of(&seed.to_le_bytes()),
-        len: 4096,
-    }
+    ChunkRef::block(BlockId::of(&seed.to_le_bytes()), 4096)
 }
 
 struct Tree {

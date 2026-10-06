@@ -605,9 +605,12 @@ impl Core {
 
     /// Every block a snapshot's committed tree references, with holes removed.
     ///
-    /// `cowfs-meta` yields the all-zero hole ref of a sparse file, which is not a block; this
-    /// filters it, so every id here is in the store. GC (#10) should use this, not the walker
-    /// directly, until `ChunkRef` has a hole flag (see `docs/v1-core.md`).
+    /// A `ChunkRef` now carries a `hole` flag, and the walk in `cowfs-meta` filters on that flag,
+    /// so it no longer yields the all-zero ref of a sparse file. The filter below is kept as a
+    /// defence in depth, so every id here is in the store either way.
+    /// GC (#10) should keep using this rather than the walker in `cowfs-meta` directly: this is the
+    /// public entry point that flushes the snapshot first and maps the walk's errors (see
+    /// `docs/v1-core.md`). Nothing here promises that GC reclaims a block, only which ids are live.
     /// Subtrees are skipped if the caller reuses one `Marker` across snapshots.
     pub fn live_blocks(
         &self,
