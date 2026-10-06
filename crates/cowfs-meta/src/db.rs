@@ -175,6 +175,22 @@ thread_local! {
     static RESERVE_COMMITS: Cell<u32> = const { Cell::new(0) };
 }
 
+// Fault injection for the ordinary batch commit, this crate's own unit tests only.
+//
+// `0` is off. `1` fails just before `wtx.commit()`, so nothing is persisted; `2` fails just after
+// it, so the edit is durable while the caller still sees an error. That second one is how a test
+// proves the retry path does not treat a persisted create as a failed one. Thread-local for the
+// same reason as `RESERVE_FAULT`.
+#[cfg(test)]
+thread_local! {
+    static COMMIT_FAULT: Cell<u8> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn commit_fault() -> u8 {
+    COMMIT_FAULT.with(Cell::get)
+}
+
 #[cfg(test)]
 fn reserve_fault() -> u8 {
     RESERVE_FAULT.with(Cell::get)
@@ -194,6 +210,12 @@ fn reserve_commits() -> u32 {
 fn reset_reserve_probe() {
     RESERVE_FAULT.with(|c| c.set(0));
     RESERVE_COMMITS.with(|c| c.set(0));
+    COMMIT_FAULT.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn set_commit_fault(v: u8) {
+    COMMIT_FAULT.with(|c| c.set(v));
 }
 
 struct HookScope;
@@ -685,7 +707,15 @@ impl Inner {
                 };
                 meta.insert("ino_reserved", reserved)?;
             }
+            #[cfg(test)]
+            if commit_fault() == 1 {
+                return Err(Error::Storage("injected before the batch commit".into()));
+            }
             wtx.commit()?;
+            #[cfg(test)]
+            if commit_fault() == 2 {
+                return Err(Error::Storage("injected after the batch commit".into()));
+            }
             Ok((new_roots, added))
         });
         let (new_roots, added) = match r {
@@ -933,6 +963,9 @@ impl Inner {
         id: SnapshotId,
         f: impl FnOnce(&mut Tx<'_>) -> Result<T>,
     ) -> Result<T> {
+        // Kept past the block so a failed durable wait can put the session's outstanding
+        // reservations back the way a retry expects to find them.
+        let mut spent: HashSet<Ino> = HashSet::new();
         let (out, wait_for) = {
             let _flight = Inflight::enter(&self.inflight);
             let mut guard_ = self.wlock()?;
@@ -950,7 +983,6 @@ impl Inner {
             let reserve = |n: u64| self.reserve_durable(n);
             // numbers spent inside this one transaction; a second create at the same number in the
             // same batch is refused rather than silently overwriting
-            let mut spent: HashSet<Ino> = HashSet::new();
             let res = {
                 let store = self.store_id;
                 let mut tx = Tx {
@@ -1034,7 +1066,17 @@ impl Inner {
             )
         };
         if let Some(seq) = wait_for {
-            self.wait_durable(seq)?;
+            if let Err(er) = self.wait_durable(seq) {
+                // The caller sees a failure and will retry. Nothing durable was written, so the
+                // numbers this batch reserved must be spendable again; the create itself stays
+                // pending in the tree like any other applied edit, so a retry at a live number is
+                // stopped by the inode-exists check rather than silently duplicated.
+                let mut s = self.wlock()?;
+                for ino in &spent {
+                    s.reserved.insert(*ino);
+                }
+                return Err(er);
+            }
         }
         Ok(out)
     }
@@ -2052,6 +2094,19 @@ mod tests {
         Meta::open(dir.join(name), opts()).unwrap()
     }
 
+    /// The same small store, but a batch returns only once its change is durable.
+    fn opts_durable() -> Options {
+        Options {
+            ack: Ack::Durable,
+            ..opts()
+        }
+    }
+
+    fn open_durable(dir: &std::path::Path, name: &str) -> Meta {
+        reset_reserve_probe();
+        Meta::open(dir.join(name), opts_durable()).unwrap()
+    }
+
     /// The durable floor as the store holds it, read through a fresh read transaction.
     fn durable_reserved(m: &Meta) -> u64 {
         let rtx = m.h.inner.db.begin_read().unwrap();
@@ -2387,5 +2442,67 @@ mod tests {
             .unwrap();
         assert_eq!(ok.ino, want, "the retry reused the ticket's number");
         m.check().unwrap();
+    }
+
+    // T13: a durable commit that fails before it persists must not strand the reserved number.
+    //
+    // The batch returns an error, so the caller retries. With the removal of the number from the
+    // session's outstanding set placed before the commit, the retry was refused as if the ticket
+    // had never been minted. Here the number stays owned by the session, so the retry is stopped
+    // only by the create that is still pending in the tree, never by a lost reservation.
+    #[test]
+    fn a_failed_durable_commit_does_not_strand_the_reserved_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open_durable(dir.path(), "m.redb");
+        let s = m.new_snapshot("s").unwrap();
+        let tickets = m.reserve_tickets(1).unwrap();
+        let want = tickets[0].ino();
+
+        set_commit_fault(1);
+        let failed = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
+        set_commit_fault(0);
+        assert!(
+            failed.is_err(),
+            "the durable commit was expected to fail: {failed:?}"
+        );
+
+        let retry = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
+        if let Err(e) = &retry {
+            assert!(
+                !e.to_string().contains("was not issued"),
+                "the failed durable commit stranded the reserved number: {e:?}"
+            );
+        }
+        m.check().unwrap();
+    }
+
+    // T14: a durable commit that fails after it persisted must not let the number be created twice.
+    //
+    // The caller sees an error and retries, but the first create is already on disk, so the retry
+    // at the same number is refused rather than silently duplicating it.
+    #[test]
+    fn a_durable_commit_that_persisted_then_failed_does_not_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open_durable(dir.path(), "m.redb");
+        let s = m.new_snapshot("s").unwrap();
+        let tickets = m.reserve_tickets(1).unwrap();
+        let want = tickets[0].ino();
+
+        set_commit_fault(2);
+        let failed = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
+        set_commit_fault(0);
+        assert!(
+            failed.is_err(),
+            "the durable commit was expected to fail: {failed:?}"
+        );
+
+        // the create did persist, so the inode is there and the retry cannot make a second one
+        s.getattr(want)
+            .expect("the persisted create must be visible");
+        let retry = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
+        assert!(
+            retry.is_err(),
+            "a retry after a persisted-but-failed commit duplicated the inode: {retry:?}"
+        );
     }
 }

@@ -227,7 +227,9 @@ impl Core {
         let md = std::fs::metadata(dir).map_err(|e| from_io(&e))?;
         let total = fs2::total_space(dir).unwrap_or(1 << 40);
         let avail = fs2::available_space(dir).unwrap_or(total);
-        let (mark, mark_warning) =
+        // The mark is only read now, to warn about a store written before meta owned the
+        // reservation; nothing hands out virtual numbers any more.
+        let (_, mark_warning) =
             ino::read_virt_mark(dir).counter(!meta.snapshots().map_err(from_meta)?.is_empty());
         let base_pack_bytes = store.stats().pack_bytes;
         let inner = Arc::new(Inner {
@@ -240,9 +242,6 @@ impl Core {
             aliases: RwLock::new(Aliases::default()),
             handles: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
-            next_virt: AtomicU64::new(mark),
-            virt_reserved: AtomicU64::new(mark),
-            virt_lock: Mutex::new(()),
             reserved: Mutex::new(Vec::new()),
             dirty_bytes: AtomicUsize::new(0),
             uid: md.uid(),

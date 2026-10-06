@@ -8,8 +8,6 @@ use cowfs_vfs::{Error, Ino, Result, ROOT_INO};
 
 /// Set on inode numbers handed out before meta assigned a real one.
 pub(crate) const VIRT: u64 = 1 << 63;
-/// How many virtual numbers one durable reservation covers.
-pub(crate) const VIRT_BLOCK: u64 = 1 << 20;
 const VIRT_A: &str = "virt.ino.a";
 const VIRT_B: &str = "virt.ino.b";
 const SHIFT: u32 = 40;
@@ -60,6 +58,10 @@ pub(crate) fn pack(snap: u64, m: u64) -> Result<Ino> {
     cowfs_meta::Meta::pack_ino(SnapshotId(snap), cowfs_meta::Ino(m)).ok_or(Error::NoSpace)
 }
 
+// Encodes a legacy virtual number. No production caller left: creates go through meta's own
+// reservation now. Kept so the shape tests can still exercise `classify`, `snap_of` and `Aliases`
+// against the numbers a pre-meta store would hold.
+#[cfg(test)]
 pub(crate) fn virt(snap: u64, n: u64) -> Result<Ino> {
     if snap == 0 || snap >= MAX_VIRT_SNAP || n > LOW {
         return Err(Error::NoSpace);
@@ -217,6 +219,10 @@ fn parse_mark(b: &[u8]) -> Option<u64> {
 
 /// Records `n` durably in the copy that does not hold the newest value, through a temporary file and
 /// a rename, so the previous copy survives a crash anywhere in here.
+///
+/// Nothing writes the mark in production any more, but the read side is still live for stores
+/// written before meta owned the reservation, so the tests need a way to lay one down.
+#[cfg(test)]
 pub(crate) fn write_virt_mark(root: &std::path::Path, n: u64) -> std::io::Result<()> {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&n.to_le_bytes());
@@ -237,6 +243,7 @@ pub(crate) fn write_virt_mark(root: &std::path::Path, n: u64) -> std::io::Result
 }
 
 /// The copy that holds the highest intact value, so the next write goes to the other one.
+#[cfg(test)]
 fn newest_copy(root: &std::path::Path) -> (&'static str, &'static str) {
     let a = parse_mark(&std::fs::read(root.join(VIRT_A)).unwrap_or_default()).unwrap_or(0);
     let b = parse_mark(&std::fs::read(root.join(VIRT_B)).unwrap_or_default()).unwrap_or(0);

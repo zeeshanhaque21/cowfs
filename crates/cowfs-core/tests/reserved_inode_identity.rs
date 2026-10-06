@@ -8,12 +8,12 @@
 //! a number drawn from that reservation must keep that same number durably, and
 //! must survive a crash and a reopen with the same identity and bytes.
 //!
-//! Today Core does not do that. `Inner::alloc_virt` mints a *virtual* number
-//! (top bit `VIRT = 1 << 63` set) from Core's own mark files, create queues an
-//! `Op::Create` carrying that virtual number, and only the metadata `Tx` picks a
-//! real meta number. Core then records the bridge in an in-memory alias table.
-//! The virtual number is a session-local alias: it is not the durable identity,
-//! it is not reservation-backed, and it is gone after a reopen.
+//! Today Core does not do that. It used to mint a *virtual* number (top bit
+//! `VIRT = 1 << 63` set) from Core's own mark files, queue an `Op::Create`
+//! carrying that virtual number, and let the metadata `Tx` pick a real meta
+//! number. Core then recorded the bridge in an in-memory alias table.
+//! The virtual number was a session-local alias: not the durable identity, not
+//! reservation-backed, and gone after a reopen.
 //!
 //! This test pins the *consumer contract* with the existing public Core API:
 //! the number a caller holds for a created file must be the same durable
@@ -191,4 +191,69 @@ fn a_virtual_alias_number_is_stale_after_a_reopen() {
         Err(Error::Stale),
         "a virtual alias number is not stale after a reopen: {virt_alias:#x}"
     );
+}
+
+/// End to end through the public API: a create whose first flush fails must keep
+/// the same number and the same bytes once the flush is retried, and must come
+/// back to the same identity after a reopen.
+///
+/// This is the consumer-visible form of the reservation-retry contract: a
+/// failure on the write path must not strand the number the caller already
+/// holds, and must not let a retry mint a different one.
+#[test]
+fn a_create_that_failed_its_first_flush_keeps_its_number_and_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"flush-failure-must-not-change-identity";
+
+    let (created, meta_before) = {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        c.create_snapshot("s").unwrap();
+        let r = root_entry(&c, "s").ino;
+
+        let a = c.create(r, b"f", 0o644).unwrap();
+        let created = a.ino;
+        let meta_before = c.meta_inode(created);
+        write_all(&c, created, 0, bytes);
+
+        // Fail every attempt of the first flush, past the internal retry budget,
+        // so the flush really reports a failure instead of masking it. `fsync`
+        // surfaces a surviving transient failure; `flush` alone would not.
+        c.set_flush_fault(created, 1, 8);
+        let failed = Vfs::fsync(&c, created, false);
+        assert!(
+            failed.is_err(),
+            "the injected flush fault did not surface: {failed:?}"
+        );
+        c.set_flush_fault(created, 0, 0);
+
+        // The number the caller holds is unchanged by the failure.
+        assert_eq!(
+            c.meta_inode(created),
+            meta_before,
+            "the meta identity changed across a failed flush"
+        );
+
+        // Retry the flush; it must now go through.
+        Vfs::fsync(&c, created, false).unwrap();
+        c.sync().unwrap();
+        write_all(&c, created, 0, bytes);
+        c.sync().unwrap();
+        (created, meta_before)
+    };
+
+    // A fresh Core must resolve the file to the same durable identity and bytes.
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    let r = root_entry(&c, "s").ino;
+    let a = c.lookup(r, b"f").unwrap();
+    assert_eq!(
+        a.ino, created,
+        "the inode number changed after a failed-then-retried flush and a reopen"
+    );
+    assert_eq!(
+        c.meta_inode(a.ino),
+        meta_before,
+        "the durable meta identity changed across the reopen"
+    );
+    assert_eq!(read_all(&c, a.ino), bytes, "the bytes did not survive");
+    c.check().unwrap();
 }

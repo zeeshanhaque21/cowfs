@@ -182,15 +182,9 @@ pub(crate) struct Inner {
     pub(crate) aliases: RwLock<Aliases>,
     pub(crate) handles: Mutex<HashMap<u64, Ino>>,
     pub(crate) next_handle: AtomicU64,
-    pub(crate) next_virt: AtomicU64,
-    /// Virtual numbers up to here are recorded in `<root>/virt.ino`, so a restart never hands out
-    /// a number an earlier session used.
-    pub(crate) virt_reserved: AtomicU64,
-    pub(crate) virt_lock: Mutex<()>,
     /// Tickets minted from a [`cowfs_meta::Meta::reserve_tickets`] batch and not yet spent by a
-    /// create. A create pops one here; the pool refills a block ahead so a create does not hold a
-    /// Core lock while meta's writer lock is taken. Numbers in a popped-but-unused ticket are
-    /// wasted, never reused.
+    /// create. A create pops one here; a create does not hold a Core lock while meta's writer lock
+    /// is taken. Numbers in a popped-but-unused ticket are wasted, never reused.
     pub(crate) reserved: Mutex<Vec<cowfs_meta::ReservedIno>>,
     pub(crate) dirty_bytes: AtomicUsize,
     pub(crate) uid: u32,
@@ -258,41 +252,6 @@ impl Inner {
         self.snaps.rd().by_id.values().cloned().collect()
     }
 
-    /// The meta inode number behind `ino`, if meta has one yet.
-    /// The next virtual number, extending the durable reservation when it runs out.
-    ///
-    /// Refuses at the alias ceiling: the number would be handed out now and released later, and a
-    /// client still holding it would see `Stale`, so the create fails here instead.
-    pub(crate) fn alloc_virt(&self, snap: u64) -> Result<Ino> {
-        let live = self.aliases.rd().len();
-        if live >= self.opts.alias_limit {
-            *self.last_error.lk() = Some(format!(
-                "session inode limit reached: {live} inodes are live, the ceiling is {}",
-                self.opts.alias_limit
-            ));
-            return Err(Error::NoSpace);
-        }
-        let n = self.next_virt.fetch_add(1, Ordering::AcqRel) + 1;
-        if n >= self.virt_reserved.load(Ordering::Acquire) {
-            self.reserve_virt()?;
-        }
-        crate::ino::virt(snap, n)
-    }
-
-    /// Records a block of virtual numbers durably before any of them is handed out, so a crash
-    /// can only waste numbers, never reuse them.
-    fn reserve_virt(&self) -> Result<()> {
-        let _g = self.virt_lock.lk();
-        let next = self.next_virt.load(Ordering::Acquire);
-        if next < self.virt_reserved.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let new = next.saturating_add(crate::ino::VIRT_BLOCK);
-        crate::ino::write_virt_mark(&self.root, new).map_err(|e| crate::error::from_io(&e))?;
-        self.virt_reserved.store(new, Ordering::Release);
-        Ok(())
-    }
-
     /// One reserved ticket for a create, refilling the pool in blocks.
     ///
     /// Takes no snapshot lock: a caller reserves before it takes `sc.ns`. A refill opens a meta
@@ -328,6 +287,7 @@ impl Inner {
         }
     }
 
+    /// The meta inode number behind `ino`, if meta has one yet.
     pub(crate) fn meta_of(&self, ino: Ino) -> Option<u64> {
         match classify(ino) {
             Id::Meta { m, .. } => Some(m),
