@@ -277,6 +277,8 @@ mod tests {
     fn a_legacy_virtual_mark_syncs_its_bytes_then_rename_then_directory() {
         let _seam = mark_seam();
         let d = tempfile::tempdir().unwrap();
+        write_virt_mark(d.path(), 12343).unwrap();
+        write_virt_mark(d.path(), 12344).unwrap();
         crate::fsops::arm();
         let result = write_virt_mark(d.path(), 12345);
         let trace = crate::fsops::trace_take();
