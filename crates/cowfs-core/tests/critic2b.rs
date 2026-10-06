@@ -41,6 +41,29 @@ fn child(name: &str, dir: &std::path::Path, which: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Like `child`, but for the crash child that must really die by abort: the caller's assertions
+/// only mean something if the process was actually killed without a clean close, so a normal exit
+/// (including a panicking test that still returns 0 output) fails here instead of false-passing.
+fn child_abort(name: &str, dir: &std::path::Path, which: &str) -> String {
+    let exe = std::env::current_exe().unwrap();
+    let out = Command::new(exe)
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env("COWFS_C2B_DIR", dir)
+        .env("COWFS_C2B_WHICH", which)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        out.status.signal(),
+        Some(6),
+        "reservation child did not abort: {text:?}"
+    );
+    text
+}
+
 fn snap_names(c: &Core) -> Vec<String> {
     let mut v: Vec<String> = c
         .list_snapshots()
@@ -332,7 +355,7 @@ fn legacy_mark_corruption_never_reissues_a_live_physical_number() {
         let dir = tempfile::tempdir().unwrap();
         // The live child allocates and returns its physical number, then aborts without syncing or
         // closing. That number is what a reissued identity must not collide with.
-        let out = child(
+        let out = child_abort(
             "reservation_child_allocates_physical_numbers",
             dir.path(),
             damage,
@@ -393,9 +416,9 @@ fn legacy_mark_corruption_never_reissues_a_live_physical_number() {
                 if !ta.exists() {
                     std::fs::write(&ta, encode_mark(1000)).unwrap();
                 }
-                let mut b = std::fs::read(&tb).unwrap_or_else(|_| encode_mark(2000));
+                let mut b = std::fs::read(&tb).unwrap_or_else(|_| encode_mark(2000).to_vec());
                 if b.is_empty() {
-                    b = encode_mark(2000);
+                    b = encode_mark(2000).to_vec();
                 }
                 if let Some(last) = b.last_mut() {
                     *last ^= 0xff;
