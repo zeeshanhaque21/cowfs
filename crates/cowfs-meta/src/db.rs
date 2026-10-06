@@ -1614,10 +1614,6 @@ impl Meta {
         self.h.inner.health()
     }
 
-    /// Runs `before_sync`, then makes every applied change durable. The hook runs on every call,
-    /// also when nothing is pending, so a caller can use this as "sync the store, then the
-    /// metadata". Returns the hook's or the commit's error.
-    ///
     /// Reserves `n` inode numbers before any inode exists, and hands them back.
     ///
     /// The numbers come from the same allocator [`Snapshot::batch`] creation draws on, so an
@@ -1638,6 +1634,9 @@ impl Meta {
         self.h.inner.reserve_inodes(n)
     }
 
+    /// Runs `before_sync`, then makes every applied change durable. The hook runs on every call,
+    /// also when nothing is pending, so a caller can use this as "sync the store, then the
+    /// metadata". Returns the hook's or the commit's error.
     pub fn sync(&self) -> Result<()> {
         self.h.inner.sync()
     }
