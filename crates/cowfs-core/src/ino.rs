@@ -1,6 +1,8 @@
 //! Inode number shapes and the alias table. See `docs/v1-core.md`, "Inode numbers".
 
 use std::collections::HashMap;
+// Only the test-only `write_virt_mark` writes a mark now; the production path only reads one.
+#[cfg(test)]
 use std::io::Write as _;
 
 use cowfs_meta::SnapshotId;
