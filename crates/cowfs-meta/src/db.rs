@@ -151,17 +151,17 @@ thread_local! {
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Fault injection for the durable reservation path, for this crate's own unit tests only.
-///
-/// `0` is off. `1` fails before the floor commit, `2` fails after it has persisted, and `3` fails
-/// before the bound commit. Thread-local because the reservation path runs under a process-wide
-/// write lock, so a process-wide fault would bleed into whichever other test happens to hold it.
+// Fault injection for the durable reservation path, for this crate's own unit tests only.
+//
+// `0` is off. `1` fails before the floor commit, `2` fails after it has persisted, and `3` fails
+// before the bound commit. Thread-local because the reservation path runs under a process-wide
+// write lock, so a process-wide fault would bleed into whichever other test happens to hold it.
 #[cfg(test)]
 thread_local! {
     static RESERVE_FAULT: Cell<u8> = const { Cell::new(0) };
 }
 
-/// Durable reservation commits made on this thread, so a test can prove the count does not follow `n`.
+// Durable reservation commits made on this thread, so a test can prove the count does not follow `n`.
 #[cfg(test)]
 thread_local! {
     static RESERVE_COMMITS: Cell<u32> = const { Cell::new(0) };
@@ -2000,13 +2000,6 @@ mod tests {
         let rtx = m.h.inner.db.begin_read().unwrap();
         let meta = rtx.open_table(META).unwrap();
         meta.get(INO_INTENT).unwrap().map(|g| g.value())
-    }
-
-    fn put_meta(m: &Meta, k: &str, v: u64) {
-        let mut wtx = m.h.inner.db.begin_write().unwrap();
-        wtx.set_two_phase_commit(true);
-        wtx.open_table(META).unwrap().insert(k, v).unwrap();
-        wtx.commit().unwrap();
     }
 
     // T1: the regression this change exists for. The commit count must not follow `n`.
