@@ -2575,6 +2575,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m.redb");
 
+        // Create the snapshot before the hook exists. Under `Ack::Durable` `new_snapshot` commits
+        // synchronously with `force_hook`, so it runs the hook; if the hook were installed first it
+        // would send on `entered_tx` and block, and the buffered signal would later be misread as
+        // the leader's. Opening the store hook-free, snapshotting, then reopening with the hook
+        // makes every signal on `entered_tx` the leader's own commit.
+        let mut warm = opts();
+        warm.ack = Ack::Durable;
+        let m0 = Meta::open(&path, warm).unwrap();
+        m0.new_snapshot("s").unwrap();
+        m0.close().unwrap();
+        drop(m0);
+
         // The leader blocks in the hook until released, so its commit cannot publish `durable_seq`.
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -2592,7 +2604,6 @@ mod tests {
         o.ack = Ack::Durable;
         o.before_sync = Some(hook);
         let m = Meta::open(&path, o).unwrap();
-        m.new_snapshot("s").unwrap();
 
         let follower_saw: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let target;
