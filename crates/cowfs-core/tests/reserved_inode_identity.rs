@@ -156,26 +156,39 @@ fn a_created_number_is_never_the_virtual_alias_shape_or_the_root() {
     );
 }
 
-/// Negative control for the refusal path: reading a number the fresh session
-/// never handed out is `Stale`, not another file's bytes. This is the property
-/// the virtual-alias design exists to protect, and it must hold no matter which
-/// identity scheme backs a created file.
+/// Negative control for the refusal path: a virtual alias-shaped number the
+/// fresh session never handed out is `Stale`, not another file's bytes.
+///
+/// This tests the alias *shape*, not any created file's real identity. It must
+/// not assert on a created file's number: under the NEW reservation design a
+/// created file's number is durable, so a fresh `getattr` on it must succeed,
+/// and testing `Stale` on the created number would contradict the positive case
+/// above. The `VIRT` bit is what makes a number an alias, and a real
+/// reservation-backed number never sets it, so the tagged number here is a
+/// distinct, non-admitted identity by construction.
 #[test]
-fn a_number_from_a_closed_session_is_stale_after_a_reopen() {
+fn a_virtual_alias_number_is_stale_after_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let stale = {
+    let virt_alias = {
         let c = Core::open(dir.path(), test_opts()).unwrap();
         c.create_snapshot("s").unwrap();
         let r = root_entry(&c, "s").ino;
         let a = c.create(r, b"f", 0o644).unwrap();
         write_all(&c, a.ino, 0, b"x");
         c.sync().unwrap();
-        a.ino
+        // The legacy alias shape: top bit set, tagged virtual on purpose. On a
+        // real reservation this number is never handed out, so it stays stale.
+        a.ino | VIRT
     };
+    assert_ne!(
+        virt_alias & VIRT,
+        0,
+        "the control number is not alias-shaped: {virt_alias:#x}"
+    );
     let c = Core::open(dir.path(), test_opts()).unwrap();
     assert_eq!(
-        c.getattr(stale),
+        c.getattr(virt_alias),
         Err(Error::Stale),
-        "a number from a closed session is not stale after a reopen"
+        "a virtual alias number is not stale after a reopen: {virt_alias:#x}"
     );
 }
