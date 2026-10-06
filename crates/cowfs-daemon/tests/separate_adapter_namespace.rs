@@ -251,7 +251,7 @@ impl Client {
         }
         let fh = rb(&mut r);
         let kind = skip_and_kind(&mut r);
-        (st, fh, Some(kind))
+        (st, fh, kind)
     }
 
     /// CREATE, guarded (mode 1). Returns (status, handle).
@@ -336,8 +336,25 @@ fn skip_fattr(r: &mut Cursor<Vec<u8>>) -> u32 {
     kind
 }
 
-fn skip_and_kind(r: &mut Cursor<Vec<u8>>) -> u32 {
-    skip_fattr(r)
+fn skip_and_kind(r: &mut Cursor<Vec<u8>>) -> Option<u32> {
+    rbool(r).then(|| skip_fattr(r))
+}
+
+#[test]
+fn lookup_post_op_attr_decodes_kind_after_the_present_flag() {
+    for kind in [FTYPE_DIR, FTYPE_REG] {
+        let mut bytes = Vec::new();
+        for word in [1u32, kind].into_iter().chain([0; 20]) {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        bytes.extend_from_slice(&0x12345678u32.to_be_bytes());
+        let mut reply = Cursor::new(bytes);
+        assert_eq!(skip_and_kind(&mut reply), Some(kind));
+        assert_eq!(ru32(&mut reply), 0x12345678);
+    }
+    let mut reply = Cursor::new(0u32.to_be_bytes().to_vec());
+    assert_eq!(skip_and_kind(&mut reply), None);
+    assert_eq!(reply.position(), 4);
 }
 
 fn skip_post_op_attr(r: &mut Cursor<Vec<u8>>) -> bool {
