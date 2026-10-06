@@ -218,7 +218,6 @@ impl Queue {
 #[derive(Debug)]
 pub(crate) struct SnapCtx {
     pub(crate) id: u64,
-    pub(crate) name: String,
     pub(crate) snap: Snapshot,
     /// Held by operations that change directory entries.
     pub(crate) ns: Mutex<()>,
@@ -234,10 +233,9 @@ pub(crate) struct SnapCtx {
 }
 
 impl SnapCtx {
-    pub(crate) fn new(id: u64, name: String, snap: Snapshot) -> Self {
+    pub(crate) fn new(id: u64, snap: Snapshot) -> Self {
         Self {
             id,
-            name,
             snap,
             ns: Mutex::new(()),
             flush: Mutex::new(()),
