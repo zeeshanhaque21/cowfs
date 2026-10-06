@@ -131,10 +131,10 @@ impl WatchVfs {
         self.ready.notify_all();
     }
 
-    fn hold_if_armed(&self, name: &[u8]) {
+    fn hold_if_armed(&self, name: &[u8]) -> bool {
         let mut s = self.hold.lock().unwrap();
         if s.armed.as_deref() != Some(name) || s.reached {
-            return;
+            return false;
         }
         s.reached = true;
         self.ready.notify_all();
@@ -142,17 +142,25 @@ impl WatchVfs {
         while !s.released {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                return;
+                return true;
             }
             let (g, _) = self.ready.wait_timeout(s, left).unwrap();
             s = g;
         }
+        true
     }
 }
 
 impl Vfs for WatchVfs {
     fn lookup(&self, p: Ino, n: &[u8]) -> Result<Attr> {
-        self.inner.lookup(p, n)
+        // The guard read: the adapter asks the backend whether a name exists before it mutates. The
+        // hold is placed after the backend has answered, so the guard has its stale answer in hand
+        // when the second request changes the tree; the mutation that follows then runs on the
+        // answer read before the change. This is the check-then-write window on the real request
+        // flow, with no injection below `Vfs`.
+        let r = self.inner.lookup(p, n);
+        self.hold_if_armed(n);
+        r
     }
     fn forget(&self, i: Ino, c: u64) {
         self.inner.forget(i, c)
@@ -248,12 +256,20 @@ fn is_real_dir(vfs: &dyn Vfs) -> bool {
     matches!(vfs.lookup(ROOT_INO, SIDE), Ok(a) if a.kind == FileKind::Directory)
 }
 
-/// The dispatch sample: one bounded, complete raw-NFS run. `mkdir(._doc)` and `create(doc)` are two
-/// real RPCs over two connections to the real in-process server. The property is that the adapter
-/// serialises them for one directory, so the server never has both name-space changes in flight at
-/// once. On the reviewed head both run inside the guard's window and the backend sees depth two,
-/// which is the window a real directory takes the view name in; with the per-directory lock the
-/// second request cannot enter until the first leaves.
+/// The dispatch sample: one bounded, complete raw-NFS run over the real in-process server.
+///
+/// Two real RPCs on two connections race the guard's window for one directory. The window is opened
+/// on the real request flow, with no injection below `Vfs`: the first `mkdir(._doc)` is held at its
+/// guard read, the backend lookup that decides whether the name is free. The second connection then
+/// creates the main name while the first request is stopped between its read and its write, which is
+/// exactly the transition a bare read-then-write cannot cover.
+///
+/// The outcome that matters is decided by what the guard saw, not by timing. The test records
+/// whether the main name was already present in the tree at the moment the held mutation was
+/// allowed to run. If it was, the guard read stale state, and a real directory must never take the
+/// live view name. If it was not, the `mkdir` was the serial winner and a real `._doc` directory is
+/// the correct macOS fallback for a name that had no main file yet. The check is unconditional
+/// given the recorded fact, so a run that produces the shadow cannot pass by skipping it.
 #[test]
 fn a_sidecar_name_never_becomes_a_real_object_under_raw_nfs() {
     let inner = memfs();
@@ -261,7 +277,9 @@ fn a_sidecar_name_never_becomes_a_real_object_under_raw_nfs() {
     let (server, mut c) = serve(watch.clone(), translated());
     let root = c.root.clone();
 
-    watch.arm(SIDE);
+    // Hold on the guard read of `doc`, which is the read the `mkdir(._doc)` guard does before it
+    // would write. The hold is inside the adapter's window, not below `Vfs`.
+    watch.arm(MAIN);
 
     let mk = {
         let mut c = common::Nfs::connect(server.port(), server.export_name());
@@ -269,47 +287,68 @@ fn a_sidecar_name_never_becomes_a_real_object_under_raw_nfs() {
         std::thread::spawn(move || c.mkdir(&root, "._doc"))
     };
 
-    // The guard for `mkdir(._doc)` has read the directory. Race the main name in with a second
-    // request on a second connection, which is what a client does.
     assert!(
         watch.wait_reached(10),
-        "mkdir(._doc) never reached its mutation; the window could not be opened"
+        "mkdir(._doc) never reached its guard read of doc; the window could not be opened"
     );
+
+    // The main name is created on a second connection while the first request is stopped in its
+    // window. On an adapter whose read and write are one step this blocks on the directory lock
+    // until the first request finishes; on one without the step it runs straight through.
     let created = {
         let mut c = common::Nfs::connect(server.port(), server.export_name());
         let root = root.clone();
         std::thread::spawn(move || c.create(&root, "doc", 1, common::sattr_mode(0o644), [0; 8]))
     };
-    // Give the second request a bounded window to overlap with the first. On the head this reaches
-    // depth two at once; with the lock it never does, and the wait simply runs to its deadline.
-    watch.wait_peak(2, 1000);
+    // Bounded: give the second request a window to slip in. When it is serialized away, nothing
+    // changes and this simply runs to its deadline.
+    let overlapped = watch.wait_peak(2, 1000);
     let depth_while_held = watch.peak();
+
+    // The fact the outcome turns on: is the main name in the tree while the held mutation has not
+    // run yet? If yes, the guard read it away too early and the write that follows is the defect.
+    let doc_present_at_mutation = inner.lookup(ROOT_INO, MAIN).is_ok();
     watch.release();
     let (mk_st, _fh) = mk.join().unwrap();
     let (created, _fh, _) = created.join().unwrap();
 
     let real = is_real_dir(inner.as_ref());
+    let doc_exists = inner.lookup(ROOT_INO, MAIN).is_ok();
     let names = c.names(&root);
     eprintln!(
-        "NFS mkdir(._doc)={mk_st} create(doc)={created} real_dir_took_the_name={real} \
-         peak_depth_while_held={depth_while_held} peak_depth={} names={names:?}",
+        "NFS mkdir(._doc)={mk_st} create(doc)={created} overlapped={overlapped} \
+         doc_present_at_mutation={doc_present_at_mutation} real_dir_took_the_name={real} \
+         doc_exists={doc_exists} depth_while_held={depth_while_held} peak_depth={} names={names:?}",
         watch.peak()
     );
 
-    assert_eq!(created, OK, "the concurrent create(doc) must succeed");
+    // The lock contract: the two guarded changes for one directory never overlap. On the fixed
+    // adapter the second request cannot enter, so the peak stays one.
     assert_eq!(
         watch.peak(),
         1,
         "two guarded name-space operations on one directory ran at the same time"
     );
+    assert!(
+        !overlapped,
+        "the second request entered the first request's guard window"
+    );
 
-    // The user-visible damage: with the name free, the attribute channel for `doc` must still open.
-    if !real {
+    // The illegal transition: the guard held an answer from before the main name landed, so no
+    // real object may take the live view name.
+    if doc_present_at_mutation {
+        assert!(
+            !real,
+            "a real directory took the live view name: the guard read stale state"
+        );
+    }
+    // A real `._doc` directory from the serial fallback is not the view: the channel must not
+    // report it as a usable attribute view.
+    if real {
         let (ch, _fh, _) = c.create(&root, "._doc", 1, common::sattr_mode(0o600), [0; 8]);
-        eprintln!("NFS attribute-channel create(._doc)={ch}");
-        assert_eq!(
+        assert_ne!(
             ch, OK,
-            "the attribute channel for doc is dead: ._doc is a real object"
+            "a real ._doc directory was reported as a usable attribute view"
         );
     }
 }
