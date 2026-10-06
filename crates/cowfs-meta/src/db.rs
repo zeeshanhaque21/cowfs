@@ -208,6 +208,7 @@ pub(crate) enum WaitWitness {
 thread_local! {
     static WAIT_WITNESS: std::cell::RefCell<Option<std::sync::mpsc::Sender<WaitWitness>>> =
         const { std::cell::RefCell::new(None) };
+    static WAIT_EARLY_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Installs the witness sender on the calling thread and returns a receiver for its events.
@@ -1039,6 +1040,10 @@ impl Inner {
                 return Ok(());
             }
             if *led {
+                #[cfg(test)]
+                if WAIT_EARLY_RETURN.with(|flag| flag.get()) {
+                    return Ok(());
+                }
                 #[cfg(test)]
                 wait_witness(WaitWitness::WaitEntered);
                 let _ = self.gc_cv.wait_timeout(led, Duration::from_millis(50));
@@ -2613,6 +2618,16 @@ mod tests {
     // leader's committed create must survive a reopen.
     #[test]
     fn follower_wait_does_not_ack_before_the_leader_publishes_durable_seq() {
+        follower_wait_case(false);
+    }
+
+    #[test]
+    #[should_panic(expected = "follower did not enter the gc_cv wait branch")]
+    fn follower_verifier_rejects_the_real_branch_early_return_control() {
+        follower_wait_case(true);
+    }
+
+    fn follower_wait_case(early_return: bool) {
         use std::sync::mpsc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2634,13 +2649,16 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
+        let hold_once = std::sync::atomic::AtomicBool::new(true);
         let hook: SyncHook = Arc::new(move || {
-            let _ = entered_tx.send(());
-            // Bounded receive: a buggy test must not hang forever waiting for the release.
-            let _ = release_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(30));
+            if hold_once.swap(false, SeqCst) {
+                entered_tx.send(()).map_err(std::io::Error::other)?;
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(std::io::Error::other)?;
+            }
             Ok(())
         });
         let mut o = opts();
@@ -2692,6 +2710,7 @@ mod tests {
             let saw = follower_saw.clone();
             let follower = std::thread::spawn(move || {
                 let observed = watch_wait_durable();
+                WAIT_EARLY_RETURN.with(|flag| flag.set(early_return));
                 let _ = rx_tx.send(observed);
                 let r = inner.wait_durable(target);
                 let seq = inner.durable_seq.load(SeqCst);
@@ -2709,20 +2728,17 @@ mod tests {
             // The first witness event is the branch proof. `WaitEntered` means the real follower
             // branch ran and parked; anything else (a `Returned` from the mutant return, or no event)
             // fails here. Bounded so a bug in the harness cannot hang the suite.
-            let first = witness_rx
-                .recv_timeout(Duration::from_secs(30))
-                .expect("follower produced no witness event");
+            let first = witness_rx.recv_timeout(Duration::from_secs(30));
+
+            release_tx.send(()).unwrap();
+            lead.join().unwrap().unwrap();
+            follower.join().unwrap().unwrap();
             assert_eq!(
-                first,
+                first.expect("follower produced no witness event"),
                 WaitWitness::WaitEntered,
                 "follower did not enter the gc_cv wait branch: it returned (or skipped) before the \
                  leader published durable_seq, which is the follower-acked-early defect"
             );
-
-            // Release the leader; its commit carries the follower's target into `durable_seq`.
-            release_tx.send(()).unwrap();
-            lead.join().unwrap().unwrap();
-            follower.join().unwrap().unwrap();
         }
 
         let saw = follower_saw
