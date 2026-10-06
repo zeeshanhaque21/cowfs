@@ -256,6 +256,12 @@ fn is_real_dir(vfs: &dyn Vfs) -> bool {
     matches!(vfs.lookup(ROOT_INO, SIDE), Ok(a) if a.kind == FileKind::Directory)
 }
 
+/// A valid AppleDouble image, the form a macOS client writes for `._name`. The bytes the channel
+/// must accept and round-trip.
+fn valid_sidecar() -> Vec<u8> {
+    cowfs_nfs::Sidecar::from_xattrs([(b"user.k".to_vec(), vec![7u8; 100])]).encode()
+}
+
 /// The dispatch sample: one bounded, complete raw-NFS run over the real in-process server.
 ///
 /// Two real RPCs on two connections race the guard's window for one directory. The window is opened
@@ -264,12 +270,17 @@ fn is_real_dir(vfs: &dyn Vfs) -> bool {
 /// creates the main name while the first request is stopped between its read and its write, which is
 /// exactly the transition a bare read-then-write cannot cover.
 ///
-/// The outcome that matters is decided by what the guard saw, not by timing. The test records
-/// whether the main name was already present in the tree at the moment the held mutation was
-/// allowed to run. If it was, the guard read stale state, and a real directory must never take the
-/// live view name. If it was not, the `mkdir` was the serial winner and a real `._doc` directory is
-/// the correct macOS fallback for a name that had no main file yet. The check is unconditional
-/// given the recorded fact, so a run that produces the shadow cannot pass by skipping it.
+/// Every status is asserted, so a run cannot pass because a request failed. The two legal outcomes
+/// are derived, not guessed from timing:
+///   - If the main name was already in the tree when the held mutation ran, the guard read stale
+///     state: a real directory must NOT have taken the live view name, and the `._doc` channel for
+///     the main file must open and round-trip valid AppleDouble bytes.
+///   - If it was not, the `mkdir` was the serial winner: a real `._doc` directory IS correct (the
+///     macOS fallback for a sidecar written before its main file), and `create(doc)` must still
+///     succeed afterward.
+///
+/// The channel-success branch (main file first) cannot be reached by the race when the adapter
+/// serialises correctly, so `a_main_file_first_channel_round_trips` covers it explicitly.
 #[test]
 fn a_sidecar_name_never_becomes_a_real_object_under_raw_nfs() {
     let inner = memfs();
@@ -309,21 +320,28 @@ fn a_sidecar_name_never_becomes_a_real_object_under_raw_nfs() {
     // run yet? If yes, the guard read it away too early and the write that follows is the defect.
     let doc_present_at_mutation = inner.lookup(ROOT_INO, MAIN).is_ok();
     watch.release();
-    let (mk_st, _fh) = mk.join().unwrap();
-    let (created, _fh, _) = created.join().unwrap();
+    let (mkdir_st, _fh) = mk.join().unwrap();
+    let (created_st, created_fh, _) = created.join().unwrap();
 
     let real = is_real_dir(inner.as_ref());
-    let doc_exists = inner.lookup(ROOT_INO, MAIN).is_ok();
     let names = c.names(&root);
     eprintln!(
-        "NFS mkdir(._doc)={mk_st} create(doc)={created} overlapped={overlapped} \
+        "NFS mkdir(._doc)={mkdir_st} create(doc)={created_st} overlapped={overlapped} \
          doc_present_at_mutation={doc_present_at_mutation} real_dir_took_the_name={real} \
-         doc_exists={doc_exists} depth_while_held={depth_while_held} peak_depth={} names={names:?}",
+         depth_while_held={depth_while_held} peak_depth={} names={names:?}",
         watch.peak()
     );
 
-    // The lock contract: the two guarded changes for one directory never overlap. On the fixed
-    // adapter the second request cannot enter, so the peak stays one.
+    // Every request that must succeed, succeeds. A failed create(doc) would otherwise make the
+    // main name look absent and skip the shadow check.
+    assert_eq!(created_st, OK, "create(doc) failed under the race");
+    assert!(
+        matches!(c.lookup(&root, "doc").0, OK),
+        "doc is not visible through a raw lookup after create"
+    );
+    assert_eq!(mkdir_st, OK, "mkdir(._doc) failed");
+
+    // The lock contract: the two guarded changes for one directory never overlap.
     assert_eq!(
         watch.peak(),
         1,
@@ -334,22 +352,36 @@ fn a_sidecar_name_never_becomes_a_real_object_under_raw_nfs() {
         "the second request entered the first request's guard window"
     );
 
-    // The illegal transition: the guard held an answer from before the main name landed, so no
-    // real object may take the live view name.
     if doc_present_at_mutation {
+        // The illegal transition: the guard held an answer from before the main name landed. No
+        // real object may take the live view name, and the attribute channel must carry bytes.
         assert!(
             !real,
             "a real directory took the live view name: the guard read stale state"
         );
-    }
-    // A real `._doc` directory from the serial fallback is not the view: the channel must not
-    // report it as a usable attribute view.
-    if real {
-        let (ch, _fh, _) = c.create(&root, "._doc", 1, common::sattr_mode(0o600), [0; 8]);
-        assert_ne!(
-            ch, OK,
-            "a real ._doc directory was reported as a usable attribute view"
+        let (ch, fh, _) = c.create(&root, "._doc", 1, common::sattr_mode(0o600), [0; 8]);
+        assert_eq!(ch, OK, "the attribute channel for doc did not open");
+        let f = fh.expect("a handle for the live view");
+        let blob = valid_sidecar();
+        let (ws, _n, _) = c.write(&f, 0, &blob, 0);
+        assert_eq!(ws, OK, "the attribute channel rejected valid bytes");
+        let (rs, got, _) = c.read(&f, 0, (1 << 16) as u32);
+        assert_eq!(rs, OK, "the attribute channel rejected a read");
+        assert_eq!(got, blob, "the attribute bytes did not survive");
+    } else {
+        // The serial fallback: the main name was absent when the guard read it, so a real `._doc`
+        // directory is correct, and the main file that landed must still be a regular file.
+        assert!(
+            real,
+            "mkdir(._doc) won the guard while doc was absent, so ._doc must be a real directory"
         );
+        let main_attr = inner.lookup(ROOT_INO, MAIN).expect("doc survives");
+        assert_eq!(
+            main_attr.kind,
+            FileKind::Regular,
+            "the main name is not a regular file"
+        );
+        assert!(created_fh.is_some(), "create(doc) returned no handle");
     }
 }
 
@@ -423,4 +455,84 @@ fn a_refused_directory_leaves_the_name_free() {
         "a refused mkdir left ._doc behind"
     );
     assert!(inner.lookup(ROOT_INO, MAIN).is_ok(), "doc survives");
+}
+
+/// The channel-success ordering, covered explicitly. When the main file exists first, `._doc` is a
+/// translating view: creating it must open a channel that accepts valid AppleDouble bytes and
+/// returns them unchanged. The race test cannot reach this branch on a correctly serialised adapter
+/// (the `mkdir` wins the lock first), so it is driven here directly over the same raw NFS server.
+#[test]
+fn a_main_file_first_channel_round_trips() {
+    let inner = memfs();
+    let (server, mut c) = serve(inner.clone(), translated());
+    let _ = server;
+    let root = c.root.clone();
+
+    let (doc_st, _fh, _) = c.create(&root, "doc", 1, common::sattr_mode(0o644), [0; 8]);
+    assert_eq!(doc_st, OK, "create(doc)");
+
+    let (ch, fh, _) = c.create(&root, "._doc", 1, common::sattr_mode(0o600), [0; 8]);
+    assert_eq!(ch, OK, "the attribute channel for doc did not open");
+    let f = fh.expect("a handle for the live view");
+
+    let blob = valid_sidecar();
+    let (ws, _n, _) = c.write(&f, 0, &blob, 0);
+    assert_eq!(ws, OK, "the attribute channel rejected valid bytes");
+    let (rs, got, _) = c.read(&f, 0, (1 << 16) as u32);
+    assert_eq!(rs, OK, "the attribute channel rejected a read");
+    assert_eq!(got, blob, "the attribute bytes did not survive");
+
+    // A view, not a real directory: the main name is untouched and no real `._doc` exists.
+    assert!(
+        !is_real_dir(inner.as_ref()),
+        "._doc became a real directory"
+    );
+    let names = c.names(&root);
+    assert!(names.contains(&"doc".to_string()), "doc missing: {names:?}");
+
+    eprintln!(
+        "CHANNEL create(doc)={doc_st} create(._doc)={ch} write={ws} read={rs} bytes={} eq={} names={names:?}",
+        got.len(),
+        got == blob
+    );
+}
+
+/// Implausible bytes under a translating sidecar name are refused, by design, with
+/// `NFS3ERR_NOTSUPP`, and leave the tree unchanged. This is the valid-vs-invalid control the earlier
+/// receipt mislabelled: `[0u8; N]` can never be a sidecar, so the refusal is not a product bug and
+/// no namespace fix touches it.
+#[test]
+fn implausible_sidecar_bytes_are_refused() {
+    const NOTSUPP: u32 = 10004;
+    let inner = memfs();
+    let (_server, mut c) = serve(inner.clone(), translated());
+    let root = c.root.clone();
+
+    // The main name exists, so `._doc` is a translating view, not a real file.
+    let (doc_st, _fh, _) = c.create(&root, "doc", 1, common::sattr_mode(0o644), [0; 8]);
+    assert_eq!(doc_st, OK, "create(doc)");
+    let (ch, fh, _) = c.create(&root, "._doc", 1, common::sattr_mode(0o600), [0; 8]);
+    assert_eq!(ch, OK, "the attribute channel for doc did not open");
+    let f = fh.expect("a handle for the live view");
+
+    let junk = vec![0u8; 4096];
+    let (ws, _n, _) = c.write(&f, 0, &junk, 0);
+    eprintln!("REFUSED implausible bytes write={ws} (expected NOTSUPP={NOTSUPP})");
+    assert_eq!(
+        ws, NOTSUPP,
+        "implausible bytes were not refused with NFS3ERR_NOTSUPP"
+    );
+
+    // No corrupt state: the tree is unchanged and a valid payload still round-trips.
+    assert!(
+        !is_real_dir(inner.as_ref()),
+        "a refused write created a real ._doc"
+    );
+    assert!(inner.lookup(ROOT_INO, MAIN).is_ok(), "doc survives");
+    let blob = valid_sidecar();
+    let (ws2, _n, _) = c.write(&f, 0, &blob, 0);
+    assert_eq!(ws2, OK, "a valid payload was rejected after the refusal");
+    let (rs2, got, _) = c.read(&f, 0, (1 << 16) as u32);
+    assert_eq!(rs2, OK, "the channel read failed after the refusal");
+    assert_eq!(got, blob, "the channel did not recover after the refusal");
 }
