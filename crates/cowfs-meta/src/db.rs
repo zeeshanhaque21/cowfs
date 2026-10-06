@@ -33,6 +33,13 @@ pub(crate) const REFS: TableDefinition<[u8; 32], u64> = TableDefinition::new("re
 pub(crate) const SNAPSHOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("snapshots");
 pub(crate) const SNAP_NAMES: TableDefinition<&str, u64> = TableDefinition::new("snap_names");
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+
+/// The durable floor a pending reservation is about to move `ino_reserved` to.
+///
+/// Written by its own commit ahead of the one that moves the floor, so redb discarding the newest
+/// commit still leaves the bound behind for `record_recovery` to skip to. Absent whenever no
+/// reservation is in flight, and absent entirely in files written before it existed.
+const INO_INTENT: &str = "ino_reserved_intent";
 pub(crate) const REAP: TableDefinition<u64, [u8; 32]> = TableDefinition::new("reap");
 
 /// "COWFSMET": identifies a cowfs-meta database among redb files.
@@ -142,6 +149,43 @@ impl std::fmt::Debug for Options {
 
 thread_local! {
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+// Fault injection for the durable reservation path, for this crate's own unit tests only.
+//
+// `0` is off. `1` fails before the floor commit, `2` fails after it has persisted, and `3` fails
+// before the bound commit. Thread-local because the reservation path runs under a process-wide
+// write lock, so a process-wide fault would bleed into whichever other test happens to hold it.
+#[cfg(test)]
+thread_local! {
+    static RESERVE_FAULT: Cell<u8> = const { Cell::new(0) };
+}
+
+// Durable reservation commits made on this thread, so a test can prove the count does not follow `n`.
+#[cfg(test)]
+thread_local! {
+    static RESERVE_COMMITS: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reserve_fault() -> u8 {
+    RESERVE_FAULT.with(Cell::get)
+}
+
+#[cfg(test)]
+fn count_reserve_commit() {
+    RESERVE_COMMITS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+fn reserve_commits() -> u32 {
+    RESERVE_COMMITS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn reset_reserve_probe() {
+    RESERVE_FAULT.with(|c| c.set(0));
+    RESERVE_COMMITS.with(|c| c.set(0));
 }
 
 struct HookScope;
@@ -702,45 +746,129 @@ impl Inner {
     }
 
     /// Durably reserves inode numbers below `new`. Carries no chunk references, so no hook.
+    ///
+    /// Spends any pending bound, because the floor has now reached the target that bound named.
     fn reserve_durable(&self, new: u64) -> Result<()> {
+        #[cfg(test)]
+        {
+            count_reserve_commit();
+            if reserve_fault() == 1 {
+                return Err(Error::Storage("injected before the durable commit".into()));
+            }
+        }
         guard(|| {
             let mut wtx = self.db.begin_write()?;
             wtx.set_two_phase_commit(true);
-            wtx.open_table(META)?.insert("ino_reserved", new)?;
+            {
+                let mut meta = wtx.open_table(META)?;
+                meta.insert("ino_reserved", new)?;
+                meta.remove(INO_INTENT)?;
+            }
+            wtx.commit()?;
+            Ok(())
+        })?;
+        #[cfg(test)]
+        if reserve_fault() == 2 {
+            return Err(Error::Storage("injected after the durable commit".into()));
+        }
+        Ok(())
+    }
+
+    /// Durably records that a reservation is about to move the floor to `target`.
+    ///
+    /// Written in a commit of its own, ahead of the one that moves the floor, because that is the
+    /// only arrangement that survives redb discarding its latest commit: the bound outlives the
+    /// floor move it describes, so `record_recovery` can still see how far the floor had been asked
+    /// to jump. Storing the amount in the same commit as the floor move would lose both together
+    /// and leave only the one-block bound. Carries no chunk references, so no hook.
+    fn reserve_intent(&self, target: u64) -> Result<()> {
+        #[cfg(test)]
+        count_reserve_commit();
+        #[cfg(test)]
+        if reserve_fault() == 3 {
+            return Err(Error::Storage("injected before the bound commit".into()));
+        }
+        guard(|| {
+            let mut wtx = self.db.begin_write()?;
+            wtx.set_two_phase_commit(true);
+            wtx.open_table(META)?.insert(INO_INTENT, target)?;
             wtx.commit()?;
             Ok(())
         })
+    }
+
+    /// Reserves `n` contiguous inode numbers, durably, before any of them names an inode.
+    ///
+    /// Takes the same lock and draws on the same allocator as `mutate`, so a reservation and an
+    /// ordinary create can never overlap and no number is handed out twice.
+    ///
+    /// The floor is moved in one commit rather than a block at a time, and the bound that commit
+    /// moved it by is durable in a commit of its own ahead of it. `record_recovery` then knows how
+    /// far the floor had been asked to jump even when redb discards the floor move itself, so a
+    /// lost commit can never reissue a number. A range the cached floor already covers commits
+    /// nothing at all. `next` is advanced only after the floor is durable, so a failure here
+    /// exposes no number and a reopen starts at or above the whole range.
+    pub(crate) fn reserve_inodes(&self, n: u64) -> Result<InoRange> {
+        let _flight = Inflight::enter(&self.inflight);
+        let mut s = self.wlock()?;
+        self.check_writable(&s)?;
+        if n == 0 {
+            return Err(Error::Invalid(
+                "a reservation must ask for at least one inode",
+            ));
+        }
+        if s.ino.next >= INO_LIMIT || n > INO_LIMIT - s.ino.next {
+            return Err(Error::LimitExceeded("inode numbers exhausted"));
+        }
+        let target = s.ino.next + n;
+        if target > s.ino.reserved {
+            self.reserve_intent(target)?;
+            self.reserve_durable(target)?;
+            s.ino.reserved = target;
+        }
+        let start = s.ino.next;
+        s.ino.next = target;
+        Ok(InoRange::new(Ino(start), Ino(target)))
     }
 
     /// Records a rollback that lost the newest commit, and moves the two counter floors past
     /// everything the lost commit could have handed out.
     ///
     /// A rollback returns the store to the previous commit, so the inode and snapshot counters go
-    /// back with it. Inode numbers are reserved one block at a time, each reservation its own
-    /// durable commit, and redb's repair falls back exactly one commit, so the lost commit
-    /// advanced `ino_reserved` by at most one block. `next_snapshot` moves one per commit.
+    /// back with it. The floor is moved by one commit that may jump by any amount, and the bound
+    /// naming that jump is written by an earlier commit, so redb discarding the newest commit
+    /// leaves that bound behind and the skip below can still cover it. Where there is no bound, the
+    /// floor only ever moved one block, which is what a reservation's own commits can have lost.
+    /// `next_snapshot` moves one per commit.
     /// Adding those bounds keeps the never-reused rule: a number can be wasted, never handed out
     /// twice.
     ///
-    /// The block must be the one this file was CREATED with, because that is the size the lost
-    /// reservation was written with. A file written before the block was persisted has no
-    /// provable bound, so this refuses instead of guessing; refusing to recover is recoverable,
-    /// re-issuing a number is not. Carries no chunk references, so no hook.
+    /// A bound, where one was left behind, names the floor move exactly and so no block is needed.
+    /// Only a file with no bound, which is one written before bounds existed, needs the block, and
+    /// that must be the one the file was CREATED with because it is the size the lost reservation
+    /// was written with. A file written before the block was persisted has no provable bound, so
+    /// this refuses instead of guessing; refusing to recover is recoverable, re-issuing a number is
+    /// not. Carries no chunk references, so no hook.
     fn record_recovery(&self) -> Result<(u64, u64, u64)> {
-        let Some(block) = self.ino_block else {
-            return Err(Error::Format(
-                "cannot recover: this file predates the persisted inode reservation block, so \
-                 the size of the lost reservation cannot be proven"
-                    .into(),
-            ));
-        };
         let (recoveries, ino_floor, snapshot_floor) = guard(|| {
             let mut wtx = self.db.begin_write()?;
             wtx.set_two_phase_commit(true);
             let mut meta = wtx.open_table(META)?;
-            let ino_floor = meta_get(&meta, "ino_reserved")?
-                .saturating_add(block)
-                .min(INO_LIMIT);
+            let bound = meta.get(INO_INTENT)?.map_or(0, |g| g.value());
+            let reserved = meta_get(&meta, "ino_reserved")?;
+            let floor = if bound > 0 {
+                bound
+            } else {
+                let Some(block) = self.ino_block else {
+                    return Err(Error::Format(
+                        "cannot recover: this file predates the persisted inode reservation block, \
+                         so the size of the lost reservation cannot be proven"
+                            .into(),
+                    ));
+                };
+                reserved.saturating_add(block)
+            };
+            let ino_floor = floor.max(reserved).min(INO_LIMIT);
             let snapshot_floor = meta_get(&meta, "next_snapshot")?
                 .saturating_add(1)
                 .min(SNAPSHOT_LIMIT);
@@ -751,6 +879,7 @@ impl Inner {
             meta.insert("ino_reserved", ino_floor)?;
             meta.insert("next_snapshot", snapshot_floor)?;
             meta.insert("recoveries", recoveries)?;
+            meta.remove(INO_INTENT)?;
             drop(meta);
             wtx.commit()?;
             Ok((recoveries, ino_floor, snapshot_floor))
@@ -1578,6 +1707,26 @@ impl Meta {
         self.h.inner.health()
     }
 
+    /// Reserves `n` inode numbers before any inode exists, and hands them back.
+    ///
+    /// The numbers come from the same allocator [`Snapshot::batch`] creation draws on, so an
+    /// ordinary create never receives one of them and this never receives one from a create.
+    /// Numbers are contiguous and `end` is exclusive.
+    ///
+    /// The durable floor is committed before this returns, so a number is never reissued after a
+    /// reopen, including one that was reserved and then never used. Because it commits, it is a
+    /// durable operation rather than an applied one: it runs under the same lock as a batch and
+    /// runs no `before_sync` hook, since it carries no chunk references.
+    ///
+    /// Asking for zero is [`Error::Invalid`], and asking for more than the remaining numbers below
+    /// [`INO_LIMIT`] is [`Error::LimitExceeded`]. Neither writes anything.
+    ///
+    /// This hands out numbers; it does not create inodes. Creating an inode at a reserved number is
+    /// a separate concern and is not provided here.
+    pub fn reserve_inodes(&self, n: u64) -> Result<InoRange> {
+        self.h.inner.reserve_inodes(n)
+    }
+
     /// Runs `before_sync`, then makes every applied change durable. The hook runs on every call,
     /// also when nothing is pending, so a caller can use this as "sync the store, then the
     /// metadata". Returns the hook's or the commit's error.
@@ -1816,5 +1965,263 @@ impl Snapshot {
     /// Do not call this store from inside the closure other than through the `Tx`.
     pub fn batch<T>(&self, f: impl FnOnce(&mut Tx<'_>) -> Result<T>) -> Result<T> {
         self.h.inner.mutate(self.id, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small blocks, so a range that crosses several of them still costs a fixed commit count.
+    fn opts() -> Options {
+        Options {
+            node_size: 512,
+            sync_every_ops: 1,
+            background: false,
+            ino_block: 8,
+            ..Options::default()
+        }
+    }
+
+    fn open(dir: &std::path::Path, name: &str) -> Meta {
+        reset_reserve_probe();
+        Meta::open(dir.join(name), opts()).unwrap()
+    }
+
+    /// The durable floor as the store holds it, read through a fresh read transaction.
+    fn durable_reserved(m: &Meta) -> u64 {
+        let rtx = m.h.inner.db.begin_read().unwrap();
+        let meta = rtx.open_table(META).unwrap();
+        meta_get(&meta, "ino_reserved").unwrap()
+    }
+
+    /// The pending bound as the store holds it, if one is there.
+    fn durable_bound(m: &Meta) -> Option<u64> {
+        let rtx = m.h.inner.db.begin_read().unwrap();
+        let meta = rtx.open_table(META).unwrap();
+        meta.get(INO_INTENT).unwrap().map(|g| g.value())
+    }
+
+    // T1: the regression this change exists for. The commit count must not follow `n`.
+    #[test]
+    fn a_large_reservation_costs_two_durable_commits_however_big() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+        let before = m.new_snapshot("s").unwrap().info().unwrap();
+
+        reset_reserve_probe();
+        let r = m.reserve_inodes(100_001).unwrap();
+        let commits = reserve_commits();
+
+        assert_eq!(r.len(), 100_001, "the whole range is handed back");
+        assert!(
+            commits <= 2,
+            "a reservation must cost a fixed number of durable commits, got {commits}"
+        );
+        assert_eq!(
+            commits, 2,
+            "one commit for the bound and one for the floor move"
+        );
+        assert_eq!(
+            durable_reserved(&m),
+            r.end().0,
+            "the floor lands exactly on the end of the range"
+        );
+        assert_eq!(durable_bound(&m), None, "the bound is spent by the move");
+
+        // The same work under the old loop needed 12501 commits at this block size.
+        let after = m.snapshot_by_id(before.id).unwrap().info().unwrap();
+        assert_eq!(after.id, before.id, "the snapshot is untouched");
+        m.check().expect("check after a large reservation");
+    }
+
+    // T2: a range the cached floor already covers must commit nothing at all. The cached floor
+    // leads `next` after an ordinary create, which is the only way `next < reserved`.
+    #[test]
+    fn a_range_the_cached_floor_covers_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+
+        let s = m.new_snapshot("s").unwrap();
+        s.create(ROOT_INO, b"f", 0o644).unwrap();
+        m.sync().unwrap();
+        let covered_to = durable_reserved(&m);
+        let next = s.create(ROOT_INO, b"g", 0o644).unwrap();
+        assert!(
+            next.ino.0 + 4 <= covered_to,
+            "the cached floor must lead next for this case to exist"
+        );
+
+        reset_reserve_probe();
+        let r = m.reserve_inodes(4).unwrap();
+
+        assert_eq!(
+            reserve_commits(),
+            0,
+            "a covered range must not touch the store at all"
+        );
+        assert_eq!(r.start().0, next.ino.0 + 1, "hands out from next");
+        assert!(r.end().0 <= covered_to, "and stays inside the cached floor");
+    }
+
+    // T3: the reason the bound is written first. A bound left behind by a lost floor move is what
+    // recovery skips to, and it is the only thing that can cover a jump larger than one block.
+    #[test]
+    fn a_bound_left_behind_is_exactly_what_recovery_skips_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+
+        // The state redb leaves behind when it discards the newest commit: the bound is durable,
+        // the floor move that was to follow it is not.
+        let target = 500_000;
+        m.h.inner.reserve_intent(target).unwrap();
+        assert_eq!(durable_bound(&m), Some(target), "the bound survived");
+        assert!(
+            durable_reserved(&m) < target,
+            "the floor move did not, which is the case under test"
+        );
+
+        let (_, ino_floor, _) = m.h.inner.record_recovery().unwrap();
+
+        assert_eq!(
+            ino_floor, target,
+            "recovery must skip to the bound, not one block past the floor"
+        );
+        assert!(ino_floor > target - 8, "and one block alone would not have");
+        assert_eq!(durable_bound(&m), None, "the bound is spent by recovery");
+        assert_eq!(durable_reserved(&m), target, "and the floor is durable");
+
+        // No number below the floor can come back after a reopen.
+        drop(m);
+        let again = Meta::open(dir.path().join("m.redb"), opts()).unwrap();
+        let r = again.reserve_inodes(4).unwrap();
+        assert!(
+            r.start().0 >= target,
+            "the allocator resumes at or above the recovered floor, got {}",
+            r.start().0
+        );
+    }
+
+    // T4: a file written before bounds existed still recovers, by the one-block rule it always used.
+    #[test]
+    fn a_file_without_a_bound_still_recovers_by_one_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+        let reserved = durable_reserved(&m);
+        assert_eq!(durable_bound(&m), None, "no bound is present");
+
+        let block = opts().ino_block;
+        let (_, ino_floor, _) = m.h.inner.record_recovery().unwrap();
+
+        assert_eq!(
+            ino_floor,
+            reserved + block,
+            "a legacy file keeps the one-block skip it has always used"
+        );
+    }
+
+    // T5: failing before anything is persisted must expose no number and consume nothing.
+    #[test]
+    fn a_failure_before_persisting_exposes_no_number_and_consumes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+        let before = durable_reserved(&m);
+
+        RESERVE_FAULT.with(|c| c.set(1));
+        let e = m.reserve_inodes(4096).unwrap_err();
+        assert!(matches!(e, Error::Storage(_)), "{e:?}");
+
+        assert_eq!(
+            durable_reserved(&m),
+            before,
+            "a commit that never ran cannot have moved the floor"
+        );
+
+        // The allocator did not move, so the same numbers are still available and nothing was
+        // handed out in between.
+        reset_reserve_probe();
+        let r = m.reserve_inodes(4096).unwrap();
+        assert_eq!(r.len(), 4096);
+        assert!(
+            r.start().0 < before + 4096,
+            "the refused call consumed nothing"
+        );
+    }
+
+    // T6: the uncertain outcome. The floor move persisted and the caller still saw an error, so the
+    // floor is ahead of anything this process was told. That is safe precisely because it only ever
+    // moves forward, and a retry cannot reissue what was already skipped.
+    #[test]
+    fn a_failure_after_the_floor_persisted_leaves_the_floor_ahead_and_never_reissues() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+        let before = durable_reserved(&m);
+
+        RESERVE_FAULT.with(|c| c.set(2));
+        let e = m.reserve_inodes(4096).unwrap_err();
+        assert!(matches!(e, Error::Storage(_)), "{e:?}");
+
+        let after = durable_reserved(&m);
+        assert_eq!(
+            after,
+            before + 4096,
+            "the commit really did persist before the error was returned"
+        );
+
+        // Recovery has nothing to skip, because the move is durable and the bound is spent.
+        let (_, ino_floor, _) = m.h.inner.record_recovery().unwrap();
+        assert_eq!(ino_floor, after + opts().ino_block);
+
+        // Reopening must not hand the skipped range back, even though the caller saw an error and
+        // believes it holds nothing.
+        reset_reserve_probe();
+        drop(m);
+        let again = Meta::open(dir.path().join("m.redb"), opts()).unwrap();
+        let r = again.reserve_inodes(8).unwrap();
+        assert!(
+            r.start().0 >= after,
+            "a number the failed call covered must not come back, got {}",
+            r.start().0
+        );
+        again.check().unwrap();
+    }
+
+    // T7: failing before the bound commit must also expose nothing.
+    #[test]
+    fn a_failure_before_the_bound_commits_exposes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+        let before = durable_reserved(&m);
+
+        RESERVE_FAULT.with(|c| c.set(3));
+        let e = m.reserve_inodes(4096).unwrap_err();
+        assert!(matches!(e, Error::Storage(_)), "{e:?}");
+
+        assert_eq!(durable_reserved(&m), before, "the floor never moved");
+        assert_eq!(durable_bound(&m), None, "and no bound was left behind");
+
+        reset_reserve_probe();
+        let r = m.reserve_inodes(4096).unwrap();
+        assert_eq!(r.len(), 4096, "the same range is still available");
+        m.check().unwrap();
+    }
+
+    // T8: an ordinary create and a reservation still draw from one allocator after all of this.
+    #[test]
+    fn ordinary_creation_still_starts_above_a_large_reserved_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+        let r = m.reserve_inodes(50_000).unwrap();
+        m.sync().unwrap();
+
+        let s = m.new_snapshot("s").unwrap();
+        let f = s.create(ROOT_INO, b"f", 0o644).unwrap();
+        assert!(
+            f.ino.0 >= r.end().0,
+            "creation must not land inside a reserved range: {} < {}",
+            f.ino.0,
+            r.end().0
+        );
+        m.check().unwrap();
     }
 }
