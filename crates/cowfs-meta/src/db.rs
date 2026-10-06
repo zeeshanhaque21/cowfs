@@ -188,6 +188,45 @@ fn reset_reserve_probe() {
     RESERVE_COMMITS.with(|c| c.set(0));
 }
 
+// Branch-entry witness for the follower half of `wait_durable`, for this crate's own unit tests.
+//
+// The follower branch is chosen under a private lock, so its entry is invisible from outside and a
+// test that only bounds a follower's return can false-green when the follower is never scheduled
+// before the leader is released. A test installs a sender on the follower thread; the real
+// `wait_durable` then reports `WaitEntered` the moment it takes the `if *led` branch (before it
+// parks on `gc_cv`) and `Returned` at its real `return`. Event order is then a proof of control
+// flow, independent of thread scheduling. Thread-local so the leader's own `wait_durable` call
+// never pollutes the follower's channel. Absent unless a test installs a sender.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitWitness {
+    WaitEntered,
+    Returned,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAIT_WITNESS: std::cell::RefCell<Option<std::sync::mpsc::Sender<WaitWitness>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs the witness sender on the calling thread and returns a receiver for its events.
+#[cfg(test)]
+fn watch_wait_durable() -> std::sync::mpsc::Receiver<WaitWitness> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    WAIT_WITNESS.with(|w| *w.borrow_mut() = Some(tx));
+    rx
+}
+
+#[cfg(test)]
+fn wait_witness(ev: WaitWitness) {
+    WAIT_WITNESS.with(|w| {
+        if let Some(tx) = w.borrow().as_ref() {
+            let _ = tx.send(ev);
+        }
+    });
+}
+
 struct HookScope;
 
 impl HookScope {
@@ -995,9 +1034,13 @@ impl Inner {
         loop {
             let mut led = lock(&self.gc);
             if self.durable_seq.load(SeqCst) >= seq {
+                #[cfg(test)]
+                wait_witness(WaitWitness::Returned);
                 return Ok(());
             }
             if *led {
+                #[cfg(test)]
+                wait_witness(WaitWitness::WaitEntered);
                 let _ = self.gc_cv.wait_timeout(led, Duration::from_millis(50));
                 continue;
             }
@@ -2635,26 +2678,46 @@ mod tests {
                 );
             }
 
-            // The follower runs the real private `wait_durable` under the leader-held flag.
-            let (done_tx, done_rx) = mpsc::channel::<u64>();
+            // The follower runs the real private `wait_durable` under the leader-held flag, and it
+            // reports its control flow through the thread-local witness installed on its own thread.
+            // The first event must be `WaitEntered`, emitted inside the real `if *led` branch before
+            // it parks on `gc_cv`; the mutant (`if *led { return Ok(()); }`) skips that emission and
+            // only the harness `Returned` below ever fires, so the first event proves which branch
+            // ran, with no sleep and independent of when the follower thread is scheduled.
+            //
+            // The witness sender is thread-local, so it must be installed on the follower thread:
+            // the follower sends its receiver to the main thread before it calls `wait_durable`.
+            let (rx_tx, rx_rx) = mpsc::channel::<mpsc::Receiver<WaitWitness>>();
             let inner = m.h.inner.clone();
             let saw = follower_saw.clone();
             let follower = std::thread::spawn(move || {
+                let observed = watch_wait_durable();
+                let _ = rx_tx.send(observed);
                 let r = inner.wait_durable(target);
                 let seq = inner.durable_seq.load(SeqCst);
+                // Harness terminal event: fires for both the real follower (after the leader's wake)
+                // and the mutant (immediately), so a missing `WaitEntered` is never mistakable for an
+                // unscheduled thread.
+                wait_witness(WaitWitness::Returned);
                 *saw.lock().unwrap() = Some(seq);
-                let _ = done_tx.send(seq);
                 r
             });
+            let witness_rx = rx_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("follower thread never installed the wait witness");
 
-            // Bounded, failure-aware: with the leader held, the only wake is the leader's
-            // `notify_all`, so a real follower cannot return here; the mutant returns at once.
-            if let Ok(seq_at_return) = done_rx.recv_timeout(Duration::from_millis(150)) {
-                panic!(
-                    "follower acked before the leader published durable_seq: returned with \
-                     durable_seq={seq_at_return} < target={target}"
-                );
-            }
+            // The first witness event is the branch proof. `WaitEntered` means the real follower
+            // branch ran and parked; anything else (a `Returned` from the mutant return, or no event)
+            // fails here. Bounded so a bug in the harness cannot hang the suite.
+            let first = witness_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("follower produced no witness event");
+            assert_eq!(
+                first,
+                WaitWitness::WaitEntered,
+                "follower did not enter the gc_cv wait branch: it returned (or skipped) before the \
+                 leader published durable_seq, which is the follower-acked-early defect"
+            );
 
             // Release the leader; its commit carries the follower's target into `durable_seq`.
             release_tx.send(()).unwrap();
