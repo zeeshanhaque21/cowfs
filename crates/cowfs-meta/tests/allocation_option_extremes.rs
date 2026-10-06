@@ -82,7 +82,7 @@ fn a_u64_max_block_is_clamped_in_the_ordinary_allocator() {
         "a clean reopen floor is a legal inode: got {floor}"
     );
     assert!(
-        floor >= created.0 + 1,
+        floor > created.0,
         "the floor is above the used inode {}: got {floor}",
         created.0
     );
