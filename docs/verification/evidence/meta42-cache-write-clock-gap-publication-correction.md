@@ -162,9 +162,47 @@ exit 0
 `origin/main`, and it was verified present in the local object store before the call.
 No checkout, no merge, no branch switch, no source written.
 
-**What this is:** a clean, conflict-free resulting tree against that explicit main.
-**What this is not:** a green run.
-Nothing was compiled from that tree, and no test in it was executed.
+**What this is, on my own reading:** a clean, conflict-free resulting tree against that explicit main.
+**What I did myself:** nothing was compiled from that tree and no test in it was executed.
+
+**What CI did, which is separate and stronger, and which I had to correct this document for.**
+The run at `04d2fb5` executed on the pull request's **merge ref**, not on the branch head alone.
+Both workspace job logs record:
+
+```
+HEAD is now at a78e287 Merge 04d2fb554563df467b3f14a712f994c5d363ca19 into cf67e8a6b2f8d346485fdf1c71d24283da0b43a0
+```
+
+So CI compiled and tested the branch **integrated into current `main`** at `cf67e8a`, which is exactly
+the integration I could not afford locally.
+That is CI's evidence and not mine, and it belongs to the merge ref `a78e287`, which contains `04d2fb5` and
+not the documentation commits published on top of it.
+
+Reading the two workspace job logs directly, with the exact head they checked out and the exact test
+results, rather than trusting a green tick:
+
+| what | macOS job 112043107530 | Ubuntu job 112043107562 |
+|---|---|---|
+| merge ref checked out | `a78e287` | `a78e287` |
+| branch head inside it | `04d2fb5` | `04d2fb5` |
+| `io::clock_order_tests::ctime_does_not_move_backwards_when_the_first_writer_applies_last` | **ok** | **ok** |
+| the `cowfs-core` lib binary | **30 passed, 0 failed, 0 ignored** | **30 passed, 0 failed, 0 ignored** |
+| `tests/caches.rs` | 2 passed, 0 failed, 0 ignored | 2 passed, 0 failed, 0 ignored |
+| `tests/locks.rs` | 2 passed, 0 failed, 0 ignored | 2 passed, 0 failed, 0 ignored |
+| `tests/operation_time.rs` | 4 passed, 0 failed, 0 ignored | 4 passed, 0 failed, 0 ignored |
+| `tests/critic2b.rs` | 27 passed, 0 failed, **1 ignored** | 27 passed, 0 failed, **1 ignored** |
+
+The new test's own name appears in both logs, so it ran rather than being filtered out, and the 30-test
+lib count includes it.
+The 1 ignored in `critic2b` is reported as ignored, not as passed.
+The log files are kept at `bench/out/meta42-cache-write-clock-gap-correction/logs/ci-04d2fb5-macos.log`
+and `ci-04d2fb5-ubuntu.log`.
+
+This corrects my earlier statement in the record `508698d0…`, which said no compile of the integrated tree
+was run.
+That statement was true of what I ran locally and false as a statement about the branch's CI, and the
+distinction is the whole point: **local work and CI evidence are separate and must be attributed
+separately.**
 
 ## The three-arm results are mine, not independently re-executed
 
@@ -177,13 +215,13 @@ the shape of both halves, and the fact that the `old`-arm description contradict
 
 ## The one green CI job is not a runtime gate for this change
 
-At `04d2fb5`, run 37393266584:
+At `04d2fb5`, run 37393266584, read once when all three had finished:
 
 | job | conclusion | covers this change |
 |---|---|---|
-| `linux-fuse` | completed, success | **no** |
-| `check (ubuntu-latest)` | in_progress | not yet determined |
-| `check (macos-latest)` | in_progress | not yet determined |
+| `linux-fuse` | completed, success | **no**, see below |
+| `check (ubuntu-latest)` | completed, success | **yes**, the table above |
+| `check (macos-latest)` | completed, success | **yes**, the table above |
 
 The `linux-fuse` job runs `cowfs-vfs-path --test native` for three native controls and then
 `cargo test -p cowfs-fuse --include-ignored`.
@@ -194,9 +232,13 @@ It never runs `cowfs-core`, so it does not execute `io::clock_order_tests`, `cac
 
 **Therefore a green `linux-fuse` job is not evidence that this change's tests pass, and none is claimed
 from it.**
-The jobs that do run `cargo test --workspace`, and would execute the new test, were still in progress at
-this snapshot.
-CI on the head this document publishes is read once and reported, not polled.
+The evidence comes from the two workspace jobs, read from their logs.
+
+**A green result does not carry to a new head.**
+The head this document publishes on top of `04d2fb5` is documentation only, and `crates/cowfs-core/src/io.rs`
+is byte-identical at both, so the test outcome carries as a matter of source identity.
+It is still a different commit, and its own CI is read once and reported on its own terms, not inherited
+from `04d2fb5`.
 
 ## The physical under-lock fix is unchanged
 
@@ -229,7 +271,7 @@ branch's current commits.
 
 ## What this document does not claim
 
-- **No runtime gate from CI.** One job is green and it does not cover `cowfs-core`.
+- **No runtime gate from the `linux-fuse` job.** It is green and it does not cover `cowfs-core`. The runtime evidence is the two workspace jobs, and it belongs to the merge ref `a78e287` containing `04d2fb5`, read from their logs and attributed to CI rather than to me.
 - **No independently re-executed three-arm result.** Those are author-local measurements, re-read by the
   review but not rebuilt.
 - **No compile of the merged tree.** Integration is a conflict-free tree and nothing more.
