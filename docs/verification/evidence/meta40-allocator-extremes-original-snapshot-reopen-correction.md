@@ -21,6 +21,5 @@ mode), and create `g` there. Absence semantics not weakened. Missing-clamp
 discriminator and live-floor-limit assertions unchanged. No production change.
 
 ## Status
-CI on `825bd38`: PENDING until the named four tests pass in a completed run.
-Runnable command: `cargo test -p cowfs-meta --test allocation_option_extremes`.
+CI on `825bd38`: PENDING until the named four tests pass in a completed run. Runnable command: `cargo test -p cowfs-meta --test allocation_option_extremes`.
 Old receipts `486b16f6...`, `c418d15c...`, `ec04ce04...`, `15801061...` and review `0f730979...` unchanged.
