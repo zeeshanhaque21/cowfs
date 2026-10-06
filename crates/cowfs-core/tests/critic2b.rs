@@ -367,7 +367,7 @@ fn legacy_mark_corruption_never_reissues_a_live_physical_number() {
             .and_then(|v| v.split_whitespace().next())
             .and_then(|v| v.trim().parse().ok())
             .expect("the child reported its physical number");
-        assert_ne!(
+        assert_eq!(
             first & (1 << 63),
             0,
             "{damage}: the child handed out a virtual alias, not a physical number: {first:#x}"
