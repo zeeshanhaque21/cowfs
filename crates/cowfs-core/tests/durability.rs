@@ -134,7 +134,7 @@ fn a_physical_reservation_is_durable_before_its_number_is_handed_out() {
     let fs = c.snapshot_view("s").unwrap();
     let before = syncs.load(Ordering::SeqCst);
     let a = fs.create(ROOT_INO, b"f", 0o644).unwrap();
-    assert_eq!(a.ino.0 & (1 << 63), 0);
+    assert_eq!(a.ino & (1 << 63), 0);
     assert!(syncs.load(Ordering::SeqCst) > before);
     let meta_ino = c.meta_inode(a.ino).unwrap();
     let floor = c.meta().health().ino_floor;
@@ -185,7 +185,7 @@ fn a_physical_reservation_refuses_when_metadata_cannot_be_made_durable() {
         Err(cowfs_vfs::Error::NotFound)
     ));
     let a = fs.create(ROOT_INO, b"g", 0o644).unwrap();
-    assert_eq!(a.ino.0 & (1 << 63), 0);
+    assert_eq!(a.ino & (1 << 63), 0);
     assert!(c.meta().health().ino_floor > c.meta_inode(a.ino).unwrap());
     fs.write(a.ino, 0, b"retry survived").unwrap();
     c.sync().unwrap();
