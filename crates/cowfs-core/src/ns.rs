@@ -243,6 +243,11 @@ impl Inner {
             s
         };
         pn.ns_seq.store(seq, Ordering::Release);
+        // A reserved create's number is a packed meta number, so `meta_of` answers for it before meta
+        // has seen it. The child records the same sequence its create was queued at, so the gates
+        // that read meta through the child (`op_readdir`, `require_empty`, `barrier_if_needed`) commit
+        // the create first instead of reading an inode meta does not have, which is `Stale`.
+        node.ns_seq.store(seq, Ordering::Release);
         self.nodes.upsert(ino, node.clone());
         self.shrink_nodes(ino);
         self.dents.put(parent, name, Some((ino, kind)), seq);

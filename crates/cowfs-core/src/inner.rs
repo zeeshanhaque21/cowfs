@@ -545,19 +545,27 @@ impl Inner {
         }
         if node.st.rd().xattrs.is_none() {
             let mut map = BTreeMap::new();
-            if let Some(m) = self.meta_of(node.ino) {
-                for name in sc
-                    .snap
-                    .listxattr(mino(m))
-                    .map_err(from_meta)
-                    .map_err(stale)?
-                {
-                    let v = sc
+            // A reserved create's number is the packed meta number, so `meta_of` answers for it
+            // before meta has committed the create. Reading meta then reports `NotFound` for an
+            // inode that exists as `Stale`, and there is nothing to preserve anyway: an uncommitted
+            // create has no xattrs in meta. `barrier` cannot run here because the callers hold the
+            // namespace lock (lock order: the flush lock is taken unlocked), so a pending create
+            // gets an empty map instead of a meta read.
+            if node.seq.load(Ordering::Acquire) <= sc.flushed() {
+                if let Some(m) = self.meta_of(node.ino) {
+                    for name in sc
                         .snap
-                        .getxattr(mino(m), &name)
+                        .listxattr(mino(m))
                         .map_err(from_meta)
-                        .map_err(stale)?;
-                    map.insert(name, v);
+                        .map_err(stale)?
+                    {
+                        let v = sc
+                            .snap
+                            .getxattr(mino(m), &name)
+                            .map_err(from_meta)
+                            .map_err(stale)?;
+                        map.insert(name, v);
+                    }
                 }
             }
             node.st.wr().xattrs = Some(map);
