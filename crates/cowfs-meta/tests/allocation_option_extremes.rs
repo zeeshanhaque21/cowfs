@@ -14,10 +14,11 @@
 //! of that inode, the durable floor, and `check()`.
 //!
 //! Bounds, not volume: `ino_block` is only read at create, so each case uses its own fresh store,
-//! and the maximum case intentionally exhausts the id space after the first create rather than
-//! allocating a range or iterating.
+//! and every case makes a single small ordinary create rather than allocating a range or iterating.
+//! A clean close collapses the durable floor to the next unused id, so the maximum case proves the
+//! clamp held and the created inode survived a reopen, not that the id space stayed reserved.
 
-use cowfs_meta::{Error, FileType, Meta, Options, INO_LIMIT, ROOT_INO};
+use cowfs_meta::{FileType, Meta, Options, INO_LIMIT, ROOT_INO};
 
 fn opts_with_block(ino_block: u64) -> Options {
     Options {
@@ -38,7 +39,7 @@ fn a_u64_max_block_is_clamped_in_the_ordinary_allocator() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.redb");
 
-    let (created, floor) = {
+    let created = {
         let m = Meta::open(&path, opts_with_block(u64::MAX)).unwrap();
         let s = m.new_snapshot("s0").unwrap();
 
@@ -58,39 +59,55 @@ fn a_u64_max_block_is_clamped_in_the_ordinary_allocator() {
         assert_eq!(back.kind, FileType::File);
         assert_eq!(back.mode & 0o777, 0o644);
 
-        // The clamped block reserves the whole id space in one step. That is the honest
-        // consequence of an extreme block: the floor is at the limit, not wrapped past it.
-        let floor = m.health().ino_floor;
+        // The clamped block reserves the whole id space in one step, so the in-memory floor is at
+        // the limit rather than wrapped past it.
         assert_eq!(
-            floor, INO_LIMIT,
+            m.health().ino_floor,
+            INO_LIMIT,
             "the clamped block reserves up to INO_LIMIT, not past it"
         );
         m.check()
             .expect("check after an ordinary create under u64::MAX");
-        m.sync().unwrap();
-        (f.ino, floor)
+        f.ino
     };
 
-    // Drop every handle, then reopen: the floor is persisted, and the id space the extreme block
-    // reserved is genuinely gone, so the next ordinary create is refused honestly.
+    // Drop every handle, then reopen. A clean close collapses the durable floor to `next`, since
+    // the reserved-but-unused numbers no longer need protecting: `next` was 3 after the single
+    // create, so the floor is 3, not INO_LIMIT. What matters is that the block never wrapped, the
+    // created inode survives, and a fresh ordinary create resumes above it rather than colliding.
     let m = Meta::open(&path, opts_with_block(4)).unwrap();
-    assert_eq!(
-        m.health().ino_floor,
-        floor,
-        "the reserved floor survives a reopen"
-    );
-    let s = m.new_snapshot("s1").unwrap();
-    let e = s
-        .create(ROOT_INO, b"g", 0o644)
-        .expect_err("a fully reserved id space must be refused, not wrapped into");
+    let floor = m.health().ino_floor;
     assert!(
-        matches!(e, Error::LimitExceeded(_)),
-        "space exhaustion is LimitExceeded, got {e:?}"
+        floor > ROOT_INO.0 && floor <= INO_LIMIT,
+        "a clean reopen floor is a legal inode: got {floor}"
+    );
+    assert!(
+        floor >= created.0 + 1,
+        "the floor is above the used inode {}: got {floor}",
+        created.0
     );
 
-    // The first inode is not reissued and remains readable.
+    let s = m.new_snapshot("s1").unwrap();
     let back = s.lookup(ROOT_INO, b"f").unwrap();
-    assert_eq!(back.ino, created, "the created inode is not reused");
+    assert_eq!(
+        back.ino, created,
+        "the created inode is not reused after a reopen"
+    );
+
+    let g = s
+        .create(ROOT_INO, b"g", 0o644)
+        .expect("ordinary create after a reopen");
+    assert!(
+        g.ino.0 > created.0,
+        "a new inode after a reopen is fresh: got {} after {}",
+        g.ino.0,
+        created.0
+    );
+    assert!(
+        g.ino.0 < INO_LIMIT,
+        "ordinary creation never returns INO_LIMIT: got {}",
+        g.ino.0
+    );
     m.check().expect("check after reopen");
 }
 
