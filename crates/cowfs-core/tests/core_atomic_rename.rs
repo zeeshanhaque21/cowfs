@@ -267,9 +267,11 @@ fn a_rename_moves_one_name_and_changes_no_other_snapshot() {
     f.c.check().unwrap();
 }
 
-/// Promotion still replaces its target: it is not a rename and must keep working.
+/// Promotion replaces its target with the source's content. Its recorded old-consumer
+/// failure was an earlier body of this fixture reading the target's original inode, which
+/// the replacement destroys, so nothing in this case depends on the rename change.
 #[test]
-fn promote_base_still_replaces_its_target() {
+fn promote_base_replaces_its_target_with_the_source_content() {
     let f = with_file("base", b"old base");
     f.c.create_snapshot("src").unwrap();
     let v = f.c.snapshot_view("src").unwrap();
