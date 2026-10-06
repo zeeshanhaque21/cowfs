@@ -268,6 +268,37 @@ fn newest_copy(root: &std::path::Path) -> (&'static str, &'static str) {
 mod tests {
     use super::*;
 
+    fn mark_seam() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn a_legacy_virtual_mark_syncs_its_bytes_then_rename_then_directory() {
+        let _seam = mark_seam();
+        let d = tempfile::tempdir().unwrap();
+        crate::fsops::arm();
+        let result = write_virt_mark(d.path(), 12345);
+        let trace = crate::fsops::trace_take();
+        crate::fsops::disarm();
+        result.unwrap();
+        let position = |prefix: &str| trace.iter().position(|e| e.starts_with(prefix)).unwrap();
+        assert!(position("sync_file:virt.ino") < position("virt_mark_renamed"));
+        assert!(position("virt_mark_renamed") < position("sync_dir:"));
+        assert_eq!(read_virt_mark(d.path()), Mark::Value(12345));
+    }
+
+    #[test]
+    fn a_legacy_virtual_mark_refuses_a_failed_directory_sync() {
+        let _seam = mark_seam();
+        let d = tempfile::tempdir().unwrap();
+        crate::fsops::arm();
+        crate::fsops::set_fault(crate::fsops::Fault::DirSync, &d.path().to_string_lossy(), 1);
+        let result = write_virt_mark(d.path(), 12345);
+        crate::fsops::disarm();
+        assert!(result.is_err());
+    }
+
     #[test]
     fn shapes_round_trip() {
         assert_eq!(classify(ROOT_INO), Id::Root);
@@ -290,6 +321,7 @@ mod tests {
 
     #[test]
     fn the_virtual_mark_round_trips_and_a_torn_one_falls_back_to_the_other() {
+        let _seam = mark_seam();
         let d = tempfile::tempdir().unwrap();
         assert_eq!(read_virt_mark(d.path()), Mark::Missing);
         let (v, e) = read_virt_mark(d.path()).counter(false);

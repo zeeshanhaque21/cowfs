@@ -2,7 +2,7 @@
 //! describe. Every test here fails with its mutant and passes without it.
 //!
 //! `cowfs_core::fsops` is a test-only seam: it records the `sync` calls the swap and the
-//! virtual-number reservation make, and can make one of them fail.
+//! swap makes, and can make one of them fail. Physical reservations use the metadata sync hook.
 
 mod common;
 
@@ -113,77 +113,88 @@ fn a_swap_refuses_when_the_intent_file_cannot_be_made_durable() {
     );
 }
 
-// ---------------------------------------------------------------- n04: the virtual-number mark
-
-/// n04: a number from a new reservation may only be handed out once the mark that reserves it is on
-/// the medium, with the rename and its directory entry before it.
 #[test]
-fn a_new_virtual_reservation_is_durable_before_any_of_its_numbers_is_handed_out() {
-    let _seam = seam();
+fn a_physical_reservation_is_durable_before_its_number_is_handed_out() {
+    use std::sync::atomic::AtomicUsize;
+
     let dir = tempfile::tempdir().unwrap();
-    // start the counter right at the end of the reservation so the first create extends it
-    {
-        let c = Core::open(dir.path(), opts_tiny_reservation()).unwrap();
-        c.create_snapshot("s").unwrap();
-        let fs = c.snapshot_view("s").unwrap();
-        let a = fs.create(ROOT_INO, b"f", 0o644).unwrap().ino;
-        c.sync().unwrap();
-        let _ = a;
-    }
+    let syncs = Arc::new(AtomicUsize::new(0));
+    let observed = syncs.clone();
+    let c = Core::open_with_meta(dir.path(), opts_tiny_reservation(), move |d, mut o| {
+        let store_sync = o.before_sync.take().unwrap();
+        o.before_sync = Some(Arc::new(move || {
+            store_sync()?;
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        cowfs_meta::Meta::open(d.join("meta.redb"), o)
+    })
+    .unwrap();
+    c.create_snapshot("s").unwrap();
+    let fs = c.snapshot_view("s").unwrap();
+    let before = syncs.load(Ordering::SeqCst);
+    let a = fs.create(ROOT_INO, b"f", 0o644).unwrap();
+    assert_eq!(a.ino.0 & (1 << 63), 0);
+    assert!(syncs.load(Ordering::SeqCst) > before);
+    let meta_ino = c.meta_inode(a.ino).unwrap();
+    let floor = c.meta().health().ino_floor;
+    assert!(floor > meta_ino);
+    fs.write(a.ino, 0, b"durable physical identity").unwrap();
+    c.sync().unwrap();
+    drop(fs);
+    drop(c);
     let c = Core::open(dir.path(), opts_tiny_reservation()).unwrap();
     let fs = c.snapshot_view("s").unwrap();
-    fsops::arm();
-    let r = fs.create(ROOT_INO, b"g", 0o644);
-    let trace = fsops::trace_take();
-    fsops::disarm();
-    println!("create extending the reservation -> {r:?}\ntrace: {trace:?}");
-    let _ = r;
-
-    let renamed = trace
-        .iter()
-        .position(|e| e == "virt_mark_renamed")
-        .unwrap_or_else(|| panic!("the reservation did not rewrite the mark: {trace:?}"));
-    let synced = trace
-        .iter()
-        .position(|e| e.starts_with("sync_dir:"))
-        .unwrap_or_else(|| panic!("the reservation did not sync its directory: {trace:?}"));
-    let tmp_synced = trace
-        .iter()
-        .position(|e| e.starts_with("sync_file:virt.ino"))
-        .unwrap_or_else(|| panic!("the reservation did not sync its record: {trace:?}"));
-    assert!(tmp_synced < renamed, "{trace:?}");
-    assert!(
-        renamed < synced,
-        "the mark was handed to the directory before its rename was durable: {trace:?}"
+    let reopened = fs.lookup(ROOT_INO, b"f").unwrap();
+    assert_eq!(reopened.ino, a.ino);
+    assert_eq!(
+        fs.read(a.ino, 0, 100).unwrap(),
+        b"durable physical identity"
     );
+    assert!(c.meta().health().ino_floor >= floor);
+    assert_ne!(fs.create(ROOT_INO, b"g", 0o644).unwrap().ino, a.ino);
 }
 
-/// n04 from the other side: a reservation whose directory entry cannot be durable must not hand out
-/// its numbers, or a crash right after hands the same number out twice.
 #[test]
-fn a_reservation_refuses_when_its_directory_cannot_be_made_durable() {
-    let _seam = seam();
+fn a_physical_reservation_refuses_when_metadata_cannot_be_made_durable() {
     let dir = tempfile::tempdir().unwrap();
-    {
-        let c = Core::open(dir.path(), opts_tiny_reservation()).unwrap();
-        c.create_snapshot("s").unwrap();
-        mkfile(&c.snapshot_view("s").unwrap(), ROOT_INO, "f", b"first");
-        c.sync().unwrap();
-    }
-    let c = Core::open(dir.path(), opts_tiny_reservation()).unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let flag = armed.clone();
+    let c = Core::open_with_meta(dir.path(), opts_tiny_reservation(), move |d, mut o| {
+        let store_sync = o.before_sync.take().unwrap();
+        o.before_sync = Some(Arc::new(move || {
+            if flag.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("reservation sync refused"));
+            }
+            store_sync()
+        }));
+        cowfs_meta::Meta::open(d.join("meta.redb"), o)
+    })
+    .unwrap();
+    c.create_snapshot("s").unwrap();
     let fs = c.snapshot_view("s").unwrap();
-    fsops::arm();
-    fsops::set_fault(Fault::DirSync, &dir.path().to_string_lossy(), 4);
+    armed.store(true, Ordering::SeqCst);
     let r = fs.create(ROOT_INO, b"g", 0o644);
-    fsops::disarm();
-    println!(
-        "create with a failing mark directory sync -> {:?}",
-        r.as_ref().err()
-    );
+    armed.store(false, Ordering::SeqCst);
     assert!(
         r.is_err(),
-        "a number was handed out from an unreserved counter"
+        "a number was handed out despite refused durability"
     );
+    assert!(matches!(
+        fs.lookup(ROOT_INO, b"g"),
+        Err(cowfs_vfs::Error::NotFound)
+    ));
+    let a = fs.create(ROOT_INO, b"g", 0o644).unwrap();
+    assert_eq!(a.ino.0 & (1 << 63), 0);
+    assert!(c.meta().health().ino_floor > c.meta_inode(a.ino).unwrap());
+    fs.write(a.ino, 0, b"retry survived").unwrap();
+    c.sync().unwrap();
+    drop(fs);
+    drop(c);
+    let c = Core::open(dir.path(), opts_tiny_reservation()).unwrap();
+    let fs = c.snapshot_view("s").unwrap();
+    assert_eq!(fs.lookup(ROOT_INO, b"g").unwrap().ino, a.ino);
+    assert_eq!(fs.read(a.ino, 0, 100).unwrap(), b"retry survived");
 }
 
 // ---------------------------------------------------------------- b11: the node load retry
