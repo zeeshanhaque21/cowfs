@@ -1,21 +1,23 @@
-//! Issue #40 M5: `Options::ino_block` at its extremes.
+//! Issue #40 M5: `Options::ino_block` at its extremes, through ordinary creation.
 //!
-//! `ino_block` is declared `u64` but is a durable reservation step size, and `init` clamps it to
-//! `1..=INO_LIMIT` when the file is created. Before that clamp, `ino_block = u64::MAX` panicked in
-//! debug and wrapped in release, and a caller could pass any value. This covers the two ends of
-//! the domain through the public API only:
+//! `ino_block` is the step the ordinary allocator grows the durable inode floor by, and the
+//! historical defect lived in that allocator, not in `reserve_inodes`. `Tx::alloc`
+//! (`crates/cowfs-meta/src/tx.rs`) computes `(a.next + a.block.max(1)).min(INO_LIMIT)`, and it is
+//! reached by every ordinary `create`/`mkdir`/`symlink`. With `ino_block = u64::MAX` and `next = 2`
+//! the addition overflowed: debug panicked, release wrapped. `init` now clamps the stored block
+//! with `opts.ino_block.clamp(1, INO_LIMIT)` (`crates/cowfs-meta/src/db.rs`), and that clamped value
+//! seeds `InoAlloc.block` on open.
 //!
-//! - `ino_block = 0` is clamped up to 1, so a reservation is never a silent no-op,
-//! - `ino_block = u64::MAX` is clamped down to `INO_LIMIT`, so the step never wraps or panics,
-//! - both extremes behave exactly like the value they clamp to, and a plain reopen keeps the
-//!   stored block governing, so nothing already handed out is reissued.
+//! These cases drive the clamp through the real allocator, which `reserve_inodes` never consults:
+//! it does `s.ino.next + n` and reads no block. So a reservation-only test passes with the clamp
+//! removed. Here the observable is the inode an ordinary `create` actually receives, the readback
+//! of that inode, the durable floor, and `check()`.
 //!
-//! The observables are the durable floor (`Meta::health().ino_floor`), the ranges handed back, and
-//! `check()`, not the internal field. `ino_block` is only consulted on create, so each case uses
-//! its own fresh store, and the max case must not allocate a large range: the point is the clamp,
-//! not volume.
+//! Bounds, not volume: `ino_block` is only read at create, so each case uses its own fresh store,
+//! and the maximum case intentionally exhausts the id space after the first create rather than
+//! allocating a range or iterating.
 
-use cowfs_meta::{Error, Meta, Options, INO_LIMIT, ROOT_INO};
+use cowfs_meta::{Error, FileType, Meta, Options, INO_LIMIT, ROOT_INO};
 
 fn opts_with_block(ino_block: u64) -> Options {
     Options {
@@ -27,140 +29,114 @@ fn opts_with_block(ino_block: u64) -> Options {
     }
 }
 
-/// `ino_block = 0` clamps to 1. A reservation must still advance the floor and hand out numbers,
-/// which is the behaviour a literal zero block would have destroyed.
+/// `ino_block = u64::MAX` clamps to `INO_LIMIT` at create, and the clamped value is what the
+/// ordinary allocator uses. This is the historical overflow: `alloc()` with `next = 2` and an
+/// unclamped `u64::MAX` block computed `2 + u64::MAX`, panicking in debug and wrapping in release.
+/// Nothing here touches `reserve_inodes`, so a clamp-removal mutant is caught by the first create.
 #[test]
-fn a_zero_block_is_clamped_to_one_and_still_reserves() {
+fn a_u64_max_block_is_clamped_in_the_ordinary_allocator() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.redb");
 
-    let reserved = {
-        let m = Meta::open(&path, opts_with_block(0)).unwrap();
-        // One reservation. With a literal zero block the durable floor either would not move or
-        // the arithmetic would be a no-op; the clamp to 1 makes this an ordinary reservation.
-        let r = m.reserve_inodes(5).unwrap();
-        assert_eq!(r.len(), 5);
-        assert!(r.start().0 > ROOT_INO.0, "never includes the root");
+    let (created, floor) = {
+        let m = Meta::open(&path, opts_with_block(u64::MAX)).unwrap();
+        let s = m.new_snapshot("s0").unwrap();
+
+        // The ordinary allocator path. An unclamped u64::MAX block overflows exactly here.
+        let f = s
+            .create(ROOT_INO, b"f", 0o644)
+            .expect("ordinary create under a u64::MAX block must not overflow");
+
+        assert_eq!(f.ino.0, 2, "the first ordinary inode after the root");
+        assert_eq!(f.kind, FileType::File, "a regular file was created");
+        assert!(f.ino.0 > ROOT_INO.0, "never the root");
+
+        // Read the inode back through the public lookup, so this is a real created inode and not
+        // just a successful return.
+        let back = s.lookup(ROOT_INO, b"f").unwrap();
+        assert_eq!(back.ino, f.ino, "lookup returns the created inode");
+        assert_eq!(back.kind, FileType::File);
+        assert_eq!(back.mode & 0o777, 0o644);
+
+        // The clamped block reserves the whole id space in one step. That is the honest
+        // consequence of an extreme block: the floor is at the limit, not wrapped past it.
+        let floor = m.health().ino_floor;
         assert_eq!(
-            m.health().ino_floor,
-            r.end().0,
-            "the floor is durable when the reservation returns"
+            floor, INO_LIMIT,
+            "the clamped block reserves up to INO_LIMIT, not past it"
         );
-        m.check().expect("check after a zero-block reservation");
+        m.check()
+            .expect("check after an ordinary create under u64::MAX");
         m.sync().unwrap();
-        r
+        (f.ino, floor)
     };
 
-    // Nothing reserved comes back, on the same store after a reopen.
-    let m = Meta::open(&path, opts_with_block(0)).unwrap();
-    let after = m.reserve_inodes(5).unwrap();
-    assert!(
-        after.start().0 >= reserved.end().0,
-        "reopen must resume at or above {}: got {}",
-        reserved.end().0,
-        after.start().0
+    // Drop every handle, then reopen: the floor is persisted, and the id space the extreme block
+    // reserved is genuinely gone, so the next ordinary create is refused honestly.
+    let m = Meta::open(&path, opts_with_block(4)).unwrap();
+    assert_eq!(
+        m.health().ino_floor,
+        floor,
+        "the reserved floor survives a reopen"
     );
+    let s = m.new_snapshot("s1").unwrap();
+    let e = s
+        .create(ROOT_INO, b"g", 0o644)
+        .expect_err("a fully reserved id space must be refused, not wrapped into");
     assert!(
-        !after.iter().any(|i| reserved.contains(i)),
-        "no number from the first reservation is reissued"
+        matches!(e, Error::LimitExceeded(_)),
+        "space exhaustion is LimitExceeded, got {e:?}"
     );
+
+    // The first inode is not reissued and remains readable.
+    let back = s.lookup(ROOT_INO, b"f").unwrap();
+    assert_eq!(back.ino, created, "the created inode is not reused");
     m.check().expect("check after reopen");
 }
 
-/// `ino_block = u64::MAX` clamps to `INO_LIMIT`. It must not panic (debug) or wrap (release), must
-/// hand out numbers with a floor that never exceeds the limit, and must stay correct across a
-/// reopen with the stored block governing.
-///
-/// This is the case the audit found missing: the old failure was an arithmetic overflow on this
-/// value, and nothing drove it.
+/// `ino_block = 0` must not break ordinary creation. Note `alloc()` already writes
+/// `block.max(1)`, so a literal zero is bounded locally even without the `Options` clamp; this case
+/// is branch and bounds coverage for the zero end, not a load-bearing clamp-removal claim.
 #[test]
-fn a_u64_max_block_is_clamped_and_never_overflows_or_panics() {
+fn a_zero_block_still_creates_with_a_valid_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.redb");
 
-    let reserved = {
-        // The clamp runs at create. If it did not, this call or the reservation below would
-        // overflow or panic; that is exactly what this case rejects.
-        let m = Meta::open(&path, opts_with_block(u64::MAX)).unwrap();
+    let first = {
+        let m = Meta::open(&path, opts_with_block(0)).unwrap();
+        let s = m.new_snapshot("s0").unwrap();
+        let f = s
+            .create(ROOT_INO, b"f", 0o644)
+            .expect("ordinary create under a zero block");
+        assert_eq!(f.ino.0, 2);
+        assert_eq!(f.kind, FileType::File);
 
-        let floor_before = m.health().ino_floor;
-        let r = m.reserve_inodes(3).unwrap();
-        assert_eq!(r.len(), 3, "a normal small request is honoured");
-        assert!(r.start().0 > ROOT_INO.0, "never includes the root");
-
-        let floor = m.health().ino_floor;
-        assert!(
-            floor <= INO_LIMIT,
-            "the floor must never exceed INO_LIMIT ({INO_LIMIT}), got {floor}"
-        );
-        assert!(
-            floor >= r.end().0,
-            "the floor covers the reserved end {}: got {floor}",
-            r.end().0
-        );
-        assert!(
-            floor >= floor_before,
-            "the floor only moves up: {floor_before} -> {floor}"
-        );
-        m.check().expect("check after a u64::MAX-block reservation");
+        let back = s.lookup(ROOT_INO, b"f").unwrap();
+        assert_eq!(back.ino, f.ino);
+        assert_eq!(back.kind, FileType::File);
+        m.check().expect("check after a zero-block create");
         m.sync().unwrap();
-        r
+        f.ino
     };
 
-    // The stored block governs on reopen: a caller passing a small block now must not change the
-    // allocator, and no number already handed out comes back.
-    let m = Meta::open(&path, opts_with_block(4)).unwrap();
+    // Reopen: the second ordinary inode is fresh, not a collision with the first.
+    let m = Meta::open(&path, opts_with_block(0)).unwrap();
+    let s = m.new_snapshot("s1").unwrap();
+    let f2 = s.create(ROOT_INO, b"g", 0o644).unwrap();
     assert!(
-        m.health().recoveries == 0,
-        "no rollback happened, so no recovery was recorded"
+        f2.ino.0 > first.0,
+        "a new ordinary inode must not collide: got {} after {}",
+        f2.ino.0,
+        first.0
     );
-    let after = m.reserve_inodes(1).unwrap();
-    assert!(
-        after.start().0 >= reserved.end().0,
-        "reopen must resume at or above {}: got {}",
-        reserved.end().0,
-        after.start().0
-    );
-    assert!(
-        after.start().0 <= INO_LIMIT,
-        "no number at or above INO_LIMIT is ever handed out"
-    );
-    m.check()
-        .expect("check after reopen with a different block");
+    m.check().expect("check after a zero-block reopen");
 }
 
-/// A request larger than the space left below `INO_LIMIT` is refused, not clamped to a fraction and
-/// not allowed to wrap, under a max-clamped block. This pins the interaction between the extreme
-/// block and the `LimitExceeded` guard the ordinary tests already cover at a small block.
+/// The default block is the control: an ordinary create yields a valid file, the next id is not a
+/// collision, and the floor persists across a reopen. This shows the extreme cases are the two ends
+/// of a range, not the whole behaviour collapsing to one end.
 #[test]
-fn a_max_clamped_block_still_refuses_a_request_past_the_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("m.redb");
-    let m = Meta::open(&path, opts_with_block(u64::MAX)).unwrap();
-
-    // Ask for more than the whole domain. It must be refused and write nothing, not panic.
-    let e = m.reserve_inodes(u64::MAX).unwrap_err();
-    assert!(
-        matches!(e, Error::LimitExceeded(_)),
-        "a request past the limit must be LimitExceeded, got {e:?}"
-    );
-    assert_eq!(
-        m.health().ino_floor,
-        2,
-        "a refused request leaves the fresh floor untouched"
-    );
-
-    // A normal request right after still works, so the refusal did not wedge the allocator.
-    let r = m.reserve_inodes(2).unwrap();
-    assert_eq!(r.len(), 2);
-    m.check().expect("check after a refused max request");
-}
-
-/// The default block is untouched by the clamping cases: it behaves like an ordinary step, so the
-/// clamp is not accidentally collapsing every value to one end. This is the control for the two
-/// extreme cases above.
-#[test]
-fn the_default_block_is_a_normal_step() {
+fn the_default_block_creates_valid_files_and_persists() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.redb");
     let default_block = Options::default().ino_block;
@@ -169,14 +145,56 @@ fn the_default_block_is_a_normal_step() {
         "the default must already be inside the clamp: {default_block}"
     );
 
-    let m = Meta::open(&path, opts_with_block(default_block)).unwrap();
-    let first = m.reserve_inodes(1).unwrap();
-    assert!(first.start().0 > ROOT_INO.0);
+    let first = {
+        let m = Meta::open(&path, opts_with_block(default_block)).unwrap();
+        let s = m.new_snapshot("s0").unwrap();
+        let f = s.create(ROOT_INO, b"f", 0o644).unwrap();
+        assert_eq!(f.ino.0, 2);
+        assert_eq!(f.kind, FileType::File);
+        assert_eq!(s.lookup(ROOT_INO, b"f").unwrap().ino, f.ino);
+        assert!(
+            m.health().ino_floor >= f.ino.0,
+            "the floor covers the created inode"
+        );
+        m.check().expect("check under the default block");
+        m.sync().unwrap();
+        f.ino
+    };
 
-    let second = m.reserve_inodes(1).unwrap();
+    let m = Meta::open(&path, opts_with_block(default_block)).unwrap();
+    let s = m.new_snapshot("s1").unwrap();
+    let f2 = s.create(ROOT_INO, b"g", 0o644).unwrap();
     assert!(
-        second.start().0 >= first.end().0,
-        "no reuse under the default block"
+        f2.ino.0 > first.0,
+        "no collision across a reopen: got {} after {}",
+        f2.ino.0,
+        first.0
     );
-    m.check().expect("check under the default block");
+    m.check()
+        .expect("check under the default block after reopen");
+}
+
+/// A single ordinary create must never hand back `INO_LIMIT` or the root, under either extreme.
+/// This pins the boundary the allocator's `.min(INO_LIMIT)` and the root exclusion enforce, so an
+/// extreme block cannot leak an illegal id into ordinary use.
+#[test]
+fn ordinary_creation_never_returns_the_root_or_the_limit() {
+    for block in [0u64, 1, 4, u64::MAX] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+        let m = Meta::open(&path, opts_with_block(block)).unwrap();
+        let s = m.new_snapshot("s0").unwrap();
+        let f = s.create(ROOT_INO, b"f", 0o644).unwrap();
+        assert!(
+            f.ino.0 > ROOT_INO.0,
+            "block {block}: never the root, got {}",
+            f.ino.0
+        );
+        assert!(
+            f.ino.0 < INO_LIMIT,
+            "block {block}: never INO_LIMIT, got {}",
+            f.ino.0
+        );
+        m.check().expect("check under an extreme block");
+    }
 }
