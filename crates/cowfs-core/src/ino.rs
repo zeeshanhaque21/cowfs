@@ -99,8 +99,16 @@ impl Aliases {
 
     pub(crate) fn insert(&mut self, virt: Ino, snap: u64, m: u64) {
         self.fwd.insert(virt, m);
+        // The reverse map is a bridge from a meta inode to the *different* number a caller holds.
+        // A reservation-backed create hands out the packed meta number itself, so `virt` is already
+        // canonical and a reverse entry would be `pm -> pm`. `canon` reads this map and `load_node`
+        // reloads through its result, so a self-map makes that reload recurse into itself forever.
+        // Leave the forward entry (the alias count and `meta_of` need it); the reverse lookup is a
+        // miss, and `Inner::canon` falls through to `pack`, which is the same number.
         if let Ok(pm) = pack(snap, m) {
-            self.rev.insert(pm, virt);
+            if pm != virt {
+                self.rev.insert(pm, virt);
+            }
         }
     }
 
@@ -312,5 +320,56 @@ mod tests {
         a.remove(v);
         assert_eq!(a.len(), 0);
         assert_eq!(a.canon(2, 40), None);
+    }
+
+    /// The reserved-create regression: `commit_batch` aliases every committed create by its packed
+    /// meta number, which for a reservation-backed create is the number the caller already holds, so
+    /// `insert` was called with `virt == pack(snap, m)`. The reverse map then held `pm -> pm`, and
+    /// `load_node` reloads through `canon`, so an uncached node recursed forever and aborted the
+    /// process. A physical self-alias must make `canon` miss (the caller of `canon`, `Inner::canon`,
+    /// then falls through to `pack`, the same number) while the forward map still carries the entry.
+    #[test]
+    fn a_physical_self_alias_does_not_create_a_reverse_self_map() {
+        let mut a = Aliases::default();
+        let pm = pack(2, 40).unwrap();
+        a.insert(pm, 2, 40);
+        // the forward map is the alias count and the `meta_of` bridge; it must be there
+        assert_eq!(a.meta_of(pm), Some(40));
+        assert_eq!(a.len(), 1, "the live inode still counts one alias");
+        // the reverse lookup must NOT return the same number it was asked about, or the reload
+        // through `canon` never terminates
+        assert_eq!(
+            a.canon(2, 40),
+            None,
+            "a physical number must not be its own reverse alias"
+        );
+        // a different meta inode is unaffected
+        assert_eq!(a.canon(2, 41), None);
+        // removal frees the one entry, and the absent reverse entry is not resurrected
+        a.remove(pm);
+        assert_eq!(a.len(), 0);
+        assert_eq!(a.meta_of(pm), None);
+    }
+
+    /// The forward-only physical entry must coexist with a genuine virtual bridge in the same table,
+    /// so a later legacy number does not resurrect the self-map and a physical removal does not drop
+    /// the virtual entry's reverse bridge.
+    #[test]
+    fn a_physical_self_alias_does_not_disturb_a_virtual_bridge() {
+        let mut a = Aliases::default();
+        let v = virt(2, 1).unwrap();
+        a.insert(v, 2, 40);
+        let pm = pack(2, 40).unwrap();
+        // the same meta inode seen under its physical number is the shape a reservation create makes
+        a.insert(pm, 2, 40);
+        assert_eq!(a.canon(2, 40), Some(v), "the virtual bridge still resolves");
+        assert_eq!(a.len(), 2, "both aliases are live");
+        a.remove(v);
+        assert_eq!(
+            a.canon(2, 40),
+            None,
+            "after the virtual alias is gone only the physical number is left, no bridge"
+        );
+        assert_eq!(a.len(), 1);
     }
 }
