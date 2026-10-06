@@ -25,6 +25,14 @@ pub struct Tx<'a> {
     pub(crate) src: &'a dyn NodeSource,
     pub(crate) ino: &'a mut InoAlloc,
     pub(crate) reserve: &'a dyn Fn(u64) -> Result<()>,
+    /// Identity of the store this transaction runs against, compared with a [`ReservedIno`]'s.
+    pub(crate) store: u64,
+    /// The session's outstanding reserved numbers. A selected create is admitted only for a number
+    /// in here, which is what refuses a ticket from another store or a closed session.
+    pub(crate) reserved: &'a HashSet<Ino>,
+    /// Numbers already spent inside this one transaction, so a batch cannot create two inodes at
+    /// the same reserved number.
+    pub(crate) spent: &'a mut HashSet<Ino>,
     pub(crate) now: Timestamp,
 }
 
@@ -215,6 +223,64 @@ impl Tx<'_> {
         Ok(rec.attr(ino))
     }
 
+    /// [`Tx::new_child`], but at a number taken from a reservation instead of a fresh allocation.
+    ///
+    /// The number comes only from `ticket`, a [`ReservedIno`] this store's session minted and has
+    /// not spent. `ticket.store` must equal this transaction's store and `ticket.ino` must be in the
+    /// session's outstanding set, so a ticket from another store or a session that has closed is
+    /// refused. The number is then spent once: the inode record must not already exist, and a second
+    /// create at the same number in this transaction is refused.
+    fn new_child_at(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        kind: FileType,
+        mode: u32,
+        target: Option<&[u8]>,
+        ticket: &ReservedIno,
+    ) -> Result<Attr> {
+        validate_name(name)?;
+        if ticket.store != self.store {
+            return Err(Error::Invalid(
+                "reserved number belongs to a different store",
+            ));
+        }
+        let ino = ticket.ino;
+        if !self.reserved.contains(&ino) {
+            return Err(Error::Invalid(
+                "reserved number was not issued by this store's open session",
+            ));
+        }
+        if self.spent.contains(&ino) {
+            return Err(Error::Exists);
+        }
+        read::dir_inode(self, dir)?;
+        if read::entry(self, dir, name)?.is_some() {
+            return Err(Error::Exists);
+        }
+        if read::inode(self, ino).is_ok() {
+            return Err(Error::Exists);
+        }
+        if let Some(t) = target {
+            if t.is_empty() {
+                return Err(Error::Invalid("empty symlink target"));
+            }
+            if t.len() > SYMLINK_MAX {
+                return Err(Error::TooBig);
+            }
+        }
+        let mut rec = self.new_rec(kind, mode, dir);
+        let delta = i64::from(kind == FileType::Dir);
+        if let Some(t) = target {
+            rec.size = t.len() as u64;
+            self.put(key(ino, K_LINK, &[]), t.to_vec())?;
+        }
+        self.put_inode(ino, &rec)?;
+        self.add_entry(dir, name, ino, kind, delta)?;
+        self.spent.insert(ino);
+        Ok(rec.attr(ino))
+    }
+
     /// The time every inode this transaction touches is stamped with.
     ///
     /// Defaults to the wall clock at the moment the transaction opened, which is what a caller that
@@ -242,6 +308,43 @@ impl Tx<'_> {
     /// Creates a symbolic link holding `target`.
     pub fn symlink(&mut self, dir: Ino, name: &[u8], target: &[u8]) -> Result<Attr> {
         self.new_child(dir, name, FileType::Symlink, 0o777, Some(target))
+    }
+
+    /// Creates an empty regular file at a number taken from a reservation.
+    ///
+    /// The number is `ticket`'s, which only a reservation on this same open store minted. Refused if
+    /// the ticket is foreign, already spent, or names an inode that already exists.
+    pub fn create_at(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        mode: u32,
+        ticket: &ReservedIno,
+    ) -> Result<Attr> {
+        self.new_child_at(dir, name, FileType::File, mode, None, ticket)
+    }
+
+    /// Creates an empty directory at a number taken from a reservation. See [`Tx::create_at`].
+    pub fn mkdir_at(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        mode: u32,
+        ticket: &ReservedIno,
+    ) -> Result<Attr> {
+        self.new_child_at(dir, name, FileType::Dir, mode, None, ticket)
+    }
+
+    /// Creates a symbolic link holding `target`, at a number taken from a reservation. See
+    /// [`Tx::create_at`].
+    pub fn symlink_at(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        target: &[u8],
+        ticket: &ReservedIno,
+    ) -> Result<Attr> {
+        self.new_child_at(dir, name, FileType::Symlink, 0o777, Some(target), ticket)
     }
 
     /// Adds another name for a file or symlink. Directories cannot be hardlinked.

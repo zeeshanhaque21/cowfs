@@ -26,6 +26,9 @@ pub(crate) enum Op {
         name: Box<[u8]>,
         mode: u32,
         child: Ino,
+        /// The reservation ticket this create's number came from, spent when the create reaches
+        /// meta. `None` for a create replayed from a store written before reservations existed.
+        reserved: Option<cowfs_meta::ReservedIno>,
         what: Create,
     },
     Link {

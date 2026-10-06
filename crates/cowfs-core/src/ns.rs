@@ -165,6 +165,12 @@ impl Inner {
         if parent == ROOT_INO {
             return Err(Error::ReadOnly);
         }
+        // Reserve before any Core lock: the refill opens a meta reservation, and no lock of ours
+        // may be held across a meta transaction. A ticket popped and then unused (an early
+        // `Exists`/`NotFound` below) is wasted, never reused.
+        let ticket = self.take_reserved()?;
+        let snap = snap_of(parent).ok_or(Error::Stale)?;
+        let ino = pack(snap, ticket.ino().0)?;
         let (sc, pn) = self.dir(parent)?;
         let _ns = sc.ns.lk();
         if pn.st.rd().attr.nlink == 0 {
@@ -174,7 +180,6 @@ impl Inner {
             return Err(Error::Exists);
         }
         let now = Timestamp::now();
-        let ino = self.alloc_virt(sc.id)?;
         let (kind, nlink, size, target, mode) = match &what {
             Create::File => (FileKind::Regular, 1, 0, None, mode & MODE_MASK),
             Create::Dir => (FileKind::Directory, 2, 0, None, mode & MODE_MASK),
@@ -219,6 +224,7 @@ impl Inner {
                 name: name.into(),
                 mode,
                 child: ino,
+                reserved: Some(ticket),
                 what,
             };
             let s = q.push(op, &[&pn, &node], &[&pn, &node]);

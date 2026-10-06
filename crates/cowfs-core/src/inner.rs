@@ -18,6 +18,10 @@ use crate::node::{Node, NodeState};
 use crate::queue::{Batch, Create, Op, SnapCtx};
 use crate::util::{MutexExt, RwExt, ShardMap, SHARDS};
 
+/// How many reserved inode tickets one meta reservation covers. A create pops one, so a refill
+/// happens once per this many creates and each refill is one durable meta reservation.
+pub(crate) const RESERVED_BLOCK: u64 = 1 << 16;
+
 /// Tuning knobs for [`Core::open`](crate::Core::open). See `docs/v1-core.md` for the exact
 /// durability and loss bounds they control.
 #[derive(Clone, Debug)]
@@ -183,6 +187,11 @@ pub(crate) struct Inner {
     /// a number an earlier session used.
     pub(crate) virt_reserved: AtomicU64,
     pub(crate) virt_lock: Mutex<()>,
+    /// Tickets minted from a [`cowfs_meta::Meta::reserve_tickets`] batch and not yet spent by a
+    /// create. A create pops one here; the pool refills a block ahead so a create does not hold a
+    /// Core lock while meta's writer lock is taken. Numbers in a popped-but-unused ticket are
+    /// wasted, never reused.
+    pub(crate) reserved: Mutex<Vec<cowfs_meta::ReservedIno>>,
     pub(crate) dirty_bytes: AtomicUsize,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
@@ -282,6 +291,28 @@ impl Inner {
         crate::ino::write_virt_mark(&self.root, new).map_err(|e| crate::error::from_io(&e))?;
         self.virt_reserved.store(new, Ordering::Release);
         Ok(())
+    }
+
+    /// One reserved ticket for a create, refilling the pool in blocks.
+    ///
+    /// Takes no snapshot lock: a caller reserves before it takes `sc.ns`. A refill opens a meta
+    /// reservation, which no Core lock may be held across.
+    pub(crate) fn take_reserved(&self) -> Result<cowfs_meta::ReservedIno> {
+        {
+            let mut pool = self.reserved.lk();
+            if let Some(t) = pool.pop() {
+                return Ok(t);
+            }
+        }
+        let block = self
+            .meta
+            .reserve_tickets(RESERVED_BLOCK)
+            .map_err(from_meta)?;
+        let mut pool = self.reserved.lk();
+        let mut it = block.into_iter();
+        let first = it.next().ok_or(Error::NoSpace)?;
+        pool.extend(it);
+        Ok(first)
     }
 
     /// Test seam: report that the next node-table insertion for `ino` lost its race, up to the
@@ -794,8 +825,13 @@ impl Inner {
             Ok(created) => {
                 {
                     let mut al = self.aliases.wr();
+                    // Only a virtual child needs the bridge to its meta number. A create at a
+                    // reserved number already holds the packed meta number, so aliasing it would be
+                    // a self-entry that inflates the table and counts against the alias ceiling.
                     for (v, m) in &created {
-                        al.insert(*v, sc.id, *m);
+                        if matches!(classify(*v), Id::Virt { .. }) {
+                            al.insert(*v, sc.id, *m);
+                        }
                     }
                 }
                 sc.flushed.store(batch.seq, Ordering::Release);
@@ -946,6 +982,7 @@ impl Inner {
                         name,
                         mode,
                         child,
+                        reserved,
                         what,
                     } => {
                         if b.elided.contains(child) {
@@ -953,10 +990,15 @@ impl Inner {
                         }
                         stamp(tx, *child);
                         let p = resolve(*parent, &newly)?;
-                        let a = match what {
-                            Create::File => tx.create(p, name, *mode)?,
-                            Create::Dir => tx.mkdir(p, name, *mode)?,
-                            Create::Symlink(t) => tx.symlink(p, name, t)?,
+                        let a = match (reserved, what) {
+                            (Some(ticket), Create::File) => tx.create_at(p, name, *mode, ticket)?,
+                            (Some(ticket), Create::Dir) => tx.mkdir_at(p, name, *mode, ticket)?,
+                            (Some(ticket), Create::Symlink(t)) => {
+                                tx.symlink_at(p, name, t, ticket)?
+                            }
+                            (None, Create::File) => tx.create(p, name, *mode)?,
+                            (None, Create::Dir) => tx.mkdir(p, name, *mode)?,
+                            (None, Create::Symlink(t)) => tx.symlink(p, name, t)?,
                         };
                         newly.insert(*child, a.ino.0);
                     }

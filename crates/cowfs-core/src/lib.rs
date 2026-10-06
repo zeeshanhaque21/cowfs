@@ -243,6 +243,7 @@ impl Core {
             next_virt: AtomicU64::new(mark),
             virt_reserved: AtomicU64::new(mark),
             virt_lock: Mutex::new(()),
+            reserved: Mutex::new(Vec::new()),
             dirty_bytes: AtomicUsize::new(0),
             uid: md.uid(),
             gid: md.gid(),

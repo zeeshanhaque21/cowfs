@@ -433,6 +433,7 @@ that takes a lock is not listed here.
 | `inner::all_snaps` | leaf | 1 |
 | `inner::alloc_virt` | aliases, last_error | leaf |
 | `inner::reserve_virt` | virt_lock | leaf |
+| `inner::take_reserved` | reserved | leaf |
 | `inner::lose_the_next_insert` | leaf | 1 |
 | `inner::meta_of` | aliases | leaf |
 | `inner::canon` | aliases | leaf |
