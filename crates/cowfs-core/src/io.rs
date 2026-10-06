@@ -85,12 +85,16 @@ impl Inner {
                 break;
             }
         }
-        let now = Timestamp::now();
+        #[cfg(test)]
+        park_if_armed();
         {
             let mut st = node.st.wr();
             if let Some(e) = node.poisoned() {
                 return Err(e);
             }
+            // read under the node lock: a writer that parks here applies after, so its clock must be
+            // its own application point rather than a reading taken before the wait
+            let now = clock_read(&st);
             let NodeState { attr, file, .. } = &mut *st;
             let Some(f) = file.as_mut() else {
                 return Err(Error::Stale);
@@ -475,5 +479,227 @@ impl Inner {
             files_free: FILES.saturating_sub(net),
             name_max: NAME_MAX as u32,
         })
+    }
+}
+
+/// A rendezvous one writer can park at, so a test can impose an interleaving the scheduler will not
+/// produce on its own. Built only for this crate's own tests, like `Gate::set_fault`.
+///
+/// Thread-scoped, not process-global: a writer arms it on its own thread, so two tests running in
+/// parallel cannot park each other's writers. What the test and the writer share is the `Arc`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ClockGate {
+    /// A writer has reached the boundary, so the test can write as the second writer.
+    parked: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+    /// A writer already parked on this thread, so a second one does not queue behind it.
+    taken: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl ClockGate {
+    /// Arms this gate for the calling thread, so the writer that parks and the test that releases
+    /// it are looking at one gate.
+    pub(crate) fn arm(self: &Arc<Self>) {
+        ARMED.with(|c| *c.borrow_mut() = Some(Arc::clone(self)));
+    }
+
+    /// True once a writer has reached the boundary.
+    pub(crate) fn parked(&self) -> bool {
+        self.parked.load(Ordering::Acquire)
+    }
+
+    /// Lets the parked writer continue.
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ARMED: std::cell::RefCell<Option<Arc<ClockGate>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Parks the calling thread at the `op_write` pre-node-lock boundary, if this thread armed a gate.
+///
+/// The boundary is reached holding no node lock, so a second writer is never blocked behind this one
+/// and cannot deadlock against it. The wait is bounded: a test that never releases fails with a
+/// message rather than hanging.
+#[cfg(test)]
+fn park_if_armed() {
+    let Some(g) = ARMED.with(|c| c.borrow().clone()) else {
+        return;
+    };
+    if g.taken.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    g.parked.store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !g.released.load(Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked op_write writer was never released"
+        );
+        std::thread::yield_now();
+    }
+    ARMED.with(|c| *c.borrow_mut() = None);
+}
+
+/// The wall clock for one `op_write`, taken while the caller holds this node's write guard.
+///
+/// Taking the guard as an argument is what makes the ordering checkable rather than merely
+/// documented: `op_write` cannot call this without holding `node.st.wr()`, so a reading taken above
+/// the lock is a compile error here rather than a silent regression. The guard is only borrowed to
+/// witness that, and is not otherwise read, so a production build's clock read is exactly the call
+/// it always was.
+#[cfg(not(test))]
+#[inline]
+fn clock_read(_guard: &std::sync::RwLockWriteGuard<'_, NodeState>) -> Timestamp {
+    Timestamp::now()
+}
+
+/// Test twin of [`clock_read`].
+///
+/// It counts the readings this thread took while holding a node write guard, so the test can assert
+/// the clock really is read inside the critical section rather than beside it.
+/// The guard argument is not inspected: this is a counter, not a lock-liveness probe, and the part that
+/// makes the ordering unbreakable is that `clock_read` requires a live write guard to be called at all,
+/// which is a compile-time property rather than a runtime claim.
+#[cfg(test)]
+#[inline]
+fn clock_read(_guard: &std::sync::RwLockWriteGuard<'_, NodeState>) -> Timestamp {
+    let now = Timestamp::now();
+    READS_UNDER_GUARD.with(|c| c.set(c.get() + 1));
+    now
+}
+
+/// How many `op_write` clock readings this thread took while holding a node write guard.
+#[cfg(test)]
+fn reads_under_guard() -> usize {
+    READS_UNDER_GUARD.with(|c| c.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    static READS_UNDER_GUARD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod clock_order_tests {
+    use super::*;
+    use crate::Core;
+    use cowfs_vfs::Vfs;
+    use std::time::{Duration, Instant};
+
+    /// Applied second, having reached the boundary first.
+    const SECOND: &[u8] = b"BBBBBBBB";
+    /// Applied last, having reached the boundary first.
+    const LAST: &[u8] = b"AAAAAAAA";
+
+    fn opts() -> crate::Options {
+        crate::Options {
+            background: false,
+            ..Default::default()
+        }
+    }
+
+    /// `op_write` must read its clock after it holds the node write lock, so a writer's `ctime` is its
+    /// own application point. The gate forces the interleaving that breaks it: the first writer to
+    /// reach the boundary parks there holding no node lock, the test writes as the second writer, and
+    /// the parked writer then applies last.
+    ///
+    /// Content linearizes by application order, so the last writer's bytes must be the durable bytes.
+    /// `ctime` must not move backwards past a value a client already read, and the durable `ctime`
+    /// after a flush, a drop and a reopen must equal the final cached one exactly.
+    ///
+    /// The ordering is imposed by the rendezvous, not by a clock step: both clock readings come from
+    /// the host clock, microseconds apart. Nothing here claims the host clock is monotonic.
+    #[test]
+    fn ctime_does_not_move_backwards_when_the_first_writer_applies_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Arc::new(Core::open(dir.path(), opts()).unwrap());
+        c.create_snapshot("s").unwrap();
+        let v = c.snapshot_view("s").unwrap();
+        let f = v.create(ROOT_INO, b"f", 0o644).unwrap().ino;
+        c.flush().unwrap();
+
+        // the writer that reaches the boundary first, and parks on it: it arms the gate on its own
+        // thread, which is what keeps a second test's writers out of it
+        let gate = Arc::new(ClockGate::default());
+        let cg = Arc::clone(&gate);
+        let ca = Arc::clone(&c);
+        let a = std::thread::spawn(move || {
+            cg.arm();
+            let va = ca.snapshot_view("s").unwrap();
+            let n = va
+                .write(f, 0, LAST)
+                .expect("the parked writer's write applies");
+            assert_eq!(n as usize, LAST.len());
+            (va.getattr(f).unwrap().ctime, reads_under_guard())
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !gate.parked() {
+            assert!(
+                Instant::now() < deadline,
+                "no writer reached the op_write boundary, so this run proves nothing"
+            );
+            std::thread::yield_now();
+        }
+
+        // the second writer, on a thread that armed no gate, so it is not parked
+        v.write(f, 0, SECOND).expect("the second write applies");
+        let after_second = v.getattr(f).unwrap().ctime;
+
+        gate.release();
+        let (a_reported, reads_under_guard) = a.join().expect("the parked writer did not panic");
+
+        // The parked writer's clock reading happened while it held the node write guard, not beside
+        // it. `clock_read` cannot be called without a live guard, so this is the mechanical half of
+        // the property; the assertions below are the behavioural half.
+        assert_eq!(
+            reads_under_guard, 1,
+            "the writer's clock reading must be taken while it holds the node write guard"
+        );
+
+        let final_cached = v.getattr(f).unwrap().ctime;
+        let final_bytes = v.read(f, 0, 8).unwrap();
+        assert_eq!(
+            final_bytes, LAST,
+            "content must linearize by application order, and the parked writer applied last"
+        );
+        assert!(
+            final_cached >= after_second,
+            "the cached ctime moved backwards: {final_cached:?} is earlier than the {after_second:?} \
+             a client had already observed"
+        );
+        assert!(
+            a_reported >= after_second,
+            "the writer that applied last reported an older ctime: {a_reported:?}"
+        );
+
+        c.flush().unwrap();
+        drop(v);
+        drop(c);
+        let c2 = Arc::new(Core::open(dir.path(), opts()).unwrap());
+        let v2 = c2.snapshot_view("s").unwrap();
+        let reopened = v2.lookup(ROOT_INO, b"f").unwrap();
+        assert_eq!(
+            v2.read(reopened.ino, 0, 8).unwrap(),
+            LAST,
+            "the durable bytes must be the last writer's"
+        );
+        assert_eq!(
+            reopened.ctime, final_cached,
+            "the durable ctime must equal the final cached ctime"
+        );
+        assert!(
+            reopened.ctime >= after_second,
+            "the durable ctime moved backwards: {:?} is earlier than {:?}",
+            reopened.ctime,
+            after_second
+        );
     }
 }
