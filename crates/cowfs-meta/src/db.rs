@@ -2508,8 +2508,9 @@ mod tests {
         drop(s);
         drop(m);
         let again = Meta::open(dir.path().join("m.redb"), opts_durable()).unwrap();
+        let reopened = again.snapshot_by_id(SnapshotId(1)).unwrap();
         assert!(
-            matches!(again.getattr(want), Err(Error::NotFound)),
+            matches!(reopened.getattr(want), Err(Error::NotFound)),
             "the pre-persist failure left an inode behind across a reopen"
         );
         again.check().unwrap();
