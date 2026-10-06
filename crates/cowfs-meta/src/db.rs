@@ -2431,9 +2431,8 @@ mod tests {
             failed.is_err(),
             "the batch was expected to fail: {failed:?}"
         );
-        assert_eq!(
-            s.getattr(want),
-            Err(Error::NotFound),
+        assert!(
+            matches!(s.getattr(want), Err(Error::NotFound)),
             "the failed batch must have left no inode"
         );
 
@@ -2496,9 +2495,15 @@ mod tests {
             "the durable commit was expected to fail: {failed:?}"
         );
 
-        // the create did persist, so the inode is there and the retry cannot make a second one
-        s.getattr(want)
+        // the create did persist, so the inode is there at the same number and the retry cannot
+        // make a second one
+        let got = s
+            .getattr(want)
             .expect("the persisted create must be visible");
+        assert_eq!(
+            got.ino, want,
+            "the persisted create is not at the reserved number"
+        );
         let retry = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
         assert!(
             retry.is_err(),
