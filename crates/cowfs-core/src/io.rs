@@ -94,7 +94,7 @@ impl Inner {
             }
             // read under the node lock: a writer that parks here applies after, so its clock must be
             // its own application point rather than a reading taken before the wait
-            let now = Timestamp::now();
+            let now = clock_read(&st);
             let NodeState { attr, file, .. } = &mut *st;
             let Some(f) = file.as_mut() else {
                 return Err(Error::Stale);
@@ -547,6 +547,45 @@ fn park_if_armed() {
     ARMED.with(|c| *c.borrow_mut() = None);
 }
 
+/// The wall clock for one `op_write`, taken while the caller holds this node's write guard.
+///
+/// Taking the guard as an argument is what makes the ordering checkable rather than merely
+/// documented: `op_write` cannot call this without holding `node.st.wr()`, so a reading taken above
+/// the lock is a compile error here rather than a silent regression. The guard is only borrowed to
+/// witness that, and is not otherwise read, so a production build's clock read is exactly the call
+/// it always was.
+#[cfg(not(test))]
+#[inline]
+fn clock_read(_guard: &std::sync::RwLockWriteGuard<'_, NodeState>) -> Timestamp {
+    Timestamp::now()
+}
+
+/// Test twin of [`clock_read`].
+///
+/// It counts the readings this thread took while holding a node write guard, so the test can assert
+/// the clock really is read inside the critical section rather than beside it.
+/// The guard argument is not inspected: this is a counter, not a lock-liveness probe, and the part that
+/// makes the ordering unbreakable is that `clock_read` requires a live write guard to be called at all,
+/// which is a compile-time property rather than a runtime claim.
+#[cfg(test)]
+#[inline]
+fn clock_read(_guard: &std::sync::RwLockWriteGuard<'_, NodeState>) -> Timestamp {
+    let now = Timestamp::now();
+    READS_UNDER_GUARD.with(|c| c.set(c.get() + 1));
+    now
+}
+
+/// How many `op_write` clock readings this thread took while holding a node write guard.
+#[cfg(test)]
+fn reads_under_guard() -> usize {
+    READS_UNDER_GUARD.with(|c| c.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    static READS_UNDER_GUARD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod clock_order_tests {
     use super::*;
@@ -598,7 +637,7 @@ mod clock_order_tests {
                 .write(f, 0, LAST)
                 .expect("the parked writer's write applies");
             assert_eq!(n as usize, LAST.len());
-            va.getattr(f).unwrap().ctime
+            (va.getattr(f).unwrap().ctime, reads_under_guard())
         });
 
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -615,7 +654,15 @@ mod clock_order_tests {
         let after_second = v.getattr(f).unwrap().ctime;
 
         gate.release();
-        let a_reported = a.join().expect("the parked writer did not panic");
+        let (a_reported, reads_under_guard) = a.join().expect("the parked writer did not panic");
+
+        // The parked writer's clock reading happened while it held the node write guard, not beside
+        // it. `clock_read` cannot be called without a live guard, so this is the mechanical half of
+        // the property; the assertions below are the behavioural half.
+        assert_eq!(
+            reads_under_guard, 1,
+            "the writer's clock reading must be taken while it holds the node write guard"
+        );
 
         let final_cached = v.getattr(f).unwrap().ctime;
         let final_bytes = v.read(f, 0, 8).unwrap();
