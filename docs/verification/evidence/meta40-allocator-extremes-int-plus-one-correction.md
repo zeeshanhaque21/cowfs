@@ -9,16 +9,15 @@ Run `37531555084`, `check` (Ubuntu, macOS), `cargo clippy --workspace --all-targ
 error: unnecessary `>= y + 1` or `x - 1 >=`
   --> crates/cowfs-meta/tests/allocation_option_extremes.rs:85:9
 85 |         floor >= created.0 + 1,
-   |         ----------------------- help: change it to: `floor > created.0`
+   |         help: change it to: `floor > created.0`
 ```
 
 ## Fix
 `floor >= created.0 + 1` -> `floor > created.0`. Same condition, assertion retained.
-No other assertion changed, no production change. No test run locally (8 GiB cap; no waiver).
+No other assertion changed, no production change. No local test run (8 GiB cap; no waiver).
 Standalone `rustfmt --edition 2021 --check` clean.
 
 ## Status
 CI on `2d9e263`: PENDING. Not green until the named tests pass in a completed run.
 Runnable command: `cargo test -p cowfs-meta --test allocation_option_extremes`.
-
 Old receipts `486b16f6...`, `c418d15c...`, `ec04ce04...` and review `0f730979...` unchanged.
