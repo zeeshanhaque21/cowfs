@@ -569,6 +569,13 @@ fn verify(dir: &Path, p: &Point, what: &str) {
     c.check()
         .unwrap_or_else(|e| panic!("{what}: meta check failed: {e:?}"));
     let report = c.fsck().unwrap();
+    assert!(
+        !report
+            .damage
+            .iter()
+            .any(|d| matches!(d, cowfs_store::Damage::MissingLiveBlock { .. })),
+        "crash verifier found a missing live block: {what}: {report:?}"
+    );
     assert!(report.is_clean(), "{what}: fsck: {report:?}");
     let listed: HashSet<String> = c
         .list_snapshots()
@@ -676,9 +683,9 @@ fn crash_images_reopen_consistent_and_keep_fsynced_data() {
 }
 
 /// The test must be able to see the bug it guards against: without the store sync before durable
-/// metadata commits, some image has a dangling chunk or a lost fsynced file.
+/// metadata commits, some image has a dangling live chunk.
 #[test]
-#[should_panic]
+#[should_panic(expected = "crash verifier found a missing live block")]
 fn the_crash_test_notices_a_missing_store_sync_before_metadata_commits() {
     for s in 0..4 {
         run(0xBAD + s * 13, 100, false);
