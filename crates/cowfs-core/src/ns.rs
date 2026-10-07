@@ -471,7 +471,8 @@ impl Inner {
     /// answer cannot be known from memory.
     /// Commits this directory's pending work if it has any, without any lock of ours.
     fn barrier_if_needed(&self, sc: &SnapCtx, cn: &Node) -> Result<()> {
-        if cn.ns_seq.load(Ordering::Acquire) > sc.flushed() {
+        let unknown = cn.st.rd().kids.is_none();
+        if unknown && cn.ns_seq.load(Ordering::Acquire) > sc.flushed() {
             self.barrier(sc)?;
         }
         Ok(())
