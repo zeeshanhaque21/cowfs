@@ -60,6 +60,28 @@ impl InoRange {
     }
 }
 
+/// One inode number a [`Meta`](crate::Meta) session has reserved and not yet created.
+///
+/// This is the capability a selected-number create needs. It is deliberately `!Copy` and `!Clone`
+/// with a private field, so a caller cannot duplicate it and mint the same number twice, and it
+/// carries the store's own identity and the session that minted it, so a create can refuse a ticket
+/// from another store or from a session that has since closed. Only [`Meta::reserve_tickets`]
+/// mints one, and the session removes it from its outstanding set when the create commits.
+///
+/// [`Meta::reserve_tickets`]: crate::Meta::reserve_tickets
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReservedIno {
+    pub(crate) store: u64,
+    pub(crate) ino: Ino,
+}
+
+impl ReservedIno {
+    /// The reserved inode number itself. Read-only: reading it does not spend the ticket.
+    pub const fn ino(&self) -> Ino {
+        self.ino
+    }
+}
+
 /// Snapshot id. Never reused.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct SnapshotId(pub u64);
