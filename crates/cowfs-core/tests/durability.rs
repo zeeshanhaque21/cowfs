@@ -2,7 +2,7 @@
 //! describe. Every test here fails with its mutant and passes without it.
 //!
 //! `cowfs_core::fsops` is a test-only seam: it records the `sync` calls the swap and the
-//! swap makes, and can make one of them fail. Physical reservations use the metadata sync hook.
+//! swap makes, and can make one of them fail. Counter-only reservations do not run the store hook.
 
 mod common;
 
@@ -135,12 +135,13 @@ fn a_physical_reservation_is_durable_before_its_number_is_handed_out() {
     let before = syncs.load(Ordering::SeqCst);
     let a = fs.create(ROOT_INO, b"f", 0o644).unwrap();
     assert_eq!(a.ino & (1 << 63), 0);
-    assert!(syncs.load(Ordering::SeqCst) > before);
+    assert_eq!(syncs.load(Ordering::SeqCst), before);
     let meta_ino = c.meta_inode(a.ino).unwrap();
     let floor = c.meta().health().ino_floor;
     assert!(floor > meta_ino);
     fs.write(a.ino, 0, b"durable physical identity").unwrap();
     c.sync().unwrap();
+    assert!(syncs.load(Ordering::SeqCst) > before);
     drop(fs);
     drop(c);
     let c = Core::open(dir.path(), opts_tiny_reservation()).unwrap();
@@ -156,7 +157,7 @@ fn a_physical_reservation_is_durable_before_its_number_is_handed_out() {
 }
 
 #[test]
-fn a_physical_reservation_refuses_when_metadata_cannot_be_made_durable() {
+fn a_reserved_create_keeps_its_identity_when_the_store_sync_fails_and_retries() {
     let dir = tempfile::tempdir().unwrap();
     let armed = Arc::new(AtomicBool::new(false));
     let flag = armed.clone();
@@ -164,7 +165,7 @@ fn a_physical_reservation_refuses_when_metadata_cannot_be_made_durable() {
         let store_sync = o.before_sync.take().unwrap();
         o.before_sync = Some(Arc::new(move || {
             if flag.load(Ordering::SeqCst) {
-                return Err(std::io::Error::other("reservation sync refused"));
+                return Err(std::io::Error::other("store sync refused"));
             }
             store_sync()
         }));
@@ -174,20 +175,18 @@ fn a_physical_reservation_refuses_when_metadata_cannot_be_made_durable() {
     c.create_snapshot("s").unwrap();
     let fs = c.snapshot_view("s").unwrap();
     armed.store(true, Ordering::SeqCst);
-    let r = fs.create(ROOT_INO, b"g", 0o644);
-    armed.store(false, Ordering::SeqCst);
-    assert!(
-        r.is_err(),
-        "a number was handed out despite refused durability"
-    );
-    assert!(matches!(
-        fs.lookup(ROOT_INO, b"g"),
-        Err(cowfs_vfs::Error::NotFound)
-    ));
     let a = fs.create(ROOT_INO, b"g", 0o644).unwrap();
     assert_eq!(a.ino & (1 << 63), 0);
     assert!(c.meta().health().ino_floor > c.meta_inode(a.ino).unwrap());
     fs.write(a.ino, 0, b"retry survived").unwrap();
+    let r = c.sync();
+    armed.store(false, Ordering::SeqCst);
+    assert!(
+        r.is_err(),
+        "sync acknowledged despite the refused store hook"
+    );
+    assert_eq!(fs.lookup(ROOT_INO, b"g").unwrap().ino, a.ino);
+    assert_eq!(fs.read(a.ino, 0, 100).unwrap(), b"retry survived");
     c.sync().unwrap();
     drop(fs);
     drop(c);
@@ -195,6 +194,20 @@ fn a_physical_reservation_refuses_when_metadata_cannot_be_made_durable() {
     let fs = c.snapshot_view("s").unwrap();
     assert_eq!(fs.lookup(ROOT_INO, b"g").unwrap().ino, a.ino);
     assert_eq!(fs.read(a.ino, 0, 100).unwrap(), b"retry survived");
+}
+
+#[test]
+fn a_physical_reservation_refuses_when_the_metadata_session_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(dir.path(), opts_tiny_reservation()).unwrap();
+    c.create_snapshot("s").unwrap();
+    let fs = c.snapshot_view("s").unwrap();
+    c.meta().close().unwrap();
+    assert!(fs.create(ROOT_INO, b"g", 0o644).is_err());
+    assert!(matches!(
+        fs.lookup(ROOT_INO, b"g"),
+        Err(cowfs_vfs::Error::NotFound)
+    ));
 }
 
 // ---------------------------------------------------------------- b11: the node load retry
