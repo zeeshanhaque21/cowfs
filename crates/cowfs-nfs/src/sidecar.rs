@@ -108,7 +108,7 @@ pub(crate) struct PerIno {
 }
 
 impl PerIno {
-    fn of(&mut self, ino: Ino) -> Arc<Mutex<()>> {
+    pub(crate) fn of(&mut self, ino: Ino) -> Arc<Mutex<()>> {
         if let Some(l) = self.map.get(&ino).and_then(Weak::upgrade) {
             return l;
         }
