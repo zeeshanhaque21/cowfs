@@ -18,6 +18,10 @@ use crate::node::{Node, NodeState};
 use crate::queue::{Batch, Create, Op, SnapCtx};
 use crate::util::{MutexExt, RwExt, ShardMap, SHARDS};
 
+/// How many reserved inode tickets one meta reservation covers. A create pops one, so a refill
+/// happens once per this many creates and each refill is one durable meta reservation.
+pub(crate) const RESERVED_BLOCK: u64 = 1 << 16;
+
 /// Tuning knobs for [`Core::open`](crate::Core::open). See `docs/v1-core.md` for the exact
 /// durability and loss bounds they control.
 #[derive(Clone, Debug)]
@@ -178,11 +182,10 @@ pub(crate) struct Inner {
     pub(crate) aliases: RwLock<Aliases>,
     pub(crate) handles: Mutex<HashMap<u64, Ino>>,
     pub(crate) next_handle: AtomicU64,
-    pub(crate) next_virt: AtomicU64,
-    /// Virtual numbers up to here are recorded in `<root>/virt.ino`, so a restart never hands out
-    /// a number an earlier session used.
-    pub(crate) virt_reserved: AtomicU64,
-    pub(crate) virt_lock: Mutex<()>,
+    /// Tickets minted from a [`cowfs_meta::Meta::reserve_tickets`] batch and not yet spent by a
+    /// create. A create pops one here; a create does not hold a Core lock while meta's writer lock
+    /// is taken. Numbers in a popped-but-unused ticket are wasted, never reused.
+    pub(crate) reserved: Mutex<Vec<cowfs_meta::ReservedIno>>,
     pub(crate) dirty_bytes: AtomicUsize,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
@@ -249,39 +252,26 @@ impl Inner {
         self.snaps.rd().by_id.values().cloned().collect()
     }
 
-    /// The meta inode number behind `ino`, if meta has one yet.
-    /// The next virtual number, extending the durable reservation when it runs out.
+    /// One reserved ticket for a create, refilling the pool in blocks.
     ///
-    /// Refuses at the alias ceiling: the number would be handed out now and released later, and a
-    /// client still holding it would see `Stale`, so the create fails here instead.
-    pub(crate) fn alloc_virt(&self, snap: u64) -> Result<Ino> {
-        let live = self.aliases.rd().len();
-        if live >= self.opts.alias_limit {
-            *self.last_error.lk() = Some(format!(
-                "session inode limit reached: {live} inodes are live, the ceiling is {}",
-                self.opts.alias_limit
-            ));
-            return Err(Error::NoSpace);
+    /// Takes no snapshot lock: a caller reserves before it takes `sc.ns`. A refill opens a meta
+    /// reservation, which no Core lock may be held across.
+    pub(crate) fn take_reserved(&self) -> Result<cowfs_meta::ReservedIno> {
+        {
+            let mut pool = self.reserved.lk();
+            if let Some(t) = pool.pop() {
+                return Ok(t);
+            }
         }
-        let n = self.next_virt.fetch_add(1, Ordering::AcqRel) + 1;
-        if n >= self.virt_reserved.load(Ordering::Acquire) {
-            self.reserve_virt()?;
-        }
-        crate::ino::virt(snap, n)
-    }
-
-    /// Records a block of virtual numbers durably before any of them is handed out, so a crash
-    /// can only waste numbers, never reuse them.
-    fn reserve_virt(&self) -> Result<()> {
-        let _g = self.virt_lock.lk();
-        let next = self.next_virt.load(Ordering::Acquire);
-        if next < self.virt_reserved.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let new = next.saturating_add(crate::ino::VIRT_BLOCK);
-        crate::ino::write_virt_mark(&self.root, new).map_err(|e| crate::error::from_io(&e))?;
-        self.virt_reserved.store(new, Ordering::Release);
-        Ok(())
+        let block = self
+            .meta
+            .reserve_tickets(RESERVED_BLOCK)
+            .map_err(from_meta)?;
+        let mut pool = self.reserved.lk();
+        let mut it = block.into_iter();
+        let first = it.next().ok_or(Error::NoSpace)?;
+        pool.extend(it);
+        Ok(first)
     }
 
     /// Test seam: report that the next node-table insertion for `ino` lost its race, up to the
@@ -297,6 +287,7 @@ impl Inner {
         }
     }
 
+    /// The meta inode number behind `ino`, if meta has one yet.
     pub(crate) fn meta_of(&self, ino: Ino) -> Option<u64> {
         match classify(ino) {
             Id::Meta { m, .. } => Some(m),
@@ -554,19 +545,27 @@ impl Inner {
         }
         if node.st.rd().xattrs.is_none() {
             let mut map = BTreeMap::new();
-            if let Some(m) = self.meta_of(node.ino) {
-                for name in sc
-                    .snap
-                    .listxattr(mino(m))
-                    .map_err(from_meta)
-                    .map_err(stale)?
-                {
-                    let v = sc
+            // A reserved create's number is the packed meta number, so `meta_of` answers for it
+            // before meta has committed the create. Reading meta then reports `NotFound` for an
+            // inode that exists as `Stale`, and there is nothing to preserve anyway: an uncommitted
+            // create has no xattrs in meta. `barrier` cannot run here because the callers hold the
+            // namespace lock (lock order: the flush lock is taken unlocked), so a pending create
+            // gets an empty map instead of a meta read.
+            if node.seq.load(Ordering::Acquire) <= sc.flushed() {
+                if let Some(m) = self.meta_of(node.ino) {
+                    for name in sc
                         .snap
-                        .getxattr(mino(m), &name)
+                        .listxattr(mino(m))
                         .map_err(from_meta)
-                        .map_err(stale)?;
-                    map.insert(name, v);
+                        .map_err(stale)?
+                    {
+                        let v = sc
+                            .snap
+                            .getxattr(mino(m), &name)
+                            .map_err(from_meta)
+                            .map_err(stale)?;
+                        map.insert(name, v);
+                    }
                 }
             }
             node.st.wr().xattrs = Some(map);
@@ -794,6 +793,11 @@ impl Inner {
             Ok(created) => {
                 {
                     let mut al = self.aliases.wr();
+                    // Every live inode keeps one alias, so the table tracks the live count and the
+                    // session ceiling stays honest. A reserved create's child is already the packed
+                    // meta number, so its alias is the identity bridge `meta_of`/`canon` need; the
+                    // key is that packed number and the value is the bare meta number, so it is a
+                    // real entry, not a self-map.
                     for (v, m) in &created {
                         al.insert(*v, sc.id, *m);
                     }
@@ -946,6 +950,7 @@ impl Inner {
                         name,
                         mode,
                         child,
+                        reserved,
                         what,
                     } => {
                         if b.elided.contains(child) {
@@ -953,10 +958,15 @@ impl Inner {
                         }
                         stamp(tx, *child);
                         let p = resolve(*parent, &newly)?;
-                        let a = match what {
-                            Create::File => tx.create(p, name, *mode)?,
-                            Create::Dir => tx.mkdir(p, name, *mode)?,
-                            Create::Symlink(t) => tx.symlink(p, name, t)?,
+                        let a = match (reserved, what) {
+                            (Some(ticket), Create::File) => tx.create_at(p, name, *mode, ticket)?,
+                            (Some(ticket), Create::Dir) => tx.mkdir_at(p, name, *mode, ticket)?,
+                            (Some(ticket), Create::Symlink(t)) => {
+                                tx.symlink_at(p, name, t, ticket)?
+                            }
+                            (None, Create::File) => tx.create(p, name, *mode)?,
+                            (None, Create::Dir) => tx.mkdir(p, name, *mode)?,
+                            (None, Create::Symlink(t)) => tx.symlink(p, name, t)?,
                         };
                         newly.insert(*child, a.ino.0);
                     }

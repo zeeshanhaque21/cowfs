@@ -223,15 +223,36 @@ fn the_stored_bytes_survive_a_drop_and_a_reopen_under_the_same_id() {
     let e = entry(&c, "renamed");
     assert_eq!(e.id, id, "the id survives a reopen");
     assert_eq!(e.ino, packed, "the packed root inode survives a reopen");
-    // A fresh session hands out its own virtual inode numbers and never reuses an earlier
-    // session's, so the file is resolved by name here. The rename is what has to be invisible:
-    // same id, same packed root, same bytes under the new name.
+    // A create under the reservation design hands out the packed, meta-backed number itself, so
+    // the number a caller held before the drop must be the number a fresh session resolves, not a
+    // different session-local alias. The rename has to be invisible: same id, same packed root,
+    // same file number, same bytes under the new name.
+    let m = file & cowfs_core::VIRT_COUNTER_MASK;
+    assert_eq!(
+        file & (1u64 << 63),
+        0,
+        "the first-session file number is a virtual alias"
+    );
     let v = c.snapshot_view("renamed").unwrap();
     let root = root_entry(&c, "renamed").ino;
     let reopened_file = v.lookup(root, b"f").expect("f is under the new name").ino;
-    assert_ne!(
+    assert_eq!(
         reopened_file, file,
-        "a new session must not reuse an earlier session's virtual inode"
+        "the file's inode number changed across a reopen"
+    );
+    // Stable physical class: the reopened number does not carry the virtual alias bit, so it is a
+    // packed meta number this store owns, not a session-local virtual alias a later session would
+    // have to re-mint.
+    assert_eq!(
+        reopened_file & (1u64 << 63),
+        0,
+        "the reopened file number is a virtual alias, not a packed physical number"
+    );
+    // The same durable meta inode is behind the number on both sides of the reopen.
+    assert_eq!(
+        c.meta_inode(reopened_file),
+        Some(m),
+        "the durable meta identity behind the file changed across the reopen"
     );
     assert_eq!(read_all(&v, reopened_file), body, "the exact bytes survive");
     assert_eq!(c.snapshot_view("work").err(), Some(ControlError::NotFound));

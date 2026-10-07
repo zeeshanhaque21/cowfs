@@ -20,7 +20,8 @@ pub use error::{Error, Result};
 pub use node::NodeId;
 pub use tx::Tx;
 pub use types::{
-    Attr, ChunkRange, DirEntry, FileType, Ino, InoRange, ReadDir, Removed, SetAttr, SnapshotId,
-    SnapshotInfo, Timestamp, INO_LIMIT, NAME_MAX, ROOT_INO, SNAPSHOT_LIMIT, SYMLINK_MAX, XATTR_MAX,
+    Attr, ChunkRange, DirEntry, FileType, Ino, InoRange, ReadDir, Removed, ReservedIno, SetAttr,
+    SnapshotId, SnapshotInfo, Timestamp, INO_LIMIT, NAME_MAX, ROOT_INO, SNAPSHOT_LIMIT,
+    SYMLINK_MAX, XATTR_MAX,
 };
 pub use walk::{LiveBlocks, Marker};
