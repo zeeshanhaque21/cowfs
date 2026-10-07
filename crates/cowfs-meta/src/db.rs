@@ -1163,7 +1163,12 @@ impl Inner {
 
     pub(crate) fn sync(&self) -> Result<()> {
         let mut s = self.wlock()?;
-        self.commit(&mut s, Extra::None, false, true).map(|_| ())
+        let r = self.commit(&mut s, Extra::None, false, true).map(|_| ());
+        match &r {
+            Ok(()) => self.note_flush_ok(),
+            Err(e) => self.note_flush_failure(e.to_string()),
+        }
+        r
     }
 
     pub(crate) fn close(&self) -> Result<()> {

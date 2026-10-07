@@ -511,7 +511,8 @@ impl Core {
 
     /// The most recent error a background flush hit, of any kind, if any.
     pub fn last_flush_error(&self) -> Option<String> {
-        self.inner.last_error.lk().clone()
+        let own = self.inner.last_error.lk().clone();
+        own.or_else(|| self.inner.meta.health().last_flush_error)
     }
 
     /// Blocks that only memory names: chunks of open unlinked files and of files whose chunk list
@@ -864,10 +865,13 @@ impl Inner {
                 });
             }
         }
+        let own = self.last_error.lk().clone();
+        let meta = self.meta.health();
         Health {
             files,
             lanes,
-            last_error: self.last_error.lk().clone(),
+            last_error: own.or_else(|| meta.last_flush_error.clone()),
+            meta,
         }
     }
 
