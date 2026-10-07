@@ -28,6 +28,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLock
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+#[path = "../tests/common/backend.rs"]
+mod reap_backend;
+
+#[cfg(test)]
+std::thread_local! {
+    static SKIP_REAP_DURABILITY: Cell<bool> = const { Cell::new(false) };
+}
+
 pub(crate) const NODES: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("nodes");
 pub(crate) const REFS: TableDefinition<[u8; 32], u64> = TableDefinition::new("refs");
 pub(crate) const SNAPSHOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("snapshots");
@@ -1294,7 +1303,11 @@ impl Inner {
             }
             // A durable commit flushes every earlier non-durable one, so bound the backlog: it
             // carries no chunk references, hence no hook.
-            if self.reap_steps.fetch_add(1, SeqCst) % REAP_DURABLE_EVERY == REAP_DURABLE_EVERY - 1 {
+            let periodic =
+                self.reap_steps.fetch_add(1, SeqCst) % REAP_DURABLE_EVERY == REAP_DURABLE_EVERY - 1;
+            #[cfg(test)]
+            let periodic = periodic && !SKIP_REAP_DURABILITY.with(|c| c.get());
+            if periodic {
                 wtx.set_durability(Durability::Immediate)?;
                 wtx.set_two_phase_commit(true);
             }
@@ -2130,6 +2143,109 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verify_reap_durability(skip_check: bool) {
+        use reap_backend::{Be, Ev};
+
+        let be = Be::default();
+        let m = Meta::open_with_backend(be.clone(), opts()).unwrap();
+        let keep = m.new_snapshot("keep").unwrap();
+        let file = keep
+            .batch(|tx| tx.create(ROOT_INO, b"kept", 0o644))
+            .unwrap();
+        let gone = m.new_snapshot("gone").unwrap();
+        let id = gone.id();
+        let root = *gone.info().unwrap().root.as_bytes();
+        drop(gone);
+        m.reap_all().unwrap();
+        m.remove_snapshot(id).unwrap();
+        assert_eq!(m.pending_reap(), 1);
+
+        let count = REAP_BUDGET as u64 + 1;
+        {
+            let wtx = m.h.inner.db.begin_write().unwrap();
+            {
+                let mut reap = wtx.open_table(REAP).unwrap();
+                let mut refs = wtx.open_table(REFS).unwrap();
+                let nodes = wtx.open_table(NODES).unwrap();
+                let mut meta = wtx.open_table(META).unwrap();
+                assert_eq!(reap.len().unwrap(), 1);
+                assert_eq!(refs.get(root).unwrap().unwrap().value(), 1);
+                let bytes = nodes.get(root).unwrap().unwrap().value().to_vec();
+                assert!(Node::parse(bytes).unwrap().is_leaf());
+                let mut next = meta_get(&meta, "next_reap").unwrap();
+                for _ in 1..count {
+                    reap.insert(next, root).unwrap();
+                    next += 1;
+                }
+                refs.insert(root, count).unwrap();
+                meta.insert("next_reap", next).unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+        m.h.inner.reap_len.store(count, SeqCst);
+        m.h.inner.reap_steps.store(REAP_DURABLE_EVERY - 2, SeqCst);
+        m.check().unwrap();
+
+        be.tag.store(1, SeqCst);
+        let before = be.log().len();
+        assert!(m.reap_step().unwrap());
+        assert_eq!(m.pending_reap(), 1);
+        assert!(be.log()[before..].iter().all(|ev| !matches!(ev, Ev::S(_))));
+
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SKIP_REAP_DURABILITY.with(|c| c.set(self.0));
+            }
+        }
+        let reset = Reset(SKIP_REAP_DURABILITY.with(|c| c.replace(skip_check)));
+        be.tag.store(2, SeqCst);
+        let before = be.log().len();
+        let more = m.reap_step().unwrap();
+        drop(reset);
+        assert!(!more);
+        assert_eq!(m.pending_reap(), 0);
+        let rtx = m.h.inner.db.begin_read().unwrap();
+        assert!(rtx.open_table(NODES).unwrap().get(root).unwrap().is_none());
+        assert!(rtx.open_table(REFS).unwrap().get(root).unwrap().is_none());
+        drop(rtx);
+        assert_eq!(keep.lookup(ROOT_INO, b"kept").unwrap().ino, file.ino);
+        m.check().unwrap();
+        assert!(
+            be.log()[before..].iter().any(|ev| matches!(ev, Ev::S(2))),
+            "reap verifier observed no periodic durable sync"
+        );
+
+        let image = be.image();
+        let recovered = Meta::open_with_backend(Be::from_image(image), opts()).unwrap();
+        assert_eq!(recovered.pending_reap(), 0);
+        assert!(matches!(
+            recovered.snapshot("gone"),
+            Err(Error::NoSuchSnapshot)
+        ));
+        assert_eq!(
+            recovered
+                .snapshot("keep")
+                .unwrap()
+                .lookup(ROOT_INO, b"kept")
+                .unwrap()
+                .ino,
+            file.ino
+        );
+        recovered.check().unwrap();
+    }
+
+    #[test]
+    fn reap_periodic_commit_syncs_the_prior_nondurable_step() {
+        verify_reap_durability(false);
+    }
+
+    #[test]
+    #[should_panic(expected = "reap verifier observed no periodic durable sync")]
+    fn reap_verifier_rejects_the_real_durability_guard_removal_control() {
+        verify_reap_durability(true);
+    }
 
     /// Small blocks, so a range that crosses several of them still costs a fixed commit count.
     fn opts() -> Options {
