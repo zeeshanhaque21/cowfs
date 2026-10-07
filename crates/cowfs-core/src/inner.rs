@@ -162,6 +162,7 @@ pub struct Health {
     pub lanes: Vec<LaneHealth>,
     /// The last error a flush reported, whatever its kind.
     pub last_error: Option<String>,
+    pub meta: cowfs_meta::Health,
 }
 
 #[derive(Debug, Default)]
