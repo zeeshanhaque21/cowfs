@@ -159,6 +159,7 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static RESERVE_FAULT: Cell<u8> = const { Cell::new(0) };
+    static SKIP_SNAPSHOT_LIMIT: Cell<bool> = const { Cell::new(false) };
 }
 
 // Durable reservation commits made on this thread, so a test can prove the count does not follow `n`.
@@ -563,7 +564,10 @@ impl Inner {
                         return Err(Error::NoSuchSnapshot);
                     }
                 }
-                if s.next_snapshot >= SNAPSHOT_LIMIT {
+                let exhausted = s.next_snapshot >= SNAPSHOT_LIMIT;
+                #[cfg(test)]
+                let exhausted = exhausted && !SKIP_SNAPSHOT_LIMIT.with(Cell::get);
+                if exhausted {
                     return Err(Error::LimitExceeded("snapshot ids exhausted"));
                 }
             }
@@ -2019,6 +2023,68 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verify_snapshot_limit(skip_check: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+        let m = Meta::open(&path, opts()).unwrap();
+        {
+            let mut s = m.h.inner.wlock().unwrap();
+            assert_eq!(s.next_snapshot, 1);
+            s.next_snapshot = SNAPSHOT_LIMIT - 1;
+        }
+        let last = m.new_snapshot("last").unwrap();
+        assert_eq!(last.id().0, SNAPSHOT_LIMIT - 1);
+        drop(last);
+        m.close().unwrap();
+        drop(m);
+        let m = Meta::open(&path, opts()).unwrap();
+        assert_eq!(m.snapshot("last").unwrap().id().0, SNAPSHOT_LIMIT - 1);
+        assert_eq!(m.health().snapshot_floor, SNAPSHOT_LIMIT);
+
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SKIP_SNAPSHOT_LIMIT.with(|c| c.set(self.0));
+            }
+        }
+        let reset = Reset(SKIP_SNAPSHOT_LIMIT.with(|c| c.replace(skip_check)));
+        let result = m.new_snapshot("overflow");
+        drop(reset);
+        match result {
+            Err(Error::LimitExceeded("snapshot ids exhausted")) => {}
+            Err(e) => panic!("unexpected snapshot-limit fixture failure: {e}"),
+            Ok(s) => {
+                assert_eq!(s.id().0, SNAPSHOT_LIMIT);
+                drop(s);
+                m.close().unwrap();
+                panic!("snapshot-limit verifier accepted an unrepresentable snapshot id");
+            }
+        }
+        assert!(matches!(m.snapshot("overflow"), Err(Error::NoSuchSnapshot)));
+        assert_eq!(m.health().snapshot_floor, SNAPSHOT_LIMIT);
+        m.check().unwrap();
+        m.close().unwrap();
+        drop(m);
+        let m = Meta::open(&path, opts()).unwrap();
+        assert_eq!(m.snapshot("last").unwrap().id().0, SNAPSHOT_LIMIT - 1);
+        assert!(matches!(m.snapshot("overflow"), Err(Error::NoSuchSnapshot)));
+        assert!(matches!(
+            m.new_snapshot("still-overflow"),
+            Err(Error::LimitExceeded("snapshot ids exhausted"))
+        ));
+    }
+
+    #[test]
+    fn snapshot_limit_refuses_unrepresentable_ids_across_reopen() {
+        verify_snapshot_limit(false);
+    }
+
+    #[test]
+    #[should_panic(expected = "snapshot-limit verifier accepted an unrepresentable snapshot id")]
+    fn snapshot_limit_verifier_rejects_the_real_guard_removal_control() {
+        verify_snapshot_limit(true);
+    }
 
     /// Small blocks, so a range that crosses several of them still costs a fixed commit count.
     fn opts() -> Options {
