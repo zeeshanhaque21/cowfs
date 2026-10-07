@@ -167,6 +167,7 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static RESERVE_FAULT: Cell<u8> = const { Cell::new(0) };
+    static SKIP_MAGIC_CHECK: Cell<bool> = const { Cell::new(false) };
 }
 
 // Durable reservation commits made on this thread, so a test can prove the count does not follow `n`.
@@ -1632,7 +1633,10 @@ impl Meta {
         }
         let rtx = db.begin_read()?;
         let meta = rtx.open_table(META)?;
-        if meta.get("magic")?.map(|g| g.value()) != Some(MAGIC) {
+        let wrong_magic = meta.get("magic")?.map(|g| g.value()) != Some(MAGIC);
+        #[cfg(test)]
+        let wrong_magic = wrong_magic && !SKIP_MAGIC_CHECK.with(Cell::get);
+        if wrong_magic {
             return Err(Error::Format(
                 "no cowfs-meta header in this redb file".into(),
             ));
@@ -2212,6 +2216,74 @@ mod tests {
     #[should_panic(expected = "inode-limit verifier accepted an unrepresentable inode id")]
     fn inode_limit_verifier_rejects_the_real_guard_removal_control() {
         verify_inode_limit(true);
+    }
+
+    fn verify_header_refusal(value: Option<u64>, skip_check: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+        let m = Meta::open(&path, opts()).unwrap();
+        m.new_snapshot("s").unwrap();
+        m.close().unwrap();
+        drop(m);
+        let healthy = Meta::open(&path, opts()).unwrap();
+        assert_eq!(healthy.snapshot("s").unwrap().info().unwrap().name, "s");
+        healthy.check().unwrap();
+        healthy.close().unwrap();
+        drop(healthy);
+        let db = Database::open(&path).unwrap();
+        let wtx = db.begin_write().unwrap();
+        {
+            let mut meta = wtx.open_table(META).unwrap();
+            assert_eq!(meta.get("magic").unwrap().unwrap().value(), MAGIC);
+            match value {
+                Some(v) => {
+                    meta.insert("magic", v).unwrap();
+                }
+                None => {
+                    meta.remove("magic").unwrap();
+                }
+            }
+        }
+        wtx.commit().unwrap();
+        drop(db);
+
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SKIP_MAGIC_CHECK.with(|c| c.set(self.0));
+            }
+        }
+        let reset = Reset(SKIP_MAGIC_CHECK.with(|c| c.replace(skip_check)));
+        let result = Meta::open(&path, opts());
+        drop(reset);
+        match result {
+            Err(Error::Format(why)) if why == "no cowfs-meta header in this redb file" => {}
+            Err(e) => panic!("unexpected header fixture failure: {e}"),
+            Ok(m) => {
+                assert_eq!(m.snapshot("s").unwrap().info().unwrap().name, "s");
+                m.close().unwrap();
+                drop(m);
+                panic!("header verifier accepted an invalid cowfs-meta magic");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_and_wrong_metadata_magic_are_refused() {
+        verify_header_refusal(None, false);
+        verify_header_refusal(Some(MAGIC ^ 1), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "header verifier accepted an invalid cowfs-meta magic")]
+    fn header_verifier_rejects_the_real_missing_magic_check_control() {
+        verify_header_refusal(None, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "header verifier accepted an invalid cowfs-meta magic")]
+    fn header_verifier_rejects_the_real_wrong_magic_check_control() {
+        verify_header_refusal(Some(MAGIC ^ 1), true);
     }
 
     /// Small blocks, so a range that crosses several of them still costs a fixed commit count.
