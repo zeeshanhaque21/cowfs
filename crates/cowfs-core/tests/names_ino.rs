@@ -7,10 +7,9 @@ use common::*;
 use cowfs_core::{name_key, validate_snapshot_name, ControlError, Core};
 use cowfs_vfs::{Error, Vfs};
 
-/// F4: a number handed out in one session is never handed out in the next, so a stale NFS
-/// file handle gets `Stale` and never another file's bytes.
+/// F4: live physical IDs survive a restart; deleted IDs stay stale and never name another file.
 #[test]
-fn virtual_inode_numbers_are_never_reused_across_a_restart() {
+fn physical_inode_numbers_survive_a_restart_without_reuse() {
     let dir = tempfile::tempdir().unwrap();
     let first = {
         let c = Core::open(dir.path(), test_opts()).unwrap();
@@ -19,20 +18,19 @@ fn virtual_inode_numbers_are_never_reused_across_a_restart() {
         let a = c.create(r, b"A", 0o644).unwrap().ino;
         c.write(a, 0, b"AAAA").unwrap();
         c.sync().unwrap();
-        // a file that is created but never committed still consumed a number
         let pending = c.create(r, b"pending", 0o644).unwrap().ino;
-        vec![(a, "A"), (pending, "pending")]
+        c.unlink(r, b"pending").unwrap();
+        c.sync().unwrap();
+        (a, pending)
     };
     let c = Core::open(dir.path(), test_opts()).unwrap();
     let r = root_entry(&c, "s").ino;
-    for (old, what) in first.iter().copied() {
-        assert_eq!(
-            c.getattr(old),
-            Err(Error::Stale),
-            "{what}: a number from the previous session is not stale"
-        );
-        assert!(c.read(old, 0, 16).is_err());
-    }
+    assert_eq!(c.lookup(r, b"A").unwrap().ino, first.0);
+    assert_eq!(c.getattr(first.0).unwrap().ino, first.0);
+    assert_eq!(read_all(&c, first.0), b"AAAA");
+    assert_eq!(c.getattr(first.1), Err(Error::Stale));
+    assert!(c.read(first.1, 0, 16).is_err());
+    assert_eq!(c.lookup(r, b"pending"), Err(Error::NotFound));
     let mut fresh = Vec::new();
     for i in 0..200 {
         let a = c.create(r, format!("n{i}").as_bytes(), 0o644).unwrap().ino;
@@ -41,13 +39,15 @@ fn virtual_inode_numbers_are_never_reused_across_a_restart() {
     }
     for a in &fresh {
         assert!(
-            !first.iter().any(|(n, _)| *n == *a),
+            *a != first.0 && *a != first.1,
             "a new file got an old session's number {a:#x}"
         );
     }
     c.sync().unwrap();
     assert_eq!(read_all(&c, fresh[0]), b"BBBB");
     assert_eq!(read_all(&c, c.lookup(r, b"A").unwrap().ino), b"AAAA");
+    assert_eq!(c.getattr(first.1), Err(Error::Stale));
+    assert!(c.read(first.1, 0, 16).is_err());
 }
 
 /// F4: the reservation is durable, so a process that dies between sessions still cannot reuse a

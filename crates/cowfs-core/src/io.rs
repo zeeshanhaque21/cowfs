@@ -322,9 +322,15 @@ impl Inner {
     }
 
     /// Meta inode number of `node`, committing pending work first when it has none yet.
+    ///
+    /// A reserved create's number is the packed meta number, so `meta_of` answers before meta has
+    /// committed the create. The signal that the create is still pending is the node's own sequence
+    /// (`make` records it, `commit_batch` advances `sc.flushed`), not the presence of a number.
     fn committed_meta(&self, sc: &SnapCtx, node: &Node) -> Result<u64> {
-        if let Some(m) = self.meta_of(node.ino) {
-            return Ok(m);
+        if node.seq.load(Ordering::Acquire) <= sc.flushed() {
+            if let Some(m) = self.meta_of(node.ino) {
+                return Ok(m);
+            }
         }
         self.barrier(sc)?;
         self.meta_of(node.ino).ok_or(Error::Stale)
@@ -342,9 +348,7 @@ impl Inner {
             }
         }
         let sc = self.snapctx(ino)?;
-        let Some(m) = self.meta_of(ino) else {
-            return Err(Error::NoAttr);
-        };
+        let m = self.committed_meta(&sc, &n)?;
         sc.snap
             .getxattr(mino(m), name)
             .map_err(from_meta)
@@ -363,9 +367,7 @@ impl Inner {
             }
         }
         let sc = self.snapctx(ino)?;
-        let Some(m) = self.meta_of(ino) else {
-            return Ok(Vec::new());
-        };
+        let m = self.committed_meta(&sc, &n)?;
         sc.snap.listxattr(mino(m)).map_err(from_meta).map_err(stale)
     }
 
@@ -387,47 +389,45 @@ impl Inner {
         if value.len() > XATTR_VALUE_MAX || name.len() > NAME_MAX {
             return Err(Error::Range);
         }
-        let _ns = sc.ns.lk();
         let now = Timestamp::now();
-        let exists = self.xattr_exists(&sc, &n, name)?;
+        {
+            let _ns = sc.ns.lk();
+            let mut st = n.st.wr();
+            if let Some(map) = st.xattrs.as_mut() {
+                let exists = map.contains_key(name);
+                if flags.create && exists {
+                    return Err(Error::Exists);
+                }
+                if flags.replace && !exists {
+                    return Err(Error::NoAttr);
+                }
+                map.insert(name.to_vec(), value.to_vec());
+                st.attr.ctime = now;
+                return Ok(());
+            }
+        }
+        // No cached map yet, so the exists answer has to come from meta. The barrier and the meta
+        // write can wait for another thread's store fsync, so they run without the namespace lock:
+        // an xattr belongs to an inode, and nothing here renames it. The create is committed first,
+        // since a reserved create's number is known to `meta_of` before meta has seen the inode.
+        let m = self.committed_meta(&sc, &n)?;
+        let exists = match sc.snap.getxattr(mino(m), name) {
+            Ok(_) => true,
+            Err(cowfs_meta::Error::NoAttr) => false,
+            Err(e) => return Err(stale(from_meta(e))),
+        };
         if flags.create && exists {
             return Err(Error::Exists);
         }
         if flags.replace && !exists {
             return Err(Error::NoAttr);
         }
-        {
-            let mut st = n.st.wr();
-            if let Some(map) = st.xattrs.as_mut() {
-                map.insert(name.to_vec(), value.to_vec());
-                st.attr.ctime = now;
-                return Ok(());
-            }
-        }
-        // The barrier and the meta write can wait for another thread's store fsync, so they run
-        // without the namespace lock: an xattr belongs to an inode, and nothing here renames it.
-        drop(_ns);
-        let m = self.committed_meta(&sc, &n)?;
         sc.snap
             .setxattr(mino(m), name, value)
             .map_err(from_meta)
             .map_err(stale)?;
         n.st.wr().attr.ctime = now;
         Ok(())
-    }
-
-    fn xattr_exists(&self, sc: &SnapCtx, n: &Node, name: &[u8]) -> Result<bool> {
-        if let Some(map) = &n.st.rd().xattrs {
-            return Ok(map.contains_key(name));
-        }
-        let Some(m) = self.meta_of(n.ino) else {
-            return Ok(false);
-        };
-        match sc.snap.getxattr(mino(m), name) {
-            Ok(_) => Ok(true),
-            Err(cowfs_meta::Error::NoAttr) => Ok(false),
-            Err(e) => Err(stale(from_meta(e))),
-        }
     }
 
     pub(crate) fn op_removexattr(&self, ino: Ino, name: &[u8]) -> Result<()> {
@@ -446,11 +446,11 @@ impl Inner {
                 return Ok(());
             }
         }
-        let Some(m) = self.meta_of(ino) else {
-            return Err(Error::NoAttr);
-        };
         // a meta commit can wait for another thread's store fsync, so it runs unlocked
         drop(ns);
+        // a reserved create's number is known to `meta_of` before meta has the inode, so its create
+        // must be committed first or meta answers `NotFound` for a file that exists, as `Stale`
+        let m = self.committed_meta(&sc, &n)?;
         sc.snap
             .removexattr(mino(m), name)
             .map_err(from_meta)

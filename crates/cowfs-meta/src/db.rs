@@ -19,7 +19,7 @@ use redb::{
     StorageBackend, TableDefinition,
 };
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,14 @@ pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta")
 /// reservation is in flight, and absent entirely in files written before it existed.
 const INO_INTENT: &str = "ino_reserved_intent";
 pub(crate) const REAP: TableDefinition<u64, [u8; 32]> = TableDefinition::new("reap");
+
+/// Distinguishes one open store from another within this process, so a reservation ticket minted
+/// against one store is refused by another even when the numeric inode is the same.
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_store_id() -> u64 {
+    NEXT_STORE_ID.fetch_add(1, SeqCst)
+}
 
 /// "COWFSMET": identifies a cowfs-meta database among redb files.
 pub(crate) const MAGIC: u64 = 0x434f_5746_534d_4554;
@@ -167,6 +175,22 @@ thread_local! {
     static RESERVE_COMMITS: Cell<u32> = const { Cell::new(0) };
 }
 
+// Fault injection for the ordinary batch commit, this crate's own unit tests only.
+//
+// `0` is off. `1` fails just before `wtx.commit()`, so nothing is persisted; `2` fails just after
+// it, so the edit is durable while the caller still sees an error. That second one is how a test
+// proves the retry path does not treat a persisted create as a failed one. Thread-local for the
+// same reason as `RESERVE_FAULT`.
+#[cfg(test)]
+thread_local! {
+    static COMMIT_FAULT: Cell<u8> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn commit_fault() -> u8 {
+    COMMIT_FAULT.with(Cell::get)
+}
+
 #[cfg(test)]
 fn reserve_fault() -> u8 {
     RESERVE_FAULT.with(Cell::get)
@@ -186,6 +210,12 @@ fn reserve_commits() -> u32 {
 fn reset_reserve_probe() {
     RESERVE_FAULT.with(|c| c.set(0));
     RESERVE_COMMITS.with(|c| c.set(0));
+    COMMIT_FAULT.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn set_commit_fault(v: u8) {
+    COMMIT_FAULT.with(|c| c.set(v));
 }
 
 // Branch-entry witness for the follower half of `wait_durable`, for this crate's own unit tests.
@@ -282,6 +312,11 @@ pub(crate) struct Session {
     pub(crate) snaps: BTreeMap<SnapshotId, SnapEntry>,
     pub(crate) names: HashMap<String, SnapshotId>,
     pub(crate) ino: InoAlloc,
+    /// Numbers this session minted a [`ReservedIno`](crate::ReservedIno) for and that no create
+    /// has spent yet. Minting a ticket adds its number here; a selected create removes it in the
+    /// same write lock, so a number is spent at most once and a ticket from another store or a
+    /// closed session is refused because it is not in this set.
+    pub(crate) reserved: std::collections::HashSet<Ino>,
     pub(crate) next_snapshot: u64,
     applied: u64,
     durable: u64,
@@ -309,6 +344,10 @@ pub(crate) struct Inner {
     pub(crate) node_max: usize,
     pub(crate) cache: Arc<NodeCache>,
     pub(crate) session: RwLock<Session>,
+    /// Identity of this open store, unique per process. A [`ReservedIno`](crate::ReservedIno)
+    /// carries it, so a ticket minted against another store is refused even when its number is
+    /// numerically the same as one this store reserved.
+    pub(crate) store_id: u64,
     durable_seq: AtomicU64,
     gc: Mutex<bool>,
     gc_cv: Condvar,
@@ -708,7 +747,15 @@ impl Inner {
                 };
                 meta.insert("ino_reserved", reserved)?;
             }
+            #[cfg(test)]
+            if commit_fault() == 1 {
+                return Err(Error::Storage("injected before the batch commit".into()));
+            }
             wtx.commit()?;
+            #[cfg(test)]
+            if commit_fault() == 2 {
+                return Err(Error::Storage("injected after the batch commit".into()));
+            }
             Ok((new_roots, added))
         });
         let (new_roots, added) = match r {
@@ -871,6 +918,25 @@ impl Inner {
         Ok(InoRange::new(Ino(start), Ino(target)))
     }
 
+    /// Reserves `n` inode numbers and returns one [`ReservedIno`] ticket per number.
+    ///
+    /// Same durable reservation as [`Inner::reserve_inodes`], with the numbers wrapped in
+    /// session-owned tickets and recorded in the session's outstanding set. A ticket is spent by the
+    /// selected-number create that consumes it; until then it is the only way to name one of these
+    /// numbers on a create, and it is refused by a create on a different store or a session that has
+    /// closed.
+    pub(crate) fn reserve_tickets(&self, n: u64) -> Result<Vec<ReservedIno>> {
+        let range = self.reserve_inodes(n)?;
+        let store = self.store_id;
+        let mut s = self.wlock()?;
+        let mut out = Vec::with_capacity(range.len() as usize);
+        for ino in range.iter() {
+            s.reserved.insert(ino);
+            out.push(ReservedIno { store, ino });
+        }
+        Ok(out)
+    }
+
     /// Records a rollback that lost the newest commit, and moves the two counter floors past
     /// everything the lost commit could have handed out.
     ///
@@ -937,6 +1003,9 @@ impl Inner {
         id: SnapshotId,
         f: impl FnOnce(&mut Tx<'_>) -> Result<T>,
     ) -> Result<T> {
+        // Kept past the block so a failed durable wait can put the session's outstanding
+        // reservations back the way a retry expects to find them.
+        let mut spent: HashSet<Ino> = HashSet::new();
         let (out, wait_for) = {
             let _flight = Inflight::enter(&self.inflight);
             let mut guard_ = self.wlock()?;
@@ -952,12 +1021,18 @@ impl Inner {
             let saved = e.tree.clone();
             let lazy = Lazy::new(&self.db, &self.cache);
             let reserve = |n: u64| self.reserve_durable(n);
+            // numbers spent inside this one transaction; a second create at the same number in the
+            // same batch is refused rather than silently overwriting
             let res = {
+                let store = self.store_id;
                 let mut tx = Tx {
                     tree: &mut e.tree,
                     src: &lazy,
                     ino: &mut s.ino,
                     reserve: &reserve,
+                    store,
+                    reserved: &s.reserved,
+                    spent: &mut spent,
                     now: Timestamp::now(),
                 };
                 catch_unwind(AssertUnwindSafe(|| f(&mut tx)))
@@ -974,6 +1049,13 @@ impl Inner {
                 }
                 Ok(Ok(v)) => v,
             };
+            // the closure succeeded, so every reserved number a selected create spent is now named
+            // and must not be minted again from this session. Removal is deferred to here, not done
+            // inside the closure, so a closure that returns `Err` leaves the ticket usable for a
+            // retry.
+            for ino in &spent {
+                s.reserved.remove(ino);
+            }
             let changed = e.tree.edits() != saved.edits();
             if changed {
                 s.applied += 1;
@@ -1024,7 +1106,17 @@ impl Inner {
             )
         };
         if let Some(seq) = wait_for {
-            self.wait_durable(seq)?;
+            if let Err(er) = self.wait_durable(seq) {
+                // The caller sees a failure and will retry. Nothing durable was written, so the
+                // numbers this batch reserved must be spendable again; the create itself stays
+                // pending in the tree like any other applied edit, so a retry at a live number is
+                // stopped by the inode-exists check rather than silently duplicated.
+                let mut s = self.wlock()?;
+                for ino in &spent {
+                    s.reserved.insert(*ino);
+                }
+                return Err(er);
+            }
         }
         Ok(out)
     }
@@ -1587,6 +1679,7 @@ impl Meta {
                 block: stored_block.unwrap_or(ino_block),
             },
             next_snapshot: meta_get(&meta, "next_snapshot")?,
+            reserved: HashSet::new(),
             applied: 0,
             durable: 0,
             pending_ops: 0,
@@ -1603,6 +1696,7 @@ impl Meta {
             node_max,
             cache: Arc::new(NodeCache::new(opts.node_cache)),
             session: RwLock::new(session),
+            store_id: next_store_id(),
             ino_block: stored_block,
             durable_seq: AtomicU64::new(0),
             gc: Mutex::new(false),
@@ -1773,6 +1867,18 @@ impl Meta {
     /// a separate concern and is not provided here.
     pub fn reserve_inodes(&self, n: u64) -> Result<InoRange> {
         self.h.inner.reserve_inodes(n)
+    }
+
+    /// Reserves `n` inode numbers and returns one [`ReservedIno`] ticket per number.
+    ///
+    /// Same durable reservation as [`Meta::reserve_inodes`], with each number wrapped in a
+    /// session-owned ticket. A ticket is the only way to create an inode at one of these numbers:
+    /// [`Tx::create_at`](crate::Tx::create_at) and its siblings take a `&ReservedIno`, refuse a
+    /// ticket from another store or a session that has closed, and spend it at most once. Ask for
+    /// zero or more than the remaining numbers below [`INO_LIMIT`] and the whole call is refused
+    /// with nothing written and no ticket minted.
+    pub fn reserve_tickets(&self, n: u64) -> Result<Vec<ReservedIno>> {
+        self.h.inner.reserve_tickets(n)
     }
 
     /// Runs `before_sync`, then makes every applied change durable. The hook runs on every call,
@@ -2036,6 +2142,19 @@ mod tests {
         Meta::open(dir.join(name), opts()).unwrap()
     }
 
+    /// The same small store, but a batch returns only once its change is durable.
+    fn opts_durable() -> Options {
+        Options {
+            ack: Ack::Durable,
+            ..opts()
+        }
+    }
+
+    fn open_durable(dir: &std::path::Path, name: &str) -> Meta {
+        reset_reserve_probe();
+        Meta::open(dir.join(name), opts_durable()).unwrap()
+    }
+
     /// The durable floor as the store holds it, read through a fresh read transaction.
     fn durable_reserved(m: &Meta) -> u64 {
         let rtx = m.h.inner.db.begin_read().unwrap();
@@ -2286,6 +2405,215 @@ mod tests {
             r.end().0
         );
         m.check().unwrap();
+    }
+
+    // T9: a ticket creates at exactly the number it names, and is spent by the create.
+    #[test]
+    fn a_ticket_creates_at_its_number_and_is_spent_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+        let s = m.new_snapshot("s").unwrap();
+        let tickets = m.reserve_tickets(3).unwrap();
+        let want = tickets[0].ino();
+
+        let a = s
+            .batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]))
+            .unwrap();
+        assert_eq!(a.ino, want, "the create landed at the ticket's number");
+        assert_eq!(
+            s.getattr(want).unwrap().ino,
+            want,
+            "the inode is really at that number"
+        );
+
+        // the same ticket cannot be spent again
+        let again = s.batch(|tx| tx.create_at(ROOT_INO, b"b", 0o644, &tickets[0]));
+        assert!(
+            again.is_err(),
+            "a spent ticket created a second inode: {again:?}"
+        );
+
+        // a different ticket still works
+        let b = s
+            .batch(|tx| tx.create_at(ROOT_INO, b"c", 0o644, &tickets[1]))
+            .unwrap();
+        assert_eq!(b.ino, tickets[1].ino());
+        m.check().unwrap();
+    }
+
+    // T10: a ticket is refused by a different store, even when the number is the same.
+    #[test]
+    fn a_ticket_from_another_store_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = open(dir.path(), "a.redb");
+        let b = Meta::open(dir.path().join("b.redb"), opts()).unwrap();
+        let sa = a.new_snapshot("s").unwrap();
+        let sb = b.new_snapshot("s").unwrap();
+        let tickets = a.reserve_tickets(1).unwrap();
+        let foreign = &tickets[0];
+        let own = b.reserve_tickets(1).unwrap();
+        assert_eq!(foreign.ino(), own[0].ino());
+        let err = sb.batch(|tx| tx.create_at(ROOT_INO, b"x", 0o644, foreign));
+        assert!(
+            err.is_err(),
+            "a foreign store's ticket was accepted: {err:?}"
+        );
+        assert!(matches!(sb.getattr(foreign.ino()), Err(Error::NotFound)));
+        let created = sb
+            .batch(|tx| tx.create_at(ROOT_INO, b"x", 0o644, &own[0]))
+            .unwrap();
+        assert_eq!(created.ino, own[0].ino());
+        let created = sa
+            .batch(|tx| tx.create_at(ROOT_INO, b"x", 0o644, foreign))
+            .unwrap();
+        assert_eq!(created.ino, foreign.ino());
+        a.check().unwrap();
+        b.check().unwrap();
+    }
+
+    // T11: a ticket minted by a session that has closed is refused by the reopened store.
+    #[test]
+    fn a_ticket_from_a_closed_session_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+        let s = m.new_snapshot("s").unwrap();
+        let tickets = m.reserve_tickets(1).unwrap();
+        drop(s);
+        drop(m);
+
+        let again = Meta::open(dir.path().join("m.redb"), opts()).unwrap();
+        let s2 = again.snapshot_by_id(SnapshotId(1)).unwrap();
+        let err = s2.batch(|tx| tx.create_at(ROOT_INO, b"x", 0o644, &tickets[0]));
+        assert!(err.is_err(), "a stale ticket was accepted: {err:?}");
+    }
+
+    // T12: a closure error does not spend the ticket, so a retry uses the same number.
+    #[test]
+    fn a_closure_error_leaves_the_ticket_usable_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open(dir.path(), "m.redb");
+        let s = m.new_snapshot("s").unwrap();
+        let tickets = m.reserve_tickets(1).unwrap();
+        let want = tickets[0].ino();
+
+        let failed = s.batch(|tx| {
+            tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0])?;
+            Err::<(), _>(Error::Invalid("deliberate failure after the create"))
+        });
+        assert!(
+            failed.is_err(),
+            "the batch was expected to fail: {failed:?}"
+        );
+        assert!(
+            matches!(s.getattr(want), Err(Error::NotFound)),
+            "the failed batch must have left no inode"
+        );
+
+        let ok = s
+            .batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]))
+            .unwrap();
+        assert_eq!(ok.ino, want, "the retry reused the ticket's number");
+        m.check().unwrap();
+    }
+
+    // T13: a durable commit that fails before it persists must not strand the reserved number.
+    //
+    // The batch returns an error, so the caller retries. With the removal of the number from the
+    // session's outstanding set placed before the commit, the retry was refused as if the ticket
+    // had never been minted. Here the number stays owned by the session, so the retry is stopped
+    // only by the create that is still pending in the tree, never by a lost reservation.
+    #[test]
+    fn a_failed_durable_commit_does_not_strand_the_reserved_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open_durable(dir.path(), "m.redb");
+        let s = m.new_snapshot("s").unwrap();
+        let tickets = m.reserve_tickets(1).unwrap();
+        let want = tickets[0].ino();
+
+        set_commit_fault(1);
+        let failed = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
+        set_commit_fault(0);
+        assert!(
+            failed.is_err(),
+            "the durable commit was expected to fail: {failed:?}"
+        );
+
+        // The create stays pending in the session tree even though the durable commit failed, so
+        // the number resolves to the pending inode rather than being absent.
+        let pending = s
+            .getattr(want)
+            .expect("the pending create must still resolve in the session tree");
+        assert_eq!(
+            pending.ino, want,
+            "the pending inode is not at the reserved number"
+        );
+        assert_eq!(
+            pending.kind,
+            FileType::File,
+            "the pending inode is not the file that was created"
+        );
+
+        // The number is still owned by the session, so the retry is stopped by the pending inode,
+        // never by a reservation the session lost. A different name is used so the refusal can
+        // only come from the inode number already being taken, not from the name.
+        let retry = s.batch(|tx| tx.create_at(ROOT_INO, b"b", 0o644, &tickets[0]));
+        assert!(
+            matches!(retry, Err(Error::Exists)),
+            "the retry was not stopped by the pending inode: {retry:?}"
+        );
+
+        // Refuse close-time persistence too; a successful graceful drop would flush this create.
+        set_commit_fault(1);
+        let closed = m.close();
+        set_commit_fault(0);
+        assert!(
+            matches!(closed, Err(Error::Storage(ref why)) if why == "injected before the batch commit")
+        );
+        drop(s);
+        drop(m);
+        let again = Meta::open(dir.path().join("m.redb"), opts_durable()).unwrap();
+        let reopened = again.snapshot_by_id(SnapshotId(1)).unwrap();
+        assert!(
+            matches!(reopened.getattr(want), Err(Error::NotFound)),
+            "the pre-persist failure left an inode behind across a reopen"
+        );
+        again.check().unwrap();
+    }
+
+    // T14: a durable commit that fails after it persisted must not let the number be created twice.
+    //
+    // The caller sees an error and retries, but the first create is already on disk, so the retry
+    // at the same number is refused rather than silently duplicating it.
+    #[test]
+    fn a_durable_commit_that_persisted_then_failed_does_not_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open_durable(dir.path(), "m.redb");
+        let s = m.new_snapshot("s").unwrap();
+        let tickets = m.reserve_tickets(1).unwrap();
+        let want = tickets[0].ino();
+
+        set_commit_fault(2);
+        let failed = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
+        set_commit_fault(0);
+        assert!(
+            failed.is_err(),
+            "the durable commit was expected to fail: {failed:?}"
+        );
+
+        // the create did persist, so the inode is there at the same number and the retry cannot
+        // make a second one
+        let got = s
+            .getattr(want)
+            .expect("the persisted create must be visible");
+        assert_eq!(
+            got.ino, want,
+            "the persisted create is not at the reserved number"
+        );
+        let retry = s.batch(|tx| tx.create_at(ROOT_INO, b"a", 0o644, &tickets[0]));
+        assert!(
+            retry.is_err(),
+            "a retry after a persisted-but-failed commit duplicated the inode: {retry:?}"
+        );
     }
 
     // T9: the `INO_LIMIT` ceiling. The last legal range is accepted, the end lands exactly on the
