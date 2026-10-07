@@ -442,6 +442,9 @@ The damaged-file test covers truncations and bit flips and requires an error or 
 
 ## Measurements
 
+Durable operations and random-access lookups lead this table; hot-cache and applied-only figures are not substitutes for either.
+These are historical shared-load measurements, not quiet-host acceptance gates or measurements of the current main revision.
+
 Every number below comes from `crates/cowfs-meta/examples/review_bench.rs` (modes `lookup`, `create`, `group`, `splice`, `rm`, `check`), the first design's `examples/bench.rs`, and the review's `critic_perf` for the "before" splice and remove rows.
 Machine: Apple M3 Max, APFS, shared with other agents and busy: load1 was 25 to 100 during all runs, so every row is flagged high load and absolute numbers are pessimistic.
 Each row is n=5 (n=7 for lookups) repetitions of the stated batch under the shared CPU lock (the "before" remove_snapshot and chunk rows are n=5 runs of `critic_perf`, also under the lock).
@@ -449,15 +452,15 @@ Tree: 1,000 files per directory, one 4 KiB chunk per file.
 
 | metric | before | after |
 |---|---|---|
-| lookup, 1M inodes, 1000 fixed names (hot) | 38.9 to 41.6 us (measured by the reviewer and by the first bench, one mixed pattern) | 1.9 us (range 1.6 to 4.7) |
-| lookup, 1M inodes, random file, node cache warm | same | 18.6 us (12.2 to 28.5) |
-| lookup, 1M inodes, absent name | not measured | 3.0 us (2.7 to 4.6) |
-| lookup, 1M inodes, random file, node cache cold (fresh open) | not measured | 28.8 us (27.4 to 62.1) |
-| lookup, 1M inodes, random file, node cache off | not measured | 56.6 us (48.6 to 72.4) |
-| create, one call per file, unbatched | 1,775 us (563 per s), 10,000 creates about 17 s | 208.6 us (4,793 per s; range 180 to 250 us), applied in memory, durable by policy |
-| create, 1000 per batch | 10.2 us | 35.4 us (under load 73 to 76; the first number was under load 102, not comparable) |
 | durable create, 1 thread | about 12 to 20 ms (one fsync each) | 19.3 ms (52 per s) |
 | durable create, 2 / 8 / 32 threads, group commit | none | 18.4 ms per op (54 per s) / 5.5 ms (182 per s) / 1.2 ms (827 per s) |
+| lookup, 1M inodes, random file, node cache warm | not separately measured; original mixed lookup 38.9 to 41.6 us | 18.6 us (12.2 to 28.5) |
+| lookup, 1M inodes, random file, node cache cold (fresh open) | not measured | 28.8 us (27.4 to 62.1) |
+| lookup, 1M inodes, random file, node cache off | not measured | 56.6 us (48.6 to 72.4) |
+| lookup, 1M inodes, 1000 fixed names (hot) | 38.9 to 41.6 us (measured by the reviewer and by the first bench, one mixed pattern) | 1.9 us (range 1.6 to 4.7) |
+| lookup, 1M inodes, absent name | not measured | 3.0 us (2.7 to 4.6) |
+| create, one call per file, unbatched | 1,775 us (563 per s), 10,000 creates about 17 s | 208.6 us (4,793 per s; range 180 to 250 us), applied in memory, durable by policy |
+| create, 1000 per batch | 10.2 us | 35.4 us (under load 73 to 76; the first number was under load 102, not comparable) |
 | append one chunk, file of 1k / 10k / 100k / 1M chunks | 106 us / 393 us / 3.68 ms / set_content alone 1.48 s at 1M (whole list) | `splice_content`: 12.6 / 25.3 / 24.4 / 20.6 us |
 | replace one mid-file chunk, same sizes | not possible without the whole list | `splice_content`: 57 / 63 / 71 / 74 us |
 | append via `chunks()` + `set_content`, same sizes (kept for comparison) | as above | 0.61 ms / 5.6 ms / 353 ms / 1,110 ms |
@@ -466,6 +469,20 @@ Tree: 1,000 files per directory, one 4 KiB chunk per file.
 | worst create latency including the durable commit of `remove_snapshot` itself | same | 28 ms (13.8 to 43.8) |
 | time until all nodes of the removed 1M-inode snapshot are freed | 0.9 s (inline) | 6.2 s (5.9 to 8.0), in the background |
 | `check()`, 1M inodes | 2.5 s, 747 MB resident (reviewer, one run) | 4.2 s (3.2 to 5.0), +230 MB resident (302 to 532 MB) |
+
+### Separate round-2 reviewer report
+
+[Issue #40](https://github.com/zeeshanhaque21/cowfs/issues/40) records the critic's separate measurements at load 28 to 85.
+Its issue body does not state the repetition count; these are attributed historical reports, not fresh reruns or replacements for the implementation benchmark rows above.
+
+| reviewer metric | figure reported in #40 | comparison limit |
+|---|---|---|
+| durable single-thread create | 32.8 ms | implementation benchmark reports 19.3 ms in a different run |
+| random lookup | 24 us median, range 15 to 56 us | the 1.9 us hot lookup is not a random-access figure |
+| remove_snapshot, 200k inodes | 44 ms | implementation benchmark's 19.7 ms row uses 1M inodes in a different run |
+
+Neither workload size nor host load is matched across these reports, so the discrepancies are not measured regressions or speedups.
+No current-main performance benefit is established by this documentation correction.
 
 What these show and do not show:
 
