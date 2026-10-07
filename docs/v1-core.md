@@ -510,6 +510,7 @@ that takes a lock is not listed here.
 | `ns::op_link` | sc.ns, sc.q, st.wr, st.rd, dents | 1 then 2 |
 | `ns::op_unlink` | sc.ns, sc.q, st.wr, st.rd, dents | 1 then 2 |
 | `ns::op_rmdir` | sc.ns, sc.q, st.wr, dents | 1 then 2 |
+| `ns::barrier_if_needed` | st.rd, released before barrier commit | 1 |
 | `ns::require_empty` | st.rd | 2 |
 | `ns::op_rename` | sc.ns, sc.q, st.wr, st.rd, dents | 1 then 2 |
 | `ns::adjust_kids` | st.wr | 2 |
