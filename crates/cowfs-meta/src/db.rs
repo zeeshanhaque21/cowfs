@@ -2400,17 +2400,27 @@ mod tests {
         let a = open(dir.path(), "a.redb");
         let b = Meta::open(dir.path().join("b.redb"), opts()).unwrap();
         let sa = a.new_snapshot("s").unwrap();
+        let sb = b.new_snapshot("s").unwrap();
         let tickets = a.reserve_tickets(1).unwrap();
         let foreign = &tickets[0];
-
-        // store b's own reservation can hand out the same numeric inode; the foreign ticket is
-        // still refused because it carries store a's identity
-        let err = sa.batch(|tx| tx.create_at(ROOT_INO, b"x", 0o644, foreign));
+        let own = b.reserve_tickets(1).unwrap();
+        assert_eq!(foreign.ino(), own[0].ino());
+        let err = sb.batch(|tx| tx.create_at(ROOT_INO, b"x", 0o644, foreign));
         assert!(
             err.is_err(),
             "a foreign store's ticket was accepted: {err:?}"
         );
-        let _ = b;
+        assert!(matches!(sb.getattr(foreign.ino()), Err(Error::NotFound)));
+        let created = sb
+            .batch(|tx| tx.create_at(ROOT_INO, b"x", 0o644, &own[0]))
+            .unwrap();
+        assert_eq!(created.ino, own[0].ino());
+        let created = sa
+            .batch(|tx| tx.create_at(ROOT_INO, b"x", 0o644, foreign))
+            .unwrap();
+        assert_eq!(created.ino, foreign.ino());
+        a.check().unwrap();
+        b.check().unwrap();
     }
 
     // T11: a ticket minted by a session that has closed is refused by the reopened store.
@@ -2504,7 +2514,13 @@ mod tests {
             "the retry was not stopped by the pending inode: {retry:?}"
         );
 
-        // The commit failed before it reached redb, so a fresh reopen holds no inode at the number.
+        // Refuse close-time persistence too; a successful graceful drop would flush this create.
+        set_commit_fault(1);
+        let closed = m.close();
+        set_commit_fault(0);
+        assert!(
+            matches!(closed, Err(Error::Storage(ref why)) if why == "injected before the batch commit")
+        );
         drop(s);
         drop(m);
         let again = Meta::open(dir.path().join("m.redb"), opts_durable()).unwrap();
