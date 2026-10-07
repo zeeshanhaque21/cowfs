@@ -482,7 +482,7 @@ that takes a lock is not listed here.
 | `lib::fork_snapshot` | snap. | 3 |
 | `lib::list_snapshots` | leaf | 1 |
 | `lib::merkle_root` | snap. | 3 |
-| `lib::last_flush_error` | last_error | leaf |
+| `lib::last_flush_error` | last_error | leaf; clone and release before Meta health |
 | `lib::alias_table` | aliases | leaf |
 | `lib::set_load_node_contention` | leaf | 1 |
 | `lib::set_flush_fault` | leaf | 1 |
@@ -494,7 +494,7 @@ that takes a lock is not listed here.
 | `lib::register` | root_time, last_error, snap. | 3 then leaf |
 | `lib::unregister` | sc.ns, sc.flush, sc.q, st.try_read, nodes, dents, aliases, root_time | 1 then 2 then leaf |
 | `lib::stats` | sc.q, nodes, dents, aliases | 1 then 2 then leaf |
-| `lib::health` | sc.q, nodes, last_error | 1 then 2 then leaf |
+| `lib::health` | sc.q, nodes, last_error | 1 then 2 then leaf; release all before Meta health |
 | `lib::unpoison` | sc.q | 1 |
 | `lib::drop_caches` | st.try_read, nodes, dents | 2 |
 | `node::try_read_for` | st.try_read | 2 |

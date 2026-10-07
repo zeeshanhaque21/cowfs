@@ -62,11 +62,13 @@ fn metadata_sync_failures_count_once_and_an_idle_retry_resets_the_consecutive_co
 #[test]
 fn metadata_sync_failures_are_visible_through_core_health_and_remain_after_retry() {
     let (_dir, c, expected) = failed_metadata_sync_fixture();
+    assert_eq!(c.health().meta, c.meta().health());
     assert_eq!(c.health().last_error.as_deref(), Some(expected.as_str()));
     assert_eq!(c.last_flush_error().as_deref(), Some(expected.as_str()));
 
     c.meta().sync().unwrap();
     assert_eq!(c.meta().health().consecutive_flush_failures, 0);
+    assert_eq!(c.health().meta, c.meta().health());
     assert_eq!(c.health().last_error.as_deref(), Some(expected.as_str()));
     assert_eq!(c.last_flush_error().as_deref(), Some(expected.as_str()));
     c.check().unwrap();
