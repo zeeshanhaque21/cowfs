@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use cowfs_core::{Core, Options};
 
-#[test]
-fn metadata_sync_failures_are_visible_through_core_health_and_remain_after_retry() {
+fn failed_metadata_sync_fixture() -> (tempfile::TempDir, Core, String) {
     let dir = tempfile::tempdir().unwrap();
     let armed = Arc::new(AtomicBool::new(false));
     let flag = armed.clone();
@@ -43,6 +42,26 @@ fn metadata_sync_failures_are_visible_through_core_health_and_remain_after_retry
     assert_eq!(metadata.consecutive_flush_failures, 2);
     let expected = metadata.last_flush_error.unwrap();
     assert!(expected.contains("metadata health sentinel"));
+    (dir, c, expected)
+}
+
+#[test]
+fn metadata_sync_failures_count_once_and_an_idle_retry_resets_the_consecutive_count() {
+    let (_dir, c, expected) = failed_metadata_sync_fixture();
+    c.meta().sync().unwrap();
+    let metadata = c.meta().health();
+    assert_eq!(metadata.flush_failures, 2);
+    assert_eq!(metadata.consecutive_flush_failures, 0);
+    assert_eq!(
+        metadata.last_flush_error.as_deref(),
+        Some(expected.as_str())
+    );
+    c.check().unwrap();
+}
+
+#[test]
+fn metadata_sync_failures_are_visible_through_core_health_and_remain_after_retry() {
+    let (_dir, c, expected) = failed_metadata_sync_fixture();
     assert_eq!(c.health().last_error.as_deref(), Some(expected.as_str()));
     assert_eq!(c.last_flush_error().as_deref(), Some(expected.as_str()));
 
