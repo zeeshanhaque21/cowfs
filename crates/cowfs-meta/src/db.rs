@@ -218,6 +218,46 @@ fn set_commit_fault(v: u8) {
     COMMIT_FAULT.with(|c| c.set(v));
 }
 
+// Branch-entry witness for the follower half of `wait_durable`, for this crate's own unit tests.
+//
+// The follower branch is chosen under a private lock, so its entry is invisible from outside and a
+// test that only bounds a follower's return can false-green when the follower is never scheduled
+// before the leader is released. A test installs a sender on the follower thread; the real
+// `wait_durable` then reports `WaitEntered` the moment it takes the `if *led` branch (before it
+// parks on `gc_cv`) and `Returned` at its real `return`. Event order is then a proof of control
+// flow, independent of thread scheduling. Thread-local so the leader's own `wait_durable` call
+// never pollutes the follower's channel. Absent unless a test installs a sender.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitWitness {
+    WaitEntered,
+    Returned,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAIT_WITNESS: std::cell::RefCell<Option<std::sync::mpsc::Sender<WaitWitness>>> =
+        const { std::cell::RefCell::new(None) };
+    static WAIT_EARLY_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Installs the witness sender on the calling thread and returns a receiver for its events.
+#[cfg(test)]
+fn watch_wait_durable() -> std::sync::mpsc::Receiver<WaitWitness> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    WAIT_WITNESS.with(|w| *w.borrow_mut() = Some(tx));
+    rx
+}
+
+#[cfg(test)]
+fn wait_witness(ev: WaitWitness) {
+    WAIT_WITNESS.with(|w| {
+        if let Some(tx) = w.borrow().as_ref() {
+            let _ = tx.send(ev);
+        }
+    });
+}
+
 struct HookScope;
 
 impl HookScope {
@@ -1087,9 +1127,17 @@ impl Inner {
         loop {
             let mut led = lock(&self.gc);
             if self.durable_seq.load(SeqCst) >= seq {
+                #[cfg(test)]
+                wait_witness(WaitWitness::Returned);
                 return Ok(());
             }
             if *led {
+                #[cfg(test)]
+                if WAIT_EARLY_RETURN.with(|flag| flag.get()) {
+                    return Ok(());
+                }
+                #[cfg(test)]
+                wait_witness(WaitWitness::WaitEntered);
                 let _ = self.gc_cv.wait_timeout(led, Duration::from_millis(50));
                 continue;
             }
@@ -2883,5 +2931,166 @@ mod tests {
                  max={max:?}"
             ));
         }
+    }
+
+    // The follower branch of `wait_durable` (the `follower-acked-early` mutant target), forced
+    // deterministically rather than left to timing. A real leader thread is held inside its
+    // `before_sync` hook, so the gc flag is set and `durable_seq` is below the target: any caller
+    // that now reaches `wait_durable(target)` must take the follower wait. A follower that returns
+    // before the target is published is exactly the defect (`if *led { return Ok(()); }`).
+    //
+    // The follower runs the real private `wait_durable`; nothing about the branch is reimplemented.
+    // The "did it return early" check is a bounded, failure-aware receive: the real code cannot
+    // return while the leader is held (the leader withholds the only wake), the mutant returns at
+    // once. After release the follower must return, observe `durable_seq >= target`, and the
+    // leader's committed create must survive a reopen.
+    #[test]
+    fn follower_wait_does_not_ack_before_the_leader_publishes_durable_seq() {
+        follower_wait_case(false);
+    }
+
+    #[test]
+    #[should_panic(expected = "follower did not enter the gc_cv wait branch")]
+    fn follower_verifier_rejects_the_real_branch_early_return_control() {
+        follower_wait_case(true);
+    }
+
+    fn follower_wait_case(early_return: bool) {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+
+        // Create the snapshot before the hook exists. Under `Ack::Durable` `new_snapshot` commits
+        // synchronously with `force_hook`, so it runs the hook; if the hook were installed first it
+        // would send on `entered_tx` and block, and the buffered signal would later be misread as
+        // the leader's. Opening the store hook-free, snapshotting, then reopening with the hook
+        // makes every signal on `entered_tx` the leader's own commit.
+        let mut warm = opts();
+        warm.ack = Ack::Durable;
+        let m0 = Meta::open(&path, warm).unwrap();
+        m0.new_snapshot("s").unwrap();
+        m0.close().unwrap();
+        drop(m0);
+
+        // The leader blocks in the hook until released, so its commit cannot publish `durable_seq`.
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let hold_once = std::sync::atomic::AtomicBool::new(true);
+        let hook: SyncHook = Arc::new(move || {
+            if hold_once.swap(false, SeqCst) {
+                entered_tx.send(()).map_err(std::io::Error::other)?;
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        });
+        let mut o = opts();
+        o.ack = Ack::Durable;
+        o.before_sync = Some(hook);
+        let m = Meta::open(&path, o).unwrap();
+
+        let follower_saw: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let target;
+        {
+            let m_leader = m.clone();
+            let lead = std::thread::spawn(move || {
+                m_leader
+                    .snapshot("s")
+                    .unwrap()
+                    .create(ROOT_INO, b"lead", 0o644)
+            });
+
+            entered_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("leader never reached the before_sync hook");
+
+            // Precondition for the follower branch, read from the real state: the leader holds the gc
+            // flag and its commit has not yet published `durable_seq`.
+            target = m.h.inner.durable_seq.load(SeqCst) + 1;
+            {
+                let led = lock(&m.h.inner.gc);
+                assert!(
+                    *led,
+                    "a leader must be running for this to be a follower test"
+                );
+                assert!(
+                    m.h.inner.durable_seq.load(SeqCst) < target,
+                    "the target must not be durable yet"
+                );
+            }
+
+            // The follower runs the real private `wait_durable` under the leader-held flag, and it
+            // reports its control flow through the thread-local witness installed on its own thread.
+            // The first event must be `WaitEntered`, emitted inside the real `if *led` branch before
+            // it parks on `gc_cv`; the mutant (`if *led { return Ok(()); }`) skips that emission and
+            // only the harness `Returned` below ever fires, so the first event proves which branch
+            // ran, with no sleep and independent of when the follower thread is scheduled.
+            //
+            // The witness sender is thread-local, so it must be installed on the follower thread:
+            // the follower sends its receiver to the main thread before it calls `wait_durable`.
+            let (rx_tx, rx_rx) = mpsc::channel::<mpsc::Receiver<WaitWitness>>();
+            let inner = m.h.inner.clone();
+            let saw = follower_saw.clone();
+            let follower = std::thread::spawn(move || {
+                let observed = watch_wait_durable();
+                WAIT_EARLY_RETURN.with(|flag| flag.set(early_return));
+                let _ = rx_tx.send(observed);
+                let r = inner.wait_durable(target);
+                let seq = inner.durable_seq.load(SeqCst);
+                // Harness terminal event: fires for both the real follower (after the leader's wake)
+                // and the mutant (immediately), so a missing `WaitEntered` is never mistakable for an
+                // unscheduled thread.
+                wait_witness(WaitWitness::Returned);
+                *saw.lock().unwrap() = Some(seq);
+                r
+            });
+            let witness_rx = rx_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("follower thread never installed the wait witness");
+
+            // The first witness event is the branch proof. `WaitEntered` means the real follower
+            // branch ran and parked; anything else (a `Returned` from the mutant return, or no event)
+            // fails here. Bounded so a bug in the harness cannot hang the suite.
+            let first = witness_rx.recv_timeout(Duration::from_secs(30));
+
+            release_tx.send(()).unwrap();
+            lead.join().unwrap().unwrap();
+            follower.join().unwrap().unwrap();
+            assert_eq!(
+                first.expect("follower produced no witness event"),
+                WaitWitness::WaitEntered,
+                "follower did not enter the gc_cv wait branch: it returned (or skipped) before the \
+                 leader published durable_seq, which is the follower-acked-early defect"
+            );
+        }
+
+        let saw = follower_saw
+            .lock()
+            .unwrap()
+            .expect("follower never returned");
+        assert!(
+            saw >= target,
+            "the follower returned before durable_seq reached the target: {saw} < {target}"
+        );
+
+        // Genuine durability: reopen from the file and require the acked create to survive.
+        m.close().unwrap();
+        drop(m);
+        let again = Meta::open(&path, opts()).unwrap();
+        let entries = again
+            .snapshot("s")
+            .unwrap()
+            .readdir(ROOT_INO, 0, 1000)
+            .unwrap();
+        assert_eq!(
+            entries.entries.len(),
+            1,
+            "the acked create was lost after reopen"
+        );
     }
 }
