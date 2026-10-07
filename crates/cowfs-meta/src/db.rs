@@ -2126,6 +2126,89 @@ impl Snapshot {
 mod tests {
     use super::*;
 
+    fn verify_inode_limit(skip_check: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+        let m = Meta::open(&path, opts()).unwrap();
+        let s = m.new_snapshot("s").unwrap();
+        {
+            let mut state = m.h.inner.wlock().unwrap();
+            state.ino.next = INO_LIMIT - 1;
+            state.ino.reserved = INO_LIMIT - 1;
+        }
+        let last = s.batch(|tx| tx.create(ROOT_INO, b"last", 0o644)).unwrap();
+        assert_eq!(last.ino.0, INO_LIMIT - 1);
+        assert_eq!(s.lookup(ROOT_INO, b"last").unwrap().ino, last.ino);
+        drop(s);
+        m.close().unwrap();
+        drop(m);
+
+        let m = Meta::open(&path, opts()).unwrap();
+        let s = m.snapshot("s").unwrap();
+        assert_eq!(s.lookup(ROOT_INO, b"last").unwrap().ino, last.ino);
+        assert_eq!(durable_reserved(&m), INO_LIMIT);
+
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::tx::SKIP_INODE_LIMIT.with(|c| c.set(self.0));
+            }
+        }
+        let reset = Reset(crate::tx::SKIP_INODE_LIMIT.with(|c| c.replace(skip_check)));
+        let result = s.batch(|tx| tx.create(ROOT_INO, b"overflow", 0o644));
+        drop(reset);
+        match result {
+            Err(Error::LimitExceeded("inode numbers exhausted")) => {}
+            Err(e) => panic!("unexpected inode-limit fixture failure: {e}"),
+            Ok(attr) => {
+                assert_eq!(attr.ino.0, INO_LIMIT);
+                assert_eq!(s.lookup(ROOT_INO, b"overflow").unwrap().ino, attr.ino);
+                panic!("inode-limit verifier accepted an unrepresentable inode id");
+            }
+        }
+        assert!(matches!(
+            s.lookup(ROOT_INO, b"overflow"),
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            s.batch(|tx| tx.mkdir(ROOT_INO, b"directory", 0o755)),
+            Err(Error::LimitExceeded("inode numbers exhausted"))
+        ));
+        assert!(matches!(
+            s.batch(|tx| tx.symlink(ROOT_INO, b"link", b"last")),
+            Err(Error::LimitExceeded("inode numbers exhausted"))
+        ));
+        assert_eq!(durable_reserved(&m), INO_LIMIT);
+        m.check().unwrap();
+        drop(s);
+        m.close().unwrap();
+        drop(m);
+
+        let m = Meta::open(&path, opts()).unwrap();
+        let s = m.snapshot("s").unwrap();
+        assert_eq!(s.lookup(ROOT_INO, b"last").unwrap().ino, last.ino);
+        for name in [b"overflow".as_slice(), b"directory", b"link"] {
+            assert!(matches!(s.lookup(ROOT_INO, name), Err(Error::NotFound)));
+        }
+        assert!(matches!(
+            s.batch(|tx| tx.create(ROOT_INO, b"still-overflow", 0o644)),
+            Err(Error::LimitExceeded("inode numbers exhausted"))
+        ));
+        assert_eq!(durable_reserved(&m), INO_LIMIT);
+        m.check().unwrap();
+    }
+
+    #[test]
+    fn inode_limit_refuses_unrepresentable_ids_across_reopen() {
+        verify_inode_limit(false);
+    }
+
+    #[test]
+    #[should_panic(expected = "inode-limit verifier accepted an unrepresentable inode id")]
+    fn inode_limit_verifier_rejects_the_real_guard_removal_control() {
+        verify_inode_limit(true);
+    }
+
     /// Small blocks, so a range that crosses several of them still costs a fixed commit count.
     fn opts() -> Options {
         Options {

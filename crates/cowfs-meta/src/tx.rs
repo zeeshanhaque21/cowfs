@@ -7,6 +7,11 @@ use crate::{Error, Result};
 use cowfs_store::ChunkRef;
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static SKIP_INODE_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Hands out inode numbers below a durable high-water mark.
 #[derive(Debug)]
 pub(crate) struct InoAlloc {
@@ -73,7 +78,10 @@ impl Tx<'_> {
 
     fn alloc(&mut self) -> Result<Ino> {
         let a = &mut *self.ino;
-        if a.next >= INO_LIMIT {
+        let exhausted = a.next >= INO_LIMIT;
+        #[cfg(test)]
+        let exhausted = exhausted && !SKIP_INODE_LIMIT.with(|c| c.get());
+        if exhausted {
             return Err(Error::LimitExceeded("inode numbers exhausted"));
         }
         if a.next >= a.reserved {
