@@ -2159,7 +2159,7 @@ mod tests {
         drop(gone);
         m.reap_all().unwrap();
         m.remove_snapshot(id).unwrap();
-        assert_eq!(m.pending_reap(), 1);
+        assert_eq!(m.pending_reap().unwrap(), 1);
 
         let count = REAP_BUDGET as u64 + 1;
         {
@@ -2190,7 +2190,7 @@ mod tests {
         be.tag.store(1, SeqCst);
         let before = be.log().len();
         assert!(m.reap_step().unwrap());
-        assert_eq!(m.pending_reap(), 1);
+        assert_eq!(m.pending_reap().unwrap(), 1);
         assert!(be.log()[before..].iter().all(|ev| !matches!(ev, Ev::S(_))));
 
         struct Reset(bool);
@@ -2205,7 +2205,7 @@ mod tests {
         let more = m.reap_step().unwrap();
         drop(reset);
         assert!(!more);
-        assert_eq!(m.pending_reap(), 0);
+        assert_eq!(m.pending_reap().unwrap(), 0);
         let rtx = m.h.inner.db.begin_read().unwrap();
         assert!(rtx.open_table(NODES).unwrap().get(root).unwrap().is_none());
         assert!(rtx.open_table(REFS).unwrap().get(root).unwrap().is_none());
@@ -2219,7 +2219,7 @@ mod tests {
 
         let image = be.image();
         let recovered = Meta::open_with_backend(Be::from_image(image), opts()).unwrap();
-        assert_eq!(recovered.pending_reap(), 0);
+        assert_eq!(recovered.pending_reap().unwrap(), 0);
         assert!(matches!(
             recovered.snapshot("gone"),
             Err(Error::NoSuchSnapshot)
