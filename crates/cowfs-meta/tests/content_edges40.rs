@@ -27,6 +27,9 @@ fn an_empty_splice_inside_a_chunk_is_refused_without_changing_the_file() {
     let s = m.snapshot("s").unwrap();
     assert_eq!(s.content_version(f.ino).unwrap(), version);
     assert_eq!(s.chunks(f.ino).unwrap(), vec![chunk]);
+    let version = s
+        .batch(|tx| tx.splice_content(f.ino, version, 0, 0, &[], 8))
+        .expect("an empty splice at the initial chunk boundary stays legal");
     s.batch(|tx| tx.splice_content(f.ino, version, 8, 8, &[], 8))
         .expect("an empty splice at the covered-end boundary stays legal");
     m.check().unwrap();

@@ -560,6 +560,9 @@ impl Tx<'_> {
     /// hole). Last writer wins; use [`Tx::splice_content`] for a compare-and-swap.
     pub fn set_content(&mut self, ino: Ino, chunks: &[ChunkRef], size: u64) -> Result<Attr> {
         let mut rec = self.file_rec(ino)?;
+        if chunks.iter().any(|c| c.len == 0) {
+            return Err(Error::Invalid("zero-length chunk ref"));
+        }
         let total: u64 = chunks.iter().map(|c| u64::from(c.len)).sum();
         if size < total {
             return Err(Error::Invalid("size smaller than chunk list"));
@@ -611,6 +614,17 @@ impl Tx<'_> {
         }
         if start > end || end > rec.covered {
             return Err(Error::Invalid("splice range outside the chunk list"));
+        }
+        if new_chunks.iter().any(|c| c.len == 0) {
+            return Err(Error::Invalid("zero-length chunk ref"));
+        }
+        if start == end
+            && start < rec.covered
+            && self
+                .get(&key(ino, K_CHUNK, &start.to_be_bytes()))?
+                .is_none()
+        {
+            return Err(Error::Invalid("splice range is not on chunk boundaries"));
         }
         let old = read::extents(self, ino, start, end)?;
         let old_len: u64 = old.iter().map(|(_, c)| u64::from(c.len)).sum();
