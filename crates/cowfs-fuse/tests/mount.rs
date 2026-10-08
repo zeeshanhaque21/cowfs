@@ -587,6 +587,45 @@ fn access_follows_mode_bits_without_default_permissions() {
     assert!(!ok("-x", "w"));
 }
 
+#[test]
+#[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
+fn chown_to_another_uid_is_refused_and_changes_nothing() {
+    // nodefault_permissions: with it the kernel itself refuses a non-root chown, which would hide
+    // the adapter. Root still reaches the adapter either way.
+    let Some(fx) = Fixture::with("nodefault_permissions", |v| {
+        v.create(ROOT_INO, b"f", 0o644).unwrap();
+    }) else {
+        return;
+    };
+    let m = fs::metadata(fx.p("f")).unwrap();
+    let (uid, gid) = (m.uid(), m.gid());
+    // Everything belongs to the mounter, so another uid is a change the filesystem will not make.
+    assert_eq!(
+        errno(std::os::unix::fs::chown(fx.p("f"), Some(uid + 1), None)),
+        libc::EPERM,
+        "other uid"
+    );
+    assert_eq!(
+        errno(std::os::unix::fs::chown(
+            fx.p("f"),
+            Some(uid + 1),
+            Some(gid)
+        )),
+        libc::EPERM,
+        "other uid with the current gid"
+    );
+    let m = fs::metadata(fx.p("f")).unwrap();
+    assert_eq!(
+        (m.uid(), m.gid()),
+        (uid, gid),
+        "refused chown changes nothing"
+    );
+    // The current uid changes nothing, and a gid is accepted and ignored.
+    std::os::unix::fs::chown(fx.p("f"), Some(uid), None).unwrap();
+    std::os::unix::fs::chown(fx.p("f"), Some(uid), Some(gid)).unwrap();
+    std::os::unix::fs::chown(fx.p("f"), None, Some(gid)).unwrap();
+}
+
 fn create_read_only_and_write(fx: &Fixture) {
     let mut f = OpenOptions::new()
         .write(true)
