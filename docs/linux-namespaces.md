@@ -176,11 +176,13 @@ two-route check passes.
 The full `bench/` suite reports 53 tests on macOS, 10 of them skipped, and the rest of them belong to
 `bench/test_gates.py`.
 
-The GitHub `ubuntu-latest` runner denies namespaces, so CI takes the macOS branch and reports
-`OK (skipped=10)` there.
-That is the honest outcome and not a CI gap in the tests: a refusal pass is not an isolation pass, and
-the run's first line says which branch it took.
-The isolation matrix was run on `moonscape` instead, and the measurements above are from there.
+The GitHub `ubuntu-latest` runner (ubuntu-24.04, kernel 6.17) denies unprivileged user namespaces by default.
+Probe on the runner (2026-10-08, image ubuntu24/20261004.327): `kernel.apparmor_restrict_unprivileged_userns=1`, `kernel.unprivileged_userns_clone=1`, and `unshare -Ur -m true` fails with `write failed /proc/self/uid_map: Operation not permitted`.
+After `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` the same call succeeds and a `--rbind` inside the new mount namespace works.
+The `check` job still takes the refusal branch and reports `OK (skipped=10)` on its ubuntu leg.
+The `linux-namespaces` job in `.github/workflows/ci.yml` lifts that one sysctl, runs `bench/test_namespaces.py`, and then fails unless all 9 `Isolation` tests report `ok` and the only skip is `test_off_linux_is_unmeasurable`.
+A skipped isolation test therefore cannot read as green in that job (issue #171).
+The moonscape measurements above remain the FUSE-level evidence.
 `test_both_routes_refused_names_both_in_the_message` puts a refusing `unshare` stub first on `PATH`, so the two-route refusal message is still checked everywhere, including on a host where a namespace does work.
 
 The end-to-end run, on a Linux host with `/dev/fuse` and a Rust toolchain:

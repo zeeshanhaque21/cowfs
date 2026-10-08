@@ -32,6 +32,38 @@ jobs:
       - name: Bench harness unit tests
         run: python3 -m unittest discover -s bench -v
 
+  # Issue 171: the namespace isolation tests skip on a host that denies unprivileged user namespaces.
+  # ubuntu-24.04 does (kernel.apparmor_restrict_unprivileged_userns=1, measured on the runner), so
+  # this job lifts that one sysctl and then refuses to go green unless the isolation tests ran.
+  linux-namespaces:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --user --map-root-user --mount --propagation private -- true
+      - name: Namespace tests
+        shell: bash  # bash -e -o pipefail, so a failing test fails the step through the tee
+        run: python3 -m unittest discover -s bench -p test_namespaces.py -v 2>&1 | tee namespaces.log
+      - name: Enforce that isolation ran, not skipped
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          log = Path("namespaces.log").read_text()
+          assert "a mount namespace was available" in log, "helper reported no namespace: isolation skipped"
+          ran = re.findall(r"^(test_\w+) \(test_namespaces\.Isolation\.\w+\) \.\.\. ok$", log, re.MULTILINE)
+          assert len(ran) == 9, f"expected 9 isolation tests to pass, saw {len(ran)}: {ran}"
+          assert re.search(r"^Ran 17 tests", log, re.MULTILINE), "test count changed: update this gate"
+          assert re.search(r"^OK \(skipped=1\)$", log, re.MULTILINE), "namespace run was not a clean pass"
+          skipped = re.findall(r"^(test_\w+) .*\.\.\. skipped", log, re.MULTILINE)
+          assert skipped == ["test_off_linux_is_unmeasurable"], f"unexpected skips: {skipped}"
+          print("::notice::namespace isolation tests ran and passed: " + ", ".join(sorted(ran)))
+          PY
+
   linux-fuse:
     runs-on: ubuntu-latest
     timeout-minutes: 25
