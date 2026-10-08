@@ -11,7 +11,7 @@ use cowfs_vfs::{
 };
 use nfsserve::nfs::{
     cookie3, count3, createverf3, fattr3, fileid3, filename3, fsstat3, nfs_fh3, nfspath3, nfsstat3,
-    sattr3, set_gid3, set_mode3, set_uid3,
+    sattr3, set_mode3, set_uid3,
 };
 use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult};
 
@@ -433,21 +433,16 @@ impl Adapter {
         }
     }
 
-    /// Everything belongs to the mounter, so naming any other owner is a chown the filesystem will
-    /// not make: native answers EPERM to a non-root caller, and cowfs cannot store another owner
-    /// for any caller. Checked before anything is applied, so a refused request is not half done.
-    /// Naming the current owner changes nothing and passes.
+    /// Everything belongs to the mounter, so naming another uid is a chown the filesystem will not
+    /// make: native answers EPERM to a non-root caller, and cowfs cannot store another owner for
+    /// any caller. Checked before anything is applied, so a refused request is not half done.
+    /// Naming the current uid changes nothing and passes. A gid is still accepted and ignored, as
+    /// before: it is never stored, and native lets an owner chgrp to a group they belong to.
     fn owner_unchanged(&self, id: fileid3, s: &sattr3) -> NfsResult<()> {
-        if !matches!(s.uid, set_uid3::uid(_)) && !matches!(s.gid, set_gid3::gid(_)) {
+        let set_uid3::uid(u) = s.uid else {
             return Ok(());
-        }
-        let cur = self.getattr(id)?;
-        let same =
-            matches!(s.uid, set_uid3::Void) || matches!(s.uid, set_uid3::uid(u) if u == cur.uid);
-        let same = same
-            && (matches!(s.gid, set_gid3::Void)
-                || matches!(s.gid, set_gid3::gid(g) if g == cur.gid));
-        if same {
+        };
+        if u == self.getattr(id)?.uid {
             Ok(())
         } else {
             Err(nfsstat3::NFS3ERR_PERM)

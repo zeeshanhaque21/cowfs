@@ -56,7 +56,7 @@ These were raised as gaps by the adapter builders and judged correct as they are
 
 - `lookup_parent`: both adapters keep their own parent map, because they need the parent after a rename, which a point-in-time query cannot give.
 - `access` and permission enforcement: adapters check mode bits themselves.
-- `uid` and `gid` in `SetAttr`: adding them invites implementers to honour `chown`. The NFS adapter refuses a chown to another owner with EPERM (#110); FUSE still accepts and ignores it (#160).
+- `uid` and `gid` in `SetAttr`: adding them invites implementers to honour `chown`. The NFS adapter refuses a chown to another uid with EPERM (#110); a gid is still accepted and ignored, and FUSE still accepts and ignores both (#160).
 - An async trait: the trait is synchronous, and async adapters call it from blocking tasks.
 - `fallocate`, `copy_file_range`, hole queries (`SEEK_HOLE`), `RENAME_EXCHANGE`, special files, `dev` and `rdev`, and locks: adapters answer `ENOTSUP` or let the kernel handle them.
 - Core's hole flag, virtual inode alias table and snapshot rename belong to `cowfs-store`, `cowfs-core` and the control plane, not to `Vfs`.

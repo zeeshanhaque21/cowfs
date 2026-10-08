@@ -229,22 +229,31 @@ fn setattr_variants() {
 }
 
 #[test]
-fn chown_to_another_owner_is_refused_and_changes_nothing() {
+fn chown_to_another_uid_is_refused_and_changes_nothing() {
     use nfsserve::nfs::{set_gid3, set_uid3};
     const PERM: u32 = nfsstat3::NFS3ERR_PERM as u32;
-    let (_s, mut c) = setup();
-    let root = c.root.clone();
-    let f = c.create_file(&root, "f");
-    let a = c.attrs(&f);
-    let (uid, gid) = (a.uid, a.gid);
     let own = |u, g| nfsserve::nfs::sattr3 {
         uid: set_uid3::uid(u),
         gid: set_gid3::gid(g),
         ..sattr3_default()
     };
-    // Everything is owned by the mounter, so another owner is a change the filesystem will not make.
+    let opts = MountOptions {
+        appledouble: AppleDoubleMode::Hide,
+        ..MountOptions::default()
+    };
+    let (_s, mut c) = serve(memfs(), opts);
+    let root = c.root.clone();
+    let f = c.create_file(&root, "f");
+    let side = c.create_file(&root, "._f");
+    let a = c.attrs(&f);
+    let (uid, gid) = (a.uid, a.gid);
+    // Everything is owned by the mounter, so another uid is a change the filesystem will not make.
     assert_eq!(c.setattr(&f, own(uid + 1, gid)).0, PERM, "other uid");
-    assert_eq!(c.setattr(&f, own(uid, gid + 1)).0, PERM, "other gid");
+    assert_eq!(
+        c.setattr(&side, own(uid + 1, gid)).0,
+        PERM,
+        "other uid, sidecar"
+    );
     // A refused chown refuses the whole request, as native does: the mode in it is not applied.
     let mixed = nfsserve::nfs::sattr3 {
         uid: set_uid3::uid(uid + 1),
@@ -256,8 +265,10 @@ fn chown_to_another_owner_is_refused_and_changes_nothing() {
         a.mode,
         "mode untouched by a refused chown"
     );
-    // Naming the current owner changes nothing, which native allows.
+    // The current uid changes nothing, and a gid is accepted and ignored.
     assert_eq!(c.setattr(&f, own(uid, gid)).0, OK, "same owner");
+    assert_eq!(c.setattr(&f, own(uid, gid + 1)).0, OK, "any gid");
+    assert_eq!(c.attrs(&f).gid, gid, "gid unchanged");
 }
 
 #[test]

@@ -72,7 +72,9 @@ pub enum SetTime {
 }
 
 /// File attributes. Everything is owned by the mounter, so uid and gid are reported as the
-/// mounter's. `SetAttr` has no uid or gid: the NFS adapter answers a `chown` to another owner with `EPERM` and accepts one naming the current owner as a no-op. The FUSE adapter still accepts and ignores `chown`.
+/// mounter's. `SetAttr` has no uid or gid. The NFS adapter answers a `chown` to another uid with
+/// `EPERM` and accepts one naming the current uid as a no-op. A gid is accepted and ignored, and
+/// the FUSE adapter still accepts and ignores a uid too.
 ///
 /// Every operation that adds, removes or renames a name (`create`, `mkdir`, `symlink`,
 /// `link`, `unlink`, `rmdir`, `rename`) sets the mtime and ctime of the parent directory
