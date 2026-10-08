@@ -26,6 +26,9 @@ pub(crate) enum Op {
         name: Box<[u8]>,
         mode: u32,
         child: Ino,
+        /// The reservation ticket this create's number came from, spent when the create reaches
+        /// meta. `None` for a create replayed from a store written before reservations existed.
+        reserved: Option<cowfs_meta::ReservedIno>,
         what: Create,
     },
     Link {
@@ -218,7 +221,6 @@ impl Queue {
 #[derive(Debug)]
 pub(crate) struct SnapCtx {
     pub(crate) id: u64,
-    pub(crate) name: String,
     pub(crate) snap: Snapshot,
     /// Held by operations that change directory entries.
     pub(crate) ns: Mutex<()>,
@@ -234,10 +236,9 @@ pub(crate) struct SnapCtx {
 }
 
 impl SnapCtx {
-    pub(crate) fn new(id: u64, name: String, snap: Snapshot) -> Self {
+    pub(crate) fn new(id: u64, snap: Snapshot) -> Self {
         Self {
             id,
-            name,
             snap,
             ns: Mutex::new(()),
             flush: Mutex::new(()),

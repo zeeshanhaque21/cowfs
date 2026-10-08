@@ -30,9 +30,14 @@ pub struct PoolEntry {
     /// Absolute worktree path.
     #[serde(default)]
     pub path: String,
-    /// True while a lease or owner reservation protects the slot.
+    /// The state treehouse prints in its `status` column: `available`, `leased`, `dirty` and so on.
+    ///
+    /// A string, not a boolean: treehouse v3.1.0's JSON has no `leased` key, so a `leased: bool`
+    /// here deserialised as false for every slot ever read. Nothing reads this field yet; the
+    /// release path pins on `lease_id` instead, and a slot with no lease id is refused rather than
+    /// released. It is recorded because it is what the command actually says.
     #[serde(default)]
-    pub leased: bool,
+    pub status: String,
     /// Lease identity, when leased.
     #[serde(default)]
     pub lease_id: String,
@@ -208,7 +213,7 @@ fn stderr_of(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-fn tail(s: &str) -> String {
+pub(crate) fn tail(s: &str) -> String {
     const MAX: usize = 400;
     let t = s.trim();
     if t.chars().count() <= MAX {

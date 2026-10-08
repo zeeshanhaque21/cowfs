@@ -1,7 +1,8 @@
 //! Crash-safe snapshot replacement: stage a fork, record the intent, then move it into place.
 //!
-//! `cowfs-meta` has no atomic rename of a snapshot, so `Core` cannot replace a name in one
-//! transaction. Two rules make the operation safe without one:
+//! This is the replacement path, for promotion. A rename moves a name inside one metadata
+//! transaction and does not come here; a promotion has to destroy the target it replaces, and
+//! that cannot be one transaction. Two rules make the replacement safe without one:
 //!
 //! - The staging snapshot's name carries the reserved suffix `.cowfs-swap<N>`. The name rules
 //!   refuse it, so no caller can create or move a snapshot into it, and the synthetic root filters
@@ -34,12 +35,13 @@ use super::{control_meta, validate_snapshot_name, ControlError, Core, SnapshotEn
 use crate::util::MutexExt as _;
 
 const SWAP_PREFIX: &str = "swap-";
-/// Reserved in snapshot names: see the module docs.
-pub(crate) const STAGING: &str = ".cowfs-swap";
+/// Reserved in snapshot names: see the module docs. The marker and the rule that refuses it live
+/// in `cowfs-snapname`, so the control API refuses these names too.
+pub(crate) const STAGING: &str = cowfs_snapname::RESERVED;
 
 /// True for a name only the swap may use.
 pub(crate) fn is_staging(name: &str) -> bool {
-    name.contains(STAGING)
+    cowfs_snapname::is_reserved(name)
 }
 
 fn intent_path(root: &Path, target: &str) -> PathBuf {
@@ -137,10 +139,9 @@ pub(crate) fn recover(core: &Core) {
 }
 
 impl Core {
-    /// Replaces snapshot `new` with a clone of `src`.
-    ///
-    /// `rename_from` is `Some(old)` for a rename, where `old == src` and `old != new`; `None` for a
-    /// promote, where the existing `new` is the victim.
+    /// Replaces snapshot `new` with a clone of `src`, for the promotion path. A rename moves a name
+    /// rather than replacing one and does not come here: it has no victim to remove and needs no
+    /// staging, so `Core::rename_snapshot` commits the name directly.
     /// Returns `Ok` only when the new name is in place. Returns `Err` with the mount unchanged,
     /// except after the old target was removed, where the swap is rolled forward instead.
     /// The two forks change the snapshot id, so every inode number in the new snapshot differs
@@ -148,7 +149,6 @@ impl Core {
     pub(crate) fn swap_snapshot(
         &self,
         src: &str,
-        rename_from: Option<&str>,
         new: &str,
     ) -> Result<SnapshotEntry, ControlError> {
         validate_snapshot_name(new)?;
@@ -158,11 +158,11 @@ impl Core {
             ));
         }
         let src_sc = self.inner.snap_by_name(src)?;
-        // the snapshot whose name goes away: the renamed one, or an existing target of a promote
-        let victim: Option<&str> = match rename_from {
-            Some(o) => Some(o),
-            None if self.inner.snap_by_name(new).is_ok() => Some(new),
-            None => None,
+        // the snapshot whose name goes away: the existing target, when there is one
+        let victim: Option<&str> = if self.inner.snap_by_name(new).is_ok() {
+            Some(new)
+        } else {
+            None
         };
         self.inner.check_new_name_except(new, victim)?;
         let staged = staging_name(new);

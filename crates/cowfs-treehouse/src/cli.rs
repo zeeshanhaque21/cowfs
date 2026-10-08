@@ -5,7 +5,9 @@ use std::time::Duration;
 use crate::ctl::DEFAULT_BUSY_TIMEOUT;
 use crate::error::{Env, Error, Result, EXIT_ERROR, EXIT_OK};
 use crate::mode_a::{Doctor, ReturnOptions};
-use crate::mode_b::{BaseRefresh, PromoteOptions, DEFAULT_NFS_TIMEOUT, DEFAULT_TREEHOUSE_TIMEOUT};
+use crate::mode_b::{
+    BaseRefresh, Canonical, PromoteOptions, DEFAULT_NFS_TIMEOUT, DEFAULT_TREEHOUSE_TIMEOUT,
+};
 use crate::{connect, mode_a, mode_b, treehouse_bin, Daemon, Treehouse};
 
 const AFTER_HELP: &str = "\
@@ -196,6 +198,15 @@ pub struct BaseRefreshArgs {
     /// Refuse per-slot compiler flags, which spike 6 measured to dirty every clone
     #[arg(long)]
     pub rustflags: Option<String>,
+    /// Build in a mount namespace where the slot also appears at this absolute path, so artifacts
+    /// that embed an absolute path come out identical across slots. Linux only, and the directory
+    /// must already exist: the companion will not create it.
+    #[arg(long, value_name = "DIR", requires = "build")]
+    pub canonical: Option<PathBuf>,
+    /// Path to scripts/cowfs-ns-run.sh, given explicitly so it is not looked up through the
+    /// working directory
+    #[arg(long, value_name = "PATH", requires = "canonical")]
+    pub ns_helper: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -281,7 +292,6 @@ fn dispatch(cli: &Cli, env: &Env) -> Result<i32> {
                     a.mode
                 )));
             }
-            // Mode (a) needs no daemon, so nothing connects before the pool is named.
             let root = match a.root.clone() {
                 Some(r) => r,
                 None => {
@@ -292,7 +302,16 @@ fn dispatch(cli: &Cli, env: &Env) -> Result<i32> {
                     ))
                 }
             };
-            let mut daemon = if mode_b { Some(connect(env)?) } else { None };
+            // A mode (a) slot on a cowfs mount is scanned through the daemon's `ps` before the
+            // release, which is what catches the open descriptors and flocks `treehouse return`
+            // cannot see (issue #20). That scan needs a daemon, so a named `--socket` is
+            // required to be reachable rather than quietly ignored; without the flag mode (a)
+            // still needs no cowfs at all, which is the off-mount case.
+            let mut daemon = if mode_b || env.socket.is_some() {
+                Some(connect(env)?)
+            } else {
+                None
+            };
             let out = do_return(cli, &mut daemon, a, &root, mode_b, discard)?;
             emit(env, &out)?;
             Ok(EXIT_OK)
@@ -377,6 +396,25 @@ fn dispatch(cli: &Cli, env: &Env) -> Result<i32> {
     }
 }
 
+/// The opt-in canonical build path, or `None` for the pre-existing behaviour.
+///
+/// Both halves are required together, so a canonical path with no helper, or a helper with no
+/// canonical path, is a usage error rather than a silently ignored flag.
+fn canonical_of(a: &BaseRefreshArgs) -> Result<Option<Canonical>> {
+    match (&a.canonical, &a.ns_helper) {
+        (None, None) => Ok(None),
+        (Some(dir), Some(helper)) => Ok(Some(Canonical {
+            dir: dir.clone(),
+            helper: helper.clone(),
+        })),
+        _ => Err(Error::Usage(
+            "--canonical and --ns-helper go together: --canonical names the path, --ns-helper the \
+             scripts/cowfs-ns-run.sh that puts the slot there"
+                .to_owned(),
+        )),
+    }
+}
+
 fn dispatch_base(cli: &Cli, env: &Env, command: &BaseCommand) -> Result<i32> {
     match command {
         BaseCommand::Refresh(a) => {
@@ -388,6 +426,8 @@ fn dispatch_base(cli: &Cli, env: &Env, command: &BaseCommand) -> Result<i32> {
                         .to_owned(),
                 ));
             }
+            // Before the daemon, so a bad flag is reported as a usage error rather than as exit 3.
+            let canonical = canonical_of(a)?;
             let mut daemon = connect(env)?;
             let treehouse = match (&a.build, &a.root) {
                 (Some(_), Some(root)) => Some(treehouse_of(cli, Some(root))?),
@@ -400,6 +440,7 @@ fn dispatch_base(cli: &Cli, env: &Env, command: &BaseCommand) -> Result<i32> {
                 git_ref: a.git_ref.clone(),
                 build: a.build.clone(),
                 slot: a.slot.clone(),
+                canonical,
             }
             .run()?;
             emit(env, &out)?;

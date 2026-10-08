@@ -433,6 +433,7 @@ that takes a lock is not listed here.
 | `inner::all_snaps` | leaf | 1 |
 | `inner::alloc_virt` | aliases, last_error | leaf |
 | `inner::reserve_virt` | virt_lock | leaf |
+| `inner::take_reserved` | reserved | leaf |
 | `inner::lose_the_next_insert` | leaf | 1 |
 | `inner::meta_of` | aliases | leaf |
 | `inner::canon` | aliases | leaf |
@@ -455,9 +456,12 @@ that takes a lock is not listed here.
 | `inner::flush_locked_snapshot` | sc.q | 1 |
 | `inner::commit_batch` | sc.q, nodes, dents, aliases, unsynced | 1 then 2 then leaf |
 | `inner::restore_state` | st.rd, nodes | 2 |
+| `inner::op_times` | st.rd, nodes | 2 |
 | `inner::commit` | aliases, snap. | 3 then leaf |
 | `inner::sync_all` | unsynced | leaf |
 | `inner::fsync_snapshot` | unsynced | leaf |
+| `inner::sync_ns_snapshot` | unsynced | leaf |
+| `inner::finish_sync` | last_error, unsynced | leaf |
 | `inner::barrier` | sc.flush, last_error | 1 then leaf |
 | `inner::flush_namespace_locked` | sc.q | 1 |
 | `inner::tick` | sc.q, unsynced | 1 then leaf |
@@ -479,7 +483,7 @@ that takes a lock is not listed here.
 | `lib::fork_snapshot` | snap. | 3 |
 | `lib::list_snapshots` | leaf | 1 |
 | `lib::merkle_root` | snap. | 3 |
-| `lib::last_flush_error` | last_error | leaf |
+| `lib::last_flush_error` | last_error | leaf; clone and release before Meta health |
 | `lib::alias_table` | aliases | leaf |
 | `lib::set_load_node_contention` | leaf | 1 |
 | `lib::set_flush_fault` | leaf | 1 |
@@ -491,7 +495,7 @@ that takes a lock is not listed here.
 | `lib::register` | root_time, last_error, snap. | 3 then leaf |
 | `lib::unregister` | sc.ns, sc.flush, sc.q, st.try_read, nodes, dents, aliases, root_time | 1 then 2 then leaf |
 | `lib::stats` | sc.q, nodes, dents, aliases | 1 then 2 then leaf |
-| `lib::health` | sc.q, nodes, last_error | 1 then 2 then leaf |
+| `lib::health` | sc.q, nodes, last_error | 1 then 2 then leaf; release all before Meta health |
 | `lib::unpoison` | sc.q | 1 |
 | `lib::drop_caches` | st.try_read, nodes, dents | 2 |
 | `node::try_read_for` | st.try_read | 2 |
@@ -506,6 +510,7 @@ that takes a lock is not listed here.
 | `ns::op_link` | sc.ns, sc.q, st.wr, st.rd, dents | 1 then 2 |
 | `ns::op_unlink` | sc.ns, sc.q, st.wr, st.rd, dents | 1 then 2 |
 | `ns::op_rmdir` | sc.ns, sc.q, st.wr, dents | 1 then 2 |
+| `ns::barrier_if_needed` | st.rd, released before barrier commit | 1 |
 | `ns::require_empty` | st.rd | 2 |
 | `ns::op_rename` | sc.ns, sc.q, st.wr, st.rd, dents | 1 then 2 |
 | `ns::adjust_kids` | st.wr | 2 |

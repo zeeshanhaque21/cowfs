@@ -208,6 +208,10 @@ pub struct Adapter {
     parents: Mutex<HashMap<Ino, Ino>>,
     pub(crate) sidecars: Mutex<SidecarBuffers>,
     pub(crate) sidecar_locks: Mutex<PerIno>,
+    /// One lock per directory, so a call that reads a name and then changes it is one step against
+    /// that directory. Without it the sidecar guard could pass on a name that had just become a
+    /// live view, and a real directory or hard link could take the name.
+    names: Mutex<PerIno>,
 }
 
 impl std::fmt::Debug for Adapter {
@@ -230,6 +234,7 @@ impl Adapter {
             parents: Mutex::new(HashMap::new()),
             sidecars: Mutex::new(SidecarBuffers::default()),
             sidecar_locks: Mutex::new(PerIno::default()),
+            names: Mutex::new(PerIno::default()),
         })
     }
 
@@ -408,13 +413,39 @@ impl Adapter {
         }
     }
 
+    /// Barriers `dir`, and on failure answers with the barrier's status rather than the caller's.
+    ///
+    /// The status that goes out has to mean one thing only: every change this RPC made is durable.
+    /// When both the change's own step and the barrier failed, the barrier's `NFS3ERR_IO` is the
+    /// honest one, because the change's status would read as "that did not happen" and the caller
+    /// would have no way to learn that it did.
+    ///
+    /// The barrier is unconditional, and deliberately so. It is never "nothing to do because this
+    /// RPC changed nothing": it commits whatever the snapshot already had queued, so a refusal that
+    /// arrives on top of earlier uncommitted writes still discharges them. Callers reach this only
+    /// once they have passed prevalidation and may already have mutated, so the cost is one metadata
+    /// sync on a refusal rather than a name left unbarriered.
+    fn durable_or<T>(&self, dir: Ino, made: &NfsResult<T>) -> NfsResult<()> {
+        match (self.durable(dir), made) {
+            (Ok(()), Ok(_)) => Ok(()),
+            (Err(e), _) => Err(e),
+            (Ok(()), Err(e)) => Err(*e),
+        }
+    }
+
     pub fn setattr(&self, id: fileid3, s: &sattr3) -> NfsResult<fattr3> {
         let i = self.ident(id);
         if i.is_side() {
             return self.side_setattr(i.ino, s);
         }
-        self.apply(i.ino, set_attr(s))
-            .and_then(|a| self.fa(&a, Kind::Plain))
+        let out = self
+            .apply(i.ino, set_attr(s))
+            .and_then(|a| self.fa(&a, Kind::Plain));
+        // Unconditional, and that is the point: the barrier commits whatever this snapshot already
+        // had queued, so a refused `setattr` still discharges earlier uncommitted writes. It costs
+        // one metadata sync on a refusal. A failed barrier outranks the refusal's own status.
+        self.durable_or(i.ino, &out)?;
+        out
     }
 
     pub fn readlink(&self, id: fileid3) -> NfsResult<Vec<u8>> {
@@ -458,6 +489,17 @@ impl Adapter {
         self.vfs.fsync(i.ino, false).map_err(stat)
     }
 
+    /// Makes a name or attribute change durable before it is acknowledged.
+    ///
+    /// macOS sends no COMMIT for a directory `fsync`, nor for an `fsync` of a descriptor with no
+    /// dirty pages, so a caller that renamed and then synced the parent directory, the whole
+    /// POSIX dance, was told `NFS3_OK` about a name that was still only in memory and was back at
+    /// its old name after the daemon died. The reply is the one chance to fix that, and it costs
+    /// file data nothing: a dirty file stays unstable until its own COMMIT.
+    fn durable(&self, ino: Ino) -> NfsResult<()> {
+        self.vfs.sync_namespace(ino).map_err(stat)
+    }
+
     pub fn create(
         &self,
         dir: fileid3,
@@ -467,38 +509,57 @@ impl Adapter {
     ) -> NfsResult<(fileid3, fattr3)> {
         let d = self.ident(dir);
         not_side(d)?;
-        if self.side_of(d.ino, name) {
-            let (id, attr) = self.side_create(d.ino, name, attr, guarded)?;
-            return Ok((self.id_of(id), attr));
-        }
-        new_name(name)?;
-        let mode = match attr.mode {
-            set_mode3::mode(m) => m,
-            set_mode3::Void => 0o644,
-        };
-        let mut changes = set_attr(attr);
-        match self.vfs.create(d.ino, name, mode) {
-            Ok(a) => {
-                self.handed_out(Some(d.ino), &a);
-                changes.mode = None;
-                if changes.size == Some(0) {
-                    changes.size = None;
-                }
-                let a = self.apply(a.ino, changes)?;
-                Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
+        self.with_names(d.ino, || {
+            if self.side_of(d.ino, name) {
+                let (id, attr) = self.side_create(d.ino, name, attr, guarded)?;
+                self.durable(d.ino)?;
+                return Ok((self.id_of(id), attr));
             }
-            Err(Error::Exists) if !guarded => {
-                let existing = self.vfs.lookup(d.ino, name).map_err(stat)?;
-                if existing.kind == FileKind::Directory {
-                    self.vfs.forget(existing.ino, 1);
-                    return Err(nfsstat3::NFS3ERR_ISDIR);
+            new_name(name)?;
+            let mode = match attr.mode {
+                set_mode3::mode(m) => m,
+                set_mode3::Void => 0o644,
+            };
+            let mut changes = set_attr(attr);
+            // `Vfs::create` has already made the name by the time any of this runs, so the arm must not
+            // return with `?`: the barrier is owed whatever the attribute step does.
+            let made = match self.vfs.create(d.ino, name, mode) {
+                Ok(a) => {
+                    self.handed_out(Some(d.ino), &a);
+                    changes.mode = None;
+                    if changes.size == Some(0) {
+                        changes.size = None;
+                    }
+                    match self.apply(a.ino, changes) {
+                        Ok(a) => self
+                            .fa(&a, Kind::Plain)
+                            .map(|fa| (self.id_of(Id::plain(a.ino)), fa)),
+                        Err(e) => Err(e),
+                    }
                 }
-                self.handed_out(Some(d.ino), &existing);
-                let a = self.apply(existing.ino, changes)?;
-                Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
-            }
-            Err(e) => Err(stat(e)),
-        }
+                Err(Error::Exists) if !guarded => {
+                    let existing = match self.vfs.lookup(d.ino, name) {
+                        Ok(a) => a,
+                        Err(e) => return Err(stat(e)),
+                    };
+                    if existing.kind == FileKind::Directory {
+                        self.vfs.forget(existing.ino, 1);
+                        return Err(nfsstat3::NFS3ERR_ISDIR);
+                    }
+                    self.handed_out(Some(d.ino), &existing);
+                    match self.apply(existing.ino, changes) {
+                        Ok(a) => self
+                            .fa(&a, Kind::Plain)
+                            .map(|fa| (self.id_of(Id::plain(a.ino)), fa)),
+                        Err(e) => Err(e),
+                    }
+                }
+                // Nothing was created, so nothing is owed and no barrier runs.
+                Err(e) => return Err(stat(e)),
+            };
+            self.durable_or(d.ino, &made)?;
+            made
+        })
     }
 
     pub fn create_exclusive(
@@ -509,48 +570,115 @@ impl Adapter {
     ) -> NfsResult<(fileid3, fattr3)> {
         let d = self.ident(dir);
         not_side(d)?;
-        if self.side_of(d.ino, name) {
-            let (id, attr) = self.side_create_exclusive(d.ino, name)?;
-            return Ok((self.id_of(id), attr));
-        }
-        new_name(name)?;
-        let (atime, mtime) = verifier_times(verf);
-        match self.vfs.create(d.ino, name, 0o600) {
-            Ok(a) => {
-                self.handed_out(Some(d.ino), &a);
-                let changes = SetAttr {
-                    atime: Some(SetTime::At(atime)),
-                    mtime: Some(SetTime::At(mtime)),
-                    ..SetAttr::default()
-                };
-                let a = self.vfs.setattr(a.ino, changes).map_err(stat)?;
-                Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
+        self.with_names(d.ino, || {
+            if self.side_of(d.ino, name) {
+                let (id, attr) = self.side_create_exclusive(d.ino, name)?;
+                self.durable(d.ino)?;
+                return Ok((self.id_of(id), attr));
             }
-            Err(Error::Exists) => {
-                let a = self.vfs.lookup(d.ino, name).map_err(stat)?;
-                if a.kind == FileKind::Regular && a.atime == atime && a.mtime == mtime {
+            new_name(name)?;
+            let (atime, mtime) = verifier_times(verf);
+            // The name exists once `Vfs::create` has returned, so the arm yields a value and the barrier
+            // runs whatever the `setattr` and attribute conversion do. The `Exists` arm below created
+            // nothing, so it owes no barrier.
+            let made = match self.vfs.create(d.ino, name, 0o600) {
+                Ok(a) => {
                     self.handed_out(Some(d.ino), &a);
-                    Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
-                } else {
-                    self.vfs.forget(a.ino, 1);
-                    Err(nfsstat3::NFS3ERR_EXIST)
+                    let changes = SetAttr {
+                        atime: Some(SetTime::At(atime)),
+                        mtime: Some(SetTime::At(mtime)),
+                        ..SetAttr::default()
+                    };
+                    match self.vfs.setattr(a.ino, changes) {
+                        Ok(a) => match self.fa(&a, Kind::Plain) {
+                            Ok(fa) => Ok((self.id_of(Id::plain(a.ino)), fa)),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(stat(e)),
+                    }
                 }
-            }
-            Err(e) => Err(stat(e)),
+                Err(Error::Exists) => {
+                    let a = match self.vfs.lookup(d.ino, name) {
+                        Ok(a) => a,
+                        Err(e) => return Err(stat(e)),
+                    };
+                    if a.kind == FileKind::Regular && a.atime == atime && a.mtime == mtime {
+                        self.handed_out(Some(d.ino), &a);
+                        match self.fa(&a, Kind::Plain) {
+                            Ok(fa) => Ok((self.id_of(Id::plain(a.ino)), fa)),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        self.vfs.forget(a.ino, 1);
+                        return Err(nfsstat3::NFS3ERR_EXIST);
+                    }
+                }
+                Err(e) => return Err(stat(e)),
+            };
+            self.durable_or(d.ino, &made)?;
+            made
+        })
+    }
+
+    /// A name that is a live sidecar view belongs to another file's extended attributes, so no
+    /// real directory, symlink or hard link may take it: a real object under that name would
+    /// shadow the view for the rest of the mount, and a hard link would hand the view the bytes
+    /// of the file it names. `ACCES` is what [`Adapter::rename`] already answers when a real
+    /// file is moved onto a view.
+    fn not_a_view(&self, dir: Ino, name: &[u8]) -> NfsResult<()> {
+        if self.side_of(dir, name) {
+            Err(nfsstat3::NFS3ERR_ACCES)
+        } else {
+            Ok(())
         }
+    }
+
+    /// Runs `f` with `dir`'s name space locked, so a read of a name and the change that follows it
+    /// are one step. The lock is per directory, so writers of different directories do not wait
+    /// for each other, and it is a plain mutex because the work under it is synchronous `Vfs`
+    /// calls that never re-enter the adapter.
+    fn with_names<T>(&self, dir: Ino, f: impl FnOnce() -> NfsResult<T>) -> NfsResult<T> {
+        let l = lock(&self.names).of(dir);
+        let g = lock(&l);
+        let out = f();
+        drop(g);
+        out
+    }
+
+    /// The same, for a call that changes two directories at once. Both locks are taken in a fixed
+    /// order, so two renames cannot take them in opposite orders and stop each other forever.
+    fn with_two_names<T>(&self, a: Ino, b: Ino, f: impl FnOnce() -> NfsResult<T>) -> NfsResult<T> {
+        if a == b {
+            return self.with_names(a, f);
+        }
+        let (first, second) = if a < b { (a, b) } else { (b, a) };
+        let (l1, l2) = {
+            let mut m = lock(&self.names);
+            (m.of(first), m.of(second))
+        };
+        let g1 = lock(&l1);
+        let g2 = lock(&l2);
+        let out = f();
+        drop(g2);
+        drop(g1);
+        out
     }
 
     pub fn mkdir(&self, dir: fileid3, name: &[u8], attr: &sattr3) -> NfsResult<(fileid3, fattr3)> {
         let d = self.ident(dir);
         not_side(d)?;
         new_name(name)?;
-        let mode = match attr.mode {
-            set_mode3::mode(m) => m,
-            set_mode3::Void => 0o755,
-        };
-        let a = self.vfs.mkdir(d.ino, name, mode).map_err(stat)?;
-        self.handed_out(Some(d.ino), &a);
-        Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
+        self.with_names(d.ino, || {
+            self.not_a_view(d.ino, name)?;
+            let mode = match attr.mode {
+                set_mode3::mode(m) => m,
+                set_mode3::Void => 0o755,
+            };
+            let a = self.vfs.mkdir(d.ino, name, mode).map_err(stat)?;
+            self.handed_out(Some(d.ino), &a);
+            self.durable(d.ino)?;
+            Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
+        })
     }
 
     pub fn symlink(
@@ -568,9 +696,13 @@ impl Adapter {
         if target.len() > SYMLINK_TARGET_MAX {
             return Err(nfsstat3::NFS3ERR_NAMETOOLONG);
         }
-        let a = self.vfs.symlink(d.ino, name, target).map_err(stat)?;
-        self.handed_out(Some(d.ino), &a);
-        Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
+        self.with_names(d.ino, || {
+            self.not_a_view(d.ino, name)?;
+            let a = self.vfs.symlink(d.ino, name, target).map_err(stat)?;
+            self.handed_out(Some(d.ino), &a);
+            self.durable(d.ino)?;
+            Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
+        })
     }
 
     pub fn link(&self, file: fileid3, dir: fileid3, name: &[u8]) -> NfsResult<fattr3> {
@@ -581,9 +713,13 @@ impl Adapter {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
         new_name(name)?;
-        let a = self.vfs.link(f.ino, d.ino, name).map_err(stat)?;
-        self.handed_out(None, &a);
-        self.fa(&a, Kind::Plain)
+        self.with_names(d.ino, || {
+            self.not_a_view(d.ino, name)?;
+            let a = self.vfs.link(f.ino, d.ino, name).map_err(stat)?;
+            self.handed_out(None, &a);
+            self.durable(d.ino)?;
+            self.fa(&a, Kind::Plain)
+        })
     }
 
     /// Removes one name and releases the inode if that was its last link.
@@ -605,20 +741,27 @@ impl Adapter {
         let d = self.ident(dir);
         not_side(d)?;
         check_name(name)?;
-        if self.translating(d.ino, name) {
-            return self.side_remove(d.ino, name);
-        }
-        self.remove_one(d.ino, name)?;
-        if let (true, Some(side)) = (
-            self.opts.appledouble == AppleDoubleMode::Hide,
-            Self::sidecar(name),
-        ) {
-            let _ = self.remove_one(d.ino, &side);
-        }
-        Ok(())
+        self.with_names(d.ino, || {
+            if self.translating(d.ino, name) {
+                return self.side_remove(d.ino, name);
+            }
+            self.remove_one(d.ino, name)?;
+            if let (true, Some(side)) = (
+                self.opts.appledouble == AppleDoubleMode::Hide,
+                Self::sidecar(name),
+            ) {
+                let _ = self.remove_one(d.ino, &side);
+            }
+            self.durable(d.ino)?;
+            Ok(())
+        })
     }
 
     /// Removes every entry of `dir` if all of them are AppleDouble sidecars.
+    ///
+    /// Each removal is a real name change, so a failure part way through has already mutated and the
+    /// caller owes the barrier. That is why this returns a `Result` rather than acting through `?`
+    /// into an early return that would skip it.
     fn purge_sidecars(&self, dir: Ino) -> NfsResult<()> {
         let mut names = Vec::new();
         let mut cookie = 0;
@@ -635,6 +778,8 @@ impl Adapter {
                 _ => break,
             }
         }
+        // Stop at the first failure and report it. Some names may already be gone, which the
+        // caller's barrier covers; this function does not pretend the directory is untouched.
         for name in names {
             self.remove_one(dir, &name)?;
         }
@@ -645,19 +790,30 @@ impl Adapter {
         let d = self.ident(dir);
         not_side(d)?;
         check_name(name)?;
-        if self.translating(d.ino, name) {
-            return Err(nfsstat3::NFS3ERR_NOTDIR);
-        }
-        let target = self.peek(d.ino, name).map_err(stat)?;
-        match self.vfs.rmdir(d.ino, name) {
-            Err(Error::NotEmpty) if self.opts.appledouble == AppleDoubleMode::Hide => {
-                self.purge_sidecars(target.ino)?;
-                self.vfs.rmdir(d.ino, name).map_err(stat)?;
+        self.with_names(d.ino, || {
+            if self.translating(d.ino, name) {
+                return Err(nfsstat3::NFS3ERR_NOTDIR);
             }
-            r => r.map_err(stat)?,
-        }
-        self.reap_if_last(target.ino);
-        Ok(())
+            let target = self.peek(d.ino, name).map_err(stat)?;
+            // The purge removes real names, so every exit from here owes the barrier, including the ones
+            // that answer with an error. The arm therefore yields a value instead of propagating with
+            // `?`: a `?` after `purge_sidecars` returned before the barrier while sidecar names were
+            // already removed, which is the same defect the `create` arms had.
+            let made: NfsResult<()> = match self.vfs.rmdir(d.ino, name) {
+                Err(Error::NotEmpty) if self.opts.appledouble == AppleDoubleMode::Hide => {
+                    match self.purge_sidecars(target.ino) {
+                        Ok(()) => self.vfs.rmdir(d.ino, name).map_err(stat),
+                        Err(e) => Err(e),
+                    }
+                }
+                r => r.map_err(stat),
+            };
+            self.durable_or(d.ino, &made)?;
+            if made.is_ok() {
+                self.reap_if_last(target.ino);
+            }
+            made
+        })
     }
 
     pub fn rename(
@@ -672,47 +828,54 @@ impl Adapter {
         not_side(td)?;
         check_name(from)?;
         check_name(to)?;
-        match (self.side_of(fd.ino, from), self.side_of(td.ino, to)) {
-            // The attributes live on the inode and moved with it, so there is nothing to do.
-            (true, _) => return Ok(()),
-            // A real file cannot be moved onto the view of another file.
-            (false, true) if !self.translating(fd.ino, from) => {
-                return Err(nfsstat3::NFS3ERR_ACCES);
+        self.with_two_names(fd.ino, td.ino, || {
+            match (self.side_of(fd.ino, from), self.side_of(td.ino, to)) {
+                // The attributes live on the inode and moved with it, so there is nothing to do.
+                (true, _) => return Ok(()),
+                // A real file cannot be moved onto the view of another file.
+                (false, true) if !self.translating(fd.ino, from) => {
+                    return Err(nfsstat3::NFS3ERR_ACCES);
+                }
+                // A plain name moved onto a view: that view is the file's own attributes already.
+                (false, true) => return Ok(()),
+                // Both are ordinary names, including a `._name` with no main file to hold attributes.
+                (false, false) => {}
             }
-            // A plain name moved onto a view: that view is the file's own attributes already.
-            (false, true) => return Ok(()),
-            // Both are ordinary names, including a `._name` with no main file to hold attributes.
-            (false, false) => {}
-        }
-        let src = self.peek(fd.ino, from).map_err(stat)?;
-        let replaced = self.peek(td.ino, to).ok();
-        self.vfs
-            .rename(fd.ino, from, td.ino, to, RenameFlags::default())
-            .map_err(stat)?;
-        if src.kind == FileKind::Directory {
-            lock(&self.parents).insert(src.ino, td.ino);
-        }
-        if let Some(d) = replaced {
-            if d.ino != src.ino {
-                self.reap_if_last(d.ino);
+            let src = self.peek(fd.ino, from).map_err(stat)?;
+            let replaced = self.peek(td.ino, to).ok();
+            self.vfs
+                .rename(fd.ino, from, td.ino, to, RenameFlags::default())
+                .map_err(stat)?;
+            if src.kind == FileKind::Directory {
+                lock(&self.parents).insert(src.ino, td.ino);
             }
-        }
-        if self.opts.appledouble == AppleDoubleMode::Hide {
-            if let (Some(from_side), Some(to_side)) = (Self::sidecar(from), Self::sidecar(to)) {
-                let replaced_side = self.peek(td.ino, &to_side).ok();
-                let moved =
-                    self.vfs
-                        .rename(fd.ino, &from_side, td.ino, &to_side, RenameFlags::default());
-                if moved.is_err() {
-                    let _ = self.remove_one(td.ino, &to_side);
-                } else if let Some(d) = replaced_side {
-                    if d.nlink <= 1 {
-                        self.reap(d.ino);
+            if let Some(d) = replaced {
+                if d.ino != src.ino {
+                    self.reap_if_last(d.ino);
+                }
+            }
+            if self.opts.appledouble == AppleDoubleMode::Hide {
+                if let (Some(from_side), Some(to_side)) = (Self::sidecar(from), Self::sidecar(to)) {
+                    let replaced_side = self.peek(td.ino, &to_side).ok();
+                    let moved = self.vfs.rename(
+                        fd.ino,
+                        &from_side,
+                        td.ino,
+                        &to_side,
+                        RenameFlags::default(),
+                    );
+                    if moved.is_err() {
+                        let _ = self.remove_one(td.ino, &to_side);
+                    } else if let Some(d) = replaced_side {
+                        if d.nlink <= 1 {
+                            self.reap(d.ino);
+                        }
                     }
                 }
             }
-        }
-        Ok(())
+            self.durable(fd.ino)?;
+            Ok(())
+        })
     }
 
     /// Up to `max` visible entries after `cookie`. Hidden sidecars are skipped but their cookies

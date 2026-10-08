@@ -115,9 +115,9 @@ fn create_after_an_elided_unlink_survives_a_reopen() {
     assert_eq!(names(&c, s1), vec![b"f".to_vec()]);
     let reopened = c.lookup(s1, b"f").unwrap().ino;
     assert_eq!(read_all(&c, reopened), b"third");
-    assert_ne!(
+    assert_eq!(
         reopened, committed,
-        "a reopened session hands out new inode numbers"
+        "reopening preserves the committed physical inode number"
     );
     c.check().unwrap();
     assert!(c.fsck().unwrap().is_clean());

@@ -108,7 +108,7 @@ pub(crate) struct PerIno {
 }
 
 impl PerIno {
-    fn of(&mut self, ino: Ino) -> Arc<Mutex<()>> {
+    pub(crate) fn of(&mut self, ino: Ino) -> Arc<Mutex<()>> {
         if let Some(l) = self.map.get(&ino).and_then(Weak::upgrade) {
             return l;
         }
@@ -164,6 +164,11 @@ impl Adapter {
     fn side_target(&self, dir: Ino, name: &[u8]) -> NfsResult<Attr> {
         let target = side_of(name).ok_or(nfsstat3::NFS3ERR_INVAL)?;
         if is_appledouble(target) {
+            return Err(nfsstat3::NFS3ERR_NOENT);
+        }
+        // `.` and `..` are the two names a `Vfs` refuses to look up and no client can create, so
+        // `._.` and `._..` are real files. Looking one up is a missing name, not a bad one.
+        if target == b"." || target == b".." {
             return Err(nfsstat3::NFS3ERR_NOENT);
         }
         self.peek(dir, target).map_err(stat)

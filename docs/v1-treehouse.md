@@ -447,16 +447,18 @@ Not testable today, listed so it is not mistaken for done.
    `.git` file rewrite and `target/` becoming Fresh.
 3. `flock` and hardlinks on the real adapter. The doctor checks run against native directories
    today and report what they can.
-4. `.nfs*` silly-rename behaviour on the real NFS loopback. The sandbox tests reproduce the
-   condition with a held file descriptor on a native directory, which is enough to prove the
-   wrapper's detect, wait and refuse logic but not the kernel behaviour.
+4. ~~`.nfs*` silly-rename behaviour on the real NFS loopback.~~ Measured on a live cowfs mount in
+   `docs/verification/ready-20.md`: a held file unlinked through the mount becomes
+   `.nfs.<id>` with identical content, the return refuses, and the silly-rename disappears when the
+   descriptor is released, not at unmount.
 5. Real commit hashes in `base.commit`, so staleness is a real comparison.
 6. A warm base with a `.git` file rather than a `.git` directory (gap 7).
 7. AppleDouble hiding or translation (gap 9).
 8. Dedup actually happening across slots, which is the point of the whole thing and needs the
    store and the GC.
-9. `ps` reporting real `fd` and `lock` holds from a real adapter. The stub reports injected
-   holders, so the tests prove the companion's logic and not the adapter's scan.
+9. ~~`ps` reporting real `fd` and `lock` holds from a real adapter.~~ Measured on the same live
+   mount: `ps` on a mode (a) slot directory names the pids holding a descriptor in it, with no
+   `cwd` hold anywhere, through the real `lsof` scan.
 
 ## User guide
 
@@ -490,8 +492,11 @@ cd <path from the JSON>
 cowfs-treehouse return --slot <path> --root ~/.cowfs/mnt/th
 ```
 
-The wrapper is optional in mode (a). Plain `treehouse return` works, and leaves issue #20 open:
-a holder with only an open fd or a flock is missed and the slot ends up `dirty`.
+The wrapper is what makes mode (a) safe on a mount. Plain `treehouse return` cannot see a holder
+that has chdir'd out of the slot and still has a file or a flock in it, and on a network mount it
+leaves the slot `dirty`. Give the wrapper `--socket` so it can scan the slot through the daemon before
+the release; without it there is nothing to scan and it says so rather than claiming the slot was
+quiet.
 
 ### Mode (b), end to end
 

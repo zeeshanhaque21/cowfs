@@ -29,6 +29,6 @@ pub use sys::current_uid;
 pub use treehash::{hash_tree, hash_view, TreeHash, HASH_ALGORITHM};
 pub use types::*;
 pub use validate::{
-    escape_control, name_key, validate_abs_path, validate_git_ref, validate_repo,
-    validate_snapshot_name, MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_REF_BYTES,
+    escape_control, name_key, validate_abs_path, validate_git_ref, validate_mount_relative,
+    validate_repo, validate_snapshot_name, MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_REF_BYTES,
 };

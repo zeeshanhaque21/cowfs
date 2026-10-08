@@ -165,6 +165,23 @@ impl Inner {
         if parent == ROOT_INO {
             return Err(Error::ReadOnly);
         }
+        // Refuse at the session ceiling before reserving: the number would be handed out now and
+        // released later, and a client still holding it would see `Stale`, so the create fails
+        // here instead. Every live inode keeps one alias, so the alias count is the live count.
+        let live = self.aliases.rd().len();
+        if live >= self.opts.alias_limit {
+            *self.last_error.lk() = Some(format!(
+                "session inode limit reached: {live} inodes are live, the ceiling is {}",
+                self.opts.alias_limit
+            ));
+            return Err(Error::NoSpace);
+        }
+        // Reserve before any Core lock: the refill opens a meta reservation, and no lock of ours
+        // may be held across a meta transaction. A ticket popped and then unused (an early
+        // `Exists`/`NotFound` below) is wasted, never reused.
+        let ticket = self.take_reserved()?;
+        let snap = snap_of(parent).ok_or(Error::Stale)?;
+        let ino = pack(snap, ticket.ino().0)?;
         let (sc, pn) = self.dir(parent)?;
         let _ns = sc.ns.lk();
         if pn.st.rd().attr.nlink == 0 {
@@ -174,7 +191,6 @@ impl Inner {
             return Err(Error::Exists);
         }
         let now = Timestamp::now();
-        let ino = self.alloc_virt(sc.id)?;
         let (kind, nlink, size, target, mode) = match &what {
             Create::File => (FileKind::Regular, 1, 0, None, mode & MODE_MASK),
             Create::Dir => (FileKind::Directory, 2, 0, None, mode & MODE_MASK),
@@ -219,6 +235,7 @@ impl Inner {
                 name: name.into(),
                 mode,
                 child: ino,
+                reserved: Some(ticket),
                 what,
             };
             let s = q.push(op, &[&pn, &node], &[&pn, &node]);
@@ -226,6 +243,11 @@ impl Inner {
             s
         };
         pn.ns_seq.store(seq, Ordering::Release);
+        // A reserved create's number is a packed meta number, so `meta_of` answers for it before meta
+        // has seen it. The child records the same sequence its create was queued at, so the gates
+        // that read meta through the child (`op_readdir`, `require_empty`, `barrier_if_needed`) commit
+        // the create first instead of reading an inode meta does not have, which is `Stale`.
+        node.ns_seq.store(seq, Ordering::Release);
         self.nodes.upsert(ino, node.clone());
         self.shrink_nodes(ino);
         self.dents.put(parent, name, Some((ino, kind)), seq);
@@ -449,7 +471,8 @@ impl Inner {
     /// answer cannot be known from memory.
     /// Commits this directory's pending work if it has any, without any lock of ours.
     fn barrier_if_needed(&self, sc: &SnapCtx, cn: &Node) -> Result<()> {
-        if cn.ns_seq.load(Ordering::Acquire) > sc.flushed() {
+        let unknown = cn.st.rd().kids.is_none();
+        if unknown && cn.ns_seq.load(Ordering::Acquire) > sc.flushed() {
             self.barrier(sc)?;
         }
         Ok(())

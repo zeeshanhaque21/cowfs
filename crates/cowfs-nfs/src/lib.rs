@@ -38,8 +38,15 @@
 //!   calls. It holds no lock across a `Vfs` call: the only locks it takes are over its own
 //!   sidecar state, and they are per inode.
 //! - `fsync(ROOT_INO, false)` is the whole-mount barrier. NFS COMMIT maps to `fsync(ino, false)`
-//!   for every handle, the root included, and never to a data-only sync, so the name a file was
-//!   created under is durable when COMMIT returns.
+//!   for every handle, the root included, and never to a data-only sync, so a file whose COMMIT
+//!   returned survives a crash.
+//! - The client does not send a COMMIT for every sync a caller writes: not for a directory `fsync`,
+//!   and not for an `fsync` of a descriptor with no dirty pages. A rename the caller followed with
+//!   `fsync(parent_dir_fd)`, which is the whole POSIX dance, would be acknowledged and still be
+//!   only in memory. So the adapter does not wait to be asked: every name and attribute it changes
+//!   is made durable with `sync_namespace` before the reply goes out (issue #90, measured in
+//!   `docs/nfs-namespace-durability90.md`). That is a barrier on the acknowledgement of a name, not
+//!   a flush per byte: `WRITE` stays unstable until the client's own COMMIT.
 //! - `readdir` with `max == 0` is `InvalidArgument`, so the adapter clamps a zero budget to one
 //!   entry instead of passing it on or turning it into an error the client cannot act on.
 //! - `open`, `release` and `flush` are not called: NFSv3 has no procedure for them.

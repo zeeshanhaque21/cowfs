@@ -5,7 +5,10 @@ use crate::frame::{
 };
 use crate::handler::{CancelToken, ControlHandler, HolderGuard, OpContext};
 use crate::types::*;
-use crate::validate::{validate_abs_path, validate_git_ref, validate_repo, validate_snapshot_name};
+use crate::validate::{
+    validate_abs_path, validate_git_ref, validate_mount_relative, validate_repo,
+    validate_snapshot_name,
+};
 use crate::{socket, sys};
 use serde_json::json;
 use std::collections::HashMap;
@@ -1152,7 +1155,9 @@ fn dispatch(
             Response::BaseRefresh(h.base_refresh(p, ctx)?)
         }
         Request::Ps(p) => {
-            validate_snapshot_name(&p.snapshot)?;
+            // A mount-relative directory, not a snapshot name: a mode (a) treehouse slot is a
+            // directory inside a snapshot, and issue #20 needs a scan of exactly that directory.
+            validate_mount_relative(&p.snapshot)?;
             Response::Processes(ProcessList {
                 processes: h.holders(&p.snapshot)?,
             })

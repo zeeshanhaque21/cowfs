@@ -271,6 +271,159 @@ fn a_sidecar_write_past_the_cap_is_refused() {
     );
 }
 
+/// `._name` is the sidecar of `name` while `name` exists, so the name is a view of that file's
+/// extended attributes rather than a name in the directory. CREATE already answers a view for it;
+/// MKDIR, SYMLINK and LINK did not check at all, so a real directory, symlink or hard link could
+/// take the name, shadow the view for the rest of the mount, and in the LINK case hand the view
+/// the bytes of the file it names. `ACCES` is what RENAME already answers when a real file is
+/// moved onto a view.
+#[test]
+fn a_view_cannot_be_made_a_real_object() {
+    let vfs = memfs();
+    let (_s, mut c) = serve(vfs.clone(), translated());
+    let root = c.root.clone();
+    let doc = c.create_file(&root, "doc");
+
+    assert_eq!(c.mkdir(&root, "._doc").0, ACCES, "a directory");
+    assert_eq!(c.symlink(&root, "._doc", "somewhere").0, ACCES, "a symlink");
+    assert_eq!(c.link(&doc, &root, "._doc").0, ACCES, "a hard link");
+    assert_eq!(
+        vfs.lookup(ROOT_INO, b"._doc").err(),
+        Some(Error::NotFound),
+        "no real object took the name"
+    );
+    assert_eq!(c.names(&root), vec!["doc"]);
+
+    // With no `name` to hold the attributes there is no view, and a real object is right.
+    assert_eq!(c.mkdir(&root, "._lonely").0, OK);
+    assert_eq!(c.symlink(&root, "._link", "somewhere").0, OK);
+    assert_eq!(c.link(&doc, &root, "._hard").0, OK);
+    assert_eq!(c.names(&root), vec!["._hard", "._link", "._lonely", "doc"]);
+
+    // And a stored `._doc` is already a real file, so the same three calls stay allowed. It has
+    // to arrive before `doc` exists, which is what every zip, tar and git checkout does.
+    let vfs = memfs();
+    let (_s2, mut c) = serve(vfs, translated());
+    let root = c.root.clone();
+    c.create_file(&root, "._doc");
+    c.create_file(&root, "doc");
+    // The name is occupied, not a view, so the refusal is EXIST and not ACCES.
+    for (what, st) in [
+        ("mkdir", c.mkdir(&root, "._doc").0),
+        ("symlink", c.symlink(&root, "._doc", "somewhere").0),
+    ] {
+        assert_eq!(st, EXIST, "{what} onto a real file of that name");
+    }
+    assert_eq!(
+        c.mkdir(&root, "._dir").0,
+        OK,
+        "no main file, so a real name"
+    );
+    assert_eq!(c.names(&root), vec!["._dir", "._doc", "doc"]);
+}
+
+/// The corruption this allowed: the client sets an extended attribute by creating `._doc` and
+/// writing an AppleDouble file to it. With a hard link under that name the write landed on the
+/// file itself, so 19 bytes of content became a 4096 byte sidecar and every call answered OK.
+#[test]
+fn a_link_under_a_view_name_never_rewrites_the_files_content() {
+    let vfs = memfs();
+    let (_s, mut c) = serve(vfs.clone(), translated());
+    let root = c.root.clone();
+    let doc = c.create_file(&root, "doc");
+    assert_eq!(c.write(&doc, 0, b"the quick brown fox", 2).0, OK);
+    let ino = vfs.lookup(ROOT_INO, b"doc").unwrap().ino;
+
+    assert_eq!(c.link(&doc, &root, "._doc").0, ACCES, "refused");
+
+    // The client pattern that used to destroy the content.
+    let (st, side, _) = c.create(&root, "._doc", 0, sattr_mode(0o644), [0; 8]);
+    assert_eq!(st, OK);
+    let side = side.expect("a view of doc");
+    assert_eq!(c.write(&side, 0, &sidecar_with("user.k", b"v"), 2).0, OK);
+    assert_eq!(c.commit(&side), OK);
+
+    assert_eq!(vfs.read(ino, 0, 4096), Ok(b"the quick brown fox".to_vec()));
+    assert_eq!(vfs.getattr(ino).unwrap().size, 19);
+    assert_eq!(vfs.getxattr(ino, b"user.k"), Ok(b"v".to_vec()));
+    assert_eq!(vfs.getattr(ino).unwrap().nlink, 1, "no second name");
+    assert_eq!(c.names(&root), vec!["doc"]);
+}
+
+/// `.` and `..` are the two names a `Vfs` refuses to look up and no client can create, so a
+/// `._.` or `._..` is never a view. Looking one up has to say so the way every other missing
+/// name does; it used to answer `INVAL`, which a client cannot act on.
+#[test]
+fn a_dot_name_view_is_noent_and_the_name_is_a_real_file() {
+    let vfs = memfs();
+    let (_s, mut c) = serve(vfs.clone(), translated());
+    let root = c.root.clone();
+    let (_, sub) = c.mkdir(&root, "sub");
+    let sub = sub.unwrap();
+
+    for name in ["._.", "._.."] {
+        assert_eq!(c.lookup(&root, name).0, NOENT, "{name} at the root");
+        assert_eq!(c.lookup(&sub, name).0, NOENT, "{name} in sub");
+    }
+
+    c.create_file(&root, "._.");
+    c.create_file(&sub, "._..");
+    let sub_ino = vfs.lookup(ROOT_INO, b"sub").unwrap().ino;
+    assert!(
+        vfs.lookup(ROOT_INO, b"._.").is_ok(),
+        "a real file at the root"
+    );
+    assert!(vfs.lookup(sub_ino, b"._..").is_ok(), "a real file in sub");
+
+    let made = c.must_lookup(&sub, "._..");
+    assert_eq!(c.write(&made, 0, b"a real file", 2).0, OK);
+    assert_eq!(c.read(&made, 0, 100).1, b"a real file");
+    assert!(
+        vfs.listxattr(sub_ino).unwrap().is_empty(),
+        "the directory kept its own attributes"
+    );
+    assert_ne!(
+        c.lookup(&sub, "._..").1.unwrap().data,
+        root.data,
+        "`._..` is not a view of the mount root"
+    );
+    assert_eq!(c.names(&sub), vec!["._.."]);
+}
+
+/// The negative control: the guard is about `Translate` only. `Hide` and `Store` keep every
+/// `._` name an ordinary name, so all three calls still make a real object.
+#[test]
+fn outside_translate_every_dot_underscore_name_is_an_ordinary_name() {
+    for mode in [AppleDoubleMode::Hide, AppleDoubleMode::Store] {
+        let vfs = memfs();
+        let opts = MountOptions {
+            appledouble: mode,
+            ..MountOptions::default()
+        };
+        let (_s, mut c) = serve(vfs.clone(), opts);
+        let root = c.root.clone();
+        let doc = c.create_file(&root, "doc");
+        assert_eq!(c.mkdir(&root, "._doc").0, OK, "{mode:?} a directory");
+        assert_eq!(
+            c.symlink(&root, "._sym", "somewhere").0,
+            OK,
+            "{mode:?} a symlink"
+        );
+        assert_eq!(c.link(&doc, &root, "._hard").0, OK, "{mode:?} a hard link");
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"._doc").map(|a| a.kind),
+            Ok(cowfs_vfs::FileKind::Directory),
+            "{mode:?}"
+        );
+        assert_eq!(
+            vfs.getattr(vfs.lookup(ROOT_INO, b"doc").unwrap().ino)
+                .unwrap()
+                .nlink,
+            2
+        );
+    }
+}
+
 #[test]
 fn the_sidecar_of_a_sidecar_is_a_real_file() {
     let vfs = memfs();

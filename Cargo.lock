@@ -241,6 +241,7 @@ version = "0.0.0"
 dependencies = [
  "cowfs-gc",
  "cowfs-meta",
+ "cowfs-snapname",
  "cowfs-store",
  "cowfs-vfs",
  "cowfs-vfs-test",
@@ -251,7 +252,6 @@ dependencies = [
  "redb",
  "tempfile",
  "thiserror",
- "unicode-normalization",
 ]
 
 [[package]]
@@ -259,6 +259,7 @@ name = "cowfs-ctl"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "cowfs-snapname",
  "cowfs-vfs",
  "cowfs-vfs-path",
  "libc",
@@ -266,7 +267,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "unicode-normalization",
 ]
 
 [[package]]
@@ -295,6 +295,7 @@ dependencies = [
 name = "cowfs-fuse"
 version = "0.0.0"
 dependencies = [
+ "cowfs-core",
  "cowfs-vfs",
  "cowfs-vfs-path",
  "cowfs-vfs-test",
@@ -339,12 +340,21 @@ dependencies = [
  "async-trait",
  "blake3",
  "cowfs-vfs",
+ "cowfs-vfs-path",
  "cowfs-vfs-test",
  "nfsserve",
  "signal-hook",
  "tempfile",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "cowfs-snapname"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "unicode-normalization",
 ]
 
 [[package]]

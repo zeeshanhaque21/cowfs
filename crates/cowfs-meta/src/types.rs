@@ -11,6 +11,77 @@ pub struct Ino(pub u64);
 /// The root directory of every snapshot.
 pub const ROOT_INO: Ino = Ino(1);
 
+/// A contiguous half-open range of inode numbers reserved before any of them names an inode.
+///
+/// `end` is exclusive, so the range holds `end - start` numbers and a one-number range is
+/// `start..start + 1`. The numbers come from the same allocator ordinary creation draws on, so no
+/// other caller is handed one of them, and the durable floor is committed before the range is
+/// returned, so a number is not reissued after a reopen even if it never gets used.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InoRange {
+    start: Ino,
+    end: Ino,
+}
+
+impl InoRange {
+    /// Builds a range whose first number is `start` and whose end is one past the last.
+    pub const fn new(start: Ino, end: Ino) -> Self {
+        Self { start, end }
+    }
+
+    /// The lowest number in the range.
+    pub const fn start(&self) -> Ino {
+        self.start
+    }
+
+    /// One past the highest number, exclusive.
+    pub const fn end(&self) -> Ino {
+        self.end
+    }
+
+    /// How many numbers the range holds.
+    pub const fn len(&self) -> u64 {
+        self.end.0 - self.start.0
+    }
+
+    /// Always false for a range this crate hands out: asking for zero numbers is refused.
+    pub const fn is_empty(&self) -> bool {
+        self.end.0 == self.start.0
+    }
+
+    /// Whether `ino` is one of the numbers in the range.
+    pub const fn contains(&self, ino: Ino) -> bool {
+        ino.0 >= self.start.0 && ino.0 < self.end.0
+    }
+
+    /// Every number in the range, lowest first.
+    pub fn iter(&self) -> impl Iterator<Item = Ino> + '_ {
+        (self.start.0..self.end.0).map(Ino)
+    }
+}
+
+/// One inode number a [`Meta`](crate::Meta) session has reserved and not yet created.
+///
+/// This is the capability a selected-number create needs. It is deliberately `!Copy` and `!Clone`
+/// with a private field, so a caller cannot duplicate it and mint the same number twice, and it
+/// carries the store's own identity and the session that minted it, so a create can refuse a ticket
+/// from another store or from a session that has since closed. Only [`Meta::reserve_tickets`]
+/// mints one, and the session removes it from its outstanding set when the create commits.
+///
+/// [`Meta::reserve_tickets`]: crate::Meta::reserve_tickets
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReservedIno {
+    pub(crate) store: u64,
+    pub(crate) ino: Ino,
+}
+
+impl ReservedIno {
+    /// The reserved inode number itself. Read-only: reading it does not spend the ticket.
+    pub const fn ino(&self) -> Ino {
+        self.ino
+    }
+}
+
 /// Snapshot id. Never reused.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct SnapshotId(pub u64);
@@ -332,13 +403,17 @@ pub(crate) fn decode_cookie_val(b: &[u8]) -> Result<(Ino, FileType, &[u8])> {
     ))
 }
 
-pub(crate) fn encode_chunks(chunks: &[ChunkRef]) -> Vec<u8> {
+pub(crate) fn encode_chunks(chunks: &[ChunkRef]) -> Result<Vec<u8>> {
     let mut b = Vec::with_capacity(chunks.len() * 36);
     for c in chunks {
+        // the flag and the sentinel must agree before anything reaches the medium: a hole that
+        // named a stored block would lose that block from every walk
+        c.validate()
+            .map_err(|_| Error::Invalid("chunk ref is neither a hole nor a block"))?;
         b.extend_from_slice(c.id.as_bytes());
         b.extend(c.len.to_le_bytes());
     }
-    b
+    Ok(b)
 }
 
 pub(crate) fn decode_chunks(b: &[u8]) -> Result<Vec<ChunkRef>> {
@@ -349,10 +424,18 @@ pub(crate) fn decode_chunks(b: &[u8]) -> Result<Vec<ChunkRef>> {
         .0
         .iter()
         .map(|c| {
-            Ok(ChunkRef {
-                id: BlockId::from_bytes(rd(c, 0)?),
-                len: u32::from_le_bytes(rd(c, 32)?),
-            })
+            let id = BlockId::from_bytes(rd(c, 0)?);
+            let len = u32::from_le_bytes(rd(c, 32)?);
+            // a store written before the flag existed still says "hole" with the sentinel, so the
+            // flag comes from the id here and costs nothing on the medium
+            let r = ChunkRef {
+                id,
+                len,
+                hole: id == cowfs_store::HOLE,
+            };
+            r.validate()
+                .map_err(|_| Error::Corrupt("chunk ref is not a hole or a block".into()))?;
+            Ok(r)
         })
         .collect()
 }

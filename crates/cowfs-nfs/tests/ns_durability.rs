@@ -1,0 +1,608 @@
+//! The durability contract of the NFS transport: what the adapter makes durable before it
+//! acknowledges a namespace RPC, and what it deliberately leaves alone. Issue #90.
+//!
+//! The crash itself is `cowfs-daemon`'s `namespace_durability` test, over a real mount. These are
+//! the same claim at the seam, so a mistake here is caught without a mount, in seconds, and the
+//! two together pin the order: the barrier follows the mutation it is making durable, and a
+//! barrier that fails is an error rather than a success.
+mod common;
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use common::*;
+use cowfs_vfs::{
+    Attr, Error, FileHandle, ReadDir, ReadDirPlus, Result, SetAttr, StatFs, Vfs, XattrFlags,
+};
+use cowfs_vfs_test::MemVfs;
+use nfsserve::nfs::sattr3;
+
+/// One event the server asked the `Vfs` for, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Call {
+    Fsync(u64),
+    SyncNs(u64),
+    Rename,
+    Create,
+    Unlink,
+    Write,
+}
+
+/// A `MemVfs` that records the durability calls it was asked for and can be told to fail the
+/// namespace barrier only, so the failure cannot be confused with a failed mutation.
+struct Watched {
+    inner: Arc<MemVfs>,
+    calls: Mutex<Vec<Call>>,
+    /// Names `create` was told to make, whether or not the RPC that followed succeeded.
+    created: Mutex<Vec<String>>,
+    fail_ns: AtomicBool,
+    fail_mutation: AtomicBool,
+    /// Fail `setattr`, which is the step after a name exists, without failing the create.
+    fail_setattr: AtomicBool,
+    /// Fail `rmdir` from the Nth call on, so the Hide-mode purge has already removed sidecars.
+    /// `usize::MAX` never fires.
+    fail_rmdir_after: AtomicUsize,
+    /// Fail the Nth `unlink`, so a purge fails part way through.
+    fail_unlink_at: AtomicUsize,
+    unlinks: AtomicUsize,
+    rmdirs: AtomicUsize,
+}
+
+impl Watched {
+    fn new() -> Arc<Watched> {
+        Arc::new(Watched {
+            inner: Arc::new(MemVfs::new()),
+            calls: Mutex::new(Vec::new()),
+            created: Mutex::new(Vec::new()),
+            fail_ns: AtomicBool::new(false),
+            fail_mutation: AtomicBool::new(false),
+            fail_setattr: AtomicBool::new(false),
+            fail_rmdir_after: AtomicUsize::new(usize::MAX),
+            fail_unlink_at: AtomicUsize::new(0),
+            unlinks: AtomicUsize::new(0),
+            rmdirs: AtomicUsize::new(0),
+        })
+    }
+
+    fn note(&self, c: Call) {
+        self.calls.lock().unwrap().push(c);
+    }
+
+    fn calls(&self) -> Vec<Call> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn forget(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+
+    /// The names `create` was told to make, so a test can tell an error reply from a name that
+    /// does not exist.
+    fn created(&self) -> Vec<String> {
+        self.created.lock().unwrap().clone()
+    }
+
+    /// How many `unlink`s reached the inner filesystem, so a test can prove a purge really removed
+    /// names before the failure it is testing.
+    fn unlinks(&self) -> usize {
+        self.unlinks.load(Ordering::Relaxed)
+    }
+
+    /// Every barrier seen since the last `forget`.
+    fn barriers(&self) -> Vec<Call> {
+        self.calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::SyncNs(_) | Call::Fsync(_)))
+            .collect()
+    }
+}
+
+impl Vfs for Watched {
+    fn lookup(&self, p: u64, n: &[u8]) -> Result<Attr> {
+        self.inner.lookup(p, n)
+    }
+    fn getattr(&self, i: u64) -> Result<Attr> {
+        self.inner.getattr(i)
+    }
+    fn setattr(&self, i: u64, c: SetAttr) -> Result<Attr> {
+        // `PermissionDenied`, not `Io`: `nfsstat` maps it to `NFS3ERR_ACCES`, so a reply carrying it
+        // is distinguishable from the barrier's `NFS3ERR_IO` and the precedence is observable.
+        if self.fail_setattr.load(Ordering::Relaxed) {
+            return Err(Error::PermissionDenied);
+        }
+        self.inner.setattr(i, c)
+    }
+    fn readlink(&self, i: u64) -> Result<Vec<u8>> {
+        self.inner.readlink(i)
+    }
+    fn create(&self, p: u64, n: &[u8], m: u32) -> Result<Attr> {
+        if self.fail_mutation.load(Ordering::Relaxed) {
+            return Err(Error::PermissionDenied);
+        }
+        self.note(Call::Create);
+        self.created
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(n).into_owned());
+        self.inner.create(p, n, m)
+    }
+    fn mkdir(&self, p: u64, n: &[u8], m: u32) -> Result<Attr> {
+        self.inner.mkdir(p, n, m)
+    }
+    fn symlink(&self, p: u64, n: &[u8], t: &[u8]) -> Result<Attr> {
+        self.inner.symlink(p, n, t)
+    }
+    fn link(&self, i: u64, p: u64, n: &[u8]) -> Result<Attr> {
+        self.inner.link(i, p, n)
+    }
+    fn unlink(&self, p: u64, n: &[u8]) -> Result<()> {
+        if self.fail_mutation.load(Ordering::Relaxed) {
+            return Err(Error::PermissionDenied);
+        }
+        self.note(Call::Unlink);
+        let seen = self.unlinks.fetch_add(1, Ordering::Relaxed);
+        if seen + 1 == self.fail_unlink_at.load(Ordering::Relaxed) {
+            return Err(Error::PermissionDenied);
+        }
+        self.inner.unlink(p, n)
+    }
+    fn rmdir(&self, p: u64, n: &[u8]) -> Result<()> {
+        // Counted so a test can fail the retry after `purge_sidecars` has already removed names.
+        let seen = self.rmdirs.fetch_add(1, Ordering::Relaxed);
+        if seen >= self.fail_rmdir_after.load(Ordering::Relaxed) {
+            return Err(Error::PermissionDenied);
+        }
+        self.inner.rmdir(p, n)
+    }
+    fn rename(
+        &self,
+        p: u64,
+        n: &[u8],
+        np: u64,
+        nn: &[u8],
+        f: cowfs_vfs::RenameFlags,
+    ) -> Result<()> {
+        if self.fail_mutation.load(Ordering::Relaxed) {
+            return Err(Error::PermissionDenied);
+        }
+        self.note(Call::Rename);
+        self.inner.rename(p, n, np, nn, f)
+    }
+    fn open(&self, i: u64) -> Result<FileHandle> {
+        self.inner.open(i)
+    }
+    fn release(&self, h: FileHandle) -> Result<()> {
+        self.inner.release(h)
+    }
+    fn read(&self, i: u64, o: u64, s: u32) -> Result<Vec<u8>> {
+        self.inner.read(i, o, s)
+    }
+    fn write(&self, i: u64, o: u64, d: &[u8]) -> Result<u32> {
+        self.note(Call::Write);
+        self.inner.write(i, o, d)
+    }
+    fn flush(&self, i: u64) -> Result<()> {
+        self.inner.flush(i)
+    }
+    fn fsync(&self, i: u64, data_only: bool) -> Result<()> {
+        assert!(!data_only, "COMMIT is never data only");
+        self.note(Call::Fsync(i));
+        self.inner.fsync(i, data_only)
+    }
+    fn sync_namespace(&self, ino: u64) -> Result<()> {
+        self.note(Call::SyncNs(ino));
+        if self.fail_ns.load(Ordering::Relaxed) {
+            return Err(Error::Io("store sync failed".into()));
+        }
+        self.inner.sync_namespace(ino)
+    }
+    fn readdir(&self, d: u64, c: u64, m: usize) -> Result<ReadDir> {
+        self.inner.readdir(d, c, m)
+    }
+    fn readdir_attrs(&self, d: u64, c: u64, m: usize) -> Result<ReadDirPlus> {
+        self.inner.readdir_attrs(d, c, m)
+    }
+    fn statfs(&self) -> Result<StatFs> {
+        self.inner.statfs()
+    }
+    fn getxattr(&self, i: u64, n: &[u8]) -> Result<Vec<u8>> {
+        self.inner.getxattr(i, n)
+    }
+    fn setxattr(&self, i: u64, n: &[u8], v: &[u8], f: XattrFlags) -> Result<()> {
+        self.inner.setxattr(i, n, v, f)
+    }
+    fn listxattr(&self, i: u64) -> Result<Vec<Vec<u8>>> {
+        self.inner.listxattr(i)
+    }
+    fn removexattr(&self, i: u64, n: &[u8]) -> Result<()> {
+        self.inner.removexattr(i, n)
+    }
+}
+
+fn start(vfs: Arc<Watched>) -> (cowfs_nfs::Server, Nfs) {
+    serve(vfs, translated())
+}
+
+/// Hide mode, where a directory's `._name` sidecars are real files and `rmdir` purges them.
+fn start_hidden(vfs: Arc<Watched>) -> (cowfs_nfs::Server, Nfs) {
+    let mut opts = cowfs_nfs::MountOptions {
+        appledouble: cowfs_nfs::AppleDoubleMode::Hide,
+        ..cowfs_nfs::MountOptions::default()
+    };
+    opts.check_peer_uid = false;
+    let server = cowfs_nfs::Server::start(vfs.clone(), &opts, None).unwrap();
+    let c = Nfs::connect(server.port(), server.export_name());
+    (server, c)
+}
+
+fn translated() -> cowfs_nfs::MountOptions {
+    cowfs_nfs::MountOptions {
+        appledouble: cowfs_nfs::AppleDoubleMode::Translate,
+        ..cowfs_nfs::MountOptions::default()
+    }
+}
+
+/// The rename the issue measured as lost: one `RENAME`, and the barrier has to follow the rename
+/// and use the directory that was renamed in, so a caller that syncs the parent gets durability
+/// without ever asking again.
+#[test]
+fn a_rename_is_durable_before_it_is_acknowledged() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start(vfs.clone());
+    let root = c.root.clone();
+    let a = c.create_file(&root, "a");
+    let d = c.mkdir(&root, "d").1.expect("mkdir");
+    vfs.forget();
+
+    assert_eq!(c.rename(&root, "a", &d, "b"), OK);
+    assert_eq!(
+        vfs.calls(),
+        vec![Call::Rename, Call::SyncNs(c.attrs(&root).fileid)],
+        "the barrier must follow the rename and name the source directory, so a caller that syncs \
+         the parent directory gets the name"
+    );
+    // The name really is there, and only under its new one.
+    let (st, _, _, _) = c.lookup(&d, "b");
+    assert_eq!(st, OK);
+    assert_eq!(c.lookup(&root, "a").0, NOENT);
+    assert_eq!(
+        a.data,
+        c.must_lookup(&d, "b").data,
+        "the handle must be the same inode under the new name"
+    );
+}
+
+/// One namespace RPC to drive, and the name to report if it forgets its barrier.
+type Case<'a> = (&'a str, Box<dyn FnOnce(&mut Nfs) + 'a>);
+
+/// Every namespace RPC, so a new mutating procedure cannot join this list by being forgotten.
+#[test]
+fn every_namespace_rpc_is_durable_before_it_is_acknowledged() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start(vfs.clone());
+    let root = c.root.clone();
+    let f = c.create_file(&root, "f");
+    c.write(&f, 0, b"x", 2);
+    c.mkdir(&root, "d").1.expect("mkdir");
+    c.symlink(&root, "l", "f");
+    let (st, _) = c.link(&f, &root, "hard");
+    assert_eq!(st, OK);
+
+    let cases: Vec<Case> = vec![
+        (
+            "create",
+            Box::new(|c| {
+                c.create_file(&root, "n1");
+            }),
+        ),
+        (
+            "create exclusive",
+            Box::new(|c| {
+                let (st, _, _) = c.create(&root, "n1x", 2, sattr3::default(), [7; 8]);
+                assert_eq!(st, OK, "exclusive create");
+            }),
+        ),
+        (
+            "mkdir",
+            Box::new(|c| {
+                c.mkdir(&root, "n2");
+            }),
+        ),
+        (
+            "symlink",
+            Box::new(|c| {
+                c.symlink(&root, "n3", "f");
+            }),
+        ),
+        (
+            "link",
+            Box::new(|c| {
+                c.link(&f, &root, "n4");
+            }),
+        ),
+        (
+            "setattr",
+            Box::new(|c| {
+                c.setattr(&f, sattr_mtime(7, 0));
+            }),
+        ),
+        (
+            "remove",
+            Box::new(|c| {
+                c.remove(&root, "f");
+            }),
+        ),
+        (
+            "rmdir",
+            Box::new(|c| assert_eq!(c.rmdir(&root, "d"), OK, "rmdir of an empty dir")),
+        ),
+        (
+            "rename",
+            Box::new(|c| {
+                c.rename(&root, "l", &root, "l2");
+            }),
+        ),
+    ];
+    for (name, run) in cases {
+        vfs.forget();
+        run(&mut c);
+        let barriers = vfs.barriers();
+        assert_eq!(
+            barriers.len(),
+            1,
+            "{name} must make the namespace durable exactly once"
+        );
+        assert!(
+            matches!(barriers[0], Call::SyncNs(_)),
+            "{name} must use the namespace barrier, not a data fsync: {:?}",
+            vfs.calls()
+        );
+    }
+}
+
+/// WRITE stays unstable and READ stays cheap: the repair is a barrier at the acknowledgement of a
+/// name, not a flush per byte or per lookup.
+#[test]
+fn a_write_and_a_read_are_not_a_namespace_barrier() {
+    const UNSTABLE: u32 = 0;
+    const FILE_SYNC: u32 = 2;
+    let vfs = Watched::new();
+    let (_s, mut c) = start(vfs.clone());
+    let root = c.root.clone();
+    let f = c.create_file(&root, "f");
+    vfs.forget();
+
+    assert_eq!(c.write(&f, 0, b"payload", UNSTABLE).0, OK);
+    assert_eq!(
+        vfs.barriers(),
+        Vec::new(),
+        "an UNSTABLE write must stay unstable: the barrier is at the acknowledgement of a name, \
+         not per byte"
+    );
+
+    let (st, got, _) = c.read(&f, 0, 7);
+    assert_eq!((st, got.as_slice()), (OK, &b"payload"[..]));
+    assert_eq!(vfs.barriers(), Vec::new(), "READ must stay cheap");
+
+    // A client that asks for a stable write gets the data sync it asked for, and that is still
+    // the file's own fsync rather than the namespace barrier.
+    assert_eq!(c.write(&f, 7, b"!", FILE_SYNC).0, OK);
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::Fsync(c.attrs(&f).fileid)],
+        "a stable write syncs that file's data, and no namespace with it"
+    );
+
+    vfs.forget();
+    assert_eq!(c.commit(&f), OK);
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::Fsync(c.attrs(&f).fileid)],
+        "COMMIT of a file stays a data fsync of that file"
+    );
+}
+
+/// The failure path: a barrier that cannot be made durable must not be reported as success, and
+/// must not be papered over by syncing some other file's data, which would not make the name
+/// durable and would cost a healthy file its write-back cache.
+#[test]
+fn a_failed_barrier_is_an_error_not_a_success() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start(vfs.clone());
+    let root = c.root.clone();
+    c.create_file(&root, "f");
+    let d = c.mkdir(&root, "d").1.expect("mkdir");
+    vfs.forget();
+    vfs.fail_ns.store(true, Ordering::Relaxed);
+
+    assert_eq!(c.rename(&root, "f", &d, "g"), IO);
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&root).fileid)],
+        "the barrier was attempted once and nothing else was flushed to hide it"
+    );
+
+    // A failed mutation is still a failed mutation, and it does not reach the barrier.
+    vfs.forget();
+    vfs.fail_mutation.store(true, Ordering::Relaxed);
+    assert_eq!(c.rename(&d, "g", &root, "h"), ACCES);
+    assert_eq!(
+        vfs.barriers(),
+        Vec::new(),
+        "a refused rename needs no barrier"
+    );
+}
+
+/// A name exists as soon as `Vfs::create` returned, so an error reply must not leave it
+/// unbarriered. This is the regression for the gap where a `?` in the match arm returned before
+/// `durable`, which the old head does: remove the barrier and this test fails.
+///
+/// The three routes are the ones a caller can hit. The attribute step succeeds and the barrier
+/// succeeds: one barrier, the attributes reported. The attribute step fails and the barrier is
+/// healthy: the barrier still runs, and the caller's own status comes back, so a caller can tell an
+/// attribute problem from a durability one. Both fail: the barrier's `NFS3ERR_IO` wins, because a
+/// status reading as "that did not happen" would be a lie about a name that exists.
+///
+/// The attribute fault is `PermissionDenied` and the barrier fault is `Io` on purpose.
+/// `nfsstat` maps those to `NFS3ERR_ACCES` and `NFS3ERR_IO`, so the reply says which failure it is.
+/// With both mapped to `IO` the precedence assertion below would pass whichever order the code used.
+#[test]
+fn a_created_name_is_barriered_even_when_the_attribute_step_fails() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start(vfs.clone());
+    let root = c.root.clone();
+
+    // The route where nothing goes wrong: exactly one barrier.
+    vfs.forget();
+    assert_eq!(c.create(&root, "ok", 1, sattr_mode(0o644), [0; 8]).0, OK);
+    assert_eq!(vfs.created(), vec!["ok".to_string()]);
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&root).fileid)],
+        "a successful create barriers exactly once"
+    );
+
+    // The attribute step fails after the name exists, and the barrier is healthy. The barrier is
+    // still owed, and the caller's own status comes back so the two failures stay distinguishable.
+    vfs.forget();
+    vfs.fail_setattr.store(true, Ordering::Relaxed);
+    let st = c.create(&root, "attrfail", 1, sattr_mtime(7, 0), [0; 8]).0;
+    vfs.fail_setattr.store(false, Ordering::Relaxed);
+    assert_eq!(
+        vfs.created(),
+        vec!["ok".to_string(), "attrfail".to_string()]
+    );
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&root).fileid)],
+        "a name that exists must be barriered even when the RPC answers with an error"
+    );
+    assert!(
+        c.lookup(&root, "attrfail").0 == OK,
+        "the name the server created is real, which is why the barrier was owed"
+    );
+    assert_eq!(
+        st, ACCES,
+        "with a healthy barrier the caller's own status must survive, or it cannot tell an \
+         attribute problem from a durability one"
+    );
+
+    // Both fail at once. The barrier's IO is the honest status, and ACCES would mean the reply hid
+    // the fact that durability could not be promised.
+    vfs.forget();
+    vfs.fail_setattr.store(true, Ordering::Relaxed);
+    vfs.fail_ns.store(true, Ordering::Relaxed);
+    let st = c.create(&root, "both", 1, sattr_mtime(7, 0), [0; 8]).0;
+    vfs.fail_ns.store(false, Ordering::Relaxed);
+    vfs.fail_setattr.store(false, Ordering::Relaxed);
+    assert_eq!(vfs.created().last().map(String::as_str), Some("both"));
+    assert_eq!(vfs.barriers(), vec![Call::SyncNs(c.attrs(&root).fileid)]);
+    assert_eq!(
+        st, IO,
+        "the barrier's status must outrank the attribute error, and the two are distinguishable"
+    );
+}
+
+/// A refused `setattr` still issues exactly one namespace barrier.
+///
+/// **What this pins, and what it does not.** It pins issuance and the caller's status: the barrier
+/// runs even though the RPC refuses, and exactly once. It does *not* pin a discharge, because
+/// `Watched` wraps `MemVfs`, which has no queue to inspect. An earlier name for this test,
+/// `..._what_was_already_queued`, promised more than the assertion could observe, which is the same
+/// over-claim this branch has been removing from the documentation.
+///
+/// The discharge claim is true, but it is verified structurally rather than here:
+/// `Vfs::sync_namespace` reaches `Inner::sync_ns_snapshot`, which calls `barrier`, which calls
+/// `flush_namespace_locked`, which drains that snapshot's queue. Observing it end to end would need
+/// a real `Core` with a queue that can be read back after a reopen, which this seam has no business
+/// standing up.
+#[test]
+fn a_refused_setattr_still_issues_a_namespace_barrier() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start(vfs.clone());
+    let root = c.root.clone();
+    let f = c.create_file(&root, "f");
+    vfs.forget();
+
+    vfs.fail_setattr.store(true, Ordering::Relaxed);
+    let st = c.setattr(&f, sattr_mtime(7, 0)).0;
+    vfs.fail_setattr.store(false, Ordering::Relaxed);
+
+    assert_eq!(st, ACCES, "the refusal's own status reaches the caller");
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&f).fileid)],
+        "a refusal issues exactly one barrier, because the barrier is unconditional"
+    );
+}
+
+/// `rmdir` in Hide mode purges sidecar names, which are real name changes.
+///
+/// If the retry then fails, or the purge itself fails part way through, the names that were already
+/// removed still owe the barrier. This is the same shape the `create` arms had, and the same shape
+/// the fix exists to eliminate.
+#[test]
+fn an_rmdir_that_purged_sidecars_is_barriered_even_when_it_fails() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start_hidden(vfs.clone());
+    let root = c.root.clone();
+    let d = c.mkdir(&root, "d").1.expect("mkdir");
+
+    // Two sidecars and nothing else, so the purge is allowed to run and then the retry fails.
+    for n in ["._a", "._b"] {
+        let f = c.create_file(&d, n);
+        c.write(&f, 0, b"sidecar", 2);
+    }
+    vfs.forget();
+
+    // The first `rmdir` returns NotEmpty, the purge removes both sidecars, and the retry fails.
+    vfs.fail_rmdir_after.store(1, Ordering::Relaxed);
+    let st = c.rmdir(&root, "d");
+    vfs.fail_rmdir_after.store(usize::MAX, Ordering::Relaxed);
+
+    assert_eq!(st, ACCES, "the retry's own status reaches the caller");
+    assert_eq!(
+        vfs.unlinks(),
+        2,
+        "the purge really removed both sidecar names before the retry failed"
+    );
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&root).fileid)],
+        "removed sidecar names still owe the barrier when the RPC answers with an error"
+    );
+}
+
+/// The same route where the purge itself fails part way through: one sidecar is gone and the second
+/// removal is refused. The one that was removed must not be left queued.
+#[test]
+fn a_purge_that_fails_midway_still_barriers() {
+    let vfs = Watched::new();
+    let (_s, mut c) = start_hidden(vfs.clone());
+    let root = c.root.clone();
+    let d = c.mkdir(&root, "d").1.expect("mkdir");
+    for n in ["._a", "._b"] {
+        let f = c.create_file(&d, n);
+        c.write(&f, 0, b"sidecar", 2);
+    }
+    vfs.forget();
+
+    // Fail the second unlink, so the first has already happened.
+    vfs.fail_unlink_at.store(2, Ordering::Relaxed);
+    let st = c.rmdir(&root, "d");
+    vfs.fail_unlink_at.store(0, Ordering::Relaxed);
+
+    assert_eq!(
+        st, ACCES,
+        "the refused removal's own status reaches the caller"
+    );
+    assert_eq!(vfs.unlinks(), 2, "one sidecar went, the second was refused");
+    assert_eq!(
+        vfs.barriers(),
+        vec![Call::SyncNs(c.attrs(&root).fileid)],
+        "a half-finished purge owes the barrier for what it already removed"
+    );
+}
+
+const IO: u32 = nfsserve::nfs::nfsstat3::NFS3ERR_IO as u32;
+const ACCES: u32 = nfsserve::nfs::nfsstat3::NFS3ERR_ACCES as u32;

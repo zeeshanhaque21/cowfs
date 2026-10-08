@@ -18,6 +18,10 @@ use crate::node::{Node, NodeState};
 use crate::queue::{Batch, Create, Op, SnapCtx};
 use crate::util::{MutexExt, RwExt, ShardMap, SHARDS};
 
+/// How many reserved inode tickets one meta reservation covers. A create pops one, so a refill
+/// happens once per this many creates and each refill is one durable meta reservation.
+pub(crate) const RESERVED_BLOCK: u64 = 1 << 16;
+
 /// Tuning knobs for [`Core::open`](crate::Core::open). See `docs/v1-core.md` for the exact
 /// durability and loss bounds they control.
 #[derive(Clone, Debug)]
@@ -158,6 +162,7 @@ pub struct Health {
     pub lanes: Vec<LaneHealth>,
     /// The last error a flush reported, whatever its kind.
     pub last_error: Option<String>,
+    pub meta: cowfs_meta::Health,
 }
 
 #[derive(Debug, Default)]
@@ -178,11 +183,10 @@ pub(crate) struct Inner {
     pub(crate) aliases: RwLock<Aliases>,
     pub(crate) handles: Mutex<HashMap<u64, Ino>>,
     pub(crate) next_handle: AtomicU64,
-    pub(crate) next_virt: AtomicU64,
-    /// Virtual numbers up to here are recorded in `<root>/virt.ino`, so a restart never hands out
-    /// a number an earlier session used.
-    pub(crate) virt_reserved: AtomicU64,
-    pub(crate) virt_lock: Mutex<()>,
+    /// Tickets minted from a [`cowfs_meta::Meta::reserve_tickets`] batch and not yet spent by a
+    /// create. A create pops one here; a create does not hold a Core lock while meta's writer lock
+    /// is taken. Numbers in a popped-but-unused ticket are wasted, never reused.
+    pub(crate) reserved: Mutex<Vec<cowfs_meta::ReservedIno>>,
     pub(crate) dirty_bytes: AtomicUsize,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
@@ -249,39 +253,26 @@ impl Inner {
         self.snaps.rd().by_id.values().cloned().collect()
     }
 
-    /// The meta inode number behind `ino`, if meta has one yet.
-    /// The next virtual number, extending the durable reservation when it runs out.
+    /// One reserved ticket for a create, refilling the pool in blocks.
     ///
-    /// Refuses at the alias ceiling: the number would be handed out now and released later, and a
-    /// client still holding it would see `Stale`, so the create fails here instead.
-    pub(crate) fn alloc_virt(&self, snap: u64) -> Result<Ino> {
-        let live = self.aliases.rd().len();
-        if live >= self.opts.alias_limit {
-            *self.last_error.lk() = Some(format!(
-                "session inode limit reached: {live} inodes are live, the ceiling is {}",
-                self.opts.alias_limit
-            ));
-            return Err(Error::NoSpace);
+    /// Takes no snapshot lock: a caller reserves before it takes `sc.ns`. A refill opens a meta
+    /// reservation, which no Core lock may be held across.
+    pub(crate) fn take_reserved(&self) -> Result<cowfs_meta::ReservedIno> {
+        {
+            let mut pool = self.reserved.lk();
+            if let Some(t) = pool.pop() {
+                return Ok(t);
+            }
         }
-        let n = self.next_virt.fetch_add(1, Ordering::AcqRel) + 1;
-        if n >= self.virt_reserved.load(Ordering::Acquire) {
-            self.reserve_virt()?;
-        }
-        crate::ino::virt(snap, n)
-    }
-
-    /// Records a block of virtual numbers durably before any of them is handed out, so a crash
-    /// can only waste numbers, never reuse them.
-    fn reserve_virt(&self) -> Result<()> {
-        let _g = self.virt_lock.lk();
-        let next = self.next_virt.load(Ordering::Acquire);
-        if next < self.virt_reserved.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let new = next.saturating_add(crate::ino::VIRT_BLOCK);
-        crate::ino::write_virt_mark(&self.root, new).map_err(|e| crate::error::from_io(&e))?;
-        self.virt_reserved.store(new, Ordering::Release);
-        Ok(())
+        let block = self
+            .meta
+            .reserve_tickets(RESERVED_BLOCK)
+            .map_err(from_meta)?;
+        let mut pool = self.reserved.lk();
+        let mut it = block.into_iter();
+        let first = it.next().ok_or(Error::NoSpace)?;
+        pool.extend(it);
+        Ok(first)
     }
 
     /// Test seam: report that the next node-table insertion for `ino` lost its race, up to the
@@ -297,6 +288,7 @@ impl Inner {
         }
     }
 
+    /// The meta inode number behind `ino`, if meta has one yet.
     pub(crate) fn meta_of(&self, ino: Ino) -> Option<u64> {
         match classify(ino) {
             Id::Meta { m, .. } => Some(m),
@@ -554,19 +546,27 @@ impl Inner {
         }
         if node.st.rd().xattrs.is_none() {
             let mut map = BTreeMap::new();
-            if let Some(m) = self.meta_of(node.ino) {
-                for name in sc
-                    .snap
-                    .listxattr(mino(m))
-                    .map_err(from_meta)
-                    .map_err(stale)?
-                {
-                    let v = sc
+            // A reserved create's number is the packed meta number, so `meta_of` answers for it
+            // before meta has committed the create. Reading meta then reports `NotFound` for an
+            // inode that exists as `Stale`, and there is nothing to preserve anyway: an uncommitted
+            // create has no xattrs in meta. `barrier` cannot run here because the callers hold the
+            // namespace lock (lock order: the flush lock is taken unlocked), so a pending create
+            // gets an empty map instead of a meta read.
+            if node.seq.load(Ordering::Acquire) <= sc.flushed() {
+                if let Some(m) = self.meta_of(node.ino) {
+                    for name in sc
                         .snap
-                        .getxattr(mino(m), &name)
+                        .listxattr(mino(m))
                         .map_err(from_meta)
-                        .map_err(stale)?;
-                    map.insert(name, v);
+                        .map_err(stale)?
+                    {
+                        let v = sc
+                            .snap
+                            .getxattr(mino(m), &name)
+                            .map_err(from_meta)
+                            .map_err(stale)?;
+                        map.insert(name, v);
+                    }
                 }
             }
             node.st.wr().xattrs = Some(map);
@@ -789,10 +789,16 @@ impl Inner {
 
     fn commit_batch(&self, sc: &SnapCtx, batch: Batch) -> Result<()> {
         let states = self.restore_states(&batch);
-        match self.commit(sc, &batch, &states) {
+        let times = self.op_times(&batch);
+        match self.commit(sc, &batch, &states, &times) {
             Ok(created) => {
                 {
                     let mut al = self.aliases.wr();
+                    // Every live inode keeps one alias, so the table tracks the live count and the
+                    // session ceiling stays honest. A reserved create's child is already the packed
+                    // meta number, so its alias is the identity bridge `meta_of`/`canon` need; the
+                    // key is that packed number and the value is the bare meta number, so it is a
+                    // real entry, not a self-map.
                     for (v, m) in &created {
                         al.insert(*v, sc.id, *m);
                     }
@@ -866,12 +872,61 @@ impl Inner {
             .collect()
     }
 
+    /// The time each queued operation happened, keyed by the inode whose cached `ctime` carries it.
+    ///
+    /// Every operation that reaches meta stamps two or three inodes from one `Timestamp::now()`
+    /// reading, and the layer above writes that same value into each cached node as it queues, so
+    /// one of those nodes is the operation's time. Read before the commit opens meta's writer lock,
+    /// like [`Inner::restore_states`], for the same lock-order reason.
+    ///
+    /// An inode whose node has gone is absent, and its operations keep the batch time, which is what
+    /// they had before.
+    fn op_times(&self, b: &Batch) -> HashMap<Ino, cowfs_meta::Timestamp> {
+        // `NodeState::attr` is behind an `RwLock`, so this reads it the way `restore_state` does and
+        // is listed in the audit table beside it for the same lock-order reason.
+        let stamp = |ino: &Ino| {
+            self.nodes
+                .get(ino)
+                .map(|n| to_meta_ts(n.st.rd().attr.ctime))
+        };
+        let mut out = HashMap::new();
+        for op in &b.ops {
+            // the inode whose cached ctime is this operation's single clock reading
+            let subject = match op {
+                Op::Create { child, .. } => child,
+                Op::Link { ino, .. } | Op::Content { ino, .. } => ino,
+                // the parent, which the namespace operations stamp from the same reading as the
+                // child they name, and which the operation carries by inode
+                Op::Unlink { parent, .. } | Op::Rmdir { parent, .. } => parent,
+                Op::Rename { from, .. } => from,
+            };
+            if let Some(t) = stamp(subject) {
+                out.insert(*subject, t);
+            }
+        }
+        for ino in &b.touched {
+            if let Some(t) = stamp(ino) {
+                out.insert(*ino, t);
+            }
+        }
+        out
+    }
+
     fn commit(
         &self,
         sc: &SnapCtx,
         b: &Batch,
         states: &HashMap<Ino, (u32, Timestamp, Timestamp)>,
+        times: &HashMap<Ino, cowfs_meta::Timestamp>,
     ) -> Result<Vec<(Ino, u64)>> {
+        // `ctime` is the time of the change, not the time of the batch: stamp each operation with
+        // the time its cached node already holds. Only `ctime` follows it, and an inode the batch
+        // does not name keeps the wall clock the transaction opened with.
+        let stamp = |tx: &mut cowfs_meta::Tx<'_>, ino: Ino| {
+            if let Some(t) = times.get(&ino) {
+                tx.set_now(*t);
+            }
+        };
         use cowfs_meta::Error as M;
         let alias = self.aliases.rd().clone();
         let res = sc.snap.batch(|tx| {
@@ -896,26 +951,36 @@ impl Inner {
                         name,
                         mode,
                         child,
+                        reserved,
                         what,
                     } => {
                         if b.elided.contains(child) {
                             continue;
                         }
+                        stamp(tx, *child);
                         let p = resolve(*parent, &newly)?;
-                        let a = match what {
-                            Create::File => tx.create(p, name, *mode)?,
-                            Create::Dir => tx.mkdir(p, name, *mode)?,
-                            Create::Symlink(t) => tx.symlink(p, name, t)?,
+                        let a = match (reserved, what) {
+                            (Some(ticket), Create::File) => tx.create_at(p, name, *mode, ticket)?,
+                            (Some(ticket), Create::Dir) => tx.mkdir_at(p, name, *mode, ticket)?,
+                            (Some(ticket), Create::Symlink(t)) => {
+                                tx.symlink_at(p, name, t, ticket)?
+                            }
+                            (None, Create::File) => tx.create(p, name, *mode)?,
+                            (None, Create::Dir) => tx.mkdir(p, name, *mode)?,
+                            (None, Create::Symlink(t)) => tx.symlink(p, name, t)?,
                         };
                         newly.insert(*child, a.ino.0);
                     }
                     Op::Link { ino, parent, name } => {
+                        stamp(tx, *ino);
                         tx.link(resolve(*ino, &newly)?, resolve(*parent, &newly)?, name)?;
                     }
                     Op::Unlink { parent, name } => {
+                        stamp(tx, *parent);
                         tx.unlink(resolve(*parent, &newly)?, name)?;
                     }
                     Op::Rmdir { parent, name } => {
+                        stamp(tx, *parent);
                         tx.rmdir(resolve(*parent, &newly)?, name)?;
                     }
                     Op::Rename {
@@ -935,6 +1000,7 @@ impl Inner {
                         if b.elided.contains(ino) {
                             continue;
                         }
+                        stamp(tx, *ino);
                         tx.set_content(resolve(*ino, &newly)?, &chunks.refs, *size)?;
                     }
                 }
@@ -955,6 +1021,9 @@ impl Inner {
                     mtime: Some(to_meta_ts(*mtime)),
                     size: None,
                 };
+                // the same reason: this loop runs once per touched inode, and without a stamp per
+                // inode every one of them would take the transaction's opening time
+                stamp(tx, *ino);
                 match tx.setattr(m, set) {
                     Ok(_) | Err(M::NotFound) => {}
                     Err(e) => return Err(e),
@@ -970,17 +1039,39 @@ impl Inner {
         for sc in self.all_snaps() {
             self.flush_snapshot(&sc)?;
         }
-        self.meta.sync().map_err(from_meta)?;
-        *self.unsynced.lk() = None;
-        Ok(())
+        self.finish_sync()
     }
 
     /// Flushes and syncs until this snapshot's work is durable.
     pub(crate) fn fsync_snapshot(&self, sc: &SnapCtx) -> Result<()> {
         self.flush_snapshot(sc)?;
-        self.meta.sync().map_err(from_meta)?;
-        *self.unsynced.lk() = None;
-        Ok(())
+        self.finish_sync()
+    }
+
+    /// Makes this snapshot's names and attributes durable, leaving file data that is still dirty
+    /// alone.
+    ///
+    /// A namespace commit names only blocks the store already has: [`Inner::queue_content`] runs
+    /// after the flush that wrote them, and a file with unflushed bytes has no content operation
+    /// queued at all. `finish_sync` then syncs the store before the metadata, so nothing that
+    /// becomes durable here can point at a block that is not.
+    pub(crate) fn sync_ns_snapshot(&self, sc: &SnapCtx) -> Result<()> {
+        self.barrier(sc)?;
+        self.finish_sync()
+    }
+
+    /// Makes everything applied to the metadata durable and clears the unsynced mark. A failure is
+    /// recorded where [`Core::health`] reports it, so a caller that is told the sync worked is
+    /// never the only thing that knows it did not.
+    fn finish_sync(&self) -> Result<()> {
+        let r = self.meta.sync().map_err(from_meta);
+        if let Err(e) = &r {
+            self.ctr.flush_errors.fetch_add(1, Ordering::Relaxed);
+            *self.last_error.lk() = Some(e.to_string());
+        } else {
+            *self.unsynced.lk() = None;
+        }
+        r
     }
 
     /// Commits the snapshot's namespace so an operation that needs meta to be current can go on.

@@ -1,8 +1,7 @@
 use crate::error::{CtlError, CtlResult};
-use unicode_normalization::UnicodeNormalization;
 
 /// Longest snapshot name in bytes.
-pub const MAX_NAME_BYTES: usize = 255;
+pub const MAX_NAME_BYTES: usize = cowfs_snapname::NAME_MAX;
 /// Longest path in bytes.
 pub const MAX_PATH_BYTES: usize = 4096;
 /// Longest git ref in bytes.
@@ -24,26 +23,55 @@ pub fn escape_control(s: &str) -> String {
 /// The API-level snapshot name rule: non-empty, at most 255 bytes, no `/`, no control characters
 /// (NUL, newline and ESC included), and no leading `.` (which also rules out `.`, `..`, `._*`
 /// and `.nfs*`). Names are UTF-8 by construction, since the wire format is JSON.
+///
+/// The rule lives in `cowfs-snapname`, which the backend depends on too, so the API cannot accept
+/// a snapshot name the backend refuses.
 pub fn validate_snapshot_name(name: &str) -> CtlResult<()> {
+    cowfs_snapname::validate_snapshot_name(name)
+        .map_err(|e| CtlError::invalid(format!("invalid snapshot name {name:?}: {}", e.why())))
+}
+
+/// A directory named relative to the daemon's mount, which is what `ps` accepts for a treehouse
+/// slot in mode (a): such a slot is a directory inside a snapshot, not a snapshot.
+///
+/// Unlike a snapshot name this may contain `/` and may start with a dot, because `.treehouse` is a
+/// real directory in a pool and a slot is three levels below it. What it may not do is leave the
+/// mount: an absolute path or a `..` component is refused here, and the daemon re-checks the
+/// resolved path against its own mount before it scans anything.
+///
+/// A leading `.` component is refused too. It names the mount itself, and a scan of the whole mount
+/// is a scan of the wrong size with no bound but the deadline, after which every return on the
+/// machine blocks. A `.` further along is harmless and stays legal.
+pub fn validate_mount_relative(name: &str) -> CtlResult<()> {
     let bad = |why: &str| {
         Err(CtlError::invalid(format!(
-            "invalid snapshot name {name:?}: {why}"
+            "invalid mount-relative name {name:?}: {why}"
         )))
     };
     if name.is_empty() {
         return bad("empty");
     }
-    if name.len() > MAX_NAME_BYTES {
-        return bad("longer than 255 bytes");
+    if name.len() > MAX_PATH_BYTES {
+        return bad("longer than 4096 bytes");
     }
-    if name.starts_with('.') {
-        return bad("must not start with a dot");
-    }
-    if name.contains('/') {
-        return bad("must not contain a slash");
+    if name.starts_with('/') {
+        return bad("must be relative to the mount");
     }
     if name.chars().any(char::is_control) {
         return bad("must not contain control characters");
+    }
+    let mut components = name.split('/');
+    let first = components.next().unwrap_or_default();
+    if first == "." {
+        return bad("must not name the mount itself");
+    }
+    // `..` is the only way out, in any position including the first, and an empty component would
+    // name a directory twice.
+    if first == ".." || components.any(|c| c.is_empty() || c == "..") {
+        return bad("must not contain a `..` or empty component");
+    }
+    if name.ends_with('/') {
+        return bad("must not end with a slash");
     }
     Ok(())
 }
@@ -56,17 +84,7 @@ pub fn validate_snapshot_name(name: &str) -> CtlResult<()> {
 /// bytes), so a key longer than the bound is replaced by a hash of the folded form. That keeps
 /// the key a valid, bounded snapshot name, at the cost of a theoretical hash collision.
 pub fn name_key(name: &str) -> String {
-    let folded: String = name
-        .nfc()
-        .collect::<String>()
-        .to_lowercase()
-        .nfc()
-        .collect();
-    if folded.len() <= MAX_NAME_BYTES {
-        return folded;
-    }
-    let digest = blake3::hash(folded.as_bytes()).to_hex().to_string();
-    format!("#{digest}")
+    cowfs_snapname::name_key(name)
 }
 
 /// An absolute path with no control characters, at most 4096 bytes. `what` names the field in the error.
@@ -141,8 +159,42 @@ mod tests {
             "a\u{1b}b",
             "\u{85}",
             &"x".repeat(256),
+            "slot.cowfs-swap0",
         ] {
             assert!(validate_snapshot_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A mode (a) slot is `.treehouse/{pool}/{slot}/{repo}` below the mount, so the name has to
+    /// carry a dot directory, three levels and slashes, still be unable to leave the mount, and not
+    /// be able to name the mount itself.
+    #[test]
+    fn mount_relative_names() {
+        for ok in [
+            "snap",
+            ".treehouse/repo-abc123/1/repo",
+            "base/.treehouse/cowfs-7c1bf8/2/cowfs",
+            "a/./b",
+        ] {
+            assert!(validate_mount_relative(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "/snap",
+            "../snap",
+            ".treehouse/../../elsewhere",
+            "a/../b",
+            ".treehouse/repo/1/repo/",
+            "a//b",
+            // A leading `.` is the mount itself, which is the whole mount to scan.
+            ".",
+            "./snap",
+            "a/./../b",
+            "a\0b",
+            "a\nb",
+            &"x".repeat(4097),
+        ] {
+            assert!(validate_mount_relative(bad).is_err(), "{bad:?}");
         }
     }
 

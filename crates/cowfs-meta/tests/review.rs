@@ -17,10 +17,7 @@ fn quiet() -> Options {
 }
 
 fn chunk(n: u8, len: u32) -> ChunkRef {
-    ChunkRef {
-        id: BlockId::of(&[n]),
-        len,
-    }
+    ChunkRef::block(BlockId::of(&[n]), len)
 }
 
 /// The file as a crash would leave it if only fsynced writes reached the disk.
@@ -95,7 +92,7 @@ fn hook_runs_after_the_closure_so_no_chunk_dangles() {
         s.batch(|tx| {
             let id = store.put(&i.to_le_bytes());
             let f = tx.create(ROOT_INO, format!("f{i}").as_bytes(), 0o644)?;
-            tx.set_content(f.ino, &[ChunkRef { id, len: 4 }], 4)?;
+            tx.set_content(f.ino, &[ChunkRef::block(id, 4)], 4)?;
             Ok(())
         })
         .unwrap();
@@ -620,10 +617,7 @@ fn append_cost(n: u32) -> usize {
     let s = m.new_snapshot("s").unwrap();
     let f = s.create(ROOT_INO, b"f", 0o644).unwrap().ino;
     let list: Vec<ChunkRef> = (0..n)
-        .map(|i| ChunkRef {
-            id: BlockId::of(&i.to_le_bytes()),
-            len: 65536,
-        })
+        .map(|i| ChunkRef::block(BlockId::of(&i.to_le_bytes()), 65536))
         .collect();
     let covered = u64::from(n) * 65536;
     s.set_content(f, &list, covered).unwrap();

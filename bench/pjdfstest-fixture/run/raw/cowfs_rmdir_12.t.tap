@@ -1,0 +1,9 @@
+1..6
+ok 1
+ok 2
+ok 3
+not ok 4 - tried 'rmdir pjdfstest_8404abf291e907231ce7be361619fe47/pjdfstest_b2c9418a588942df3cd639d24ad1d591/..', expected ENOTEMPTY|EEXIST, got EINVAL
+ok 5
+ok 6
+
+--- stderr ---
