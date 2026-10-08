@@ -594,6 +594,7 @@ fn chown_to_another_uid_is_refused_and_changes_nothing() {
     // the adapter. Root still reaches the adapter either way.
     let Some(fx) = Fixture::with("nodefault_permissions", |v| {
         v.create(ROOT_INO, b"f", 0o644).unwrap();
+        v.create(ROOT_INO, b"s", 0o4755).unwrap();
     }) else {
         return;
     };
@@ -620,6 +621,15 @@ fn chown_to_another_uid_is_refused_and_changes_nothing() {
         (uid, gid),
         "refused chown changes nothing"
     );
+    // A refused chown refuses the whole request: a chown the kernel pairs with a cleared setuid
+    // bit must not apply the mode half.
+    assert_eq!(fs::metadata(fx.p("s")).unwrap().mode() & 0o7777, 0o4755);
+    assert_eq!(
+        errno(std::os::unix::fs::chown(fx.p("s"), Some(uid + 1), None)),
+        libc::EPERM,
+        "other uid on a setuid file"
+    );
+    assert_eq!(fs::metadata(fx.p("s")).unwrap().mode() & 0o7777, 0o4755);
     // The current uid changes nothing, and a gid is accepted and ignored.
     std::os::unix::fs::chown(fx.p("f"), Some(uid), None).unwrap();
     std::os::unix::fs::chown(fx.p("f"), Some(uid), Some(gid)).unwrap();
