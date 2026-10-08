@@ -113,6 +113,17 @@ pub trait Backend: Send + Sync + fmt::Debug {
     ) -> CtlResult<Option<Ingested>> {
         Ok(None)
     }
+
+    /// Like [`Backend::ingest`], but a snapshot already called `name` is replaced, only once the
+    /// new tree is staged and verified. `None` when the backend has no writer.
+    fn ingest_replacing(
+        &self,
+        _from: &Path,
+        _name: &str,
+        _progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> CtlResult<Option<Ingested>> {
+        Ok(None)
+    }
 }
 
 /// What one garbage-collection cycle did, with the block counts around it.
@@ -334,6 +345,10 @@ fn with_core<T>(slot: &CoreSlot, f: impl FnOnce(&Core) -> io::Result<T>) -> io::
 ///
 /// A name with no record is not a base and does not become one here: a plain snapshot must not
 /// acquire a record that nothing asked for.
+fn io_err_ctl(what: &str, e: io::Error) -> CtlError {
+    CtlError::new(ErrorCode::IoError, format!("{what}: {e}"))
+}
+
 fn invalidate_base_record(
     root: &Path,
     records: &mut std::collections::BTreeMap<String, crate::base_meta::Record>,
@@ -507,6 +522,49 @@ fn core_info(
     }
 }
 
+impl CoreBackend {
+    /// Runs one of the core's ingests and maps its error onto the protocol's codes.
+    fn ingest_with(
+        &self,
+        from: &Path,
+        name: &str,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+        ingest: fn(
+            &Core,
+            &Path,
+            &str,
+            &mut cowfs_core::Hooks<'_>,
+        ) -> Result<Ingested, cowfs_core::ImportError>,
+    ) -> CtlResult<Option<Ingested>> {
+        // `with_core` speaks `io::Error`, so the ingest error is carried through a local and
+        // re-mapped by the one call that can afford to hold both types.
+        let mut out: Result<Ingested, CtlError> =
+            Err(CtlError::new(ErrorCode::IoError, "the ingest did not run"));
+        with_core(&self.core, |c| {
+            let mut hooks = cowfs_core::Hooks {
+                progress: &mut *progress,
+            };
+            match ingest(c, from, name, &mut hooks) {
+                Ok(i) => {
+                    out = Ok(i);
+                    Ok(())
+                }
+                Err(e) => {
+                    out = Err(ingest_error(e));
+                    Ok(())
+                }
+            }
+        })
+        .map_err(|e| {
+            CtlError::new(
+                ErrorCode::IoError,
+                format!("cannot ingest into the core: {e}"),
+            )
+        })?;
+        out.map(Some)
+    }
+}
+
 impl Backend for CoreBackend {
     fn root(&self) -> io::Result<Arc<dyn Vfs>> {
         // The core's root already lists the snapshots, so the default mount needs no wrapper.
@@ -552,30 +610,37 @@ impl Backend for CoreBackend {
     ) -> CtlResult<Option<Ingested>> {
         // `with_core` speaks `io::Error`, so the ingest error is carried through the message and
         // re-mapped by the one call that can afford to hold both types.
-        let mut out: Result<Ingested, CtlError> =
-            Err(CtlError::new(ErrorCode::IoError, "the ingest did not run"));
-        with_core(&self.core, |c| {
-            let mut hooks = cowfs_core::Hooks {
-                progress: &mut *progress,
-            };
-            match cowfs_core::ingest(c, from, name, &mut hooks) {
-                Ok(i) => {
-                    out = Ok(i);
-                    Ok(())
-                }
-                Err(e) => {
-                    out = Err(ingest_error(e));
-                    Ok(())
-                }
+        self.ingest_with(from, name, progress, cowfs_core::ingest)
+    }
+
+    fn ingest_replacing(
+        &self,
+        from: &Path,
+        name: &str,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> CtlResult<Option<Ingested>> {
+        // The old record describes the tree about to be replaced, so it is cleared first: once the
+        // core rolls forward, no error can say whether the swap happened. A cancelled or refused
+        // ingest fails before the core touches the old tree, so for those the record goes back.
+        // Any other error leaves it cleared, and the base reports stale rather than a commit it may
+        // no longer have.
+        let saved = self
+            .snaps
+            .bases
+            .exclusive(|records| {
+                let saved = records.get(name).cloned();
+                invalidate_base_record(self.snaps.bases.root(), records, name).map(|()| saved)
+            })
+            .map_err(|e| io_err_ctl("cannot clear the old base record", e))?;
+        let out = self.ingest_with(from, name, progress, cowfs_core::ingest_replacing);
+        if let (Err(e), Some(saved)) = (&out, saved) {
+            if matches!(e.code, ErrorCode::Cancelled | ErrorCode::InvalidParams) {
+                let _ = self.snaps.bases.exclusive(|records| {
+                    crate::base_meta::write_locked(self.snaps.bases.root(), records, name, &saved)
+                });
             }
-        })
-        .map_err(|e| {
-            CtlError::new(
-                ErrorCode::IoError,
-                format!("cannot ingest into the core: {e}"),
-            )
-        })?;
-        out.map(Some)
+        }
+        out
     }
 
     fn collect_garbage(

@@ -204,6 +204,29 @@ impl Core {
         done
     }
 
+    /// Replaces `target` with the already verified snapshot `staged`, for an import that replaces.
+    /// The intent record goes down before the old target is removed, so a crash after that point is
+    /// rolled forward by `Core::open`; an error before it leaves the old target in place.
+    pub(crate) fn replace_with_staged(
+        &self,
+        staged: &str,
+        target: &str,
+    ) -> Result<SnapshotEntry, ControlError> {
+        if let Err(e) = write_intent(&self.inner.root, staged, target) {
+            self.rollback(staged, target);
+            return Err(e);
+        }
+        if let Ok(old) = self.inner.snap_by_name(target) {
+            if let Err(e) = self.inner.unregister(&old) {
+                self.rollback(staged, target);
+                return Err(e);
+            }
+        }
+        // Past this point the old target is gone and only `staged` holds the new tree, so an error
+        // is returned as it is and nothing is cleaned up: the intent file makes `Core::open` finish.
+        self.finish_swap(staged, target)
+    }
+
     /// Steps 1 and 2. A failure in either leaves nothing behind.
     fn stage_and_intent(
         &self,

@@ -50,7 +50,7 @@ use crate::util::{MutexExt, RwExt, ShardMap};
 #[doc(hidden)]
 pub mod fsops;
 pub use crate::gc::{Collector, CoreRoots};
-pub use crate::import::{ingest, Hooks, ImportError, Ingested};
+pub use crate::import::{ingest, ingest_replacing, Hooks, ImportError, Ingested};
 pub use crate::inner::{FileHealth, Health, LaneHealth};
 pub use crate::inner::{Options, Stats};
 pub use crate::ino::VIRT_COUNTER_MASK;

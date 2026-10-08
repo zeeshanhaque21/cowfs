@@ -19,12 +19,10 @@ The request and report shapes do not change.
 1. Resolve the commit for `git_ref` in `repo`.
    An unreadable ref is `not_found`.
 2. Check the ref out into a daemon-owned staging worktree beside the repository (`staging_path` and `git worktree add --detach`, repaired by issue 97).
-3. Ingest that checkout through `Backend::ingest` into the staging snapshot `cowfs-import-<name>`.
-   The Core verifies the tree byte for byte before the name is visible.
-   The name has no leading dot because the Core refuses one.
-4. Install it under `<name>`.
-   A free name is a `rename`.
-   A taken name goes through the Core's crash-safe `swap` (intent record), and the staging snapshot is removed afterwards.
+3. Ingest that checkout through `Backend::ingest` (free name) or `Backend::ingest_replacing` (taken name), which stage under the Core's reserved hidden name `<name>.cowfs-swap0` and verify byte for byte.
+   No snapshot a user can see or create is made or deleted.
+4. For a taken name, the old base's record is cleared first and stays cleared.
+   Then the swap's intent record is written, the old tree is removed, and the staged tree is forked into place (`replace_with_staged`, rolled forward by `Core::open` after a crash).
 5. Promote `<name>` as a base, then persist provenance (`repo`, `git_ref`, real `commit`) with `set_base_meta` (issue 98).
 6. Re-read the record with `create_meta` and return it, so the report says fresh only if a later reader of the store agrees.
 7. Notify the daemon that the snapshot set changed, as `import` does.
@@ -37,27 +35,35 @@ A warm `target/` is not part of this slice (see the remainder).
 ## Existing seams reused
 
 - `import::base_refresh`: commit resolution, staging path, worktree add and cleanup (issue 97).
-- `Backend::ingest`, the Core import path, in place of `copy_tree`.
-- `Snapshots::{rename, swap, remove, promote, set_base_meta, create_meta}` and the exclusive base-record section behind them (issue 98).
+- `Backend::ingest` and the Core's hidden staging name plus `finish_swap`, in place of `copy_tree`.
+- `Snapshots::{promote, set_base_meta, create_meta}` and the exclusive base-record section behind them (issue 98).
 - `snapshot create --from`, `snapshot reset` and `mount_snapshot` for slots.
 - The real-project acceptance test as the end-to-end proof.
 
-The change is the Core branch of `import::replace` (`replace_tree`), and `Handler::base_refresh` no longer calls `can_ingest`.
+The change is `cowfs_core::ingest_replacing`, `Backend::ingest_replacing`, the Core branch of `import::replace` (`replace_tree`), and `Handler::base_refresh` no longer calls `can_ingest`.
 `can_ingest` stays on the `import` fallback, where it still refuses a backend with no writer.
 
 ## Failure modes
 
 - Ref or repo missing: `not_found`, nothing created.
 - `git worktree add` fails: a half-made directory is removed if git does not know it, nothing else changes.
-- Ingest fails or is cancelled: the Core never made the staging name visible, and the old base is untouched.
-- Swap or rename fails: the staging snapshot is removed and the error is returned.
-- Crash between ingest and install: a stale `cowfs-import-<name>` snapshot remains.
-  The next refresh of the same name clears it first.
+- Ingest is cancelled or refused: nothing visible changed.
+  The old tree is untouched and its record is restored, so the old base still reports its commit.
+- Any other ingest error on a replacement: the old record stays cleared and the base reports stale, because the error cannot say whether the swap happened.
+- Crash during staging: only the hidden staging snapshot remains, which `Core::open` and the next ingest of that name clear.
+- Crash after the intent record is written: `Core::open` rolls the replacement forward.
 - Crash after install and before promote or provenance: the base exists but reports unknown rather than fresh (issue 98), and a retry converges.
 - Provenance write fails: the refresh fails instead of reporting a base that cannot be found again.
-- A user snapshot named `cowfs-import-<name>` is removed by a refresh of `<name>`, because the Core staging name lives in the user namespace (the passthrough dot-prefix name could not collide).
+- A user snapshot named `cowfs-import-<name>` (or a case variant) is never touched, because staging is not in the user namespace.
+- A name so long that the swap's `swap-<name>` intent file exceeds the filesystem limit publishes the first time.
+  Replacing it fails cleanly with the old tree intact and its provenance cleared, so it reports stale, which is the Core's own limit.
+- A failure after the old tree is removed keeps the staged tree and the intent file, so `Core::open` rolls the replacement forward.
+  There is no fault-injection test for that step.
+- A refresh of a name that is a plain user snapshot, not a base, replaces it, as the passthrough backend does.
+  Callers pick the name, so the contract is that `base_refresh` owns the name it is given.
+- Two concurrent refreshes of one name are not serialised (issue 167, unverified).
+  The replacing ingest also runs outside the bases lock, so a snapshot created under `<name>` during the ingest would be replaced as the victim.
 - Replacing a base that has forked slots or live holders is not exercised here and is unverified.
-  The swap is the Core's own seam, and this slice adds no claim about it.
 
 ## Out of scope and remainder
 
@@ -74,4 +80,7 @@ The change is the Core branch of `import::replace` (`replace_tree`), and `Handle
 ## Proof
 
 - Daemon test `import::tests::the_core_publishes_a_warm_base_by_ingesting_the_checkout`: publish, replace, no staging left, reopen the store and read the commit back.
+- Daemon test `import::tests::a_user_snapshot_named_like_staging_survives_every_core_refresh`: user snapshots named like the old staging name survive publish, replace and a cancelled ingest, which also keeps the old base and commit.
+- Daemon test `import::tests::a_base_name_at_the_length_limit_publishes_and_never_leaves_partial_state_on_the_core`.
+- Gate `the_core_daemon_publishes_base_refresh_and_leaves_no_worktree`: exit 0, the real commit, `base status` fresh, no worktree left, and a loud failure on a host that cannot mount.
 - Ignored acceptance `warm_base_acceptance_over_a_real_core`: two fresh slots cloned from the published base, real `cargo build` and `cargo test` in each over an NFS mount, reset to a byte-identical base, base intact.
