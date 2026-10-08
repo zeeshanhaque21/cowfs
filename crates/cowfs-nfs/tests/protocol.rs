@@ -229,6 +229,38 @@ fn setattr_variants() {
 }
 
 #[test]
+fn chown_to_another_owner_is_refused_and_changes_nothing() {
+    use nfsserve::nfs::{set_gid3, set_uid3};
+    const PERM: u32 = nfsstat3::NFS3ERR_PERM as u32;
+    let (_s, mut c) = setup();
+    let root = c.root.clone();
+    let f = c.create_file(&root, "f");
+    let a = c.attrs(&f);
+    let (uid, gid) = (a.uid, a.gid);
+    let own = |u, g| nfsserve::nfs::sattr3 {
+        uid: set_uid3::uid(u),
+        gid: set_gid3::gid(g),
+        ..sattr3_default()
+    };
+    // Everything is owned by the mounter, so another owner is a change the filesystem will not make.
+    assert_eq!(c.setattr(&f, own(uid + 1, gid)).0, PERM, "other uid");
+    assert_eq!(c.setattr(&f, own(uid, gid + 1)).0, PERM, "other gid");
+    // A refused chown refuses the whole request, as native does: the mode in it is not applied.
+    let mixed = nfsserve::nfs::sattr3 {
+        uid: set_uid3::uid(uid + 1),
+        ..sattr_mode(0o600)
+    };
+    assert_eq!(c.setattr(&f, mixed).0, PERM);
+    assert_eq!(
+        c.attrs(&f).mode,
+        a.mode,
+        "mode untouched by a refused chown"
+    );
+    // Naming the current owner changes nothing, which native allows.
+    assert_eq!(c.setattr(&f, own(uid, gid)).0, OK, "same owner");
+}
+
+#[test]
 fn namespace_operations() {
     let (_s, mut c) = setup();
     let root = c.root.clone();
