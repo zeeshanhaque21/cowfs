@@ -396,6 +396,33 @@ fn a4_shutdown_abandons_a_handler_that_never_returns() {
 #[test]
 fn a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace() {
     let _w = Watchdog::start(180);
+    // The promise only covers a client that resumes inside `shutdown_deadline` plus the grace. A
+    // `thread::sleep` is a lower bound, so on a starved runner the resume can land past that window
+    // and the case then says nothing about the guarantee. Each attempt therefore measures when it
+    // actually resumed, from before `shutdown()`, which is never later than the server's own start.
+    // An attempt that resumed late is discarded and rerun; only an on-time resume is asserted on.
+    let window = Duration::from_millis(450);
+    let mut late = Vec::new();
+    for _ in 0..5 {
+        let (e, resumed) = a4_resume_after_400ms();
+        eprintln!("A4 within-grace ending={e:?} resumed_at={resumed:?}");
+        if resumed >= window {
+            late.push(resumed);
+            continue;
+        }
+        assert_eq!(
+            e,
+            Ending::Response,
+            "a client that resumed at {resumed:?}, inside the {window:?} window, must get its whole terminal frame: {e:?}"
+        );
+        return;
+    }
+    panic!("no attempt resumed inside the {window:?} window, so the runner was too starved to test it: {late:?}");
+}
+
+/// One run of the scenario: returns the ending and how long after just before `shutdown()` the
+/// client began reading.
+fn a4_resume_after_400ms() -> (Ending, Duration) {
     let fx = start_with(
         Streamer {
             steps: 20_000,
@@ -419,18 +446,14 @@ fn a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace() 
     w.write_all(REQUEST.as_bytes()).unwrap();
     w.write_all(b"\n").unwrap();
     thread::sleep(Duration::from_millis(300));
+    let t0 = Instant::now();
     fx.server().handle().shutdown();
-    // Resume at 400 ms, inside the promised window: `shutdown_deadline` 200 ms plus the 250 ms
-    // grace closes at 450 ms.
+    // Aim to resume at 400 ms, inside the promised window: `shutdown_deadline` 200 ms plus the
+    // 250 ms grace closes at 450 ms.
     thread::sleep(Duration::from_millis(400));
     drop(w);
-    let e = classify(&s, Duration::from_millis(2500));
-    eprintln!("A4 within-grace ending={e:?}");
-    assert_eq!(
-        e,
-        Ending::Response,
-        "a client that resumes inside the grace must get its whole terminal frame: {e:?}"
-    );
+    let resumed = t0.elapsed();
+    (classify(&s, Duration::from_millis(2500)), resumed)
 }
 
 /// Past the grace the server closes the connection before `wait()` returns, so a client that is
