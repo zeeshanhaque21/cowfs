@@ -16,10 +16,7 @@ use util::{load1, locked, measure, row, Rng};
 const PER_DIR: usize = 1000;
 
 fn chunk(n: u64, len: u32) -> ChunkRef {
-    ChunkRef {
-        id: BlockId::of(&n.to_le_bytes()),
-        len,
-    }
+    ChunkRef::block(BlockId::of(&n.to_le_bytes()), len)
 }
 
 fn rss_mb() -> u64 {

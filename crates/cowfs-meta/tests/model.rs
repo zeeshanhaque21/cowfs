@@ -563,9 +563,11 @@ fn op() -> impl Strategy<Value = Op> {
 
 fn chunks(cnt: usize, seed: u8) -> Vec<ChunkRef> {
     (0..cnt)
-        .map(|j| ChunkRef {
-            id: BlockId::of(&[seed, j as u8]),
-            len: 1 + (j as u32 + u32::from(seed)) % 5,
+        .map(|j| {
+            ChunkRef::block(
+                BlockId::of(&[seed, j as u8]),
+                1 + (j as u32 + u32::from(seed)) % 5,
+            )
         })
         .collect()
 }

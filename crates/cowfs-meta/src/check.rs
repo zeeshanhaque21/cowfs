@@ -56,6 +56,19 @@ pub(crate) fn check(inner: &Inner) -> Result<()> {
     if !(2..=INO_LIMIT).contains(&reserved) {
         errs.push(format!("ino_reserved {reserved} outside 2..={INO_LIMIT}"));
     }
+    // A bound is only ever present while a reservation is in flight, and it names a floor at or
+    // above the one in force. Absent in every file written before bounds existed.
+    if let Some(bound) = meta.get("ino_reserved_intent")?.map(|g| g.value()) {
+        if !(2..=INO_LIMIT).contains(&bound) {
+            errs.push(format!(
+                "ino_reserved_intent {bound} outside 2..={INO_LIMIT}"
+            ));
+        } else if bound < reserved {
+            errs.push(format!(
+                "ino_reserved_intent {bound} below ino_reserved {reserved}"
+            ));
+        }
+    }
 
     let mut infos = Vec::new();
     for r in snaps.iter()? {
@@ -635,10 +648,7 @@ mod tests {
     #[test]
     fn extent_gap_is_reported() {
         let (_d, m) = open();
-        let c = cowfs_store::ChunkRef {
-            id: cowfs_store::BlockId::of(b"x"),
-            len: 4,
-        };
+        let c = cowfs_store::ChunkRef::block(cowfs_store::BlockId::of(b"x"), 4);
         m.snapshot("s")
             .unwrap()
             .set_content(Ino(3), &[c], 4)
@@ -647,7 +657,7 @@ mod tests {
             t.insert(
                 src,
                 &key(Ino(3), K_CHUNK, &99u64.to_be_bytes()),
-                encode_chunks(&[c]),
+                encode_chunks(&[c]).unwrap(),
             )
             .unwrap();
         });

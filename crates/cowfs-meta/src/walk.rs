@@ -99,7 +99,10 @@ impl<'m> LiveBlocks<'m> {
                 let k = top.node.key(i);
                 if k.get(8) == Some(&K_CHUNK) {
                     let refs = decode_chunks(top.node.val(i))?;
-                    self.queue.extend(refs.into_iter().map(|c| c.id));
+                    // the flag, not the id: a hole is not a block and this walker is the only thing
+                    // a collector has to trust, so it must not hand out the sentinel
+                    self.queue
+                        .extend(refs.into_iter().filter_map(|c| (!c.hole).then_some(c.id)));
                 }
             } else {
                 let child = top.node.child(i);
