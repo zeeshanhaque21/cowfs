@@ -159,6 +159,18 @@ pub fn xattr_name_ok(name: &[u8], root: bool) -> Result<(), i32> {
     }
 }
 
+/// Everything belongs to the mounter, so a setattr naming another uid is a chown the filesystem
+/// will not make: native answers EPERM to a non-root caller, and cowfs cannot store another owner
+/// for any caller. Naming the mounter's uid changes nothing and passes. A gid is never refused:
+/// it is accepted and ignored, as native lets an owner chgrp to a group they belong to.
+/// Checked before anything is applied, so a refused request is not half done.
+pub fn owner_unchanged(uid: Option<u32>, mounter: u32) -> Result<(), i32> {
+    match uid {
+        Some(u) if u != mounter => Err(libc::EPERM),
+        _ => Ok(()),
+    }
+}
+
 /// Mode-bit permission check for `access(2)` as the mounter's uid and gid.
 /// Root may read and write anything, and execute anything with at least one execute bit.
 pub fn access_allowed(mode: u32, owner: u32, group: u32, uid: u32, gid: u32, mask: i32) -> bool {
@@ -187,6 +199,13 @@ mod tests {
 
     fn ts(secs: i64, nanos: u32) -> Timestamp {
         Timestamp { secs, nanos }
+    }
+
+    #[test]
+    fn only_another_uid_is_refused() {
+        assert_eq!(owner_unchanged(Some(8), 7), Err(libc::EPERM));
+        assert_eq!(owner_unchanged(Some(7), 7), Ok(()));
+        assert_eq!(owner_unchanged(None, 7), Ok(()));
     }
 
     #[test]
