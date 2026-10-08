@@ -278,6 +278,7 @@ dependencies = [
  "cowfs-ctl",
  "cowfs-fuse",
  "cowfs-gc",
+ "cowfs-meta",
  "cowfs-nfs",
  "cowfs-store",
  "cowfs-vfs",
