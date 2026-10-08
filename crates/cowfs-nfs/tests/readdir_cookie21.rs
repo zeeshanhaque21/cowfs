@@ -9,8 +9,10 @@ use std::collections::HashSet;
 use common::*;
 use cowfs_nfs::MountOptions;
 
-/// dircount is in bytes; the server packs `dircount / 24` entries per READDIR page.
-const PAGE: u32 = 5 * 24;
+/// dircount in bytes. Plain READDIR reuses it as the reply budget, and the server reserves 160
+/// bytes of that for the RPC header and trailer, so it must clear 160 plus one entry or the
+/// reply is NFS3ERR_TOOSMALL. 300 leaves room for a handful of entries per page, well under 40.
+const PAGE: u32 = 300;
 
 fn page_through_edits(plus: bool) {
     let (_s, mut c) = serve(memfs(), MountOptions::default());
