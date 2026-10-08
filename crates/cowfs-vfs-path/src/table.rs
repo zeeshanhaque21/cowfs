@@ -12,6 +12,29 @@ use crate::sys::{self, Stat};
 /// Unpinned descriptors kept for speed. The table is cleared when it fills up.
 const CACHE_CAP: usize = 256;
 
+#[cfg(test)]
+thread_local! {
+    static DIR_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn dir_scan_count() -> u64 {
+    DIR_SCANS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_dir_scan_count() {
+    DIR_SCANS.with(|c| c.set(0));
+}
+
+/// The one place a directory's names are read, so the tests can count scans without the
+/// production code exposing anything.
+fn scan_dir(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<Vec<Vec<u8>>> {
+    #[cfg(test)]
+    DIR_SCANS.with(|c| c.set(c.get() + 1));
+    sys::list_dir(fd)
+}
+
 /// Maps a failed system call to the `Vfs` error for its errno.
 pub(crate) fn io_err(e: io::Error) -> Error {
     let Some(n) = e.raw_os_error() else {
@@ -163,9 +186,15 @@ impl State {
     /// One page of a directory listing, with attributes.
     ///
     /// The directory is read again when the call starts from the beginning or when the directory
-    /// itself changed since the last read, which is the only signal that a name appeared or
-    /// vanished without `PathVfs` doing it. Between the pages of one listing the cached names are
+    /// itself changed since the last read. Between the pages of one listing the cached names are
     /// used as they are, so paging a large directory stays linear.
+    ///
+    /// A host's directory clock is coarse enough that an external create and remove inside one tick
+    /// leaves that stamp unchanged, and a cached listing is then indistinguishable from a current
+    /// one. So when the pages run out of cached names, the last page checks the directory itself
+    /// before it reports `eof`: `eof` is a claim about the directory, not about the cache. That
+    /// costs a fixed number of reads for a listing that does not change, and one more read for each
+    /// time a name appears at the tail, which a page-bounded caller already paces.
     pub(crate) fn readdir_page(
         &mut self,
         dir: Ino,
@@ -187,41 +216,51 @@ impl State {
                 .nodes
                 .get(&dir)
                 .is_none_or(|n| n.listing.is_none() || n.listing_stamp != Some(stamp));
-        let listing = if restart {
-            let names = sys::list_dir(open.file.as_fd()).map_err(io_err)?;
+        let mut listing = if restart {
+            let names = scan_dir(open.file.as_fd()).map_err(io_err)?;
             self.node_mut(dir)?.cookies.sync(names)
         } else {
             self.node_mut(dir)?.listing.take().ok_or(Error::Stale)?
         };
-        let start = listing.partition_point(|(c, _)| *c <= cookie);
+        let mut cursor = listing.partition_point(|(c, _)| *c <= cookie);
+        let mut last = cookie;
         let mut entries = Vec::new();
-        let mut consumed = 0;
-        for (c, name) in &listing[start..] {
-            if entries.len() >= max {
+        loop {
+            while entries.len() < max && cursor < listing.len() {
+                let (c, name) = listing[cursor].clone();
+                cursor += 1;
+                let st = match sys::fstatat(open.file.as_fd(), &name) {
+                    Ok(st) => st,
+                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+                    Err(e) => return Err(io_err(e)),
+                };
+                let Ok(kind) = kind_of(&st) else {
+                    continue;
+                };
+                let ino = self.register(dir, &open.file, &name, &st)?;
+                let attr = self.attr_of(ino, &st)?;
+                last = c;
+                entries.push((
+                    DirEntry {
+                        ino,
+                        kind,
+                        name,
+                        cookie: c,
+                    },
+                    attr,
+                ));
+            }
+            if cursor < listing.len() {
                 break;
             }
-            consumed += 1;
-            let st = match sys::fstatat(open.file.as_fd(), name) {
-                Ok(st) => st,
-                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
-                Err(e) => return Err(io_err(e)),
-            };
-            let Ok(kind) = kind_of(&st) else {
-                continue;
-            };
-            let ino = self.register(dir, &open.file, name, &st)?;
-            let attr = self.attr_of(ino, &st)?;
-            entries.push((
-                DirEntry {
-                    ino,
-                    kind,
-                    name: name.clone(),
-                    cookie: *c,
-                },
-                attr,
-            ));
+            let names = scan_dir(open.file.as_fd()).map_err(io_err)?;
+            listing = self.node_mut(dir)?.cookies.sync(names);
+            cursor = listing.partition_point(|(c, _)| *c <= last);
+            if cursor == listing.len() {
+                break;
+            }
         }
-        let eof = consumed == listing.len() - start;
+        let eof = cursor == listing.len();
         let n = self.node_mut(dir)?;
         n.listing = Some(listing);
         n.listing_stamp = Some(stamp);

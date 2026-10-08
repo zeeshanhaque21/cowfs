@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::*;
+use crate::table::{dir_scan_count, reset_dir_scan_count};
 use cowfs_vfs::SetAttr;
 
 struct Scratch(PathBuf);
@@ -398,6 +399,124 @@ fn readdir_sees_a_name_created_outside_the_vfs_while_a_listing_is_paged() {
         [b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()],
         "a listing taken from the start"
     );
+}
+
+/// Issue #120: a name created outside while a listing is paged must appear before the traversal
+/// ends, including when the host leaves every directory stamp field unchanged.
+///
+/// The assertion is unconditional, so on a host whose directory clock does move it passes because
+/// the cache was invalidated. That is not a skip: nothing is skipped and nothing is weakened here.
+/// What this test adds over the one above is that it holds when the stamp gives no signal at all,
+/// which is the case the six-field comparison cannot see.
+#[test]
+fn a_name_created_outside_appears_before_a_paged_traversal_ends() {
+    let (scratch, v) = fs();
+    for n in ["a", "b", "c", "d"] {
+        v.create(ROOT_INO, n.as_bytes(), 0o644).expect("create");
+    }
+    let first = v.readdir(ROOT_INO, 0, 2).expect("first page");
+    let cached = dir_stamp(&scratch.0);
+    std::fs::write(scratch.0.join("e"), b"new").expect("create outside");
+    std::fs::remove_file(scratch.0.join("a")).expect("remove outside");
+    let observed = dir_stamp(&scratch.0);
+    println!(
+        "STAMP stamp_before={cached:?} stamp_after={observed:?} moved={}",
+        cached != observed
+    );
+
+    let mut names: Vec<Vec<u8>> = first.entries.iter().map(|e| e.name.clone()).collect();
+    let mut cookies: Vec<u64> = first.entries.iter().map(|e| e.cookie).collect();
+    let mut cur = first.entries.last().expect("entry").cookie;
+    let mut pages = 1usize;
+    loop {
+        let page = v.readdir(ROOT_INO, cur, 100).expect("resume");
+        pages += 1;
+        for e in &page.entries {
+            names.push(e.name.clone());
+            cookies.push(e.cookie);
+        }
+        match page.entries.last() {
+            Some(l) => cur = l.cookie,
+            None => {
+                assert!(page.eof);
+                break;
+            }
+        }
+    }
+    names.sort();
+    let mut sorted_cookies = cookies.clone();
+    sorted_cookies.sort_unstable();
+    println!("LISTING pages={pages} names={names:?} cookies={sorted_cookies:?}");
+
+    assert_eq!(
+        names,
+        [
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"e".to_vec()
+        ],
+        "the traversal ended without the name created outside it, so 'eof' claimed a completeness \
+         the directory stamp could not confirm"
+    );
+    assert_eq!(
+        sorted_cookies,
+        vec![1, 2, 3, 4, 5],
+        "survivors keep their cookies and the added name takes the next one, with no gaps"
+    );
+
+    let fresh: Vec<Vec<u8>> = v
+        .readdir(ROOT_INO, 0, 100)
+        .expect("fresh listing")
+        .entries
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    assert_eq!(
+        fresh,
+        [b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()],
+        "a listing taken from the start"
+    );
+}
+
+/// Issue #120: the terminal check costs a fixed number of directory scans, not one per page.
+#[test]
+fn a_long_unchanged_listing_costs_a_fixed_number_of_directory_scans() {
+    let (_s, v) = fs();
+    for i in 0..500 {
+        v.create(ROOT_INO, format!("e{i:06}").as_bytes(), 0o644)
+            .expect("create");
+    }
+    for page in [7usize, 10, 1000] {
+        reset_dir_scan_count();
+        let mut cur = 0u64;
+        let mut pages = 0usize;
+        let mut seen = 0usize;
+        loop {
+            let r = v.readdir(ROOT_INO, cur, page).expect("page");
+            pages += 1;
+            seen += r.entries.len();
+            match r.entries.last() {
+                Some(l) => cur = l.cookie,
+                None => break,
+            }
+            assert!(pages < 5000, "paging did not terminate");
+        }
+        let scans = dir_scan_count();
+        println!("SCANS page={page} pages={pages} entries={seen} scans={scans}");
+        assert_eq!(seen, 500, "page {page} listed every entry");
+        assert!(
+            scans >= 2,
+            "page {page} took {scans} scans, so nothing ever checked the directory at the end of \
+             the traversal and an external change at the tail could not be seen"
+        );
+        assert!(
+            scans <= 4,
+            "page {page} took {pages} pages and {scans} scans, so the terminal check rescans per \
+             page instead of a fixed number of times"
+        );
+    }
 }
 
 #[test]
