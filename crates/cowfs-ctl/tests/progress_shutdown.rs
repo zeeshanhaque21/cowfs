@@ -316,6 +316,36 @@ fn blocked_progress_write_does_not_stall_admission() {
     drop(second);
 }
 
+/// Read raw bytes until EOF or `until`, and parse nothing. The delivery windows these tests assert
+/// are the server's, so the client must not spend them on its own work. Measured on the same
+/// server (300 ms deadline): the old parse-in-the-window client took 336 to 1329 ms to reach EOF
+/// (N=20 idle and N=20 under CPU load), this one 300 to 314 ms. Parse after the drain.
+/// See docs/reviews/pr79-spike-20261008.md.
+fn drain_raw<R: Read>(from: &mut R, until: Instant) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    while Instant::now() < until {
+        match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+    }
+    out
+}
+
+/// Ids of the terminal frames in `raw`. Only a complete line counts, so a truncated tail can never
+/// be mistaken for a delivered terminal.
+fn terminal_ids(raw: &[u8]) -> std::collections::BTreeSet<u64> {
+    let complete = raw.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    raw[..complete]
+        .split(|&b| b == b'\n')
+        .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+        .filter(|v| matches!(v["type"].as_str(), Some("response") | Some("error")))
+        .filter_map(|v| v["id"].as_u64())
+        .collect()
+}
+
 /// A reader that never stops reading must still get its terminal frame when shutdown abandons the
 /// request, under the deadline. This is the "normal readers get a terminal frame when possible"
 /// half: the same seam that abandons a blocked writer must not cut a reading client's frame.
@@ -358,29 +388,15 @@ fn an_unblocked_client_still_receives_a_terminal_frame_at_shutdown() {
     // Keep reading so the abandoned request's terminal frame is not lost to a full buffer. The
     // frame now lands at the deadline plus grace, well under 2 s; a 5 s window would mask a
     // regression back to the write timeout.
-    let mut terminal = false;
-    let until = Instant::now() + Duration::from_secs(2);
-    let mut pending = Vec::new();
     let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
-    while Instant::now() < until {
-        match (&s).read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                pending.extend_from_slice(&buf[..n]);
-                while let Some(i) = pending.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = pending.drain(..=i).collect();
-                    let v: serde_json::Value =
-                        serde_json::from_slice(&line[..line.len() - 1]).unwrap_or_default();
-                    if matches!(v["type"].as_str(), Some("response") | Some("error")) {
-                        assert_eq!(v["id"], 1, "terminal frame carries the request id");
-                        terminal = true;
-                    }
-                }
-            }
-            Err(_) => {}
-        }
-    }
+    let raw = drain_raw(&mut &s, Instant::now() + Duration::from_secs(2));
     let elapsed = t0.elapsed();
+    let ids = terminal_ids(&raw);
+    assert!(
+        ids.iter().all(|&i| i == 1),
+        "terminal frame carries the request id: {ids:?}"
+    );
+    let terminal = !ids.is_empty();
     eprintln!(
         "PROGRESS77 terminal_present={terminal} elapsed_ms={}",
         elapsed.as_millis()
@@ -455,27 +471,10 @@ fn pending_requests_are_abandoned_together_when_one_progress_write_is_blocked() 
     fx.server().handle().shutdown();
     // Read both terminal frames. The connection is abandoned at the deadline; the frames land at
     // the deadline plus grace, and the 2 s window fails a regression to the write timeout.
-    let mut seen: std::collections::BTreeSet<u64> = Default::default();
     let _ = r.stream.set_read_timeout(Some(Duration::from_millis(50)));
-    let until = Instant::now() + Duration::from_secs(2);
-    let mut buf = Vec::new();
-    while Instant::now() < until && seen.len() < 2 {
-        buf.clear();
-        match r.reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(_) => {
-                let v: serde_json::Value =
-                    serde_json::from_slice(&buf[..buf.len().saturating_sub(1)]).unwrap_or_default();
-                if matches!(v["type"].as_str(), Some("response") | Some("error")) {
-                    if let Some(id) = v["id"].as_u64() {
-                        seen.insert(id);
-                    }
-                }
-            }
-            Err(_) => {}
-        }
-    }
+    let raw = drain_raw(&mut r.reader, Instant::now() + Duration::from_secs(2));
     let elapsed = t0.elapsed();
+    let seen = terminal_ids(&raw);
     eprintln!(
         "PROGRESS77 pending_ids={:?} wait_elapsed_ms={}",
         seen,
@@ -1322,27 +1321,11 @@ fn a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame() {
             let _ = client
                 .stream
                 .set_read_timeout(Some(Duration::from_millis(50)));
-            let until = Instant::now() + Duration::from_millis(2500);
-            let mut buf = Vec::new();
-            let mut whole = false;
-            while Instant::now() < until {
-                buf.clear();
-                match client.reader.read_until(b'\n', &mut buf) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let v: serde_json::Value =
-                            serde_json::from_slice(&buf[..buf.len().saturating_sub(1)])
-                                .unwrap_or_default();
-                        if matches!(v["type"].as_str(), Some("response") | Some("error"))
-                            && v["id"].as_u64() == Some(1)
-                        {
-                            whole = true;
-                            break;
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
+            let raw = drain_raw(
+                &mut client.reader,
+                Instant::now() + Duration::from_millis(2500),
+            );
+            let whole = terminal_ids(&raw).contains(&1);
             // The server finishes its own grace and returns; only after that is the close claim
             // meaningful. `wait()` returns inside the budget, so this cannot stretch anything.
             server.wait();
