@@ -28,6 +28,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLock
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+#[path = "../tests/common/backend.rs"]
+mod reap_backend;
+
+#[cfg(test)]
+std::thread_local! {
+    static SKIP_REAP_DURABILITY: Cell<bool> = const { Cell::new(false) };
+}
+
 pub(crate) const NODES: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("nodes");
 pub(crate) const REFS: TableDefinition<[u8; 32], u64> = TableDefinition::new("refs");
 pub(crate) const SNAPSHOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("snapshots");
@@ -167,6 +176,7 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static RESERVE_FAULT: Cell<u8> = const { Cell::new(0) };
+    static SKIP_SNAPSHOT_LIMIT: Cell<bool> = const { Cell::new(false) };
     static SKIP_MAGIC_CHECK: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -603,7 +613,10 @@ impl Inner {
                         return Err(Error::NoSuchSnapshot);
                     }
                 }
-                if s.next_snapshot >= SNAPSHOT_LIMIT {
+                let exhausted = s.next_snapshot >= SNAPSHOT_LIMIT;
+                #[cfg(test)]
+                let exhausted = exhausted && !SKIP_SNAPSHOT_LIMIT.with(Cell::get);
+                if exhausted {
                     return Err(Error::LimitExceeded("snapshot ids exhausted"));
                 }
             }
@@ -1295,7 +1308,11 @@ impl Inner {
             }
             // A durable commit flushes every earlier non-durable one, so bound the backlog: it
             // carries no chunk references, hence no hook.
-            if self.reap_steps.fetch_add(1, SeqCst) % REAP_DURABLE_EVERY == REAP_DURABLE_EVERY - 1 {
+            let periodic =
+                self.reap_steps.fetch_add(1, SeqCst) % REAP_DURABLE_EVERY == REAP_DURABLE_EVERY - 1;
+            #[cfg(test)]
+            let periodic = periodic && !SKIP_REAP_DURABILITY.with(|c| c.get());
+            if periodic {
                 wtx.set_durability(Durability::Immediate)?;
                 wtx.set_two_phase_commit(true);
             }
@@ -2134,6 +2151,254 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verify_snapshot_limit(skip_check: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+        let m = Meta::open(&path, opts()).unwrap();
+        {
+            let mut s = m.h.inner.wlock().unwrap();
+            assert_eq!(s.next_snapshot, 1);
+            s.next_snapshot = SNAPSHOT_LIMIT - 1;
+        }
+        let last = m.new_snapshot("last").unwrap();
+        assert_eq!(last.id().0, SNAPSHOT_LIMIT - 1);
+        drop(last);
+        m.close().unwrap();
+        drop(m);
+        let m = Meta::open(&path, opts()).unwrap();
+        assert_eq!(m.snapshot("last").unwrap().id().0, SNAPSHOT_LIMIT - 1);
+        assert_eq!(m.health().snapshot_floor, SNAPSHOT_LIMIT);
+
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SKIP_SNAPSHOT_LIMIT.with(|c| c.set(self.0));
+            }
+        }
+        let reset = Reset(SKIP_SNAPSHOT_LIMIT.with(|c| c.replace(skip_check)));
+        let result = m.new_snapshot("overflow");
+        drop(reset);
+        match result {
+            Err(Error::LimitExceeded("snapshot ids exhausted")) => {}
+            Err(e) => panic!("unexpected snapshot-limit fixture failure: {e}"),
+            Ok(s) => {
+                assert_eq!(s.id().0, SNAPSHOT_LIMIT);
+                drop(s);
+                m.close().unwrap();
+                panic!("snapshot-limit verifier accepted an unrepresentable snapshot id");
+            }
+        }
+        assert!(matches!(m.snapshot("overflow"), Err(Error::NoSuchSnapshot)));
+        assert_eq!(m.health().snapshot_floor, SNAPSHOT_LIMIT);
+        m.check().unwrap();
+        m.close().unwrap();
+        drop(m);
+        let m = Meta::open(&path, opts()).unwrap();
+        assert_eq!(m.snapshot("last").unwrap().id().0, SNAPSHOT_LIMIT - 1);
+        assert!(matches!(m.snapshot("overflow"), Err(Error::NoSuchSnapshot)));
+        assert!(matches!(
+            m.new_snapshot("still-overflow"),
+            Err(Error::LimitExceeded("snapshot ids exhausted"))
+        ));
+    }
+
+    #[test]
+    fn snapshot_limit_refuses_unrepresentable_ids_across_reopen() {
+        verify_snapshot_limit(false);
+    }
+
+    #[test]
+    #[should_panic(expected = "snapshot-limit verifier accepted an unrepresentable snapshot id")]
+    fn snapshot_limit_verifier_rejects_the_real_guard_removal_control() {
+        verify_snapshot_limit(true);
+    }
+
+    fn verify_inode_limit(skip_check: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+        let m = Meta::open(&path, opts()).unwrap();
+        let s = m.new_snapshot("s").unwrap();
+        {
+            let mut state = m.h.inner.wlock().unwrap();
+            state.ino.next = INO_LIMIT - 1;
+            state.ino.reserved = INO_LIMIT - 1;
+        }
+        let last = s.batch(|tx| tx.create(ROOT_INO, b"last", 0o644)).unwrap();
+        assert_eq!(last.ino.0, INO_LIMIT - 1);
+        assert_eq!(s.lookup(ROOT_INO, b"last").unwrap().ino, last.ino);
+        drop(s);
+        m.close().unwrap();
+        drop(m);
+
+        let m = Meta::open(&path, opts()).unwrap();
+        let s = m.snapshot("s").unwrap();
+        assert_eq!(s.lookup(ROOT_INO, b"last").unwrap().ino, last.ino);
+        assert_eq!(durable_reserved(&m), INO_LIMIT);
+
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::tx::SKIP_INODE_LIMIT.with(|c| c.set(self.0));
+            }
+        }
+        let reset = Reset(crate::tx::SKIP_INODE_LIMIT.with(|c| c.replace(skip_check)));
+        let result = s.batch(|tx| tx.create(ROOT_INO, b"overflow", 0o644));
+        drop(reset);
+        match result {
+            Err(Error::LimitExceeded("inode numbers exhausted")) => {}
+            Err(e) => panic!("unexpected inode-limit fixture failure: {e}"),
+            Ok(attr) => {
+                assert_eq!(attr.ino.0, INO_LIMIT);
+                assert_eq!(s.lookup(ROOT_INO, b"overflow").unwrap().ino, attr.ino);
+                panic!("inode-limit verifier accepted an unrepresentable inode id");
+            }
+        }
+        assert!(matches!(
+            s.lookup(ROOT_INO, b"overflow"),
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            s.batch(|tx| tx.mkdir(ROOT_INO, b"directory", 0o755)),
+            Err(Error::LimitExceeded("inode numbers exhausted"))
+        ));
+        assert!(matches!(
+            s.batch(|tx| tx.symlink(ROOT_INO, b"link", b"last")),
+            Err(Error::LimitExceeded("inode numbers exhausted"))
+        ));
+        assert_eq!(durable_reserved(&m), INO_LIMIT);
+        m.check().unwrap();
+        drop(s);
+        m.close().unwrap();
+        drop(m);
+
+        let m = Meta::open(&path, opts()).unwrap();
+        let s = m.snapshot("s").unwrap();
+        assert_eq!(s.lookup(ROOT_INO, b"last").unwrap().ino, last.ino);
+        for name in [b"overflow".as_slice(), b"directory", b"link"] {
+            assert!(matches!(s.lookup(ROOT_INO, name), Err(Error::NotFound)));
+        }
+        assert!(matches!(
+            s.batch(|tx| tx.create(ROOT_INO, b"still-overflow", 0o644)),
+            Err(Error::LimitExceeded("inode numbers exhausted"))
+        ));
+        assert_eq!(durable_reserved(&m), INO_LIMIT);
+        m.check().unwrap();
+    }
+
+    #[test]
+    fn inode_limit_refuses_unrepresentable_ids_across_reopen() {
+        verify_inode_limit(false);
+    }
+
+    #[test]
+    #[should_panic(expected = "inode-limit verifier accepted an unrepresentable inode id")]
+    fn inode_limit_verifier_rejects_the_real_guard_removal_control() {
+        verify_inode_limit(true);
+    }
+
+    fn verify_reap_durability(skip_check: bool) {
+        use reap_backend::{Be, Ev};
+
+        let be = Be::default();
+        let m = Meta::open_with_backend(be.clone(), opts()).unwrap();
+        let keep = m.new_snapshot("keep").unwrap();
+        let file = keep
+            .batch(|tx| tx.create(ROOT_INO, b"kept", 0o644))
+            .unwrap();
+        let gone = m.new_snapshot("gone").unwrap();
+        let id = gone.id();
+        let root = *gone.info().unwrap().root.as_bytes();
+        drop(gone);
+        m.reap_all().unwrap();
+        m.remove_snapshot(id).unwrap();
+        assert_eq!(m.pending_reap().unwrap(), 1);
+
+        let count = REAP_BUDGET as u64 + 1;
+        {
+            let wtx = m.h.inner.db.begin_write().unwrap();
+            {
+                let mut reap = wtx.open_table(REAP).unwrap();
+                let mut refs = wtx.open_table(REFS).unwrap();
+                let nodes = wtx.open_table(NODES).unwrap();
+                let mut meta = wtx.open_table(META).unwrap();
+                assert_eq!(reap.len().unwrap(), 1);
+                assert_eq!(refs.get(root).unwrap().unwrap().value(), 1);
+                let bytes = nodes.get(root).unwrap().unwrap().value().to_vec();
+                assert!(Node::parse(bytes).unwrap().is_leaf());
+                let mut next = meta_get(&meta, "next_reap").unwrap();
+                for _ in 1..count {
+                    reap.insert(next, root).unwrap();
+                    next += 1;
+                }
+                refs.insert(root, count).unwrap();
+                meta.insert("next_reap", next).unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+        m.h.inner.reap_len.store(count, SeqCst);
+        m.h.inner.reap_steps.store(REAP_DURABLE_EVERY - 2, SeqCst);
+        m.check().unwrap();
+
+        be.tag.store(1, SeqCst);
+        let before = be.log().len();
+        assert!(m.reap_step().unwrap());
+        assert_eq!(m.pending_reap().unwrap(), 1);
+        assert!(be.log()[before..].iter().all(|ev| !matches!(ev, Ev::S(_))));
+
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SKIP_REAP_DURABILITY.with(|c| c.set(self.0));
+            }
+        }
+        let reset = Reset(SKIP_REAP_DURABILITY.with(|c| c.replace(skip_check)));
+        be.tag.store(2, SeqCst);
+        let before = be.log().len();
+        let more = m.reap_step().unwrap();
+        drop(reset);
+        assert!(!more);
+        assert_eq!(m.pending_reap().unwrap(), 0);
+        let rtx = m.h.inner.db.begin_read().unwrap();
+        assert!(rtx.open_table(NODES).unwrap().get(root).unwrap().is_none());
+        assert!(rtx.open_table(REFS).unwrap().get(root).unwrap().is_none());
+        drop(rtx);
+        assert_eq!(keep.lookup(ROOT_INO, b"kept").unwrap().ino, file.ino);
+        m.check().unwrap();
+        assert!(
+            be.log()[before..].iter().any(|ev| matches!(ev, Ev::S(2))),
+            "reap verifier observed no periodic durable sync"
+        );
+
+        let image = be.image();
+        let recovered = Meta::open_with_backend(Be::from_image(image), opts()).unwrap();
+        assert_eq!(recovered.pending_reap().unwrap(), 0);
+        assert!(matches!(
+            recovered.snapshot("gone"),
+            Err(Error::NoSuchSnapshot)
+        ));
+        assert_eq!(
+            recovered
+                .snapshot("keep")
+                .unwrap()
+                .lookup(ROOT_INO, b"kept")
+                .unwrap()
+                .ino,
+            file.ino
+        );
+        recovered.check().unwrap();
+    }
+
+    #[test]
+    fn reap_periodic_commit_syncs_the_prior_nondurable_step() {
+        verify_reap_durability(false);
+    }
+
+    #[test]
+    #[should_panic(expected = "reap verifier observed no periodic durable sync")]
+    fn reap_verifier_rejects_the_real_durability_guard_removal_control() {
+        verify_reap_durability(true);
+    }
 
     fn verify_header_refusal(value: Option<u64>, skip_check: bool) {
         let dir = tempfile::tempdir().unwrap();
