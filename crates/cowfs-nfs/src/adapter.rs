@@ -789,6 +789,10 @@ impl Adapter {
     pub fn rmdir(&self, dir: fileid3, name: &[u8]) -> NfsResult<()> {
         let d = self.ident(dir);
         not_side(d)?;
+        // POSIX rmdir (pjdfstest rmdir/12.t): "." is EINVAL, but ".." names a directory that is never empty.
+        if name == b".." {
+            return Err(nfsstat3::NFS3ERR_NOTEMPTY);
+        }
         check_name(name)?;
         self.with_names(d.ino, || {
             if self.translating(d.ino, name) {
