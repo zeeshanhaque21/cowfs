@@ -1223,9 +1223,13 @@ impl ControlHandler for FiniteFlood {
 ///
 /// | case | window closes | resume | room left | half-split cut was |
 /// |---|---|---|---|---|
-/// | 200/250 | 450 ms | 340 ms | 110 ms | 325 ms |
+/// | 200/500 | 700 ms | 480 ms | 220 ms | 450 ms |
 /// | 200/1000 | 1200 ms | 900 ms | 300 ms | 700 ms |
 /// | 200/1000 | 1200 ms | 950 ms | 250 ms | 700 ms |
+///
+/// The first row was 200/250 resuming at 340 ms (110 ms of room) until the single shutdown deadline (#77) removed
+/// the incidental slack a hosted macOS rep had been relying on; 200/500 resuming at 480 ms keeps the same property
+/// (past the half-split cut) with twice the room.
 ///
 /// The 200/250 geometry resuming at 400 ms was a committed point and deliberately is not one any more.
 /// It left 50 ms, and one hosted macOS rep in six missed it at `elapsed_ms=547` against a 450 ms
@@ -1251,10 +1255,10 @@ fn a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame() {
     // Labels carry the window-closing time and the resume, both measured from the start of shutdown.
     let cases = [
         Case {
-            label: "window450/resume340",
+            label: "window700/resume480",
             deadline: Duration::from_millis(200),
-            drain: Duration::from_millis(250),
-            resume_ms: 340,
+            drain: Duration::from_millis(500),
+            resume_ms: 480,
         },
         Case {
             label: "window1200/resume900",
