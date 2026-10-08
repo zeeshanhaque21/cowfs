@@ -1261,3 +1261,42 @@ fn a_dead_server_costs_the_caller_bounded_time_when_soft() {
         eprintln!("{name}: after the sweep ls on the old path answered: {after_ok}");
     }
 }
+
+/// pjdfstest `unlink/14.t` #4 and `rmdir/12.t` #4 through the real client (#109).
+///
+/// `rmdir a/b/..` must be ENOTEMPTY or EEXIST. An open file that is unlinked cannot report nlink 0:
+/// the client never sends REMOVE for it, it renames it to `.nfs.*` (silly rename) and the file keeps
+/// its one link on the server until the last close. That is the NFS client contract, not a server
+/// defect, so this pins what the mount does instead of asserting the local-filesystem answer.
+#[test]
+#[ignore = "needs mount_nfs"]
+fn rmdir_dotdot_and_open_unlinked_file_through_a_real_mount() {
+    let Some(m) = mounted(MountOptions::default()) else {
+        return;
+    };
+    let root = m.path().to_path_buf();
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    let e = fs::remove_dir(root.join("a/b/..")).unwrap_err();
+    assert!(
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::AlreadyExists
+        ),
+        "rmdir a/b/.. answered {e:?}"
+    );
+    fs::write(root.join("f"), "x").unwrap();
+    let open = fs::File::open(root.join("f")).unwrap();
+    fs::remove_file(root.join("f")).unwrap();
+    assert_eq!(
+        open.metadata().unwrap().nlink(),
+        1,
+        "silly-renamed, still linked"
+    );
+    let names: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().any(|n| n.starts_with(".nfs")), "{names:?}");
+    drop(open);
+    m.finish();
+}
