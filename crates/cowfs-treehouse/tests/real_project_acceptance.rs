@@ -1328,7 +1328,12 @@ fn native_control_builds_and_tests_the_sample_project() {
         .collect();
     record("native-control", &refs);
 
-    assert_eq!(code(&build), 0, "native build failed: {}", output_tail(&build));
+    assert_eq!(
+        code(&build),
+        0,
+        "native build failed: {}",
+        output_tail(&build)
+    );
     assert_eq!(code(&test), 0, "native test failed: {}", output_tail(&test));
     assert!(built.is_file(), "the native control produced no rlib");
 }
@@ -2986,13 +2991,13 @@ fn warm_base_acceptance_over_a_real_core() {
             code(&build),
             0,
             "slot {slot_no} build failed:\n{}",
-            stderr(&build)
+            output_tail(&build)
         );
         assert_eq!(
             code(&test),
             0,
             "slot {slot_no} test failed:\n{}",
-            stderr(&test)
+            output_tail(&test)
         );
 
         // Reset the slot and prove it is the untouched base again, on a fresh export.
