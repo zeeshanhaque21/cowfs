@@ -11,12 +11,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  # fmt and clippy run beside the test shards, not before them.
+  lint:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,9 +25,56 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
       - name: Bench harness unit tests
         run: python3 -m unittest discover -s bench -v
+
+  # The 170 test binaries ran one after another in a single job (about 740 s of the 780 s test
+  # step; compile was already cached). nextest runs the tests of every binary in one pool, and
+  # --partition splits the whole set over parallel runners.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        shard: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}
+          # Only main writes the cache, and only one shard of it. PR runs restore main's.
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --workspace --profile ci --partition hash:${{ matrix.shard }}/3
+      # nextest does not run doctests.
+      - name: Doctests
+        if: ${{ matrix.shard == 1 }}
+        run: cargo test --doc --workspace
+
+  # One name to require: fails unless lint, bench and every test shard passed.
+  check:
+    needs: [lint, bench, test]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "lint=${{ needs.lint.result }} bench=${{ needs.bench.result }} test=${{ needs.test.result }}"
+          test "${{ needs.lint.result }}" = success
+          test "${{ needs.bench.result }}" = success
+          test "${{ needs.test.result }}" = success
 
   linux-fuse:
     runs-on: ubuntu-latest

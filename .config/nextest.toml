@@ -1,0 +1,13 @@
+[profile.default]
+# No retries: a test that passes only on a second try is a flake to fix, not to hide.
+retries = 0
+
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+
+# cowfs-ctl tests measure shutdown windows and grace periods against wall-clock bounds
+# (issues 77, 121, 128, 166). Each runs alone on the runner so another test's load cannot eat the margin.
+[[profile.default.overrides]]
+filter = 'package(cowfs-ctl)'
+threads-required = "num-cpus"
