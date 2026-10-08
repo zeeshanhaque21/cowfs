@@ -147,10 +147,9 @@ So this run used `rustc` directly, and a canonical path says nothing about a car
 - The treehouse wiring uses `--slot`, not a treehouse lease.
   moonscape has no `treehouse` binary, so the integration run builds in the snapshot itself.
   That is the same `run_build` call site a leased slot takes; only the slot provider differs.
-- The integration run uses the path backend, not the core backend, because `base_refresh` copies a
-  directory into the store and the core backend refuses that by design.
-  It is the backend that supports the operation under test, serving the same store over the same
-  FUSE mount.
+- The integration run used the path backend, not the core backend, because at the time `base_refresh` copied a
+  directory into the store and the core backend refused that.
+  The core backend now publishes `base_refresh` tree-natively (issue 123), but this run predates that.
   Block-level verification is the core backend's, and belongs to the helper run.
 - `base_refresh` no longer depends on what git prints: the checkout path is passed as an argument and
   nothing is read from stdout. That removes the version question entirely rather than answering it, and

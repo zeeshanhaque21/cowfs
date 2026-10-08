@@ -50,7 +50,7 @@ The change is `cowfs_core::ingest_replacing`, `Backend::ingest_replacing`, the C
 - Ingest is cancelled or refused: nothing visible changed.
   The old tree is untouched and its record is restored, so the old base still reports its commit.
 - Any other ingest error on a replacement: the old record stays cleared and the base reports stale, because the error cannot say whether the swap happened.
-- Crash during staging: only the hidden staging snapshot remains, which `Core::open` and the next ingest of that name clear.
+- Crash during staging: only the hidden staging snapshot remains, which `Core::open` does not clear (it only recovers intent files); the next ingest or swap of that name does.
 - Crash after the intent record is written: `Core::open` rolls the replacement forward.
 - Crash after install and before promote or provenance: the base exists but reports unknown rather than fresh (issue 98), and a retry converges.
 - Provenance write fails: the refresh fails instead of reporting a base that cannot be found again.
@@ -59,8 +59,10 @@ The change is `cowfs_core::ingest_replacing`, `Backend::ingest_replacing`, the C
   Replacing it fails cleanly with the old tree intact and its provenance cleared, so it reports stale, which is the Core's own limit.
 - A failure after the old tree is removed keeps the staged tree and the intent file, so `Core::open` rolls the replacement forward.
   There is no fault-injection test for that step.
+  A same-name retry unregisters the kept staged tree first, so a second failure then loses both trees (issue filed, not fixed here).
 - A refresh of a name that is a plain user snapshot, not a base, replaces it, as the passthrough backend does.
   Callers pick the name, so the contract is that `base_refresh` owns the name it is given.
+  Refusing an unrecorded existing name unless the caller asks to replace it is a product decision (issue filed).
 - Two concurrent refreshes of one name are not serialised (issue 167, unverified).
   The replacing ingest also runs outside the bases lock, so a snapshot created under `<name>` during the ingest would be replaced as the victim.
 - Replacing a base that has forked slots or live holders is not exercised here and is unverified.

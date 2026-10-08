@@ -146,8 +146,9 @@ fn ingest_with(
     c.inner.check_new_name_except(name, victim)?;
     let total = plan(from);
     let staged = swap::staging_name(name);
-    // A staging snapshot an earlier crash left behind holds blocks nothing points at, and its name
-    // is deterministic, so it is this one.
+    // A leftover staging snapshot of this name is removed first. After a crash before the intent it
+    // holds blocks nothing points at; after a failed swap that left an intent it is the only copy
+    // of the new tree (issue 177). Nothing else sweeps orphans (issue 176).
     if let Ok(leftover) = c.inner.snap_by_name_raw(&staged) {
         let _ = c.inner.unregister(&leftover);
     }

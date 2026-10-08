@@ -900,19 +900,21 @@ mod tests {
         // long is the core's own limit (it hits `promote_base` too). It must fail cleanly: an
         // error, the old base still there, and nothing left under another name.
         let second = refresh(&core, &repo, &long);
+        assert!(
+            second.is_err(),
+            "replacing a 255-byte name hits the Core intent-file limit (issue 170); when that is fixed, flip this to expect success"
+        );
         assert_eq!(
             core.snapshots().list().unwrap(),
             std::slice::from_ref(&long)
         );
-        if second.is_err() {
-            let view = core.snapshot(&long).unwrap();
-            let files = cowfs_ctl::hash_view(view.as_ref(), cowfs_vfs::ROOT_INO)
-                .unwrap()
-                .files;
-            assert!(files >= 1, "a failed replacement left the old base intact");
-            drop(view);
-            core.snapshots().create_meta(&long).unwrap();
-        }
+        let view = core.snapshot(&long).unwrap();
+        let files = cowfs_ctl::hash_view(view.as_ref(), cowfs_vfs::ROOT_INO)
+            .unwrap()
+            .files;
+        assert!(files >= 1, "a failed replacement left the old base intact");
+        drop(view);
+        core.snapshots().create_meta(&long).unwrap();
         core.close().unwrap();
     }
 

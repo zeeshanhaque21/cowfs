@@ -22,8 +22,9 @@
 //! 6. remove the intent file.
 //!
 //! A crash or error from step 3 on leaves the intent file, and the next `Core::open` finishes
-//! steps 4 to 6 before serving anything. A crash before step 3 leaves a staging snapshot with no
-//! intent file, which `Core::open` removes because the name is deterministic.
+//! steps 4 to 6 before serving anything. A crash before step 3 leaves a hidden staging snapshot with
+//! no intent file. `Core::open` does not remove it (it only recovers intent files); the next swap or
+//! import of the same target does, because the name is deterministic.
 
 use std::fs;
 use std::io::Write as _;
@@ -166,8 +167,9 @@ impl Core {
         };
         self.inner.check_new_name_except(new, victim)?;
         let staged = staging_name(new);
-        // a leftover staging snapshot from an earlier crash: the intent file is gone, so this is
-        // garbage. Removing it is what `Core::open` does; do the same here.
+        // A leftover staging snapshot of this name is removed first. That is garbage after a crash
+        // before the intent, but if a failed swap left an intent naming it, this destroys the only
+        // copy of the new tree (issue 177). `Core::open` does not sweep orphans either (issue 176).
         if let Ok(leftover) = self.inner.snap_by_name_raw(&staged) {
             let _ = self.inner.unregister(&leftover);
         }

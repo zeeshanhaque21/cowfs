@@ -161,9 +161,9 @@ impl Handler {
     }
 
     /// `import` copies a directory into the store, which only means anything for
-    /// a backend whose snapshots are directories. On the core the source has to go in through the
-    /// mount, which is a different operation, so this says so instead of writing a tree the core
-    /// would not read back as a snapshot.
+    /// a backend whose snapshots are directories. It guards only the passthrough fallback of `import`:
+    /// the core ingests through its own writer (`Backend::ingest`), and `base_refresh` publishes
+    /// tree-natively through `import::replace_tree` (issue 123), so neither comes here for the core.
     fn can_ingest(&self) -> CtlResult<()> {
         if self.backend.ingests_directories() {
             return Ok(());
