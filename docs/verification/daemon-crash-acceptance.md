@@ -2,15 +2,61 @@
 
 Issue: [#88](https://github.com/zeeshanhaque21/cowfs/issues/88).
 Harness: `scripts/verify-daemon-crash.py`, tests `bench/test_daemon_crash.py`.
-Finding: [#90](https://github.com/zeeshanhaque21/cowfs/issues/90).
+Finding: [#90](https://github.com/zeeshanhaque21/cowfs/issues/90), closed, repaired by PR #96.
 Reviews: `docs/reviews/crash88-final.md`, `docs/reviews/crash88-repair-final.md`.
+Post-#96 status analysis: `docs/reviews/issue88-status-20261008.md`.
+The reviews predate #96, so no independent reviewer has seen the post-#96 result below.
 
-## Verdict
+## Verdict, post-#96, 2026-10-08
+
+Measured at main `04bbdd0ec430eecd606dc55acd64d98f7d3a4611`, which contains PR #96 (merge `951045f`).
+Harness sha256 `1c400c5edd34208eaf1d1c0a205cea4156e35ef534a553186aef36289aee3e10`.
+Build artifacts, not reproducible: `cowfs-daemon` `7ea65e2eabd608fd3c5e1638ce8c9d60f7d7af4f57aac868cd28c13c9d163023`, `cowfs` `46aa94a1522f06c360c44ce3b81b3c1e0307e9d3456838bac83b97483d470b77`.
+Transport and host: real in-process NFSv3 loopback, `cowfs-daemon --backend core`, macOS Darwin 25.6.0, local run and not a CI run.
+Evidence is gitignored: `bench/out/crash88-post96/s88a` and `bench/out/crash88-post96/m88a` in the primary checkout.
+
+Sample: `python3 scripts/verify-daemon-crash.py --stage sample --reps 1 --run-id s88a`.
+Result: 2 executed, 0 reused, 2 passed, 0 failed, accounting balanced.
+Cases: `write_fsync` and `rename_posix_durability`.
+
+Matrix: `python3 scripts/verify-daemon-crash.py --stage all --reps 2 --run-id m88a`.
+Result: `executed_all_passed`, exit 0, fresh acceptance yes.
+Executed 29 (28 cowfs and 1 native), reused 0, accounting 29 planned and 29 accounted and balanced.
+Passed 29, failed 0, in about 3m05s.
+Receipts issued: 72, of which 52 durable, 18 applied and 2 removed.
+Every one of the 52 durable receipts matched the sha256 read back through a fresh daemon on the same store.
+fsck was clean in 28 of 28 cowfs cases.
+Before #96 the same matrix was 23 passed and 6 failed, all six at the `rename` plus `fsync` boundary (history below).
 
 | scope | verdict |
 |---|---|
 | the instrument: a bounded, runnable, fail-closed crash harness against the real daemon, CLI and mount | **holds** |
-| success criterion 3 (zero data loss in crash-injection tests) and gate g6, for the `rename` + `fsync` boundary | **BLOCKED** |
+| zero data loss for the sampled process-crash windows (SIGKILL) on this Mac: 2 matrix reps per cowfs case, 2 sample reps of two cases, 1 native | **met** |
+| `rename` + `fsync` boundary, formerly blocked by #90 | **met**, 4 of 4 `rename_posix_durability` and 2 of 2 `rename_posix_durability_ro` |
+| gate g6 for power loss, mid-GC crash and internal fsync orderings | **NOT covered** |
+
+This is a finite matrix of 2 reps, scoped evidence and not a proof over all crash windows.
+
+### Not covered
+
+Power loss is not tested.
+SIGKILL kills a process, not the kernel, and the host page cache survives, so fsync is never really exercised.
+A mid-GC crash is not tested.
+The kill lands after the gc ack, and the gc case frees 0 bytes (`freed_bytes` 0 with 167 and 164 candidate blocks in the two reps) because a small fixture lives in the open pack.
+Internal orderings are not tested: pack fsync to watermark advance, and watermark advance to metadata commit.
+They have no public boundary to drive.
+The native control runs on APFS, where a process kill cannot expose a missing fsync, so it validates the recipe and readback only.
+Concurrent writers and `shutdown` as a crash boundary are not sampled either.
+
+## Superseded verdict, before #96, kept as history
+
+Everything from here to "Superseded evidence" describes the pre-#96 run at `90c9a8f` unless a section says otherwise.
+Its counts and its "BLOCKED" verdict are superseded by the section above.
+
+| scope | verdict |
+|---|---|
+| the instrument: a bounded, runnable, fail-closed crash harness against the real daemon, CLI and mount | **holds** |
+| success criterion 3 (zero data loss in crash-injection tests) and gate g6, for the `rename` + `fsync` boundary | **BLOCKED** (then) |
 
 **The run exits non-zero on purpose.** 6 of 29 executions fail, every one the same boundary: a
 caller's `fsync` returned success and the name it was supposed to make durable was gone after
@@ -74,7 +120,7 @@ is identical, because that revision only touched this document.
 The harness does not exist at the base commit `ceb96c6`, and no row here claims it does. An
 earlier revision of this report cited `ceb96c6` and was wrong.
 
-### The binary's source inputs changed after that run, so the counts above are not re-asserted for current main
+### Pre-#96 (`90c9a8f`): the binary's source inputs changed after that run, so the pre-#96 counts above are not re-asserted for current main
 
 This branch has since merged main at `46b0f269d5bef4a2c204c25f5b3015da601d3beb`, which carries #93
 and #95. The 29-execution run above was measured at `90c9a8f`, **before** both.
@@ -109,7 +155,7 @@ The integrated build's digests, `eb48f336` for the daemon and `e0cc963b` for the
 below as the artifacts that particular run used. They are build-specific, they are not reproducible,
 and they are not offered as evidence of anything about source.
 
-### Scoped re-measurement on the integrated binary
+### Pre-#96 (`90c9a8f`): scoped re-measurement on the integrated binary
 
 Executed on the merged tree, one sample per case, real daemon, real CLI, real NFS loopback, private
 store, SIGKILL and reopen:
@@ -180,7 +226,7 @@ recorded (`receipt.repath`, 8), every durable promise gets the state it actually
 (`readback.durable`, 52, one per durable receipt), and every case records its verdict before its
 terminal record (`case.verdict`, 29).
 
-## Results, 29 executions
+## Pre-#96 (`90c9a8f`): results, 29 executions
 
 | | |
 |---|---|
@@ -224,7 +270,7 @@ file vanishing:
 `fsck` is clean in every failing rep and the old name is intact, so this is loss of an
 uncommitted name, not corruption.
 
-## Finding: a successful POSIX `fsync` after `rename` buys nothing on this transport
+## Pre-#96 (`90c9a8f`) finding, fixed by #96: a successful POSIX `fsync` after `rename` bought nothing on this transport
 
 `docs/design.md` lists atomic `rename` under full POSIX, and POSIX says a successful `fsync` on
 the parent directory makes the new name durable. Here that call returns 0 and the name is still
@@ -558,10 +604,7 @@ collector's own 8 MiB floor.
 
 ## What is still needed
 
-The source fix is **not** in this branch and is not mine to land. Issue #90 carries the corrected
-scope: a durability barrier a caller can reach, or a narrowed capability claim in
-`docs/design.md`. Either way, `rename_posix_durability` and `rename_posix_durability_ro` must be
-re-run against the fixed tree and pass on their own, with no wrapper. This harness is the
-instrument for that and currently reports the boundary as failing.
+Pre-#96 text, superseded: issue #90 is closed by PR #96, and `rename_posix_durability` and `rename_posix_durability_ro` pass on main `04bbdd0` with no wrapper.
 
-Independent review of this revision is wanted.
+Still open, as listed under "Not covered": power loss, mid-GC crash and the internal fsync orderings.
+An independent review of the post-#96 result has not been done.
