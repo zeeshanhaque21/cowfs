@@ -10,7 +10,7 @@
 //! 1. `crates/cowfs-daemon/src/handler.rs` `base_refresh` calls `can_ingest()?` before anything
 //!    else, and `can_ingest` answers `unsupported` unless `backend.ingests_directories()`.
 //!    `CoreBackend::ingests_directories()` is `false` by design, documented on the method itself.
-//!    So on the core the call is refused before any publication or persistence is attempted.
+//!    On the core the checkout is published tree-natively through the core writer (issue 123).
 //! 2. Only then does `crates/cowfs-daemon/src/import.rs` matter: it found the checkout by reading
 //!    the last line of `git worktree add --detach <commit>` stdout, and no line of that stdout is a
 //!    path on the git this host has. Reproduced here.
@@ -1317,20 +1317,19 @@ fn native_control_builds_and_tests_the_sample_project() {
     assert!(built.is_file(), "the native control produced no rlib");
 }
 
-/// The first link in the chain: `base_refresh` does not publish on the core.
+/// The first link in the chain, closed by issue 123: `base_refresh` publishes on the core.
 ///
-/// This test asserts a clean refusal, not merely an error: exit 1, a message that names the reason,
-/// no snapshot published, and no git worktree left behind.
+/// It asserts exit 0, a listed base, and no git worktree left behind.
 #[test]
-fn the_core_daemon_refuses_base_refresh_and_publishes_nothing() {
+fn the_core_daemon_publishes_base_refresh_and_leaves_no_worktree() {
     let deadline = Deadline::after(600);
     let Ok(core) = Core::start(
-        "the_core_daemon_refuses_base_refresh_and_publishes_nothing",
+        "the_core_daemon_publishes_base_refresh_and_leaves_no_worktree",
         deadline,
     ) else {
         return;
     };
-    let sample = Sample::new("base-refresh-refused", deadline);
+    let sample = Sample::new("base-refresh-published", deadline);
     let companion = require_bin("cowfs-treehouse");
 
     let before = stdout(&sh(deadline, sample.path(), "git", &["worktree", "list"]));
@@ -1357,7 +1356,7 @@ fn the_core_daemon_refuses_base_refresh_and_publishes_nothing() {
         .unwrap_or_default();
 
     record(
-        "base-refresh-refused",
+        "base-refresh-published",
         &[
             ("outcome", MEASURED.to_owned()),
             ("companion_exit", code(&out).to_string()),
@@ -1374,28 +1373,19 @@ fn the_core_daemon_refuses_base_refresh_and_publishes_nothing() {
 
     assert_eq!(
         code(&out),
-        1,
-        "the refusal must be exit 1: {}{}",
+        0,
+        "the core publishes a base tree-natively (issue 123): {}{}",
         stdout(&out),
         stderr(&out)
     );
-    let err = stderr(&out);
     assert!(
-        err.contains("unsupported"),
-        "the core must refuse by name, not fail obscurely: {err}"
-    );
-    assert!(
-        err.contains("stores snapshots as trees"),
-        "the refusal must name the reason: {err}"
-    );
-    assert!(
-        !listed.contains("base"),
-        "a refused base_refresh must publish nothing: {listed}"
+        listed.contains("-base"),
+        "a published base_refresh must list the base: {listed}"
     );
     assert_eq!(
         before.trim(),
         after.trim(),
-        "a refused base_refresh must leave no git worktree behind"
+        "base_refresh must leave no git worktree behind"
     );
 }
 
