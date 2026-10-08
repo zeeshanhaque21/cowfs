@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to a PR cancels that PR's running checks. Other runs (main) get a unique group, so none is cancelled.
+concurrency:
+  group: ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   check:
     strategy:
@@ -18,6 +23,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only main writes the cache. PR runs restore main's, so they never evict it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -33,6 +41,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only main writes the cache. PR runs restore main's, so they never evict it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install FUSE
         run: |
           sudo apt-get update && sudo apt-get install -y fuse3
