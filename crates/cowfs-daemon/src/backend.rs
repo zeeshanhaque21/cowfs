@@ -538,9 +538,8 @@ impl Backend for CoreBackend {
         })
     }
 
-    /// `base_refresh` still copies a git worktree into the store directory, which means nothing
-    /// for a backend whose snapshots are trees, so it is refused here. `import` does not come
-    /// through this flag: it goes through [`Backend::ingest`].
+    /// Snapshots here are trees, not directories, so nothing copies a directory into the store.
+    /// `import` and `base_refresh` go through [`Backend::ingest`] instead.
     fn ingests_directories(&self) -> bool {
         false
     }

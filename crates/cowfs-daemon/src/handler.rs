@@ -160,7 +160,7 @@ impl Handler {
         self.backend.usage().ok().flatten()
     }
 
-    /// `import` and `base_refresh` copy a directory into the store, which only means anything for
+    /// `import` copies a directory into the store, which only means anything for
     /// a backend whose snapshots are directories. On the core the source has to go in through the
     /// mount, which is a different operation, so this says so instead of writing a tree the core
     /// would not read back as a snapshot.
@@ -480,8 +480,12 @@ impl ControlHandler for Handler {
         params: BaseRefreshParams,
         ctx: &OpContext<'_>,
     ) -> CtlResult<BaseRefreshReport> {
-        self.can_ingest()?;
-        crate::import::base_refresh(self.backend.as_ref(), self.snaps(), &params, ctx)
+        // No `can_ingest` here: a tree-native backend publishes the checkout through its own
+        // writer (`import::replace_tree`), so only a backend with no way in at all is refused.
+        let report =
+            crate::import::base_refresh(self.backend.as_ref(), self.snaps(), &params, ctx)?;
+        self.changed();
+        Ok(report)
     }
 
     fn mount_info(&self) -> CtlResult<MountInfo> {

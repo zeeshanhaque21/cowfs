@@ -2804,7 +2804,8 @@ fn a_claim_of_a_published_warm_base_is_refused_in_both_shapes() {
     );
 }
 
-/// The acceptance itself, `#[ignore]`d because it cannot pass until the chain is broken.
+/// The acceptance itself, `#[ignore]`d only because it is slow. The chain (`can_ingest`, #97, #98) is
+/// closed by issue 123, and this passes on a host that can mount.
 ///
 /// Run it on a head that claims to have core `base_refresh` publication, an explicit worktree path,
 /// and durable provenance:
@@ -2821,7 +2822,7 @@ fn a_claim_of_a_published_warm_base_is_refused_in_both_shapes() {
 /// read back before the build; the base still intact afterwards; and a reset that returns each
 /// slot to a byte-identical untouched base.
 #[test]
-#[ignore = "chain broken: can_ingest gate, then #97 worktree path, then #98 provenance"]
+#[ignore = "heavy: a real mount and two cargo build+test runs (about 17 minutes); issue 123 passed it, run with --ignored"]
 fn warm_base_acceptance_over_a_real_core() {
     let deadline = Deadline::after(3600);
     let companion = require_bin("cowfs-treehouse")

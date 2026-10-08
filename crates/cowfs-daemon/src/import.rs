@@ -344,11 +344,19 @@ fn replace(
     ctx: &OpContext<'_>,
 ) -> CtlResult<()> {
     let taken = snaps.list().unwrap_or_default().iter().any(|n| n == name);
-    let staging = format!(".cowfs-import-{name}");
+    // The core refuses a leading dot in a snapshot name, the passthrough store hides one.
+    let staging = if backend.ingests_directories() {
+        format!(".cowfs-import-{name}")
+    } else {
+        format!("cowfs-import-{name}")
+    };
     if snaps.list().unwrap_or_default().contains(&staging) {
         snaps
             .remove(&staging)
             .map_err(|e| io_err(&format!("cannot clear {staging:?}"), e))?;
+    }
+    if !backend.ingests_directories() {
+        return replace_tree(from, name, &staging, taken, backend, snaps, ctx);
     }
     snaps
         .create(&staging, None)
@@ -366,6 +374,51 @@ fn replace(
     snaps
         .rename(&staging, name)
         .map_err(|e| io_err(&format!("cannot install {name:?}"), e))
+}
+
+/// The tree-native publication step for a backend whose snapshots are trees (the core): the
+/// checkout goes in through the backend's own writer, which verifies it before the staging name is
+/// visible, and an existing base is replaced by the core's crash-safe `swap`, never removed first.
+fn replace_tree(
+    from: &Path,
+    name: &str,
+    staging: &str,
+    taken: bool,
+    backend: &dyn Backend,
+    snaps: &dyn Snapshots,
+    ctx: &OpContext<'_>,
+) -> CtlResult<()> {
+    let mut progress = |done: u64, total: u64| {
+        ctx.progress(ProgressEvent {
+            phase: "ingest".into(),
+            done,
+            total: Some(total),
+            unit: Unit::Bytes,
+            message: None,
+        })
+        .is_ok()
+    };
+    if backend.ingest(from, staging, &mut progress)?.is_none() {
+        return Err(CtlError::new(
+            ErrorCode::Unsupported,
+            "this backend has no writer that can ingest a directory",
+        ));
+    }
+    let installed = if taken {
+        snaps.swap(name, staging).map(|_| ())
+    } else {
+        snaps.rename(staging, name)
+    };
+    if let Err(e) = installed {
+        let _ = snaps.remove(staging);
+        return Err(io_err(&format!("cannot install {name:?}"), e));
+    }
+    if taken {
+        snaps
+            .remove(staging)
+            .map_err(|e| io_err(&format!("cannot drop {staging:?}"), e))?;
+    }
+    Ok(())
 }
 
 fn io_err(what: &str, e: std::io::Error) -> CtlError {
@@ -738,6 +791,50 @@ mod tests {
             "the repository is untouched"
         );
         assert_eq!(worktree_paths(&repo), vec![resolved(&repo)]);
+    }
+
+    /// The tree-native publication of issue 123: the core refuses a directory, so the checkout goes
+    /// in through its writer, and the base, its commit and a replacement all survive a reopen.
+    #[test]
+    fn the_core_publishes_a_warm_base_by_ingesting_the_checkout() {
+        use crate::backend::CoreBackend;
+        let store = tempfile::tempdir().unwrap();
+        let (_rd, repo) = repo("the base");
+        let want = git_commit(&repo.display().to_string(), "main").unwrap();
+        let core = CoreBackend::open(store.path(), cowfs_core::Options::default()).unwrap();
+        let first = refresh(&core, &repo, "warm").expect("a first publication");
+        assert_eq!(
+            first.snapshot.base.as_ref().unwrap().commit,
+            Some(want.clone())
+        );
+        assert_eq!(first.previous_commit, None);
+
+        // A second refresh replaces a taken name through the core's swap, with no staging left.
+        let second = refresh(&core, &repo, "warm").expect("a replacing publication");
+        assert_eq!(second.previous_commit, Some(want.clone()));
+        let names = core.snapshots().list().unwrap();
+        assert_eq!(
+            names,
+            ["warm"],
+            "no staging snapshot is left behind: {names:?}"
+        );
+        core.close().unwrap();
+        drop(core);
+
+        let reopened = CoreBackend::open(store.path(), cowfs_core::Options::default()).unwrap();
+        let info = reopened.snapshots().create_meta("warm").unwrap();
+        assert_eq!(info.base.as_ref().unwrap().commit, Some(want));
+        let view = reopened.snapshot("warm").unwrap();
+        let hash = cowfs_ctl::hash_view(view.as_ref(), cowfs_vfs::ROOT_INO).unwrap();
+        assert!(hash.files >= 1, "the published tree holds the checkout");
+        drop(view);
+        assert_eq!(
+            entries(&repo),
+            [".git", "main.rs"],
+            "the repository is untouched"
+        );
+        assert_eq!(worktree_paths(&repo), vec![resolved(&repo)]);
+        reopened.close().unwrap();
     }
 
     #[test]
