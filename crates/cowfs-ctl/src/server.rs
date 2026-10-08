@@ -110,12 +110,19 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ShutdownDeadlines {
+    abandon: Instant,
+    grace_end: Instant,
+}
+
 #[derive(Debug)]
 struct Shared {
     epoch: Instant,
     stopping: AtomicBool,
-    abandon_at: OnceLock<Instant>,
+    deadlines: OnceLock<ShutdownDeadlines>,
     shutdown_after: Duration,
+    drain_after: Duration,
     next_conn: AtomicU64,
     requests: AtomicUsize,
     conns: Mutex<HashMap<u64, Arc<Conn>>>,
@@ -124,7 +131,11 @@ struct Shared {
 
 impl Shared {
     fn begin_shutdown(&self) {
-        let _ = self.abandon_at.set(Instant::now() + self.shutdown_after);
+        let abandon = Instant::now() + self.shutdown_after;
+        let _ = self.deadlines.set(ShutdownDeadlines {
+            abandon,
+            grace_end: abandon + self.drain_after,
+        });
         self.stopping.store(true, Ordering::SeqCst);
     }
 
@@ -142,8 +153,16 @@ impl Shared {
         self.stopping.load(Ordering::SeqCst)
     }
 
+    /// The single end instant of the shutdown grace, once the shutdown deadline has passed.
+    fn abandoned_grace_end(&self) -> Option<Instant> {
+        self.deadlines
+            .get()
+            .filter(|d| Instant::now() >= d.abandon)
+            .map(|d| d.grace_end)
+    }
+
     fn abandoned(&self) -> bool {
-        self.abandon_at.get().is_some_and(|d| Instant::now() >= *d)
+        self.abandoned_grace_end().is_some()
     }
 }
 
@@ -186,8 +205,9 @@ impl Server {
         let shared = Arc::new(Shared {
             epoch: Instant::now(),
             stopping: AtomicBool::new(false),
-            abandon_at: OnceLock::new(),
+            deadlines: OnceLock::new(),
             shutdown_after: opts.shutdown_deadline,
+            drain_after: opts.drain_deadline,
             next_conn: AtomicU64::new(0),
             requests: AtomicUsize::new(0),
             conns: Mutex::new(HashMap::new()),
@@ -270,15 +290,10 @@ fn accept_loop(
         if lock(&shared.conns).is_empty() {
             break;
         }
-        if shared.abandoned() {
-            // The deadline has passed. Everything from here to the return shares ONE grace, so the
-            // budget is `shutdown_deadline + drain_deadline` and not a multiple of it. The end
-            // instant is computed once, here, and every wait below is bounded by that same instant.
-            // A per-wait budget looked equivalent but was not: each wait started its own
-            // `drain_deadline`, so a straggler that finished nothing could stretch the return to the
-            // deadline plus three graces. The accept loop polls this branch every 10 ms, so this
-            // instant is at most one poll interval after the real deadline.
-            let grace_end = Instant::now() + opts.drain_deadline;
+        if let Some(grace_end) = shared.abandoned_grace_end() {
+            // The end instant was fixed when shutdown began, not when this loop noticed the deadline.
+            // Everything from here to the return spends ONE grace: the budget is
+            // `shutdown_deadline + drain_deadline`, and no wait restarts it.
             // The whole grace is the delivery window. `kill` runs at `grace_end`, so a client that
             // resumes reading at any point inside `shutdown_deadline + drain_deadline` still gets its
             // frame; the unwind after the resume plus the terminal write still fits in that window.
