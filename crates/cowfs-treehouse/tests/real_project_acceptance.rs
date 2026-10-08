@@ -1328,8 +1328,8 @@ fn native_control_builds_and_tests_the_sample_project() {
         .collect();
     record("native-control", &refs);
 
-    assert_eq!(code(&build), 0, "native build failed: {}", stderr(&build));
-    assert_eq!(code(&test), 0, "native test failed: {}", stderr(&test));
+    assert_eq!(code(&build), 0, "native build failed: {}", output_tail(&build));
+    assert_eq!(code(&test), 0, "native test failed: {}", output_tail(&test));
     assert!(built.is_file(), "the native control produced no rlib");
 }
 
