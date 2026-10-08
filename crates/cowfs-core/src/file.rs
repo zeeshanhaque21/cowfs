@@ -4,37 +4,25 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use cowfs_store::{chunks, BlockId, ChunkRef, MAX_CHUNK_LEN};
+use cowfs_store::{chunks, ChunkRef, MAX_CHUNK_LEN};
 use cowfs_vfs::{Error, Result};
 
 use crate::blocks::Blocks;
 use crate::gate::Entry;
 
-/// Chunk refs with this id are holes: zeros that are never stored.
-pub(crate) const HOLE: BlockId = BlockId::from_bytes([0; 32]);
-/// The longest run a hole ref may claim. BLAKE3 never produces the all-zero id, so a zero id with a
-/// longer length is a corrupt entry, not a hole, and is read as `Error::Corrupt`.
-pub(crate) const HOLE_MAX: u64 = 1 << 30;
+/// The hole marker and its length bound live in `cowfs-store`, beside the flag that carries them.
+pub(crate) use cowfs_store::HOLE;
 
-/// The hole marker: the all-zero id with a length a hole can hold.
+/// The hole marker: the flag a decoded ref carries.
 pub(crate) fn is_hole(c: &ChunkRef) -> bool {
-    c.id == HOLE && u64::from(c.len) <= HOLE_MAX
+    c.is_hole()
 }
 /// Largest file size, as in the reference implementation.
 pub(crate) const MAX_FILE: u64 = 1 << 42;
 
 /// Hole refs covering `len` bytes.
-pub(crate) fn hole_refs(mut len: u64) -> Vec<ChunkRef> {
-    let mut out = Vec::new();
-    while len > 0 {
-        let n = len.min(HOLE_MAX);
-        out.push(ChunkRef {
-            id: HOLE,
-            len: n as u32,
-        });
-        len -= n;
-    }
-    out
+pub(crate) fn hole_refs(len: u64) -> Vec<ChunkRef> {
+    ChunkRef::hole_refs(len)
 }
 
 /// A chunk list with the end offset of every chunk, for offset lookups.
@@ -266,10 +254,10 @@ fn check_len(bytes: &[u8], c: ChunkRef) -> Result<()> {
 }
 
 fn put_piece(blocks: &Blocks, entry: &Entry<'_>, piece: &[u8]) -> Result<ChunkRef> {
-    Ok(ChunkRef {
-        id: blocks.put(entry, piece)?,
-        len: piece.len() as u32,
-    })
+    Ok(ChunkRef::block(
+        blocks.put(entry, piece)?,
+        piece.len() as u32,
+    ))
 }
 
 fn flush_extent(
@@ -308,7 +296,7 @@ fn flush_extent(
         let start = list.start(i);
         let c = list.refs[i];
         first = i;
-        if c.id == HOLE {
+        if is_hole(&c) {
             if a > start {
                 prefix = hole_refs(a - start);
             }
@@ -581,7 +569,7 @@ mod tests {
         assert!(
             holes
                 .iter()
-                .all(|r| r.id == HOLE && u64::from(r.len) <= HOLE_MAX),
+                .all(|r| r.hole && r.len <= cowfs_store::HOLE_MAX),
             "a hole ref must stay the all-zero id with a length a hole can hold"
         );
         let mut model = vec![0u8; (9 << 20) + 4];

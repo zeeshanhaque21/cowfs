@@ -41,6 +41,29 @@ fn child(name: &str, dir: &std::path::Path, which: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Like `child`, but for the crash child that must really die by abort: the caller's assertions
+/// only mean something if the process was actually killed without a clean close, so a normal exit
+/// (including a panicking test that still returns 0 output) fails here instead of false-passing.
+fn child_abort(name: &str, dir: &std::path::Path, which: &str) -> String {
+    let exe = std::env::current_exe().unwrap();
+    let out = Command::new(exe)
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env("COWFS_C2B_DIR", dir)
+        .env("COWFS_C2B_WHICH", which)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        out.status.signal(),
+        Some(6),
+        "reservation child did not abort: {text:?}"
+    );
+    text
+}
+
 fn snap_names(c: &Core) -> Vec<String> {
     let mut v: Vec<String> = c
         .list_snapshots()
@@ -283,114 +306,229 @@ fn pinned_blocks_contract_is_documented_and_never_partial() {
     );
 }
 
-// ---------------------------------------------------------------- B5: the virtual-number mark
+// ---------------------------------------------------------------- B5: physical reservation identity
+//
+// The two fixtures below replace the retired virtual-mark attacks. Under the reservation design a
+// create hands out a packed physical meta number (`ns.rs::make`: `pack(snap, ticket.ino().0)`), not
+// a `VIRT`-tagged session alias, so the old probes (`a & VIRT_COUNTER_MASK > 1<<32` at :390, and
+// reading `virt.ino.b` at :332) asserted against a mark production no longer writes. The safety
+// intent they carried is preserved and strengthened: a crash child really allocates and returns a
+// physical number before it aborts, and the true physical reservation authority (the durable floor
+// in `meta.redb`) is what must never reissue that number. Legacy mark SAFETY/no-reuse coverage
+// stays on `ino.rs`'s genuine unit API (`the_virtual_mark_round_trips_and_a_torn_one_falls_back_to_the_other`,
+// the `Mark::counter` cases there), not here.
 
 #[test]
-fn virt_mark_child() {
+fn reservation_child_allocates_physical_numbers() {
     let Ok(dir) = std::env::var("COWFS_C2B_DIR") else {
         return;
     };
+    let which = std::env::var("COWFS_C2B_WHICH").unwrap_or_default();
     let c = Core::open(&dir, test_opts()).unwrap();
-    c.create_snapshot("s").unwrap();
+    if c.snapshot_view("s").is_err() {
+        c.create_snapshot("s").unwrap();
+    }
     let fs = c.snapshot_view("s").unwrap();
+    // One real allocation: `create` pops a ticket from the durable reservation pool, so the number
+    // below is drawn from and committed to the physical allocator, not minted session-locally.
     let a = fs.create(ROOT_INO, b"one", 0o644).unwrap();
     fs.write(a.ino, 0, b"FIRST").unwrap();
     c.sync().unwrap();
     let mut o = std::io::stdout();
-    writeln!(o, "C first {}", a.ino).unwrap();
+    writeln!(o, "C first {} {}", a.ino, which).unwrap();
     o.flush().unwrap();
+    // Die without closing: the durable floor the create advanced must survive, and the number must
+    // not come back, whatever damage the parent then applies to unrelated files.
     std::process::abort();
 }
 
-/// B5: a rolled-back or deleted mark must not hand the same number out again.
+/// B5: a corrupted, deleted, emptied or torn set of LEGACY mark files must not let a later session
+/// hand out a physical number a live session already allocated and returned.
+///
+/// The old fixture drove every damage through the retired `virt.ino.{a,b}` copies and read the
+/// number back through them. This drives the same four damages (zeros, delete, zero-byte, torn) and
+/// then reopens the real store: the assertion is on the physical authority, so damage to files the
+/// reservation path does not consult cannot make it reissue a number.
 #[test]
-fn a_rolled_back_virtual_mark_never_hands_out_the_same_number() {
+fn legacy_mark_corruption_never_reissues_a_live_physical_number() {
     for damage in ["zeros", "delete", "zero-byte", "torn"] {
         let dir = tempfile::tempdir().unwrap();
-        let out = child("virt_mark_child", dir.path(), damage);
+        // The live child allocates and returns its physical number, then aborts without syncing or
+        // closing. That number is what a reissued identity must not collide with.
+        let out = child_abort(
+            "reservation_child_allocates_physical_numbers",
+            dir.path(),
+            damage,
+        );
         println!("child output: {out:?}");
         let first: u64 = out
             .lines()
             .find_map(|l| l.split("C first ").nth(1))
+            .and_then(|v| v.split_whitespace().next())
             .and_then(|v| v.trim().parse().ok())
-            .expect("the child reported its number");
+            .expect("the child reported its physical number");
+        assert_eq!(
+            first & (1 << 63),
+            0,
+            "{damage}: the child handed out a virtual alias, not a physical number: {first:#x}"
+        );
+
+        // Damage only the retired legacy marks, exactly as the old fixture did. These are files the
+        // reservation path never writes, so corrupting them cannot move the physical floor. Each
+        // branch lays the damage down and verifies it landed, so the case is not a silent no-op.
         match damage {
             "zeros" => {
                 for f in ["virt.ino.a", "virt.ino.b"] {
                     std::fs::write(dir.path().join(f), [0u8; 16]).unwrap();
+                    assert_eq!(
+                        std::fs::read(dir.path().join(f)).unwrap(),
+                        [0u8; 16],
+                        "{damage}: {f} was not zeroed"
+                    );
                 }
             }
             "delete" => {
-                let _ = std::fs::remove_file(dir.path().join("virt.ino.a"));
-                let _ = std::fs::remove_file(dir.path().join("virt.ino.b"));
+                for f in ["virt.ino.a", "virt.ino.b"] {
+                    let _ = std::fs::remove_file(dir.path().join(f));
+                    assert!(
+                        !dir.path().join(f).exists(),
+                        "{damage}: {f} still exists after the delete"
+                    );
+                }
             }
             "zero-byte" => {
-                std::fs::write(dir.path().join("virt.ino.a"), b"").unwrap();
-                std::fs::write(dir.path().join("virt.ino.b"), b"").unwrap();
+                for f in ["virt.ino.a", "virt.ino.b"] {
+                    std::fs::write(dir.path().join(f), b"").unwrap();
+                    assert_eq!(
+                        std::fs::read(dir.path().join(f)).unwrap().len(),
+                        0,
+                        "{damage}: {f} was not emptied"
+                    );
+                }
             }
             _ => {
-                let mut b = std::fs::read(dir.path().join("virt.ino.b")).unwrap();
+                // A tear needs both copies present and a genuine mismatch: write a valid record to
+                // `.a`, then flip a byte of a valid `.b`, so the pair disagrees. Only if a prompt
+                // write ever laid the files down do we tear them; the reservation path does not, so
+                // this branch corrupts whatever is there without inventing a dependence on it.
+                let ta = dir.path().join("virt.ino.a");
+                let tb = dir.path().join("virt.ino.b");
+                if !ta.exists() {
+                    std::fs::write(&ta, encode_mark(1000)).unwrap();
+                }
+                let mut b = std::fs::read(&tb).unwrap_or_else(|_| encode_mark(2000).to_vec());
+                if b.is_empty() {
+                    b = encode_mark(2000).to_vec();
+                }
                 if let Some(last) = b.last_mut() {
                     *last ^= 0xff;
                 }
-                std::fs::write(dir.path().join("virt.ino.b"), &b).unwrap();
+                std::fs::write(&tb, &b).unwrap();
+                // prove the torture landed: the two copies now disagree, or `.b` is at least not a
+                // verbatim copy of `.a`
+                let read_a = std::fs::read(&ta).unwrap();
+                let read_b = std::fs::read(&tb).unwrap();
+                assert_ne!(read_a, read_b, "{damage}: the torn copies are identical");
             }
         }
-        let c =
-            Core::open(dir.path(), test_opts()).expect("a damaged mark must not brick the mount");
+
+        // Reopen the real store. The physical floor the child advanced is the authority; corrupted
+        // legacy marks are read-only and must not change what the allocator hands out.
+        let c = Core::open(dir.path(), test_opts())
+            .expect("a damaged legacy mark must not brick the mount");
         let fs = c.snapshot_view("s").unwrap();
         let b = fs.create(ROOT_INO, b"two", 0o644).unwrap();
         fs.write(b.ino, 0, b"SECOND").unwrap();
         c.sync().unwrap();
-        let read = fs.read(first, 0, 16);
-        let seen = read
-            .as_ref()
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .map_err(|e| e.to_string());
         println!(
-            "{damage}: session 1 {first:#x}, session 2 {:#x}, read(old) = {seen:?}, last_error {:?}",
+            "{damage}: child {first:#x}, reopened {:#x}, floor {:?}, last_error {:?}",
             b.ino,
+            c.meta().health().ino_floor,
             c.last_flush_error()
         );
+
+        // The physical number the live child allocated and returned must not be handed out again.
         assert_ne!(
             b.ino, first,
-            "{damage}: an inode number was handed out twice"
+            "{damage}: a live physical number was handed out twice"
         );
+        // No ABA: the reopened store's durable floor sits at or above everything the child's
+        // reservation committed, so nothing at or below it can be reissued. Compare in the bare
+        // meta-number space, which is the low 40 bits the reservation floor lives in.
+        let floor = c.meta().health().ino_floor;
+        let first_meta = first & cowfs_core::VIRT_COUNTER_MASK;
+        assert!(
+            floor > first_meta,
+            "{damage}: the physical floor {floor} does not cover the child's meta number {first_meta:#x}"
+        );
+        // The old number must not resolve to another file's bytes.
+        let read = fs.read(first, 0, 16);
         assert!(
             read.as_ref().map(|v| v.as_slice() == b"SECOND") != Ok(true),
-            "{damage}: the old number returned another file's bytes"
+            "{damage}: the old physical number returned another file's bytes"
         );
+        c.check().unwrap();
     }
 }
 
-/// B5: a lost mark raises the counter by a safety margin and says so.
+/// B5: a physical number's identity, floor and bytes persist across a real close and reopen, with no
+/// ABA on the number even when the retired legacy marks are absent entirely.
 #[test]
-fn a_lost_mark_starts_far_above_the_old_counter_and_logs() {
+fn a_physical_reservation_identity_persists_across_a_reopen_under_the_floor() {
     let dir = tempfile::tempdir().unwrap();
-    {
+    let body = b"physical-reservation-recovery-payload";
+    let (created, floor_before) = {
         let c = Core::open(dir.path(), test_opts()).unwrap();
         c.create_snapshot("s").unwrap();
         let fs = c.snapshot_view("s").unwrap();
         let a = fs.create(ROOT_INO, b"f", 0o644).unwrap();
-        fs.write(a.ino, 0, b"x").unwrap();
+        write_all(&fs, a.ino, 0, body);
+        Vfs::flush(&c, a.ino).unwrap();
         c.sync().unwrap();
-        let _ = a;
-    }
-    let _ = std::fs::remove_file(dir.path().join("virt.ino.a"));
-    let _ = std::fs::remove_file(dir.path().join("virt.ino.b"));
+        let floor = c.meta().health().ino_floor;
+        (a.ino, floor)
+    };
+    // No legacy marks exist at all: the reservation never wrote them.
+    assert!(!dir.path().join("virt.ino.a").exists());
+    assert!(!dir.path().join("virt.ino.b").exists());
+
     let c = Core::open(dir.path(), test_opts()).unwrap();
-    let e = c.last_flush_error().unwrap_or_default();
-    println!("last_error after a lost mark: {e}");
-    assert!(
-        e.contains("virt"),
-        "a lost virtual-number mark must be reported loudly, got {e:?}"
+    let r = root_entry(&c, "s").ino;
+    let a = c.lookup(r, b"f").unwrap();
+    // Same durable physical identity and bytes under the same floor: the number is not a
+    // session-local alias, and the floor never falls back below it.
+    assert_eq!(
+        a.ino, created,
+        "the physical identity changed across a reopen"
     );
+    assert_eq!(
+        a.ino & (1 << 63),
+        0,
+        "the reopened number carries the retired virtual alias bit"
+    );
+    assert!(
+        c.meta().health().ino_floor >= floor_before,
+        "the physical floor fell back across the reopen"
+    );
+    assert_eq!(read_all(&c, a.ino), body, "the bytes were not durable");
+    // A fresh number drawn after the reopen is up past the earlier allocation, never ABA.
     let fs = c.snapshot_view("s").unwrap();
-    let a = fs.create(ROOT_INO, b"g", 0o644).unwrap().ino;
+    let next = fs.create(ROOT_INO, b"g", 0o644).unwrap().ino;
     assert!(
-        a & cowfs_core::VIRT_COUNTER_MASK > (1 << 32),
-        "{a:#x} starts at zero after a lost mark"
+        next > created,
+        "a later physical number {next:#x} reused an earlier one {created:#x}"
     );
+    c.check().unwrap();
+}
+
+/// A valid legacy mark record, so the torn case can lay two disagreeing copies as the old fixture
+/// did. The production reservation no longer writes these; this only reconstructs the format the
+/// read side still accepts for stores written before meta owned the reservation.
+fn encode_mark(n: u64) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&n.to_le_bytes());
+    b[8..].copy_from_slice(&n.to_le_bytes());
+    b
 }
 
 // ---------------------------------------------------------------- B6: the lock audit table
@@ -508,10 +646,7 @@ fn a_zero_id_chunk_ref_is_a_hole_only_if_the_store_does_not_hold_it() {
         let snap = meta.snapshot_by_id(info.id).unwrap();
         snap.batch(|tx| {
             let a = tx.create(cowfs_meta::ROOT_INO, b"forged", 0o644)?;
-            let refs = vec![cowfs_store::ChunkRef {
-                id: cowfs_store::BlockId::from_bytes([0; 32]),
-                len: 4096,
-            }];
+            let refs = vec![cowfs_store::ChunkRef::hole(4096)];
             tx.set_content(a.ino, &refs, 4096)?;
             Ok::<(), cowfs_meta::Error>(())
         })
@@ -555,27 +690,27 @@ fn the_zero_id_is_never_a_real_block_and_a_hole_is_length_bounded() {
         snap.batch(|tx| {
             let a = tx.create(cowfs_meta::ROOT_INO, b"forged", 0o644)?;
             let refs = vec![cowfs_store::ChunkRef {
-                id: cowfs_store::BlockId::from_bytes([0; 32]),
+                id: cowfs_store::HOLE,
                 // longer than any hole ref a sparse file can hold
                 len: (1 << 30) + 1,
+                hole: true,
             }];
             tx.set_content(a.ino, &refs, u64::from(refs[0].len))?;
             Ok::<(), cowfs_meta::Error>(())
         })
-        .unwrap();
+        // the metadata store refuses it now: a hole longer than a hole may claim is not a legal
+        // chunk ref, and a walk that yielded it would hand a collector a block the store cannot hold
+        .expect_err("a hole longer than a hole may claim must be refused");
         drop(c);
     }
+    // the refusal rolled the whole batch back, so the forged file is not there at all. A store
+    // written before the flag existed could still hold such a ref; that read path is covered in
+    // cowfs-meta's `hole_flag` fixture, where it is a decode failure rather than a write failure.
     let c = Core::open(dir.path(), test_opts()).unwrap();
-    let fs = c.snapshot_view("s").unwrap();
-    let a = fs.lookup(ROOT_INO, b"forged").unwrap();
-    let got = fs.read(a.ino, 0, 64);
-    println!(
-        "read of a zero-id ref longer than HOLE_MAX -> {:?}",
-        got.as_ref().err()
-    );
+    let snap = c.meta().snapshot("s").unwrap();
     assert!(
-        matches!(got, Err(cowfs_vfs::Error::Corrupt(_))),
-        "a zero id with a length no hole can hold is not a hole: {got:?}"
+        snap.lookup(cowfs_meta::ROOT_INO, b"forged").is_err(),
+        "the refused batch must have left nothing behind"
     );
 }
 
@@ -827,35 +962,45 @@ fn try_content(c: &Core, snap: &str, name: &str) -> Option<String> {
 /// B3: a refused rename leaves the mount exactly as it was, with no staging snapshot visible, and
 /// the next open does not complete it.
 #[test]
-fn a_refused_rename_leaves_the_mount_exactly_as_it_was() {
+fn a_refused_promotion_leaves_the_mount_exactly_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
     let names;
     {
         let c = Core::open(dir.path(), test_opts()).unwrap();
+        c.create_snapshot("src").unwrap();
+        let src_root = root_entry(&c, "src").ino;
+        mkfile(&c.snapshot_view("src").unwrap(), src_root, "x", b"payload");
         c.create_snapshot("old").unwrap();
+        let target = root_entry(&c, "old").ino;
         let fs = c.snapshot_view("old").unwrap();
-        let a = fs.create(ROOT_INO, b"x", 0o644).unwrap();
-        fs.write(a.ino, 0, b"payload").unwrap();
+        let a = mkfile(&fs, target, "y", b"doomed");
         c.sync().unwrap();
+        // the handle is on the snapshot promotion would destroy, which is what makes it refuse
         let h = fs.open(a.ino).unwrap();
-        let r = c.rename_snapshot("old", "new");
-        println!("rename with an open handle -> {r:?}");
+        let r = c.promote_base("src", "old");
+        println!("promotion with an open handle -> {r:?}");
         names = snap_names(&c);
         println!("snapshots after the refusal: {names:?}");
         assert!(r.is_err(), "setup: {r:?}");
         fs.release(h).unwrap();
-        assert_eq!(names, ["old".to_string()], "the mount changed on a refusal");
-        assert_eq!(content(&c, "old", "x"), "payload");
+        assert_eq!(
+            names,
+            ["old".to_string(), "src".to_string()],
+            "the mount changed on a refusal"
+        );
+        assert_eq!(content(&c, "src", "x"), "payload");
+        assert_eq!(content(&c, "old", "y"), "doomed");
+        drop(fs);
         assert!(
-            !dir.path().join("swap-new").exists(),
+            !dir.path().join("swap-old").exists(),
             "a refusal left an intent file behind"
         );
     }
     let c = Core::open(dir.path(), test_opts()).unwrap();
     assert_eq!(
         snap_names(&c),
-        ["old".to_string()],
-        "the refused rename completed at the next open"
+        ["old".to_string(), "src".to_string()],
+        "the refused promotion completed at the next open"
     );
     c.check().unwrap();
 }
@@ -865,26 +1010,29 @@ fn a_step_three_refusal_removes_the_intent_and_staging_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     {
         let c = Core::open(dir.path(), test_opts()).unwrap();
-        c.create_snapshot("old").unwrap();
-        mkfile(&c.snapshot_view("old").unwrap(), ROOT_INO, "x", b"OLD");
+        c.create_snapshot("base").unwrap();
+        mkfile(&c.snapshot_view("base").unwrap(), ROOT_INO, "x", b"OLD");
+        c.create_snapshot("src").unwrap();
+        mkfile(&c.snapshot_view("src").unwrap(), ROOT_INO, "y", b"NEW");
         c.sync().unwrap();
         c.set_swap_fault(3);
-        assert!(c.rename_snapshot("old", "new").is_err());
+        assert!(c.promote_base("src", "base").is_err());
         c.set_swap_fault(0);
         assert!(
-            !dir.path().join("swap-new").exists(),
+            !dir.path().join("swap-base").exists(),
             "refusal retained its intent"
         );
         assert_eq!(
             c.meta().snapshots().unwrap().len(),
-            1,
+            2,
             "hidden staging state survived"
         );
-        assert_eq!(snap_names(&c), ["old"]);
+        assert_eq!(snap_names(&c), ["base", "src"]);
     }
     let c = Core::open(dir.path(), test_opts()).unwrap();
-    assert_eq!(snap_names(&c), ["old"]);
-    assert_eq!(content(&c, "old", "x"), "OLD");
+    assert_eq!(snap_names(&c), ["base", "src"]);
+    assert_eq!(content(&c, "base", "x"), "OLD");
+    assert_eq!(content(&c, "src", "y"), "NEW");
     c.check().unwrap();
 }
 
@@ -894,14 +1042,15 @@ fn every_pre_removal_refusal_stays_refused_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
             let c = Core::open(dir.path(), test_opts()).unwrap();
-            c.create_snapshot("old").unwrap();
+            c.create_snapshot("base").unwrap();
+            c.create_snapshot("src").unwrap();
             c.set_swap_fault(step);
-            assert!(c.rename_snapshot("old", "new").is_err());
+            assert!(c.promote_base("src", "base").is_err());
         }
         let c = Core::open(dir.path(), test_opts()).unwrap();
         assert_eq!(
             snap_names(&c),
-            ["old"],
+            ["base", "src"],
             "refusal at step {step} completed on reopen"
         );
     }

@@ -1,6 +1,8 @@
 //! Inode number shapes and the alias table. See `docs/v1-core.md`, "Inode numbers".
 
 use std::collections::HashMap;
+// Only the test-only `write_virt_mark` writes a mark now; the production path only reads one.
+#[cfg(test)]
 use std::io::Write as _;
 
 use cowfs_meta::SnapshotId;
@@ -8,8 +10,6 @@ use cowfs_vfs::{Error, Ino, Result, ROOT_INO};
 
 /// Set on inode numbers handed out before meta assigned a real one.
 pub(crate) const VIRT: u64 = 1 << 63;
-/// How many virtual numbers one durable reservation covers.
-pub(crate) const VIRT_BLOCK: u64 = 1 << 20;
 const VIRT_A: &str = "virt.ino.a";
 const VIRT_B: &str = "virt.ino.b";
 const SHIFT: u32 = 40;
@@ -60,6 +60,10 @@ pub(crate) fn pack(snap: u64, m: u64) -> Result<Ino> {
     cowfs_meta::Meta::pack_ino(SnapshotId(snap), cowfs_meta::Ino(m)).ok_or(Error::NoSpace)
 }
 
+// Encodes a legacy virtual number. No production caller left: creates go through meta's own
+// reservation now. Kept so the shape tests can still exercise `classify`, `snap_of` and `Aliases`
+// against the numbers a pre-meta store would hold.
+#[cfg(test)]
 pub(crate) fn virt(snap: u64, n: u64) -> Result<Ino> {
     if snap == 0 || snap >= MAX_VIRT_SNAP || n > LOW {
         return Err(Error::NoSpace);
@@ -95,8 +99,16 @@ impl Aliases {
 
     pub(crate) fn insert(&mut self, virt: Ino, snap: u64, m: u64) {
         self.fwd.insert(virt, m);
+        // The reverse map is a bridge from a meta inode to the *different* number a caller holds.
+        // A reservation-backed create hands out the packed meta number itself, so `virt` is already
+        // canonical and a reverse entry would be `pm -> pm`. `canon` reads this map and `load_node`
+        // reloads through its result, so a self-map makes that reload recurse into itself forever.
+        // Leave the forward entry (the alias count and `meta_of` need it); the reverse lookup is a
+        // miss, and `Inner::canon` falls through to `pack`, which is the same number.
         if let Ok(pm) = pack(snap, m) {
-            self.rev.insert(pm, virt);
+            if pm != virt {
+                self.rev.insert(pm, virt);
+            }
         }
     }
 
@@ -217,6 +229,10 @@ fn parse_mark(b: &[u8]) -> Option<u64> {
 
 /// Records `n` durably in the copy that does not hold the newest value, through a temporary file and
 /// a rename, so the previous copy survives a crash anywhere in here.
+///
+/// Nothing writes the mark in production any more, but the read side is still live for stores
+/// written before meta owned the reservation, so the tests need a way to lay one down.
+#[cfg(test)]
 pub(crate) fn write_virt_mark(root: &std::path::Path, n: u64) -> std::io::Result<()> {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&n.to_le_bytes());
@@ -237,6 +253,7 @@ pub(crate) fn write_virt_mark(root: &std::path::Path, n: u64) -> std::io::Result
 }
 
 /// The copy that holds the highest intact value, so the next write goes to the other one.
+#[cfg(test)]
 fn newest_copy(root: &std::path::Path) -> (&'static str, &'static str) {
     let a = parse_mark(&std::fs::read(root.join(VIRT_A)).unwrap_or_default()).unwrap_or(0);
     let b = parse_mark(&std::fs::read(root.join(VIRT_B)).unwrap_or_default()).unwrap_or(0);
@@ -250,6 +267,39 @@ fn newest_copy(root: &std::path::Path) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mark_seam() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn a_legacy_virtual_mark_syncs_its_bytes_then_rename_then_directory() {
+        let _seam = mark_seam();
+        let d = tempfile::tempdir().unwrap();
+        write_virt_mark(d.path(), 12343).unwrap();
+        write_virt_mark(d.path(), 12344).unwrap();
+        crate::fsops::arm();
+        let result = write_virt_mark(d.path(), 12345);
+        let trace = crate::fsops::trace_take();
+        crate::fsops::disarm();
+        result.unwrap();
+        let position = |prefix: &str| trace.iter().position(|e| e.starts_with(prefix)).unwrap();
+        assert!(position("sync_file:virt.ino") < position("virt_mark_renamed"));
+        assert!(position("virt_mark_renamed") < position("sync_dir:"));
+        assert_eq!(read_virt_mark(d.path()), Mark::Value(12345));
+    }
+
+    #[test]
+    fn a_legacy_virtual_mark_refuses_a_failed_directory_sync() {
+        let _seam = mark_seam();
+        let d = tempfile::tempdir().unwrap();
+        crate::fsops::arm();
+        crate::fsops::set_fault(crate::fsops::Fault::DirSync, &d.path().to_string_lossy(), 1);
+        let result = write_virt_mark(d.path(), 12345);
+        crate::fsops::disarm();
+        assert!(result.is_err());
+    }
 
     #[test]
     fn shapes_round_trip() {
@@ -273,6 +323,7 @@ mod tests {
 
     #[test]
     fn the_virtual_mark_round_trips_and_a_torn_one_falls_back_to_the_other() {
+        let _seam = mark_seam();
         let d = tempfile::tempdir().unwrap();
         assert_eq!(read_virt_mark(d.path()), Mark::Missing);
         let (v, e) = read_virt_mark(d.path()).counter(false);
@@ -303,5 +354,56 @@ mod tests {
         a.remove(v);
         assert_eq!(a.len(), 0);
         assert_eq!(a.canon(2, 40), None);
+    }
+
+    /// The reserved-create regression: `commit_batch` aliases every committed create by its packed
+    /// meta number, which for a reservation-backed create is the number the caller already holds, so
+    /// `insert` was called with `virt == pack(snap, m)`. The reverse map then held `pm -> pm`, and
+    /// `load_node` reloads through `canon`, so an uncached node recursed forever and aborted the
+    /// process. A physical self-alias must make `canon` miss (the caller of `canon`, `Inner::canon`,
+    /// then falls through to `pack`, the same number) while the forward map still carries the entry.
+    #[test]
+    fn a_physical_self_alias_does_not_create_a_reverse_self_map() {
+        let mut a = Aliases::default();
+        let pm = pack(2, 40).unwrap();
+        a.insert(pm, 2, 40);
+        // the forward map is the alias count and the `meta_of` bridge; it must be there
+        assert_eq!(a.meta_of(pm), Some(40));
+        assert_eq!(a.len(), 1, "the live inode still counts one alias");
+        // the reverse lookup must NOT return the same number it was asked about, or the reload
+        // through `canon` never terminates
+        assert_eq!(
+            a.canon(2, 40),
+            None,
+            "a physical number must not be its own reverse alias"
+        );
+        // a different meta inode is unaffected
+        assert_eq!(a.canon(2, 41), None);
+        // removal frees the one entry, and the absent reverse entry is not resurrected
+        a.remove(pm);
+        assert_eq!(a.len(), 0);
+        assert_eq!(a.meta_of(pm), None);
+    }
+
+    /// The forward-only physical entry must coexist with a genuine virtual bridge in the same table,
+    /// so a later legacy number does not resurrect the self-map and a physical removal does not drop
+    /// the virtual entry's reverse bridge.
+    #[test]
+    fn a_physical_self_alias_does_not_disturb_a_virtual_bridge() {
+        let mut a = Aliases::default();
+        let v = virt(2, 1).unwrap();
+        a.insert(v, 2, 40);
+        let pm = pack(2, 40).unwrap();
+        // the same meta inode seen under its physical number is the shape a reservation create makes
+        a.insert(pm, 2, 40);
+        assert_eq!(a.canon(2, 40), Some(v), "the virtual bridge still resolves");
+        assert_eq!(a.len(), 2, "both aliases are live");
+        a.remove(v);
+        assert_eq!(
+            a.canon(2, 40),
+            None,
+            "after the virtual alias is gone only the physical number is left, no bridge"
+        );
+        assert_eq!(a.len(), 1);
     }
 }

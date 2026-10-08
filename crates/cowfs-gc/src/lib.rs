@@ -41,7 +41,7 @@ pub use report::{GcReport, Progress, SkipReason, Skipped};
 use state::{Hints, Marks};
 
 /// The block id a sparse hole chunk carries. It is not a block and is never stored.
-pub const HOLE: BlockId = BlockId::from_bytes([0; 32]);
+pub use cowfs_store::HOLE;
 
 /// A way to hold the reference side still, without holding it yet.
 ///

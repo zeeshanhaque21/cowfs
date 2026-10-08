@@ -48,10 +48,7 @@ fn chunks(rng: &mut Rng) -> Vec<ChunkRef> {
     };
     let seed = rng.below(50) as u8;
     (0..n)
-        .map(|j| ChunkRef {
-            id: BlockId::of(&[seed, j as u8]),
-            len: 1 + (j as u32 % 4),
-        })
+        .map(|j| ChunkRef::block(BlockId::of(&[seed, j as u8]), 1 + (j as u32 % 4)))
         .collect()
 }
 
