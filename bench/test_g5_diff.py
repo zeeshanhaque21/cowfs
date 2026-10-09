@@ -6,7 +6,11 @@ cachyos box (kernel 7.2.8); the identities are forged on purpose to show that ea
 validity rule refuses.
 """
 
+import contextlib
+import io
 import json
+import re
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -457,3 +461,91 @@ class LoadRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+HELPERS = {"fsstress_sha256": "f" * 64, "fsx_sha256": "x" * 64}
+
+
+class IgnoredTree(unittest.TestCase):
+    """Issue 251: gitignored build outputs are invisible to plain `git status --porcelain`."""
+
+    def build(self, m, helpers=None):
+        n, c, ctl = good_records()
+        return g.build_receipt(n, c, ctl, m, PIN, "acceptance", IDS6, "b" * 64, helpers)
+
+    def problems(self, r):
+        return [p for p in r["problems"] if p.startswith("tree:")]
+
+    def test_ignored_paths_without_pinned_helpers_are_invalid(self):
+        r = self.build(meta(tree_ignored="ltp/fsx ltp/fsstress", **HELPERS))
+        self.assertEqual(r["exit"], 3)
+        self.assertRegex(self.problems(r)[0], r"2 ignored paths .*ltp/fsx")
+
+    def test_one_pinned_helper_is_not_enough(self):
+        r = self.build(meta(tree_ignored="ltp/fsx", **HELPERS), {"fsx_sha256": "x" * 64})
+        self.assertEqual(r["exit"], 3)
+
+    def test_ignored_paths_with_matching_helpers_pass(self):
+        r = self.build(meta(tree_ignored="ltp/fsx ltp/fsstress", **HELPERS), HELPERS)
+        self.assertEqual((r["verdict"], r["exit"]), ("PASS", 0))
+
+    def test_given_digest_missing_from_meta_is_invalid(self):
+        r = self.build(meta(), {"fsx_sha256": "x" * 64})
+        self.assertEqual(r["exit"], 3)
+        self.assertRegex(self.problems(r)[0], r"fsx_sha256 None is not the expected")
+
+    def test_given_digest_different_is_invalid(self):
+        r = self.build(meta(**HELPERS), {"fsstress_sha256": "0" * 64})
+        self.assertEqual(r["exit"], 3)
+
+    def test_no_ignored_paths_and_no_flags_still_pass(self):
+        self.assertEqual(self.build(meta())["exit"], 0)
+
+    def test_cli_exposes_the_helper_flags(self):
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()) as out:
+            g.main(["report", "--help"])
+        self.assertIn("--fsx-sha256", out.getvalue())
+        self.assertEqual(e.exception.code, 0)
+
+
+class RootRecordsIgnored(unittest.TestCase):
+    """Runs the shipped g5_root.sh recording lines against a tiny repo."""
+
+    def record(self, root_text):
+        src = Path(__file__).with_name("g5_root.sh").read_text() if root_text is None else root_text
+        st = re.search(r"^tree_status=.*$", src, re.M)
+        po = re.search(r'^  echo "tree_porcelain=.*$', src, re.M)
+        ig = re.search(r'^  echo "tree_ignored=.*$', src, re.M)
+        lines = [st.group(0) if st else 'tree_status=$(git -C "$XFS" status --porcelain)', po.group(0)]
+        if ig:
+            lines.append(ig.group(0))
+        with tempfile.TemporaryDirectory() as d:
+            x = Path(d)
+            run = lambda *a: subprocess.run(["git", "-C", d, *a], check=True, capture_output=True,
+                                            env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                                                 "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"})
+            run("init", "-q")
+            (x / "ltp").mkdir()
+            (x / ".gitignore").write_text("/ltp/fsx\n")
+            (x / "ltp" / "fsx.c").write_text("int main;")  # tracked sibling, like upstream ltp/
+            run("add", ".gitignore", "ltp/fsx.c")
+            run("commit", "-q", "-m", "pin")
+            (x / "ltp" / "fsx").write_text("stale hand-built binary")
+            out = subprocess.run(["bash", "-c", "\n".join(lines)], env={"XFS": d, "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"},
+                                 capture_output=True, text=True, check=True).stdout
+        return parse_kv(out)
+
+    def test_planted_ignored_helper_is_recorded(self):
+        m = self.record(None)
+        self.assertEqual(m["tree_porcelain"], "")
+        self.assertEqual(m["tree_ignored"], "ltp/fsx")
+
+    def test_the_old_recording_line_was_blind_to_it(self):
+        old = 'tree_status=$(git -C "$XFS" status --porcelain)\n  echo "tree_porcelain=$tree_status"\n'
+        self.assertEqual(self.record(old).get("tree_porcelain"), "")
+        self.assertNotIn("tree_ignored", self.record(old))
+
+
+def parse_kv(text):
+    return g.parse_identity(text)
