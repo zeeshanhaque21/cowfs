@@ -151,3 +151,5 @@ mod tests {
         assert_eq!(stale(Error::Exists), Error::Exists);
     }
 }
+
+// ci-trial trial/core-filtered (throwaway)
