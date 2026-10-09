@@ -1,24 +1,23 @@
 //! Real-project acceptance for treehouse mode (b): a real project, a real `cowfs-core` daemon, a
 //! real mount, the real companion binary, and real exit codes.
 //!
-//! # This suite is not an acceptance, and it does not report one
+//! # What this suite is, and what it is not
 //!
 //! Mode (b) needs a **published warm base**: a snapshot the daemon can later find, with the
-//! repository, the ref and the commit it was built from. That step does not exist at this lane's
-//! base. The chain, in the order it has to be broken:
+//! repository, the ref and the commit it was built from. The chain that used to block it is closed
+//! (issue 123):
 //!
-//! 1. `crates/cowfs-daemon/src/handler.rs` `base_refresh` calls `can_ingest()?` before anything
-//!    else, and `can_ingest` answers `unsupported` unless `backend.ingests_directories()`.
-//!    `CoreBackend::ingests_directories()` is `false` by design, documented on the method itself.
-//!    So on the core the call is refused before any publication or persistence is attempted.
-//! 2. Only then does `crates/cowfs-daemon/src/import.rs` matter: it found the checkout by reading
-//!    the last line of `git worktree add --detach <commit>` stdout, and no line of that stdout is a
-//!    path on the git this host has. Reproduced here.
-//! 3. Only after a base is published does provenance matter: `base status` has to report the repo,
-//!    the ref, the commit and `fresh` for `find_base` to discover it.
+//! 1. `base_refresh` on the core publishes the checkout tree-natively through the core writer
+//!    (`import::replace_tree`), where it used to be refused by `can_ingest`.
+//! 2. The checkout path is chosen by the daemon and passed to git (issue 97), not parsed from git's
+//!    stdout.
+//! 3. The provenance (repo, ref, commit) is persisted with the base, so `base status` reports
+//!    `fresh` and `find_base` can discover it (issue 98).
 //!
-//! Each link has a test that pins it against the real binaries, so closing one turns a green test
-//! red and forces the acceptance to be updated rather than silently bypassed.
+//! The end-to-end acceptance is `warm_base_acceptance_over_a_real_core`. It is `#[ignore]`d because
+//! it is slow, not because it cannot pass. The CI-visible check is
+//! `the_core_daemon_publishes_base_refresh_and_leaves_no_worktree`. What is still not proven is a
+//! warm `target/` in the base and the companion's own `mount_snapshot` call.
 //!
 //! What is proven over the same real core daemon is everything the core *does* implement: a
 //! verified ingest of a real project, a promoted base, an O(1) fork whose id is distinct and whose
@@ -1338,20 +1337,20 @@ fn native_control_builds_and_tests_the_sample_project() {
     assert!(built.is_file(), "the native control produced no rlib");
 }
 
-/// The first link in the chain: `base_refresh` does not publish on the core.
+/// The first link in the chain, closed by issue 123: `base_refresh` publishes on the core.
 ///
-/// This test asserts a clean refusal, not merely an error: exit 1, a message that names the reason,
-/// no snapshot published, and no git worktree left behind.
+/// It asserts exit 0, a listed base, and no git worktree left behind.
 #[test]
-fn the_core_daemon_refuses_base_refresh_and_publishes_nothing() {
+fn the_core_daemon_publishes_base_refresh_and_leaves_no_worktree() {
     let deadline = Deadline::after(600);
     let Ok(core) = Core::start(
-        "the_core_daemon_refuses_base_refresh_and_publishes_nothing",
+        "the_core_daemon_publishes_base_refresh_and_leaves_no_worktree",
         deadline,
     ) else {
-        return;
+        // CI mounts on both OSes. A host that cannot is a failure here, never a silent `ok`.
+        panic!("the published-base gate cannot run on a host that cannot mount");
     };
-    let sample = Sample::new("base-refresh-refused", deadline);
+    let sample = Sample::new("base-refresh-published", deadline);
     let companion = require_bin("cowfs-treehouse");
 
     let before = stdout(&sh(deadline, sample.path(), "git", &["worktree", "list"]));
@@ -1378,7 +1377,7 @@ fn the_core_daemon_refuses_base_refresh_and_publishes_nothing() {
         .unwrap_or_default();
 
     record(
-        "base-refresh-refused",
+        "base-refresh-published",
         &[
             ("outcome", MEASURED.to_owned()),
             ("companion_exit", code(&out).to_string()),
@@ -1395,28 +1394,59 @@ fn the_core_daemon_refuses_base_refresh_and_publishes_nothing() {
 
     assert_eq!(
         code(&out),
-        1,
-        "the refusal must be exit 1: {}{}",
+        0,
+        "the core publishes a base tree-natively (issue 123): {}{}",
         stdout(&out),
         stderr(&out)
     );
-    let err = stderr(&out);
-    assert!(
-        err.contains("unsupported"),
-        "the core must refuse by name, not fail obscurely: {err}"
+    let published: serde_json::Value = stdout(&out)
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str(l).ok())
+        .expect("the refresh report is JSON");
+    assert_eq!(
+        published["commit"].as_str(),
+        Some(sample.commit.as_str()),
+        "the published base must carry the real commit: {published}"
     );
+    let base = published["snapshot"].as_str().expect("a snapshot name");
     assert!(
-        err.contains("stores snapshots as trees"),
-        "the refusal must name the reason: {err}"
+        listed.contains(base),
+        "a published base_refresh must list the base {base}: {listed}"
     );
-    assert!(
-        !listed.contains("base"),
-        "a refused base_refresh must publish nothing: {listed}"
+    let status = sh(
+        deadline,
+        Path::new("/"),
+        companion.to_str().expect("a utf8 path"),
+        &[
+            "--socket",
+            &core.socket.display().to_string(),
+            "--json",
+            "base",
+            "status",
+            "--repo",
+            &sample.path().display().to_string(),
+            "--ref",
+            "HEAD",
+        ],
     );
+    assert_eq!(
+        code(&status),
+        0,
+        "the base is not fresh: {}{}",
+        stdout(&status),
+        stderr(&status)
+    );
+    let status_json: serde_json::Value = stdout(&status)
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str(l).ok())
+        .expect("the status is JSON");
+    assert_eq!(status_json["fresh"], true, "{status_json}");
     assert_eq!(
         before.trim(),
         after.trim(),
-        "a refused base_refresh must leave no git worktree behind"
+        "base_refresh must leave no git worktree behind"
     );
 }
 
@@ -2028,9 +2058,8 @@ fn a_real_project_builds_and_tests_inside_an_exported_slot_snapshot() {
 /// The third link: provenance, which is what acceptance actually requires.
 ///
 /// Acceptance needs `base status` to report the repository, the ref, the commit and `fresh`, and
-/// `find_base` to discover the base. On a base where `base_refresh` refuses there is nothing
-/// published, so that is recorded. On a base where it succeeds, the provenance is demanded, which is
-/// what makes this a gate rather than a description.
+/// `find_base` to discover the base. `base_refresh` publishes on the core now (issue 123), so the
+/// provenance is demanded, which is what makes this a gate rather than a description.
 #[test]
 fn a_published_warm_base_must_be_discoverable_with_its_provenance() {
     let deadline = Deadline::after(900);
@@ -2825,7 +2854,8 @@ fn a_claim_of_a_published_warm_base_is_refused_in_both_shapes() {
     );
 }
 
-/// The acceptance itself, `#[ignore]`d because it cannot pass until the chain is broken.
+/// The acceptance itself, `#[ignore]`d only because it is slow. The chain (`can_ingest`, #97, #98) is
+/// closed by issue 123, and this passes on a host that can mount.
 ///
 /// Run it on a head that claims to have core `base_refresh` publication, an explicit worktree path,
 /// and durable provenance:
@@ -2842,7 +2872,7 @@ fn a_claim_of_a_published_warm_base_is_refused_in_both_shapes() {
 /// read back before the build; the base still intact afterwards; and a reset that returns each
 /// slot to a byte-identical untouched base.
 #[test]
-#[ignore = "chain broken: can_ingest gate, then #97 worktree path, then #98 provenance"]
+#[ignore = "heavy: a real mount and two cargo build+test runs (about 17 minutes); issue 123 passed it, run with --ignored"]
 fn warm_base_acceptance_over_a_real_core() {
     let deadline = Deadline::after(3600);
     let companion = require_bin("cowfs-treehouse")

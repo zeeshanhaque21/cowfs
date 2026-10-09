@@ -1,9 +1,29 @@
 name: ci
 
+# A change that touches only review reports, verification evidence, spike notes or the progress
+# tracker does not start CI. A search of the code, tests and bench harness found exactly one test that
+# reads a doc: crates/cowfs-core/tests/critic2b.rs asserts on docs/v1-core.md, so docs/v1-core.md and
+# the rest of docs/ are deliberately NOT ignored. A change that touches any other file as well still
+# runs everything, and so does an edit of this workflow file. A pull request that only touches the
+# paths below gets no CI run at all, not a skipped one.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/reviews/**'
+      - 'docs/verification/**'
+      - 'docs/spikes/**'
+      - 'progress/**'
+      - 'LICENSE'
+      - 'NOTICE'
   pull_request:
+    paths-ignore:
+      - 'docs/reviews/**'
+      - 'docs/verification/**'
+      - 'docs/spikes/**'
+      - 'progress/**'
+      - 'LICENSE'
+      - 'NOTICE'
 
 jobs:
   check:
@@ -18,11 +38,48 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only main writes the cache. PR runs restore main's, so they never evict it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Fault-injection seam is absent without its feature (issue 173)
+        run: scripts/check-fault-seam-absent.sh
       - name: Bench harness unit tests
         run: python3 -m unittest discover -s bench -v
+
+  # Issue 171: the namespace isolation tests skip on a host that denies unprivileged user namespaces.
+  # ubuntu-24.04 does (kernel.apparmor_restrict_unprivileged_userns=1, measured on the runner), so
+  # this job lifts that one sysctl and then refuses to go green unless the isolation tests ran.
+  linux-namespaces:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --user --map-root-user --mount --propagation private -- true
+      - name: Namespace tests
+        shell: bash  # bash -e -o pipefail, so a failing test fails the step through the tee
+        run: python3 -m unittest discover -s bench -p test_namespaces.py -v 2>&1 | tee namespaces.log
+      - name: Enforce that isolation ran, not skipped
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          log = Path("namespaces.log").read_text()
+          assert "a mount namespace was available" in log, "helper reported no namespace: isolation skipped"
+          ran = re.findall(r"^(test_\w+) \(test_namespaces\.Isolation\.\w+\) \.\.\. ok$", log, re.MULTILINE)
+          assert len(ran) == 9, f"expected 9 isolation tests to pass, saw {len(ran)}: {ran}"
+          assert re.search(r"^Ran 17 tests", log, re.MULTILINE), "test count changed: update this gate"
+          assert re.search(r"^OK \(skipped=1\)$", log, re.MULTILINE), "namespace run was not a clean pass"
+          skipped = re.findall(r"^(test_\w+) .*\.\.\. skipped", log, re.MULTILINE)
+          assert skipped == ["test_off_linux_is_unmeasurable"], f"unexpected skips: {skipped}"
+          print("::notice::namespace isolation tests ran and passed: " + ", ".join(sorted(ran)))
+          PY
 
   linux-fuse:
     runs-on: ubuntu-latest
@@ -33,6 +90,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only main writes the cache. PR runs restore main's, so they never evict it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install FUSE
         run: |
           sudo apt-get update && sudo apt-get install -y fuse3

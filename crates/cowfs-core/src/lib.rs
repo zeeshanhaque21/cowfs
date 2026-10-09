@@ -50,7 +50,7 @@ use crate::util::{MutexExt, RwExt, ShardMap};
 #[doc(hidden)]
 pub mod fsops;
 pub use crate::gc::{Collector, CoreRoots};
-pub use crate::import::{ingest, Hooks, ImportError, Ingested};
+pub use crate::import::{ingest, ingest_replacing, Hooks, ImportError, Ingested};
 pub use crate::inner::{FileHealth, Health, LaneHealth};
 pub use crate::inner::{Options, Stats};
 pub use crate::ino::VIRT_COUNTER_MASK;
@@ -347,8 +347,8 @@ impl Core {
     /// Renames a snapshot by moving its name in one metadata transaction, so the snapshot id, every
     /// inode number in it and any handle open on it all survive. The name is validated, the target
     /// name is checked, and only then is anything written, so a refused rename leaves no name
-    /// added, removed or half-moved. Replaces a snapshot rather than moving it? That is
-    /// [`Core::promote_base`], which keeps the staging swap in `src/swap.rs`.
+    /// added, removed or half-moved. Replacing a name that another snapshot holds is not a rename:
+    /// that is [`Core::promote_base`], which keeps the staging swap in `src/swap.rs`.
     pub fn rename_snapshot(&self, old: &str, new: &str) -> Result<SnapshotEntry, ControlError> {
         let sc = self.inner.snap_by_name(old)?;
         validate_snapshot_name(new)?;

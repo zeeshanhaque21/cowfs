@@ -110,6 +110,30 @@ pub fn ingest(
     name: &str,
     hooks: &mut Hooks<'_>,
 ) -> Result<Ingested, ImportError> {
+    ingest_with(c, from, name, hooks, false)
+}
+
+/// Like [`ingest`], but a snapshot already called `name` is replaced.
+///
+/// The new tree is staged under the reserved hidden name and fully verified first, so a failed
+/// ingest leaves the old snapshot exactly as it was. The old one goes only once the swap's intent
+/// record is on disk, so a crash after that is rolled forward on the next open.
+pub fn ingest_replacing(
+    c: &Core,
+    from: &Path,
+    name: &str,
+    hooks: &mut Hooks<'_>,
+) -> Result<Ingested, ImportError> {
+    ingest_with(c, from, name, hooks, true)
+}
+
+fn ingest_with(
+    c: &Core,
+    from: &Path,
+    name: &str,
+    hooks: &mut Hooks<'_>,
+    replace: bool,
+) -> Result<Ingested, ImportError> {
     let md = fs::metadata(from).map_err(|e| fs_err("cannot read", from, e))?;
     if !md.is_dir() {
         return Err(ImportError::Invalid(format!(
@@ -118,11 +142,13 @@ pub fn ingest(
         )));
     }
     crate::validate_snapshot_name(name)?;
-    c.inner.check_new_name(name)?;
+    let victim = (replace && c.inner.snap_by_name(name).is_ok()).then_some(name);
+    c.inner.check_new_name_except(name, victim)?;
     let total = plan(from);
     let staged = swap::staging_name(name);
-    // A staging snapshot an earlier crash left behind holds blocks nothing points at, and its name
-    // is deterministic, so it is this one.
+    // A leftover staging snapshot of this name is removed first. After a crash before the intent it
+    // holds blocks nothing points at; after a failed swap that left an intent it is the only copy
+    // of the new tree (issue 177). Nothing else sweeps orphans (issue 176).
     if let Ok(leftover) = c.inner.snap_by_name_raw(&staged) {
         let _ = c.inner.unregister(&leftover);
     }
@@ -152,7 +178,21 @@ pub fn ingest(
             return Err(e);
         }
     };
-    c.finish_swap(&staged, name)?;
+    let installed = if victim.is_some() {
+        c.replace_with_staged(&staged, name)
+    } else {
+        c.finish_swap(&staged, name)
+    };
+    if let Err(e) = installed {
+        // On the replacing path the old target may already be gone and `staged` is the only copy of
+        // the new tree, which `Core::open` rolls forward from the intent file, so it is kept.
+        if victim.is_none() {
+            if let Ok(sc) = c.inner.snap_by_name_raw(&staged) {
+                let _ = c.inner.unregister(&sc);
+            }
+        }
+        return Err(e.into());
+    }
     let after = c.store().stats();
     Ok(Ingested {
         files,

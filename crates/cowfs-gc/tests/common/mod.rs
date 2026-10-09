@@ -358,16 +358,33 @@ impl Parts<'_> {
 
     /// Every block any live snapshot references, holes dropped.
     ///
-    /// A snapshot removed between the listing and the lookup is skipped: it is gone, so its
-    /// blocks are not live, and a test that removes snapshots under a collector must not fail here.
+    /// A snapshot removed between the listing and the lookup, or between the lookup and the walk,
+    /// is skipped: it is gone, so its blocks are not live, and a test that removes snapshots under a
+    /// collector must not fail here.
     pub fn live(&self) -> std::collections::HashSet<BlockId> {
+        self.live_with(|_| {})
+    }
+
+    /// [`Self::live`], calling `after_lookup` with each snapshot id once it is looked up and
+    /// before its walk starts. A test uses it to land a removal in that window deterministically.
+    pub fn live_with(
+        &self,
+        mut after_lookup: impl FnMut(cowfs_meta::SnapshotId),
+    ) -> std::collections::HashSet<BlockId> {
         let mut marker = cowfs_meta::Marker::new();
         let mut out = std::collections::HashSet::new();
         for info in self.meta.durable_snapshots().expect("snaps") {
             let Ok(snap) = self.meta.snapshot_by_id(info.id) else {
                 continue;
             };
-            for b in snap.live_blocks(&mut marker).expect("walk") {
+            after_lookup(info.id);
+            let walk = match snap.live_blocks(&mut marker) {
+                Ok(w) => w,
+                // Removed in the window: gone, so not live. Any other error is a real failure.
+                Err(cowfs_meta::Error::NoSuchSnapshot) => continue,
+                Err(e) => panic!("walk: {e:?}"),
+            };
+            for b in walk {
                 let b = b.expect("block");
                 if b != cowfs_gc::HOLE {
                     out.insert(b);

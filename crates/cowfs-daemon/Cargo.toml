@@ -36,6 +36,7 @@ cowfs-nfs = { path = "../cowfs-nfs" }
 cowfs-fuse = { path = "../cowfs-fuse" }
 
 [dev-dependencies]
+cowfs-meta = { path = "../cowfs-meta" }
 tempfile.workspace = true
 
 [lints]

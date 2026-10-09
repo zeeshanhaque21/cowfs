@@ -22,8 +22,9 @@
 //! 6. remove the intent file.
 //!
 //! A crash or error from step 3 on leaves the intent file, and the next `Core::open` finishes
-//! steps 4 to 6 before serving anything. A crash before step 3 leaves a staging snapshot with no
-//! intent file, which `Core::open` removes because the name is deterministic.
+//! steps 4 to 6 before serving anything. A crash before step 3 leaves a hidden staging snapshot with
+//! no intent file. `Core::open` does not remove it (it only recovers intent files); the next swap or
+//! import of the same target does, because the name is deterministic.
 
 use std::fs;
 use std::io::Write as _;
@@ -166,8 +167,9 @@ impl Core {
         };
         self.inner.check_new_name_except(new, victim)?;
         let staged = staging_name(new);
-        // a leftover staging snapshot from an earlier crash: the intent file is gone, so this is
-        // garbage. Removing it is what `Core::open` does; do the same here.
+        // A leftover staging snapshot of this name is removed first. That is garbage after a crash
+        // before the intent, but if a failed swap left an intent naming it, this destroys the only
+        // copy of the new tree (issue 177). `Core::open` does not sweep orphans either (issue 176).
         if let Ok(leftover) = self.inner.snap_by_name_raw(&staged) {
             let _ = self.inner.unregister(&leftover);
         }
@@ -202,6 +204,29 @@ impl Core {
             *self.inner.last_error.lk() = Some(format!("swap: {e} after the swap completed"));
         }
         done
+    }
+
+    /// Replaces `target` with the already verified snapshot `staged`, for an import that replaces.
+    /// The intent record goes down before the old target is removed, so a crash after that point is
+    /// rolled forward by `Core::open`; an error before it leaves the old target in place.
+    pub(crate) fn replace_with_staged(
+        &self,
+        staged: &str,
+        target: &str,
+    ) -> Result<SnapshotEntry, ControlError> {
+        if let Err(e) = write_intent(&self.inner.root, staged, target) {
+            self.rollback(staged, target);
+            return Err(e);
+        }
+        if let Ok(old) = self.inner.snap_by_name(target) {
+            if let Err(e) = self.inner.unregister(&old) {
+                self.rollback(staged, target);
+                return Err(e);
+            }
+        }
+        // Past this point the old target is gone and only `staged` holds the new tree, so an error
+        // is returned as it is and nothing is cleaned up: the intent file makes `Core::open` finish.
+        self.finish_swap(staged, target)
     }
 
     /// Steps 1 and 2. A failure in either leaves nothing behind.

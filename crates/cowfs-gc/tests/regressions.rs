@@ -1094,3 +1094,35 @@ fn a_non_nosuchsnapshot_error_in_the_walk_window_fails_the_cycle_and_frees_nothi
         );
     }
 }
+
+/// Issue 164: the test helper `Parts::live` failed with `NoSuchSnapshot` when a snapshot was
+/// removed between its lookup and its walk (the CI flake). The removal is landed in that window
+/// deterministically; `live` must skip the vanished snapshot and still report the kept one.
+#[test]
+fn live_helper_tolerates_a_snapshot_removed_between_lookup_and_walk() {
+    let f = Fixture::eager(32 << 10);
+    let parts = f.parts();
+    let kept = f.meta.new_snapshot("kept").expect("snapshot");
+    let victim = f.meta.new_snapshot("victim").expect("snapshot");
+    parts.write(&kept, b"k", &body(4096, 1));
+    parts.write(&victim, b"v", &body(4096, 2));
+    let victim_id = victim.id();
+    let kept_blocks = {
+        let mut m = cowfs_meta::Marker::new();
+        kept.live_blocks(&mut m)
+            .expect("walk kept")
+            .map(|b| b.expect("block"))
+            .filter(|b| *b != cowfs_gc::HOLE)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    assert!(!kept_blocks.is_empty());
+    let live = parts.live_with(|id| {
+        if id == victim_id {
+            f.meta.remove_snapshot(id).expect("remove in window");
+        }
+    });
+    assert!(
+        kept_blocks.is_subset(&live),
+        "the kept snapshot's blocks stay live"
+    );
+}

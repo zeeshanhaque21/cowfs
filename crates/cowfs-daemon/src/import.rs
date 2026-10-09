@@ -345,6 +345,9 @@ fn replace(
 ) -> CtlResult<()> {
     let taken = snaps.list().unwrap_or_default().iter().any(|n| n == name);
     let staging = format!(".cowfs-import-{name}");
+    if !backend.ingests_directories() {
+        return replace_tree(from, name, taken, backend, ctx);
+    }
     if snaps.list().unwrap_or_default().contains(&staging) {
         snaps
             .remove(&staging)
@@ -366,6 +369,42 @@ fn replace(
     snaps
         .rename(&staging, name)
         .map_err(|e| io_err(&format!("cannot install {name:?}"), e))
+}
+
+/// The tree-native publication step for a backend whose snapshots are trees (the core).
+///
+/// The checkout goes in through the backend's own writer, which stages it under a name callers can
+/// neither see nor create, verifies it, and only then makes `name` appear or replaces the old
+/// tree. So no snapshot a user owns is created or deleted here, and a failed ingest leaves the
+/// previous base exactly as it was.
+fn replace_tree(
+    from: &Path,
+    name: &str,
+    taken: bool,
+    backend: &dyn Backend,
+    ctx: &OpContext<'_>,
+) -> CtlResult<()> {
+    let mut progress = |done: u64, total: u64| {
+        ctx.progress(ProgressEvent {
+            phase: "ingest".into(),
+            done,
+            total: Some(total),
+            unit: Unit::Bytes,
+            message: None,
+        })
+        .is_ok()
+    };
+    let ingested = if taken {
+        backend.ingest_replacing(from, name, &mut progress)?
+    } else {
+        backend.ingest(from, name, &mut progress)?
+    };
+    ingested.map(|_| ()).ok_or_else(|| {
+        CtlError::new(
+            ErrorCode::Unsupported,
+            "this backend has no writer that can ingest a directory",
+        )
+    })
 }
 
 fn io_err(what: &str, e: std::io::Error) -> CtlError {
@@ -738,6 +777,145 @@ mod tests {
             "the repository is untouched"
         );
         assert_eq!(worktree_paths(&repo), vec![resolved(&repo)]);
+    }
+
+    /// The tree-native publication of issue 123: the core refuses a directory, so the checkout goes
+    /// in through its writer, and the base, its commit and a replacement all survive a reopen.
+    #[test]
+    fn the_core_publishes_a_warm_base_by_ingesting_the_checkout() {
+        use crate::backend::CoreBackend;
+        let store = tempfile::tempdir().unwrap();
+        let (_rd, repo) = repo("the base");
+        let want = git_commit(&repo.display().to_string(), "main").unwrap();
+        let core = CoreBackend::open(store.path(), cowfs_core::Options::default()).unwrap();
+        let first = refresh(&core, &repo, "warm").expect("a first publication");
+        assert_eq!(
+            first.snapshot.base.as_ref().unwrap().commit,
+            Some(want.clone())
+        );
+        assert_eq!(first.previous_commit, None);
+
+        // A second refresh replaces a taken name through the core's swap, with no staging left.
+        let second = refresh(&core, &repo, "warm").expect("a replacing publication");
+        assert_eq!(second.previous_commit, Some(want.clone()));
+        let names = core.snapshots().list().unwrap();
+        assert_eq!(
+            names,
+            ["warm"],
+            "no staging snapshot is left behind: {names:?}"
+        );
+        core.close().unwrap();
+        drop(core);
+
+        let reopened = CoreBackend::open(store.path(), cowfs_core::Options::default()).unwrap();
+        let info = reopened.snapshots().create_meta("warm").unwrap();
+        assert_eq!(info.base.as_ref().unwrap().commit, Some(want));
+        let view = reopened.snapshot("warm").unwrap();
+        let hash = cowfs_ctl::hash_view(view.as_ref(), cowfs_vfs::ROOT_INO).unwrap();
+        assert!(hash.files >= 1, "the published tree holds the checkout");
+        drop(view);
+        assert_eq!(
+            entries(&repo),
+            [".git", "main.rs"],
+            "the repository is untouched"
+        );
+        assert_eq!(worktree_paths(&repo), vec![resolved(&repo)]);
+        reopened.close().unwrap();
+    }
+
+    /// The blocker of the PR 163 review: staging must never be a name a user can own. A user
+    /// snapshot called like the old staging name survives a first publication, a replacement, and a
+    /// replacement whose ingest fails, and the failed one leaves the old base and its tree alone.
+    #[test]
+    fn a_user_snapshot_named_like_staging_survives_every_core_refresh() {
+        use crate::backend::CoreBackend;
+        let store = tempfile::tempdir().unwrap();
+        let (_rd, repo) = repo("the base");
+        let want = git_commit(&repo.display().to_string(), "main").unwrap();
+        let core = CoreBackend::open(store.path(), cowfs_core::Options::default()).unwrap();
+        let snaps = core.snapshots();
+        snaps.create("cowfs-import-warm", None).unwrap();
+        snaps.create("COWFS-IMPORT-other", None).unwrap();
+
+        refresh(&core, &repo, "warm").expect("a first publication");
+        refresh(&core, &repo, "other").expect("a case variant of the staging name is no obstacle");
+        refresh(&core, &repo, "warm").expect("a replacing publication");
+        let mut names = snaps.list().unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            ["COWFS-IMPORT-other", "cowfs-import-warm", "other", "warm"],
+            "a user snapshot was deleted, or staging left a name behind"
+        );
+
+        // A cancelled ingest is the injected failure: the sink refuses the first progress event.
+        let cancelled = OpContext::new(cowfs_ctl::CancelToken::new(), |_| false);
+        let e = base_refresh(
+            &core,
+            snaps,
+            &BaseRefreshParams {
+                repo: repo.display().to_string(),
+                git_ref: "main".into(),
+                name: Some("warm".into()),
+            },
+            &cancelled,
+        )
+        .expect_err("the ingest was cancelled");
+        assert_eq!(e.code, ErrorCode::Cancelled, "{e}");
+        let mut names = snaps.list().unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            ["COWFS-IMPORT-other", "cowfs-import-warm", "other", "warm"],
+            "a failed ingest changed the namespace"
+        );
+        let view = core.snapshot("warm").unwrap();
+        assert!(
+            cowfs_ctl::hash_view(view.as_ref(), cowfs_vfs::ROOT_INO)
+                .unwrap()
+                .files
+                >= 1,
+            "the old base tree survived the failed replacement"
+        );
+        drop(view);
+        let info = snaps.create_meta("warm").unwrap();
+        assert_eq!(
+            info.base.and_then(|b| b.commit),
+            Some(want),
+            "a cancelled replacement left the old tree alone, so its commit is still true"
+        );
+        core.close().unwrap();
+    }
+
+    /// The staging name is the core's own hidden one, so a legal name at the length limit publishes.
+    #[test]
+    fn a_base_name_at_the_length_limit_publishes_and_never_leaves_partial_state_on_the_core() {
+        use crate::backend::CoreBackend;
+        let store = tempfile::tempdir().unwrap();
+        let (_rd, repo) = repo("the base");
+        let core = CoreBackend::open(store.path(), cowfs_core::Options::default()).unwrap();
+        let long = "a".repeat(cowfs_core::NAME_MAX);
+        refresh(&core, &repo, &long).expect("a name at the limit publishes");
+        // The swap's intent file is `swap-<name>` on the host filesystem, so replacing a name this
+        // long is the core's own limit (it hits `promote_base` too). It must fail cleanly: an
+        // error, the old base still there, and nothing left under another name.
+        let second = refresh(&core, &repo, &long);
+        assert!(
+            second.is_err(),
+            "replacing a 255-byte name hits the Core intent-file limit (issue 170); when that is fixed, flip this to expect success"
+        );
+        assert_eq!(
+            core.snapshots().list().unwrap(),
+            std::slice::from_ref(&long)
+        );
+        let view = core.snapshot(&long).unwrap();
+        let files = cowfs_ctl::hash_view(view.as_ref(), cowfs_vfs::ROOT_INO)
+            .unwrap()
+            .files;
+        assert!(files >= 1, "a failed replacement left the old base intact");
+        drop(view);
+        core.snapshots().create_meta(&long).unwrap();
+        core.close().unwrap();
     }
 
     #[test]

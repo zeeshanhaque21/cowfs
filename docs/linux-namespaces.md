@@ -128,8 +128,51 @@ Three claims, each against its own control:
 The caller's mount table was byte-identical before and after the three canonical builds (`mountinfo-before.txt` and `mountinfo-after.txt`), and the canonical directory was empty before and after.
 
 `rustc` itself is deterministic for a fixed path and a fixed argv, which is what makes A1 against A2 a usable control.
-`cargo` is not: spike 6 measured same-path debug rebuilds at 92% identical, because the incremental query cache and the proc-macro dylib carry run-specific bytes.
-So this run used `rustc` directly, and a canonical path says nothing about a cargo build that also embeds run-specific bytes.
+
+## What is promised for cargo
+
+Measured in `docs/verification/evidence/cargo171.md` (issue 171).
+
+With a canonical path alone, a `cargo` debug build is not byte-identical: the incremental state under `target/debug/incremental` is named with a random per-session id, and the library `.rlib` changes between builds with it.
+The canonical route of `base refresh --build --canonical` therefore runs the build with `CARGO_INCREMENTAL=0`, overriding any value the caller set, and changes nothing else.
+The earlier 92% figure and its proc-macro dylib explanation did not reproduce on Linux, see the evidence file.
+
+The cost is that a base built this way is not incrementally reusable by a build that leaves the variable unset.
+In a critic's test on a small fixture, the first default-environment build on such a base recompiled every crate (`mac`, `app` and `lib`).
+Two default-environment builds in a row, and two `CARGO_INCREMENTAL=0` builds in a row, rebuilt nothing the second time.
+A slot therefore has to keep `CARGO_INCREMENTAL=0` to stay warm, and while it does, edit rebuilds are not incremental.
+This is the accepted price of the byte-identical promise (decision of 2026-10-08).
+No numeric slowdown is claimed: the test used a tiny fixture.
+The macOS measurements are evidence about the variable, not about the shipped route, because the canonical route is Linux only.
+There is no way to opt out of the override.
+
+Promise, for a build run through the canonical route on Linux:
+
+- Every file under `target` is byte-identical across clean rebuilds and across slots at the same canonical path, including binaries, rlibs, proc-macro libraries, build-script outputs, dep-info files and the fingerprint files.
+  This held for 43 of 43 files on the test workspace, in 5 of 5 rebuilds, and between two different slots.
+- The build is not otherwise reproducible: a different toolchain, different dependency versions, or a build that embeds the time or other run-specific input is outside the promise.
+- `CARGO_TARGET_DIR` outside the snapshot and incremental rebuilds over an existing `target` were not measured, and are outside the promise.
+- Only one workspace and toolchain (rustc 1.99.0) were measured, and release builds were not.
+
+The default for a build outside the canonical route is unchanged.
+
+## Measured with real leases and three filesystems
+
+Issue 171 rows 3 and 4, on the cachyos box (kernel 7.2.8-2-cachyos, rustc 1.99.0, treehouse v3.1.2 release binary).
+Evidence and exact commands: `docs/verification/evidence/namespaces171-matrix.md`.
+
+- Real leases: `cowfs-treehouse base refresh --build 'cargo build --workspace' --root R --canonical C` without `--slot` leased 3 slots from a real treehouse pool and built in each through the namespace helper.
+  The 3 `target` trees were byte-identical (43 of 43 files).
+  A 4th lease built natively at its own path differed in 15 files.
+  `base status` reported the published base fresh.
+  The slots sat on btrfs, not on the FUSE mount, and the path backend was used.
+- Filesystems: the 9 isolation tests and the 7 refusal tests passed on btrfs, ext4 and XFS.
+  Six canonical `cargo build --workspace` runs with `CARGO_INCREMENTAL=0` were byte-identical on each (43 of 43 files).
+  The same builds with `CARGO_INCREMENTAL=1` were all different, 81 paths each, on each.
+  The ext4 and XFS filesystems were 4 GiB loop images on a btrfs file.
+- On XFS the native control differs in one more file (`dep-bin-app`) than on the others, because it lists its two dependencies in a different order.
+  Canonical builds were unaffected.
+- Not covered: any kernel older than 6.12, the core backend, a leased slot on the FUSE mount, release builds, registry dependencies, incremental rebuilds, N above 6.
 
 ## Limits
 
@@ -140,23 +183,23 @@ So this run used `rustc` directly, and a canonical path says nothing about a car
 - The canonical directory must already exist.
   The helper creates nothing outside the namespace, so provisioning it is the caller's job.
 - `--canonical` inside `--src`, or the reverse, is refused.
-- The command inherits the caller's environment unchanged.
-  The helper sets nothing and removes nothing, so `TMPDIR`, `CARGO_TARGET_DIR` and friends reach the command as the caller set them.
+- The helper passes the caller's environment through unchanged.
+  The helper sets nothing and removes nothing (the treehouse wiring is the exception: it sets `CARGO_INCREMENTAL=0`, overriding any caller value, see "What is promised for cargo"), so `TMPDIR`, `CARGO_TARGET_DIR` and friends reach the command as the caller set them.
 - The namespace is per command, not per session.
   A shell started inside one keeps it; a new command gets a new one.
-- The treehouse wiring uses `--slot`, not a treehouse lease.
-  moonscape has no `treehouse` binary, so the integration run builds in the snapshot itself.
+- The moonscape integration run uses `--slot`, not a treehouse lease, because moonscape has no `treehouse` binary.
   That is the same `run_build` call site a leased slot takes; only the slot provider differs.
-- The integration run uses the path backend, not the core backend, because `base_refresh` copies a
-  directory into the store and the core backend refuses that by design.
-  It is the backend that supports the operation under test, serving the same store over the same
-  FUSE mount.
+  A real lease run was done on the cachyos box, see the section "Measured with real leases and three filesystems".
+- The integration run used the path backend, not the core backend, because at the time `base_refresh` copied a
+  directory into the store and the core backend refused that.
+  The core backend now publishes `base_refresh` tree-natively (issue 123), but this run predates that.
   Block-level verification is the core backend's, and belongs to the helper run.
 - `base_refresh` no longer depends on what git prints: the checkout path is passed as an argument and
   nothing is read from stdout. That removes the version question entirely rather than answering it, and
   nothing here claims what 2.56 prints.
-- Verified on one kernel (6.12) and one filesystem (ext4 under the mount, `fuse.cowfs` for the source).
-  Not verified on btrfs, XFS, or an older kernel.
+- The moonscape run was one kernel (6.12) and one filesystem (ext4 under the mount, `fuse.cowfs` for the source).
+  The isolation tests and a cargo build were later measured on btrfs, ext4 and XFS on kernel 7.2.8, see the section "Measured with real leases and three filesystems".
+  No kernel older than 6.12 has been measured.
 
 ## Running it
 
@@ -176,11 +219,13 @@ two-route check passes.
 The full `bench/` suite reports 53 tests on macOS, 10 of them skipped, and the rest of them belong to
 `bench/test_gates.py`.
 
-The GitHub `ubuntu-latest` runner denies namespaces, so CI takes the macOS branch and reports
-`OK (skipped=10)` there.
-That is the honest outcome and not a CI gap in the tests: a refusal pass is not an isolation pass, and
-the run's first line says which branch it took.
-The isolation matrix was run on `moonscape` instead, and the measurements above are from there.
+The GitHub `ubuntu-latest` runner (ubuntu-24.04, kernel 6.17) denies unprivileged user namespaces by default.
+Probe on the runner (2026-10-08, image ubuntu24/20261004.327): `kernel.apparmor_restrict_unprivileged_userns=1`, `kernel.unprivileged_userns_clone=1`, and `unshare -Ur -m true` fails with `write failed /proc/self/uid_map: Operation not permitted`.
+After `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` the same call succeeds and a `--rbind` inside the new mount namespace works.
+The `check` job still takes the refusal branch and reports `OK (skipped=10)` on its ubuntu leg.
+The `linux-namespaces` job in `.github/workflows/ci.yml` lifts that one sysctl, runs `bench/test_namespaces.py`, and then fails unless all 9 `Isolation` tests report `ok` and the only skip is `test_off_linux_is_unmeasurable`.
+A skipped isolation test therefore cannot read as green in that job (issue #171).
+The moonscape measurements above remain the FUSE-level evidence.
 `test_both_routes_refused_names_both_in_the_message` puts a refusing `unshare` stub first on `PATH`, so the two-route refusal message is still checked everywhere, including on a host where a namespace does work.
 
 The end-to-end run, on a Linux host with `/dev/fuse` and a Rust toolchain:
@@ -317,13 +362,13 @@ It is not evidence that a warm base was published, because none was, and it is n
 
 - No warm base is published, so no dedup or warm-base benefit is measured.
   The path backend stored 20.9 MiB for 20.9 MiB logical in the earlier run.
-- No Core backend result, because the core backend refuses `base_refresh` by design: it ingests trees, not
-  directories.
+- No Core backend result in this run. The core backend now publishes `base_refresh` tree-natively (issue 123), but this measurement predates that.
 - No `fsck` result: the path backend has no block store and says so.
 - No crash safety and no no-data-loss claim. The readback is a daemon restart, not crash injection.
-- No leased-slot result: moonscape has no `treehouse` binary, so the run uses `--slot`, the same
+- No leased-slot result on moonscape: it has no `treehouse` binary, so the run uses `--slot`, the same
   `run_build` call site with a different slot provider.
-- No `cargo`-level canonical build, no btrfs or XFS, no kernel older than 6.12.
+  The cachyos box has one, see the section "Measured with real leases and three filesystems".
+- No `cargo`-level canonical build on moonscape, and no kernel older than 6.12 anywhere.
 
 ## A flake in the wiring tests, measured and not fixed
 
