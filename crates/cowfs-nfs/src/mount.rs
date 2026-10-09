@@ -177,8 +177,8 @@ impl Server {
         // would sit in the same argv. Binding MNT to the child's pid or uid is not possible:
         // the kernel NFS client sends MNT from a socket no process owns (`peer.rs`), and the
         // uid check only helps against another user. A racer who wins the first MNT can use the
-        // filesystem until `Mount::new` tears the server down after mount_nfs fails: a mount
-        // retry is 5 s (mount_nfs default) plus the failing attempt.
+        // filesystem until `Mount::new` tears the server down after mount_nfs fails. That is
+        // bounded by `command_timeout` (20 s by default); an observed value was not measured.
         let export = secret_path()?;
         listener.with_export_name(export.clone());
         listener.set_limits(opts.limits.clone());
