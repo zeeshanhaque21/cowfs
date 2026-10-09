@@ -1,6 +1,6 @@
 //! Power-loss crash model for the store: rebuild the disk image a cut at any op of a recorded
 //! history could leave, from the log `oplog_start` records. Only with `fault-injection`.
-//! Shared by the store, gc and core crash tests so each does not carry its own copy.
+//! Shared so a gc or core crash test can reuse it instead of carrying its own copy.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::LogOp;
 
+#[derive(Debug)]
 pub struct Rng(pub u64);
 impl Rng {
     pub fn next(&mut self) -> u64 {
@@ -112,8 +113,8 @@ pub fn crash_image(base: &Image, ops: &[LogOp], k: usize, rng: &mut Rng, mode: u
     };
     let mut last_sync: HashMap<String, usize> = HashMap::new();
     let mut last_dirsync: HashMap<&str, usize> = HashMap::new();
-    let mut created: HashMap<String, usize> = HashMap::new();
-    let mut unlinked: HashMap<String, usize> = HashMap::new();
+    let mut created: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unlinked: BTreeMap<String, usize> = BTreeMap::new();
     // `k` itself is in flight: its effect may or may not have reached the disk.
     for (p, op) in ops[..upto].iter().enumerate() {
         match op {
@@ -135,10 +136,10 @@ pub fn crash_image(base: &Image, ops: &[LogOp], k: usize, rng: &mut Rng, mode: u
     let durable_entry = |f: &str, p: usize| last_dirsync.get(dir_of(f)).is_some_and(|&d| d > p);
     let mut vanished: Vec<String> = Vec::new();
     for (f, &p) in &created {
-        if f.starts_with("pack-") || f.contains(".torn-") || f == "SYNCED" || f == "ACKED" {
-            if !durable_entry(f, p) && rng.below(2) == 0 {
-                vanished.push(f.clone());
-            }
+        let tracked =
+            f.starts_with("pack-") || f.contains(".torn-") || f == "SYNCED" || f == "ACKED";
+        if tracked && !durable_entry(f, p) && rng.below(2) == 0 {
+            vanished.push(f.clone());
         }
     }
     // An unlink whose directory fsync completed before the cut is gone for good; one without it is
@@ -228,4 +229,3 @@ pub fn crash_image(base: &Image, ops: &[LogOp], k: usize, rng: &mut Rng, mode: u
     }
     img
 }
-

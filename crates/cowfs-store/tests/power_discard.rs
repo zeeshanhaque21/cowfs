@@ -6,9 +6,10 @@
 //! an unlink survives only if the packs directory was fsynced after it. Each image is reopened with
 //! the shipped open path and must keep every live block, report no loss and pass `fsck`.
 //!
-//! This is what catches an unlink ahead of the durable watermark raise (mutation 2 of
-//! `docs/crash-injection-173.md`), which no process-crash test can see, because a process crash
-//! keeps the page cache and so keeps every unsynced byte.
+//! The target is an unlink ahead of the durable watermark raise (mutation 2 of
+//! `docs/crash-injection-173.md`), which a process-crash test cannot see, because a process crash
+//! keeps the page cache and so keeps every unsynced byte. `the_log_replays_to_the_real_disk` guards
+//! the premise that the log misses no write.
 
 use std::fs;
 use std::path::Path;
@@ -38,6 +39,8 @@ fn noisy(n: usize, seed: u32) -> Vec<u8> {
 /// A sealed pack holding 3 live and 4 dead records, plus later packs, all durable.
 struct Run {
     base: Image,
+    /// The real disk after the recorded work, to check the log against.
+    after: Image,
     ops: Vec<LogOp>,
     live: Vec<(BlockId, Vec<u8>)>,
     old: u32,
@@ -89,8 +92,10 @@ fn record(copy_first: bool) -> Run {
     let rw = early.unwrap_or_else(compact);
     s.discard_pack(old, &rw.condemned).unwrap();
     let ops = oplog_take();
+    let after = read_image(dir.path());
     Run {
         base,
+        after,
         ops,
         live,
         old,
@@ -117,12 +122,33 @@ struct Tally {
     failures: Vec<String>,
 }
 
+/// An op without its payload, for failure messages.
+fn brief(op: &LogOp) -> String {
+    match op {
+        LogOp::Write { file, off, data } => format!("write {file}@{off}+{}", data.len()),
+        LogOp::Whole { file, data } => format!("whole {file} {}B", data.len()),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Every op of the run, one per line, for reading a failing image by hand.
+fn dump(ops: &[LogOp]) -> String {
+    ops.iter()
+        .enumerate()
+        .map(|(i, o)| format!("{i}: {}\n", brief(o)))
+        .collect()
+}
+
 fn sweep(run: &Run, seeds: u64, t: &mut Tally) {
     for k in 0..run.ops.len() {
         for seed in 0..seeds {
             let mut rng = Rng(seed ^ ((k as u64) << 20) ^ 0x51ED);
             let img = crash_image(&run.base, &run.ops, k, &mut rng, seed % 4);
-            let tag = format!("k={k}/{} seed={seed}", run.ops.len());
+            let tag = format!(
+                "k={k}/{} seed={seed} op={}",
+                run.ops.len(),
+                brief(&run.ops[k])
+            );
             let dir = tempfile::tempdir().unwrap();
             write_image(&img, dir.path());
             t.images += 1;
@@ -171,7 +197,7 @@ fn seeds() -> u64 {
         .unwrap_or(16)
 }
 
-fn report(what: &str, t: &Tally) {
+fn report(what: &str, t: &Tally, ops: &[LogOp]) {
     println!(
         "{what}: {} images, source pack gone in {}, kept in {}, {} failed",
         t.images,
@@ -181,11 +207,45 @@ fn report(what: &str, t: &Tally) {
     );
     assert!(
         t.failures.is_empty(),
-        "{} of {} crash images failed; first: {:#?}",
+        "{} of {} crash images failed; first: {:#?}\nops:\n{}",
         t.failures.len(),
         t.images,
-        &t.failures[..t.failures.len().min(5)]
+        &t.failures[..t.failures.len().min(5)],
+        dump(ops)
     );
+}
+
+/// The premise of the whole sweep: replaying the log with nothing lost gives the real disk. A write
+/// that bypasses `Io` (the compaction copy once did) shows up here as a missing or short file, not
+/// as a confusing live-block loss in a crash image.
+#[test]
+fn the_log_replays_to_the_real_disk() {
+    for copy_first in [false, true] {
+        let run = record(copy_first);
+        let replayed = replay_lossless(&run.base, &run.ops);
+        let diff: Vec<String> = run
+            .after
+            .iter()
+            .filter(|(n, b)| replayed.get(*n) != Some(*b))
+            .map(|(n, b)| {
+                format!(
+                    "{n}: disk {}B, replay {:?}B",
+                    b.len(),
+                    replayed.get(n).map(Vec::len)
+                )
+            })
+            .chain(
+                replayed
+                    .keys()
+                    .filter(|n| !run.after.contains_key(*n))
+                    .map(|n| format!("{n}: only in replay")),
+            )
+            .collect();
+        assert!(
+            diff.is_empty(),
+            "copy_first={copy_first}: log and disk differ: {diff:?}"
+        );
+    }
 }
 
 /// The unlink is in the model: logged once, and followed by a fsync of the packs directory.
@@ -212,7 +272,7 @@ fn power_loss_at_every_op_of_compaction_and_discard_keeps_live_blocks() {
     let run = record(false);
     let mut t = Tally::default();
     sweep(&run, seeds(), &mut t);
-    report("compaction + discard", &t);
+    report("compaction + discard", &t, &run.ops);
     assert!(t.images > 0, "no images were built");
     // Fail closed: a model that never loses or keeps the unlink proves nothing about it.
     assert!(t.source_gone > 0, "no image lost the source pack");
@@ -225,6 +285,6 @@ fn power_loss_at_every_op_of_a_discard_keeps_live_blocks() {
     let run = record(true);
     let mut t = Tally::default();
     sweep(&run, seeds(), &mut t);
-    report("discard", &t);
+    report("discard", &t, &run.ops);
     assert!(t.images > 0, "no images were built");
 }

@@ -22,7 +22,8 @@ def move_wm_after_unlink(t):
     block = t[a:b]
     t = t[:a] + t[b:]
     anchor = "        self.forget_pack(id);\n        let mut out = Discarded {"
-    assert anchor in t
+    if anchor not in t:
+        raise ValueError(anchor)
     return t.replace(anchor, "        self.forget_pack(id);\n" + block + "        let mut out = Discarded {", 1)
 
 M = [
