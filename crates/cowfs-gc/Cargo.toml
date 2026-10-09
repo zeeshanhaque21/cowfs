@@ -23,6 +23,8 @@ cowfs-store = { path = "../cowfs-store", features = ["fault-injection"] }
 cowfs-core = { path = "../cowfs-core" }
 cowfs-vfs = { path = "../cowfs-vfs" }
 cowfs-vfs-path = { path = "../cowfs-vfs-path" }
+# The recording redb backend of `tests/power_collect.rs`, the same version cowfs-meta builds on.
+redb = "4.3"
 
 [lints]
 workspace = true

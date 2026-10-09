@@ -318,6 +318,7 @@ dependencies = [
  "cowfs-vfs",
  "cowfs-vfs-path",
  "proptest",
+ "redb",
  "tempfile",
  "thiserror",
 ]

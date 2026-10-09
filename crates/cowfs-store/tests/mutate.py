@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Mutation check for cowfs-store. Usage: [MUT_ARGS="--test crash --test power_discard"] python3 tests/mutate.py [TAG ...]
+"""Mutation check for cowfs-store. Usage: [MUT_PKG="cowfs-store"] [MUT_ARGS="--test crash --test power_discard"] python3 tests/mutate.py [TAG ...]
+
+MUT_PKG names the packages whose tests run (default cowfs-store); a mutation whose file name has a
+slash is relative to crates/ (the cowfs-gc ones), otherwise it is a cowfs-store source file.
 
 Copies the repo to target/mut/work, applies one textual mutation at a time to the store
 sources, runs the store test suite with its own CARGO_TARGET_DIR, and records whether any test
@@ -13,6 +16,8 @@ mut = f"{root}/target/mut"
 work = f"{mut}/work"
 src = f"{root}/crates/cowfs-store/src"
 dst = f"{work}/crates/cowfs-store/src"
+pkgs = [x for p in os.environ.get("MUT_PKG", "cowfs-store").split() for x in ("-p", p)]
+extra = os.environ.get("MUT_ARGS", "").split()
 
 
 def move_wm_after_unlink(t):
@@ -82,6 +87,15 @@ M = [
     ("D1 discard skips the packs directory fsync after the unlink", "compact.rs", "        if let Err(e) = g.io.sync_dir(&pack::pack_dir(g.dir)) {\n            out.durability_error = Some(e.into());\n            return Ok(out);\n        }\n", ""),
     ("E7 discard skips its leading sync", "compact.rs", "-> Result<Discarded> {\n        self.sync()?;\n", "-> Result<Discarded> {\n"),
     ("E8 acknowledge_corruption skips the directory fsync after dropping index.cix", "store.rs", "            self.io.remove_file(&self.index_path())?;\n            self.io.sync_dir(&self.dir)?;\n", "            self.io.remove_file(&self.index_path())?;\n"),
+    # Power loss across a whole collect (tests/power_collect.rs, MUT_PKG=cowfs-gc MUT_ARGS="--test power_collect").
+    ("GM1 collect discards the new pack instead of the source", "cowfs-gc/src/lib.rs", "self.store.discard(rw.from, &rw.condemned)", "self.store.discard(rw.to, &rw.condemned)"),
+    # GF1/GF2 are EQUIVALENT: live_blocks_with_root runs inner.sync() itself (db.rs:2141). Only GF1+GF2+walk-sync together
+    # is observable (8 of 992 images, and only without the mid hook): defence in depth no test pins.
+    # GA1/GA2 survive because power_collect already explores every state their fsyncs change; mark.bin bit rot is a separate known bug.
+    ("GF1 freeze skips the metadata sync", "cowfs-gc/src/lib.rs", "        self.meta.sync()?;\n        // Listed after the sync", "        // Listed after the sync"),
+    ("GF2 fresh roots skip the metadata sync", "cowfs-gc/src/lib.rs", "cowfs_meta::SnapshotId)>> {\n        self.meta.sync()?;\n", "cowfs_meta::SnapshotId)>> {\n"),
+    ("GA1 mark cache written without fsync", "cowfs-gc/src/state.rs", "            f.write_all(&buf)?;\n            f.sync_data()?;", "            f.write_all(&buf)?;"),
+    ("GA2 mark cache rename without directory fsync", "cowfs-gc/src/state.rs", "        fs::rename(&tmp, &self.path)?;\n        if let Some(parent) = self.path.parent() {\n            File::open(parent)?.sync_all()?;\n        }\n        Ok(())", "        fs::rename(&tmp, &self.path)?;\n        Ok(())"),
 ]
 
 only = sys.argv[1:]
@@ -90,7 +104,7 @@ subprocess.run(["rsync", "-a", "--delete", "--exclude", "target", "--exclude", "
 base = f"{mut}/tm_base"
 if not os.path.exists(base):
     env = dict(os.environ, CARGO_TARGET_DIR=base)
-    subprocess.run(["cargo", "test", "-j4", "--no-run", "-p", "cowfs-store"], cwd=work, env=env, check=True, capture_output=True)
+    subprocess.run(["cargo", "test", "-j4", "--no-run", *pkgs, *extra], cwd=work, env=env, check=True, capture_output=True)
 out = open(f"{mut}/results.txt", "a")
 for name, f, a, b in M:
     tag = name.split()[0]
@@ -98,7 +112,9 @@ for name, f, a, b in M:
         continue
     for fn in os.listdir(src):
         shutil.copy(f"{src}/{fn}", f"{dst}/{fn}")
-    t = open(f"{dst}/{f}").read()
+    shutil.copytree(f"{root}/crates/cowfs-gc/src", f"{work}/crates/cowfs-gc/src", dirs_exist_ok=True)
+    target = f"{work}/crates/{f}" if "/" in f else f"{dst}/{f}"
+    t = open(target).read()
     if callable(a):
         try:
             mutated = a(t)
@@ -108,13 +124,13 @@ for name, f, a, b in M:
         out.write(f"{name}: PATTERN NOT FOUND\n"); out.flush(); continue
     else:
         mutated = t.replace(a, b, 1)
-    open(f"{dst}/{f}", "w").write(mutated)
+    open(target, "w").write(mutated)
     tgt = f"{mut}/tm_{tag}"
     shutil.rmtree(tgt, ignore_errors=True)
     subprocess.run(["cp", "-cR" if sys.platform == "darwin" else "-a", base, tgt], check=True)
     env = dict(os.environ, CARGO_TARGET_DIR=tgt)
     try:
-        r = subprocess.run(["cargo", "test", "-j4", "--no-fail-fast", "-p", "cowfs-store", *os.environ.get("MUT_ARGS", "").split()], cwd=work, env=env, capture_output=True, text=True, timeout=900)
+        r = subprocess.run(["cargo", "test", "-j4", "--no-fail-fast", *pkgs, *extra], cwd=work, env=env, capture_output=True, text=True, timeout=900)
         txt = r.stdout + r.stderr
         failed = sorted(set(re.findall(r"^test (\S+) \.\.\. FAILED", txt, re.M)))
         if "could not compile" in txt:
