@@ -692,7 +692,11 @@ fn a_null_flood_does_not_evict_the_nfs_socket_while_the_mount_starts() {
     let (s, mut flood) = flooded_server();
     null_round(&mut flood);
     let mut nfs_socket = Nfs::attach(s.port(), nfs_fh3::default());
-    assert_eq!(nfs_socket.raw(100_003, 3, 0, Args::new()).0, 0, "the NULL ping");
+    assert_eq!(
+        nfs_socket.raw(100_003, 3, 0, Args::new()).0,
+        0,
+        "the NULL ping"
+    );
     null_round(&mut flood);
     let mut mnt_socket = Nfs::attach(s.port(), nfs_fh3::default());
     let (st, root) = mnt_socket.mount_path(&format!("/{}", s.export_name()));
@@ -709,12 +713,12 @@ fn the_pinged_nfs_socket_outlasts_the_cap_minus_one_later_connections() {
     // Eviction is by connection age among sockets that served nothing, so an attacker has to
     // open max_connections - 1 = 3 newer connections before the kernel's socket is the oldest
     // (recency alone needed one). The residual window is stated in the PR for #262.
-    let (s, mut flood) = flooded_server();
+    let (s, _flood) = flooded_server();
     let mut nfs_socket = Nfs::attach(s.port(), nfs_fh3::default());
     assert_eq!(nfs_socket.raw(100_003, 3, 0, Args::new()).0, 0);
     let mut later = vec![];
+    // The first three are the flood's own connections being evicted, oldest first.
     for _ in 0..3 {
-        null_round(&mut flood);
         later.push(connect_raw(s.port()));
         later.last_mut().unwrap().write_all(&null_frame()).unwrap();
         assert!(answered_fully(later.last_mut().unwrap()));
