@@ -17,10 +17,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pjdfstest as p
 
-PATHCONF = "pathconf returned -1"
+# Issue 108 (the macOS NFS client answers EINVAL for _PC_PATH_MAX only; NAME_MAX works) had a rule
+# here, case-scoped to the harness's "pathconf returned -1" stderr. Issue 218 retired it: the
+# harness now supplies the native arm's PATH_MAX to any arm that cannot answer, so those 13 cases
+# compare for real and a fresh run has no such position. A pathconf failure is a new worse position
+# again, and so is unclassified until someone decides it.
 # (issue, reason, match, test or None for any case, n or None for any position). First rule wins.
-# A pathconf rule is case-scoped by design: every worse position in a case whose stderr shows the
-# pathconf failure is the same macOS client divergence.
 RULES = [
     ("#204", "open O_WRONLY,O_NONBLOCK on a fifo with no reader answers EACCES where native answers "
              "ENXIO; a real defect tracked in #204, listed so the ordinal position is on record while "
@@ -29,9 +31,6 @@ RULES = [
     ("#109", "open O_RDONLY then unlink then fstat reports nlink 1 where native reports 0: macOS NFS "
              "silly-rename keeps nlink 1 for an open unlinked file (#109 symptom 2)",
      r"fstat 0 nlink', expected 0, got 1", "unlink/14.t", 4),
-    ("#108", "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its "
-             "long path; accepted macOS client divergence (Zee decision 2026-10-09)",
-     PATHCONF, None, None),
 ]
 
 
