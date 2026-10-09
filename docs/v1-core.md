@@ -21,6 +21,10 @@ Core::open(dir, Options)  ->  <dir>/store/  (cowfs-store)
 
 ## Inode numbers
 
+Status on main: a created inode now takes a number reserved from `Meta::reserve_inodes`, so it is born with its meta number and needs no alias (#140, #142).
+The virtual shape, the alias table and `<root>/virt.ino` below remain for numbers issued before a reopen.
+The rest of this section describes that scheme as designed, and has not been rewritten.
+
 `Ino` is a `u64` with three shapes.
 
 | Shape | Value | Meaning |
@@ -147,8 +151,12 @@ Test: `snapshot_names_follow_the_cli_rules`.
 
 ## Snapshot replacement is crash-safe
 
-`cowfs-meta` has no atomic rename of a snapshot, so `Core` cannot replace a name in one transaction.
-Every replacement (`rename_snapshot`, and `promote_base` which may overwrite) goes through `src/swap.rs`:
+`Core::rename_snapshot` moves a name in one `Meta::rename_snapshot` transaction and keeps the snapshot id, so no swap is involved.
+A refused rename (a name held by another snapshot, a bad name) writes nothing.
+Tests: `a_rename_keeps_the_id_the_root_and_the_file_numbers`, `a_rename_that_fails_at_the_commit_changes_nothing`, `rename_snapshot_is_failure_safe`.
+
+`promote_base` replaces an existing name with a clone of another snapshot.
+A rename cannot do that, because it refuses a name another snapshot holds, so `promote_base` still goes through `src/swap.rs`:
 
 1. fork the source into a staging name (a failure here changes nothing),
 2. write and sync the intent file `<root>/swap-<target>`, naming the staging and target snapshots,
@@ -161,6 +169,7 @@ Any failure before step 3 leaves the old target untouched.
 Any failure or crash from step 3 on leaves the intent file, and the next `Core::open` finishes steps 4 to 6 before it serves anything.
 So a snapshot name never disappears without a record that explains it, and a failed swap never costs the old base.
 The two forks change the snapshot id, so every inode number in the new snapshot differs from the old one's.
+Import uses the same finish step.
 
 Test: `promote_base_survives_a_failure_at_every_step` injects a failure at each of the five steps (`Core::set_swap_fault`, a doc-hidden test seam), checks the content before the reopen, reopens, and checks that recovery completed the swap or left the old base, with no staging snapshot and no intent file left.
 
@@ -181,7 +190,7 @@ Tests: `a_damaged_chunk_fails_its_own_file_and_nothing_else`, `a_damaged_chunk_f
 | `create_snapshot(name)` | one durable meta commit | empty tree |
 | `fork_snapshot(src, name)` | O(1): flush of `src`'s pending operations, then one meta row | writable clone |
 | `remove_snapshot(name)` | proportional to nodes unique to it | refused with `Busy` while any handle is open in it |
-| `rename_snapshot(old, new)` | the staged swap in `src/swap.rs` | crash-safe and error-safe (see "Snapshot replacement is crash-safe"); changes the snapshot id and so every inode number in it, refused while handles are open |
+| `rename_snapshot(old, new)` | one meta transaction | keeps the snapshot id and every inode number in it; a handle open across it keeps working; a refused rename changes nothing |
 | `promote_base(src, base)` | the staged swap, replacing an existing `base` | crash-safe and error-safe; two O(1) forks |
 | `list_snapshots()` | one read | |
 | `merkle_root(name)` | flush of that snapshot, then one read | root only covers committed state, so it flushes first |
@@ -545,39 +554,40 @@ that takes a lock is not listed here.
 
 ## Requests of store and meta
 
-State at the merge of `origin/v1/8-9-meta` (commit 9abe96e) and `origin/v1/7-block-store` (commit 1c00c1e), plus `origin/v1/vfs-test` (5cc6008) and `origin/v1/vfs-trait` (1825081).
-None of these blocks the crate, each has a workaround stated here.
+State when this section was written: the merge of `origin/v1/8-9-meta` (commit 9abe96e) and `origin/v1/7-block-store` (commit 1c00c1e), plus `origin/v1/vfs-test` (5cc6008) and `origin/v1/vfs-trait` (1825081).
+The list below is updated to main as of 2026-10-08.
 
 Landed and adopted: `before_sync` after the batch closure, `Meta::close`, `Meta::pack_ino`, the durable inode reservation (numbers are never reused), the store's `corrupt_synced` refusal, the store's v2 pack format and recovery classification, the new error variants (mapped in the error table), the store op log.
 Landed and not yet used by `Core`: `Snapshot::chunk_range`, `Tx::splice_content` (with the version check) and `Error::NeedsRechunk`.
 `Core` still reads a file's whole chunk list on first use and commits it with `set_content`, which is O(chunks in the file) per commit.
 Moving to `chunk_range` and `splice_content` is the next step for multi-GiB files and is not needed at the measured sizes.
 
-Not landed:
+Requests recorded in #42, and where each stands on main:
 
-1. `Meta::rename_snapshot(id, new_name)` (atomic, keeps the id).
-   Workaround: the staged swap with an intent record in `src/swap.rs` (see "Snapshot replacement is crash-safe"), which needs no meta change and survives a crash or an error at every step.
-   It still changes the id (two forks), which the lead may or may not care about.
-2. `Snapshot::batch_at(now: Timestamp, f)` or `Tx::set_now`, so that ctime (and creation times) of deferred operations are the times the operations happened.
-   Workaround: atime and mtime are restored with `setattr`; ctime in meta is the batch time, up to `flush_interval` late.
-   Cached ctime is exact while the node is cached.
-3. A first-class hole flag in `ChunkRef` (`ChunkRef` is in the store crate).
-   Workaround: an all-zero block id is a hole.
-   GC (#10) must use `Core::live_blocks`, which filters hole refs, and must not free blocks named only by an open orphan or by an uncommitted chunk list (`Core::pinned_blocks`), and must not free a block put after its mark started.
-4. `Meta::reserve_inodes(n)` or `Tx::create_with_ino`, which would remove the virtual inode numbers and the alias table.
-   Meta now reserves durably inside itself, but a caller still cannot get a number before the transaction that creates the inode.
-5. A crate for the snapshot-name rule shared by the backend and the control API.
-   `cowfs_core::validate_snapshot_name`, `validate_snapshot_name_bytes` and `name_key` are copied from `cowfs-ctl`'s `validate.rs` with its test table (`src/snapname.rs`) because the two are on different branches; they should become one crate, and `validate.rs` should then depend on it instead of duplicating it.
+1. `Meta::rename_snapshot(id, new_name)`: landed (#137) and used by `Core::rename_snapshot` (#141).
+   `promote_base` replaces an existing name, so it still uses the staged swap and its two forks.
+2. `Tx::set_now`: landed (#136).
+   `Core` stamps each deferred operation with the ctime its cached node holds.
+   `Snapshot::batch_at` was not added, because `set_now` covers the need.
+3. A hole flag in `ChunkRef`: landed (#138).
+   The metadata walk skips holes on its own.
+   `Core::live_blocks` keeps its own hole filter as defence in depth, and must not free blocks named only by an open orphan or by an uncommitted chunk list (`Core::pinned_blocks`), nor a block put after its mark started.
+4. `Meta::reserve_inodes(n)`: landed (#140), and `Core` creates at reserved numbers (#142).
+   The alias table and `<root>/virt.ino` are still read on open, for numbers issued before a reopen.
+   They are not removed yet.
+5. A crate for the snapshot-name rule: landed (#99) as `cowfs-snapname`.
+   `cowfs-ctl` and `cowfs-core` hold thin wrappers, and `cowfs-daemon/tests/snapname_drift.rs` checks that they agree.
 
 ## Decisions for the lead to review
 
-1. Virtual inode numbers with an alias table, in place of asking meta for a reservation.
+1. Virtual inode numbers with an alias table, in place of asking meta for a reservation (superseded for new creates by `Meta::reserve_inodes`; kept for numbers issued before a reopen).
    The counter is durable in `<root>/virt.ino` and aliases are released once nothing can hold their number, so the table is bounded (130 aliases after 500,000 creates).
 2. Directory rename, replacing a directory, and readdir of a directory with pending changes are barriers, but a barrier commits only the namespace.
    Unrelated files' dirty data is not flushed: a `readdir` of one directory with 48 MiB of dirty data in another file costs 0.14 ms at the median and never chunks the unrelated data (test `a_directory_barrier_does_not_flush_unrelated_file_data`; before the fix the same call flushed all 48 MiB and took 5.9 s on this loaded box).
-3. Timestamps: atime and mtime exact, ctime in meta is batch time (request 2).
-4. `rename_snapshot` and `promote_base` go through a staged swap with a crash-safe intent record; they change ids and are atomic only in the sense that a name is never lost (request 1).
-5. Holes are zero-id chunk refs; `Core::live_blocks` filters them for GC (request 3).
+3. Timestamps: atime and mtime exact, and ctime is the time of the operation, not of the batch (`Tx::set_now`).
+4. `rename_snapshot` is one meta transaction and keeps the id.
+   `promote_base` goes through a staged swap with a crash-safe intent record; it changes ids and is atomic only in the sense that a name is never lost.
+5. Holes carry an explicit flag in `ChunkRef`; `Core::live_blocks` still filters them for GC.
 6. No atime update on read.
 7. Data lost on crash is bounded by the write-back limits above; content updates can commit later than later namespace operations.
 8. Snapshot removal is refused while a handle is open in it, and makes its inode numbers `Stale` even when references remain.

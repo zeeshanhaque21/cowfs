@@ -1843,9 +1843,8 @@ impl Meta {
     /// [`Error::NoSuchSnapshot`]. Renaming a snapshot to the name it already has succeeds and
     /// writes nothing.
     ///
-    /// This is the metadata API only. No consumer is wired to it yet, and `cowfs-core` still stages
-    /// its own rename through `src/swap.rs`, so nothing outside `cowfs-meta` changes behaviour
-    /// until a consumer adopts this.
+    /// `cowfs-core` uses this for `Core::rename_snapshot`. Replacing an existing name is not
+    /// something this does, so `Core::promote_base` still stages that through `src/swap.rs`.
     pub fn rename_snapshot(&self, id: SnapshotId, new_name: &str) -> Result<()> {
         self.h.inner.rename_snapshot(id, new_name)
     }
@@ -1889,8 +1888,8 @@ impl Meta {
     /// Asking for zero is [`Error::Invalid`], and asking for more than the remaining numbers below
     /// [`INO_LIMIT`] is [`Error::LimitExceeded`]. Neither writes anything.
     ///
-    /// This hands out numbers; it does not create inodes. Creating an inode at a reserved number is
-    /// a separate concern and is not provided here.
+    /// This hands out numbers; it does not create inodes. A ticket from
+    /// [`Meta::reserve_tickets`] is what `Tx::create_at` and its siblings spend to create one.
     pub fn reserve_inodes(&self, n: u64) -> Result<InoRange> {
         self.h.inner.reserve_inodes(n)
     }
