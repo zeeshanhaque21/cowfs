@@ -20,11 +20,17 @@ fn probe_require_treehouse_with_no_treehouse() {
 fn run_probe(env: &[(&str, &str)]) -> (bool, String) {
     let home = tempfile::tempdir().expect("tempdir");
     let mut cmd = Command::new(std::env::current_exe().expect("current exe"));
-    cmd.args(["--ignored", "--exact", PROBE, "--nocapture", "--test-threads=1"])
-        // No PATH entry, no $HOME/.local/bin/treehouse, no override: treehouse cannot be found.
-        .env_clear()
-        .env("PATH", "")
-        .env("HOME", home.path());
+    cmd.args([
+        "--ignored",
+        "--exact",
+        PROBE,
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    // No PATH entry, no $HOME/.local/bin/treehouse, no override: treehouse cannot be found.
+    .env_clear()
+    .env("PATH", "")
+    .env("HOME", home.path());
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -40,7 +46,10 @@ fn run_probe(env: &[(&str, &str)]) -> (bool, String) {
 #[test]
 fn a_missing_treehouse_fails_the_test_when_ci_is_set() {
     let (ok, text) = run_probe(&[("CI", "true")]);
-    assert!(!ok, "the probe passed with CI set and no treehouse:\n{text}");
+    assert!(
+        !ok,
+        "the probe passed with CI set and no treehouse:\n{text}"
+    );
     assert!(text.contains("issue 259"), "unexpected failure:\n{text}");
     assert!(!text.contains("PROBE-REACHED-BODY"), "{text}");
 }
