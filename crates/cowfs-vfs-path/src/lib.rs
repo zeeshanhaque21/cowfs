@@ -264,23 +264,24 @@ impl Vfs for PathVfs {
         s.invalidate(parent);
         let mode = mode & MODE_MASK;
         // The mode goes in at creation, unfiltered by the umask, so no fchmod follows on a
-        // descriptor opened by name (it would land on whatever was renamed over the name). The
-        // owner bits are forced on so the directory can be opened. Whatever the result, the mode
-        // observed on the new directory is compared with the one asked: a mismatch (no private
-        // umask, setuid or setgid dropped, a default ACL or setgid parent, a mount option that
-        // forces modes, a server that filters them) takes one fchmod on the descriptor.
-        let exact = sys::mkdirat_exact(dir.file.as_fd(), name, mode | 0o700).map_err(io_err)?;
+        // descriptor opened by name (it would land on whatever was renamed over the name). It
+        // takes a follow-up only when the kernel may change the mode (see `mode_may_change`) or
+        // when the owner could not open the directory afterwards. Without a thread-private
+        // umask it always does.
+        let first = mode | 0o700;
+        let exact = sys::mkdirat_exact(dir.file.as_fd(), name, first).map_err(io_err)?;
         if !exact {
             sys::mkdirat(dir.file.as_fd(), name, 0o700).map_err(io_err)?;
         }
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
         let fd = sys::openat(dir.file.as_fd(), name, flags, 0).map_err(io_err)?;
-        let mut st = sys::fstat(fd.as_fd()).map_err(io_err)?;
-        if st.mode & MODE_MASK != mode {
+        // (`mkdirat` drops setuid and setgid.)
+        if !exact || first != mode || mode & 0o6000 != 0 || mode_may_change(dir.file.as_fd(), true)
+        {
             sys::fchmod(fd.as_fd(), mode).map_err(io_err)?;
-            st = sys::fstat(fd.as_fd()).map_err(io_err)?;
         }
         let open = open_from(fd, false);
+        let st = sys::fstat(open.file.as_fd()).map_err(io_err)?;
         let ino = s.register(parent, &dir.file, name, &st)?;
         s.remember(ino, open);
         s.add_ref(ino);
@@ -316,17 +317,16 @@ impl Vfs for PathVfs {
         let mode = mode & MODE_MASK;
         // The mode goes in at creation, unfiltered by the umask: a chmod after `mknodat` can only
         // go by name, and lands on whatever another process renamed over the name in between.
-        // So the chmod is left for when the observed mode differs from the one asked (no private
-        // umask, a default ACL, a mount option or server that rewrites modes).
+        // That chmod is left for when the kernel may change the mode (a default ACL on the
+        // parent) or no thread-private umask exists.
         let exact = sys::mknodat_exact(dir.file.as_fd(), name, ty | mode, host).map_err(io_err)?;
         if !exact {
             sys::mknodat(dir.file.as_fd(), name, ty | 0o600, host).map_err(io_err)?;
         }
-        let mut st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
-        if st.mode & MODE_MASK != mode {
+        if !exact || mode_may_change(dir.file.as_fd(), false) {
             sys::fchmodat(dir.file.as_fd(), name, mode).map_err(io_err)?;
-            st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
         }
+        let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
         let ino = s.register(parent, &dir.file, name, &st)?;
         s.add_ref(ino);
         s.attr_of(ino, &st)
@@ -666,6 +666,22 @@ impl Vfs for PathVfs {
         check_xattr_name(name)?;
         self.with_xattr(ino, |t| sys::removexattr(t, name))
     }
+}
+
+/// Whether creating under `dir` can leave a mode other than the one asked, even with no umask:
+/// a default ACL filters it, and a setgid parent gives a new directory its setgid bit. Anything
+/// that cannot be told counts as yes. The contract is the exact mode, for `create`, `mkdir`
+/// and `mknod` alike.
+fn mode_may_change(dir: std::os::fd::BorrowedFd<'_>, new_dir: bool) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let none = [libc::ENODATA, libc::ENOTSUP];
+        let acl = sys::getxattr(&sys::XTarget::Fd(dir), b"system.posix_acl_default");
+        if !matches!(&acl, Err(e) if e.raw_os_error().is_some_and(|c| none.contains(&c))) {
+            return true;
+        }
+    }
+    new_dir && sys::fstat(dir).map_or(true, |st| st.mode & 0o2000 != 0)
 }
 
 /// Whether this process may make device nodes under `dir`: a probe `mknod` of a character
