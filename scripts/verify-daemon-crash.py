@@ -62,6 +62,7 @@ Usage
     scripts/verify-daemon-crash.py --stage sample
     scripts/verify-daemon-crash.py --stage all --reps 2
     scripts/verify-daemon-crash.py --only rename_posix_durability
+    scripts/verify-daemon-crash.py --fault-boundary 1-60   # issue 173: daemon dies inside a real gc
     python3 -m unittest discover -s bench        # the fail-closed controls
 
 Everything lives under `bench/out/crash88*/` (gitignored). No shared daemon, store,
@@ -1094,8 +1095,18 @@ def unmount_private(mount, rec, note, keys=None):
 # --------------------------------------------------------------------------
 
 
+def daemon_env(extra):
+    """The child daemon's environment. Any C7D_ fault key inherited from the caller is dropped,
+    so only the keys this harness passes for one daemon can ever reach it."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("C7D_")}
+    env.update(extra or {})
+    return env
+
+
 class PrivateDaemon:
-    def __init__(self, store, mount, socket, log_path):
+    def __init__(self, store, mount, socket, log_path, env=None, binary=None):
+        self.env = env
+        self.binary = binary or DAEMON
         self.store = store
         self.mount = mount
         # Resolved before the mount exists. Doing it later, once the path may be a
@@ -1115,7 +1126,7 @@ class PrivateDaemon:
         # timeout that SIGTERMs the group cannot reap the daemon under test.
         self.child = subprocess.Popen(
             [
-                DAEMON,
+                self.binary,
                 "--store",
                 self.store,
                 "--mount",
@@ -1129,6 +1140,7 @@ class PrivateDaemon:
             stderr=self.log,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=daemon_env(self.env),
         )
         self.identity = process_identity(self.child)
         rec.record("daemon.spawned", True, identity=self.identity, session="new")
@@ -1770,6 +1782,257 @@ def case_kill_control(d, receipts, res, rec, probe):
     rec.record("case.phase", True, phase="idle kill control")
 
 
+# --------------------------------------------------------------------------
+# issue 173 slice 2: the daemon dies DURING a real gc sweep
+# --------------------------------------------------------------------------
+#
+# `--fault-boundary N` (or `A-B`) swaps in a daemon built with the `fault-injection` feature,
+# which only forwards the store's own seam: the process exits 77 at its N-th durability
+# boundary when C7D_EXIT_BOUNDARY_N=N is in that daemon's environment. The counter starts at
+# process start, so low N land in daemon startup/recovery and higher N inside the gc cycle;
+# both are recorded and both are verified.
+#
+# The fixture is built once (daemon without the env), then cloned per N, so only the first
+# pays for the data. Garbage must exceed the 256 MiB pack limit so the first pack is SEALED and
+# holds the live records beside dead ones: a collect then has to copy before it unlinks, and
+# frees real bytes. (The old gc_crash case kept everything in the open pack and freed 0.)
+
+FAULT_TARGET = os.path.join(REPO, "target/fault-daemon")
+FAULT_DAEMON = os.path.join(FAULT_TARGET, "debug/cowfs-daemon")
+FAULT_GARBAGE_BYTES = 288 * 1024 * 1024
+FAULT_CHUNK = 1024 * 1024
+FAULT_EXIT = 77
+SEAM_KEY = b"C7D_EXIT_BOUNDARY_N"
+
+
+def build_fault_daemon(rec):
+    p = subprocess.run(
+        ["cargo", "build", "-q", "-p", "cowfs-daemon", "--features", "fault-injection",
+         "--target-dir", FAULT_TARGET],
+        cwd=REPO, capture_output=True, text=True, env=dict(os.environ, CARGO_BUILD_JOBS="4"),
+    )
+    if p.returncode != 0:
+        raise SystemExit("fault daemon build failed:\n" + p.stderr[-2000:])
+    seam = {}
+    for label, path in (("fault", FAULT_DAEMON), ("plain", DAEMON)):
+        with open(path, "rb") as f:
+            seam[label] = f.read().count(SEAM_KEY)
+    rec.record("fault.build", seam["fault"] > 0, fault_daemon=FAULT_DAEMON, seam_hits=seam,
+               fault_daemon_sha256=binary_digest(FAULT_DAEMON), plain_daemon_sha256=binary_digest(DAEMON),
+               note="only d1 runs the fault build; the template and every restart run the plain daemon")
+    if seam["fault"] == 0:
+        raise SystemExit("fault daemon carries no seam; the sweep would test nothing")
+    if seam["plain"] != 0:
+        raise SystemExit("the plain daemon carries the seam; build it without the feature first")
+
+
+def parse_fault_range(spec):
+    a, _, b = spec.partition("-")
+    lo, hi = int(a), int(b or a)
+    if lo < 1 or hi < lo:
+        raise SystemExit("--fault-boundary wants N or A-B with 1 <= A <= B")
+    return lo, hi
+
+
+def pack_listing(store):
+    d = os.path.join(store, "store", "packs")
+    return {n: os.path.getsize(os.path.join(d, n)) for n in sorted(os.listdir(d))}
+
+
+def clone_tree(src, dst):
+    """Copy-on-write clone on APFS; plain copy elsewhere."""
+    flag = ["-c"] if sys.platform == "darwin" else []
+    subprocess.run(["cp", "-R"] + flag + [src, dst], check=True)
+
+
+def build_fault_template(base_dir, rec):
+    """Live records first, then 288 MiB of garbage in a snapshot that is removed. Returns the
+    store dir and the receipts, after a clean shutdown so the removal is committed."""
+    store = os.path.join(base_dir, "store")
+    mount = os.path.join(base_dir, "mnt")
+    d = PrivateDaemon(store, mount, sock_path("fault-tpl"), os.path.join(base_dir, "daemon.log"))
+    receipts = Receipts()
+    try:
+        d.start(rec)
+        ctl_create(d, "live")
+        for i in range(SAMPLE_FILES):
+            write_file(d.mount, "live", "f%d.bin" % i, deterministic_body(64 * 1024, 700 + i),
+                       True, rec, receipts)
+        fsync_dir(os.path.join(d.mount, "live"))
+        ctl_create(d, "garbage")
+        h = hashlib.sha256()
+        with open(os.path.join(d.mount, "garbage", "big.bin"), "wb") as f:
+            for _ in range(FAULT_GARBAGE_BYTES // FAULT_CHUNK):
+                chunk = os.urandom(FAULT_CHUNK)
+                h.update(chunk)
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+        receipts.removed("garbage/big.bin", h.hexdigest(), FAULT_GARBAGE_BYTES, "snapshot_rm", rec)
+        fsync_dir(os.path.join(d.mount, "garbage"))
+        rm = d.cli(["snapshot", "rm", "garbage"])
+        if rm.returncode != 0:
+            raise RuntimeError("snapshot rm garbage failed: %s" % rm.stderr)
+        sd = d.cli(["shutdown"])
+        if sd.returncode != 0 or not child_exited(d.child, 60):
+            raise RuntimeError("clean shutdown failed rc=%s" % sd.returncode)
+        rec.record("fault.template", True, store=store, garbage_bytes=FAULT_GARBAGE_BYTES,
+                   daemon_rc=d.child.returncode, packs=pack_listing(store))
+    finally:
+        if d.child is not None and d.child.poll() is None:
+            kill_verified(d.child, rec, d.socket, d.store, expect=d.identity)
+        d.close_log()
+        unmount_private(mount, rec, "template", d.mount_keys)
+    return store, receipts
+
+
+def run_fault_point(n, template, receipts, run_dir, parent_rec, source_pack):
+    """One point: clone the template, start a daemon with C7D_EXIT_BOUNDARY_N=n (None = control),
+    run gc, expect death with status 77, restart a fresh daemon on the same store and verify.
+    Returns (ok, phase, source_pack_present) with phase in startup|gc|completed."""
+    name = "fault-control" if n is None else "fault-n%03d" % n
+    case_dir = os.path.join(run_dir, name)
+    shutil.rmtree(case_dir, ignore_errors=True)
+    rec = Recorder(case_dir, resume=False)
+    res = CaseResult(name)
+    store = os.path.join(case_dir, "store")
+    clone_tree(template, store)
+    env = None if n is None else {"C7D_EXIT_BOUNDARY_N": str(n)}
+    d1 = PrivateDaemon(store, os.path.join(case_dir, "mnt1"), sock_path(name),
+                       os.path.join(case_dir, "daemon1.log"), env=env, binary=FAULT_DAEMON)
+    d2 = None
+    phase = "error"
+    src_present = None
+    try:
+        try:
+            d1.start(rec)
+            started = True
+        except RuntimeError:
+            started = False
+        if not started:
+            res.check(rec, d1.child.poll() == FAULT_EXIT, "startup_death_is_77", rc=d1.child.poll())
+            phase = "startup"
+        else:
+            gc = d1.cli(["gc"], timeout=180)
+            if n is None:
+                res.check(rec, gc.returncode == 0, "control_gc_ok", rc=gc.returncode, err=gc.stderr[-400:])
+                out = json.loads(gc.stdout)
+                rec.record("gc.report", True, **{k: out.get(k) for k in (
+                    "candidate_blocks", "candidate_bytes", "freed_blocks", "freed_bytes",
+                    "gross_removed_bytes", "rewrite_bytes", "net_reclaimed_bytes")})
+                res.check(rec, out.get("freed_bytes", 0) > 0, "control_gc_freed_bytes", freed=out.get("freed_bytes"))
+                phase = "completed"
+            else:
+                dead = child_exited(d1.child, 60)
+                rc = d1.child.poll()
+                if dead:
+                    res.check(rec, rc == FAULT_EXIT, "gc_death_is_77", rc=rc, gc_rc=gc.returncode)
+                    res.check(rec, gc.returncode != 0, "gc_request_failed", gc_rc=gc.returncode)
+                    phase = "gc"
+                else:
+                    res.check(rec, gc.returncode == 0, "gc_completed_alive", gc_rc=gc.returncode)
+                    phase = "completed"
+        if d1.child is not None and d1.child.poll() is None:
+            kill_verified(d1.child, rec, d1.socket, d1.store, expect=d1.identity)
+        d1.close_log()
+        unmount_private(d1.mount, rec, "after_death", d1.mount_keys)
+        # The raw pack dir before any reopen: which crash image is this?
+        packs = pack_listing(store)
+        src_present = source_pack in packs
+        rec.record("crash.image", True, n=n, packs=packs, source_pack=source_pack,
+                   source_pack_present=src_present)
+
+        d2 = PrivateDaemon(store, os.path.join(case_dir, "mnt2"), sock_path(name + "-r2"),
+                           os.path.join(case_dir, "daemon2.log"), binary=DAEMON)
+        d2.start(rec)
+        verify_readback(d2, receipts, res, rec)
+        verify_no_torn_tree(d2, res, rec)
+        verify_fsck(d2, res, rec)
+        again = d2.cli(["gc"], timeout=180)
+        res.check(rec, again.returncode == 0, "second_gc_ok", rc=again.returncode, err=again.stderr[-400:])
+        if again.returncode == 0:
+            rec.record("gc.second_report", True, freed_bytes=json.loads(again.stdout).get("freed_bytes"))
+        verify_readback(d2, receipts, res, rec)
+        verify_fsck(d2, res, rec)
+    except Exception as e:  # noqa: BLE001 - recorded as the point's error
+        res.check(rec, False, "point_error", err="%s: %s" % (type(e).__name__, e))
+    finally:
+        for d in (d1, d2):
+            if d is None:
+                continue
+            try:
+                if d.child is not None and d.child.poll() is None:
+                    kill_verified(d.child, rec, d.socket, d.store, expect=d.identity)
+            except Exception:  # noqa: BLE001
+                pass
+            d.close_log()
+            unmount_private(d.mount, rec, "teardown", d.mount_keys)
+            for victim in (d.socket, d.socket + ".lock"):
+                if os.path.exists(victim):
+                    os.unlink(victim)
+    ok = not res.failures
+    rec.record("fault.verdict", ok, n=n, phase=phase, failures=res.failures)
+    rec.close()
+    parent_rec.record("fault.point", ok, n=n, phase=phase, failures=res.failures, dir=case_dir)
+    log("  n=%-4s %-9s %s %s" % (n if n is not None else "ctl", phase, "ok" if ok else "FAIL", res.failures or ""))
+    if ok:
+        shutil.rmtree(store, ignore_errors=True)
+    return ok, phase, src_present
+
+
+def run_fault_stage(spec, run_dir, rec):
+    lo, hi = parse_fault_range(spec)
+    build_fault_daemon(rec)
+    base = os.path.join(run_dir, "fault-template")
+    shutil.rmtree(base, ignore_errors=True)
+    os.makedirs(base)
+    template, receipts = build_fault_template(base, rec)
+    packs = pack_listing(template)
+    source_pack = max(packs, key=packs.get)
+    points = []
+    ok, phase, src = run_fault_point(None, template, receipts, run_dir, rec, source_pack)
+    points.append((None, ok, phase, src))
+    n = lo
+    while ok and n <= hi:
+        ok, phase, src = run_fault_point(n, template, receipts, run_dir, rec, source_pack)
+        points.append((n, ok, phase, src))
+        if phase == "completed":
+            break
+        n += 1
+    swept = points[1:]
+    by_phase = {}
+    for _, o, ph, _src in swept:
+        by_phase.setdefault(ph, [0, 0])[0 if o else 1] += 1
+    # Fail closed, like the crate-level test: a sweep that crashed nothing proves nothing.
+    crashed = sum(1 for p in swept if p[2] in ("gc", "startup"))
+    in_gc = sum(1 for p in swept if p[2] == "gc")
+    missing = [p[0] for p in swept if p[3] is False]
+    present = [p[0] for p in swept if p[3] is True]
+    closed = []
+    if in_gc == 0:
+        closed.append("no point crashed the daemon inside the gc (the sweep crashed %d times)" % crashed)
+    if swept and swept[0][2] == "completed" and lo > 1:
+        closed.append("the first point already completed; --fault-boundary starts past the cycle")
+    full = lo == 1 and bool(swept) and swept[-1][2] == "completed"  # a whole-cycle sweep
+    if full and not missing:
+        closed.append("no crash image was missing the source pack %s: the unlink was never crossed" % source_pack)
+    if full and not present:
+        closed.append("no crash image still had the source pack: the copy phase was never crossed")
+    for c in closed:
+        rec.record("fault.closed", False, reason=c)
+        log("FAIL: " + c)
+    summary = {"range": [lo, hi], "points": [list(p) for p in points], "pass_fail_by_phase": by_phase,
+               "source_pack": source_pack, "n_source_pack_present": present,
+               "n_source_pack_missing": missing, "reached_completion": bool(swept) and swept[-1][2] == "completed",
+               "closed": closed}
+    allok = all(p[1] for p in points) and not closed
+    rec.record("fault.summary", allok, summary=summary)
+    with open(os.path.join(run_dir, "fault-summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+    log("fault sweep: %s" % json.dumps(summary))
+    return 0 if allok else 1
+
+
 CASES = {
     "write_fsync": case_write_fsync,
     "write_nofsync": case_write_nofsync,
@@ -2291,6 +2554,13 @@ def main():
         action="store_true",
         help="exit 0 on a cached-only run; the summary still reports fresh_acceptance false",
     )
+    ap.add_argument(
+        "--fault-boundary",
+        default=None,
+        metavar="N|A-B",
+        help="issue 173: kill a fault-injection daemon at store boundary N (or sweep A..B, stopping "
+        "at the first N whose gc completes) during a gc that frees real bytes; verify the restart",
+    )
     ap.add_argument("--internal-native-writer", nargs=3, metavar=("ROOT", "EXPECT", "MODE"))
     args = ap.parse_args()
 
@@ -2321,6 +2591,9 @@ def main():
             rec.record("selftest.failed", False)
             log("selftest failed; not running cases")
             return 3
+
+        if args.fault_boundary:
+            return run_fault_stage(args.fault_boundary, run_dir, rec)
 
         plan = []
         if args.only:
