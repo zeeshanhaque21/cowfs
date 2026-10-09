@@ -166,6 +166,14 @@ Mutants (`crates/cowfs-store/tests/mutate.py`, run with `MUT_ARGS="--test crash 
 - N1, no new-pack fsync in `finish_compaction`: killed by the compaction plus discard sweep.
 - D1, no packs directory fsync after the unlink: killed by the discard sweep.
 
+Issue 276 follow-ups, killed by the same harness (`MUT_ARGS="--test crash --test power_discard"`):
+
+- E7, `discard` skips its leading `sync()`: killed by `discard_makes_earlier_puts_durable`.
+  A cut inside the discard cannot show it, because the base is already durable; the test puts blocks after the last sync and checks the end state (`crash_image` takes `k == ops.len()` for "after the last op returned").
+- E8, `acknowledge_corruption` skips the directory fsync after dropping `index.cix`: killed by `dropping_the_stale_checkpoint_is_followed_by_a_directory_fsync`, a static ordering check.
+  The sweep `power_loss_at_every_op_of_acknowledge_corruption_keeps_live_blocks` now reaches that path, but it cannot kill E8: `open` re-validates a resurrected checkpoint against the packs and ignores one that names a missing pack, so both outcomes of the removal are safe.
+  The removal is defence in depth, and its fsync is pinned by order, not by a loss.
+
 M2 is also killed by the process-crash test `a_crash_at_every_step_of_a_discard_leaves_the_store_clean` now that the unlink is a boundary.
 Not done: `LogOp::Rename`, because the only renames in the store are inside `write_whole`, which the model already treats as one atomic `Whole` write.
 
