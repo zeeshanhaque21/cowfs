@@ -28,6 +28,77 @@ fn is_root() -> bool {
     fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
 }
 
+/// Special files through the kernel (issue #107): mkfifo and a socket node are created by the
+/// kernel's `mknod`, reported with the right type, mode and `nlink`, listed, and removed; a device
+/// needs root and keeps its device number.
+#[test]
+#[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
+fn special_files_through_mknod() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+    let Some(fx) = Fixture::new("") else { return };
+    let c = |name: &str| CString::new(fx.p(name).as_os_str().as_bytes()).unwrap();
+
+    let fifo = c("fifo");
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) }, 0);
+    let m = fs::symlink_metadata(fx.p("fifo")).unwrap();
+    assert!(m.file_type().is_fifo(), "{:?}", m.file_type());
+    assert_eq!((m.mode() & 0o7777, m.nlink(), m.len()), (0o640, 1, 0));
+
+    let sock = c("sock");
+    assert_eq!(
+        unsafe { libc::mknod(sock.as_ptr(), libc::S_IFSOCK | 0o600, 0) },
+        0
+    );
+    assert!(fs::symlink_metadata(fx.p("sock"))
+        .unwrap()
+        .file_type()
+        .is_socket());
+
+    let again = unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) };
+    assert_eq!(
+        (again, std::io::Error::last_os_error().raw_os_error()),
+        (-1, Some(libc::EEXIST))
+    );
+
+    let mut names: Vec<_> = fs::read_dir(fx.p(""))
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().into_string().unwrap(),
+                e.file_type().unwrap().is_fifo(),
+            )
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![("fifo".to_string(), true), ("sock".to_string(), false)]
+    );
+
+    let dev = c("chr");
+    let made = unsafe { libc::mknod(dev.as_ptr(), libc::S_IFCHR | 0o600, 0x103) };
+    if is_root() {
+        assert_eq!(made, 0, "{:?}", std::io::Error::last_os_error());
+        let m = fs::symlink_metadata(fx.p("chr")).unwrap();
+        assert!(m.file_type().is_char_device());
+        // 0x103 is Linux makedev(1, 3)
+        assert_eq!(m.rdev(), 0x103, "device number round trip");
+        fs::remove_file(fx.p("chr")).unwrap();
+    } else {
+        assert_eq!(
+            (made, std::io::Error::last_os_error().raw_os_error()),
+            (-1, Some(libc::EPERM))
+        );
+    }
+
+    fs::remove_file(fx.p("fifo")).unwrap();
+    fs::remove_file(fx.p("sock")).unwrap();
+    assert_eq!(fs::read_dir(fx.p("")).unwrap().count(), 0);
+}
+
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
 fn std_fs_round_trip() {

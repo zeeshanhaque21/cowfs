@@ -105,12 +105,12 @@ fn mount_conformance() {
             "PathVfs has no fallocate yet (#103 slice D)".into(),
         ));
     }
-    // FUSE `mknod` for special files is wired in a later slice of issue #107 (slice C); until
-    // then the mount refuses them with ENOTSUP and these checks cannot pass.
+    // This harness drives the mount through `PathVfs`, which does not implement `mknod`; the
+    // FUSE `mknod` path is covered by `special_files_through_mknod` in `mount.rs`, over MemVfs.
     for c in all_checks().iter().filter(|c| c.category == "special") {
         opts.skip.push((
             c.name.into(),
-            "FUSE mknod of special files lands in slice C of issue #107".into(),
+            "PathVfs does not implement mknod; see special_files_through_mknod in mount.rs".into(),
         ));
     }
     let report = run_all(&factory, &opts);
