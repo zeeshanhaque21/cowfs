@@ -38,6 +38,10 @@ use super::{control_meta, validate_snapshot_name, ControlError, Core, SnapshotEn
 use crate::util::MutexExt as _;
 
 const SWAP_PREFIX: &str = "swap-";
+/// The intent writer's own temp file. It must not start with [`SWAP_PREFIX`] and must not be
+/// distinguished by a suffix: the target is a user name, so `swap-<target>` for the target
+/// `base.tmp` is the same file name as a `.tmp`-suffixed temp of `base`.
+const TMP_PREFIX: &str = "tmp-swap-";
 /// Reserved in snapshot names: see the module docs. The marker and the rule that refuses it live
 /// in `cowfs-snapname`, so the control API refuses these names too.
 pub(crate) const STAGING: &str = cowfs_snapname::RESERVED;
@@ -45,6 +49,10 @@ pub(crate) const STAGING: &str = cowfs_snapname::RESERVED;
 /// True for a name only the swap may use.
 pub(crate) fn is_staging(name: &str) -> bool {
     cowfs_snapname::is_reserved(name)
+}
+
+fn tmp_path(root: &Path, target: &str) -> PathBuf {
+    root.join(format!("{TMP_PREFIX}{target}"))
 }
 
 fn intent_path(root: &Path, target: &str) -> PathBuf {
@@ -68,7 +76,7 @@ fn io(msg: &str) -> ControlError {
 
 fn write_intent(root: &Path, staged: &str, target: &str) -> Result<(), ControlError> {
     let p = intent_path(root, target);
-    let tmp = root.join(format!("{SWAP_PREFIX}{target}.tmp"));
+    let tmp = tmp_path(root, target);
     let mut f = fs::File::create(&tmp).map_err(|e| io(&e.to_string()))?;
     f.write_all(format!("{staged}\n{target}\n").as_bytes())
         .map_err(|e| io(&e.to_string()))?;
@@ -91,7 +99,9 @@ fn read_intent(p: &Path) -> Option<(String, String)> {
     (!staged.is_empty() && !target.is_empty() && is_staging(&staged)).then_some((staged, target))
 }
 
-/// Intent files left by an interrupted swap.
+/// Intent files left by an interrupted swap. Every `swap-*` file is one: the writer's temp files
+/// have their own prefix. A `swap-<X>.tmp` left by the older temp naming is dropped by
+/// `recover_intent`, which finds its name disagrees with the target it records.
 fn intents(root: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = fs::read_dir(root)
         .into_iter()
@@ -101,7 +111,7 @@ fn intents(root: &Path) -> Vec<PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(SWAP_PREFIX) && !n.ends_with(".tmp"))
+                .is_some_and(|n| n.starts_with(SWAP_PREFIX))
         })
         .collect();
     v.sort();
@@ -116,7 +126,8 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
         let name = p
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.trim_start_matches(SWAP_PREFIX).to_string())
+            .and_then(|n| n.strip_prefix(SWAP_PREFIX))
+            .map(str::to_string)
             .unwrap_or_default();
         let staged = staging_name(&name);
         if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
@@ -128,6 +139,11 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
         ));
         return Ok(());
     };
+    if intent_path(&core.inner.root, &target) != p {
+        // an older release's temp file (`swap-<target>.tmp`): its swap had not started
+        let _ = fs::remove_file(p);
+        return Ok(());
+    }
     match core.finish_swap(&staged, &target) {
         // `NotFound` is also what a swap whose staged tree is gone returns (a store the old
         // issue 177 already damaged); the intent still has to go or the name stays blocked
@@ -318,7 +334,7 @@ impl Core {
             let _ = self.inner.unregister(&sc);
         }
         let _ = fs::remove_file(intent_path(&self.inner.root, target));
-        let _ = fs::remove_file(self.inner.root.join(format!("{SWAP_PREFIX}{target}.tmp")));
+        let _ = fs::remove_file(tmp_path(&self.inner.root, target));
         sync_dir(&self.inner.root);
     }
 

@@ -412,3 +412,81 @@ fn open_recovers_a_pending_swap_and_a_second_open_changes_nothing() {
     assert_eq!(content(&c, "base", "f"), "second");
     assert!(raw_leftovers(dir.path(), &c).is_empty());
 }
+
+/// Critic of PR 220: the intent file of a target named `base.tmp` is `swap-base.tmp`, which the
+/// intent scan once mistook for the writer's temp file of `base`. Open then swept the staging
+/// snapshot of a swap past its point of no return. Names that end like a temp file, or that equal
+/// another target plus a suffix, must recover like any other.
+#[test]
+fn a_target_named_like_a_temp_file_is_rolled_forward() {
+    for target in ["base.tmp", "tmp-swap-x", "swap-y"] {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let v1 = source(scratch.path(), "v1", "old base");
+        let v2 = source(scratch.path(), "v2", "new content");
+        let run = |c: &Core, from: &std::path::Path| {
+            let mut hooks = Hooks {
+                progress: &mut |_, _| true,
+            };
+            ingest_replacing(c, from, target, &mut hooks).map(|_| ())
+        };
+        {
+            let c = Core::open(dir.path(), test_opts()).unwrap();
+            run(&c, &v1).unwrap();
+            c.set_swap_fault(4);
+            assert!(run(&c, &v2).is_err());
+        }
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        assert_eq!(content(&c, target, "f"), "new content", "{target}");
+        assert!(raw_leftovers(dir.path(), &c).is_empty(), "{target}");
+        c.check().unwrap();
+    }
+}
+
+/// An intent and the temp file of another swap never share a file name: `base` and `base.tmp`
+/// pending together both recover.
+#[test]
+fn two_pending_swaps_whose_names_differ_by_a_suffix_both_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old");
+    let v2 = source(scratch.path(), "v2", "new");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        for t in ["base", "base.tmp"] {
+            let mut h = Hooks {
+                progress: &mut |_, _| true,
+            };
+            ingest_replacing(&c, &v1, t, &mut h).unwrap();
+            c.set_swap_fault(4);
+            let mut h = Hooks {
+                progress: &mut |_, _| true,
+            };
+            assert!(ingest_replacing(&c, &v2, t, &mut h).is_err());
+            c.set_swap_fault(0);
+        }
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "new");
+    assert_eq!(content(&c, "base.tmp", "f"), "new");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+}
+
+/// A temp file the older release named `swap-<target>.tmp` is dropped on open, not read as the
+/// intent of a target called `<target>.tmp`.
+#[test]
+fn an_older_temp_file_is_dropped_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "kept");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace(&c, &v1).unwrap();
+    }
+    let stale = dir.path().join("swap-base.tmp");
+    std::fs::write(&stale, "base.cowfs-swap0\nbase\n").unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert!(!stale.exists());
+    assert_eq!(content(&c, "base", "f"), "kept");
+    c.check().unwrap();
+}
