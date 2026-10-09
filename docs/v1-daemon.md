@@ -97,7 +97,7 @@ Every snapshot operation is the core's own control plane. No tree is ever copied
 | `fsck` | `Core::fsck`, mapped to the protocol's report |
 | `gc` | `Core::collector` through the reference gate: a mark-and-sweep over the real store that reclaims packs. See below |
 | `import` | `import::ingest`: a reserved staging snapshot, a durable read-back compared byte for byte with the source, then one fork into the name. See below |
-| `base_refresh` | refused, see below |
+| `base_refresh` | a checkout of the ref is ingested through the core writer, see below |
 
 Two of those need a word.
 
@@ -158,9 +158,11 @@ already stored, and the report's `stored_bytes` says so (0 for a repeat of ident
   staging snapshot, it runs afterwards and gets `already_exists` from `check_new_name`. Across
   processes it is stronger still: the store holds an exclusive `flock` on its `LOCK` file, so a
   second daemon on the same store refuses to open it.
-- `base_refresh` is still refused here, because it copies a git worktree into the store directory,
-  which means nothing for a backend whose snapshots are trees. The handler answers `unsupported`
-  and says to copy the source through the mount instead.
+- `base_refresh` publishes tree-natively (issue 123).
+  The daemon checks the ref out into a staging worktree it chose, ingests that through `Core::ingest` (or `ingest_replacing` when the name is taken), then promotes the base and persists its provenance.
+  The new tree is staged under the core's reserved hidden name and verified first, so a failed refresh leaves the old tree alone and no user-visible residue.
+  A name already taken, by a base or a plain snapshot, is replaced.
+  A warm `target/` is not part of this yet.
 
 `gc` is wired over the real core: `CoreBackend` registers the run, clones the `Core` out of its
 slot, builds a `Collector` with `Core::collector`, and runs the cycle on a scoped thread while the

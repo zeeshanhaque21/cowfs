@@ -96,7 +96,8 @@ impl From<Record> for BaseMeta {
 ///
 /// This is deliberately weaker than `validate_snapshot_name`, which is what a *base* name must
 /// satisfy: `import` also removes and renames the private staging snapshots it creates, and those are
-/// named `.cowfs-import-<name>`, which is not a valid snapshot name. Both are single path components
+/// named `.cowfs-import-<name>` on the passthrough backend (the core stages under its own hidden name
+/// and creates none), which is not a valid snapshot name. Both are single path components
 /// under the same root, which is all this has to guarantee.
 fn check_private_name(name: &str) -> io::Result<()> {
     let bad = |why: &'static str| io::Error::new(io::ErrorKind::InvalidInput, why.to_owned());
