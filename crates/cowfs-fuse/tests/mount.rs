@@ -34,33 +34,32 @@ fn is_root() -> bool {
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
 fn special_files_through_mknod() {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
     let Some(fx) = Fixture::new("") else { return };
-    let c = |name: &str| CString::new(fx.p(name).as_os_str().as_bytes()).unwrap();
+    // The tools make the same `mknod(2)` calls the tests would; the workspace denies `unsafe`.
+    let tool = |args: &[&str]| {
+        Command::new(args[0])
+            .args(&args[1..])
+            .status()
+            .map(|s| s.success())
+            .unwrap()
+    };
+    let p = |n: &str| fx.p(n).to_str().unwrap().to_string();
 
-    let fifo = c("fifo");
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) }, 0);
+    assert!(tool(&["mkfifo", "-m", "640", &p("fifo")]));
     let m = fs::symlink_metadata(fx.p("fifo")).unwrap();
     assert!(m.file_type().is_fifo(), "{:?}", m.file_type());
     assert_eq!((m.mode() & 0o7777, m.nlink(), m.len()), (0o640, 1, 0));
 
-    let sock = c("sock");
-    assert_eq!(
-        unsafe { libc::mknod(sock.as_ptr(), libc::S_IFSOCK | 0o600, 0) },
-        0
-    );
+    // bind(2) of a unix socket reaches the daemon as mknod(S_IFSOCK)
+    let _sock = UnixListener::bind(fx.p("sock")).unwrap();
     assert!(fs::symlink_metadata(fx.p("sock"))
         .unwrap()
         .file_type()
         .is_socket());
 
-    let again = unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) };
-    assert_eq!(
-        (again, std::io::Error::last_os_error().raw_os_error()),
-        (-1, Some(libc::EEXIST))
-    );
+    assert!(!tool(&["mkfifo", &p("fifo")]), "a second mkfifo is EEXIST");
 
     let mut names: Vec<_> = fs::read_dir(fx.p(""))
         .unwrap()
@@ -78,20 +77,17 @@ fn special_files_through_mknod() {
         vec![("fifo".to_string(), true), ("sock".to_string(), false)]
     );
 
-    let dev = c("chr");
-    let made = unsafe { libc::mknod(dev.as_ptr(), libc::S_IFCHR | 0o600, 0x103) };
+    let made = tool(&["mknod", &p("chr"), "c", "1", "3"]);
     if is_root() {
-        assert_eq!(made, 0, "{:?}", std::io::Error::last_os_error());
+        assert!(made, "root can make a device node");
         let m = fs::symlink_metadata(fx.p("chr")).unwrap();
         assert!(m.file_type().is_char_device());
         // 0x103 is Linux makedev(1, 3)
         assert_eq!(m.rdev(), 0x103, "device number round trip");
         fs::remove_file(fx.p("chr")).unwrap();
     } else {
-        assert_eq!(
-            (made, std::io::Error::last_os_error().raw_os_error()),
-            (-1, Some(libc::EPERM))
-        );
+        assert!(!made, "a device node needs root (EPERM)");
+        assert!(!fx.p("chr").exists());
     }
 
     fs::remove_file(fx.p("fifo")).unwrap();
