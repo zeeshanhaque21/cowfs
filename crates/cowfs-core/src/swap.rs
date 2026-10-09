@@ -101,7 +101,7 @@ fn read_intent(p: &Path) -> Option<(String, String)> {
 
 /// Intent files left by an interrupted swap. Every `swap-*` file is one: the writer's temp files
 /// have their own prefix. A `swap-<X>.tmp` left by the older temp naming is dropped by
-/// `recover_intent`, which finds its name disagrees with the target it records.
+/// `recover_intent`, which finds the name is exactly `swap-<recorded target>.tmp`.
 fn intents(root: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = fs::read_dir(root)
         .into_iter()
@@ -139,7 +139,7 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
         ));
         return Ok(());
     };
-    if intent_path(&core.inner.root, &target) != p {
+    if p.file_name().and_then(|n| n.to_str()) == Some(&format!("{SWAP_PREFIX}{target}.tmp")) {
         // an older release's temp file (`swap-<target>.tmp`): its swap had not started
         let _ = fs::remove_file(p);
         return Ok(());
@@ -167,6 +167,17 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
 /// A failure is reported through `Core::last_flush_error` and the intent file stays for the next
 /// open, so a swap is never silently dropped.
 pub(crate) fn recover(core: &Core) {
+    // a temp file left by a crash before its rename never carries authority; the store flock means
+    // no writer is mid-way through one
+    for e in fs::read_dir(&core.inner.root)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if e.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
+            let _ = fs::remove_file(e.path());
+        }
+    }
     for p in intents(&core.inner.root) {
         if let Err(e) = recover_intent(core, &p) {
             *core.inner.last_error.lk() = Some(format!("swap recovery: {e}"));

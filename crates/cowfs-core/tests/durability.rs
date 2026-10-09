@@ -57,7 +57,7 @@ fn the_intent_file_is_durable_before_the_victim_snapshot_is_removed() {
             .unwrap_or_else(|| panic!("{what} missing from {trace:?}"))
     };
     assert!(
-        pos("sync_file:swap-base.tmp") < pos("intent_renamed"),
+        pos("sync_file:tmp-swap-base") < pos("intent_renamed"),
         "the intent record was renamed into place before its bytes were durable: {trace:?}"
     );
     let dir_sync = |e: &String| e.starts_with("sync_dir:");
@@ -87,7 +87,7 @@ fn a_swap_refuses_when_the_intent_file_cannot_be_made_durable() {
     c.sync().unwrap();
 
     fsops::arm();
-    fsops::set_fault(Fault::FileSync, "swap-base.tmp", 1);
+    fsops::set_fault(Fault::FileSync, "tmp-swap-base", 1);
     let r = c.promote_base("src", "base");
     fsops::disarm();
     println!("promote with a failing intent sync -> {r:?}");

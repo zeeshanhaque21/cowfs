@@ -56,7 +56,7 @@ fn leftovers(dir: &std::path::Path, c: &Core) -> Vec<String> {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("swap-")),
+            .filter(|n| n.starts_with("swap-") || n.starts_with("tmp-swap-")),
     );
     v
 }
@@ -223,7 +223,7 @@ fn raw_leftovers(dir: &std::path::Path, c: &Core) -> Vec<String> {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("swap-")),
+            .filter(|n| n.starts_with("swap-") || n.starts_with("tmp-swap-")),
     );
     v
 }
@@ -488,5 +488,10 @@ fn an_older_temp_file_is_dropped_on_open() {
     let c = Core::open(dir.path(), test_opts()).unwrap();
     assert!(!stale.exists());
     assert_eq!(content(&c, "base", "f"), "kept");
+    drop(c);
+    // a crash before the rename leaves the new-style temp, which open removes too
+    std::fs::write(dir.path().join("tmp-swap-base"), "x").unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
     c.check().unwrap();
 }
