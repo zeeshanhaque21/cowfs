@@ -20,7 +20,9 @@ Issue 88 forbids fault APIs in the public control surface.
 It is switched on for `cargo test` by a self dev-dependency in `crates/cowfs-store/Cargo.toml`.
 Under that feature `crates/cowfs-store/src/fsio.rs` counts every durability boundary (write, sync, dir sync, rename, truncate) and exits the process with status 77 when `C7D_EXIT_BOUNDARY_N`, `C7D_EXIT_SYNC_N` or `C7D_EXIT_FILE` plus `C7D_EXIT_LEN` match.
 Tests in `crates/cowfs-store/tests/compact.rs`, `round4.rs` and `round5.rs` drive it by re-executing the test binary as a child.
-`oplog_start`, `oplog_marker` and `oplog_take` record writes and fsyncs per thread, and `tests/crash.rs` rebuilds a disk image that drops unsynced writes.
+`oplog_start`, `oplog_marker` and `oplog_take` record writes and fsyncs per thread.
+The oplog (the thread-local `LOG` and those three functions) is itself compiled only with `fault-injection`; a normal build keeps a no-op `log_data` and the `LogOp` enum type it names, but no log, no recording entry points and no per-write allocation (ops are built lazily).
+`tests/crash.rs` uses it and `tests/crash.rs` rebuilds a disk image that drops unsynced writes.
 `crates/cowfs-gc/tests/kill9.rs` shows the child-process pattern for the collector, and `crates/cowfs-gc/tests/crash.rs` builds a crash image at each compaction step by driving the store API by hand.
 None of these crashes the real `Gc::collect` cycle with real reclamation.
 
@@ -42,7 +44,8 @@ No release profile or `[features] default` enables it.
 Constraint from issue 88:
 
 - Nothing is added to the control protocol, daemon, CLI or any public type.
-- Cost when disabled is zero, because the code is compiled out by `cfg(feature)`.
+- Cost when disabled is zero, because the seam and the oplog (`LOG`, `oplog_start`, `oplog_take`, `oplog_marker`) are compiled out by `cfg(feature)`.
+  The `LogOp` enum is not gated, but it is only a type: nothing constructs it when the feature is off.
 - `scripts/check-fault-seam-absent.sh`, run as a CI step, builds the library crates in a separate target dir without the feature.
   It fails if `cowfs-daemon`'s feature graph enables the feature, or if the rlib contains the seam's env key `C7D_EXIT_BOUNDARY_N`.
   It then rebuilds with the feature as a positive control and fails if the key is not found, so the check cannot be blind.
