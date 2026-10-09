@@ -248,13 +248,13 @@ fn a_source_that_changes_under_the_import_is_a_mismatch_not_a_success() {
     fs::write(src.join("b"), b"world").unwrap();
     // Change `a` after both files have been read, so the source is a different tree by the time the
     // imported snapshot is read back and compared with it.
-    let seen = std::cell::Cell::new(0u32);
+    // The count of the source reports a total of 0 and is before any read, so it is skipped.
+    let changed = std::cell::Cell::new(false);
     let mut hooks = Hooks {
-        progress: &mut |_, _| {
-            if seen.get() == 1 {
+        progress: &mut |done, total| {
+            if total > 0 && done == total && !changed.replace(true) {
                 fs::write(src.join("a"), b"hello, world").unwrap();
             }
-            seen.set(seen.get() + 1);
             true
         },
     };
