@@ -1,13 +1,21 @@
-[profile.default]
-# No retries: a test that passes only on a second try is a flake to fix, not to hide.
-retries = 0
-
 [profile.ci]
 fail-fast = false
 failure-output = "immediate-final"
 
-# cowfs-ctl tests measure shutdown windows and grace periods against wall-clock bounds
-# (issues 77, 121, 128, 166). Each runs alone on the runner so another test's load cannot eat the margin.
+# Retries stay at nextest's default of 0: a test that passes only on a second try is a flake to fix.
+
+# Wall-clock sensitive tests run alone on the runner, so another test's load cannot eat their margin.
+# cowfs-ctl measures shutdown windows and grace periods (issues 77, 121, 128, 166). The treehouse
+# acceptance binary runs a nested `cargo test -p cowfs-ctl --test admission`. The gc test is the
+# collect-versus-snapshot-removal race of issue 164.
 [[profile.default.overrides]]
-filter = 'package(cowfs-ctl)'
+filter = 'package(cowfs-ctl) | binary(real_project_acceptance) | test(writers_and_collects_at_once_lose_nothing)'
 threads-required = "num-cpus"
+
+# These measure descriptor and memory limits of the whole machine, so they must not overlap.
+[test-groups]
+machine-limits = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(resource_bounds)'
+test-group = "machine-limits"

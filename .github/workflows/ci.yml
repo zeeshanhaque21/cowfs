@@ -26,16 +26,7 @@ jobs:
           save-if: false
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  bench:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Bench harness unit tests
+      - name: Bench harness unit tests (ubuntu)
         run: python3 -m unittest discover -s bench -v
 
   # The 170 test binaries ran one after another in a single job (about 740 s of the 780 s test
@@ -46,12 +37,11 @@ jobs:
       fail-fast: false
       matrix:
         # macOS runners are scarce (a handful run at once across every open PR). Three macOS shards
-        # waited up to 480 s for a runner in the first run, so macOS stays one nextest job and only
-        # ubuntu is sharded.
+        # waited up to 480 s for a runner in the first run, so macOS stays one nextest job (and carries
+        # the macOS bench unit tests), and only ubuntu is sharded.
         include:
-          - { os: ubuntu-latest, shard: 1, of: 3 }
-          - { os: ubuntu-latest, shard: 2, of: 3 }
-          - { os: ubuntu-latest, shard: 3, of: 3 }
+          - { os: ubuntu-latest, shard: 1, of: 2 }
+          - { os: ubuntu-latest, shard: 2, of: 2 }
           - { os: macos-latest, shard: 1, of: 1 }
     runs-on: ${{ matrix.os }}
     steps:
@@ -71,18 +61,20 @@ jobs:
       - name: Doctests
         if: ${{ matrix.shard == 1 }}
         run: cargo test --doc --workspace
+      - name: Bench harness unit tests (macos)
+        if: ${{ matrix.os == 'macos-latest' }}
+        run: python3 -m unittest discover -s bench -v
 
-  # One name to require: fails unless lint, bench and every test shard passed.
+  # One name to require: fails unless lint and every test shard passed.
   check:
-    needs: [lint, bench, test]
+    needs: [lint, test]
     # Not always(): a superseded PR run is cancelled, and must not start a check that then fails.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - run: |
-          echo "lint=${{ needs.lint.result }} bench=${{ needs.bench.result }} test=${{ needs.test.result }}"
+          echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }}"
           test "${{ needs.lint.result }}" = success
-          test "${{ needs.bench.result }}" = success
           test "${{ needs.test.result }}" = success
 
   linux-fuse:
