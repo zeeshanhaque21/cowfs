@@ -184,6 +184,7 @@ impl Vfs for PathVfs {
                 FileKind::Directory => return Err(Error::IsDir),
                 FileKind::Symlink => return Err(Error::InvalidArgument),
                 FileKind::Regular => {}
+                k if k.is_special() => return Err(Error::InvalidArgument),
                 _ => return Err(Error::NotSupported),
             }
         }
@@ -194,7 +195,12 @@ impl Vfs for PathVfs {
             let (a, m) = (time_spec(changes.atime), time_spec(changes.mtime));
             match s.locate(ino)? {
                 Loc::Named(dir, name) => sys::utimensat(dir.as_fd(), &name, a, m),
-                Loc::Fd(o) => sys::utimens_fd(o.file.as_fd(), a, m, kind == FileKind::Symlink),
+                Loc::Fd(o) => sys::utimens_fd(
+                    o.file.as_fd(),
+                    a,
+                    m,
+                    kind == FileKind::Symlink || kind.is_special(),
+                ),
             }
             .map_err(io_err)?;
         }
@@ -202,6 +208,18 @@ impl Vfs for PathVfs {
             let mode = mode & MODE_MASK;
             // Through a descriptor opened without following symlinks: a path based chmod could
             // land on whatever was swapped into that name.
+            if kind.is_special() {
+                // An O_PATH descriptor cannot be fchmod'ed: go by name, or by /proc/self/fd.
+                match s.locate(ino)? {
+                    Loc::Named(dir, name) => sys::fchmodat(dir.as_fd(), &name, mode),
+                    #[cfg(target_os = "linux")]
+                    Loc::Fd(o) => sys::chmod_fd(o.file.as_fd(), mode),
+                    #[cfg(not(target_os = "linux"))]
+                    Loc::Fd(_) => Err(std::io::Error::from_raw_os_error(libc::ENOTSUP)),
+                }
+                .map_err(io_err)?;
+                return s.attr(ino);
+            }
             let o = s.open_kind(ino)?;
             sys::fchmod(o.file.as_fd(), mode).map_err(io_err)?;
             if mode & 0o200 != 0 {
@@ -252,6 +270,41 @@ impl Vfs for PathVfs {
         let st = sys::fstat(open.file.as_fd()).map_err(io_err)?;
         let ino = s.register(parent, &dir.file, name, &st)?;
         s.remember(ino, open);
+        s.add_ref(ino);
+        s.attr_of(ino, &st)
+    }
+
+    fn mknod(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<Attr> {
+        validate_name(name)?;
+        if !kind.is_special() || (rdev != 0 && !kind.is_device()) {
+            return Err(Error::InvalidArgument);
+        }
+        let ty = match kind {
+            FileKind::Fifo => sys::S_IFIFO,
+            FileKind::Socket => sys::S_IFSOCK,
+            FileKind::CharDevice => sys::S_IFCHR,
+            _ => sys::S_IFBLK,
+        };
+        let host = if kind.is_device() {
+            sys::cowfs_to_host(rdev)
+        } else {
+            0
+        };
+        let mut s = self.lock();
+        let dir = s.dir_fd(parent)?;
+        s.invalidate(parent);
+        sys::mknodat(dir.file.as_fd(), name, ty | 0o600, host).map_err(io_err)?;
+        // Set the mode explicitly: the creation mode is filtered by the umask.
+        sys::fchmodat(dir.file.as_fd(), name, mode & MODE_MASK).map_err(io_err)?;
+        let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
+        let ino = s.register(parent, &dir.file, name, &st)?;
         s.add_ref(ino);
         s.attr_of(ino, &st)
     }
@@ -431,6 +484,7 @@ impl Vfs for PathVfs {
                 FileKind::Directory => return Err(Error::IsDir),
                 FileKind::Symlink => return Err(Error::InvalidArgument),
                 FileKind::Regular => {}
+                k if k.is_special() => return Err(Error::InvalidArgument),
                 _ => return Err(Error::NotSupported),
             }
             s.open_fd(ino)?.file
@@ -462,6 +516,7 @@ impl Vfs for PathVfs {
                 FileKind::Directory => return Err(Error::IsDir),
                 FileKind::Symlink => return Err(Error::InvalidArgument),
                 FileKind::Regular => {}
+                k if k.is_special() => return Err(Error::InvalidArgument),
                 _ => return Err(Error::NotSupported),
             }
             s.open_rw(ino)?.file
@@ -514,7 +569,9 @@ impl Vfs for PathVfs {
     fn fsync(&self, ino: Ino, data_only: bool) -> Result<()> {
         let open = {
             let mut s = self.lock();
-            if s.node(ino)?.kind == FileKind::Symlink {
+            let kind = s.node(ino)?.kind;
+            // An O_PATH descriptor cannot be synced, and a symlink or special node has no data.
+            if kind == FileKind::Symlink || kind.is_special() {
                 return Ok(());
             }
             s.open_fd(ino)?

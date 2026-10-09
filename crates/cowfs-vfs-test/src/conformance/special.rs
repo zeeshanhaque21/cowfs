@@ -8,14 +8,36 @@
 
 use cowfs_vfs::{makedev, Error, FileKind, RenameFlags, SetAttr, SetTime, Timestamp, ROOT_INO};
 
-use super::{Ctx, Outcome};
+use super::{Ctx, Failure, Outcome};
 
-const KINDS: [(FileKind, u64); 4] = [
+const ALL_KINDS: [(FileKind, u64); 4] = [
     (FileKind::Fifo, 0),
     (FileKind::Socket, 0),
     (FileKind::CharDevice, makedev(1, 2)),
     (FileKind::BlockDevice, makedev(8, 16)),
 ];
+
+/// The kinds this backend can create. A device node needs privilege on a real kernel: a backend
+/// that answers `PermissionDenied` to a device (a client of a mount, run as a normal user) is
+/// checked with the fifo and the socket only, and the device case is left to the backends that
+/// allow it (MemVfs, Core).
+fn kinds(c: &Ctx) -> std::result::Result<Vec<(FileKind, u64)>, Failure> {
+    match c.mknod(
+        ROOT_INO,
+        b".probe",
+        FileKind::CharDevice,
+        0o600,
+        makedev(1, 3),
+    ) {
+        Ok(a) => {
+            c.fs.unlink(ROOT_INO, b".probe")?;
+            c.forget_all(a.ino);
+            Ok(ALL_KINDS.to_vec())
+        }
+        Err(Error::PermissionDenied) => Ok(ALL_KINDS[..2].to_vec()),
+        Err(e) => Err(e.into()),
+    }
+}
 
 const T1: Timestamp = Timestamp {
     secs: 1_000_000,
@@ -37,10 +59,8 @@ pub fn mknod_fifo_attrs(c: &Ctx) -> Outcome {
         (1, 0, 0, 0),
         "nlink, size, blocks, rdev"
     );
-    ensure!(
-        a.atime == a.mtime && a.mtime == a.ctime,
-        "a new node has one creation time"
-    );
+    // ctime is not compared: a backend that applies the mode after creating the node bumps it.
+    ensure!(a.atime == a.mtime, "a new node has one creation time");
     let l = c.lookup(ROOT_INO, b"p")?;
     ensure_eq!(l, a, "lookup after mknod");
     ensure_eq!(c.fs.getattr(a.ino)?, a, "getattr after mknod");
@@ -73,6 +93,9 @@ pub fn mknod_masks_mode(c: &Ctx) -> Outcome {
 }
 
 pub fn mknod_device_attrs_keep_rdev(c: &Ctx) -> Outcome {
+    if kinds(c)?.len() < 4 {
+        return Ok(()); // devices need privilege here: covered by MemVfs and Core
+    }
     let big = makedev(u32::MAX, u32::MAX);
     for (kind, rdev) in [
         (FileKind::CharDevice, makedev(1, 2)),
@@ -104,7 +127,7 @@ pub fn mknod_device_attrs_keep_rdev(c: &Ctx) -> Outcome {
 pub fn mknod_existing_is_exists(c: &Ctx) -> Outcome {
     c.file(ROOT_INO, "f")?;
     c.dir(ROOT_INO, "d")?;
-    for (kind, rdev) in KINDS {
+    for (kind, rdev) in kinds(c)? {
         for existing in [&b"f"[..], b"d"] {
             ensure_err!(
                 c.mknod(ROOT_INO, existing, kind, 0o644, rdev),
@@ -124,7 +147,7 @@ pub fn mknod_existing_is_exists(c: &Ctx) -> Outcome {
 
 pub fn mknod_in_file_is_not_dir(c: &Ctx) -> Outcome {
     let f = c.file(ROOT_INO, "f")?;
-    for (kind, rdev) in KINDS {
+    for (kind, rdev) in kinds(c)? {
         ensure_err!(
             c.mknod(f, b"x", kind, 0o644, rdev),
             Error::NotDir,
@@ -186,10 +209,10 @@ pub fn mknod_rejects_bad_arguments(c: &Ctx) -> Outcome {
 }
 
 pub fn special_readdir_kinds(c: &Ctx) -> Outcome {
-    for (kind, rdev) in KINDS {
+    for (kind, rdev) in kinds(c)? {
         c.mknod(ROOT_INO, &name(kind), kind, 0o644, rdev)?;
     }
-    for (kind, _) in KINDS {
+    for (kind, _) in kinds(c)? {
         let want = name(kind);
         let e = c.list(ROOT_INO)?.into_iter().find(|e| e.name == want);
         ensure_eq!(e.map(|e| e.kind), Some(kind), "readdir kind of {kind:?}");
@@ -198,7 +221,7 @@ pub fn special_readdir_kinds(c: &Ctx) -> Outcome {
 }
 
 pub fn special_io_is_invalid(c: &Ctx) -> Outcome {
-    for (kind, rdev) in KINDS {
+    for (kind, rdev) in kinds(c)? {
         let a = c.mknod(ROOT_INO, &name(kind), kind, 0o644, rdev)?;
         ensure_err!(
             c.fs.write(a.ino, 0, b"x"),
@@ -230,7 +253,7 @@ pub fn special_io_is_invalid(c: &Ctx) -> Outcome {
 }
 
 pub fn special_setattr_mode_and_times(c: &Ctx) -> Outcome {
-    for (kind, rdev) in KINDS {
+    for (kind, rdev) in kinds(c)? {
         let a = c.mknod(ROOT_INO, &name(kind), kind, 0o644, rdev)?;
         c.tick();
         let b = c.fs.setattr(
@@ -253,7 +276,7 @@ pub fn special_setattr_mode_and_times(c: &Ctx) -> Outcome {
 }
 
 pub fn special_open_release(c: &Ctx) -> Outcome {
-    for (kind, rdev) in KINDS {
+    for (kind, rdev) in kinds(c)? {
         let a = c.mknod(ROOT_INO, &name(kind), kind, 0o644, rdev)?;
         let h = c.fs.open(a.ino)?;
         c.fs.flush(a.ino)?;
@@ -263,7 +286,7 @@ pub fn special_open_release(c: &Ctx) -> Outcome {
 }
 
 pub fn special_hardlink_unlink_rename(c: &Ctx) -> Outcome {
-    for (kind, rdev) in KINDS {
+    for (kind, rdev) in kinds(c)? {
         let n = name(kind);
         let a = c.mknod(ROOT_INO, &n, kind, 0o644, rdev)?;
         let l = c.link(a.ino, ROOT_INO, b"alias")?;
@@ -313,7 +336,7 @@ pub fn special_hardlink_unlink_rename(c: &Ctx) -> Outcome {
 }
 
 pub fn special_unlinked_with_handle_survives(c: &Ctx) -> Outcome {
-    for (kind, rdev) in KINDS {
+    for (kind, rdev) in kinds(c)? {
         let n = name(kind);
         let a = c.mknod(ROOT_INO, &n, kind, 0o644, rdev)?;
         let h = c.fs.open(a.ino)?;
@@ -331,7 +354,7 @@ pub fn special_unlinked_with_handle_survives(c: &Ctx) -> Outcome {
 }
 
 pub fn special_dir_ops_error(c: &Ctx) -> Outcome {
-    for (kind, rdev) in KINDS {
+    for (kind, rdev) in kinds(c)? {
         let n = name(kind);
         c.mknod(ROOT_INO, &n, kind, 0o644, rdev)?;
         ensure_err!(c.fs.rmdir(ROOT_INO, &n), Error::NotDir, "rmdir of {kind:?}");

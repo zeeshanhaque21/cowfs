@@ -209,13 +209,13 @@ jobs:
           assert report and int(report[0]) + int(report[2]) + int(report[3]) + int(report[4]) == len(checks), (
               f"Conformance report does not account for all {len(checks)} checks: {report}"
           )
-          # Skips are an explicit list; the fallocate checks must never be among them.
+          # Skips are an explicit list; the fallocate and the special-file checks must never be among them.
           skipped = set(re.findall(r"^SKIP\s+\S+\s+\S+\s+(\w+)", log, re.MULTILINE))
           expected_skips = {
               "concurrent_readers_and_writers_of_one_file",
               "statfs_free_after_unlink",
               "hardlink_limit_reports_too_many_links",
-          } | {name for module, name in (c[:2] for c in checks) if module == "special"}
+          }
           assert skipped == expected_skips, f"Skipped checks differ: extra {sorted(skipped - expected_skips)}, missing {sorted(expected_skips - skipped)}"
           assert "SKIP: /dev/fuse" not in log, "FUSE tests skipped"
           assert not unexpected, "Unexpected conformance failures:\n" + "\n".join(unexpected)

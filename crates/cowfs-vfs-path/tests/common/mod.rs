@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use cowfs_vfs::Vfs;
 use cowfs_vfs_path::{force_remove_dir_all, PathVfs};
-use cowfs_vfs_test::conformance::{all_checks, run_all, Options};
+use cowfs_vfs_test::conformance::{run_all, Options};
 
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
@@ -60,10 +60,16 @@ pub fn run_suite(base: &Path) {
         // nothing about the filesystem.
         opts.timeout = std::time::Duration::from_secs(300).into();
     }
-    // PathVfs models the host file system and does not implement `mknod`.
-    for c in all_checks().iter().filter(|c| c.category == "special") {
-        opts.skip
-            .push((c.name.into(), "PathVfs does not implement mknod".into()));
+    // macOS has no `mknodat`, so PathVfs::mknod is Linux only.
+    #[cfg(not(target_os = "linux"))]
+    for c in cowfs_vfs_test::conformance::all_checks()
+        .iter()
+        .filter(|c| c.category == "special")
+    {
+        opts.skip.push((
+            c.name.into(),
+            "PathVfs::mknod needs mknodat, which only Linux has".into(),
+        ));
     }
     let report = run_all(&factory, &opts);
     println!("{}", report.table());
