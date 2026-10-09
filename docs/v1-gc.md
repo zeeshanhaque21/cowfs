@@ -174,10 +174,14 @@ A cycle is these steps.
    When the walked root differs from the listed key, the listed key is left unwalked so the entries
    that still resolve to it are walked themselves.
    The persisted `mark.bin` carries a format version (`MAGIC_MARKS`).
-   The current version is `COWMARK3`, which records one block list per walked root; `COWMARK2` and
-   `COWMARK1` stored a flat block list, which cannot say whose blocks a removed snapshot had, and
+   The current version is `COWMARK4`: `COWMARK3`'s per-root block lists plus a trailing 32 byte BLAKE3
+   hash of every byte before it.
+   `COWMARK3` had no hash, so a same-length corruption (bit rot, a zeroed span) parsed as a valid but
+   different set and a later cycle could free live blocks (issue 288).
+   `COWMARK2` and `COWMARK1` stored a flat block list, which cannot say whose blocks a removed snapshot had, and
    `COWMARK1` could also record a listed root key beside a different, newly committed root's blocks.
-   Neither older file is trusted: it loads as empty and every root is walked in full.
+   No older file is trusted, and neither is a file whose hash does not match: it loads as empty and every root is walked in full.
+   `atime.bin` is only an ordering hint and never decides what is freed, so it carries no hash.
    `docs/gc-root-mark-retention.md` has the format and the recording rules.
    The cache is derived data, so discarding it costs one walk and deletes no user block or snapshot.
 3. **Choose candidates, no barrier.** For every pack, one scan counts its live and dead record

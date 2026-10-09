@@ -34,9 +34,10 @@ The correction is narrow and keeps the algorithm:
 Inside one cycle that is the safe direction.
 Across cycles it is not: a removed snapshot's blocks stay in the list and the surviving roots' records keep naming them, so a per-request collector that trusts the file finds nothing dead and reclaims nothing (issue 82).
 
-`COWMARK3` stores one block list per walked root, and only a walk that started with an empty marker is recorded, because a walk sharing `cowfs-meta`'s node marker with an earlier root yields a delta rather than that root's complete reachable set.
+`COWMARK4` stores one block list per walked root, and only a walk that started with an empty marker is recorded, because a walk sharing `cowfs-meta`'s node marker with an earlier root yields a delta rather than that root's complete reachable set.
 A root reached only as a delta is walked again next cycle.
-`COWMARK1` and `COWMARK2` are both rejected, since neither carries a per-root association and neither can be reconstructed into one.
+`COWMARK4` ends in a BLAKE3 hash and a file that does not match it is discarded.
+`COWMARK1`, `COWMARK2` and the unhashed `COWMARK3` are rejected, since the first two carry no per-root association and cannot be reconstructed into one.
 
 `docs/gc-root-mark-retention.md` is the format, the two recording rules, what makes a record unusable, and the regressions over the real core.
 

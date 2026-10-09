@@ -312,6 +312,7 @@ dependencies = [
 name = "cowfs-gc"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "cowfs-core",
  "cowfs-meta",
  "cowfs-store",
