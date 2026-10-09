@@ -33,6 +33,21 @@ pub struct Limits {
     pub reply_cache_entries: usize,
     /// Age after which a remembered call is forgotten.
     pub reply_cache_age: Duration,
+    /// Longest a NFS handler may run. A handler past it is cancelled and its xid answered with
+    /// NFS3ERR_JUKEBOX, so a hard-mounted client retries instead of waiting for a reply that never
+    /// comes. Keep it below `reply_cache_age`, so the call is cancelled before its cache entry can
+    /// expire and let the retransmission run beside it (`set_limits` asserts this).
+    ///
+    /// HAZARD, non-idempotent procs (REMOVE, RENAME, CREATE, MKDIR, SETATTR, LINK, ...): the
+    /// watchdog drops the handler future, but a file system that runs the work on a blocking
+    /// thread (`CowNfs::run` uses `spawn_blocking`) keeps going. A cancelled call is not cached,
+    /// so the client's retry re-executes it: if the original has since finished, the retry sees
+    /// the change already applied and can return NOENT/EXIST although the operation succeeded
+    /// (rename, remove); if the original is still blocked, two copies of the mutation are in
+    /// flight. The reply cache's exactly-once guarantee therefore does not hold past this
+    /// timeout. Holding the entry InProgress until the blocking task ends would need the join
+    /// handle surfaced through `NFSFileSystem`, which is deliberately not done here.
+    pub handler_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -45,6 +60,7 @@ impl Default for Limits {
             max_frame: 1024 * 1024 + 64 * 1024,
             reply_cache_entries: 4096,
             reply_cache_age: Duration::from_secs(60),
+            handler_timeout: Duration::from_secs(45),
         }
     }
 }
@@ -204,6 +220,12 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
 }
 
 fn reply_cache(limits: &Limits) -> Arc<ReplyCache> {
+    assert!(
+        limits.handler_timeout < limits.reply_cache_age,
+        "Limits::handler_timeout ({:?}) must be below reply_cache_age ({:?})",
+        limits.handler_timeout,
+        limits.reply_cache_age
+    );
     Arc::new(ReplyCache::new(
         limits.reply_cache_entries,
         limits.reply_cache_entries.saturating_mul(4096),
@@ -265,6 +287,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 local,
                 export_name: self.export_name.clone(),
                 reply_cache: self.reply_cache.clone(),
+                handler_timeout: self.limits.handler_timeout,
                 active,
                 served,
             };
