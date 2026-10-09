@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""MEASUREMENT #21: git soak (gc, repack -adf, fsck --full, verify-pack, byte identity) on an ~800 MiB repo
+through the Core-backed FUSE mount on Linux. Usage: soak.py MINUTES"""
+import hashlib, json, os, random, shutil, subprocess, sys, threading, time
+from pathlib import Path
+
+W = Path("/mnt/docs/Projects/cowfs-8-21"); B = W / "target/release"; SOCK = W / "sock/s.sock"
+SRC = W / "omni"; LOG = W / "results/soak.jsonl"
+GITENV = {**os.environ, "GIT_AUTHOR_NAME": "s", "GIT_AUTHOR_EMAIL": "s@s", "GIT_COMMITTER_NAME": "s",
+          "GIT_COMMITTER_EMAIL": "s@s", "GIT_CONFIG_NOSYSTEM": "1", "HOME": str(W / "githome")}
+(W / "githome").mkdir(exist_ok=True)
+fails = []
+
+def rec(**kw):
+    kw["t"] = time.strftime("%H:%M:%S"); kw["load1"] = open("/proc/loadavg").read().split()[0]
+    with open(LOG, "a") as f: f.write(json.dumps(kw) + "\n"); f.flush()
+
+def run(argv, cwd=None, tag=None, timeout=3600):
+    t = time.perf_counter()
+    p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=GITENV, timeout=timeout)
+    rec(step=tag or " ".join(map(str, argv))[:80], rc=p.returncode, s=round(time.perf_counter() - t, 2),
+        err=p.stderr[-300:] if p.returncode else "")
+    return p
+
+def ctl(*a): return subprocess.run([str(B / "cowfs"), "--socket", str(SOCK), "--json", *a], capture_output=True, text=True, timeout=3600)
+
+def manifest(root: Path):
+    m = {}
+    for dp, dn, fn in os.walk(root):
+        if ".git" in dn: dn.remove(".git")
+        dn[:] = [d for d in dn if d != ".soak-scratch"]
+        for f in fn:
+            p = Path(dp) / f
+            if p.is_symlink(): m[str(p.relative_to(root))] = "L:" + os.readlink(p); continue
+            h = hashlib.sha256()
+            with open(p, "rb") as fh:
+                for c in iter(lambda: fh.read(1 << 20), b""): h.update(c)
+            m[str(p.relative_to(root))] = h.hexdigest()
+    return m
+
+def zero_runs(path):
+    runs = 0; prev = False; z = b"\0" * 4096
+    with open(path, "rb") as f:
+        while (c := f.read(1 << 20)):
+            for i in range(0, len(c) - 4095, 4096):
+                cur = c[i:i + 4096] == z
+                runs += cur and not prev; prev = cur
+    return runs
+
+def git_checks(repo: Path, label):
+    ok = True
+    p = run(["git", "fsck", "--full", "--no-progress"], repo, f"{label}:fsck")
+    ok &= p.returncode == 0
+    packdir = repo / ".git/objects/pack"
+    for idx in sorted(packdir.glob("*.idx")):
+        v = run(["git", "verify-pack", str(idx)], repo, f"{label}:verify-pack {idx.name[:14]}")
+        ok &= v.returncode == 0
+        z = zero_runs(idx)  # an idx with long all-zero 4 KiB pages is the original symptom
+        rec(step=f"{label}:zero4k-pages-idx", file=idx.name, zero_page_runs=z)
+        # a legit idx of a big repo has no 4 KiB all-zero page; fan-out table is dense
+        if z: ok = False
+    for pk in sorted(packdir.glob("*.pack")):
+        z = zero_runs(pk); rec(step=f"{label}:zero4k-pages-pack", file=pk.name, zero_page_runs=z)
+    if not ok: fails.append(label)
+    return ok
+
+class Scratch(threading.Thread):
+    """Concurrent write/read churn in an untracked dir while git runs (parallel WRITEs, read-only-mode files)."""
+    def __init__(self, d): super().__init__(daemon=True); self.d = d; self.stop = False; self.n = 0; self.bad = 0
+    def run(self):
+        self.d.mkdir(exist_ok=True); rnd = random.Random(7)
+        while not self.stop:
+            f = self.d / f"c{rnd.randrange(300)}"
+            data = rnd.randbytes(rnd.choice([100, 5000, 70000, 1 << 20]))
+            try:
+                if f.exists(): os.chmod(f, 0o644); f.unlink() if rnd.random() < .3 else None
+                with open(f, "wb") as fh: fh.write(data)
+                os.chmod(f, rnd.choice([0o444, 0o400, 0o644]))
+                if f.read_bytes() != data: self.bad += 1
+                self.n += 1
+            except OSError as e: self.bad += 1; rec(step="scratch-error", err=str(e))
+
+def main(minutes):
+    LOG.write_text(""); t_end = time.time() + minutes * 60
+    store = W / "store-soak"; mnt = W / "mnt-soak"; shutil.rmtree(store, ignore_errors=True); store.mkdir(); mnt.mkdir(exist_ok=True)
+    def start():
+        p = subprocess.Popen([str(B / "cowfs-daemon"), "--store", str(store), "--mount", str(mnt), "--socket", str(SOCK),
+                              "--backend", "core"], stdout=open(W / "logs/daemon-soak.log", "a"), stderr=subprocess.STDOUT)
+        for _ in range(100):
+            if ctl("status").returncode == 0: return p
+            time.sleep(.2)
+        raise SystemExit("daemon failed")
+    d = start(); rec(step="daemon.start", pid=d.pid)
+    # positive control: harness must flag a zeroed idx (native copy, never the mount)
+    nat = W / "native-ctl"; shutil.rmtree(nat, ignore_errors=True)
+    run(["git", "clone", "-q", "--no-local", str(SRC), str(nat)], tag="ctl:clone")
+    run(["git", "repack", "-adf"], nat, "ctl:repack")
+    idx = next((nat / ".git/objects/pack").glob("*.idx")); ok_before = git_checks(nat, "ctl-clean")
+    os.chmod(idx, 0o644)
+    with open(idx, "r+b") as f: f.seek(180224); f.write(b"\0" * 8192)
+    fails.clear(); ok_corrupt = git_checks(nat, "ctl-zeroed-idx"); fails.clear()
+    rec(step="positive-control", clean_ok=ok_before, zeroed_idx_detected=not ok_corrupt)
+    shutil.rmtree(nat)
+    assert ok_before and not ok_corrupt, "harness control failed"
+    t = time.perf_counter(); imp = ctl("import", str(SRC), "--name", "soak"); rec(step="import", rc=imp.returncode, s=round(time.perf_counter() - t, 1), out=imp.stdout[-500:])
+    assert imp.returncode == 0 and '"verified":true' in imp.stdout.replace(" ", "")
+    repo = mnt / "soak"
+    t = time.perf_counter(); src_m = manifest(SRC); rec(step="manifest.src", files=len(src_m), s=round(time.perf_counter() - t, 1))
+    orig = run(["git", "rev-parse", "HEAD"], repo, "head").stdout.strip(); branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo).stdout.strip()
+    head_src = subprocess.run(["git", "rev-parse", "HEAD"], cwd=SRC, capture_output=True, text=True).stdout.strip()
+    assert orig == head_src
+    git_checks(repo, "c0")
+    # untracked churn dir must not be hashed by `git add -A` while being truncated (a native git SIGBUSes on that too)
+    with open(repo / ".git/info/exclude", "a") as f: f.write(".soak-scratch/\n")
+    sc = Scratch(repo / ".soak-scratch"); sc.start()
+    rnd = random.Random(42); files = [k for k in src_m if not k.startswith(".soak")]
+    cycle = 0
+    while time.time() < t_end:
+        cycle += 1; c = f"c{cycle}"
+        # mixed workload on a topic branch: modify, add, commit, then return to the original tree
+        run(["git", "checkout", "-q", "-b", f"t{cycle}"], repo, f"{c}:branch")
+        for k in rnd.sample(files, 300):
+            with open(repo / k, "ab") as f: f.write(b"\n#soak %d\n" % cycle)
+        (repo / f"new{cycle}.bin").write_bytes(rnd.randbytes(3 << 20))
+        run(["git", "add", "-A"], repo, f"{c}:add"); run(["git", "commit", "-q", "-m", f"c{cycle}"], repo, f"{c}:commit")
+        run(["git", "status", "--porcelain"], repo, f"{c}:status")
+        run(["git", "checkout", "-q", branch], repo, f"{c}:checkout-back")
+        op = cycle % 3
+        if op == 1: run(["git", "gc", "--quiet"], repo, f"{c}:gc")
+        elif op == 2: run(["git", "repack", "-adf"], repo, f"{c}:repack-adf")
+        else: run(["git", "gc", "--aggressive", "--prune=now", "--quiet"], repo, f"{c}:gc-aggressive")
+        git_checks(repo, c)
+        run(["git", "branch", "-q", "-D", f"t{cycle}"], repo, f"{c}:branch-del")
+        t = time.perf_counter(); m = manifest(repo)
+        diff = [k for k in set(src_m) | set(m) if src_m.get(k) != m.get(k) and not k.startswith("new") and not k.startswith(".soak")]
+        rec(step=f"{c}:byte-identity", files=len(m), mismatches=len(diff), sample=diff[:5], s=round(time.perf_counter() - t, 1))
+        if diff: fails.append(f"{c}:identity")
+        if cycle % 3 == 0:
+            f = ctl("fsck"); rec(step=f"{c}:cowfs-fsck", rc=f.returncode, out=f.stdout[-300:])
+            if f.returncode: fails.append(f"{c}:cowfs-fsck")
+        rec(step=f"{c}:scratch", ops=sc.n, bad=sc.bad)
+        if sc.bad: fails.append(f"{c}:scratch")
+    sc.stop = True; sc.join(30)
+    # reopen through a fresh daemon
+    ctl("shutdown"); d.wait(120); d = start(); rec(step="daemon.restart")
+    f = ctl("fsck"); rec(step="final:cowfs-fsck", rc=f.returncode, out=f.stdout[-300:])
+    if f.returncode: fails.append("final:cowfs-fsck")
+    git_checks(repo, "final")
+    m = manifest(repo); diff = [k for k in set(src_m) | set(m) if src_m.get(k) != m.get(k) and not k.startswith("new") and not k.startswith(".soak")]
+    rec(step="final:byte-identity", mismatches=len(diff), sample=diff[:5])
+    if diff: fails.append("final:identity")
+    rec(step="SUMMARY", cycles=cycle, fails=fails, scratch_ops=sc.n, scratch_bad=sc.bad)
+    ctl("shutdown"); d.wait(120)
+    print("SOAK DONE cycles", cycle, "fails", fails)
+
+if __name__ == "__main__": main(float(sys.argv[1]))

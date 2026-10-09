@@ -1,0 +1,220 @@
+{
+ "host_load_start": "11.24",
+ "cp_a_native_to_mount_s": 2.1890574879944324,
+ "cp_rc": 0,
+ "baseA_cp_hardlinked": 18,
+ "native_hardlinked": 18,
+ "baseA_cp_inplace_rebuild": {
+  "s": 0.08397273399168625,
+  "rc": 0,
+  "compiling": 0,
+  "fresh": 34,
+  "tail": [
+   "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s"
+  ]
+ },
+ "baseB_clean_build": {
+  "s": 11.308780396007933,
+  "rc": 0,
+  "compiling": 34,
+  "fresh": 0,
+  "tail": [
+   "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.29s"
+  ]
+ },
+ "baseB_hardlinked": 18,
+ "baseB_inodes": 516,
+ "baseB_inplace_rebuild": {
+  "s": 0.07326464995276183,
+  "rc": 0,
+  "compiling": 0,
+  "fresh": 34,
+  "tail": [
+   "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+  ]
+ },
+ "raw": [
+  {
+   "rep": 0,
+   "load": "12.62",
+   "A_hardlinked": 18,
+   "A": {
+    "s": 0.06602554197888821,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   },
+   "B_hardlinked": 18,
+   "B": {
+    "s": 0.06888105097459629,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   }
+  },
+  {
+   "rep": 1,
+   "load": "12.62",
+   "A_hardlinked": 18,
+   "A": {
+    "s": 0.0735644269734621,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   },
+   "B_hardlinked": 18,
+   "B": {
+    "s": 0.07558021502336487,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   }
+  },
+  {
+   "rep": 2,
+   "load": "12.62",
+   "A_hardlinked": 18,
+   "A": {
+    "s": 0.06917765800608322,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   },
+   "B_hardlinked": 18,
+   "B": {
+    "s": 0.06086431100266054,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   }
+  },
+  {
+   "rep": 3,
+   "load": "12.41",
+   "A_hardlinked": 18,
+   "A": {
+    "s": 0.07190180401084945,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   },
+   "B_hardlinked": 18,
+   "B": {
+    "s": 0.0675050449790433,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   }
+  },
+  {
+   "rep": 4,
+   "load": "12.41",
+   "A_hardlinked": 18,
+   "A": {
+    "s": 0.0635023019858636,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   },
+   "B_hardlinked": 18,
+   "B": {
+    "s": 0.05871244898298755,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   }
+  }
+ ],
+ "arms": {
+  "A_snapshot_create": {
+   "n": 5,
+   "median": 0.007022423029411584,
+   "min": 0.006119691010098904,
+   "max": 0.03237792197614908,
+   "stdev": 0.011516502249222035
+  },
+  "A_build": {
+   "n": 5,
+   "median": 0.06917765800608322,
+   "min": 0.0635023019858636,
+   "max": 0.0735644269734621,
+   "stdev": 0.0041297972466894
+  },
+  "B_snapshot_create": {
+   "n": 5,
+   "median": 0.006695532007142901,
+   "min": 0.006499373994302005,
+   "max": 0.11485080496640876,
+   "stdev": 0.04839312295290721
+  },
+  "B_build": {
+   "n": 5,
+   "median": 0.0675050449790433,
+   "min": 0.05871244898298755,
+   "max": 0.07558021502336487,
+   "stdev": 0.006733379959293626
+  }
+ },
+ "arms_raw": {
+  "A_snapshot_create": [
+   0.03237792197614908,
+   0.006119691010098904,
+   0.007022423029411584,
+   0.007173952006269246,
+   0.006270334008149803
+  ],
+  "A_build": [
+   0.06602554197888821,
+   0.0735644269734621,
+   0.06917765800608322,
+   0.07190180401084945,
+   0.0635023019858636
+  ],
+  "B_snapshot_create": [
+   0.11485080496640876,
+   0.006499373994302005,
+   0.006824996031355113,
+   0.006695532007142901,
+   0.00654360098997131
+  ],
+  "B_build": [
+   0.06888105097459629,
+   0.07558021502336487,
+   0.06086431100266054,
+   0.0675050449790433,
+   0.05871244898298755
+  ]
+ },
+ "fsck_rc": 0,
+ "host_load_end": "12.41"
+}
