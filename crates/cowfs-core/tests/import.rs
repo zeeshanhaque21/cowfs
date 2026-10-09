@@ -354,7 +354,7 @@ fn keeps_the_modification_time_of_every_node_to_the_nanosecond() {
     let want = fs::symlink_metadata(src.join("link")).unwrap();
     assert_eq!(
         mtime(link.ino),
-        (want.mtime() as u64, want.mtime_nsec() as u32)
+        (want.mtime(), want.mtime_nsec() as u32)
     );
 }
 
