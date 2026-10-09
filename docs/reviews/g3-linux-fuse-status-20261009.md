@@ -144,7 +144,7 @@ Scratch stays in `/mnt/docs/Projects/cowfs-g3-linux` (source clone, build, runs,
 
 ## Code change
 
-PR on branch `fix/g3-linux-mount-parse` (commit `db7b961`): Linux mount-table parsing in `bench/pjdfstest.py` plus the `LinuxMountTable` test.
+PR #241, branch `fix/g3-linux-mount-parse` (commit `db7b961`): Linux mount-table parsing in `bench/pjdfstest.py` plus the `LinuxMountTable` test.
 On the Mac, the same 113 tests pass and the live macOS mount table (16 lines) parses identically under the old and new `mount_entries`.
 
 ## Verdict for g3, Linux arm
