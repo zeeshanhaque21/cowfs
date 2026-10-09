@@ -80,6 +80,8 @@ M = [
     ("M2 discard unlinks the pack before the watermark is raised", "compact.rs", move_wm_after_unlink, None),
     ("N1 finish_compaction skips the new pack's fsync", "compact.rs", "            g.io.sync_file(target, &path)?;\n            g.io.sync_dir(&pack::pack_dir(g.dir))?;", "            g.io.sync_dir(&pack::pack_dir(g.dir))?;"),
     ("D1 discard skips the packs directory fsync after the unlink", "compact.rs", "        if let Err(e) = g.io.sync_dir(&pack::pack_dir(g.dir)) {\n            out.durability_error = Some(e.into());\n            return Ok(out);\n        }\n", ""),
+    ("E7 discard skips its leading sync", "compact.rs", "-> Result<Discarded> {\n        self.sync()?;\n", "-> Result<Discarded> {\n"),
+    ("E8 acknowledge_corruption skips the directory fsync after dropping index.cix", "store.rs", "            self.io.remove_file(&self.index_path())?;\n            self.io.sync_dir(&self.dir)?;\n", "            self.io.remove_file(&self.index_path())?;\n"),
 ]
 
 only = sys.argv[1:]

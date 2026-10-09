@@ -91,7 +91,8 @@ fn dirsync_dir(dir: &str) -> &'static str {
     }
 }
 
-/// Disk state if power fails while op `k` is in flight.
+/// Disk state if power fails while op `k` is in flight. `k == ops.len()` is the cut after the last
+/// op returned: every op completed, nothing was in flight.
 ///
 /// Model: fsynced file data survives; unsynced writes survive in any subset and may tear at 512 B or
 /// 4 KiB sectors (`mode` 0 and 1), whole (2) or as a prefix (3). A created or unlinked file keeps its
@@ -99,8 +100,8 @@ fn dirsync_dir(dir: &str) -> &'static str {
 /// `Whole` write (temporary file, fsync, rename, directory fsync) is atomic.
 pub fn crash_image(base: &Image, ops: &[LogOp], k: usize, rng: &mut Rng, mode: u64) -> Image {
     let mut img = base.clone();
-    let k = k.min(ops.len().saturating_sub(1));
-    let upto = if ops.is_empty() { 0 } else { k + 1 };
+    let k = k.min(ops.len());
+    let upto = (k + 1).min(ops.len());
     let name_of = |op: &LogOp| -> Option<String> {
         match op {
             LogOp::Write { file, .. }
