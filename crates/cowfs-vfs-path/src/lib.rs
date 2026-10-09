@@ -63,6 +63,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use cowfs_vfs::FallocMode;
 use cowfs_vfs::{
     validate_name, Attr, DirEntryPlus, Error, FileHandle, FileKind, Ino, ReadDir, ReadDirPlus,
     RenameFlags, Result, SetAttr, SetTime, StatFs, Vfs, XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
@@ -471,6 +472,39 @@ impl Vfs for PathVfs {
         }
         file.write_all_at(data, offset).map_err(io_err)?;
         Ok(len)
+    }
+
+    fn fallocate(&self, ino: Ino, mode: FallocMode, offset: u64, len: u64) -> Result<Attr> {
+        // the kernel's mode bits: KEEP_SIZE 1, PUNCH_HOLE 2, ZERO_RANGE 0x10
+        let bits = match mode {
+            FallocMode::Allocate => 0,
+            FallocMode::KeepSize => 0x01,
+            FallocMode::PunchHole => 0x02 | 0x01,
+            FallocMode::ZeroRange => 0x10,
+            FallocMode::ZeroRangeKeepSize => 0x10 | 0x01,
+            _ => return Err(Error::NotSupported),
+        };
+        let file = {
+            let mut s = self.lock();
+            match s.node(ino)?.kind {
+                FileKind::Directory => return Err(Error::IsDir),
+                FileKind::Regular => {}
+                _ => return Err(Error::InvalidArgument),
+            }
+            s.open_rw(ino)?.file
+        };
+        if len == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // the syscall takes signed offsets: anything that does not fit is past the largest file
+        let (Ok(off), Ok(n)) = (i64::try_from(offset), i64::try_from(len)) else {
+            return Err(Error::FileTooBig);
+        };
+        if off.checked_add(n).is_none() {
+            return Err(Error::FileTooBig);
+        }
+        sys::fallocate(file.as_fd(), bits, off, n).map_err(io_err)?;
+        self.lock().attr(ino)
     }
 
     fn flush(&self, ino: Ino) -> Result<()> {

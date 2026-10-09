@@ -817,3 +817,47 @@ fn read_above_the_cap_is_not_mistaken_for_the_end_of_the_file() {
     v.write(a.ino, 0, &data).expect("write");
     assert_eq!(v.read(a.ino, 0, 4 << 20).expect("read").len(), data.len());
 }
+
+/// The mode bits reach the kernel: punch and zero-range zero the range and keep the size, a range
+/// the signed syscall cannot hold is `FileTooBig`, and a directory is `IsDir`. Skips where the
+/// scratch filesystem does not support the modes.
+#[test]
+#[cfg(target_os = "linux")]
+fn fallocate_modes_reach_the_kernel() {
+    use cowfs_vfs::FallocMode;
+    let (_s, v) = fs();
+    let f = v.create(ROOT_INO, b"f", 0o644).unwrap().ino;
+    v.write(f, 0, &[7u8; 20_000]).unwrap();
+    match v.fallocate(f, FallocMode::PunchHole, 4096, 8192) {
+        Err(Error::NotSupported) => {
+            eprintln!("SKIP: the scratch filesystem does not support fallocate modes");
+            return;
+        }
+        r => assert_eq!(r.unwrap().size, 20_000),
+    }
+    assert_eq!(v.read(f, 4000, 200).unwrap()[..96], [7u8; 96]);
+    assert_eq!(v.read(f, 4096, 8192).unwrap(), vec![0u8; 8192]);
+    let a = v.fallocate(f, FallocMode::ZeroRange, 19_000, 3000).unwrap();
+    assert_eq!(a.size, 22_000);
+    assert_eq!(v.read(f, 19_000, 3000).unwrap(), vec![0u8; 3000]);
+    let a = v
+        .fallocate(f, FallocMode::ZeroRangeKeepSize, 0, 100)
+        .unwrap();
+    assert_eq!(a.size, 22_000);
+    assert_eq!(
+        v.fallocate(f, FallocMode::Allocate, 0, 0).unwrap_err(),
+        Error::InvalidArgument
+    );
+    for (off, len) in [(u64::MAX, 2), (1, u64::MAX), (1 << 63, 1)] {
+        assert_eq!(
+            v.fallocate(f, FallocMode::KeepSize, off, len).unwrap_err(),
+            Error::FileTooBig,
+            "{off}+{len}"
+        );
+    }
+    assert_eq!(
+        v.fallocate(ROOT_INO, FallocMode::KeepSize, 0, 1)
+            .unwrap_err(),
+        Error::IsDir
+    );
+}
