@@ -127,7 +127,7 @@ fn replay_lossless(base: &Image, ops: &[LogOp]) -> Image {
     let mut img = base.clone();
     for op in ops {
         match op {
-            LogOp::Create { file } => {
+            LogOp::Create { file } if !file.ends_with(".tmp") => {
                 img.entry(file.clone()).or_default();
             }
             LogOp::Write { file, off, data } => {
@@ -149,7 +149,10 @@ fn replay_lossless(base: &Image, ops: &[LogOp]) -> Image {
             LogOp::Unlink { file } => {
                 img.remove(file);
             }
-            LogOp::Sync { .. } | LogOp::DirSync { .. } | LogOp::Marker(_) => {}
+            LogOp::Create { .. }
+            | LogOp::Sync { .. }
+            | LogOp::DirSync { .. }
+            | LogOp::Marker(_) => {}
         }
     }
     img
