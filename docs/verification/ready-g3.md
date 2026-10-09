@@ -541,6 +541,20 @@ That is the mechanism a failure would have to travel. Whether it is the mechanis
 is unproven: the failure itself was not preserved, so #125 asks for it to be captured before a fix is
 proposed, and this lane proposes none.
 
+## Update 2026-10-09: rerun after #110, #109 and PR157
+
+Full 238-case rerun at head `a93a736`, run `20261009T003926Z`, harness verdict FAIL exit 1.
+Established regressions 77, unchanged: `mkfifo/00.t` 22, `mknod/00.t` 22, `unlink/00.t` 30, `open/17.t` 3.
+Ordinal worse 699 (686 outside privilege), better 141, against 700, 687 and 855 before.
+The 714 `chown` and `lchown` better rows are gone (#110).
+`rmdir/12.t` #4 no longer diverges (#109 first symptom).
+Remaining E bucket is 14 rows: 13 fifo-loop rows and `unlink/14.t` #4 (macOS NFS silly-rename).
+One worse-than-native case outside #107, #108 and the silly-rename case: `ftruncate/12.t` and `truncate/12.t` #2.
+A truncate to 999999999999999 bytes answers ENOSPC (inferred from the 4 TiB `MAX_FILE` in `cowfs-core`), the script accepts EFBIG, EINVAL or 0.
+The earlier timestamp-order hypothesis for these two is withdrawn.
+Gate g3 stays open: Linux arm unmeasured, 8116 assertions unpairable.
+Detail: `docs/reviews/g3-status-20261009.md`.
+
 ## Remaining scope
 
 - **The Linux FUSE arm is UNMEASURABLE.** `moonscape` has `/dev/fuse` and `fusermount3`, so the arm
