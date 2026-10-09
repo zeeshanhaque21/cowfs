@@ -686,6 +686,31 @@ impl Conn {
         (&self.stream).write_all(&frame.encode()).is_ok()
     }
 
+    /// Sends a progress frame of request `id`, unless its terminal frame was already claimed.
+    ///
+    /// `finish` removes the id before it queues the terminal write, and this checks under the same
+    /// write lock the terminal write needs, so a progress frame is either written ahead of the
+    /// terminal frame or refused: nothing follows a terminal frame. A refusal does not kill the
+    /// connection, other requests share it; the handler sees `cancelled` and stops.
+    fn send_progress(&self, id: u64, event: ProgressEvent) -> bool {
+        if self.dead.load(Ordering::SeqCst) {
+            return false;
+        }
+        let wrote = {
+            let _guard = lock(&self.write_lock);
+            if !lock(&self.inflight).contains_key(&id) {
+                return false;
+            }
+            (&self.stream)
+                .write_all(&ServerFrame::Progress { id, event }.encode())
+                .is_ok()
+        };
+        if !wrote {
+            self.kill();
+        }
+        wrote
+    }
+
     fn send_error(&self, id: Option<u64>, error: CtlError) -> bool {
         self.send(&ServerFrame::Error { id, error })
     }
@@ -1093,9 +1118,7 @@ fn run_request(
     token: CancelToken,
     _slot: RequestSlot,
 ) {
-    let ctx = OpContext::new(token, |event| {
-        conn.send(&ServerFrame::Progress { id, event })
-    });
+    let ctx = OpContext::new(token, |event| conn.send_progress(id, event));
     let is_shutdown = matches!(request, Request::Shutdown(_));
     let result = catch_unwind(AssertUnwindSafe(|| {
         dispatch(handler, opts, shared, request, &ctx)
@@ -1366,5 +1389,37 @@ mod tests {
         let mut actual = Vec::new();
         client.read_to_end(&mut actual).unwrap();
         assert_eq!(actual, expected, "the terminal frame must reach the peer");
+    }
+
+    #[test]
+    fn no_progress_frame_follows_the_terminal_frame_of_its_request() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let conn = Conn::new(&server).unwrap();
+        lock(&conn.inflight).insert(1, CancelToken::new());
+        let terminal = ServerFrame::Error {
+            id: Some(1),
+            error: CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
+        };
+        conn.finish(1, &terminal);
+        // A handler that was not cancelled yet reports progress after another path ended its request.
+        let event = ProgressEvent {
+            phase: "mark".into(),
+            done: 1,
+            total: None,
+            unit: Unit::Items,
+            message: None,
+        };
+        assert!(
+            !conn.send_progress(1, event),
+            "progress for a finished request must be refused"
+        );
+        conn.kill();
+        let mut actual = Vec::new();
+        client.read_to_end(&mut actual).unwrap();
+        assert_eq!(
+            actual,
+            terminal.encode(),
+            "the terminal frame is the last frame of its id"
+        );
     }
 }
