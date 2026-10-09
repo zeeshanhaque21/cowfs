@@ -90,6 +90,12 @@ pub enum Fault {
     FallocZeroLenOk,
     /// `fallocate` punch and zero-range leave mtime and ctime alone.
     FallocNoTimes,
+    /// `mknod` forgets the device number.
+    MknodDropsRdev,
+    /// `read` of a special file succeeds with no bytes instead of `InvalidArgument`.
+    SpecialReadOk,
+    /// `mknod` leaves the parent's mtime and ctime alone.
+    MknodNoParentTimes,
 }
 
 impl Fault {
@@ -160,6 +166,9 @@ impl Fault {
         Fault::ZeroRangeNoExtend,
         Fault::FallocZeroLenOk,
         Fault::FallocNoTimes,
+        Fault::MknodDropsRdev,
+        Fault::SpecialReadOk,
+        Fault::MknodNoParentTimes,
     ];
 }
 
@@ -174,6 +183,7 @@ enum Body {
     File(Pages),
     Dir(Dir),
     Symlink { target: Vec<u8>, parent: Ino },
+    Special { kind: FileKind, rdev: u64 },
 }
 
 struct Node {
@@ -294,6 +304,7 @@ impl Node {
             Body::File(_) => FileKind::Regular,
             Body::Dir(_) => FileKind::Directory,
             Body::Symlink { .. } => FileKind::Symlink,
+            Body::Special { kind, .. } => kind,
         }
     }
 }
@@ -375,6 +386,11 @@ impl State {
                 },
                 0,
             ),
+            Body::Special { .. } => (0, 0),
+        };
+        let rdev = match n.body {
+            Body::Special { rdev, .. } => rdev,
+            _ => 0,
         };
         let nlink = if self.f(Fault::NoHardlinkNlink) && n.kind() == FileKind::Regular {
             n.nlink.min(1)
@@ -392,6 +408,7 @@ impl State {
             gid: 0,
             size,
             blocks,
+            rdev,
             atime: n.atime,
             mtime: n.mtime,
             ctime: n.ctime,

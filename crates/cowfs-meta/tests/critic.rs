@@ -554,6 +554,7 @@ fn try_digest(m: &Meta) -> Result<[u8; 32]> {
                             h.update(&s.readlink(e.ino)?);
                         }
                         FileType::Dir => work.push(e.ino),
+                        _ => {}
                     }
                 }
                 cookie = page.next_cookie;

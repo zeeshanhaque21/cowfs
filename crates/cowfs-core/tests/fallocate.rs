@@ -207,10 +207,12 @@ fn errors_leave_the_file_alone_and_past_the_maximum_is_an_error() {
             .unwrap_err(),
         Error::IsDir
     );
-    // the exact variant for a range past the largest file moves with write and setattr when
-    // FileTooBig lands; what is pinned here is that it is an error and nothing changes
+    // a range past the largest file is EFBIG, like write and setattr, and changes nothing
     for (off, len) in [(1u64 << 42, 1u64), (u64::MAX, 2), (1, u64::MAX)] {
-        assert!(v.fallocate(f, FallocMode::ZeroRange, off, len).is_err());
+        assert_eq!(
+            v.fallocate(f, FallocMode::ZeroRange, off, len).unwrap_err(),
+            Error::FileTooBig
+        );
     }
     assert_eq!(
         v.write(f, 1 << 42, b"x").unwrap_err(),

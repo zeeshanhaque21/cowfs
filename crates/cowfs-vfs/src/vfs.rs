@@ -1,8 +1,8 @@
 use crate::error::Result;
 use crate::types::FallocMode;
 use crate::types::{
-    Attr, DirEntryPlus, FileHandle, Ino, ReadDir, ReadDirPlus, RenameFlags, SetAttr, StatFs,
-    XattrFlags,
+    Attr, DirEntryPlus, FileHandle, FileKind, Ino, ReadDir, ReadDirPlus, RenameFlags, SetAttr,
+    StatFs, XattrFlags,
 };
 
 /// The POSIX-like filesystem a mount adapter serves. Operations are by inode number and
@@ -26,8 +26,9 @@ use crate::types::{
 /// ones on worker threads, so two independent calls can overlap.
 ///
 /// `ROOT_INO` may be a synthetic, read-only directory: mutating it returns `ReadOnly`, and a
-/// rename across two such subtrees returns `CrossDevice`. There are no special files
-/// (devices, fifos, sockets) and no permission enforcement: adapters check mode bits.
+/// rename across two such subtrees returns `CrossDevice`. Special files (fifos, sockets,
+/// devices) are names with attributes only (see `mknod`): the client opens and uses them.
+/// There is no permission enforcement: adapters check mode bits.
 /// Every name-taking operation validates names with `validate_name`.
 pub trait Vfs: Send + Sync {
     /// Attributes of the child `name` of directory `parent`. `Error::NotFound` if absent,
@@ -65,6 +66,25 @@ pub trait Vfs: Send + Sync {
     fn create(&self, parent: Ino, name: &[u8], mode: u32) -> Result<Attr>;
 
     fn mkdir(&self, parent: Ino, name: &[u8], mode: u32) -> Result<Attr>;
+
+    /// Creates a fifo, socket, character device or block device named `name` in `parent`.
+    /// `kind` must satisfy `FileKind::is_special`, else `Error::InvalidArgument`; `rdev` (see
+    /// `makedev`) must be `0` unless `kind.is_device()`, else `Error::InvalidArgument`. `mode` is
+    /// masked with `MODE_MASK`. Errors and effects otherwise match `create`: `nlink` 1, size 0,
+    /// the parent's mtime and ctime move. `read`, `write` and `setattr` with a size on the new
+    /// node are `Error::InvalidArgument`; `open`, hardlinks, `unlink`, `rename`, mode, times and
+    /// xattrs work as for a regular file. Whether the caller may create a device is the
+    /// adapter's decision, there are no credentials here. The default is `NotSupported`.
+    fn mknod(
+        &self,
+        _parent: Ino,
+        _name: &[u8],
+        _kind: FileKind,
+        _mode: u32,
+        _rdev: u64,
+    ) -> Result<Attr> {
+        Err(crate::Error::NotSupported)
+    }
 
     fn symlink(&self, parent: Ino, name: &[u8], target: &[u8]) -> Result<Attr>;
 

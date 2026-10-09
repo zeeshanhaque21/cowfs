@@ -66,7 +66,7 @@ impl Vfs for MemVfs {
                 FileKind::Symlink => return Err(Error::InvalidArgument),
                 FileKind::Regular if size > MAX_FILE => return Err(Error::FileTooBig),
                 FileKind::Regular => {}
-                _ => return Err(Error::NotSupported),
+                _ => return Err(Error::InvalidArgument),
             }
         }
         let t = st.now();
@@ -135,6 +135,31 @@ impl Vfs for MemVfs {
     fn mkdir(&self, parent: Ino, name: &[u8], mode: u32) -> Result<Attr> {
         self.lock()
             .new_entry(parent, name, Body::Dir(Dir::new(parent)), mode)
+    }
+
+    fn mknod(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<Attr> {
+        if !kind.is_special() || (rdev != 0 && !kind.is_device()) {
+            return Err(Error::InvalidArgument);
+        }
+        let mut st = self.lock();
+        let rdev = if st.f(Fault::MknodDropsRdev) { 0 } else { rdev };
+        let skip_times = st.f(Fault::MknodNoParentTimes);
+        let before = st.nodes.get(&parent).map(|n| (n.mtime, n.ctime));
+        let a = st.new_entry(parent, name, Body::Special { kind, rdev }, mode)?;
+        if let (true, Some((m, c))) = (skip_times, before) {
+            if let Some(n) = st.nodes.get_mut(&parent) {
+                n.mtime = m;
+                n.ctime = c;
+            }
+        }
+        Ok(a)
     }
 
     fn symlink(&self, parent: Ino, name: &[u8], target: &[u8]) -> Result<Attr> {
@@ -352,7 +377,8 @@ impl Vfs for MemVfs {
                 Ok(data)
             }
             Body::Dir(_) => Err(Error::IsDir),
-            Body::Symlink { .. } => Err(Error::InvalidArgument),
+            Body::Special { .. } if st.f(Fault::SpecialReadOk) => Ok(Vec::new()),
+            Body::Symlink { .. } | Body::Special { .. } => Err(Error::InvalidArgument),
         }
     }
 

@@ -154,7 +154,7 @@ The commit path (`inner.rs`) calls `tx.mknod` and retargets the dentry cache wit
 `inner::kind_of` maps the four new `FileType` values.
 `node.rs::report` reports `blocks` 0 for them (the existing wildcard arm already does).
 `io.rs` read, write and truncate return `InvalidArgument` for the new kinds, matching symlinks.
-`vfs_impl.rs` and `view.rs` forward `mknod`; the snapshot `view` rejects it with `ReadOnly` like the other creates.
+`vfs_impl.rs` and `view.rs` forward `mknod`; `SnapshotView::mknod` forwards to Core like `create` and `mkdir`, and `ReadOnly` comes from Core when the parent is the synthetic root.
 Reopening a store restores kind and `rdev` from the inode record.
 The `Create` queue (`queue.rs`, `Op::Create`) is in memory only; `swap.rs` persists snapshot names, not operations.
 So `Create::Special` is not an on-disk format.
@@ -183,11 +183,13 @@ Each one is decided here.
 | `cowfs-vfs-test` `MemVfs` | exhaustive `Body` enum | add a `Special` body |
 | `cowfs-ctl/src/treehash.rs` | `other` | keep (see Import) |
 
-Slice A also has to forward `mknod` in every `Vfs` wrapper.
+Slice A forwards `mknod` only in the wrappers that sit in front of a real backend and are used by the slice A suites: `SnapshotView` and the `Keep` macro in `cowfs-core/tests/conformance.rs`.
 The default `NotSupported` would otherwise make a wrapper silently refuse.
+The other wrappers keep the default `NotSupported` in slice A and forward in slice B (NFS test wrappers) and slice C (FUSE test wrappers).
 Wrappers found: `cowfs-core` `SnapshotView` (`view.rs`), the `Keep` macro in `cowfs-core/tests/conformance.rs`, `Watched` (`cowfs-nfs/tests/contract.rs`, `ns_durability.rs`), `ReusingVfs` and `CountingVfs` (`cowfs-nfs/tests/common`), `Probe` (`cowfs-fuse/tests/common/mod.rs`), the test doubles in `cowfs-fuse/src/dir.rs`, and `Bad` (`cowfs-vfs-test/tests/runner.rs`).
-Test doubles that never see a special create keep the default; wrappers that stand in front of a real backend forward.
-The daemon fault wrapper owned by the #173 builder is not edited here; forwarding `mknod` there is a follow-up in the report.
+Full list of non-forwarding wrappers for slices B to D: `Watched` (`cowfs-nfs/tests/contract.rs`, `ns_durability.rs`), `SharedBackend` (nfs and daemon `separate_adapter_namespace.rs`), `ReusingVfs`, `CountingVfs`, `WatchVfs` (`namespace_race.rs`), `Probe`, `Zeroed`, `Gappy`, `Never` (fuse), `Bad` (`cowfs-vfs-test/tests/runner.rs`), `GuardedView` (daemon test).
+Test doubles that never see a special create keep the default.
+The daemon `GuardedView` test wrapper is forwarded in slice D.
 
 ## Import (`cowfs-core::import`)
 
@@ -274,7 +276,7 @@ Conformance consumers found: `MemVfs` (`cowfs-vfs-test/tests/memvfs.rs`), Core (
 The FUSE conformance run skips them in slice A with the reason "FUSE mknod lands in slice C", and slice C removes that skip.
 `assert_skip_names` catches a misspelt name but not a missing entry, so each consumer is checked by running it.
 The model-based tests (`cowfs-core/tests/model.rs`, `cowfs-vfs-test/src/model.rs`) get a `mknod` action in slice D, after the adapters exist.
-`cowfs-core` adds reopen tests: kind and `rdev` survive a clean reopen and a crash replay, and a fork keeps them.
+`cowfs-core` adds reopen tests: kind and `rdev` survive a clean sync, drop and reopen, and a fork keeps them; a meta test injects a failing commit and shows the node and version 3 both stay off disk.
 `cowfs-meta` adds record tests: encode and decode round trip for each kind, length 94 only for devices, fsck rules.
 
 ## Slices

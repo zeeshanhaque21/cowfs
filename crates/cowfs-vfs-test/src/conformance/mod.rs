@@ -86,6 +86,7 @@ pub mod names;
 pub mod readdir;
 pub mod readonly_mode;
 pub mod rename;
+pub mod special;
 pub mod symlinks;
 pub mod xattrs;
 

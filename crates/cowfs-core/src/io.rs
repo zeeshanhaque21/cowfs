@@ -242,10 +242,10 @@ impl Inner {
         if let Some(e) = node.poisoned() {
             return Err(e);
         }
-        let now = Timestamp::now();
         // a punch stores chunks, so the gate is entered before the node lock is taken
         let entry = zero.then(|| self.gate.enter());
         let mut st = node.st.wr();
+        let now = Timestamp::now();
         let old = st.attr.size;
         if let Some(entry) = &entry {
             if off < end.min(old) {

@@ -38,6 +38,9 @@ pub struct Tx<'a> {
     /// Numbers already spent inside this one transaction, so a batch cannot create two inodes at
     /// the same reserved number.
     pub(crate) spent: &'a mut HashSet<Ino>,
+    /// Set when this transaction creates a special file, so the commit that persists it also
+    /// records the format version that only builds that know special files can open.
+    pub(crate) special: &'a mut bool,
     pub(crate) now: Timestamp,
 }
 
@@ -107,6 +110,7 @@ impl Tx<'_> {
             next_cookie: 1,
             covered: 0,
             cversion: 0,
+            rdev: 0,
         }
     }
 
@@ -205,6 +209,7 @@ impl Tx<'_> {
         kind: FileType,
         mode: u32,
         target: Option<&[u8]>,
+        rdev: u64,
     ) -> Result<Attr> {
         validate_name(name)?;
         read::dir_inode(self, dir)?;
@@ -221,6 +226,8 @@ impl Tx<'_> {
         }
         let ino = self.alloc()?;
         let mut rec = self.new_rec(kind, mode, dir);
+        rec.rdev = rdev;
+        *self.special |= kind.is_special();
         let delta = i64::from(kind == FileType::Dir);
         if let Some(t) = target {
             rec.size = t.len() as u64;
@@ -238,6 +245,7 @@ impl Tx<'_> {
     /// session's outstanding set, so a ticket from another store or a session that has closed is
     /// refused. The number is then spent once: the inode record must not already exist, and a second
     /// create at the same number in this transaction is refused.
+    #[allow(clippy::too_many_arguments)] // the one extra argument is the device number
     fn new_child_at(
         &mut self,
         dir: Ino,
@@ -245,6 +253,7 @@ impl Tx<'_> {
         kind: FileType,
         mode: u32,
         target: Option<&[u8]>,
+        rdev: u64,
         ticket: &ReservedIno,
     ) -> Result<Attr> {
         validate_name(name)?;
@@ -278,6 +287,8 @@ impl Tx<'_> {
             }
         }
         let mut rec = self.new_rec(kind, mode, dir);
+        rec.rdev = rdev;
+        *self.special |= kind.is_special();
         let delta = i64::from(kind == FileType::Dir);
         if let Some(t) = target {
             rec.size = t.len() as u64;
@@ -305,17 +316,31 @@ impl Tx<'_> {
 
     /// Creates an empty regular file.
     pub fn create(&mut self, dir: Ino, name: &[u8], mode: u32) -> Result<Attr> {
-        self.new_child(dir, name, FileType::File, mode, None)
+        self.new_child(dir, name, FileType::File, mode, None, 0)
     }
 
     /// Creates an empty directory.
     pub fn mkdir(&mut self, dir: Ino, name: &[u8], mode: u32) -> Result<Attr> {
-        self.new_child(dir, name, FileType::Dir, mode, None)
+        self.new_child(dir, name, FileType::Dir, mode, None, 0)
+    }
+
+    /// Creates a fifo, socket, character device or block device. `kind` must be one of those
+    /// four, and `rdev` must be `0` unless it is a device.
+    pub fn mknod(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        kind: FileType,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<Attr> {
+        check_mknod_args(kind, rdev)?;
+        self.new_child(dir, name, kind, mode, None, rdev)
     }
 
     /// Creates a symbolic link holding `target`.
     pub fn symlink(&mut self, dir: Ino, name: &[u8], target: &[u8]) -> Result<Attr> {
-        self.new_child(dir, name, FileType::Symlink, 0o777, Some(target))
+        self.new_child(dir, name, FileType::Symlink, 0o777, Some(target), 0)
     }
 
     /// Creates an empty regular file at a number taken from a reservation.
@@ -329,7 +354,7 @@ impl Tx<'_> {
         mode: u32,
         ticket: &ReservedIno,
     ) -> Result<Attr> {
-        self.new_child_at(dir, name, FileType::File, mode, None, ticket)
+        self.new_child_at(dir, name, FileType::File, mode, None, 0, ticket)
     }
 
     /// Creates an empty directory at a number taken from a reservation. See [`Tx::create_at`].
@@ -340,7 +365,7 @@ impl Tx<'_> {
         mode: u32,
         ticket: &ReservedIno,
     ) -> Result<Attr> {
-        self.new_child_at(dir, name, FileType::Dir, mode, None, ticket)
+        self.new_child_at(dir, name, FileType::Dir, mode, None, 0, ticket)
     }
 
     /// Creates a symbolic link holding `target`, at a number taken from a reservation. See
@@ -352,7 +377,21 @@ impl Tx<'_> {
         target: &[u8],
         ticket: &ReservedIno,
     ) -> Result<Attr> {
-        self.new_child_at(dir, name, FileType::Symlink, 0o777, Some(target), ticket)
+        self.new_child_at(dir, name, FileType::Symlink, 0o777, Some(target), 0, ticket)
+    }
+
+    /// [`Tx::mknod`] at a number taken from a reservation. See [`Tx::create_at`].
+    pub fn mknod_at(
+        &mut self,
+        dir: Ino,
+        name: &[u8],
+        kind: FileType,
+        mode: u32,
+        rdev: u64,
+        ticket: &ReservedIno,
+    ) -> Result<Attr> {
+        check_mknod_args(kind, rdev)?;
+        self.new_child_at(dir, name, kind, mode, None, rdev, ticket)
     }
 
     /// Adds another name for a file or symlink. Directories cannot be hardlinked.
@@ -504,6 +543,7 @@ impl Tx<'_> {
                 FileType::Dir => return Err(Error::IsDir),
                 FileType::Symlink => return Err(Error::Invalid("cannot resize a symlink")),
                 FileType::File => {}
+                _ => return Err(Error::Invalid("cannot resize a special file")),
             }
             if size != rec.size {
                 if size < rec.covered {
@@ -559,8 +599,8 @@ impl Tx<'_> {
         let rec = read::inode(self, ino)?;
         match rec.kind {
             FileType::Dir => Err(Error::IsDir),
-            FileType::Symlink => Err(Error::Invalid("not a regular file")),
             FileType::File => Ok(rec),
+            _ => Err(Error::Invalid("not a regular file")),
         }
     }
 
@@ -741,4 +781,14 @@ impl Tx<'_> {
 
 fn apply_delta(v: u32, d: i64) -> Result<u32> {
     u32::try_from(i64::from(v) + d).map_err(|_| Error::Invalid("link count out of range"))
+}
+
+fn check_mknod_args(kind: FileType, rdev: u64) -> Result<()> {
+    if !kind.is_special() {
+        return Err(Error::Invalid("mknod makes only special files"));
+    }
+    if rdev != 0 && !kind.is_device() {
+        return Err(Error::Invalid("only a device has a device number"));
+    }
+    Ok(())
 }

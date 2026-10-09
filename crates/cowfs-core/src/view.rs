@@ -2,7 +2,7 @@
 
 use cowfs_vfs::FallocMode;
 use cowfs_vfs::{
-    Attr, DirEntry, FileHandle, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, Vfs,
+    Attr, DirEntry, FileHandle, FileKind, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, Vfs,
     XattrFlags, ROOT_INO,
 };
 
@@ -76,6 +76,19 @@ impl Vfs for SnapshotView {
     fn mkdir(&self, parent: Ino, name: &[u8], mode: u32) -> Result<Attr> {
         self.core
             .mkdir(self.i(parent), name, mode)
+            .map(|a| self.attr(a))
+    }
+
+    fn mknod(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<Attr> {
+        self.core
+            .mknod(self.i(parent), name, kind, mode, rdev)
             .map(|a| self.attr(a))
     }
 

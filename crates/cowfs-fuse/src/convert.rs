@@ -325,6 +325,7 @@ mod tests {
             gid: 0,
             size: u64::MAX,
             blocks: u64::MAX,
+            rdev: 0,
             atime: t,
             mtime: t,
             ctime: t,

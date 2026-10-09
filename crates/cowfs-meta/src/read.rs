@@ -133,7 +133,7 @@ fn file_inode<R: Reader>(r: &R, ino: Ino) -> Result<InodeRec> {
     match rec.kind {
         FileType::File => Ok(rec),
         FileType::Dir => Err(Error::IsDir),
-        FileType::Symlink => Err(Error::Invalid("not a regular file")),
+        _ => Err(Error::Invalid("not a regular file")),
     }
 }
 

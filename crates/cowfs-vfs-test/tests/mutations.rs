@@ -41,6 +41,9 @@ const FAST: &[(Fault, &[&str])] = &[
         Fault::AllocateShrinks,
         &["fallocate_allocate_and_keep_size"],
     ),
+    (Fault::MknodDropsRdev, &["mknod_device_attrs_keep_rdev"]),
+    (Fault::SpecialReadOk, &["special_io_is_invalid"]),
+    (Fault::MknodNoParentTimes, &["mknod_fifo_attrs"]),
     (
         Fault::PunchChangesSize,
         &["fallocate_punch_reads_zeros_keeps_size"],

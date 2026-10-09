@@ -1037,6 +1037,7 @@ mod tests {
             gid: 0,
             size: 9,
             blocks: 1,
+            rdev: 0,
             atime: t,
             mtime: t,
             ctime: t,

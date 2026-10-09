@@ -45,7 +45,9 @@ macro_rules! forward {
 }
 
 use cowfs_vfs::FallocMode;
-use cowfs_vfs::{Attr, FileHandle, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, XattrFlags};
+use cowfs_vfs::{
+    Attr, FileHandle, FileKind, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, XattrFlags,
+};
 
 forward! {
     lookup(parent: Ino, name: &[u8]) -> Result<Attr>;
@@ -55,6 +57,7 @@ forward! {
     readlink(ino: Ino) -> Result<Vec<u8>>;
     create(parent: Ino, name: &[u8], mode: u32) -> Result<Attr>;
     mkdir(parent: Ino, name: &[u8], mode: u32) -> Result<Attr>;
+    mknod(parent: Ino, name: &[u8], kind: FileKind, mode: u32, rdev: u64) -> Result<Attr>;
     symlink(parent: Ino, name: &[u8], target: &[u8]) -> Result<Attr>;
     link(ino: Ino, new_parent: Ino, new_name: &[u8]) -> Result<Attr>;
     unlink(parent: Ino, name: &[u8]) -> Result<()>;
