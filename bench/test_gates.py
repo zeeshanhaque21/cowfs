@@ -595,7 +595,7 @@ class CompareRefuses(unittest.TestCase):
             rc, err, out = self.run_compare([old], old)
             self.assertEqual(rc, 3, out)
             self.assertIn("g2 rep", err)
-            new = self.write(d, "new.jsonl", [meta(), {**g2, "metrics": {"rebuilt_count": 5, "bins_relinked": 2}}])
+            new = self.write(d, "new.jsonl", [meta(), {**g2, "metrics": {"rebuilt_count": 127, "bins_relinked": 2}}])
             # Valid, but one 1 s rep is UNMEASURABLE (rc 2), not invalid (rc 3) and not a pass (issue #221).
             self.assertEqual(self.run_compare([new], new)[0], 2)
 
@@ -622,7 +622,7 @@ def artifact(name, kind="lib", fresh=False, exe=None):
 
 # What cargo reported for the g2 edits, measured with `cargo build --message-format=json` on a
 # scratch clone of the current pin: the original cookies.rs edit at the old pin (trivial), and
-# the cowfs-vfs/src/lib.rs edit at the current pin (13 units, 3 binaries). See
+# the cowfs-vfs/src/lib.rs `--tests` edit at the current pin (127 units, 3 binaries; the 13-unit shape was plain `cargo build`). See
 # docs/verification/g1-g2-readiness-20261009.md for the per-edit table.
 OLD_EDIT_OUT = "\n".join([artifact("cowfs_vfs", fresh=True), artifact("cowfs_vfs_path")])
 NEW_EDIT_OUT = "\n".join([
@@ -632,6 +632,7 @@ NEW_EDIT_OUT = "\n".join([
     artifact("cowfs-daemon", "bin", exe="/t/debug/cowfs-daemon"),
     artifact("cowfs-treehouse", "bin", exe="/t/debug/cowfs-treehouse"),
     artifact("cowfs", "bin", exe="/t/debug/cowfs"),
+    *[artifact(f"dep{i}") for i in range(gates.G2_EXPECTED_UNITS - 13)],
     json.dumps({"reason": "build-finished", "success": True}),
 ])
 
@@ -655,14 +656,14 @@ class G2RebuildValidity(unittest.TestCase):
 
     def test_new_edit_shape_is_accepted(self):
         units = gates.rebuilt_units(NEW_EDIT_OUT)
-        self.assertEqual(len(units), 13)
+        self.assertEqual(len(units), gates.G2_EXPECTED_UNITS)
         self.assertIsNone(gates.g2_rebuild_problem(units))
 
     def test_noop_and_missing_edited_crate_and_no_relink_are_each_refused(self):
         self.assertTrue(gates.g2_rebuild_problem(gates.rebuilt_units("")))
         no_edit = "\n".join([artifact("a"), artifact("b"), artifact("c", "bin", exe="/x")])
         self.assertIn(gates.EDIT_CRATE, gates.g2_rebuild_problem(gates.rebuilt_units(no_edit)))
-        no_bin = "\n".join([artifact(gates.EDIT_CRATE), artifact("b"), artifact("c")])
+        no_bin = "\n".join([artifact(gates.EDIT_CRATE), *[artifact(f"d{i}") for i in range(gates.G2_MIN_UNITS)]])
         self.assertIn("relink", gates.g2_rebuild_problem(gates.rebuilt_units(no_bin)))
 
     def test_build_scripts_and_garbage_lines_do_not_count(self):
@@ -756,7 +757,7 @@ class G2RebuildValidity(unittest.TestCase):
 
     def test_g2_records_the_rebuilt_units(self):
         m, _ = self.run_g2(NEW_EDIT_OUT)
-        self.assertEqual((m["rebuilt_count"], m["bins_relinked"]), (13, 3))
+        self.assertEqual((m["rebuilt_count"], m["bins_relinked"]), (127, 3))
         self.assertIn(gates.EDIT_CRATE, m["rebuilt_units"])
 
     def test_g2_refuses_the_trivial_workload_and_records_no_rep(self):
@@ -768,9 +769,13 @@ class G2RebuildValidity(unittest.TestCase):
         row = {"gate": "g2", "rep": 0, "metrics": {}}
         self.assertTrue(compare.g2_problem(row))
         self.assertTrue(compare.g2_problem({**row, "metrics": {"rebuilt_count": 1, "bins_relinked": 0}}))
-        self.assertIsNone(compare.g2_problem({**row, "metrics": {"rebuilt_count": 5, "bins_relinked": 2}}))
+        for n in (5, 100, gates.G2_MIN_UNITS - 1):  # issue #232: a partial rebuild is not the 127-unit workload
+            self.assertTrue(compare.g2_problem({**row, "metrics": {"rebuilt_count": n, "bins_relinked": 2}}), n)
+        for n in (gates.G2_MIN_UNITS, 127):
+            self.assertIsNone(compare.g2_problem({**row, "metrics": {"rebuilt_count": n, "bins_relinked": 2}}), n)
+        self.assertEqual((gates.G2_EXPECTED_UNITS, gates.G2_MIN_UNITS), (127, 115))
         self.assertTrue(compare.g2_problem({**row, "metrics": {"rebuilt_count": True, "bins_relinked": 1}}))
-        self.assertEqual(compare.G2_MIN_UNITS, gates.G2_MIN_UNITS)
+        self.assertFalse(hasattr(compare, "G2_MIN_UNITS"))  # one copy, gates.G2_MIN_UNITS
 
 
 if __name__ == "__main__":
