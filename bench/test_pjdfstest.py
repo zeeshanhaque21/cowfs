@@ -8,6 +8,7 @@ The pairing tests come first on purpose: an identity that survives a shifted, ad
 duplicated result is the property the whole gate rests on.
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -699,8 +700,130 @@ class SuiteInput(unittest.TestCase):
             native.mkdir()
             tests, receipt = p.suite_input_receipt(native, native, root, Path(tmp) / "run", Path(tmp) / "pjdfstest")
             self.assertEqual(receipt["pathconf"]["native"]["PC_PATH_MAX"]["value"], os.pathconf(native, "PC_PATH_MAX"))
-            self.assertEqual(receipt["injection"]["path_max"], os.pathconf(native, "PC_PATH_MAX"))
-            self.assertEqual(tests, Path(tmp) / "run" / "suite" / "tests")
+            # Both arms answer the same here, so there is nothing to supply and no overlay.
+            self.assertEqual((receipt["path_max_shape"], receipt["injection"]), ("equal", None))
+            self.assertEqual(tests, root)
+
+
+def pc(path_max, name_max=255, errno_=None):
+    answer = {"value": path_max}
+    if errno_:
+        answer["errno"] = errno_
+    return {"PC_PATH_MAX": answer, "PC_NAME_MAX": {"value": name_max}}
+
+
+NATIVE_PC = pc(1024)
+MACOS_PC = pc(None, errno_=errno.EINVAL)
+
+
+class PathMaxShape(unittest.TestCase):
+    """Issue 218 follow-up: the fallback and the verdict cover exactly the known macOS client case."""
+
+    def shape(self, cowfs, native=NATIVE_PC):
+        return p.path_max_shape({"native": native, "cowfs": cowfs})
+
+    def test_known_macos_client_limit(self):
+        self.assertEqual(self.shape(MACOS_PC), "client_limit")
+
+    def test_equal_answers(self):
+        self.assertEqual(self.shape(pc(1024)), "equal")
+
+    def test_every_other_shape_is_other(self):
+        for label, cowfs in (("EIO", pc(None, errno_=errno.EIO)), ("ENOENT", pc(None, errno_=errno.ENOENT)),
+                             ("ENOTSUP", pc(None, errno_=errno.ENOTSUP)), ("zero", pc(0)),
+                             ("wrong positive", pc(4096)),
+                             ("EINVAL but NAME_MAX differs", pc(None, 128, errno.EINVAL)),
+                             ("EINVAL but NAME_MAX fails", pc(None, None, errno.EINVAL)),
+                             ("EINVAL and a value", {**MACOS_PC, "PC_PATH_MAX": {"value": -1, "errno": errno.EINVAL}})):
+            self.assertEqual(self.shape(cowfs), "other", label)
+        self.assertEqual(self.shape(MACOS_PC, native=pc(None, errno_=errno.EINVAL)), "other")
+        self.assertEqual(p.path_max_shape({}), "other")
+
+    def test_receipt_supplies_only_in_the_known_case(self):
+        for cowfs, supplied in ((MACOS_PC, True), (pc(None, errno_=errno.EIO), False), (pc(0), False)):
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                    p, "pathconf_answer", side_effect=lambda path, name, c=cowfs: (
+                        (NATIVE_PC if "native" in str(path) else c)[name])):
+                root = Path(tmp) / "tests"
+                root.mkdir()
+                (root / "misc.sh").write_text(p.PATH_MAX_READ)
+                tests, receipt = p.suite_input_receipt(Path(tmp) / "native", Path(tmp) / "cowfs", root,
+                                                       Path(tmp) / "run", Path(tmp) / "pjdfstest")
+                self.assertEqual(receipt["injection"] is not None, supplied)
+                self.assertEqual(tests != root, supplied)
+
+    def reasons(self, cowfs, injected=True, tests=("chmod/03.t",)):
+        pathconf = {"native": NATIVE_PC, "cowfs": cowfs}
+        shape = p.path_max_shape(pathconf)
+        receipt = {"pathconf": pathconf, "path_max_shape": shape,
+                   "injection": {"path_max": 1024} if injected and shape == "client_limit" else None}
+        return p.suite_input_reasons(receipt, list(tests), None)
+
+    def test_known_case_and_equal_case_are_measurable(self):
+        self.assertEqual(self.reasons(MACOS_PC), [])
+        self.assertEqual(self.reasons(pc(1024)), [])
+
+    def test_other_shapes_are_unmeasurable_for_the_cases_that_read_path_max(self):
+        for cowfs in (pc(None, errno_=errno.EIO), pc(None, errno_=errno.ENOENT), pc(0), pc(4096)):
+            out = self.reasons(cowfs)
+            self.assertEqual([r["kind"] for r in out], [p.CAPABILITY], cowfs)
+            self.assertIn("chmod/03.t", out[0]["message"])
+
+    def test_a_known_case_receipt_without_an_injection_is_unmeasurable(self):
+        self.assertEqual([r["kind"] for r in self.reasons(MACOS_PC, injected=False)], [p.CAPABILITY])
+
+    def test_a_receipt_label_is_not_trusted(self):
+        pathconf = {"native": NATIVE_PC, "cowfs": pc(None, errno_=errno.EIO)}
+        receipt = {"pathconf": pathconf, "path_max_shape": "client_limit", "injection": {"path_max": 1024}}
+        self.assertEqual(len(p.suite_input_reasons(receipt, ["chmod/03.t"], None)), 1)
+
+    def test_scripts_that_never_read_path_max_are_not_affected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "a").mkdir()
+            (Path(tmp) / "a" / "01.t").write_text("expect 0 mkdir x 0755\n")
+            (Path(tmp) / "a" / "03.t").write_text("n=`dirgen_max`\n")
+            receipt = {"pathconf": {"native": NATIVE_PC, "cowfs": pc(0)}}
+            out = p.suite_input_reasons(receipt, ["a/01.t", "a/03.t"], Path(tmp))
+            self.assertIn("a/03.t", out[0]["message"])
+            self.assertNotIn("a/01.t", out[0]["message"])
+            self.assertEqual(p.suite_input_reasons(receipt, ["a/01.t"], Path(tmp)), [])
+
+    def test_no_suite_input_is_not_judged(self):
+        self.assertEqual(p.suite_input_reasons(None, ["chmod/03.t"], None), [])
+
+
+class PathMaxVerdict(VerdictStates):
+    """Through verdict(): an unusable PATH_MAX input is UNMEASURABLE, the known macOS case is PASS."""
+
+    def verdict_for(self, cowfs_pc):
+        pathconf = {"native": NATIVE_PC, "cowfs": cowfs_pc}
+        shape = p.path_max_shape(pathconf)
+        receipt = {"pathconf": pathconf, "path_max_shape": shape,
+                   "injection": {"path_max": 1024} if shape == "client_limit" else None}
+        cases = [case(True, n=i) for i in (1, 2, 3)]
+        with mock.patch.object(p, "reads_path_max", return_value=True):
+            tool, root = self.pinned_context()
+            with tempfile.TemporaryDirectory() as tmp:
+                run = Path(tmp)
+                lines = []
+                for arm in ("native", "cowfs"):
+                    r = record(arm, "open/17.t", cases)
+                    r.pop("synthetic")
+                    lines.append(json.dumps(r, sort_keys=True))
+                (run / "cases.jsonl").write_text("\n".join(lines) + "\n")
+                return p.verdict(run, tool, root, GOOD_IDENTITY, suite_input=receipt)
+
+    def test_known_macos_case_passes(self):
+        report = self.verdict_for(MACOS_PC)
+        self.assertEqual((report["state"], report["exit_status"]), (p.PASS, 0))
+
+    def test_equal_answers_pass(self):
+        self.assertEqual(self.verdict_for(pc(1024))["state"], p.PASS)
+
+    def test_other_answers_are_unmeasurable_never_pass(self):
+        for cowfs in (pc(None, errno_=errno.EIO), pc(None, errno_=errno.ENOENT), pc(0), pc(4096)):
+            report = self.verdict_for(cowfs)
+            self.assertEqual((report["state"], report["exit_status"]), (p.UNMEASURABLE, 2), cowfs)
 
 
 class TestList(unittest.TestCase):
