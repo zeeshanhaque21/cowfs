@@ -29,12 +29,13 @@ That is safe over-retention, not the separate mark-cache upgrade data-loss block
 
 ## The format
 
-`COWMARK3` stores one group per root:
+`COWMARK4` stores one group per root, then a BLAKE3 hash of every byte before it:
 
 ```
-COWMARK3 | u64 n_roots | ( root[32] | u64 n_blocks | block[32] * n_blocks ) * n_roots
+COWMARK4 | u64 n_roots | ( root[32] | u64 n_blocks | block[32] * n_blocks ) * n_roots | blake3[32]
 ```
 
+A hash mismatch (bit rot, a zeroed span, trailing garbage, a truncation) discards the file and every root is walked in full (issue 288).
 A block two roots share is written under both, so dropping one root keeps it live for the other.
 The file is still written whole through `mark.tmp`, fsynced and renamed, so a crash leaves the previous file or the new one and never a half-written mix.
 
