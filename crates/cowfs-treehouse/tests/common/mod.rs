@@ -61,6 +61,8 @@ pub enum TreehouseMissing {
     NotFound,
     /// Something is there but does not answer `--version`.
     Unusable(String),
+    /// Older than [`MIN_TREEHOUSE`], which first had `get --lease --json`.
+    TooOld(String),
 }
 
 impl std::fmt::Display for TreehouseMissing {
@@ -73,8 +75,21 @@ impl std::fmt::Display for TreehouseMissing {
             TreehouseMissing::Unusable(why) => {
                 write!(f, "treehouse is present but unusable: {why}")
             }
+            TreehouseMissing::TooOld(why) => f.write_str(why),
         }
     }
+}
+
+/// The oldest treehouse these tests can drive: 3.1.0 is the first with `get --lease --json`. An
+/// older binary fails 13 of the 15 sandbox tests with "unknown flag: --json".
+pub const MIN_TREEHOUSE: (u32, u32, u32) = (3, 1, 0);
+
+/// `major.minor.patch` out of `treehouse --version` output such as `v3.1.2`.
+pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    let core = text.trim().trim_start_matches('v');
+    let core = core.split(['-', '+', ' ']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
 }
 
 /// The real treehouse binary: `COWFS_TREEHOUSE_BIN`, then PATH, then `$HOME/.local/bin`.
@@ -102,21 +117,29 @@ pub fn find_treehouse() -> Result<PathBuf, TreehouseMissing> {
         if !candidate.is_file() {
             continue;
         }
-        let ok = Command::new(candidate)
+        let out = Command::new(candidate)
             .arg("--version")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if ok {
-            return Ok(candidate.clone());
-        }
-        // Present but cannot answer: keep looking, and report it if nothing better turns up.
-        return Err(TreehouseMissing::Unusable(format!(
-            "{} does not answer --version",
-            candidate.display()
-        )));
+            .output();
+        let Some(out) = out.ok().filter(|o| o.status.success()) else {
+            return Err(TreehouseMissing::Unusable(format!(
+                "{} does not answer --version",
+                candidate.display()
+            )));
+        };
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        return match parse_version(&text) {
+            Some(v) if v >= MIN_TREEHOUSE => Ok(candidate.clone()),
+            Some(_) | None => Err(TreehouseMissing::TooOld(format!(
+                "treehouse {text:?} at {} is older than {}.{}.{} (or its version is unreadable); \
+                 `get --lease --json` needs 3.1.0 or newer",
+                candidate.display(),
+                MIN_TREEHOUSE.0,
+                MIN_TREEHOUSE.1,
+                MIN_TREEHOUSE.2
+            ))),
+        };
     }
     Err(TreehouseMissing::NotFound)
 }

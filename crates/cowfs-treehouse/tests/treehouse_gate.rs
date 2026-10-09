@@ -20,6 +20,8 @@ fn probe_require_treehouse_with_no_treehouse() {
 fn run_probe(env: &[(&str, &str)]) -> (bool, String) {
     let home = tempfile::tempdir().expect("tempdir");
     let mut cmd = Command::new(std::env::current_exe().expect("current exe"));
+    // An empty PATH resolves a bare `treehouse` against the working directory, so it is an empty one.
+    cmd.current_dir(home.path());
     cmd.args([
         "--ignored",
         "--exact",
@@ -113,4 +115,56 @@ fn a_found_treehouse_is_returned_whether_or_not_it_is_required() {
             Some(bin.clone())
         );
     }
+}
+
+/// A treehouse that answers `--version` with `version`, in a directory of its own.
+fn fake_treehouse(version: &str) -> (tempfile::TempDir, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dir.path().join("treehouse");
+    std::fs::write(&bin, format!("#!/bin/sh\necho {version}\n")).expect("write");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = bin.display().to_string();
+    (dir, path)
+}
+
+#[test]
+fn a_treehouse_older_than_3_1_0_skips_on_a_developer_machine_and_fails_in_ci() {
+    for old in ["v2.0.0", "v3.0.9", "garbage"] {
+        let (_keep, bin) = fake_treehouse(old);
+        let (ok, text) = run_probe(&[("COWFS_TREEHOUSE_BIN", &bin)]);
+        assert!(
+            ok,
+            "{old}: an old treehouse must skip when optional:\n{text}"
+        );
+        assert!(text.contains("is older than 3.1.0"), "{old}: {text}");
+        assert!(!text.contains("PROBE-REACHED-BODY"), "{old}: {text}");
+        for gate in [("CI", "true"), ("COWFS_REQUIRE_TREEHOUSE", "1")] {
+            let (ok, text) = run_probe(&[("COWFS_TREEHOUSE_BIN", &bin), gate]);
+            assert!(
+                !ok,
+                "{old}: an old treehouse must fail with {gate:?}:\n{text}"
+            );
+            assert!(text.contains("is older than 3.1.0"), "{old}: {text}");
+            assert!(!text.contains("PROBE-REACHED-BODY"), "{old}: {text}");
+        }
+    }
+}
+
+#[test]
+fn a_treehouse_at_or_above_3_1_0_is_used() {
+    for good in ["v3.1.0", "v3.1.2", "v4.0.0"] {
+        let (_keep, bin) = fake_treehouse(good);
+        let (ok, text) = run_probe(&[("COWFS_TREEHOUSE_BIN", &bin), ("CI", "true")]);
+        assert!(ok, "{good} must be accepted:\n{text}");
+        assert!(text.contains("PROBE-REACHED-BODY"), "{good}: {text}");
+    }
+}
+
+#[test]
+fn versions_parse() {
+    assert_eq!(common::parse_version("v3.1.2"), Some((3, 1, 2)));
+    assert_eq!(common::parse_version("3.10.0\n"), Some((3, 10, 0)));
+    assert_eq!(common::parse_version("v2.0.0-rc1"), Some((2, 0, 0)));
+    assert_eq!(common::parse_version("nope"), None);
 }
