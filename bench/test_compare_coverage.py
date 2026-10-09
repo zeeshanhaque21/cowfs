@@ -19,6 +19,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
+sys.path.insert(0, str(HERE))
+import gates as gates_mod  # noqa: E402
+
 COMPARE = HERE / "compare.py"
 GATES = HERE / "gates.py"
 MIB = 1 << 20
@@ -26,7 +29,10 @@ GIB = 1 << 30
 ALL = ["g1", "g2", "g3", "g4", "g5", "g6"]
 
 
-def meta(gates, big_bytes=GIB, label="arm", scale=100):
+OLD_PIN = "c1619ec16df3a6b11dd5a1e08e8a512b4fedd240"
+
+
+def meta(gates, big_bytes=GIB, label="arm", scale=100, sha=None):
     row = {
         "kind": "meta",
         "label": label,
@@ -34,7 +40,7 @@ def meta(gates, big_bytes=GIB, label="arm", scale=100):
         "reps": 1,
         "gates": gates,
         "counts": {"big_bytes": big_bytes},
-        "corpus_sha": "c1619ec16df3a6b11dd5a1e08e8a512b4fedd240",
+        "corpus_sha": sha or gates_mod.DEFAULT_SHA,
         "cargo_home": "/private/cargo-home",
         "cargo_jobs": "4",
         "host": "unit-test",
@@ -225,7 +231,7 @@ class ScopedComparisonsPreserved(CliCase):
             # The native arm ran g3 but its meta records no gate list, so the report
             # may say the native arm has the data, never that it asked for it.
             nat = Path(d) / "n.jsonl"
-            nat.write_text(json.dumps({"kind": "meta", "counts": {"big_bytes": GIB}}) + "\n"
+            nat.write_text(json.dumps({"kind": "meta", "counts": {"big_bytes": GIB}, "corpus_sha": gates_mod.DEFAULT_SHA}) + "\n"
                            + json.dumps(rep("g1", 0, 8.0)) + "\n" + json.dumps(rep("g3", 0, 2.0)) + "\n")
             cow = self.arm(d, "c.jsonl", "cowfs1", ["g1", "g3"], [rep("g1", 0, 9.0)])
             rc, out, err = self.cli([str(nat)], cow)
@@ -241,7 +247,7 @@ class ScopedComparisonsPreserved(CliCase):
     def test_an_arm_with_no_gate_list_records_a_gap_with_nobody_named_as_asking(self):
         with tempfile.TemporaryDirectory() as d:
             nat = Path(d) / "n.jsonl"
-            nat.write_text(json.dumps({"kind": "meta", "counts": {"big_bytes": GIB}}) + "\n"
+            nat.write_text(json.dumps({"kind": "meta", "counts": {"big_bytes": GIB}, "corpus_sha": gates_mod.DEFAULT_SHA}) + "\n"
                            + json.dumps(rep("g1", 0, 8.0)) + "\n")
             cow = self.arm(d, "c.jsonl", "cowfs1", ["g1", "g3"], [rep("g1", 0, 9.0)])
             rc, out, err = self.cli([str(nat)], cow)
@@ -351,6 +357,44 @@ class RealHarnessOutput(CliCase):
             self.assertIn("cov80test-native1 requested it and recorded 1 reps", line)
             self.assertEqual(coverage_line(out)["compared"], ["g5"])
             self.assertIn("scope: compared 1 of 6 (g5)", out)
+
+
+class CorpusPin(CliCase):
+    """Data from another corpus pin is refused, never compared silently (the g1/g2 re-pin)."""
+
+    def arms(self, d, native_sha=None, cowfs_sha=None, drop_sha=False):
+        nat = self.arm(d, "n.jsonl", "nat", ["g1"], [rep("g1", 0, 8.0)], sha=native_sha)
+        cow = self.arm(d, "c.jsonl", "cow", ["g1"], [rep("g1", 0, 9.0)], sha=cowfs_sha)
+        if drop_sha:
+            rows = [json.loads(line) for line in Path(nat).read_text().splitlines()]
+            del rows[0]["corpus_sha"]
+            Path(nat).write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return nat, cow
+
+    def test_current_pin_on_both_arms_compares(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat, cow = self.arms(d)
+            rc, out, err = self.cli([nat], cow)
+            self.assertEqual(rc, 0, err)
+
+    def test_old_pin_is_invalid_in_either_arm_and_names_both_shas(self):
+        self.assertNotEqual(OLD_PIN, gates_mod.DEFAULT_SHA)
+        for kw in ({"native_sha": OLD_PIN}, {"cowfs_sha": OLD_PIN}, {"native_sha": OLD_PIN, "cowfs_sha": OLD_PIN}):
+            with self.subTest(kw=kw), tempfile.TemporaryDirectory() as d:
+                nat, cow = self.arms(d, **kw)
+                rc, out, err = self.cli([nat], cow)
+                self.assertEqual(rc, 3, out)
+                self.assertIn("INVALID", err)
+                self.assertIn(OLD_PIN, err)
+                self.assertIn(gates_mod.DEFAULT_SHA, err)
+                self.assertNotIn("RESULT: PASS", out)
+
+    def test_meta_without_a_corpus_sha_is_invalid(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat, cow = self.arms(d, drop_sha=True)
+            rc, out, err = self.cli([nat], cow)
+            self.assertEqual(rc, 3, out)
+            self.assertIn("corpus_sha", err)
 
 
 if __name__ == "__main__":

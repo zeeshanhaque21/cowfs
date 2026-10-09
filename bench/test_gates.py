@@ -3,6 +3,7 @@
 import contextlib
 import importlib.util
 import io
+import subprocess
 import json
 import os
 import sys
@@ -264,7 +265,7 @@ GIB = 1 << 30
 
 
 def meta(big=4 * MIB, **extra):
-    return {"kind": "meta", "counts": {"big_bytes": big}, **extra}
+    return {"kind": "meta", "counts": {"big_bytes": big}, "corpus_sha": gates.DEFAULT_SHA, **extra}
 
 
 def rep(size=4 * MIB, gate="g5", **override):
@@ -488,7 +489,7 @@ class CompareRefuses(unittest.TestCase):
 
     def test_pre_fix_baseline_file_is_invalid(self):
         with tempfile.TemporaryDirectory() as d:
-            f = self.write(d, "a.jsonl", [{"kind": "meta", "counts": {"big_bytes": 21474836}}, rep(21474836, written_bytes=None, read_bytes=None, read_matches=False)])
+            f = self.write(d, "a.jsonl", [{"kind": "meta", "counts": {"big_bytes": 21474836}, "corpus_sha": gates.DEFAULT_SHA}, rep(21474836, written_bytes=None, read_bytes=None, read_matches=False)])
             self.assertEqual(self.run_compare([f], f)[0], 3)
 
     def test_nan_load_is_valid_input_but_cannot_support_a_verdict(self):
@@ -618,17 +619,29 @@ def artifact(name, kind="lib", fresh=False, exe=None):
                        "target": {"name": name, "kind": [kind]}})
 
 
-# What cargo reported after the old g2 edit (cowfs-vfs-path/src/cookies.rs, measured on the
-# pinned corpus) and after the new one (cowfs-ctl/src/lib.rs); both measured with
-# `cargo build --message-format=json` on a scratch clone of c1619ec.
+# What cargo reported for the g2 edits, measured with `cargo build --message-format=json` on a
+# scratch clone of the current pin: the original cookies.rs edit at the old pin (trivial), and
+# the cowfs-vfs/src/lib.rs edit at the current pin (13 units, 3 binaries). See
+# docs/verification/g1-g2-readiness-20261009.md for the per-edit table.
 OLD_EDIT_OUT = "\n".join([artifact("cowfs_vfs", fresh=True), artifact("cowfs_vfs_path")])
 NEW_EDIT_OUT = "\n".join([
-    artifact("cowfs_vfs", fresh=True),
-    artifact("cowfs_ctl"), artifact("cowfs_treehouse"), artifact("cowfs_cli"),
+    artifact("cowfs_vfs"), artifact("cowfs_vfs_path"), artifact("cowfs_vfs_test"),
+    artifact("cowfs_fuse"), artifact("cowfs_nfs"), artifact("cowfs_core"), artifact("cowfs_ctl"),
+    artifact("cowfs_daemon"), artifact("cowfs_treehouse"), artifact("cowfs_cli"),
+    artifact("cowfs-daemon", "bin", exe="/t/debug/cowfs-daemon"),
     artifact("cowfs-treehouse", "bin", exe="/t/debug/cowfs-treehouse"),
     artifact("cowfs", "bin", exe="/t/debug/cowfs"),
     json.dumps({"reason": "build-finished", "success": True}),
 ])
+
+
+class CorpusPinShape(unittest.TestCase):
+    def test_pin_is_a_full_sha_other_than_the_retired_one(self):
+        self.assertRegex(gates.DEFAULT_SHA, r"^[0-9a-f]{40}$")
+        self.assertNotEqual(gates.DEFAULT_SHA, "c1619ec16df3a6b11dd5a1e08e8a512b4fedd240")
+
+    def test_meta_records_the_pin_compare_checks(self):
+        self.assertEqual(gates.meta(Path("/r"), "l", 1, ["g1"], {})["corpus_sha"], gates.DEFAULT_SHA)
 
 
 class G2RebuildValidity(unittest.TestCase):
@@ -641,7 +654,7 @@ class G2RebuildValidity(unittest.TestCase):
 
     def test_new_edit_shape_is_accepted(self):
         units = gates.rebuilt_units(NEW_EDIT_OUT)
-        self.assertEqual(len(units), 5)
+        self.assertEqual(len(units), 13)
         self.assertIsNone(gates.g2_rebuild_problem(units))
 
     def test_noop_and_missing_edited_crate_and_no_relink_are_each_refused(self):
@@ -673,9 +686,28 @@ class G2RebuildValidity(unittest.TestCase):
                     self.assertIn("--message-format=json", ck.call_args[0][0])
                     self.assertIn("// cowfs bench g2 edit", target.read_text())
 
+    def test_g2_appends_one_comment_per_rep_never_accumulating(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = gates.Ctx(Path(d), {})
+            ctx.corpus.mkdir()
+            git = lambda *a: subprocess.run(["git", "-C", str(ctx.corpus), *a], check=True, capture_output=True)
+            git("init", "-q")
+            target = ctx.corpus / gates.EDIT_TARGET
+            target.parent.mkdir(parents=True)
+            target.write_text("// lib\n")
+            git("add", "-A")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
+            done = mock.Mock(stdout=NEW_EDIT_OUT, stderr="", returncode=0)
+            real = gates.checked
+            fake = lambda cmd, **kw: real(cmd, **kw) if cmd[0] == "git" else done
+            with mock.patch.object(gates, "checked", side_effect=fake):
+                for _ in range(3):
+                    ctx.g2()
+            self.assertEqual(target.read_text().count("// cowfs bench g2 edit"), 1)
+
     def test_g2_records_the_rebuilt_units(self):
         m, _ = self.run_g2(NEW_EDIT_OUT)
-        self.assertEqual((m["rebuilt_count"], m["bins_relinked"]), (5, 2))
+        self.assertEqual((m["rebuilt_count"], m["bins_relinked"]), (13, 3))
         self.assertIn(gates.EDIT_CRATE, m["rebuilt_units"])
 
     def test_g2_refuses_the_trivial_workload_and_records_no_rep(self):

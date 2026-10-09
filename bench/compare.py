@@ -197,7 +197,11 @@ def is_nonneg_load(v):
 
 
 def meta_problem(meta):
-    """Why a meta record cannot anchor g5 byte counts, or None."""
+    """Why a meta record cannot anchor g5 byte counts or was built at another corpus pin, or None."""
+    sha = meta.get("corpus_sha")
+    if sha != gates.DEFAULT_SHA:
+        return (f"meta corpus_sha {sha!r} is not the current g1/g2 pin {gates.DEFAULT_SHA}: "
+                "data from another corpus pin is not comparable, re-run both arms")
     counts = meta.get("counts")
     if not isinstance(counts, dict):
         return "meta has no counts"
