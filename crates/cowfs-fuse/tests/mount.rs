@@ -30,7 +30,7 @@ fn is_root() -> bool {
 
 /// Special files through the kernel (issue #107): mkfifo and a socket node are created by the
 /// kernel's `mknod`, reported with the right type, mode and `nlink`, listed, and removed; a device
-/// needs root and keeps its device number.
+/// needs root and keeps its device number, except the 0:0 whiteout, which anyone may make.
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
 fn special_files_through_mknod() {
@@ -89,6 +89,27 @@ fn special_files_through_mknod() {
         assert!(!made, "a device node needs root (EPERM)");
         assert!(!fx.p("chr").exists());
     }
+
+    // Linux lets anyone make the 0:0 character device (a whiteout); no other device number,
+    // and no block device, is open to a normal user (issue #243).
+    assert!(
+        tool(&["mknod", "-m", "644", &p("wo"), "c", "0", "0"]),
+        "whiteout"
+    );
+    let m = fs::symlink_metadata(fx.p("wo")).unwrap();
+    assert!(m.file_type().is_char_device());
+    assert_eq!((m.rdev(), m.mode() & 0o7777, m.len()), (0, 0o644, 0));
+    if !is_root() {
+        assert!(
+            !tool(&["mknod", &p("blk0"), "b", "0", "0"]),
+            "block 0:0 is a device"
+        );
+        assert!(
+            !tool(&["mknod", &p("c01"), "c", "0", "1"]),
+            "char 0:1 is a device"
+        );
+    }
+    fs::remove_file(fx.p("wo")).unwrap();
 
     fs::remove_file(fx.p("fifo")).unwrap();
     fs::remove_file(fx.p("sock")).unwrap();
