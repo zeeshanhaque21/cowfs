@@ -136,3 +136,12 @@ Collapse-range, insert-range and unshare-range stay `EOPNOTSUPP`.
 Real preallocation and space reservation stay out; cowfs has none.
 Merging adjacent hole refs, trimming trailing holes and dropping dirty extents instead of flushing are optimisations left for a measured need.
 `copy_file_range` and `lseek(SEEK_HOLE/SEEK_DATA)` are separate issues.
+
+## Slice C notes (FUSE)
+
+The adapter maps `0`, `KEEP_SIZE`, `PUNCH_HOLE|KEEP_SIZE`, `ZERO_RANGE` and `ZERO_RANGE|KEEP_SIZE`, and answers `ENOTSUP` for every other mask.
+The kernel's FUSE client is expected to forward only the keep-size, punch-hole and zero-range bits, and refuses the rest itself; this is from memory of `fuse_file_fallocate`, not a read of the runner's kernel, so the mount test asserts the observable result instead.
+After a success the kernel updates its own size and drops the page-cache range, so the adapter returns no attributes.
+The mount test (`fallocate_modes_through_a_mount`, Linux CI only) checks size, blocks and bytes after each mode, and the refusals: collapse, insert, unshare and no-hide-stale are `EOPNOTSUPP`, length 0 is `EINVAL`, a range past 1<<42 is `EFBIG`.
+Special files: the kernel's `vfs_fallocate` is expected to refuse anything that is not a regular file or directory before FUSE sees it (`ENODEV`, `ESPIPE` for pipes), so the mount needs no mapping; this is not verified or tested here.
+Core and MemVfs keep `InvalidArgument` for any non-regular kind, as `read` and `write` do; an NFS adapter that wants `ENODEV` can map it, and none exists yet.
