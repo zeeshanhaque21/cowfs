@@ -553,6 +553,8 @@ fn two_long_pending_swaps_with_a_shared_prefix_both_recover() {
 }
 
 /// A record cut off inside the target name must not be read as an intent for a shorter name.
+/// The old target was already removed, so the staged tree is the only copy: it is kept and rolled
+/// forward under the name the intent file carries (N2 of the PR 220 round 3 review).
 #[test]
 fn a_torn_intent_is_not_read_as_a_shorter_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -570,5 +572,23 @@ fn a_torn_intent_is_not_read_as_a_shorter_name() {
     std::fs::write(&p, text.trim_end_matches(['\n', 'c'])).unwrap();
     let c = Core::open(dir.path(), test_opts()).unwrap();
     assert!(c.snapshot_view("ab").is_err(), "a stray snapshot ab");
+    assert_eq!(content(&c, "abc", "f"), "new", "the only copy is kept");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+}
+
+/// A torn intent whose target still exists names a swap that had not removed it: the staging tree
+/// is garbage and the old target is untouched.
+#[test]
+fn a_torn_intent_with_the_target_still_present_keeps_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace_as(&c, &v1, "abc").unwrap();
+    }
+    std::fs::write(dir.path().join("swap-abc"), "xyz").unwrap(); // torn: no final newline
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "abc", "f"), "old");
     assert!(raw_leftovers(dir.path(), &c).is_empty());
 }

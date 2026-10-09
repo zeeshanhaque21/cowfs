@@ -223,6 +223,54 @@ fn concurrent_refreshes_of_one_name_leave_a_record_that_matches_the_tree() {
     }
 }
 
+/// Issue 252: a refresh is serialised per name by `REFRESHING`, but `snapshot_promote` is not (it
+/// takes the holder guard only). Hammer one name with a promote loop while a refresh alternates two
+/// repositories: the promote may find the name briefly missing, and may write the "unknown" record,
+/// but every report must name the commit its own refresh built and the final record must match
+/// the final tree.
+#[test]
+fn a_same_name_promote_racing_a_refresh_never_leaves_a_record_that_disagrees_with_the_tree() {
+    for (which, d, b) in backends() {
+        let a = repo(d.path(), "repo-a", "tree-A");
+        let c = repo(d.path(), "repo-c", "tree-C");
+        let commits = [commit_of_repo(&a), commit_of_repo(&c)];
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let promoter = {
+            let (b, stop) = (b.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Err(e) = b.snapshots().promote("warm") {
+                        // the only legitimate failure: the name is between its old and new tree
+                        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "promote: {e}");
+                    }
+                    n += 1;
+                }
+                n
+            })
+        };
+        for round in 0..16 {
+            let i = round % 2;
+            let repo = if i == 0 { &a } else { &c };
+            let report = refresh(b.as_ref(), &params(repo, "warm", true))
+                .unwrap_or_else(|e| panic!("{which} round {round}: {e}"));
+            let got = report.snapshot.base.and_then(|m| m.commit);
+            assert_eq!(got.as_deref(), Some(commits[i].as_str()), "{which} {round}");
+            let tag = read(b.as_ref(), "warm", "tag").expect("a tree");
+            assert_eq!(
+                tag,
+                if i == 0 { "tree-A" } else { "tree-C" },
+                "{which} {round}"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            promoter.join().unwrap() > 0,
+            "{which}: the promoter never ran"
+        );
+    }
+}
+
 /// The Core stores a swap intent as `swap-<name>.tmp` in a store directory, so the longest name it
 /// can refresh is shorter than the longest name it can hold.
 #[test]

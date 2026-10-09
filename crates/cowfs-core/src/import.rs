@@ -151,13 +151,15 @@ fn ingest_with(
     c.recover_target(name)?;
     let victim = (replace && c.inner.snap_by_name(name).is_ok()).then_some(name);
     c.inner.check_new_name_except(name, victim)?;
+    // Only a real replacement writes an intent file; a fresh name is installed without one.
+    if victim.is_some() {
+        swap::check_target_len(name)?;
+    }
     let total = plan(from);
     let staged = swap::staging_name(name);
     // A leftover staging snapshot of this name holds blocks nothing points at: a pending intent was
     // finished above, and `Core::open` removes the orphans a crash left.
-    if let Ok(leftover) = c.inner.snap_by_name_raw(&staged) {
-        let _ = c.inner.unregister(&leftover);
-    }
+    c.clear_leftover(&staged, name)?;
     let snap = c.inner.meta.new_snapshot(&staged).map_err(control_meta)?;
     let entry = c.inner.register(snap)?;
     let view = SnapshotView::new(c.clone(), entry.ino);
