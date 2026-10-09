@@ -490,7 +490,7 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `lib::shutdown` | leaf | 1 |
 | `lib::from_parts` | nodes, dents, aliases, handles, root_time, pressure, unsynced, last_error | 2 then leaf |
 | `lib::fork_snapshot` | snap. | 3 |
-| `lib::rename_snapshot` | root_time | leaf |
+| `lib::move_name` | root_time | leaf |
 | `lib::list_snapshots` | leaf | 1 |
 | `lib::merkle_root` | snap. | 3 |
 | `lib::missing_live_refs` | snap. | 3 |
@@ -530,7 +530,6 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `swap::recover` | last_error | leaf |
 | `swap::swap_snapshot` | last_error | leaf |
 | `swap::stage_and_intent` | snap. | 3 |
-| `swap::finish_swap` | snap. | 3 |
 | `util::lk` | leaf | 1 |
 | `util::try_lk` | leaf | 1 |
 | `util::shard` | leaf | 1 |
