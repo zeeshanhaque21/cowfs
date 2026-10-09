@@ -1,6 +1,7 @@
 //! A tiny NFSv3 client over raw RPC frames, enough to drive the server in-process.
 #![allow(dead_code)]
 pub mod counting;
+pub mod hang;
 pub mod reuse;
 
 use std::io::{Cursor, Read, Write};
@@ -29,6 +30,7 @@ pub const INVAL: u32 = nfsstat3::NFS3ERR_INVAL as u32;
 pub const NAMETOOLONG: u32 = nfsstat3::NFS3ERR_NAMETOOLONG as u32;
 pub const NOTSUPP: u32 = nfsstat3::NFS3ERR_NOTSUPP as u32;
 pub const ROFS: u32 = nfsstat3::NFS3ERR_ROFS as u32;
+pub const JUKEBOX: u32 = nfsstat3::NFS3ERR_JUKEBOX as u32;
 pub const ACCES: u32 = nfsstat3::NFS3ERR_ACCES as u32;
 
 const NFS: u32 = 100_003;
@@ -177,6 +179,37 @@ impl Nfs {
         let _verf: Vec<u8> = dec(&mut r);
         let acc: u32 = dec(&mut r);
         (acc, r)
+    }
+
+    /// Sends an NFS call (AUTH_NULL) with the next xid and returns at once.
+    pub fn send_nfs(&mut self, proc: u32, args: Args) -> u32 {
+        self.xid += 1;
+        let mut m = Vec::new();
+        for w in [self.xid, 0, 2, NFS, 3, proc, 0, 0, 0, 0] {
+            m.extend_from_slice(&w.to_be_bytes());
+        }
+        m.extend_from_slice(&args.0);
+        self.send(&m);
+        self.xid
+    }
+
+    /// The next reply record if one arrives within `d`, as (xid, nfsstat3 or accept_stat).
+    pub fn recv_status_within(&mut self, d: Duration) -> Option<(u32, u32)> {
+        self.s.set_read_timeout(Some(d)).unwrap();
+        let mut h = [0u8; 4];
+        let got = self.s.read_exact(&mut h);
+        self.s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        got.ok()?;
+        let mut b = vec![0u8; (u32::from_be_bytes(h) & 0x7fff_ffff) as usize];
+        self.s.read_exact(&mut b).unwrap();
+        let mut r = Cursor::new(b);
+        let xid: u32 = dec(&mut r);
+        assert_eq!(dec::<u32>(&mut r), 1, "reply");
+        assert_eq!(dec::<u32>(&mut r), 0, "accepted");
+        let _flavor: u32 = dec(&mut r);
+        let _verf: Vec<u8> = dec(&mut r);
+        assert_eq!(dec::<u32>(&mut r), 0, "rpc not accepted");
+        Some((xid, dec(&mut r)))
     }
 
     /// An NFS call with an AUTH_UNIX credential for `uid`, so the server sees that caller.
