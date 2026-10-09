@@ -21,7 +21,8 @@
 //!    target is removed, in one metadata transaction,   <- rollback is no longer possible
 //! 4. remove the intent file; a failure is reported and a leftover file is dropped on open.
 //!
-//! A crash or error from step 3 on leaves the intent file, and the next `Core::open` finishes the
+//! A crash, or a step 3 commit error that a re-read cannot show did not land, leaves the intent
+//! file, and the next `Core::open` finishes the
 //! swap before serving anything. A swap or replacing import of a target with a pending intent
 //! finishes that intent first (`Core::recover_target`), so a retry never deletes the only copy of a
 //! tree. A crash before step 3 leaves a hidden staging snapshot with no intent file; `Core::open`
@@ -66,6 +67,8 @@ fn intent_path(root: &Path, target: &str) -> PathBuf {
 thread_local! {
     /// Test seam: makes `finish_swap` fail, the one step `set_swap_fault` cannot reach at open.
     static FAIL_FINISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: the replace commit returns an error without writing anything.
+    static FAIL_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test seam: forces every staging name's hash, to build the collision a real name pair needs
     /// a 2^32 search for.
     static HASH_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -311,9 +314,10 @@ impl Core {
     /// rather than replacing one and does not come here: it has no victim to remove and needs no
     /// staging, so `Core::rename_snapshot` commits the name directly.
     /// Returns `Ok` only when the new name is in place. Returns `Err` with the mount unchanged,
-    /// except when the metadata commit that replaces the target failed or was cut short: the old
-    /// target then stays live with the intent file pending, and the next open or call for the
-    /// target installs the new tree (anything written to the old target in between is discarded).
+    /// except when the metadata commit that replaces the target failed and a re-read of the file
+    /// cannot show it did not land: the old target then stays live with the intent file pending,
+    /// and the next open or call for the target installs the new tree (anything written to the old
+    /// target in between is discarded).
     /// The one fork gives the new snapshot a new id, which it keeps under the target name, so every
     /// inode number in it differs from the old target's.
     pub(crate) fn swap_snapshot(
@@ -468,7 +472,8 @@ impl Core {
     /// changed nothing, because it happens before the metadata commit (the target is `Busy`, or the
     /// staged tree cannot be flushed), is rolled back like any earlier step: the old target is
     /// still live and writable, so leaving an intent that a restart would act on later would
-    /// discard whatever is written to it in between. An error from the commit itself stays pending.
+    /// discard whatever is written to it in between. An error from the commit itself is rolled back only
+    /// when a re-read shows the replace did not land; otherwise the outcome is unknown and it stays pending.
     pub(crate) fn finish_live(
         &self,
         staged: &str,
@@ -503,7 +508,7 @@ impl Core {
                 if let Ok(sc) = self.inner.snap_by_name_raw(staged) {
                     if self.parent_of(&old) != Some(sc.id) {
                         // A flush failure and `Busy` happen before the commit and change nothing; an
-                        // error from the commit itself may have changed anything and stays pending.
+                        // error from the commit itself is handled below.
                         let unwind = |e: ControlError| {
                             if undo
                                 && self
@@ -520,9 +525,28 @@ impl Core {
                             .map_err(|e| unwind(e.into()))?;
                         // the intent file and its directory entry are durable: the old tree may go
                         crate::fsops::note("victim_removed");
-                        entry = Some(match self.move_name(&sc, staged, target, Some(&old)) {
+                        #[cfg(test)]
+                        let injected = FAIL_COMMIT.with(std::cell::Cell::get);
+                        #[cfg(not(test))]
+                        let injected = false;
+                        let moved = if injected {
+                            Err(io("injected commit failure"))
+                        } else {
+                            self.move_name(&sc, staged, target, Some(&old))
+                        };
+                        entry = Some(match moved {
                             Err(ControlError::Busy) => return Err(unwind(ControlError::Busy)),
-                            r => r?,
+                            // A commit error: roll back only when the file provably still has the
+                            // old target under its name and the staged tree under the staging
+                            // name. When that cannot be read, or says the replace landed, the
+                            // outcome is unknown and the intent stays for the next open.
+                            Err(e) => {
+                                if self.replace_did_not_land(old.id, sc.id, staged, target) {
+                                    return Err(unwind(e));
+                                }
+                                return Err(e);
+                            }
+                            Ok(r) => r,
                         });
                     }
                 }
@@ -537,6 +561,15 @@ impl Core {
         self.fault(6)?;
         self.drop_intent(target);
         entry.ok_or(ControlError::NotFound)
+    }
+
+    /// True when the metadata file, re-read now, still has snapshot `old` under `target` and
+    /// snapshot `new` under `staged`: a failed replace commit changed nothing.
+    fn replace_did_not_land(&self, old: u64, new: u64, staged: &str, target: &str) -> bool {
+        self.inner.meta.durable_snapshots().is_ok_and(|rows| {
+            let name_of = |id: u64| rows.iter().find(|r| r.id.0 == id).map(|r| r.name.as_str());
+            name_of(old) == Some(target) && name_of(new) == Some(staged)
+        })
     }
 
     /// The recorded parent id of `sc`.
@@ -855,5 +888,38 @@ mod tests {
         );
         c.write(f, 0, b"still writable").unwrap();
         c.release(h).unwrap();
+    }
+
+    /// A replace commit that fails and provably changed nothing is rolled back like a failure
+    /// before it: the old target stays live and writable and no intent is left for a restart.
+    #[test]
+    fn a_commit_error_that_did_not_land_is_rolled_back_not_left_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Core::open(
+            dir.path(),
+            crate::Options {
+                background: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        c.create_snapshot("src").unwrap();
+        c.create_snapshot("abc").unwrap();
+        let staged = staging_name("abc");
+        let src = c.inner.snap_by_name("src").unwrap();
+        c.stage_and_intent(&src, &staged, "abc").unwrap();
+        FAIL_COMMIT.with(|f| f.set(true));
+        let r = c.finish_live(&staged, "abc");
+        FAIL_COMMIT.with(|f| f.set(false));
+        assert!(r.is_err());
+        assert!(
+            !intent_path(&c.inner.root, "abc").exists(),
+            "no intent left"
+        );
+        assert!(
+            c.inner.snap_by_name_raw(&staged).is_err(),
+            "staging dropped"
+        );
+        assert!(c.inner.snap_by_name("abc").is_ok());
     }
 }

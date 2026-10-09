@@ -91,7 +91,7 @@ Every snapshot operation is the core's own control plane. No tree is ever copied
 | `snapshot_create {name}` | `create_snapshot` |
 | `snapshot_create {name, from}` | `fork_snapshot`, which is O(1) |
 | `snapshot_rm` | `remove_snapshot`, refused while a handle is open |
-| `snapshot_reset {name, from}` | `promote_base(from, name)`: the staged swap, one fork and one rename, with an intent record |
+| `snapshot_reset {name, from}` | `promote_base(from, name)`: the staged swap, one fork and one replace-by-name metadata commit, with an intent record |
 | `snapshot_rename` | `rename_snapshot`, staged the same way |
 | `snapshot_promote` | a set in the daemon, because the core does not record base-ness |
 | `fsck` | `Core::fsck`, mapped to the protocol's report |

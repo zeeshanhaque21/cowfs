@@ -160,14 +160,18 @@ A rename cannot do that, because it refuses a name another snapshot holds, so `p
 
 1. fork the source into a staging name (a failure here changes nothing),
 2. write and sync the intent file `<root>/swap-<target>`, naming the staging and target snapshots,
-3. remove the old target,
-4. fork the staging snapshot into the target name,
-5. remove the staging snapshot,
-6. remove the intent file.
+3. replace the target: `Meta::replace_snapshot` gives the staging snapshot the target name and removes the old target, in ONE metadata transaction,
+4. remove the intent file.
 
-Any failure before step 3 leaves the old target untouched.
-Any failure or crash from step 3 on leaves the intent file, and the next `Core::open` finishes steps 4 to 6 before it serves anything.
-So a snapshot name never disappears without a record that explains it, and a failed swap never costs the old base.
+The old target stays under its name until step 3 commits, so the name is never missing: exactly one of the old tree and the new tree answers to it.
+Any failure before the step 3 commit leaves the old target untouched and rolls back (the staging snapshot and the intent file are removed).
+A crash after the intent file is durable and before the commit leaves the intent file, the old target and the staging snapshot, and the next `Core::open` rolls the swap forward before it serves anything.
+That includes a call that never returned `Ok`: an unacknowledged promote can take effect after a restart, and anything written to the old target between the intent and the crash is discarded.
+If the step 3 commit itself returns an error, the file is re-read.
+When it still holds the old target under its name and the staging snapshot under the staging name, the replace provably did not land and the call rolls back like any earlier failure, so nothing is left to discard later.
+When the file cannot be read, or says the replace landed, the outcome is unknown: the call returns `Err` with the intent file kept, the old target (if it is still the one registered) stays live, and the next open or call for the target installs the new tree, discarding anything written to the old target in between.
+While the commit runs the old target is marked removed, so the name still resolves to it but operations on it fail with an error for that window (which can include a store fsync); it is not a data risk.
+A failed swap never costs the old base.
 The one fork gives the new snapshot a new id, which it keeps under the target name, so every inode number in it differs from the old target's.
 Import uses the same finish step.
 A swap or replacing import of a name with a pending intent finishes that intent first (`Core::recover_target`), so a retry never deletes the only copy of the new tree.
@@ -569,7 +573,7 @@ Moving to `chunk_range` and `splice_content` is the next step for multi-GiB file
 Requests recorded in #42, and where each stands on main:
 
 1. `Meta::rename_snapshot(id, new_name)`: landed (#137) and used by `Core::rename_snapshot` (#141).
-   `promote_base` replaces an existing name, so it still uses the staged swap; the swap forks once and renames the staged snapshot into place.
+   `promote_base` replaces an existing name, so it still uses the staged swap; the swap forks once and replaces the target by name in one metadata transaction (`Meta::replace_snapshot`).
 2. `Tx::set_now`: landed (#136).
    `Core` stamps each deferred operation with the ctime its cached node holds.
    `Snapshot::batch_at` was not added, because `set_now` covers the need.
@@ -614,7 +618,7 @@ Counts are from the runs recorded below (`cargo test -p cowfs-core` after mergin
 | Conformance | `conformance.rs` | 132 pass, 2 heavy | the whole `cowfs-vfs-test` suite through a `Core` snapshot view (levels Posix, Portable, Cowfs), plus the 2 heavy checks run separately |
 | Core behaviour | `core.rs` | 18 | mount root, snapshot rules, fork isolation both ways, persistence, dedup by byte counts, 1 TiB sparse file with RSS bound, forget accounting over 100,000 create and unlink cycles, batching, corrupt block is EIO, damaged store refused, Merkle root iff content, control plane, unlink while open, elision, background flusher, inode numbers never reused |
 | Locks | `locks.rs` | 2 | the critic's deadlock repro as a test with a stack-dumping watchdog, plus a 60 s mixed stress of every multi-lock operation |
-| Swap | `swap.rs` | 12 | failure injected at every step of a snapshot replacement and of a replacing import, the intent record's recovery on reopen, a same-name retry over a pending intent, the orphan staging sweep, a damaged store inside a swap, rename failure safety |
+| Swap | `swap.rs` | 25 (plus 8 unit tests in `src/swap.rs`) | failure injected at every step of a snapshot replacement and of a replacing import, the intent record's recovery on reopen, a same-name retry over a pending intent, the orphan staging sweep, a damaged store inside a swap, rename failure safety |
 | Poison | `poison.rs` | 3 | a damaged chunk is EIO at the write, poisons only its own file, leaves other files' `fsync` durable, and does not stop a promote |
 | Names and inode numbers | `names_ino.rs` | 4 | the CLI's name rules and collision keys, virtual numbers never reused across a clean reopen or a process that aborts |
 | Aliases | `alias.rs` | 2 | the alias table stays bounded over 20,000 (and 500,000) creates, a referenced or open file keeps its number |
@@ -772,7 +776,7 @@ All 30 mutants are killed by an assertion now; the three survivors of round 2 an
 A fault rule makes the next `times` `sync`s of a file or directory whose path contains a substring fail, and a trace records those calls in order.
 `write_intent` and `write_virt_mark` now go through the seam, so the durability orderings the design argument depends on are observable:
 
-- `n02_swap_intent_no_fsync` is killed by `a_swap_refuses_when_the_intent_file_cannot_be_made_durable` (an intent file that cannot be made durable stops the swap, with the mount unchanged) and by `the_intent_file_is_durable_before_the_victim_snapshot_is_removed` (the trace shows the record's own file sync, then its rename, then the directory sync, then the victim unregister).
+- `n02_swap_intent_no_fsync` is killed by `a_swap_refuses_when_the_intent_file_cannot_be_made_durable` (an intent file that cannot be made durable stops the swap, with the mount unchanged) and by `the_intent_file_is_durable_before_the_victim_snapshot_is_removed` (the trace shows the record's own file sync, then its rename, then the directory sync, then the `victim_removed` point before the replace commit).
   Making the intent directory sync a checked call rather than a swallowed one is a real change: a rename that cannot be made durable is now a refused swap, not a silent one.
 - `n04_virt_mark_no_dir_fsync` is killed by `a_reservation_refuses_when_its_directory_cannot_be_made_durable` and by `a_new_virtual_reservation_is_durable_before_any_of_its_numbers_is_handed_out` (the trace shows the mark's file sync, its rename, the directory sync, and only then a number from the new reservation is handed out).
 - `b11_load_node_upserts` is killed by `a_node_load_that_exhausts_its_retry_budget_fails_closed`.
