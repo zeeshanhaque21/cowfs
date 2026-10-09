@@ -18,8 +18,15 @@
 //! kind, mode and device number, never content. Any other kind of entry is refused, because
 //! silently dropping it would make the imported tree differ from the source. No directory is
 //! special-cased, `.git` included: the source is copied as it is found.
+//!
+//! Each node keeps its access and modification time to the nanosecond (`Vfs::setattr`), a
+//! directory's after its children are written so adding them does not move it, and the names of
+//! one hard linked file stay names of one inode (`Vfs::link`), counted within the imported tree
+//! only. Build tools judge freshness by those two: a copy that drops either looks changed and is
+//! rebuilt (issue 290). Times are not part of any content hash. ctime cannot be set, it is the
+//! import time. The read-back compares modification times, link identity and link counts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read as _;
@@ -27,16 +34,12 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 
-use cowfs_vfs::{Attr, FileKind, Ino, Vfs, ROOT_INO};
+use cowfs_vfs::{Attr, FileKind, Ino, SetAttr, SetTime, Timestamp, Vfs, ROOT_INO};
 
 use crate::{control_meta, swap, ControlError, Core, SnapshotView};
 
 /// Bytes one read or one write carries, and the most the ingest holds in memory at once.
 pub const CHUNK: usize = 64 << 10;
-
-/// One entry of a directory on either side of the comparison.
-/// Kind, inode, permission bits, size, device number.
-type Entry = (FileKind, Ino, u32, u64, u64);
 
 /// What an ingest did to the store.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -155,7 +158,7 @@ fn ingest_with(
     if victim.is_some() {
         swap::check_target_len(name)?;
     }
-    let total = plan(from);
+    let total = plan(from, hooks)?;
     let staged = swap::staging_name(name);
     // A leftover staging snapshot of this name holds blocks nothing points at: a pending intent was
     // finished above, and `Core::open` removes the orphans a crash left.
@@ -170,9 +173,10 @@ fn ingest_with(
     };
     let outcome = (|| {
         write_tree(&view, ROOT_INO, from, hooks, &mut n)?;
+        set_times(&view, ROOT_INO, &md, from)?;
         let sc = c.inner.snap_by_name_raw(&staged)?;
         c.inner.fsync_snapshot(&sc).map_err(core)?;
-        verify(&view, from)?;
+        verify(&view, from, hooks, n.total)?;
         Ok(())
     })();
     let (files, bytes) = match outcome {
@@ -212,23 +216,29 @@ fn ingest_with(
 
 /// The bytes of regular files under `dir`, counted before anything is written so progress has a
 /// total. A file that vanishes between this walk and the write is the write walk's problem.
-fn plan(dir: &Path) -> u64 {
+///
+/// It reports once per entry with a total of 0 (not known yet), so a walk of a huge tree is not
+/// silent to a caller that gives up on silence.
+fn plan(dir: &Path, hooks: &mut Hooks<'_>) -> Result<u64, ImportError> {
     let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
+        return Ok(0);
     };
-    entries.flatten().fold(0u64, |sum, e| {
+    let mut sum = 0u64;
+    for e in entries.flatten() {
         let path = e.path();
         let Ok(md) = fs::symlink_metadata(&path) else {
-            return sum;
+            continue;
         };
         if md.is_dir() {
-            sum + plan(&path)
+            sum = sum.saturating_add(plan(&path, hooks)?);
         } else if md.is_file() {
-            sum.saturating_add(md.size())
-        } else {
-            sum
+            sum = sum.saturating_add(md.size());
         }
-    })
+        if !hooks.report(0, 0) {
+            return Err(ImportError::Cancelled);
+        }
+    }
+    Ok(sum)
 }
 
 /// The counters one ingest threads through its walk, so no call needs more than a path and a
@@ -240,6 +250,9 @@ struct Counters {
     done: u64,
     /// What the source held when the ingest began, so progress has a total.
     total: u64,
+    /// The imported inode of each source file that has more than one name, by source device and
+    /// inode, so the next name of it is a link and not a second copy.
+    links: HashMap<(u64, u64), Ino>,
 }
 
 /// Writes the tree at `dir` into `parent` in `view`.
@@ -253,34 +266,90 @@ fn write_tree(
     for (name, path, md) in entries(dir)? {
         let key = name.as_bytes();
         let mode = md.mode() & 0o7777;
-        if md.is_dir() {
+        let id = (md.dev(), md.ino());
+        if !md.is_dir() && md.nlink() > 1 {
+            if let Some(&ino) = n.links.get(&id) {
+                view.link(ino, parent, key).map_err(core)?;
+                if md.is_file() {
+                    // Counted like the tree hash counts it: once per name.
+                    n.files += 1;
+                    n.bytes += md.size();
+                    n.done += md.size();
+                }
+                if !hooks.report(n.done, n.total) {
+                    return Err(ImportError::Cancelled);
+                }
+                continue;
+            }
+        }
+        let ino = if md.is_dir() {
             let attr = view.mkdir(parent, key, mode).map_err(core)?;
             write_tree(view, attr.ino, &path, hooks, n)?;
+            attr.ino
         } else if md.is_symlink() {
             let target =
                 fs::read_link(&path).map_err(|e| fs_err("cannot read the link", &path, e))?;
             view.symlink(parent, key, target.as_os_str().as_bytes())
-                .map_err(core)?;
+                .map_err(core)?
+                .ino
         } else if md.is_file() {
-            n.bytes += write_file(view, parent, key, &path, mode, hooks, n)?;
+            let (ino, len) = write_file(view, parent, key, &path, mode, hooks, n)?;
+            n.bytes += len;
+            ino
         } else if let Some(kind) = special_kind(&md) {
             let rdev = if kind.is_device() {
                 cowfs_rdev(md.rdev())
             } else {
                 0
             };
-            view.mknod(parent, key, kind, mode, rdev).map_err(core)?;
+            view.mknod(parent, key, kind, mode, rdev).map_err(core)?.ino
         } else {
             return Err(ImportError::Invalid(format!(
                 "{} is not a regular file, a directory, a symlink, a fifo, a socket or a device, so it cannot be ingested",
                 path.display()
             )));
+        };
+        if !md.is_dir() && md.nlink() > 1 {
+            n.links.insert(id, ino);
         }
+        // After the content and, for a directory, after every child: both move the times.
+        set_times(view, ino, &md, &path)?;
         if !hooks.report(n.done, n.total) {
             return Err(ImportError::Cancelled);
         }
     }
     Ok(())
+}
+
+/// A source entry's modification time.
+fn mtime_of(md: &std::fs::Metadata) -> Timestamp {
+    Timestamp {
+        secs: md.mtime(),
+        nanos: u32::try_from(md.mtime_nsec()).unwrap_or(0),
+    }
+}
+
+/// Gives the imported node the source's access and modification times.
+fn set_times(
+    view: &SnapshotView,
+    ino: Ino,
+    md: &std::fs::Metadata,
+    path: &Path,
+) -> Result<(), ImportError> {
+    let atime = Timestamp {
+        secs: md.atime(),
+        nanos: u32::try_from(md.atime_nsec()).unwrap_or(0),
+    };
+    view.setattr(
+        ino,
+        SetAttr {
+            atime: Some(SetTime::At(atime)),
+            mtime: Some(SetTime::At(mtime_of(md))),
+            ..SetAttr::default()
+        },
+    )
+    .map(|_| ())
+    .map_err(|e| ImportError::Invalid(format!("cannot set the times of {}: {e}", path.display())))
 }
 
 /// The special kind of a source entry, if it is one.
@@ -338,7 +407,7 @@ fn write_file(
     mode: u32,
     hooks: &mut Hooks<'_>,
     n: &mut Counters,
-) -> Result<u64, ImportError> {
+) -> Result<(Ino, u64), ImportError> {
     let md = fs::symlink_metadata(src).map_err(|e| fs_err("cannot stat", src, e))?;
     let attr = view.create(parent, name, mode).map_err(core)?;
     let handle = view.open(attr.ino).map_err(core)?;
@@ -347,7 +416,7 @@ fn write_file(
     view.release(handle).map_err(core)?;
     result?;
     n.files += 1;
-    Ok(md.size())
+    Ok((attr.ino, md.size()))
 }
 
 fn stream_into(
@@ -389,23 +458,89 @@ fn stream_into(
     }
 }
 
-/// Reads the imported tree back through the `Vfs` and compares it with the source: names, kinds,
-/// permission bits, sizes, every byte of every file, and every symlink target.
-fn verify(view: &SnapshotView, from: &Path) -> Result<(), ImportError> {
-    compare_dir(view, ROOT_INO, from)
+/// What the read-back carries from directory to directory.
+struct Check<'a, 'h> {
+    hooks: &'a mut Hooks<'h>,
+    total: u64,
+    /// Imported inode and in-tree name count of each hard linked source file, by source device
+    /// and inode.
+    links: HashMap<(u64, u64), (Ino, u32)>,
+    /// The source file each imported inode was matched with, so two source files never share one.
+    owners: HashMap<Ino, (u64, u64)>,
 }
 
-fn compare_dir(view: &SnapshotView, parent: Ino, dir: &Path) -> Result<(), ImportError> {
-    let mut imported: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+impl Check<'_, '_> {
+    /// Keeps a long read-back from being silent: the write is already at its total by now.
+    fn tick(&mut self) -> Result<(), ImportError> {
+        if self.hooks.report(self.total, self.total) {
+            Ok(())
+        } else {
+            Err(ImportError::Cancelled)
+        }
+    }
+}
+
+/// Reads the imported tree back through the `Vfs` and compares it with the source: names, kinds,
+/// permission bits, modification times, sizes, hard link identity and counts, every byte of every
+/// file, and every symlink target.
+fn verify(
+    view: &SnapshotView,
+    from: &Path,
+    hooks: &mut Hooks<'_>,
+    total: u64,
+) -> Result<(), ImportError> {
+    let mut check = Check {
+        hooks,
+        total,
+        links: HashMap::new(),
+        owners: HashMap::new(),
+    };
+    let root = fs::metadata(from).map_err(|e| fs_err("cannot stat", from, e))?;
+    let attr = view.getattr(ROOT_INO).map_err(core)?;
+    same_mtime(&attr, &root, from)?;
+    compare_dir(view, ROOT_INO, from, &mut check)?;
+    for (ino, count) in check.links.values() {
+        let attr = view.getattr(*ino).map_err(core)?;
+        if attr.nlink != *count {
+            return Err(ImportError::Mismatch {
+                path: from.display().to_string(),
+                reason: format!(
+                    "a hard linked file has {} names in the import, {count} in the source",
+                    attr.nlink
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn same_mtime(attr: &Attr, md: &std::fs::Metadata, path: &Path) -> Result<(), ImportError> {
+    let want = mtime_of(md);
+    if attr.mtime == want {
+        return Ok(());
+    }
+    Err(ImportError::Mismatch {
+        path: path.display().to_string(),
+        reason: format!(
+            "imported with mtime {}.{:09}, the source has {}.{:09}",
+            attr.mtime.secs, attr.mtime.nanos, want.secs, want.nanos
+        ),
+    })
+}
+
+fn compare_dir(
+    view: &SnapshotView,
+    parent: Ino,
+    dir: &Path,
+    check: &mut Check<'_, '_>,
+) -> Result<(), ImportError> {
+    let mut imported: BTreeMap<Vec<u8>, Attr> = BTreeMap::new();
     let mut cookie = 0u64;
     loop {
         let page = view.readdir(parent, cookie, 64).map_err(core)?;
         for e in &page.entries {
             let attr: Attr = view.getattr(e.ino).map_err(core)?;
-            imported.insert(
-                e.name.clone(),
-                (attr.kind, e.ino, attr.mode, attr.size, attr.rdev),
-            );
+            imported.insert(e.name.clone(), attr);
         }
         if page.eof {
             break;
@@ -422,15 +557,16 @@ fn compare_dir(view: &SnapshotView, parent: Ino, dir: &Path) -> Result<(), Impor
         }
     }
     for e in imported.values() {
-        view.forget(e.1, 1);
+        view.forget(e.ino, 1);
     }
     for (name, path, md) in entries(dir)? {
-        let Some(&(kind, ino, mode, size, rdev)) = imported.get(name.as_bytes()) else {
+        let Some(&attr) = imported.get(name.as_bytes()) else {
             return Err(ImportError::Mismatch {
                 path: path.display().to_string(),
                 reason: "missing from the imported snapshot".into(),
             });
         };
+        let (kind, ino, mode, size, rdev) = (attr.kind, attr.ino, attr.mode, attr.size, attr.rdev);
         let want = if md.is_dir() {
             FileKind::Directory
         } else if md.is_symlink() {
@@ -457,6 +593,7 @@ fn compare_dir(view: &SnapshotView, parent: Ino, dir: &Path) -> Result<(), Impor
                 ),
             });
         }
+        same_mtime(&attr, &md, &path)?;
         if kind.is_device() && rdev != cowfs_rdev(md.rdev()) {
             return Err(ImportError::Mismatch {
                 path: path.display().to_string(),
@@ -472,8 +609,28 @@ fn compare_dir(view: &SnapshotView, parent: Ino, dir: &Path) -> Result<(), Impor
                 reason: format!("imported {} bytes, the source has {}", size, md.len()),
             });
         }
+        if kind != FileKind::Directory && md.nlink() > 1 {
+            let id = (md.dev(), md.ino());
+            let seen = check.links.entry(id).or_insert((ino, 0));
+            seen.1 += 1;
+            if seen.0 != ino {
+                return Err(ImportError::Mismatch {
+                    path: path.display().to_string(),
+                    reason: "a hard link of the source is a separate file in the import".into(),
+                });
+            }
+        }
+        if kind != FileKind::Directory {
+            let id = (md.dev(), md.ino());
+            if *check.owners.entry(ino).or_insert(id) != id {
+                return Err(ImportError::Mismatch {
+                    path: path.display().to_string(),
+                    reason: "two different source files are one file in the import".into(),
+                });
+            }
+        }
         match kind {
-            FileKind::Directory => compare_dir(view, ino, &path)?,
+            FileKind::Directory => compare_dir(view, ino, &path, check)?,
             FileKind::Symlink => {
                 let target =
                     fs::read_link(&path).map_err(|e| fs_err("cannot read the link", &path, e))?;
@@ -485,14 +642,26 @@ fn compare_dir(view: &SnapshotView, parent: Ino, dir: &Path) -> Result<(), Impor
                     });
                 }
             }
-            FileKind::Regular => compare_bytes(view, ino, &path)?,
+            // A second name of a file already read back is not read again.
+            FileKind::Regular
+                if check
+                    .links
+                    .get(&(md.dev(), md.ino()))
+                    .is_some_and(|l| l.1 > 1) => {}
+            FileKind::Regular => compare_bytes(view, ino, &path, check)?,
             _ => {}
         }
+        check.tick()?;
     }
     Ok(())
 }
 
-fn compare_bytes(view: &SnapshotView, ino: Ino, src: &Path) -> Result<(), ImportError> {
+fn compare_bytes(
+    view: &SnapshotView,
+    ino: Ino,
+    src: &Path,
+    check: &mut Check<'_, '_>,
+) -> Result<(), ImportError> {
     let mut file = fs::File::open(src).map_err(|e| fs_err("cannot read", src, e))?;
     let mut buf = vec![0u8; CHUNK];
     let mut off = 0u64;
@@ -511,5 +680,6 @@ fn compare_bytes(view: &SnapshotView, ino: Ino, src: &Path) -> Result<(), Import
             });
         }
         off += want as u64;
+        check.tick()?;
     }
 }

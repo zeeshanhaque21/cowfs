@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 cowfs-store = { path = "../cowfs-store" }
 cowfs-meta = { path = "../cowfs-meta" }
+blake3.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -479,8 +479,24 @@ impl Core {
     /// That is GC's live set (`meta.durable_snapshots`), so a block this reports missing would fail
     /// a read through a snapshot mount. Nothing is repaired, reaped or freed.
     pub fn fsck(&self) -> Result<FsckReport, Error> {
-        let mut report = self.inner.blocks.store().fsck().map_err(from_store)?;
-        self.missing_live_refs(&mut report)?;
+        self.fsck_with(&mut |_, _| true)
+    }
+
+    /// [`Core::fsck`] that calls `progress(done, total)` while it works, in bytes of pack while the
+    /// store is re-hashed and then with `done == total` while the live set is checked. Returning
+    /// false stops the check with an I/O error. It is called often, so a caller throttles.
+    pub fn fsck_with(
+        &self,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<FsckReport, Error> {
+        let mut report = self
+            .inner
+            .blocks
+            .store()
+            .fsck_with(progress)
+            .map_err(from_store)?;
+        let total = report.bytes_scanned;
+        self.missing_live_refs(&mut report, &mut || progress(total, total))?;
         Ok(report)
     }
 
@@ -488,7 +504,11 @@ impl Core {
     ///
     /// At most [`MAX_MISSING_LIVE_REFS`] are listed, so a wholesale store loss cannot turn the
     /// report into an unbounded enumeration; the traversal itself still visits every live id.
-    fn missing_live_refs(&self, report: &mut FsckReport) -> Result<(), Error> {
+    fn missing_live_refs(
+        &self,
+        report: &mut FsckReport,
+        tick: &mut dyn FnMut() -> bool,
+    ) -> Result<(), Error> {
         let store = self.inner.blocks.store();
         let mut marker = cowfs_meta::Marker::new();
         let mut listed = 0usize;
@@ -501,6 +521,9 @@ impl Core {
             let walk = snap.live_blocks(&mut marker).map_err(from_meta)?;
             for id in walk {
                 let id = id.map_err(from_meta)?;
+                if !tick() {
+                    return Err(Error::Io("fsck was cancelled".into()));
+                }
                 if id == file::HOLE || store.contains(id) {
                     continue;
                 }

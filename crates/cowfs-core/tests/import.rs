@@ -248,13 +248,13 @@ fn a_source_that_changes_under_the_import_is_a_mismatch_not_a_success() {
     fs::write(src.join("b"), b"world").unwrap();
     // Change `a` after both files have been read, so the source is a different tree by the time the
     // imported snapshot is read back and compared with it.
-    let seen = std::cell::Cell::new(0u32);
+    // The count of the source reports a total of 0 and is before any read, so it is skipped.
+    let changed = std::cell::Cell::new(false);
     let mut hooks = Hooks {
-        progress: &mut |_, _| {
-            if seen.get() == 1 {
+        progress: &mut |done, total| {
+            if total > 0 && done == total && !changed.replace(true) {
                 fs::write(src.join("a"), b"hello, world").unwrap();
             }
-            seen.set(seen.get() + 1);
             true
         },
     };
@@ -314,4 +314,248 @@ fn list(dir: &std::path::Path) -> Vec<(String, u64, u32)> {
         .collect();
     out.sort();
     out
+}
+
+fn set_mtime(path: &std::path::Path, secs: u64, nanos: u32) {
+    let t = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+    fs::File::open(path).unwrap().set_modified(t).unwrap();
+}
+
+/// Issue 290: a build tool decides what is fresh from mtimes, so a copy that resets them looks
+/// changed and is rebuilt.
+#[test]
+fn keeps_the_modification_time_of_every_node_to_the_nanosecond() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("d/file"), b"content").unwrap();
+    fs::write(src.join("empty"), b"").unwrap();
+    symlink("d/file", src.join("link")).unwrap();
+    // Set last: writing a child moves its parent's time.
+    set_mtime(&src.join("d/file"), 1_600_000_000, 123_456_789);
+    set_mtime(&src.join("empty"), 1_500_000_000, 1);
+    set_mtime(&src.join("d"), 1_400_000_000, 999_999_999);
+    set_mtime(&src, 1_300_000_000, 5);
+
+    run(&f.core, &src, "times").unwrap();
+    let view = f.core.snapshot_view("times").unwrap();
+    let mtime = |ino| {
+        let m = view.getattr(ino).unwrap().mtime;
+        (m.secs, m.nanos)
+    };
+    let d = view.lookup(ROOT_INO, b"d").unwrap();
+    let file = view.lookup(d.ino, b"file").unwrap();
+    let empty = view.lookup(ROOT_INO, b"empty").unwrap();
+    assert_eq!(mtime(file.ino), (1_600_000_000, 123_456_789));
+    assert_eq!(mtime(empty.ino), (1_500_000_000, 1));
+    assert_eq!(mtime(d.ino), (1_400_000_000, 999_999_999));
+    assert_eq!(mtime(ROOT_INO), (1_300_000_000, 5));
+    let link = view.lookup(ROOT_INO, b"link").unwrap();
+    let want = fs::symlink_metadata(src.join("link")).unwrap();
+    assert_eq!(mtime(link.ino), (want.mtime(), want.mtime_nsec() as u32));
+}
+
+#[test]
+fn keeps_hard_links_as_one_file_counting_only_the_names_inside_the_tree() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(src.join("deps")).unwrap();
+    fs::write(src.join("a"), b"shared bytes").unwrap();
+    fs::hard_link(src.join("a"), src.join("deps/b")).unwrap();
+    fs::hard_link(src.join("a"), src.join("deps/c")).unwrap();
+    fs::write(src.join("other"), b"shared bytes").unwrap();
+    // A second name outside the imported tree is not a name inside it.
+    fs::write(src.join("kept"), b"kept").unwrap();
+    fs::hard_link(src.join("kept"), f.dir.path().join("outside")).unwrap();
+
+    let got = run(&f.core, &src, "links").unwrap();
+    assert_eq!((got.files, got.bytes), (5, 12 * 4 + 4), "{got:?}");
+
+    let view = f.core.snapshot_view("links").unwrap();
+    let deps = view.lookup(ROOT_INO, b"deps").unwrap();
+    let a = view.lookup(ROOT_INO, b"a").unwrap();
+    let b = view.lookup(deps.ino, b"b").unwrap();
+    let c = view.lookup(deps.ino, b"c").unwrap();
+    assert_eq!((a.ino, a.nlink), (b.ino, 3), "{a:?} {b:?}");
+    assert_eq!(c.ino, a.ino);
+    assert_eq!(common::read_all(&view, c.ino), b"shared bytes");
+    let other = view.lookup(ROOT_INO, b"other").unwrap();
+    assert_ne!(other.ino, a.ino, "equal content is not the same file");
+    assert_eq!(other.nlink, 1);
+    let kept = view.lookup(ROOT_INO, b"kept").unwrap();
+    assert_eq!(kept.nlink, 1, "{kept:?}");
+}
+
+/// A caller that gives up on silence needs the read-back and the count of the source to report
+/// too, not only the write (issue 290).
+#[test]
+fn reports_progress_while_it_counts_the_source_and_while_it_reads_back() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    for i in 0..10 {
+        fs::write(src.join(format!("f{i}")), b"").unwrap();
+    }
+    let mut calls = 0u32;
+    let mut hooks = Hooks {
+        progress: &mut |_, _| {
+            calls += 1;
+            true
+        },
+    };
+    ingest(&f.core, &src, "quiet", &mut hooks).unwrap();
+    // Empty files have no bytes to report, so each phase reports once per entry: count, write,
+    // read back.
+    assert!(calls >= 30, "{calls} calls");
+}
+
+/// A symlink and a fifo can have two names too. The core accepts `link` on both, so the import
+/// keeps each as one inode and does not fail.
+#[test]
+fn a_hard_linked_symlink_and_fifo_import_instead_of_failing() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("target"), b"t").unwrap();
+    symlink("target", src.join("s1")).unwrap();
+    let fifo = src.join("p1");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    // `-P` links the symlink itself on both Linux and macOS (macOS follows it by default).
+    let linked = |from: &std::path::Path, to: &std::path::Path| {
+        std::process::Command::new("ln")
+            .arg("-P")
+            .arg(from)
+            .arg(to)
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(
+        linked(&src.join("s1"), &src.join("s2")),
+        "the test needs a symlink link"
+    );
+    assert!(linked(&fifo, &src.join("p2")), "the test needs a fifo link");
+
+    run(&f.core, &src, "links").unwrap();
+    let view = f.core.snapshot_view("links").unwrap();
+    let (p1, p2) = (
+        view.lookup(ROOT_INO, b"p1").unwrap(),
+        view.lookup(ROOT_INO, b"p2").unwrap(),
+    );
+    assert_eq!((p1.kind, p2.kind), (FileKind::Fifo, FileKind::Fifo));
+    assert_eq!((p1.ino, p1.nlink), (p2.ino, 2), "the core links a fifo");
+    let s1 = view.lookup(ROOT_INO, b"s1").unwrap();
+    let s2 = view.lookup(ROOT_INO, b"s2").unwrap();
+    assert_eq!((s1.kind, s2.kind), (FileKind::Symlink, FileKind::Symlink));
+    assert_eq!((s1.ino, s1.nlink), (s2.ino, 2), "the core links a symlink");
+    assert_eq!(view.readlink(s1.ino).unwrap(), b"target");
+    assert_eq!(view.readlink(s2.ino).unwrap(), b"target");
+    f.core.check().unwrap();
+}
+
+/// A source file that gains a name while it is being imported cannot be told from a lost link, so
+/// the read-back must say so (issue 290). The new name is made after the write and before the
+/// read-back.
+#[test]
+fn a_hard_link_made_during_the_import_is_a_mismatch() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a"), b"hello").unwrap();
+    fs::write(src.join("b"), b"world").unwrap();
+    let done = std::cell::Cell::new(false);
+    let mut hooks = Hooks {
+        progress: &mut |d, total| {
+            if total > 0 && d == total && !done.replace(true) {
+                fs::hard_link(src.join("a"), src.join("a2")).unwrap();
+            }
+            true
+        },
+    };
+    let e = ingest(&f.core, &src, "raced", &mut hooks).unwrap_err();
+    assert!(matches!(e, ImportError::Mismatch { .. }), "{e:?}");
+    assert!(f.core.list_snapshots().unwrap().is_empty());
+}
+
+/// Two names of one source file must be one imported file, and a name of a link count that does not
+/// match must be reported. Here a file that was one of two names loses the other one mid-import.
+#[test]
+fn a_link_count_that_changes_during_the_import_is_a_mismatch() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a"), b"hello").unwrap();
+    fs::hard_link(src.join("a"), src.join("b")).unwrap();
+    let done = std::cell::Cell::new(false);
+    let mut hooks = Hooks {
+        progress: &mut |d, total| {
+            if total > 0 && d == total && !done.replace(true) {
+                fs::remove_file(src.join("b")).unwrap();
+            }
+            true
+        },
+    };
+    let e = ingest(&f.core, &src, "raced", &mut hooks).unwrap_err();
+    assert!(matches!(e, ImportError::Mismatch { .. }), "{e:?}");
+    assert!(f.core.list_snapshots().unwrap().is_empty());
+}
+
+/// Replacing a file with another file of the same name and size but a different inode, after the
+/// write, is a different source file in the same place: the identity check sees two source files
+/// where the import wrote one.
+#[test]
+fn two_source_files_never_share_one_imported_inode() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a"), b"hello").unwrap();
+    fs::hard_link(src.join("a"), src.join("b")).unwrap();
+    let done = std::cell::Cell::new(false);
+    let mut hooks = Hooks {
+        progress: &mut |d, total| {
+            if total > 0 && d == total && !done.replace(true) {
+                // `b` becomes a separate file with the same bytes and mtime.
+                let m = fs::metadata(src.join("b")).unwrap();
+                fs::remove_file(src.join("b")).unwrap();
+                fs::write(src.join("b"), b"hello").unwrap();
+                fs::File::open(src.join("b"))
+                    .unwrap()
+                    .set_modified(m.modified().unwrap())
+                    .unwrap();
+            }
+            true
+        },
+    };
+    let e = ingest(&f.core, &src, "raced", &mut hooks).unwrap_err();
+    assert!(matches!(e, ImportError::Mismatch { .. }), "{e:?}");
+    assert!(f.core.list_snapshots().unwrap().is_empty());
+}
+
+/// Touching a source file during the import without changing its bytes now fails the read-back,
+/// because the imported mtime is no longer the source's.
+#[test]
+fn a_source_touched_during_the_import_is_a_mismatch() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a"), b"hello").unwrap();
+    set_mtime(&src.join("a"), 1_600_000_000, 1);
+    let done = std::cell::Cell::new(false);
+    let mut hooks = Hooks {
+        progress: &mut |d, total| {
+            if total > 0 && d == total && !done.replace(true) {
+                set_mtime(&src.join("a"), 1_700_000_000, 2);
+            }
+            true
+        },
+    };
+    let e = ingest(&f.core, &src, "raced", &mut hooks).unwrap_err();
+    let ImportError::Mismatch { reason, .. } = e else {
+        panic!("expected a mismatch")
+    };
+    assert!(reason.contains("mtime"), "{reason}");
 }

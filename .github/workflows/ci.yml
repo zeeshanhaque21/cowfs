@@ -180,14 +180,23 @@ jobs:
   # Issue 171: the namespace isolation tests skip on a host that denies unprivileged user namespaces.
   # ubuntu-24.04 does (kernel.apparmor_restrict_unprivileged_userns=1, measured on the runner), so
   # this job lifts that one sysctl and then refuses to go green unless the isolation tests ran.
+  # Second leg ubuntu-22.04 (kernel 6.8, measured on the runner): it has the sysctl key at 0 already,
+  # so the lift is conditional. A future image without the key must not fail the step.
   linux-namespaces:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Allow unprivileged user namespaces
         run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          uname -r
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
           unshare --user --map-root-user --mount --propagation private -- true
       - name: Namespace tests
         shell: bash  # bash -e -o pipefail, so a failing test fails the step through the tee
@@ -200,7 +209,7 @@ jobs:
 
           log = Path("namespaces.log").read_text()
           assert "a mount namespace was available" in log, "helper reported no namespace: isolation skipped"
-          ran = re.findall(r"^(test_\w+) \(test_namespaces\.Isolation\.\w+\) \.\.\. ok$", log, re.MULTILINE)
+          ran = re.findall(r"^(test_\w+) \(test_namespaces\.Isolation(?:\.\w+)?\) \.\.\. ok$", log, re.MULTILINE)
           assert len(ran) == 9, f"expected 9 isolation tests to pass, saw {len(ran)}: {ran}"
           assert re.search(r"^Ran 17 tests", log, re.MULTILINE), "test count changed: update this gate"
           assert re.search(r"^OK \(skipped=1\)$", log, re.MULTILINE), "namespace run was not a clean pass"

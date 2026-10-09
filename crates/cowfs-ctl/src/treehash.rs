@@ -45,8 +45,15 @@ pub struct TreeHash {
 /// the child directory's hash. Symlinks are never followed, and hash as mode `0o777` whatever
 /// the kernel reports, because those bits are not the symlink's own.
 pub fn hash_tree(dir: &Path) -> io::Result<TreeHash> {
+    hash_tree_with(dir, &mut || true)
+}
+
+/// [`hash_tree`] that calls `tick` for every entry and every megabyte it reads, so a caller can
+/// report progress while a large tree is hashed. `tick` returns false to stop, which fails the
+/// hash with an `Interrupted` error. It is called often, so a caller throttles.
+pub fn hash_tree_with(dir: &Path, tick: &mut dyn FnMut() -> bool) -> io::Result<TreeHash> {
     let (mut files, mut bytes) = (0, 0);
-    let root = hash_dir(dir, &mut files, &mut bytes)?;
+    let root = hash_dir(dir, &mut files, &mut bytes, tick)?;
     Ok(TreeHash {
         root: root.to_hex().to_string(),
         files,
@@ -60,8 +67,17 @@ pub fn hash_tree(dir: &Path) -> io::Result<TreeHash> {
 /// where the imported tree has no directory on disk to hash. It walks the same algorithm, so the
 /// two hashes of one tree agree and a caller can compare them.
 pub fn hash_view(fs: &dyn Vfs, root: Ino) -> io::Result<TreeHash> {
+    hash_view_with(fs, root, &mut || true)
+}
+
+/// [`hash_view`] with the `tick` of [`hash_tree_with`].
+pub fn hash_view_with(
+    fs: &dyn Vfs,
+    root: Ino,
+    tick: &mut dyn FnMut() -> bool,
+) -> io::Result<TreeHash> {
     let (mut files, mut bytes) = (0, 0);
-    let h = hash_view_dir(fs, root, &mut files, &mut bytes)?;
+    let h = hash_view_dir(fs, root, &mut files, &mut bytes, tick)?;
     Ok(TreeHash {
         root: h.to_hex().to_string(),
         files,
@@ -77,7 +93,16 @@ struct Entry {
     size: u64,
 }
 
-fn hash_dir(dir: &Path, files: &mut u64, bytes: &mut u64) -> io::Result<blake3::Hash> {
+fn stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "the hash was stopped")
+}
+
+fn hash_dir(
+    dir: &Path,
+    files: &mut u64,
+    bytes: &mut u64,
+    tick: &mut dyn FnMut() -> bool,
+) -> io::Result<blake3::Hash> {
     let mut entries: Vec<Entry> = Vec::new();
     for e in fs::read_dir(dir)? {
         let e = e?;
@@ -93,6 +118,9 @@ fn hash_dir(dir: &Path, files: &mut u64, bytes: &mut u64) -> io::Result<blake3::
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     let mut h = blake3::Hasher::new();
     for e in entries {
+        if !tick() {
+            return Err(stopped());
+        }
         h.update(&(e.name.len() as u64).to_le_bytes());
         h.update(&e.name);
         h.update(&mode_of(&e).to_le_bytes());
@@ -104,6 +132,7 @@ fn hash_dir(dir: &Path, files: &mut u64, bytes: &mut u64) -> io::Result<blake3::
                         &dir.join(String::from_utf8_lossy(&e.name).into_owned()),
                         files,
                         bytes,
+                        tick,
                     )?
                     .as_bytes(),
                 );
@@ -118,10 +147,20 @@ fn hash_dir(dir: &Path, files: &mut u64, bytes: &mut u64) -> io::Result<blake3::
             Kind::File => {
                 h.update(b"f");
                 let mut fh = blake3::Hasher::new();
-                let n = io::copy(
-                    &mut fs::File::open(dir.join(String::from_utf8_lossy(&e.name).into_owned()))?,
-                    &mut fh,
-                )?;
+                let mut file =
+                    fs::File::open(dir.join(String::from_utf8_lossy(&e.name).into_owned()))?;
+                let (mut buf, mut n) = (vec![0u8; 1 << 20], 0u64);
+                loop {
+                    let got = io::Read::read(&mut file, &mut buf)?;
+                    if got == 0 {
+                        break;
+                    }
+                    fh.update(&buf[..got]);
+                    n += got as u64;
+                    if !tick() {
+                        return Err(stopped());
+                    }
+                }
                 *files += 1;
                 *bytes += n;
                 h.update(&n.to_le_bytes());
@@ -140,6 +179,7 @@ fn hash_view_dir(
     dir: Ino,
     files: &mut u64,
     bytes: &mut u64,
+    tick: &mut dyn FnMut() -> bool,
 ) -> io::Result<blake3::Hash> {
     let mut entries: Vec<Entry> = Vec::new();
     let mut cookie = 0u64;
@@ -167,6 +207,9 @@ fn hash_view_dir(
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     let mut h = blake3::Hasher::new();
     for e in entries {
+        if !tick() {
+            return Err(stopped());
+        }
         let ino = fs.lookup(dir, &e.name).map_err(vfs)?.ino;
         h.update(&(e.name.len() as u64).to_le_bytes());
         h.update(&e.name);
@@ -174,7 +217,7 @@ fn hash_view_dir(
         match e.kind {
             Kind::Dir => {
                 h.update(b"d");
-                h.update(hash_view_dir(fs, ino, files, bytes)?.as_bytes());
+                h.update(hash_view_dir(fs, ino, files, bytes, tick)?.as_bytes());
             }
             Kind::Link => {
                 h.update(b"l");
@@ -194,6 +237,9 @@ fn hash_view_dir(
                     fh.update(&got);
                     n += got.len() as u64;
                     off += got.len() as u64;
+                    if !tick() {
+                        return Err(stopped());
+                    }
                 }
                 *files += 1;
                 *bytes += n;

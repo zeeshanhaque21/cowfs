@@ -172,7 +172,7 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
         } else if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
             let _ = core.inner.unregister(&sc);
         }
-        let gone = crate::fsops::remove_file(p);
+        let gone = fs::remove_file(p);
         sync_dir(&core.inner.root);
         *core.inner.last_error.lk() = Some(format!(
             "swap recovery: {p:?} is unreadable, {} staging snapshot {staged}{}",
@@ -190,7 +190,7 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
     };
     if p.file_name().and_then(|n| n.to_str()) == Some(&format!("{SWAP_PREFIX}{target}.tmp")) {
         // an older release's temp file (`swap-<target>.tmp`): its swap had not started
-        if let Err(e) = crate::fsops::remove_file(p) {
+        if let Err(e) = fs::remove_file(p) {
             *core.inner.last_error.lk() = Some(format!(
                 "swap recovery: could not remove {p:?}: {e}; the next open retries"
             ));
@@ -208,7 +208,7 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
             "swap recovery: neither {target} nor its staged tree {staged} exists, intent removed"
         ));
     }
-    match crate::fsops::remove_file(p) {
+    match fs::remove_file(p) {
         Ok(()) => sync_dir(&core.inner.root),
         // `finish_swap` already dropped it
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -236,7 +236,7 @@ pub(crate) fn recover(core: &Core) {
     {
         if e.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
             // best-effort on purpose: the file is inert, and the next open retries
-            let _ = crate::fsops::remove_file(e.path());
+            let _ = fs::remove_file(e.path());
         }
     }
     for p in intents(&core.inner.root) {
@@ -478,7 +478,7 @@ impl Core {
         let p = intent_path(&self.inner.root, target);
         match self
             .fault(7)
-            .and_then(|()| crate::fsops::remove_file(&p).map_err(|e| io(&e.to_string())))
+            .and_then(|()| fs::remove_file(&p).map_err(|e| io(&e.to_string())))
         {
             Ok(()) => sync_dir(&self.inner.root),
             // nothing to remove: a recovery that already dropped it, or a swap with no intent

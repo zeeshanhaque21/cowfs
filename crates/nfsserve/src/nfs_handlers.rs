@@ -74,6 +74,33 @@ pub async fn handle_nfs(
     r
 }
 
+/// The procedure's name for logs.
+pub fn proc_name(proc: u32) -> String {
+    format!(
+        "{:?}",
+        NFSProgram::from_u32(proc).unwrap_or(NFSProgram::INVALID)
+    )
+}
+
+/// A NFS3ERR_JUKEBOX reply to `proc`: the status plus the empty failure body that procedure
+/// carries (RFC 1813: no attributes), so the client decodes it and retries later.
+pub fn jukebox_reply(xid: u32, proc: u32, output: &mut impl Write) -> Handled {
+    // Empty post_op_attr or wcc_data words after the status, by procedure.
+    let words = match proc {
+        0 | 1 => 0,
+        3..=6 | 16..=20 => 1,
+        15 => 3,
+        14 => 4,
+        _ => 2,
+    };
+    make_success_reply(xid).serialize(output)?;
+    nfsstat3::NFS3ERR_JUKEBOX.serialize(output)?;
+    for _ in 0..words {
+        0_u32.serialize(output)?;
+    }
+    Ok(())
+}
+
 const STAT_N: usize = 23;
 static STAT_COUNT: [AtomicU64; STAT_N] = [const { AtomicU64::new(0) }; STAT_N];
 static STAT_NS: [AtomicU64; STAT_N] = [const { AtomicU64::new(0) }; STAT_N];
@@ -982,6 +1009,26 @@ mod tests {
             mode,
             ..fattr3::default()
         }
+    }
+
+    #[test]
+    fn jukebox_carries_the_failure_body_of_its_procedure() {
+        let tail = |proc| {
+            let mut out = Vec::new();
+            jukebox_reply(7, proc, &mut out).unwrap();
+            let at = out
+                .windows(4)
+                .rposition(|w| w == 10008_u32.to_be_bytes())
+                .expect("status");
+            assert!(out[at + 4..].iter().all(|b| *b == 0));
+            out.len() - at - 4
+        };
+        // GETATTR: status only; LOOKUP: post_op_attr; SETATTR: wcc_data; LINK: attr + wcc;
+        // RENAME: two wcc_data.
+        assert_eq!(
+            [tail(1), tail(3), tail(2), tail(15), tail(14)],
+            [0, 4, 8, 12, 16]
+        );
     }
 
     #[test]

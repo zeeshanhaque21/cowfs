@@ -11,8 +11,8 @@
 //!   unsynced redb write is lost, which is a legal image);
 //! - the collector's own state directory, as an arbitrary mix of its old file, its new file, a torn
 //!   prefix of the new file and no file. Torn, old and missing states must be safe, and
-//!   `gc_state_is_advisory` is the evidence. Same-length corrupted bytes are NOT safe: `mark.bin`
-//!   has no checksum (see `mark_bin_bit_rot_loses_live_blocks_KNOWN_BUG`).
+//!   `gc_state_is_advisory` is the evidence. Same-length corrupted bytes are safe too: `mark.bin`
+//!   carries a trailing hash and a mismatch discards the cache (`mark_bin_bit_rot_is_rebuilt`).
 //!
 //! Each image is reopened with the shipped open paths. Every block any durable snapshot references
 //! must read back byte for byte, the store must report no loss and pass `fsck`, and a second collect
@@ -612,8 +612,8 @@ fn power_loss_at_every_op_of_a_reclaiming_collect_keeps_live_blocks() {
 
 /// The collector's state directory tolerates the states a power cut leaves: no mix of old, new, torn
 /// and missing files may lose a block or fail a collect. This is the evidence that `gcstate` needs
-/// no routing through the store's fsync model. It says nothing about same-length corrupted bytes,
-/// which `mark.bin` does not detect (the ignored test below).
+/// no routing through the store's fsync model. Same-length corrupted bytes are covered by
+/// `mark_bin_bit_rot_is_rebuilt`.
 #[test]
 fn gc_state_is_advisory() {
     let run = record();
@@ -640,14 +640,11 @@ fn gc_state_is_advisory() {
     );
 }
 
-/// KNOWN BUG, pinned and ignored so CI stays green: `mark.bin` carries no checksum, so a zeroed
-/// 64-byte span (bit rot, not a power cut) parses as a valid but different set and a later cycle
-/// can free live blocks. The fsyncs make power loss safe; they do not protect against this. Run
-/// with `--ignored`; it must start passing once the file is checksummed.
+/// `mark.bin` carries a trailing hash, so a zeroed 64-byte span (bit rot, not a power cut) is
+/// detected and the cache rebuilt by a full walk. Before issue 288 it parsed as a valid but
+/// different set and a later cycle freed live blocks.
 #[test]
-#[ignore = "known bug: mark.bin has no checksum, same-length corruption loses live blocks"]
-#[allow(non_snake_case)]
-fn mark_bin_bit_rot_loses_live_blocks_KNOWN_BUG() {
+fn mark_bin_bit_rot_is_rebuilt() {
     let run = record();
     let final_store = {
         let mut rng = Rng(7);

@@ -182,21 +182,46 @@ impl Handler {
         &self,
         params: &ImportParams,
         ingested: cowfs_core::Ingested,
+        ctx: &OpContext<'_>,
     ) -> CtlResult<ImportReport> {
+        // Hashing both trees reads every byte again, which takes as long as the ingest did. The
+        // walk has no entry count to hand, so `done` counts the walk's own steps (an entry or a
+        // megabyte) with no total: a liveness pulse that only ever rises.
+        let tick = |phase: &'static str| {
+            let mut throttle = Throttle::new();
+            let mut steps = 0u64;
+            move || {
+                steps += 1;
+                !throttle.due()
+                    || ctx
+                        .progress(ProgressEvent {
+                            phase: phase.into(),
+                            done: steps,
+                            total: None,
+                            unit: Unit::Items,
+                            message: None,
+                        })
+                        .is_ok()
+            }
+        };
+        let stopped = |e: std::io::Error| {
+            ctx.check().err().unwrap_or_else(|| {
+                CtlError::new(ErrorCode::IoError, format!("cannot hash the tree: {e}"))
+            })
+        };
         let source = PathBuf::from(&params.path);
-        let source_hash = cowfs_ctl::hash_tree(&source).map_err(|e| {
-            CtlError::new(ErrorCode::IoError, format!("cannot hash the source: {e}"))
-        })?;
+        let source_hash =
+            cowfs_ctl::hash_tree_with(&source, &mut tick("hash source")).map_err(stopped)?;
         let view = self
             .backend
             .snapshot(&params.name)
             .map_err(|e| io(e, "cannot read the imported snapshot"))?;
-        let got = cowfs_ctl::hash_view(view.as_ref(), cowfs_vfs::ROOT_INO).map_err(|e| {
-            CtlError::new(
-                ErrorCode::IoError,
-                format!("cannot hash the imported snapshot: {e}"),
-            )
-        })?;
+        let got = cowfs_ctl::hash_view_with(
+            view.as_ref(),
+            cowfs_vfs::ROOT_INO,
+            &mut tick("hash snapshot"),
+        )
+        .map_err(stopped)?;
         let verified = source_hash.root == got.root;
         Ok(ImportReport {
             name: params.name.clone(),
@@ -425,10 +450,30 @@ impl ControlHandler for Handler {
     }
 
     fn fsck(&self, ctx: &OpContext<'_>) -> CtlResult<FsckReport> {
+        // Re-hashing a large store takes minutes, so it reports as it goes: a client gives up on a
+        // daemon that stays silent for its timeout.
+        let mut throttle = Throttle::new();
+        let mut progress = |done: u64, total: u64| {
+            !throttle.due()
+                || ctx
+                    .progress(ProgressEvent {
+                        phase: "verify".into(),
+                        done,
+                        total: Some(total),
+                        unit: Unit::Bytes,
+                        message: None,
+                    })
+                    .is_ok()
+        };
         let report = self
             .backend
-            .fsck()
-            .map_err(|e| CtlError::new(ErrorCode::IoError, format!("fsck: {e}")))?
+            .fsck(&mut progress)
+            .map_err(|e| {
+                // A cancel stops the check by failing it, and says why through the context.
+                ctx.check()
+                    .err()
+                    .unwrap_or_else(|| CtlError::new(ErrorCode::IoError, format!("fsck: {e}")))
+            })?
             .ok_or_else(|| {
                 CtlError::new(
                     ErrorCode::Unsupported,
@@ -457,19 +502,24 @@ impl ControlHandler for Handler {
     /// compress into.
     fn import(&self, params: ImportParams, ctx: &OpContext<'_>) -> CtlResult<ImportReport> {
         let source = std::path::PathBuf::from(&params.path);
+        // Called for every entry and every chunk, so most calls are skipped. A total of 0 is the
+        // walk that counts the source, before there is one to show.
+        let mut throttle = Throttle::new();
         let mut progress = |done: u64, total: u64| {
-            ctx.progress(ProgressEvent {
-                phase: "ingest".into(),
-                done,
-                total: Some(total),
-                unit: Unit::Bytes,
-                message: None,
-            })
-            .is_ok()
+            !throttle.due()
+                || ctx
+                    .progress(ProgressEvent {
+                        phase: "ingest".into(),
+                        done,
+                        total: (total > 0).then_some(total),
+                        unit: Unit::Bytes,
+                        message: None,
+                    })
+                    .is_ok()
         };
         if let Some(ingested) = self.backend.ingest(&source, &params.name, &mut progress)? {
             self.changed();
-            return self.verified_report(&params, ingested);
+            return self.verified_report(&params, ingested, ctx);
         }
         self.can_ingest()?;
         crate::import::run(self.backend.as_ref(), self.snaps(), &params, ctx)
@@ -527,6 +577,28 @@ impl ControlHandler for Handler {
             eprintln!("cowfs-daemon: {e}");
         }
         Ok(())
+    }
+}
+
+/// Lets a call that fires per entry report about twenty times a second, the protocol's rate.
+struct Throttle(Option<std::time::Instant>);
+
+impl Throttle {
+    fn new() -> Self {
+        Throttle(None)
+    }
+
+    /// True on the first call and then at most once per 50 ms.
+    fn due(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if self
+            .0
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(50))
+        {
+            return false;
+        }
+        self.0 = Some(now);
+        true
     }
 }
 
@@ -832,6 +904,61 @@ mod tests {
         keep
     }
 
+    fn recording() -> (Arc<Lock<Vec<ProgressEvent>>>, OpContext<'static>) {
+        let events = Arc::new(Lock::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let ctx = OpContext::new(cowfs_ctl::CancelToken::new(), move |e| {
+            sink.lock().unwrap().push(e);
+            true
+        });
+        (events, ctx)
+    }
+
+    /// Issue 290: a client gives up on a daemon that stays silent for its timeout, and `fsck` of a
+    /// large store used to say nothing until it was done.
+    #[test]
+    fn fsck_reports_progress_while_it_runs_not_only_at_the_end() {
+        let (_d, h, backend) = core_handler();
+        garbage(&h, &backend);
+        let (events, ctx) = recording();
+        h.fsck(&ctx).unwrap();
+        let events = events.lock().unwrap();
+        let first = events.first().expect("an event");
+        assert!(
+            events.len() >= 2 && first.done < first.total.unwrap(),
+            "the first event comes before the work is done: {events:?}"
+        );
+    }
+
+    /// The same for `import`: the hash of the source and of the snapshot run after the ingest and
+    /// read every byte again.
+    #[test]
+    fn import_reports_progress_in_every_phase() {
+        let (d, h, _backend) = core_handler();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/a"), body(200_000, 3)).unwrap();
+        std::fs::write(src.join("b"), body(10, 4)).unwrap();
+        let (events, ctx) = recording();
+        let report = h
+            .import(
+                ImportParams {
+                    path: src.display().to_string(),
+                    name: "imp".into(),
+                },
+                &ctx,
+            )
+            .unwrap();
+        assert!(report.verified, "{report:?}");
+        let events = events.lock().unwrap();
+        for phase in ["ingest", "hash source", "hash snapshot"] {
+            assert!(
+                events.iter().any(|e| e.phase == phase),
+                "no {phase:?} event: {events:?}"
+            );
+        }
+    }
+
     #[test]
     fn gc_over_the_core_reclaims_dead_packs_and_survivors_still_read() {
         let (_d, h, backend) = core_handler();
@@ -889,7 +1016,12 @@ mod tests {
         for (n, data) in &keep {
             assert!(get(k.as_ref(), n) == *data, "{n}");
         }
-        assert!(backend.fsck().unwrap().unwrap().damage.is_empty());
+        assert!(backend
+            .fsck(&mut |_, _| true)
+            .unwrap()
+            .unwrap()
+            .damage
+            .is_empty());
     }
 
     /// A backend that reports a GC cycle which failed but still wrote bytes into a new pack: an
@@ -1031,7 +1163,12 @@ mod tests {
         for (n, data) in &keep {
             assert!(get(k.as_ref(), n) == *data, "{n}");
         }
-        assert!(backend.fsck().unwrap().unwrap().damage.is_empty());
+        assert!(backend
+            .fsck(&mut |_, _| true)
+            .unwrap()
+            .unwrap()
+            .damage
+            .is_empty());
         let again = h
             .gc(GcParams { dry_run: false }, &OpContext::detached())
             .unwrap();
