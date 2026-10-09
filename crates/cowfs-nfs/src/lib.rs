@@ -81,14 +81,17 @@
 //! The server listens on 127.0.0.1 only, and answers MNT for one export path
 //! (`localhost:/cowfs-<32 random hex digits>`) that only `mount_nfs` is told. A local process that
 //! finds the port cannot guess the path, so it cannot become a client at all; that is what
-//! protects the root handle, which is then given to one connection (the first MNT, one-shot,
-//! `Server::rearm_mount` for a remount). Every handle carries a keyed BLAKE3 MAC (random key per
+//! protects the root handle, which is then given to one MNT (the first, one-shot: a second MNT is
+//! refused even from the same connection, and UMNT does not reopen the gate; a deliberate remount
+//! within one server's lifetime needs `Server::rearm_mount`, and a daemon restart makes a new
+//! export path and gate). Every handle carries a keyed BLAKE3 MAC (random key per
 //! server instance), so a process that never obtained handles from the client cannot forge one.
 //!
 //! Residual risk, stated plainly: any process that can read the mounting client's memory or the
 //! kernel NFS state can take a real handle; any process of the same user can use the mount point
 //! itself; and the export path reaches the process table of any process that can see the
-//! `mount_nfs` command line while it runs. `check_peer_uid` (an `lsof` lookup) is off by default
+//! `mount_nfs` command line while it runs (and the mount table lists it afterwards, when the gate is
+//! already closed). `check_peer_uid` (an `lsof` lookup) is off by default
 //! because the kernel NFS client's socket is invisible to it, so it cannot tell an attacker from
 //! the client.
 //!

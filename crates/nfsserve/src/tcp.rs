@@ -49,12 +49,12 @@ impl Default for Limits {
     }
 }
 
-/// Lets one client take the root file handle. The first peer to call MNT claims it, later MNT
-/// calls from other connections are refused until `rearm`. Unmounting does not rearm it, so a
-/// process that sends UMNT cannot reopen the gate.
+/// Lets exactly one MNT take the root file handle. The first MNT claims it and every later MNT,
+/// from any connection or source address (the claimer's included), is refused until `rearm`.
+/// Unmounting does not rearm it, so a process that sends UMNT cannot reopen the gate.
 #[derive(Debug, Default)]
 pub struct MountGate {
-    claimed: Mutex<Option<SocketAddr>>,
+    claimed: AtomicBool,
     refused: AtomicBool,
 }
 
@@ -63,25 +63,18 @@ impl MountGate {
         Self::default()
     }
 
-    /// True if `peer` may mount: nobody has yet, or `peer` is the connection that already did.
-    pub fn claim(&self, peer: SocketAddr) -> bool {
-        let mut g = self.claimed.lock().unwrap_or_else(PoisonError::into_inner);
-        match *g {
-            None => {
-                *g = Some(peer);
-                true
-            }
-            Some(p) if p == peer => true,
-            Some(_) => {
-                self.refused.store(true, Ordering::Relaxed);
-                false
-            }
+    /// True for the first caller since creation or the last `rearm`, false for every other.
+    pub fn claim(&self) -> bool {
+        if self.claimed.swap(true, Ordering::AcqRel) {
+            self.refused.store(true, Ordering::Relaxed);
+            return false;
         }
+        true
     }
 
     /// Allows the next MNT to claim the gate, for a deliberate remount.
     pub fn rearm(&self) {
-        *self.claimed.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.claimed.store(false, Ordering::Release);
     }
 
     /// True if a MNT was refused since the gate was created.
@@ -351,22 +344,14 @@ fn is_transient_accept_error(e: &io::Error) -> bool {
 mod tests {
     use super::*;
 
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], port))
-    }
-
     #[test]
-    fn the_gate_admits_one_peer_until_rearmed() {
+    fn the_gate_admits_one_mnt_until_rearmed() {
         let g = MountGate::new();
-        assert!(g.claim(addr(1)));
-        assert!(
-            g.claim(addr(1)),
-            "the claiming connection may repeat itself"
-        );
-        assert!(!g.claim(addr(2)));
+        assert!(g.claim());
+        assert!(!g.claim(), "not even the claimer may take a second handle");
         assert!(g.refused_any());
         g.rearm();
-        assert!(g.claim(addr(2)));
-        assert!(!g.claim(addr(1)));
+        assert!(g.claim());
+        assert!(!g.claim());
     }
 }

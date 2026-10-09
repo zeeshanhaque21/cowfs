@@ -121,7 +121,7 @@ pub async fn mountproc3_mnt(
         }
     }
     if let Some(gate) = &context.mount_gate {
-        if !gate.claim(context.peer) {
+        if !gate.claim() {
             debug!(
                 "{:?} --> MNT3ERR_ACCES, the root handle was already taken",
                 xid

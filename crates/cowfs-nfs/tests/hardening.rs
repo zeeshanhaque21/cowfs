@@ -29,8 +29,8 @@ fn only_the_first_mnt_gets_the_root_handle() {
     );
     assert_eq!(
         first.mount_path(&own).0,
-        0,
-        "the claiming connection may repeat itself"
+        MNT_ACCES,
+        "even the claiming connection cannot take a second root handle (#43)"
     );
     assert_eq!(
         other.getattr(&root).0,
@@ -131,6 +131,61 @@ fn export_does_not_hand_out_the_secret_export_path() {
             "EXPORT listed {path}; MNT of it then returned status {st}, root handle: {}",
             h.is_some()
         );
+    }
+}
+
+#[test]
+fn a_mnt_after_the_legitimate_one_never_gets_a_root_handle() {
+    let (s, mut legit) = serve(memfs(), MountOptions::default());
+    let own = format!("/{}", s.export_name());
+    let root = legit.root.clone();
+    assert_eq!(legit.getattr(&root).0, OK);
+    // A later connection, and the legitimate connection itself, both ask again.
+    let mut late = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(late.mount_path(&own).0, MNT_ACCES, "a later connection");
+    assert_eq!(
+        legit.mount_path(&own).0,
+        MNT_ACCES,
+        "a repeat on the same one"
+    );
+    // After the legitimate connection is gone, nothing reopens the gate either.
+    drop(legit);
+    let mut after = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(after.mount_path(&own).0, MNT_ACCES, "after it hung up");
+}
+
+#[test]
+fn a_racing_mnt_that_wins_leaves_the_legitimate_one_refused_loudly() {
+    // A local process that already knows the path (say from `ps`) mounts before mount_nfs.
+    let s = Server::start(memfs(), &MountOptions::default(), None).unwrap();
+    let own = format!("/{}", s.export_name());
+    let mut racer = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(racer.mount_path(&own).0, 0, "the racer wins the gate");
+    let mut legit = Nfs::attach(s.port(), nfs_fh3::default());
+    // mount_nfs fails on this status, so Mount::new returns an error instead of a hijacked mount.
+    assert_eq!(legit.mount_path(&own).0, MNT_ACCES);
+    assert!(
+        s.mnt_was_refused(),
+        "Mount::new reports this as RootHandleTaken"
+    );
+}
+
+#[test]
+fn unmounting_does_not_reopen_the_gate() {
+    // Decision (#43): within one server's lifetime a remount needs the explicit `rearm_mount`.
+    // A daemon restart makes a new server, a new export path and a new gate, so `Mount` never
+    // needs it. UMNT (MOUNT procedure 3) and UMNTALL (4) must not reopen the gate.
+    let (s, mut legit) = serve(memfs(), MountOptions::default());
+    let own = format!("/{}", s.export_name());
+    for proc in [3, 4] {
+        let args = if proc == 3 {
+            Args::new().put(&own.as_bytes().to_vec())
+        } else {
+            Args::new()
+        };
+        assert_eq!(legit.raw(MOUNT, 3, proc, args).0, 0);
+        let mut x = Nfs::attach(s.port(), nfs_fh3::default());
+        assert_eq!(x.mount_path(&own).0, MNT_ACCES, "after MOUNT proc {proc}");
     }
 }
 
