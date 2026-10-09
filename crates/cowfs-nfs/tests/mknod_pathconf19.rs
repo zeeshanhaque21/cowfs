@@ -94,7 +94,11 @@ fn mknod_whiteout_is_allowed_for_any_caller_but_no_other_device() {
     let (_s, mut c) = serve(memfs(), MountOptions::default());
     let root = c.root.clone();
     let perm = nfsstat3::NFS3ERR_PERM as u32;
-    let (st, _) = c.call_as(1000, 11, mknod_args(&root, "wo", ftype3::NF3CHR, 0o644, (0, 0)));
+    let (st, _) = c.call_as(
+        1000,
+        11,
+        mknod_args(&root, "wo", ftype3::NF3CHR, 0o644, (0, 0)),
+    );
     assert_eq!(st, OK, "whiteout as uid 1000");
     for (kind, n, dev) in [
         (ftype3::NF3BLK, "blk00", (0, 0)),
