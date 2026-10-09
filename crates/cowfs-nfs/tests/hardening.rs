@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use common::reuse::ReusingVfs;
 use common::*;
-use cowfs_nfs::{MountOptions, HANDLE_LEN};
+use cowfs_nfs::{MountOptions, Server, HANDLE_LEN};
 use nfsserve::nfs::nfs_fh3;
 use nfsserve::tcp::Limits;
 
@@ -29,8 +29,8 @@ fn only_the_first_mnt_gets_the_root_handle() {
     );
     assert_eq!(
         first.mount_path(&own).0,
-        0,
-        "the claiming connection may repeat itself"
+        MNT_ACCES,
+        "even the claiming connection cannot take a second root handle (#43)"
     );
     assert_eq!(
         other.getattr(&root).0,
@@ -106,6 +106,87 @@ fn a_gate_off_server_lets_everyone_mount() {
         y.mount_path("/cowfs-0123456789abcdef0123456789abcdef").0,
         MNT_NOENT
     );
+}
+
+/// What a process that never mounted learns from MOUNT EXPORT (procedure 5): the export path if
+/// the server lists one.
+fn export_list(x: &mut Nfs) -> Option<String> {
+    let (acc, mut r) = x.raw(MOUNT, 3, 5, Args::new());
+    assert_eq!(acc, 0);
+    if dec::<u32>(&mut r) == 0 {
+        return None;
+    }
+    let dir: Vec<u8> = dec(&mut r);
+    Some(String::from_utf8_lossy(&dir).into_owned())
+}
+
+#[test]
+fn export_does_not_hand_out_the_secret_export_path() {
+    // No legitimate client yet, so a process that learns the path from EXPORT mounts first.
+    let s = Server::start(memfs(), &MountOptions::default(), None).unwrap();
+    let mut spy = Nfs::attach(s.port(), nfs_fh3::default());
+    if let Some(path) = export_list(&mut spy) {
+        let (st, h) = spy.mount_path(&path);
+        panic!(
+            "EXPORT listed {path}; MNT of it then returned status {st}, root handle: {}",
+            h.is_some()
+        );
+    }
+}
+
+#[test]
+fn a_mnt_after_the_legitimate_one_never_gets_a_root_handle() {
+    let (s, mut legit) = serve(memfs(), MountOptions::default());
+    let own = format!("/{}", s.export_name());
+    let root = legit.root.clone();
+    assert_eq!(legit.getattr(&root).0, OK);
+    // A later connection, and the legitimate connection itself, both ask again.
+    let mut late = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(late.mount_path(&own).0, MNT_ACCES, "a later connection");
+    assert_eq!(
+        legit.mount_path(&own).0,
+        MNT_ACCES,
+        "a repeat on the same one"
+    );
+    // After the legitimate connection is gone, nothing reopens the gate either.
+    drop(legit);
+    let mut after = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(after.mount_path(&own).0, MNT_ACCES, "after it hung up");
+}
+
+#[test]
+fn a_racing_mnt_that_wins_leaves_the_legitimate_one_refused_loudly() {
+    // A local process that already knows the path (say from `ps`) mounts before mount_nfs.
+    let s = Server::start(memfs(), &MountOptions::default(), None).unwrap();
+    let own = format!("/{}", s.export_name());
+    let mut racer = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(racer.mount_path(&own).0, 0, "the racer wins the gate");
+    let mut legit = Nfs::attach(s.port(), nfs_fh3::default());
+    // mount_nfs fails on this status, so Mount::new returns an error instead of a hijacked mount.
+    assert_eq!(legit.mount_path(&own).0, MNT_ACCES);
+    assert!(
+        s.mnt_was_refused(),
+        "Mount::new reports this as RootHandleTaken"
+    );
+}
+
+#[test]
+fn unmounting_does_not_reopen_the_gate() {
+    // Decision (#43): within one server's lifetime a remount needs the explicit `rearm_mount`.
+    // A daemon restart makes a new server, a new export path and a new gate, so `Mount` never
+    // needs it. UMNT (MOUNT procedure 3) and UMNTALL (4) must not reopen the gate.
+    let (s, mut legit) = serve(memfs(), MountOptions::default());
+    let own = format!("/{}", s.export_name());
+    for proc in [3, 4] {
+        let args = if proc == 3 {
+            Args::new().put(&own.as_bytes().to_vec())
+        } else {
+            Args::new()
+        };
+        assert_eq!(legit.raw(MOUNT, 3, proc, args).0, 0);
+        let mut x = Nfs::attach(s.port(), nfs_fh3::default());
+        assert_eq!(x.mount_path(&own).0, MNT_ACCES, "after MOUNT proc {proc}");
+    }
 }
 
 #[test]
@@ -536,4 +617,33 @@ fn a_record_may_not_exceed_the_cap_across_fragments() {
         "the cap is for the whole record, not for one fragment"
     );
     assert_eq!(c.getattr(&root).0, OK, "the server is unharmed");
+}
+
+#[test]
+fn a_flood_of_null_calls_does_not_evict_the_client_that_uses_handles() {
+    let limits = Limits {
+        max_connections: 4,
+        ..Limits::default()
+    };
+    let (s, mut c) = serve(memfs(), opts(limits));
+    let root = c.root.clone();
+    assert_eq!(c.getattr(&root).0, OK);
+    let mut flood = vec![];
+    for _ in 0..3 {
+        let mut x = connect_raw(s.port());
+        for _ in 0..50 {
+            x.write_all(&null_frame()).unwrap();
+            assert!(answered(&mut x));
+        }
+        flood.push(x);
+    }
+    // The cap is full: a fourth connection makes the server drop one.
+    let mut late = connect_raw(s.port());
+    late.write_all(&null_frame()).unwrap();
+    assert!(answered(&mut late));
+    assert_eq!(
+        c.getattr(&root).0,
+        OK,
+        "the connection that carries file handles was evicted by cheap NULL traffic"
+    );
 }

@@ -32,7 +32,7 @@ pub const ROFS: u32 = nfsstat3::NFS3ERR_ROFS as u32;
 pub const ACCES: u32 = nfsstat3::NFS3ERR_ACCES as u32;
 
 const NFS: u32 = 100_003;
-const MOUNT: u32 = 100_005;
+pub const MOUNT: u32 = 100_005;
 
 #[derive(Default)]
 pub struct Args(Vec<u8>);

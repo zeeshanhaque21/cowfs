@@ -58,6 +58,11 @@ pub enum MountError {
     AlreadyMounted(PathBuf),
     #[error("{0} does not appear in the mount table after mount_nfs succeeded")]
     NotMounted(PathBuf),
+    #[error(
+        "another process took the root handle before mount_nfs did (it learned the export path \
+         from the process table), so the mount was refused; mount_nfs said: {0}"
+    )]
+    RootHandleTaken(String),
     #[error("could not unmount {path}: {stderr}")]
     Unmount { path: PathBuf, stderr: String },
 }
@@ -74,8 +79,8 @@ pub struct MountOptions {
     pub actimeo: u32,
     /// What to do with the `._name` files the macOS client writes for extended attributes.
     pub appledouble: AppleDoubleMode,
-    /// Give the root file handle to one client only: the first MNT wins and later ones are
-    /// refused until [`Server::rearm_mount`].
+    /// Give the root file handle to one MNT only: the first wins and every later one, from any
+    /// connection, is refused until [`Server::rearm_mount`].
     pub one_shot_mount: bool,
     /// Refuse MNT from a process of another user than the server's. Best effort with `lsof`,
     /// which cannot see the kernel NFS client's socket, so it is off by default and adds nothing
@@ -212,7 +217,15 @@ impl Server {
         self.port
     }
 
-    /// Lets the next MNT take the root handle again, for a deliberate remount.
+    /// True if a MNT was refused because the root handle was already taken. After a failed
+    /// `mount_nfs` that means someone else's MNT won the race, see [`MountError::RootHandleTaken`].
+    pub fn mnt_was_refused(&self) -> bool {
+        self.gate.as_ref().is_some_and(|g| g.refused_any())
+    }
+
+    /// Lets the next MNT take the root handle again, for a deliberate remount. UMNT never does
+    /// this: a daemon restart makes a new server, export path and gate, so [`Mount`] never
+    /// needs it.
     pub fn rearm_mount(&self) {
         if let Some(g) = &self.gate {
             g.rearm();
@@ -359,6 +372,7 @@ impl Mount {
                 .arg(&mountpoint),
             timeout,
         );
+        let refused = server.mnt_was_refused();
         let mut mount = Mount {
             server: Some(server),
             mountpoint,
@@ -369,7 +383,14 @@ impl Mount {
                 let _ = mount.do_unmount();
             }
             mount.server = None;
-            return Err(e);
+            // ponytail: reasoned, not tested end to end. The racer needs the path from `ps`
+            // while mount_nfs is starting, which a test cannot time.
+            return Err(match e {
+                MountError::CommandFailed { stderr, .. } if refused => {
+                    MountError::RootHandleTaken(stderr)
+                }
+                e => e,
+            });
         }
         if !listed(&mount.mountpoint, timeout)? {
             mount.server = None;

@@ -169,7 +169,13 @@ macro_rules! args {
 macro_rules! fh_or_fail {
     ($ctx:expr, $fh:expr, $xid:expr, $output:expr, $tail:expr) => {
         match $ctx.vfs.fh_to_id($fh) {
-            Ok(id) => id,
+            Ok(id) => {
+                // The one place a handle is accepted: the connection has shown it holds a real
+                // one, which is what keeps it from being evicted at the connection cap (#43).
+                $ctx.served
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                id
+            }
             Err(stat) => {
                 begin($xid, $output, stat)?;
                 $tail.serialize($output)?;

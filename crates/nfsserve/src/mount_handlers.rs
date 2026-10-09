@@ -121,7 +121,7 @@ pub async fn mountproc3_mnt(
         }
     }
     if let Some(gate) = &context.mount_gate {
-        if !gate.claim(context.peer) {
+        if !gate.claim() {
             debug!(
                 "{:?} --> MNT3ERR_ACCES, the root handle was already taken",
                 xid
@@ -137,6 +137,10 @@ pub async fn mountproc3_mnt(
             auth_flavors: vec![auth_flavor::AUTH_NULL as u32, auth_flavor::AUTH_UNIX as u32],
         };
         debug!("{:?} --> {:?}", xid, response);
+        // Holding the root handle proves as much as presenting one, see `fh_or_fail`.
+        context
+            .served
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(ref chan) = context.mount_signal {
             let _ = chan.send(true).await;
         }
@@ -189,16 +193,12 @@ pub fn mountproc3_export(
     xid: u32,
     _: &mut impl Read,
     output: &mut impl Write,
-    context: &RPCContext,
+    _: &RPCContext,
 ) -> Result<(), anyhow::Error> {
     debug!("mountproc3_export({:?}) ", xid);
     make_success_reply(xid).serialize(output)?;
-    true.serialize(output)?;
-    // dirpath
-    context.export_name.as_bytes().to_vec().serialize(output)?;
-    // groups
-    false.serialize(output)?;
-    // next exports
+    // An empty export list. The export path is a secret that only `mount_nfs` is told (see the
+    // security model in cowfs-nfs), so a caller with no handle must not be able to read it here.
     false.serialize(output)?;
     Ok(())
 }
