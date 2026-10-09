@@ -66,6 +66,13 @@ impl FileKind {
     }
 }
 
+/// The one mknod privilege rule every adapter applies: creating a device node needs root, except
+/// Linux's whiteout, the character device 0:0, which anyone may make (`vfs_mknod`). Fifos and
+/// sockets never need root. `rdev` is the cowfs device number (see `makedev`).
+pub fn mknod_needs_root(kind: FileKind, rdev: u64) -> bool {
+    kind.is_device() && !(kind == FileKind::CharDevice && rdev == 0)
+}
+
 /// Builds the cowfs device number `(major << 32) | minor`. This is not a host `dev_t`: each
 /// adapter converts to and from its own encoding, so a store is portable across systems.
 pub const fn makedev(major: u32, minor: u32) -> u64 {

@@ -14,7 +14,7 @@ mod vfs;
 pub use error::{Error, Result};
 pub use types::FallocMode;
 pub use types::{
-    dev_major, dev_minor, makedev, validate_name, Attr, DirEntry, DirEntryPlus, FileHandle,
+    dev_major, dev_minor, makedev, mknod_needs_root, validate_name, Attr, DirEntry, DirEntryPlus, FileHandle,
     FileKind, Ino, ReadDir, ReadDirPlus, RenameFlags, SetAttr, SetTime, StatFs, Timestamp,
     XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
 };
@@ -23,6 +23,20 @@ pub use vfs::Vfs;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mknod_privilege_rule() {
+        let (chr, blk) = (FileKind::CharDevice, FileKind::BlockDevice);
+        // The whiteout is exactly a character device numbered 0:0.
+        assert!(!mknod_needs_root(chr, 0));
+        assert!(mknod_needs_root(blk, 0), "a block 0:0 is not a whiteout");
+        assert!(mknod_needs_root(chr, makedev(0, 1)));
+        assert!(mknod_needs_root(chr, makedev(1, 0)));
+        assert!(mknod_needs_root(blk, makedev(8, 0)));
+        for k in [FileKind::Fifo, FileKind::Socket] {
+            assert!(!mknod_needs_root(k, 0), "{k:?}");
+        }
+    }
 
     #[test]
     fn names() {

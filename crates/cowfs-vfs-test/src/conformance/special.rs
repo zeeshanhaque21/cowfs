@@ -382,7 +382,8 @@ pub fn special_dir_ops_error(c: &Ctx) -> Outcome {
 /// The character device 0:0 is Linux's whiteout: the kernel lets anyone make it, so a backend a
 /// normal user reaches (a client of a mount, a native directory) must not refuse it (issue #243).
 /// It keeps its kind, mode and an `rdev` of 0, and has no data. Off Linux a device needs
-/// privilege, so `PermissionDenied` passes there.
+/// privilege, so `PermissionDenied` passes there. On Linux older than 5.8 a native (non-root)
+/// run fails this check, because the kernel only began allowing the whiteout to anyone then.
 pub fn mknod_whiteout_char_device(c: &Ctx) -> Outcome {
     let a = match c.mknod(ROOT_INO, b"wo", FileKind::CharDevice, 0o644, 0) {
         Err(Error::PermissionDenied) if !cfg!(target_os = "linux") => return Ok(()),
