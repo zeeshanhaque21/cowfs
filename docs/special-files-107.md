@@ -321,10 +321,20 @@ The import test that expects a fifo to be refused (`crates/cowfs-core/tests/impo
 - `Attr` gains a field, so every constructor changes.
   Mitigation: the compiler finds all of them; the edits are mechanical.
 - Verified by the slice B/C run on this Mac (2026-10-09, `bench/out/special-107/run`): `mkfifo(2)` and `mknod(2)` of a fifo reach the server as MKNOD, `bind(2)` of an AF_UNIX socket creates the node (`open/24.t` 5/5 on both arms), and `mkfifo/00.t` and `mknod/00.t` give the same 25 ok / 11 not ok on the native and the cowfs arm (the 11 are root-only assertions).
-- Found by that run and not fixed (#204): a fifo created on the mount cannot be opened at all. Every open (read, write, read-write, with or without O_NONBLOCK, any mode) gives EACCES, `open/17.t` #2 expects ENXIO, and a reader/writer exchange fails. The client sends no RPC for the open, the attributes equal native, and a restart of the daemon, nodev,nosuid, and the mode do not change it. Cause not determined. On the Linux FUSE path the kernel handles fifos locally and is not affected.
+- Found by that run (#204): a fifo created on the macOS NFS mount cannot be opened. See "Known limits" below.
 - Still unverified: macOS client behaviour for fifo close.
   Mitigation: the live run after slice B is a gate, and anything unexpected there is reported as a finding, not guessed.
 - Downgrade: an older build refuses a version 3 store up front (see Storage).
+
+## Known limits
+
+- macOS NFS client: `open(2)` of a fifo on the mount fails with `EACCES` (issue #204, kept open as a known limit).
+  Cause: the client's `nfs_vnop_open` returns `EACCES` for any vnode that is not a regular file, directory or symlink, so the server sees no RPC.
+  No server change and no mount option helps.
+  `mkfifo` and `stat` of a fifo work; rename and unlink were not exercised.
+  pjdfstest `open/17.t` #2 (expects `ENXIO`, macOS NFS gives `EACCES`) is this limit.
+  Evidence: `docs/verification/evidence/nfs204-fifo-open.md`.
+  The Linux FUSE path is not affected.
 
 ## Open questions for the advisor and critic
 

@@ -23,6 +23,12 @@ cowfs deduplicates at the block level, so identical bytes are stored once regard
 - Linux and macOS first, with an OS-agnostic core.
 - Day-1 integration with [treehouse](https://github.com/kunchenguid/treehouse).
 
+## Known limits
+
+- macOS NFS mount: `open(2)` of a fifo fails with `EACCES`, because the macOS NFS client refuses to open any vnode that is not a regular file, directory or symlink.
+  The server sees no request, and no server change or mount option helps.
+  See issue #204 and [the evidence](docs/verification/evidence/nfs204-fifo-open.md).
+
 ## License
 
 Apache-2.0.

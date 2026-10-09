@@ -1,3 +1,9 @@
+// Issue #204 (open(2) of a fifo on a macOS mount gives EACCES; pjdfstest open/17.t #2 expects
+// ENXIO) is not listed here: the tests in this file talk RPC to an unmounted server, and the macOS
+// client refuses that open before sending any RPC, so there is nothing here to observe. It is
+// recorded in docs/special-files-107.md, README.md and the crate docs of src/lib.rs, with the
+// evidence in docs/verification/evidence/nfs204-fifo-open.md.
+
 mod common;
 
 use std::sync::Arc;

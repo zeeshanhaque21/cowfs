@@ -32,6 +32,13 @@
 //! fail a write half way through. So it is off by default. What does unblock a caller is
 //! [`install_signal_cleanup`] on SIGTERM and [`sweep_stale_mounts`] after a crash.
 //!
+//! # Known limit: fifos cannot be opened on a macOS mount
+//!
+//! `mkfifo` works, but `open(2)` of a fifo fails with `EACCES`: the macOS NFS client's
+//! `nfs_vnop_open` refuses every vnode that is not a regular file, directory or symlink, before
+//! any RPC is sent. No server change or mount option helps (issue #204, evidence in
+//! `docs/verification/evidence/nfs204-fifo-open.md`; pjdfstest `open/17.t` #2).
+//!
 //! # What this crate requires of every `Vfs`
 //!
 //! - Every method may block and each is atomic, so the adapter must not rely on the order of two
