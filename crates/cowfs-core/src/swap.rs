@@ -202,8 +202,15 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
             "swap recovery: neither {target} nor its staged tree {staged} exists, intent removed"
         ));
     }
-    if fs::remove_file(p).is_ok() {
-        sync_dir(&core.inner.root);
+    match fs::remove_file(p) {
+        Ok(()) => sync_dir(&core.inner.root),
+        // `finish_swap` already dropped it
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            *core.inner.last_error.lk() = Some(format!(
+                "swap recovery: could not remove {p:?}: {e}; the next open drops it"
+            ));
+        }
     }
     Ok(())
 }
@@ -447,13 +454,33 @@ impl Core {
         if let Ok(st) = self.inner.snap_by_name_raw(staged) {
             let _ = self.inner.unregister(&st);
         }
-        if fs::remove_file(intent_path(&self.inner.root, target)).is_ok() {
-            sync_dir(&self.inner.root);
-        }
+        // fault 6 is a crash here: the rename is done, the intent file is still on disk
+        self.fault(6)?;
+        self.drop_intent(target);
         entry.ok_or(ControlError::NotFound)
     }
 
-    /// Test seam: make the swap fail at `step` (1 to 5). 0 disables it.
+    /// Step 6: removes the intent file of `target`. The new name is already in place, so a failure
+    /// is reported through `last_flush_error` and never fails the swap: a leftover intent finds its
+    /// target present and no staging snapshot, and the next `Core::open` drops it.
+    fn drop_intent(&self, target: &str) {
+        let p = intent_path(&self.inner.root, target);
+        match self
+            .fault(7)
+            .and_then(|()| fs::remove_file(&p).map_err(|e| io(&e.to_string())))
+        {
+            Ok(()) => sync_dir(&self.inner.root),
+            // nothing to remove: a recovery that already dropped it, or a swap with no intent
+            Err(_) if !p.exists() => {}
+            Err(e) => {
+                *self.inner.last_error.lk() = Some(format!(
+                    "swap: could not remove {p:?} after the swap completed: {e}; the next open drops it"
+                ));
+            }
+        }
+    }
+
+    /// Test seam: make the swap fail at `step` (1 to 7). 0 disables it.
     #[doc(hidden)]
     pub fn set_swap_fault(&self, step: u8) {
         self.inner
