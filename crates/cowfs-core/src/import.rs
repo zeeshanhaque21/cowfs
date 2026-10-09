@@ -302,9 +302,7 @@ fn write_tree(
             } else {
                 0
             };
-            view.mknod(parent, key, kind, mode, rdev)
-                .map_err(core)?
-                .ino
+            view.mknod(parent, key, kind, mode, rdev).map_err(core)?.ino
         } else {
             return Err(ImportError::Invalid(format!(
                 "{} is not a regular file, a directory, a symlink, a fifo, a socket or a device, so it cannot be ingested",
@@ -645,7 +643,11 @@ fn compare_dir(
                 }
             }
             // A second name of a file already read back is not read again.
-            FileKind::Regular if check.links.get(&(md.dev(), md.ino())).is_some_and(|l| l.1 > 1) => {}
+            FileKind::Regular
+                if check
+                    .links
+                    .get(&(md.dev(), md.ino()))
+                    .is_some_and(|l| l.1 > 1) => {}
             FileKind::Regular => compare_bytes(view, ino, &path, check)?,
             _ => {}
         }

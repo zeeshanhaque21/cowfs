@@ -352,10 +352,7 @@ fn keeps_the_modification_time_of_every_node_to_the_nanosecond() {
     assert_eq!(mtime(ROOT_INO), (1_300_000_000, 5));
     let link = view.lookup(ROOT_INO, b"link").unwrap();
     let want = fs::symlink_metadata(src.join("link")).unwrap();
-    assert_eq!(
-        mtime(link.ino),
-        (want.mtime(), want.mtime_nsec() as u32)
-    );
+    assert_eq!(mtime(link.ino), (want.mtime(), want.mtime_nsec() as u32));
 }
 
 #[test]

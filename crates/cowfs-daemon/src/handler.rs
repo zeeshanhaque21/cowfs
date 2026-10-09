@@ -186,7 +186,7 @@ impl Handler {
     ) -> CtlResult<ImportReport> {
         // Hashing both trees reads every byte again, which takes as long as the ingest did.
         let hashed = ingested.files;
-        let mut tick = |phase: &'static str| {
+        let tick = |phase: &'static str| {
             let mut throttle = Throttle::new();
             move || {
                 !throttle.due()
@@ -467,9 +467,9 @@ impl ControlHandler for Handler {
             .fsck(&mut progress)
             .map_err(|e| {
                 // A cancel stops the check by failing it, and says why through the context.
-                ctx.check().err().unwrap_or_else(|| {
-                    CtlError::new(ErrorCode::IoError, format!("fsck: {e}"))
-                })
+                ctx.check()
+                    .err()
+                    .unwrap_or_else(|| CtlError::new(ErrorCode::IoError, format!("fsck: {e}")))
             })?
             .ok_or_else(|| {
                 CtlError::new(
@@ -1013,7 +1013,12 @@ mod tests {
         for (n, data) in &keep {
             assert!(get(k.as_ref(), n) == *data, "{n}");
         }
-        assert!(backend.fsck(&mut |_, _| true).unwrap().unwrap().damage.is_empty());
+        assert!(backend
+            .fsck(&mut |_, _| true)
+            .unwrap()
+            .unwrap()
+            .damage
+            .is_empty());
     }
 
     /// A backend that reports a GC cycle which failed but still wrote bytes into a new pack: an
@@ -1155,7 +1160,12 @@ mod tests {
         for (n, data) in &keep {
             assert!(get(k.as_ref(), n) == *data, "{n}");
         }
-        assert!(backend.fsck(&mut |_, _| true).unwrap().unwrap().damage.is_empty());
+        assert!(backend
+            .fsck(&mut |_, _| true)
+            .unwrap()
+            .unwrap()
+            .damage
+            .is_empty());
         let again = h
             .gc(GcParams { dry_run: false }, &OpContext::detached())
             .unwrap();
