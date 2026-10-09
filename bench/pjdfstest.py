@@ -169,7 +169,12 @@ def mount_table(timeout: int = 15) -> tuple[str | None, str]:
 
 
 def mount_entries(table: str) -> list[tuple[str, str, str]]:
-    """(source, decoded mount point, options) per line. macOS escapes a space in a path."""
+    """(source, decoded mount point, options) per line. Both OSes escape a space in a path.
+
+    macOS prints `src on /mp (fstype, opts)`. Linux prints `src on /mp type fstype (opts)`; its
+    type moves to the front of the options so the first option is the type on both, and since a
+    space is escaped a literal ` type ` cannot be part of the mount point.
+    """
     entries = []
     for line in table.splitlines():
         if " on " not in line:
@@ -178,7 +183,11 @@ def mount_entries(table: str) -> list[tuple[str, str, str]]:
         if " (" not in rest:
             continue
         mountpoint, options = rest.rsplit(" (", 1)
-        entries.append((source.strip(), _unescape(mountpoint.strip()), options.rstrip(")")))
+        options = options.rstrip(")")
+        if " type " in mountpoint:
+            mountpoint, fstype = mountpoint.rsplit(" type ", 1)
+            options = f"{fstype},{options}"
+        entries.append((source.strip(), _unescape(mountpoint.strip()), options))
     return entries
 
 
