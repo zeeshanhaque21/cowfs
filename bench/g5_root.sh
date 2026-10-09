@@ -78,10 +78,12 @@ if [ "${1:-}" = inns ]; then # re-exec target inside the private mount namespace
   mount --bind "$MAIN/$SN" "$MNT"
   [ "$ARM" != control ] || mount -o remount,ro,bind "$MNT"
   umount -l "$MAIN"
-  make_shim "$CD/shim" "$MNT" cowfs "$STASH" "$CD/mountcycle.log"
+  pre=
+  # NOSHIM=1 is a diagnostic switch: the hand recipe's exact PATH, to tell a shim effect from a cowfs one.
+  [ -n "${NOSHIM:-}" ] || { make_shim "$CD/shim" "$MNT" cowfs "$STASH" "$CD/mountcycle.log"; pre=$CD/shim:; }
   record_identity "$ARM" "$CD" "$MNT" cowfs "$SN"
   set +e
-  run_check "$CD" "$ID" "$CD/shim:" fuse cowfs "$MNT"
+  run_check "$CD" "$ID" "$pre" fuse cowfs "$MNT"
   exit 0
 fi
 
@@ -129,6 +131,8 @@ case "$BIN" in */release|*/release/) profile=release;; */debug|*/debug/) profile
   echo "cowfs_bin_sha256=$(sha256sum "$BIN/cowfs-daemon" | cut -d' ' -f1)"
   echo "cowfs_profile=$profile"
   echo "cowfs_rev=${COWFS_REV:-unrecorded}"
+  echo "g5_root_sha256=$(sha256sum "$0" | cut -d' ' -f1)"
+  echo "noshim=${NOSHIM:-}"
   echo "kernel=$(uname -r)"
   for id in $(sed 's#.*/##' "$CASES"); do
     echo "case_sha.$id=$(sha256sum "$XFS/tests/generic/$id" | cut -d' ' -f1)"

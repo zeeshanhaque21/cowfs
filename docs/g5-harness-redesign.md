@@ -172,7 +172,15 @@ The wide run is the 155 diagnostic ids: valid, verdict FAIL by the rules above, 
 Native took about 14 minutes with a fresh filesystem per case, and cowfs about 21 minutes on the release build.
 generic/247 unmounts `TEST_DIR` and never restores it, and the shim log caught it as `PASS_EMULATED`.
 generic/127 fails on cowfs twice in a row on the release build (one `fsx` line missing from the output), where the hand run recorded a pass.
+The hand recipe passed it on the same binary, but a rerun with the shim disabled (`NOSHIM=1`) also failed, so the shim is not the cause.
 Its cause is not diagnosed here.
+
+## Where work stopped (2026-10-09)
+
+Stopped by request, with the harness, report, unit tests and two box runs (sample, wide) done.
+Remaining before this can close g5: a critic review, the `xfstests_gate.py preflight` reason fix verified on the box (it has no unit test yet), a lint check of `bench/`, and a diagnosis of generic/127.
+The 6-id sample is repeatable, the wide run is not part of CI.
+`wide-receipt` was produced by an intermediate `g5_root.sh` (before the teardown wait and `NOSHIM` edits), which only affects teardown counting and a diagnostic switch.
 
 ## Not done here
 

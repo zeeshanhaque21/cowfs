@@ -21,7 +21,7 @@ RUN_OUT=$1; shift
 ( printf '%s\n' "$P" | setsid sudo -S -p "" env "$@" >"$RUN_OUT.sudo.log" 2>&1 & echo $! > "$RUN_OUT.pid" )
 EOF
   # the password goes to the launcher's stdin only; everything else is argv-safe text
-  ssh "$HOST" "bash $OUT.launch.sh $OUT XFS=$W/ref/xfstests BIN=$W/target/release ARMS='$arms' COWFS_REV=${COWFS_REV:-unrecorded} TMO=${TMO:-300} bash $W/g5_root.sh $OUT $OUT.cases"
+  ssh "$HOST" "bash $OUT.launch.sh $OUT XFS=$W/ref/xfstests BIN=$W/target/release ARMS='$arms' COWFS_REV=${COWFS_REV:-unrecorded} NOSHIM=${NOSHIM:-} TMO=${TMO:-300} bash $W/g5_root.sh $OUT $OUT.cases"
   ;;
 poll)
   ssh "$HOST" "tail -n 5 $OUT/progress.txt 2>/dev/null; tail -n 3 $OUT.sudo.log 2>/dev/null | grep -v '^\$' ; uptime"
