@@ -265,7 +265,7 @@ GIB = 1 << 30
 
 
 def meta(big=4 * MIB, **extra):
-    return {"kind": "meta", "counts": {"big_bytes": big}, "corpus_sha": gates.DEFAULT_SHA, **extra}
+    return {"kind": "meta", "counts": {"big_bytes": big}, "corpus_sha": gates.DEFAULT_SHA, "platform": "Linux-6.8", **extra}
 
 
 def rep(size=4 * MIB, gate="g5", **override):

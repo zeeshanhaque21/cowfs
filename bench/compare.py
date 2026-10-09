@@ -52,6 +52,13 @@ ratio is printed as the noise floor. Without it, no ratio is a finding: run
 run-pair.sh, which interleaves native, cowfs, native, cowfs, or report the
 baseline yourself.
 
+Exit codes: INVALID (3) before any verdict, then FAIL (1) over UNMEASURABLE (2) over PASS (0). Exit 1 can carry
+unmeasurable gates (`RESULT: FAIL (1), 1 unmeasurable`); exit 2 means no gate failed.
+
+The g2 rule (macOS budget or Linux ratio) follows the platform the reps were MEASURED on, not the one compare.py runs on:
+meta `measured_on` ("macos" or "linux", written by gates.py), else for older data the meta `platform` string
+(macOS/Darwin or Linux). Neither, fields that disagree, or arms measured on different platforms, is INVALID (3) when g2 reps are present.
+
 Criterion (docs/design.md, amended by issue #18):
   g1 clean cargo build      ratio <= 1.5 on every platform
   g2 warm edit-and-rebuild  ratio <= 1.5 off macOS, and on macOS the added
@@ -253,6 +260,45 @@ def g5_problem(row, meta_bytes):
     return None
 
 
+def legacy_platform(meta):
+    """"macos", "linux" or None from the meta `platform` string (platform.platform(): macOS/Darwin or Linux)."""
+    v = meta.get("platform")
+    low = v.lower() if isinstance(v, str) else ""
+    return "macos" if low.startswith(("macos", "darwin")) else "linux" if low.startswith("linux") else None
+
+
+def measured_on(meta):
+    """"macos", "linux" or None: where the reps were measured, which is not where compare.py runs.
+
+    Rule: meta `measured_on` (written by gates.py) is used when valid; data from before that field uses the meta
+    `platform` string. Anything else is unknown. g2_platform refuses a record whose two fields disagree.
+    """
+    if "measured_on" in meta:
+        return meta["measured_on"] if meta["measured_on"] in ("macos", "linux") else None
+    return legacy_platform(meta)
+
+
+def g2_platform(paths):
+    """(platform, problems): the one platform every g2-bearing input was measured on, else why none can be named."""
+    seen, bad = {}, []
+    for path in paths:
+        rows = rows_of(path)
+        if not any(r.get("kind") == "rep" and r.get("gate") == "g2" for r in rows):
+            continue
+        meta = next((r for r in rows if r.get("kind") == "meta"), {})
+        where = measured_on(meta)
+        if where is None:
+            bad.append(f"{path}: g2 reps but the meta names no measuring platform (measured_on {meta.get('measured_on')!r}, platform {meta.get('platform')!r}): "
+                       "the macOS budget or the Linux ratio cannot be chosen, re-run the arm")
+        elif legacy_platform(meta) not in (None, where):
+            bad.append(f"{path}: meta measured_on {where!r} disagrees with platform {meta.get('platform')!r}: the record contradicts itself, re-run the arm")
+        else:
+            seen[path] = where
+    if len(set(seen.values())) > 1:
+        bad.append(f"g2 inputs were measured on different platforms {seen}: macOS and Linux timings are not comparable")
+    return (next(iter(seen.values()), None) if not bad else None), bad
+
+
 def g2_problem(row):
     """Why a g2 rep did not rebuild and relink enough to be an edit-rebuild, or None."""
     m = row.get("metrics")
@@ -416,7 +462,6 @@ def main() -> int:
     ap.add_argument("--budget-add", type=float, default=1.0)
     args = ap.parse_args()
 
-    on_macos = sys.platform == "darwin"
     bad = []
     g5n = {}
     for path in [*args.native, args.cowfs, *([args.noise_floor] if args.noise_floor else [])]:
@@ -430,6 +475,10 @@ def main() -> int:
         cowfs_gates = set(by_gate(load([args.cowfs])[1]))
         if not native_gates & cowfs_gates:
             bad.append("inputs: no gate is present in both the native and the cowfs arm, nothing to compare")
+    where = None
+    if not bad:
+        where, plat_bad = g2_platform([*args.native, args.cowfs, *([args.noise_floor] if args.noise_floor else [])])
+        bad += plat_bad
     if bad:
         for line in bad:
             print(f"INVALID {line}", file=sys.stderr)
@@ -442,6 +491,9 @@ def main() -> int:
     print(f"platform      {platform.platform()}")
     print(f"native arm    {', '.join(args.native)}")
     print(f"cowfs arm     {args.cowfs}")
+    ran_on = "macos" if sys.platform == "darwin" else "linux"
+    on_macos = (where or ran_on) == "macos"  # the platform the reps were measured on, not the one this script runs on
+    print(f"measured on   {where or 'n/a (no g2 reps)'}  (compare.py ran on {ran_on})")
     print(f"macOS         {on_macos}  (g2 uses an absolute budget on macOS)")
     print()
 
