@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{Fixture, Sandbox, Watchdog};
+use common::{require_bin, Fixture, Sandbox, Watchdog};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -25,12 +25,6 @@ fn companion() -> PathBuf {
 /// The sandboxed treehouse shim, so every companion call in this file is guarded too.
 fn shim_of(s: &Sandbox) -> String {
     s.shim().display().to_string()
-}
-
-/// The `cowfs` binary, built alongside it in the same target directory.
-fn cowfs_bin() -> Option<PathBuf> {
-    let guess = std::env::current_exe().ok()?.parent()?.join("cowfs");
-    guess.is_file().then_some(guess)
 }
 
 fn run(args: &[&str]) -> std::process::Output {
@@ -527,14 +521,17 @@ fn a_slot_can_be_reacquired_after_a_return_and_gets_the_same_slot() {
 fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
     let _w = Watchdog::start(180);
     let _ = crate::require_treehouse!();
-    let Some(cowfs) = cowfs_bin() else {
-        eprintln!("skipping: the cowfs binary is not built next to the companion");
-        return;
-    };
+    let cowfs = require_bin("cowfs");
     let dir = common::private_tempdir();
     let s = Sandbox::new();
     let run_dir = dir.path().join("run");
     std::fs::create_dir_all(&run_dir).expect("mkdir run");
+    // The daemon refuses a socket directory that is not mode 0700.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod run");
+    }
     let sock = run_dir.join("control.sock");
     let mut server = Command::new(&cowfs)
         .args([

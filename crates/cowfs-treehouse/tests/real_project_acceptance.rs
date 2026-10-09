@@ -47,7 +47,7 @@
 
 mod common;
 
-use common::private_tempdir;
+use common::{private_tempdir, require_bin, sibling_bin};
 use cowfs_ctl::{Client, ClientOptions, MountSnapshot, Request, Response, UnmountSnapshot};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -89,36 +89,6 @@ fn workspace() -> PathBuf {
         .nth(2)
         .expect("the crate is inside the workspace")
         .to_path_buf()
-}
-
-/// A sibling of the test binary, which is where cargo puts the binaries it built with it.
-fn sibling_bin(name: &str) -> Option<PathBuf> {
-    let mut path = std::env::current_exe().ok()?;
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    let candidate = path.join(name);
-    candidate.is_file().then_some(candidate)
-}
-
-/// A sibling binary, or a hard failure.
-///
-/// This is the fix for the silent-skip defect: the five daemon gates used to return `Ok(())` when
-/// `cowfs-daemon` was absent, which libtest reports as `ok`. A missing binary is a wrong
-/// invocation, not a host limitation, so it fails whatever the mode is.
-fn require_bin(name: &'static str) -> PathBuf {
-    match sibling_bin(name) {
-        Some(p) => p,
-        None => panic!(
-            "{name} is not beside this test binary at {}. Run the suite from the workspace \
-             (`cargo test --workspace` or `cargo build -p cowfs-daemon -p cowfs-cli \
-             -p cowfs-treehouse --bins` first); a missing binary is never a pass.",
-            std::env::current_exe()
-                .unwrap_or_else(|_| PathBuf::from("<unknown>"))
-                .display(),
-        ),
-    }
 }
 
 /// Where raw evidence is appended, one flushed JSON object per record.
@@ -859,8 +829,9 @@ impl Core {
         // workspace binaries are built, so their absence means the command was wrong. Letting it
         // skip is exactly the defect this replaces, where libtest reported `ok` for a gate that
         // ran nothing.
-        require_bin("cowfs-daemon");
-        let daemon = sibling_bin("cowfs-daemon").expect("require_bin just proved it is there");
+        let daemon = require_bin("cowfs-daemon");
+        // `Core::cli` and `teardown` run `cowfs`; a missing one must not become a quiet `None`.
+        require_bin("cowfs");
         if !cowfs_nfs_or_fuse_present() {
             let skip = Skip {
                 what: "a mount adapter",

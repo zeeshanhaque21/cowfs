@@ -15,6 +15,34 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// A sibling of the test binary, which is where cargo puts the binaries it built with it.
+pub fn sibling_bin(name: &str) -> Option<PathBuf> {
+    let mut path = std::env::current_exe().ok()?;
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    let candidate = path.join(name);
+    candidate.is_file().then_some(candidate)
+}
+
+/// A sibling binary, or a hard failure.
+///
+/// A missing binary is a wrong invocation, not a host limitation: libtest reports a test that
+/// printed "skipping" and returned as `ok` (issue 244), so it fails whatever the mode is.
+pub fn require_bin(name: &str) -> PathBuf {
+    sibling_bin(name).unwrap_or_else(|| {
+        panic!(
+            "{name} is not beside this test binary at {}. Build it in the same invocation \
+             (`cargo test -p cowfs-treehouse -p cowfs-cli -p cowfs-daemon` or `--workspace`); a \
+             missing binary is never a pass.",
+            std::env::current_exe()
+                .unwrap_or_else(|_| PathBuf::from("<unknown>"))
+                .display(),
+        )
+    })
+}
+
 /// The real treehouse store on this machine, or wherever `TREEHOUSE_REAL_STORE` points it. Only
 /// ever read: it belongs to other agents.
 pub fn real_treehouse_root() -> PathBuf {
