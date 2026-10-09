@@ -23,7 +23,9 @@
 //!    a concurrent tear rate alone cannot stand in for.
 //! 4. `direct_readers_through_the_mount_never_see_a_torn_block`: the same race through the mount,
 //!    with `O_DIRECT` readers. Without the page cache in the way, the atomicity is cowfs' again, so
-//!    a tear here is the adapter or the `Core`, and it is asserted to be zero.
+//!    a tear here is the adapter or the `Core`, and it is asserted to be zero. The adapter queues
+//!    same-inode requests in order, so a slow split READ serialises behind the writes and passes;
+//!    `Core` atomicity itself is held by test 1.
 //!
 //! Run: `cargo test -p cowfs-fuse -j4 --test coherence -- --nocapture --test-threads=1`
 //!
@@ -339,9 +341,11 @@ fn concurrent_writers_leave_every_block_uniform_and_acknowledged() {
 
 /// The atomicity the page cache hides is still the mount's to keep once the page cache is out of
 /// the way. `O_DIRECT` readers reach the adapter as one READ per block, so a tear here is the
-/// adapter or the `Core` mixing two writes, not the kernel: an adapter that split a READ into
-/// several `Vfs` calls, or a `Core` read that assembled chunks across a concurrent write, fails
-/// this. Writers stay buffered, as they are for every application. For issue #45 a standalone
+/// adapter or the `Core` mixing two writes, not the kernel. The adapter queues same-inode requests
+/// in order on one lane, so this catches a READ split into several `Vfs` calls only while READ and
+/// WRITE are dispatched differently (one inline, one on the lane): a fast split is caught, a slow
+/// one serialises behind the writes. `Core` atomicity under real thread concurrency is asserted by
+/// `core_view_keeps_aligned_4k_blocks_atomic_while_flushing`. Writers stay buffered, as they are for every application. For issue #45 a standalone
 /// stress (3 writers, 3 readers, 16 blocks, 1000 iterations) measured 0 tears in 35.9M `O_DIRECT`
 /// reads through a `Core`-backed mount on Linux 7.2, against 34238 in 1.27G buffered reads of it.
 /// This test itself ran 1000 times there with 0 tears in 6M reads.
@@ -364,7 +368,7 @@ fn direct_readers_through_the_mount_never_see_a_torn_block() {
 
 /// The matched control for the mount's torn count: this same harness, this same 4096-byte blocks
 /// and thread counts, against a native tmpfs with no cowfs code underneath. Nothing here asserts
-/// the concurrent count either, because the page cache owns it on every Linux filesystem. It is
+/// the concurrent count either, because the page cache owns it on ext4, btrfs and tmpfs (measured). It is
 /// measured so the mount's number can be read against something. The at-rest assertions do hold,
 /// and must, because no write interleaving may leave a block torn once the writers have stopped.
 #[test]
