@@ -203,7 +203,7 @@ Mutants (`MUT_PKG=cowfs-gc MUT_ARGS="--test power_collect" python3 crates/cowfs-
 - N1, no new-pack fsync: killed.
 - D1, no packs directory fsync after the unlink: killed (through the whole-pack acceptance check).
 - Survivors, with the reason: W1 and E7 (watermark before data fsync, no leading sync) need a writer with unsynced puts, which a collect does not have; the store sweeps kill them.
-  GF1 and GF2 (no metadata sync at the freeze, none at the fresh listing): each sync is the other's backup and `durable_snapshots` lists a snapshot as soon as `new_snapshot` returns, so neither is observable here; `race.rs` is where that window lives.
+  GF1 and GF2 (no metadata sync at the freeze, none at the fresh listing): each sync is the other's backup and `durable_snapshots` lists a snapshot as soon as `new_snapshot` returns, so, from reading `Gc::marked` (not isolated by experiment), neither is observable here; `race.rs` is where that window lives.
 
 Not covered: metadata unsynced writes surviving a cut (only the durable prefix is modelled; redb's own recovery is `cowfs-meta/tests/crash.rs`), the core-level timeline with the flusher thread (slice 5), `fsops.rs` intent files.
 
