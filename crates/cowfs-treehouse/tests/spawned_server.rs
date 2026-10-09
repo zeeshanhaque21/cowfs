@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{private_tempdir, Sandbox, Watchdog};
+use common::{private_tempdir, require_bin, Sandbox, Watchdog};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -14,12 +14,6 @@ use std::time::Duration;
 /// The companion binary under test.
 fn companion() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_cowfs-treehouse"))
-}
-
-/// The `cowfs` binary, which lives beside this one in the same target directory.
-fn cowfs_bin() -> Option<PathBuf> {
-    let guess = std::env::current_exe().ok()?.parent()?.join("cowfs");
-    guess.is_file().then_some(guess)
 }
 
 /// A spawned `cowfs serve --stub`, stopped when the test ends.
@@ -31,13 +25,14 @@ struct Serve {
 }
 
 impl Serve {
-    fn start(dir: tempfile::TempDir) -> Option<Serve> {
+    fn start(dir: tempfile::TempDir) -> Serve {
         let path = dir.path().to_path_buf();
-        let cowfs = cowfs_bin()?;
+        let cowfs = require_bin("cowfs");
         let sock_dir = path.join("run");
-        std::fs::create_dir_all(&sock_dir).ok()?;
+        std::fs::create_dir_all(&sock_dir).expect("mkdir run");
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+        std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod run");
         let socket = sock_dir.join("control.sock");
         let child = Command::new(cowfs)
             .args([
@@ -54,7 +49,7 @@ impl Serve {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+            .expect("spawn cowfs serve --stub");
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while !socket.exists() {
             if std::time::Instant::now() >= deadline {
@@ -65,11 +60,11 @@ impl Serve {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Some(Serve {
+        Serve {
             child,
             socket,
             _dir: dir,
-        })
+        }
     }
 }
 
@@ -129,10 +124,7 @@ fn json(args: &[&str]) -> serde_json::Value {
 #[test]
 fn a_second_process_can_drive_the_daemon_over_a_real_socket() {
     let _w = Watchdog::start(120);
-    let Some(serve) = Serve::start(private_tempdir()) else {
-        eprintln!("skipping: the cowfs binary is not built next to the companion");
-        return;
-    };
+    let serve = Serve::start(private_tempdir());
     let s = Sandbox::new();
     let sock = serve.socket.display().to_string();
 
@@ -279,9 +271,7 @@ fn a_pool_id_is_printed_for_a_real_repository() {
 #[test]
 fn provision_refuses_a_path_that_is_not_a_slot() {
     let _w = Watchdog::start(60);
-    let Some(serve) = Serve::start(private_tempdir()) else {
-        return;
-    };
+    let serve = Serve::start(private_tempdir());
     let out = run(&[
         "--socket",
         &serve.socket.display().to_string(),
@@ -291,4 +281,17 @@ fn provision_refuses_a_path_that_is_not_a_slot() {
     ]);
     assert_eq!(out.status.code(), Some(2), "a usage error");
     assert!(String::from_utf8_lossy(&out.stderr).contains("treehouse slot path"));
+}
+
+/// Negative control for issue 244: a missing sibling binary must panic, never skip.
+#[test]
+#[should_panic(expected = "is not beside this test binary")]
+fn a_missing_sibling_binary_fails_loudly() {
+    let _ = require_bin("cowfs-no-such-binary-244");
+}
+
+/// The binary the serve tests depend on really is there, so they cannot be silent passes.
+#[test]
+fn the_cowfs_binary_is_built_beside_the_tests() {
+    assert!(require_bin("cowfs").is_file());
 }
