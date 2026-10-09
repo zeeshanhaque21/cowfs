@@ -98,18 +98,22 @@ jobs:
       - name: Fault-injection seam is absent without its feature (issue 173)
         run: scripts/check-fault-seam-absent.sh
 
-  # One name to require: fails unless lint, fault-seam and every test shard passed.
+  # One name to require: fails unless lint, fault-seam, every test shard, linux-fuse and
+  # linux-namespaces passed. The last two are the FUSE conformance run and the namespace isolation
+  # gate: each refuses to go green unless its checks ran, so a red one must fail this aggregate.
   check:
-    needs: [lint, fault-seam, test]
+    needs: [lint, fault-seam, test, linux-fuse, linux-namespaces]
     # Not always(): a superseded PR run is cancelled, and must not start a check that then fails.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - run: |
-          echo "lint=${{ needs.lint.result }} fault-seam=${{ needs.fault-seam.result }} test=${{ needs.test.result }}"
+          echo "lint=${{ needs.lint.result }} fault-seam=${{ needs.fault-seam.result }} test=${{ needs.test.result }} linux-fuse=${{ needs.linux-fuse.result }} linux-namespaces=${{ needs.linux-namespaces.result }}"
           test "${{ needs.lint.result }}" = success
           test "${{ needs.fault-seam.result }}" = success
           test "${{ needs.test.result }}" = success
+          test "${{ needs.linux-fuse.result }}" = success
+          test "${{ needs.linux-namespaces.result }}" = success
 
   # Issue 171: the namespace isolation tests skip on a host that denies unprivileged user namespaces.
   # ubuntu-24.04 does (kernel.apparmor_restrict_unprivileged_userns=1, measured on the runner), so
@@ -168,7 +172,7 @@ jobs:
       - name: Native page-cache control
         env:
           COWFS_CONFORMANCE_FILTER: concurrent_readers_and_writers_of_one_file
-        shell: bash  # bash -e -o pipefail, so a cargo build failure fails the step; || true keeps a torn read from failing it
+        shell: bash  # || true swallows the whole pipeline, pipefail included; the Enforce step's `1 run,` assertion is what catches a cargo failure here
         run: cargo test -p cowfs-vfs-path --test native -j4 -- --ignored --nocapture --test-threads=1 2>&1 | tee native-page-cache.log || true
       - name: Native forget control
         env:

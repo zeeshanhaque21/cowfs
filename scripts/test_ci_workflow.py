@@ -14,7 +14,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = Path(os.environ.get("CI_WORKFLOW", ROOT / ".github/workflows/ci.yml"))
-STEPS = {s["name"]: s for s in yaml.safe_load(WORKFLOW.read_text())["jobs"]["linux-fuse"]["steps"] if "name" in s}
+WORKFLOW_YAML = yaml.safe_load(WORKFLOW.read_text())
+STEPS = {s["name"]: s for s in WORKFLOW_YAML["jobs"]["linux-fuse"]["steps"] if "name" in s}
 CARGO_STEPS = ["Native xattr control", "Native page-cache control", "Native forget control", "Test FUSE mounts and conformance"]
 ENFORCE = "Enforce conformance results"
 KNOWN = "FAIL cowfs    xattrs         xattr_on_directory_and_symlink                    6.98ms  unexpected error: permission denied (PermissionDenied)"
@@ -106,6 +107,40 @@ class Enforce(unittest.TestCase):
     def test_skip_set_drift_fails(self):
         extra = {**EXPECTED_SKIPS, "new_check": "SKIP cowfs    basic          new_check   -  because"}
         self.assertNotEqual(self.enforce(skips=extra).returncode, 0)
+
+
+class EveryTeeHasPipefail(unittest.TestCase):
+    def test_no_step_pipes_through_tee_without_pipefail(self):
+        for job, spec in WORKFLOW_YAML["jobs"].items():
+            for step in spec.get("steps", []):
+                run = step.get("run", "")
+                if re.search(r"\|\s*tee\b", run):
+                    with self.subTest(job=job, step=step.get("name", run[:40])):
+                        self.assertTrue(
+                            step.get("shell") == "bash" or "pipefail" in run,
+                            "a pipe into tee takes tee's exit status unless pipefail is on",
+                        )
+
+
+class CheckAggregate(unittest.TestCase):
+    JOBS = ["lint", "fault-seam", "test", "linux-fuse", "linux-namespaces"]
+    CHECK = WORKFLOW_YAML["jobs"]["check"]
+
+    def run_check(self, results):
+        script = self.CHECK["steps"][0]["run"]
+        script = re.sub(r"\$\{\{ needs\.([\w-]+)\.result \}\}", lambda m: results.get(m.group(1), "<unset>"), script)
+        return subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], capture_output=True, text=True)
+
+    def test_needs_and_cancelled_semantics(self):
+        self.assertTrue(set(self.JOBS) <= set(self.CHECK["needs"]))
+        self.assertEqual(self.CHECK["if"].replace(" ", ""), "${{!cancelled()}}")
+
+    def test_all_green_passes_and_any_red_fails(self):
+        green = {j: "success" for j in self.JOBS}
+        self.assertEqual(self.run_check(green).returncode, 0)
+        for job in self.JOBS:
+            with self.subTest(red=job):
+                self.assertNotEqual(self.run_check({**green, job: "failure"}).returncode, 0)
 
 
 if __name__ == "__main__":
