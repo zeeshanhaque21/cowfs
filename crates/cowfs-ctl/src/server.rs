@@ -607,7 +607,12 @@ fn admit(
                 conn.abandon_inflight();
             }
             conn.kill();
-            conn.drain_and_close(&mut reader, opts.drain_deadline);
+            let drain = if shared2.abandoned() {
+                Duration::ZERO
+            } else {
+                opts.drain_deadline
+            };
+            conn.drain_and_close(&mut reader, drain);
             lock(&shared2.conns).remove(&id);
         }
     });
@@ -787,14 +792,13 @@ impl Conn {
         let _ = reader
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(50)));
-        // A connection that was already killed has had its delivery grace: the write side is closed
-        // and the peer either got its terminal frame or never will. Reading away what the peer sent
-        // is politeness for a peer that is still there, and it is what would otherwise hold this
-        // socket, and the handler behind it, open for the whole drain deadline after `wait()`
-        // returned. Close now instead; the contract only promises the close.
+        // `deadline` is zero once the shutdown deadline has passed: the grace is spent, nobody is
+        // left to be polite to, and this read is what would hold the socket, and the handler behind
+        // it, open after `wait()` returned. Every other close reads away what the peer sent, so a
+        // reset cannot destroy a frame the peer has not read yet.
         let until = Instant::now() + deadline;
         let mut sink = [0u8; 8192];
-        while !self.dead.load(Ordering::SeqCst) && Instant::now() < until {
+        while Instant::now() < until {
             match reader.read(&mut sink) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
@@ -1272,5 +1276,26 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(conn.dead.load(Ordering::SeqCst));
         assert!(pending.is_cancelled());
+    }
+
+    /// A close that is not part of an abandoned shutdown still reads away what the peer already
+    /// sent (`v1-control-api.md`, Shutdown). `kill` runs right before the drain on every teardown,
+    /// so `dead` cannot be what decides to skip it. The drain only returns once a read finds nothing
+    /// more (the 50 ms read timeout) when the peer stays open, so the lower bound cannot flake on a
+    /// slow machine.
+    #[test]
+    fn a_normal_close_reads_away_what_the_peer_sent() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let conn = Conn::new(&server).unwrap();
+        let mut reader = BufReader::new(server.try_clone().unwrap());
+        client.write_all(&[b'x'; 5000]).unwrap();
+        conn.kill();
+        let t0 = Instant::now();
+        conn.drain_and_close(&mut reader, Duration::from_secs(2));
+        assert!(
+            t0.elapsed() >= Duration::from_millis(40),
+            "the drain returned without reading ({:?})",
+            t0.elapsed()
+        );
     }
 }

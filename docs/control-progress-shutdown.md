@@ -224,9 +224,12 @@ counterexample was measured on that source and not on the working tree.
    does not mean its handler is gone, which the spawn-failure variant demonstrated
    (`handler_alive_at_return=true`, `connection_closed_at_return=false`, `fds_at_return` 10 of 12).
    `Conn::released` is the predicate the accept loop waits on, bounded by the same grace.
-3. **Close without draining when the connection was already killed.** `drain_and_close` read away
-   what the peer sent, for up to `drain_deadline`. Past the grace there is nobody left to be polite
-   to, and that read is what held the socket open after `wait()` returned.
+3. **Close without draining once the shutdown deadline has passed.** `drain_and_close` reads away
+   what the peer sent, for up to `drain_deadline`. Past the deadline there is nobody left to be
+   polite to, and that read is what held the socket open after `wait()` returned. Every earlier
+   close still drains, as `v1-control-api.md` says. An earlier version keyed the skip on the
+   connection being killed, which `run_connection`'s caller does before every close, so it skipped
+   the drain on every teardown.
 
 ## Spawn-failure and full-buffer fallback
 
