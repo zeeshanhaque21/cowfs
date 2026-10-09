@@ -1,27 +1,26 @@
 name: ci
 
-# A change that touches only review reports, verification evidence, spike notes or the progress
-# tracker does not start CI. A search of the code, tests and bench harness found exactly one test that
-# reads a doc: crates/cowfs-core/tests/critic2b.rs asserts on docs/v1-core.md, so docs/v1-core.md and
-# the rest of docs/ are deliberately NOT ignored. A change that touches any other file as well still
-# runs everything, and so does an edit of this workflow file. A pull request that only touches the
-# paths below gets no CI run at all, not a skipped one.
+# A change that touches only documentation or the progress tracker does not start CI. No test reads a
+# doc: the generated lock-audit table in docs/v1-core.md is checked by scripts/lock_audit.py --check in
+# the lint job, which runs whenever source changes. A change that touches any other file as well still
+# runs everything, and so does an edit of this workflow file. A pull request that only touches the paths
+# below gets no CI run at all, not a skipped one.
 on:
   push:
     branches: [main]
     paths-ignore:
-      - 'docs/reviews/**'
-      - 'docs/verification/**'
-      - 'docs/spikes/**'
+      - 'docs/**'
       - 'progress/**'
+      - 'README.md'
+      - 'AGENTS.md'
       - 'LICENSE'
       - 'NOTICE'
   pull_request:
     paths-ignore:
-      - 'docs/reviews/**'
-      - 'docs/verification/**'
-      - 'docs/spikes/**'
+      - 'docs/**'
       - 'progress/**'
+      - 'README.md'
+      - 'AGENTS.md'
       - 'LICENSE'
       - 'NOTICE'
 
@@ -43,6 +42,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Lock-audit table in docs/v1-core.md is current
+        run: python3 scripts/lock_audit.py --check
       - run: cargo test --workspace
       - name: Fault-injection seam is absent without its feature (issue 173)
         run: scripts/check-fault-seam-absent.sh

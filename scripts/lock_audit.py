@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Regenerate the lock-audit table in docs/v1-core.md from the source.
 
-`tests/critic2b.rs::every_lock_site_is_in_the_audit_table` fails if a function that takes a lock is
-missing from the table, so the table cannot rot. Run this after touching a lock site:
+CI runs `--check` (the lint job), so the table cannot rot when the source changes. Run this after
+touching a lock site:
 
     python3 scripts/lock_audit.py            # print the table
     python3 scripts/lock_audit.py --write    # rewrite the table in docs/v1-core.md
+    python3 scripts/lock_audit.py --check    # exit 1 if the table in the doc is not the generated one
 """
 import re
 import sys
@@ -121,5 +122,14 @@ if __name__ == "__main__":
             j += 1
         DOC.write_text("\n".join(lines[:i] + t.split("\n") + lines[j:]))
         print(f"wrote {len(t.splitlines()) - 2} rows")
+    elif "--check" in sys.argv:
+        lines = DOC.read_text().split("\n")
+        i = lines.index(HEADER_MARK)
+        j = i + 2
+        while j < len(lines) and lines[j].startswith("|"):
+            j += 1
+        if "\n".join(lines[i:j]) != t:
+            sys.exit("docs/v1-core.md lock-audit table is stale: run python3 scripts/lock_audit.py --write")
+        print(f"lock-audit table is current ({len(t.splitlines()) - 2} rows)")
     else:
         print(t)
