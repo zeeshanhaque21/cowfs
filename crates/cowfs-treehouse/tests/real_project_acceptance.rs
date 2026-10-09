@@ -31,7 +31,8 @@
 //!   workspace binaries are built, so their absence means the command was wrong, not the host.
 //! - A missing mount capability is a recorded capability skip, never a silent pass: it writes
 //!   `outcome=skipped-capability` into the receipt, prints that nothing was measured, and
-//!   `the_acceptance_receipt_states_what_was_measured` checks that claim against the receipt.
+//!   `the_receipt_of_a_real_run_states_what_was_measured` checks that claim against the receipt of a
+//!   real run (rows are also checked as they are written).
 //!   `COWFS_ACCEPTANCE_REQUIRED=1` turns both into failures, and is the only mode that can produce
 //!   acceptance.
 //! - Every teardown command is bounded by one absolute deadline taken before the first spawn, the
@@ -435,7 +436,15 @@ fn record(test: &str, fields: &[(&str, String)]) {
     write_record(&body);
 }
 
+/// Every row of the run's own receipt is audited as it is written, in whatever order the tests run:
+/// a row that claims a published warm base, or has no outcome, panics at the writer.
+/// The whole-run properties (empty, skips under `COWFS_ACCEPTANCE_REQUIRED=1`) are checked by
+/// `the_receipt_of_a_real_run_states_what_was_measured`.
 fn write_record(body: &str) {
+    let row: serde_json::Value = serde_json::from_str(body).expect("a receipt row is JSON");
+    if let Err(e) = audit_row(&row) {
+        panic!("refusing to write a receipt row: {e}: {body}");
+    }
     write_record_to(&evidence_dir().join("acceptance.jsonl"), body);
 }
 
@@ -2375,73 +2384,156 @@ localhost:/elsewhere on /Users/somebody/elsewhere (nfs, nodev, nosuid, mounted b
     );
 }
 
-/// What the receipt says about what was measured.
-///
-/// A capability skip is only honest if it is written down. This reads the receipt the run produced
-/// and fails if a gate recorded a skip while the run is being presented as an acceptance.
-#[test]
-fn the_acceptance_receipt_states_what_was_measured() {
-    let deadline = Deadline::after(120);
-    let path = evidence_dir().join("acceptance.jsonl");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let records: Vec<serde_json::Value> = text
+/// Parses a receipt file into its rows. A missing file is an empty receipt.
+fn read_receipt(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    let skips: Vec<&serde_json::Value> = records
+        .collect()
+}
+
+/// What a receipt says about what was measured.
+///
+/// A capability skip is only honest if it is written down. This fails if the receipt is empty, if a
+/// gate recorded a skip while `mode` requires measuring, if any row claims a published warm base,
+/// or if a row has no outcome.
+fn audit_receipt(records: &[serde_json::Value], mode: Mode) -> Result<(), String> {
+    if records.is_empty() {
+        return Err("the receipt is empty, so this run measured nothing at all".into());
+    }
+    let skips: Vec<&str> = records
         .iter()
         .filter(|r| r["outcome"] == SKIPPED_CAPABILITY)
+        .filter_map(|r| r["test"].as_str())
         .collect();
+    if !skips.is_empty() {
+        eprintln!(
+            "ACCEPTANCE NOT MEASURED: {} gate(s) were capability-skipped: {skips:?}. \
+             This run is NOT an acceptance.",
+            skips.len()
+        );
+        if mode != Mode::BestEffort {
+            return Err(
+                "COWFS_ACCEPTANCE_REQUIRED=1 was set, so a capability skip must have been a failure"
+                    .into(),
+            );
+        }
+    }
+    records.iter().try_for_each(audit_row)
+}
+
+/// The per-row checks, applied both to a finished receipt and to each row as it is written.
+fn audit_row(row: &serde_json::Value) -> Result<(), String> {
+    let test = row["test"].as_str().unwrap_or("?");
+    // A published warm base must never be claimed while the chain is still broken. Both shapes are
+    // refused, and an unrecognised shape is refused rather than read as false: the previous
+    // comparison was against a JSON boolean only, so a row written as the string "true" passed it.
+    if claims_published_warm_base(row) {
+        return Err(format!(
+            "row {test:?} claims a published warm base, which no gate at this base established"
+        ));
+    }
+    // Every row is self-describing, so counting outcomes cannot undercount rows.
+    if row["outcome"].as_str().is_none() {
+        return Err(format!("row {test:?} has no outcome"));
+    }
+    Ok(())
+}
+
+/// The audit, over a receipt this test writes itself through the same row writers the gates use.
+///
+/// It used to read the shared `acceptance.jsonl` that sibling tests append to, so it failed with
+/// "the receipt is empty" whenever it ran alone or against an empty evidence directory, and passed
+/// in a full run only because a sibling happened to have written first. Now the clean receipt and
+/// every refused shape are built here, so the result does not depend on scheduling, and the same
+/// `audit_receipt` is what audits a real run in `the_receipt_of_a_real_run_states_what_was_measured`.
+#[test]
+fn the_acceptance_receipt_states_what_was_measured() {
+    let dir = private_tempdir();
+    let write = |name: &str, rows: &[(&str, &[(&str, Field<'_>)])]| {
+        let path = dir.path().join(name);
+        for (test, fields) in rows {
+            record_typed_to(&path, test, fields);
+        }
+        read_receipt(&path)
+    };
+    let measured = [("outcome", Field::Text(MEASURED))];
+    let skipped = [("outcome", Field::Text(SKIPPED_CAPABILITY))];
+    let no_outcome = [("files", Field::Num(1))];
+
+    // A clean receipt passes in both modes.
+    let clean = write(
+        "clean.jsonl",
+        &[("gate-a", &measured), ("gate-b", &measured)],
+    );
+    assert_eq!(clean.len(), 2, "the writer produced the rows it was given");
+    for m in [Mode::BestEffort, Mode::Required] {
+        audit_receipt(&clean, m)
+            .unwrap_or_else(|e| panic!("a clean receipt is refused in {m:?}: {e}"));
+    }
+    // An absent or empty receipt measured nothing.
+    assert!(read_receipt(&dir.path().join("absent.jsonl")).is_empty());
+    let err = audit_receipt(&[], Mode::BestEffort).expect_err("an empty receipt is refused");
+    assert!(err.contains("receipt is empty"), "{err}");
+    // A capability skip is tolerated best-effort and refused when measuring is required.
+    let skip = write("skip.jsonl", &[("gate-a", &measured), ("gate-b", &skipped)]);
+    audit_receipt(&skip, Mode::BestEffort).expect("a recorded skip is tolerated best-effort");
+    let err = audit_receipt(&skip, Mode::Required).expect_err("a skip fails when required");
+    assert!(err.contains("capability skip"), "{err}");
+    // A warm-base claim is refused in each shape and for each key, one receipt per shape.
+    for (name, fields) in [
+        ("flag", [("warm_base_published", Field::Flag(true))]),
+        ("text", [("warm_base_published", Field::Text("true"))]),
+        ("fresh-flag", [("base_status_fresh", Field::Flag(true))]),
+        ("fresh-text", [("base_status_fresh", Field::Text("true"))]),
+    ] {
+        let mut row = fields.to_vec();
+        row.push(("outcome", Field::Text(MEASURED)));
+        let claimed = write(&format!("{name}.jsonl"), &[("gate-a", &row)]);
+        let err = audit_receipt(&claimed, Mode::BestEffort)
+            .expect_err(&format!("{name}: a warm claim is refused"));
+        assert!(err.contains("published warm base"), "{name}: {err}");
+        assert!(
+            audit_row(&claimed[0]).is_err(),
+            "{name}: refused at write time too"
+        );
+    }
+    // A row with no outcome is refused.
+    let loose = write(
+        "loose.jsonl",
+        &[("gate-a", &measured), ("gate-b", &no_outcome)],
+    );
+    let err = audit_receipt(&loose, Mode::BestEffort).expect_err("an outcome-less row is refused");
+    assert!(
+        err.contains("no outcome") && err.contains("gate-b"),
+        "{err}"
+    );
+}
+
+/// The audit over the receipt a real run wrote: the whole-run properties (not empty, no skip under
+/// `COWFS_ACCEPTANCE_REQUIRED=1`) plus every row. Run it as a SEPARATE command after the `--ignored`
+/// acceptance has finished, never in the same `--include-ignored` run, where it could execute
+/// before the acceptance has written anything:
+/// `cargo test -p cowfs-treehouse --test real_project_acceptance -- --ignored --exact
+/// the_receipt_of_a_real_run_states_what_was_measured`, with the same `COWFS_ACCEPTANCE_EVIDENCE`
+/// and `COWFS_ACCEPTANCE_REQUIRED` as the acceptance. Rows are also audited as they are written.
+#[test]
+#[ignore = "audits the receipt of a real acceptance run: run it after warm_base_acceptance_over_a_real_core"]
+fn the_receipt_of_a_real_run_states_what_was_measured() {
+    let records = read_receipt(&evidence_dir().join("acceptance.jsonl"));
     record(
         "receipt-summary",
         &[
             ("outcome", MEASURED.to_owned()),
             ("records_read", records.len().to_string()),
-            ("capability_skips", skips.len().to_string()),
             ("mode", format!("{:?}", mode())),
         ],
     );
-    assert!(
-        !records.is_empty(),
-        "the receipt is empty, so this run measured nothing at all"
-    );
-    if !skips.is_empty() {
-        let names: Vec<&str> = skips.iter().filter_map(|r| r["test"].as_str()).collect();
-        eprintln!(
-            "ACCEPTANCE NOT MEASURED: {} gate(s) were capability-skipped: {names:?}. \
-             This run is NOT an acceptance.",
-            skips.len()
-        );
-        assert_eq!(
-            mode(),
-            Mode::BestEffort,
-            "COWFS_ACCEPTANCE_REQUIRED=1 was set, so a capability skip must have been a failure"
-        );
+    if let Err(e) = audit_receipt(&records, mode()) {
+        panic!("{e}");
     }
-    // A published warm base must never be claimed while the chain is still broken. Both shapes are
-    // refused, and an unrecognised shape is refused rather than read as false: the previous
-    // comparison was against a JSON boolean only, so a row written as the string "true" passed it.
-    let claimed = records
-        .iter()
-        .filter(|r| claims_published_warm_base(r))
-        .count();
-    assert_eq!(
-        claimed, 0,
-        "the receipt claims a published warm base in {claimed} row(s), which no gate at this \
-         base established"
-    );
-    // Every row is self-describing: an outcome, or an explicit statement that it is not a gate.
-    let undescribed: Vec<&str> = records
-        .iter()
-        .filter(|r| r["outcome"].as_str().is_none())
-        .filter_map(|r| r["test"].as_str())
-        .collect();
-    assert!(
-        undescribed.is_empty(),
-        "receipt rows without an outcome, so counting outcomes undercounts rows: {undescribed:?}"
-    );
-    let _ = deadline;
 }
 
 /// Whether one receipt row claims a warm base was published and is fresh.
