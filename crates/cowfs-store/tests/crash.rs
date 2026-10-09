@@ -53,9 +53,9 @@ fn history(seed: u64, o: Options) -> Hist {
                 _ => {
                     let len = 500 + rng.below(9000) as usize;
                     let d = if rng.below(3) == 0 {
-                        compressible(rng.next(), len)
+                        compressible(rng.next_u64(), len)
                     } else {
-                        random(rng.next(), len)
+                        random(rng.next_u64(), len)
                     };
                     let id = s.put(&d).unwrap();
                     puts.push((id, d));
@@ -184,7 +184,7 @@ fn case(seed: u64, depth: u32, t: &mut Tally) {
             }
         }
         for i in 0..4 {
-            let d = random(rng.next() ^ i, 600 + rng.below(3000) as usize);
+            let d = random(rng.next_u64() ^ i, 600 + rng.below(3000) as usize);
             extra.push((s.put(&d).unwrap(), d));
         }
         s.sync().unwrap();
