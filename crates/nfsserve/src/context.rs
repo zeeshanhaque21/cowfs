@@ -30,6 +30,8 @@ pub struct RPCContext {
     pub local: SocketAddr,
     pub export_name: Arc<String>,
     pub reply_cache: Arc<ReplyCache>,
+    /// See `Limits::handler_timeout`.
+    pub handler_timeout: std::time::Duration,
 }
 
 impl fmt::Debug for RPCContext {

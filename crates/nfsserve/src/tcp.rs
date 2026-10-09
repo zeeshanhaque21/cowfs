@@ -33,6 +33,11 @@ pub struct Limits {
     pub reply_cache_entries: usize,
     /// Age after which a remembered call is forgotten.
     pub reply_cache_age: Duration,
+    /// Longest a NFS handler may run. A handler past it is cancelled and its xid answered with
+    /// NFS3ERR_JUKEBOX, so a hard-mounted client retries instead of waiting for a reply that never
+    /// comes. Keep it below `reply_cache_age`, so the call is cancelled before its cache entry can
+    /// expire and let the retransmission run beside it.
+    pub handler_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -45,6 +50,7 @@ impl Default for Limits {
             max_frame: 1024 * 1024 + 64 * 1024,
             reply_cache_entries: 4096,
             reply_cache_age: Duration::from_secs(60),
+            handler_timeout: Duration::from_secs(45),
         }
     }
 }
@@ -265,6 +271,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 local,
                 export_name: self.export_name.clone(),
                 reply_cache: self.reply_cache.clone(),
+                handler_timeout: self.limits.handler_timeout,
                 active,
                 served,
             };
