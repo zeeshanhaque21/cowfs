@@ -1,16 +1,21 @@
 //! Snapshot replacement: failure injection at every step of the swap (F2) and the intent record's
 //! recovery on the next open.
 //!
-//! The swap stages a fork, writes an intent file, removes the old target, then forks into the
-//! target name. The states a failure may leave are:
+//! The swap forks the source once into a hidden staging snapshot, writes an intent file, removes
+//! the old target, renames the staging snapshot to the target name (one metadata transaction, the
+//! id is kept) and removes the intent file. The states a failure may leave are:
 //!
 //! | fault at | before reopen | after reopen |
 //! |---|---|---|
 //! | none | base is the new content | same |
-//! | 1 (staging fork) | base is the old content | same |
+//! | 1, promote only (staging fork) | base is the old content | same |
 //! | 2 (intent file) | base is the old content | same |
 //! | 3 (remove old) | base is the old content | same |
-//! | 4 (final fork) | `base` is absent, intent file present | base is the new content |
+//! | 4, import (after the old target went) | `base` is absent, intent file present, the call returns `Err` | base is the new content |
+//! | 4, promote (after the old target went) | base is the new content, error logged, the swap rolls forward and returns `Ok` | same |
+//! | 5, promote only (after the swap completed) | base is the new content, error logged | same |
+//! | 6 (rename done, intent kept: a crash) | base is the new content, intent file present | base is the new content, intent dropped |
+//! | 7 (intent removal fails) | base is the new content, error logged, intent file present | same as 6 |
 //!
 //! So the only window in which a name is missing is the one the intent record explains, and a
 //! failed swap never destroys the old base.
@@ -652,4 +657,103 @@ fn a_stale_intent_after_the_rename_is_dropped_on_open() {
     assert_eq!(content(&c, "base", "f"), "new content");
     assert!(leftovers(dir.path(), &c).is_empty());
     c.check().unwrap();
+}
+
+fn promotable(dir: &std::path::Path) -> Core {
+    let c = Core::open(dir, test_opts()).unwrap();
+    c.create_snapshot("base").unwrap();
+    let rb = root_entry(&c, "base").ino;
+    mkfile(&c, rb, "f", b"old base");
+    c.create_snapshot("src").unwrap();
+    let rs = root_entry(&c, "src").ino;
+    mkfile(&c, rs, "f", b"new content");
+    c.sync().unwrap();
+    c
+}
+
+/// The real crash between the rename into the target name and the removal of the intent file
+/// (fault 6): the new name is in place, the intent file is on disk, and the next open drops it.
+/// `a_stale_intent_after_the_rename_is_dropped_on_open` builds the same image by hand.
+#[test]
+fn a_crash_between_the_rename_and_the_intent_removal_is_dropped_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = promotable(dir.path());
+        c.set_swap_fault(6);
+        assert!(
+            c.promote_base("src", "base").is_err(),
+            "fault 6 not injected"
+        );
+        assert_eq!(content(&c, "base", "f"), "new content", "rename is done");
+        assert!(
+            dir.path().join("swap-base").exists(),
+            "the crash keeps the intent"
+        );
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "new content");
+    assert!(leftovers(dir.path(), &c).is_empty());
+    assert!(c.snapshot_view("src").is_ok());
+    c.check().unwrap();
+}
+
+/// The same crash point for a replacing import.
+#[test]
+fn an_import_crash_between_the_rename_and_the_intent_removal_is_dropped_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "new content");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace(&c, &v1).unwrap();
+        c.set_swap_fault(6);
+        assert!(replace(&c, &v2).is_err(), "fault 6 not injected");
+        assert_eq!(content(&c, "base", "f"), "new content");
+        assert!(dir.path().join("swap-base").exists());
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "new content");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}
+
+/// A failed intent removal after the rename is reported, does not fail the swap that landed, and
+/// the leftover intent is dropped by the next open.
+#[test]
+fn a_failed_intent_removal_is_reported_and_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = promotable(dir.path());
+        assert!(c.last_flush_error().is_none());
+        c.set_swap_fault(7);
+        let e = c.promote_base("src", "base").expect("the swap landed");
+        assert_eq!(e.name, "base");
+        assert_eq!(content(&c, "base", "f"), "new content");
+        let msg = c.last_flush_error().expect("the failure was swallowed");
+        assert!(msg.contains("could not remove"), "{msg}");
+        assert!(dir.path().join("swap-base").exists());
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "new content");
+    assert!(leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}
+
+/// A promoted snapshot's recorded parent is the source it was cloned from, not the id of the
+/// staging snapshot the fork used to be named after (which no longer exists).
+#[test]
+fn a_promoted_snapshot_records_the_source_as_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = promotable(dir.path());
+    let src = c
+        .list_snapshots()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "src")
+        .unwrap();
+    for target in ["base", "fresh"] {
+        let e = c.promote_base("src", target).unwrap();
+        assert_eq!(e.parent, Some(src.id), "{target}");
+    }
 }
