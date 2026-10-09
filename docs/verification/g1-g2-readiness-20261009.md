@@ -83,7 +83,7 @@ Edit rebuild (harness g2): reset `crates/cowfs-vfs/src/lib.rs` to the pinned con
 The `--message-format=json` output is parsed for `compiler-artifact` records with `fresh` false.
 A rep is refused (no row recorded) unless `cowfs_vfs` itself was rebuilt, at least 3 units were rebuilt, and at least one executable was relinked.
 Each recorded g2 rep carries `rebuilt_count`, `bins_relinked` and `rebuilt_units`, and `compare.py` marks a g2 rep without them (any pre-fix file) INVALID.
-The two checks use the same minimum (`G2_MIN_UNITS`, pinned equal by a test).
+The two checks share one minimum, `gates.G2_MIN_UNITS` (115, see issue 232 below).
 The file is reset before every rep, so the corpus file holds exactly one appended comment and does not grow across reps (the earlier code appended a line per rep).
 
 ### Edit at the new pin (decision of 2026-10-09, after the re-pin)
@@ -139,13 +139,32 @@ Host load1 was 175 to 212 for the first two variants and 50 to 136 for the third
 | `cargo build --tests` | 127 | 117 | 22.97 s | 17.37 to 29.34 s | 1.69x |
 | `cargo build --all-targets` | 133 | 123 | 23.51 s | 16.90 to 30.57 s | 1.81x |
 
-Decision: ADOPTED `cargo build --tests` for g2 (about 23 s of native work, well above the 4 s bar and the 3 s floor; spread 1.69x is inside the 2.0 bound even at load 175 to 212).
+Decision: ADOPTED `cargo build --tests` for g2 (about 23 s of native work, well above the 4 s bar and the 3 s floor; spread 1.69x is inside the 2.0 load-contamination bound even at load 175 to 212; the no-flip rule below decides what the range supports).
 `--all-targets` costs the same and adds examples and benches the edit does not matter for.
 A new untimed `warm_tests` step builds the test targets once before rep 0, so rep 0 is an edit and not a cold test build.
-Unit and relink counts are now about 127 and 117, so the `G2_MIN_UNITS` shape floor (3 units, 1 relink) is loose; it is kept as a floor on shape, not an expected count.
+Unit and relink counts are now about 127 and 117, so the old `G2_MIN_UNITS` floor of 3 was loose; issue 232 raised it to 115.
 Harness dry run of the new g2, native only, no mount, load1 26 to 34, NOT A GATE RESULT: `python3 bench/gates.py --gates g2 --reps 3` gave 15.44 s, 16.65 s, 17.93 s, each with `rebuilt_count` 127 and `bins_relinked` 117.
 Not yet measured: the cowfs arm (through the mount) on this workload, any Linux number, and any quiet-host number.
 The previous "Edit at the new pin" table above is the plain-build record and still holds for it.
+
+### g2 no-flip rule, 115-unit floor and exit precedence (issue 232, NOT A GATE RESULT)
+
+Source: the PR 229 critic.
+The fixed 2.0x spread bound and the 3-unit floor did not fit the measured 23 s, 127-unit workload.
+Every number below is from the earlier noisy-host measurements and is NOT A GATE RESULT.
+
+- No-flip rule: a g2 verdict is decided only if every median inside the observed [min, max] ranges gives the same answer.
+  - macOS (added-seconds budget B, default 1.0 s): FAIL if min_cow - max_nat >= B; PASS if max_cow - min_nat < B; otherwise UNMEASURABLE.
+  - Linux (1.5x ratio): PASS if max_cow <= 1.5 * min_nat; FAIL if min_cow > 1.5 * max_nat; otherwise UNMEASURABLE.
+  - Consequence: a range of about 12 s on a workload of about 23 s (the 17.37 to 29.34 s measured above) can only decide results far from the budget.
+    The old rule judged by medians and accepted that range because 1.69x is under 2.0x.
+  - The 2.0x max/min bound stays as a load-contamination sanity check, not as the decision rule.
+- Unit floor: `gates.G2_EXPECTED_UNITS` is 127 and `gates.G2_MIN_UNITS` is ceil(0.9 * 127) = 115, replacing the loose floor of 3.
+  `compare.py` uses `gates.G2_MIN_UNITS`; it no longer keeps its own copy.
+  A g2 rep with `rebuilt_count` 5 or 100 is INVALID (exit 3).
+- Exit codes: INVALID (3) is decided before any verdict, then FAIL (1) beats UNMEASURABLE (2) beats PASS (0).
+  A FAIL on any gate returns 1 even if another gate is UNMEASURABLE, and the RESULT line shows both: `FAIL (n), m unmeasurable`.
+  `bench/g12_run.py` already treats compare rc 1 as a FAIL verdict and rc 2 or 3 as INVALID, so a mixed run reports FAIL there.
 
 ### Why the earlier edit, history at the retired pin `c1619ec` (superseded by the section above)
 
