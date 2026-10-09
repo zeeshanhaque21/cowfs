@@ -1,0 +1,294 @@
+{"step": "daemon.start", "pid": 1629977, "t": "12:14:00", "load1": "14.69"}
+{"step": "ctl:clone", "rc": 0, "s": 9.85, "err": "", "t": "12:14:10", "load1": "15.83"}
+{"step": "ctl:repack", "rc": 0, "s": 17.44, "err": "", "t": "12:14:27", "load1": "18.57"}
+{"step": "ctl-clean:fsck", "rc": 0, "s": 4.48, "err": "", "t": "12:14:32", "load1": "17.88"}
+{"step": "ctl-clean:verify-pack pack-67a350202", "rc": 0, "s": 5.02, "err": "", "t": "12:14:37", "load1": "17.25"}
+{"step": "ctl-clean:zero4k-pages-idx", "file": "pack-67a3502028926f08af19d475c9abf98fab1cd563.idx", "zero_page_runs": 0, "t": "12:14:37", "load1": "17.25"}
+{"step": "ctl-clean:zero4k-pages-pack", "file": "pack-67a3502028926f08af19d475c9abf98fab1cd563.pack", "zero_page_runs": 0, "t": "12:14:37", "load1": "17.25"}
+{"step": "ctl-zeroed-idx:fsck", "rc": 11, "s": 4.49, "err": "9e023b2495bf999518d7afb41: invalid sha1 pointer in cache-tree of .git/index\nerror: 520cb6bca1971c796d760fccdfe1f338b73b2c13: invalid sha1 pointer in cache-tree of .git/index\nerror: Could not read 510e1718994d2d874f3c5c00d5505db0ce106e32\nerror: Could not read 51082ea7a525379a926f8262739419939a2ad1dc\n", "t": "12:14:41", "load1": "16.59"}
+{"step": "ctl-zeroed-idx:verify-pack pack-67a350202", "rc": 1, "s": 5.03, "err": "fatal: sha1 file '/mnt/docs/Projects/cowfs-8-21/native-ctl/.git/objects/pack/pack-67a3502028926f08af19d475c9abf98fab1cd563.idx' validation error\n", "t": "12:14:46", "load1": "15.98"}
+{"step": "ctl-zeroed-idx:zero4k-pages-idx", "file": "pack-67a3502028926f08af19d475c9abf98fab1cd563.idx", "zero_page_runs": 1, "t": "12:14:46", "load1": "15.98"}
+{"step": "ctl-zeroed-idx:zero4k-pages-pack", "file": "pack-67a3502028926f08af19d475c9abf98fab1cd563.pack", "zero_page_runs": 0, "t": "12:14:47", "load1": "15.98"}
+{"step": "positive-control", "clean_ok": true, "zeroed_idx_detected": true, "t": "12:14:47", "load1": "15.98"}
+{"step": "import", "rc": 0, "s": 12.7, "out": "{\"bytes\":883971260,\"files\":25290,\"hash_algorithm\":\"blake3\",\"imported_root_hash\":\"a4ec9964cc46452ed3026fe6558f84ecce8f7e3c4f66da1978c1b7ef57ee68a6\",\"mismatches\":[],\"mismatches_truncated\":false,\"name\":\"soak\",\"source_root_hash\":\"a4ec9964cc46452ed3026fe6558f84ecce8f7e3c4f66da1978c1b7ef57ee68a6\",\"stored_bytes\":300791074,\"verified\":true}\n", "t": "12:15:00", "load1": "14.58"}
+{"step": "manifest.src", "files": 25261, "s": 1.9, "t": "12:15:02", "load1": "14.58"}
+{"step": "head", "rc": 0, "s": 0.0, "err": "", "t": "12:15:02", "load1": "14.58"}
+{"step": "git rev-parse --abbrev-ref HEAD", "rc": 0, "s": 0.0, "err": "", "t": "12:15:02", "load1": "14.58"}
+{"step": "c0:fsck", "rc": 0, "s": 5.58, "err": "", "t": "12:15:08", "load1": "14.21"}
+{"step": "c0:verify-pack pack-5671cffe7", "rc": 0, "s": 5.7, "err": "", "t": "12:15:13", "load1": "13.96"}
+{"step": "c0:zero4k-pages-idx", "file": "pack-5671cffe7fd736a3d597b238f6bfffd01e883ea2.idx", "zero_page_runs": 0, "t": "12:15:13", "load1": "13.96"}
+{"step": "c0:zero4k-pages-pack", "file": "pack-5671cffe7fd736a3d597b238f6bfffd01e883ea2.pack", "zero_page_runs": 0, "t": "12:15:13", "load1": "13.96"}
+{"step": "c1:branch", "rc": 0, "s": 13.9, "err": "", "t": "12:15:27", "load1": "13.29"}
+{"step": "c1:add", "rc": 0, "s": 2.23, "err": "", "t": "12:15:30", "load1": "13.11"}
+{"step": "c1:commit", "rc": 0, "s": 0.7, "err": "", "t": "12:15:31", "load1": "13.11"}
+{"step": "c1:status", "rc": 0, "s": 0.59, "err": "", "t": "12:15:31", "load1": "13.11"}
+{"step": "c1:checkout-back", "rc": 0, "s": 1.22, "err": "", "t": "12:15:32", "load1": "13.11"}
+{"step": "c1:gc", "rc": 0, "s": 8.08, "err": "", "t": "12:15:40", "load1": "13.22"}
+{"step": "c1:fsck", "rc": 0, "s": 7.67, "err": "", "t": "12:15:48", "load1": "13.12"}
+{"step": "c1:verify-pack pack-62e335704", "rc": 0, "s": 7.51, "err": "", "t": "12:15:56", "load1": "12.80"}
+{"step": "c1:zero4k-pages-idx", "file": "pack-62e335704c59fd5922acf3d3f02025c02d8c09b0.idx", "zero_page_runs": 0, "t": "12:15:56", "load1": "12.80"}
+{"step": "c1:zero4k-pages-pack", "file": "pack-62e335704c59fd5922acf3d3f02025c02d8c09b0.pack", "zero_page_runs": 0, "t": "12:15:56", "load1": "12.80"}
+{"step": "c1:branch-del", "rc": 0, "s": 0.02, "err": "", "t": "12:15:56", "load1": "12.80"}
+{"step": "c1:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 30.2, "t": "12:16:26", "load1": "11.65"}
+{"step": "c1:scratch", "ops": 20214, "bad": 0, "t": "12:16:26", "load1": "11.65"}
+{"step": "c2:branch", "rc": 0, "s": 0.75, "err": "", "t": "12:16:27", "load1": "11.65"}
+{"step": "c2:add", "rc": 0, "s": 1.89, "err": "", "t": "12:16:29", "load1": "11.52"}
+{"step": "c2:commit", "rc": 0, "s": 0.82, "err": "", "t": "12:16:30", "load1": "11.52"}
+{"step": "c2:status", "rc": 0, "s": 0.57, "err": "", "t": "12:16:31", "load1": "11.52"}
+{"step": "c2:checkout-back", "rc": 0, "s": 1.03, "err": "", "t": "12:16:32", "load1": "11.52"}
+{"step": "c2:repack-adf", "rc": 0, "s": 36.17, "err": "", "t": "12:17:08", "load1": "13.73"}
+{"step": "c2:fsck", "rc": 0, "s": 8.07, "err": "", "t": "12:17:16", "load1": "13.39"}
+{"step": "c2:verify-pack pack-534566258", "rc": 0, "s": 8.09, "err": "", "t": "12:17:24", "load1": "12.87"}
+{"step": "c2:zero4k-pages-idx", "file": "pack-534566258508146f399a7b5bd386a456fab676fc.idx", "zero_page_runs": 0, "t": "12:17:24", "load1": "12.87"}
+{"step": "c2:zero4k-pages-pack", "file": "pack-534566258508146f399a7b5bd386a456fab676fc.pack", "zero_page_runs": 0, "t": "12:17:24", "load1": "12.87"}
+{"step": "c2:branch-del", "rc": 0, "s": 0.01, "err": "", "t": "12:17:24", "load1": "12.87"}
+{"step": "c2:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 31.5, "t": "12:17:56", "load1": "12.01"}
+{"step": "c2:scratch", "ops": 42982, "bad": 0, "t": "12:17:56", "load1": "12.01"}
+{"step": "c3:branch", "rc": 0, "s": 0.31, "err": "", "t": "12:17:56", "load1": "12.01"}
+{"step": "c3:add", "rc": 0, "s": 1.89, "err": "", "t": "12:17:58", "load1": "12.01"}
+{"step": "c3:commit", "rc": 0, "s": 0.59, "err": "", "t": "12:17:59", "load1": "11.85"}
+{"step": "c3:status", "rc": 0, "s": 0.74, "err": "", "t": "12:18:00", "load1": "11.85"}
+{"step": "c3:checkout-back", "rc": 0, "s": 1.21, "err": "", "t": "12:18:01", "load1": "11.85"}
+{"step": "c3:gc-aggressive", "rc": 0, "s": 164.76, "err": "", "t": "12:20:46", "load1": "17.17"}
+{"step": "c3:fsck", "rc": 0, "s": 7.92, "err": "", "t": "12:20:54", "load1": "16.60"}
+{"step": "c3:verify-pack pack-fb874e676", "rc": 0, "s": 8.17, "err": "", "t": "12:21:02", "load1": "15.65"}
+{"step": "c3:zero4k-pages-idx", "file": "pack-fb874e6762180dce9f3dcfba27f6dff79fcfb110.idx", "zero_page_runs": 0, "t": "12:21:02", "load1": "15.65"}
+{"step": "c3:zero4k-pages-pack", "file": "pack-fb874e6762180dce9f3dcfba27f6dff79fcfb110.pack", "zero_page_runs": 0, "t": "12:21:02", "load1": "15.65"}
+{"step": "c3:branch-del", "rc": 0, "s": 0.01, "err": "", "t": "12:21:02", "load1": "15.65"}
+{"step": "c3:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 32.6, "t": "12:21:35", "load1": "14.17"}
+{"step": "c3:cowfs-fsck", "rc": 0, "out": "{\"blocks_checked\":374168,\"bytes_checked\":22721733362,\"ok\":true,\"problems\":[],\"snapshots_checked\":1}\n", "t": "12:21:58", "load1": "13.41"}
+{"step": "c3:scratch", "ops": 94671, "bad": 0, "t": "12:21:58", "load1": "13.41"}
+{"step": "c4:branch", "rc": 0, "s": 0.46, "err": "", "t": "12:21:59", "load1": "13.41"}
+{"step": "c4:add", "rc": 0, "s": 2.07, "err": "", "t": "12:22:01", "load1": "13.29"}
+{"step": "c4:commit", "rc": 0, "s": 0.84, "err": "", "t": "12:22:02", "load1": "13.29"}
+{"step": "c4:status", "rc": 0, "s": 0.55, "err": "", "t": "12:22:03", "load1": "13.29"}
+{"step": "c4:checkout-back", "rc": 0, "s": 1.47, "err": "", "t": "12:22:04", "load1": "13.03"}
+{"step": "c4:gc", "rc": 0, "s": 6.31, "err": "", "t": "12:22:10", "load1": "13.03"}
+{"step": "c4:fsck", "rc": 0, "s": 8.48, "err": "", "t": "12:22:19", "load1": "12.87"}
+{"step": "c4:verify-pack pack-945d935bb", "rc": 0, "s": 8.04, "err": "", "t": "12:22:27", "load1": "12.73"}
+{"step": "c4:zero4k-pages-idx", "file": "pack-945d935bb0bab76432cecac5bad7477af1bb89b3.idx", "zero_page_runs": 0, "t": "12:22:27", "load1": "12.73"}
+{"step": "c4:zero4k-pages-pack", "file": "pack-945d935bb0bab76432cecac5bad7477af1bb89b3.pack", "zero_page_runs": 0, "t": "12:22:27", "load1": "12.73"}
+{"step": "c4:branch-del", "rc": 0, "s": 0.01, "err": "", "t": "12:22:27", "load1": "12.73"}
+{"step": "c4:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 29.7, "t": "12:22:57", "load1": "11.94"}
+{"step": "c4:scratch", "ops": 110540, "bad": 0, "t": "12:22:57", "load1": "11.94"}
+{"step": "c5:branch", "rc": 0, "s": 0.36, "err": "", "t": "12:22:58", "load1": "11.94"}
+{"step": "c5:add", "rc": 0, "s": 1.65, "err": "", "t": "12:22:59", "load1": "11.79"}
+{"step": "c5:commit", "rc": 0, "s": 0.99, "err": "", "t": "12:23:00", "load1": "11.79"}
+{"step": "c5:status", "rc": 0, "s": 0.34, "err": "", "t": "12:23:01", "load1": "11.79"}
+{"step": "c5:checkout-back", "rc": 0, "s": 1.4, "err": "", "t": "12:23:02", "load1": "11.79"}
+{"step": "c5:repack-adf", "rc": 0, "s": 34.71, "err": "", "t": "12:23:37", "load1": "13.13"}
+{"step": "c5:fsck", "rc": 0, "s": 8.36, "err": "", "t": "12:23:45", "load1": "12.65"}
+{"step": "c5:verify-pack pack-b0a36d97d", "rc": 0, "s": 7.84, "err": "", "t": "12:23:53", "load1": "12.59"}
+{"step": "c5:zero4k-pages-idx", "file": "pack-b0a36d97d315f74fad4f31283bcb5a596f18392e.idx", "zero_page_runs": 0, "t": "12:23:53", "load1": "12.59"}
+{"step": "c5:zero4k-pages-pack", "file": "pack-b0a36d97d315f74fad4f31283bcb5a596f18392e.pack", "zero_page_runs": 0, "t": "12:23:54", "load1": "12.59"}
+{"step": "c5:branch-del", "rc": 0, "s": 0.01, "err": "", "t": "12:23:54", "load1": "12.59"}
+{"step": "c5:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 30.0, "t": "12:24:24", "load1": "11.41"}
+{"step": "c5:scratch", "ops": 133155, "bad": 0, "t": "12:24:24", "load1": "11.41"}
+{"step": "c6:branch", "rc": 0, "s": 0.51, "err": "", "t": "12:24:24", "load1": "11.46"}
+{"step": "c6:add", "rc": 0, "s": 1.92, "err": "", "t": "12:24:26", "load1": "11.46"}
+{"step": "c6:commit", "rc": 0, "s": 0.68, "err": "", "t": "12:24:27", "load1": "11.46"}
+{"step": "c6:status", "rc": 0, "s": 0.49, "err": "", "t": "12:24:28", "load1": "11.46"}
+{"step": "c6:checkout-back", "rc": 0, "s": 1.07, "err": "", "t": "12:24:29", "load1": "11.46"}
+{"step": "c6:gc-aggressive", "rc": 0, "s": 153.06, "err": "", "t": "12:27:02", "load1": "19.62"}
+{"step": "c6:fsck", "rc": 0, "s": 9.02, "err": "", "t": "12:27:11", "load1": "18.22"}
+{"step": "c6:verify-pack pack-df64bb61c", "rc": 0, "s": 8.11, "err": "", "t": "12:27:19", "load1": "17.64"}
+{"step": "c6:zero4k-pages-idx", "file": "pack-df64bb61ce41ac7ffc6fb530fbbfbcab708a64b8.idx", "zero_page_runs": 0, "t": "12:27:19", "load1": "17.64"}
+{"step": "c6:zero4k-pages-pack", "file": "pack-df64bb61ce41ac7ffc6fb530fbbfbcab708a64b8.pack", "zero_page_runs": 0, "t": "12:27:20", "load1": "17.11"}
+{"step": "c6:branch-del", "rc": 0, "s": 0.03, "err": "", "t": "12:27:20", "load1": "17.11"}
+{"step": "c6:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 32.6, "t": "12:27:52", "load1": "14.45"}
+{"step": "c6:cowfs-fsck", "rc": 4, "out": "{\"error\":{\"code\":\"timeout\",\"message\":\"the server did not send a response within 30s\"}}\n", "t": "12:28:22", "load1": "13.61"}
+{"step": "c6:scratch", "ops": 181673, "bad": 0, "t": "12:28:22", "load1": "13.61"}
+{"step": "c7:branch", "rc": 0, "s": 0.33, "err": "", "t": "12:28:23", "load1": "13.61"}
+{"step": "c7:add", "rc": 0, "s": 1.72, "err": "", "t": "12:28:25", "load1": "13.48"}
+{"step": "c7:commit", "rc": 0, "s": 1.15, "err": "", "t": "12:28:26", "load1": "13.48"}
+{"step": "c7:status", "rc": 0, "s": 0.79, "err": "", "t": "12:28:27", "load1": "13.48"}
+{"step": "c7:checkout-back", "rc": 0, "s": 1.05, "err": "", "t": "12:28:28", "load1": "13.48"}
+{"step": "c7:gc", "rc": 0, "s": 7.69, "err": "", "t": "12:28:35", "load1": "13.25"}
+{"step": "c7:fsck", "rc": 0, "s": 11.08, "err": "", "t": "12:28:47", "load1": "13.21"}
+{"step": "c7:verify-pack pack-c149bae9f", "rc": 0, "s": 9.07, "err": "", "t": "12:28:56", "load1": "14.47"}
+{"step": "c7:zero4k-pages-idx", "file": "pack-c149bae9f7f339c050544e03f6f9e6620a079350.idx", "zero_page_runs": 0, "t": "12:28:56", "load1": "14.47"}
+{"step": "c7:zero4k-pages-pack", "file": "pack-c149bae9f7f339c050544e03f6f9e6620a079350.pack", "zero_page_runs": 0, "t": "12:28:56", "load1": "14.47"}
+{"step": "c7:branch-del", "rc": 0, "s": 0.03, "err": "", "t": "12:28:56", "load1": "14.47"}
+{"step": "c7:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 30.9, "t": "12:29:27", "load1": "13.20"}
+{"step": "c7:scratch", "ops": 198206, "bad": 0, "t": "12:29:27", "load1": "13.20"}
+{"step": "c8:branch", "rc": 0, "s": 0.57, "err": "", "t": "12:29:28", "load1": "13.20"}
+{"step": "c8:add", "rc": 0, "s": 1.88, "err": "", "t": "12:29:30", "load1": "13.02"}
+{"step": "c8:commit", "rc": 0, "s": 0.87, "err": "", "t": "12:29:31", "load1": "13.02"}
+{"step": "c8:status", "rc": 0, "s": 0.4, "err": "", "t": "12:29:31", "load1": "13.02"}
+{"step": "c8:checkout-back", "rc": 0, "s": 1.21, "err": "", "t": "12:29:32", "load1": "13.02"}
+{"step": "c8:repack-adf", "rc": 0, "s": 36.5, "err": "", "t": "12:30:09", "load1": "13.96"}
+{"step": "c8:fsck", "rc": 0, "s": 9.36, "err": "", "t": "12:30:18", "load1": "13.43"}
+{"step": "c8:verify-pack pack-6a66ec081", "rc": 0, "s": 9.1, "err": "", "t": "12:30:27", "load1": "13.14"}
+{"step": "c8:zero4k-pages-idx", "file": "pack-6a66ec08147ef5b0aecad6b356cabbe3668a6b50.idx", "zero_page_runs": 0, "t": "12:30:27", "load1": "13.14"}
+{"step": "c8:zero4k-pages-pack", "file": "pack-6a66ec08147ef5b0aecad6b356cabbe3668a6b50.pack", "zero_page_runs": 0, "t": "12:30:28", "load1": "13.14"}
+{"step": "c8:branch-del", "rc": 0, "s": 0.03, "err": "", "t": "12:30:28", "load1": "13.14"}
+{"step": "c8:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 31.8, "t": "12:30:59", "load1": "11.82"}
+{"step": "c8:scratch", "ops": 221764, "bad": 0, "t": "12:30:59", "load1": "11.82"}
+{"step": "c9:branch", "rc": 0, "s": 0.38, "err": "", "t": "12:31:00", "load1": "11.82"}
+{"step": "c9:add", "rc": 0, "s": 2.18, "err": "", "t": "12:31:02", "load1": "11.82"}
+{"step": "c9:commit", "rc": 0, "s": 0.81, "err": "", "t": "12:31:03", "load1": "11.82"}
+{"step": "c9:status", "rc": 0, "s": 0.53, "err": "", "t": "12:31:04", "load1": "11.82"}
+{"step": "c9:checkout-back", "rc": 0, "s": 1.12, "err": "", "t": "12:31:05", "load1": "11.59"}
+{"step": "c9:gc-aggressive", "rc": 0, "s": 140.3, "err": "", "t": "12:33:25", "load1": "17.63"}
+{"step": "c9:fsck", "rc": 0, "s": 5.52, "err": "", "t": "12:33:30", "load1": "16.62"}
+{"step": "c9:verify-pack pack-c9f7d9f6c", "rc": 0, "s": 5.51, "err": "", "t": "12:33:36", "load1": "15.53"}
+{"step": "c9:zero4k-pages-idx", "file": "pack-c9f7d9f6c7a830ac03d9a2a32052b0219354f5f3.idx", "zero_page_runs": 0, "t": "12:33:36", "load1": "15.53"}
+{"step": "c9:zero4k-pages-pack", "file": "pack-c9f7d9f6c7a830ac03d9a2a32052b0219354f5f3.pack", "zero_page_runs": 0, "t": "12:33:36", "load1": "15.53"}
+{"step": "c9:branch-del", "rc": 0, "s": 0.01, "err": "", "t": "12:33:36", "load1": "15.53"}
+{"step": "c9:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 19.3, "t": "12:33:56", "load1": "12.83"}
+{"step": "c9:cowfs-fsck", "rc": 4, "out": "{\"error\":{\"code\":\"timeout\",\"message\":\"the server did not send a response within 30s\"}}\n", "t": "12:34:26", "load1": "9.44"}
+{"step": "c9:scratch", "ops": 276605, "bad": 0, "t": "12:34:26", "load1": "9.44"}
+{"step": "c10:branch", "rc": 0, "s": 0.25, "err": "", "t": "12:34:26", "load1": "9.44"}
+{"step": "c10:add", "rc": 0, "s": 1.31, "err": "", "t": "12:34:28", "load1": "9.44"}
+{"step": "c10:commit", "rc": 0, "s": 0.53, "err": "", "t": "12:34:28", "load1": "9.44"}
+{"step": "c10:status", "rc": 0, "s": 0.29, "err": "", "t": "12:34:28", "load1": "9.44"}
+{"step": "c10:checkout-back", "rc": 0, "s": 0.61, "err": "", "t": "12:34:29", "load1": "9.44"}
+{"step": "c10:gc", "rc": 0, "s": 4.9, "err": "", "t": "12:34:34", "load1": "8.93"}
+{"step": "c10:fsck", "rc": 0, "s": 5.8, "err": "", "t": "12:34:40", "load1": "8.32"}
+{"step": "c10:verify-pack pack-4f8b3bc34", "rc": 0, "s": 5.67, "err": "", "t": "12:34:45", "load1": "8.13"}
+{"step": "c10:zero4k-pages-idx", "file": "pack-4f8b3bc34fca9aea1c112bc8c5b9c2c64dc2b277.idx", "zero_page_runs": 0, "t": "12:34:45", "load1": "8.13"}
+{"step": "c10:zero4k-pages-pack", "file": "pack-4f8b3bc34fca9aea1c112bc8c5b9c2c64dc2b277.pack", "zero_page_runs": 0, "t": "12:34:46", "load1": "8.13"}
+{"step": "c10:branch-del", "rc": 0, "s": 0.03, "err": "", "t": "12:34:46", "load1": "8.13"}
+{"step": "c10:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 25.0, "t": "12:35:11", "load1": "5.93"}
+{"step": "c10:scratch", "ops": 292968, "bad": 0, "t": "12:35:11", "load1": "5.93"}
+{"step": "c11:branch", "rc": 0, "s": 0.22, "err": "", "t": "12:35:11", "load1": "5.93"}
+{"step": "c11:add", "rc": 0, "s": 1.41, "err": "", "t": "12:35:13", "load1": "5.93"}
+{"step": "c11:commit", "rc": 0, "s": 0.56, "err": "", "t": "12:35:13", "load1": "5.93"}
+{"step": "c11:status", "rc": 0, "s": 0.27, "err": "", "t": "12:35:13", "load1": "5.93"}
+{"step": "c11:checkout-back", "rc": 0, "s": 0.69, "err": "", "t": "12:35:14", "load1": "5.62"}
+{"step": "c11:repack-adf", "rc": 0, "s": 16.8, "err": "", "t": "12:35:31", "load1": "6.37"}
+{"step": "c11:fsck", "rc": 0, "s": 4.57, "err": "", "t": "12:35:36", "load1": "6.58"}
+{"step": "c11:verify-pack pack-e9aa61ef4", "rc": 0, "s": 4.47, "err": "", "t": "12:35:40", "load1": "6.22"}
+{"step": "c11:zero4k-pages-idx", "file": "pack-e9aa61ef4738f5d7c4d2078e2ba59230fa17ad04.idx", "zero_page_runs": 0, "t": "12:35:40", "load1": "6.22"}
+{"step": "c11:zero4k-pages-pack", "file": "pack-e9aa61ef4738f5d7c4d2078e2ba59230fa17ad04.pack", "zero_page_runs": 0, "t": "12:35:41", "load1": "6.22"}
+{"step": "c11:branch-del", "rc": 0, "s": 0.01, "err": "", "t": "12:35:41", "load1": "6.22"}
+{"step": "c11:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 25.3, "t": "12:36:06", "load1": "5.00"}
+{"step": "c11:scratch", "ops": 314936, "bad": 0, "t": "12:36:06", "load1": "5.00"}
+{"step": "c12:branch", "rc": 0, "s": 0.36, "err": "", "t": "12:36:06", "load1": "5.00"}
+{"step": "c12:add", "rc": 0, "s": 1.43, "err": "", "t": "12:36:08", "load1": "5.00"}
+{"step": "c12:commit", "rc": 0, "s": 0.64, "err": "", "t": "12:36:08", "load1": "5.00"}
+{"step": "c12:status", "rc": 0, "s": 0.35, "err": "", "t": "12:36:09", "load1": "5.00"}
+{"step": "c12:checkout-back", "rc": 0, "s": 0.75, "err": "", "t": "12:36:10", "load1": "5.00"}
+{"step": "c12:gc-aggressive", "rc": 0, "s": 88.66, "err": "", "t": "12:37:38", "load1": "10.73"}
+{"step": "c12:fsck", "rc": 0, "s": 4.33, "err": "", "t": "12:37:43", "load1": "10.03"}
+{"step": "c12:verify-pack pack-6a7da4379", "rc": 0, "s": 4.4, "err": "", "t": "12:37:47", "load1": "10.35"}
+{"step": "c12:zero4k-pages-idx", "file": "pack-6a7da4379f8a33286ae3530b1fd0ba3da55563a3.idx", "zero_page_runs": 0, "t": "12:37:47", "load1": "10.35"}
+{"step": "c12:zero4k-pages-pack", "file": "pack-6a7da4379f8a33286ae3530b1fd0ba3da55563a3.pack", "zero_page_runs": 0, "t": "12:37:47", "load1": "10.35"}
+{"step": "c12:branch-del", "rc": 0, "s": 0.02, "err": "", "t": "12:37:47", "load1": "10.35"}
+{"step": "c12:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 26.0, "t": "12:38:13", "load1": "7.57"}
+{"step": "c12:cowfs-fsck", "rc": 4, "out": "{\"error\":{\"code\":\"timeout\",\"message\":\"the server did not send a response within 30s\"}}\n", "t": "12:38:43", "load1": "6.16"}
+{"step": "c12:scratch", "ops": 370650, "bad": 0, "t": "12:38:43", "load1": "6.16"}
+{"step": "c13:branch", "rc": 0, "s": 0.19, "err": "", "t": "12:38:44", "load1": "6.16"}
+{"step": "c13:add", "rc": 0, "s": 1.17, "err": "", "t": "12:38:45", "load1": "5.90"}
+{"step": "c13:commit", "rc": 0, "s": 0.43, "err": "", "t": "12:38:45", "load1": "5.90"}
+{"step": "c13:status", "rc": 0, "s": 0.33, "err": "", "t": "12:38:46", "load1": "5.90"}
+{"step": "c13:checkout-back", "rc": 0, "s": 0.6, "err": "", "t": "12:38:46", "load1": "5.90"}
+{"step": "c13:gc", "rc": 0, "s": 5.02, "err": "", "t": "12:38:51", "load1": "5.67"}
+{"step": "c13:fsck", "rc": 0, "s": 6.15, "err": "", "t": "12:38:57", "load1": "5.46"}
+{"step": "c13:verify-pack pack-b2597eb84", "rc": 0, "s": 6.17, "err": "", "t": "12:39:04", "load1": "5.34"}
+{"step": "c13:zero4k-pages-idx", "file": "pack-b2597eb84168eba0885db8dd331e35e4e4cee405.idx", "zero_page_runs": 0, "t": "12:39:04", "load1": "5.34"}
+{"step": "c13:zero4k-pages-pack", "file": "pack-b2597eb84168eba0885db8dd331e35e4e4cee405.pack", "zero_page_runs": 0, "t": "12:39:04", "load1": "5.34"}
+{"step": "c13:branch-del", "rc": 0, "s": 0.02, "err": "", "t": "12:39:04", "load1": "5.34"}
+{"step": "c13:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 22.2, "t": "12:39:26", "load1": "5.91"}
+{"step": "c13:scratch", "ops": 387350, "bad": 0, "t": "12:39:26", "load1": "5.91"}
+{"step": "c14:branch", "rc": 0, "s": 0.25, "err": "", "t": "12:39:26", "load1": "5.91"}
+{"step": "c14:add", "rc": 0, "s": 1.43, "err": "", "t": "12:39:28", "load1": "5.91"}
+{"step": "c14:commit", "rc": 0, "s": 0.55, "err": "", "t": "12:39:29", "load1": "5.91"}
+{"step": "c14:status", "rc": 0, "s": 0.28, "err": "", "t": "12:39:29", "load1": "5.91"}
+{"step": "c14:checkout-back", "rc": 0, "s": 0.59, "err": "", "t": "12:39:29", "load1": "5.68"}
+{"step": "c14:repack-adf", "rc": 0, "s": 18.36, "err": "", "t": "12:39:48", "load1": "6.37"}
+{"step": "c14:fsck", "rc": 0, "s": 4.59, "err": "", "t": "12:39:52", "load1": "6.02"}
+{"step": "c14:verify-pack pack-09d502a8f", "rc": 0, "s": 5.98, "err": "", "t": "12:39:58", "load1": "5.70"}
+{"step": "c14:zero4k-pages-idx", "file": "pack-09d502a8fa6a355f749a2b43f9c70d8829f25a3f.idx", "zero_page_runs": 0, "t": "12:39:58", "load1": "5.70"}
+{"step": "c14:zero4k-pages-pack", "file": "pack-09d502a8fa6a355f749a2b43f9c70d8829f25a3f.pack", "zero_page_runs": 0, "t": "12:39:59", "load1": "5.70"}
+{"step": "c14:branch-del", "rc": 0, "s": 0.02, "err": "", "t": "12:39:59", "load1": "5.70"}
+{"step": "c14:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 26.9, "t": "12:40:26", "load1": "5.15"}
+{"step": "c14:scratch", "ops": 410052, "bad": 0, "t": "12:40:26", "load1": "5.15"}
+{"step": "c15:branch", "rc": 0, "s": 0.54, "err": "", "t": "12:40:26", "load1": "5.15"}
+{"step": "c15:add", "rc": 0, "s": 1.53, "err": "", "t": "12:40:28", "load1": "5.15"}
+{"step": "c15:commit", "rc": 0, "s": 0.47, "err": "", "t": "12:40:28", "load1": "5.15"}
+{"step": "c15:status", "rc": 0, "s": 0.45, "err": "", "t": "12:40:29", "load1": "5.15"}
+{"step": "c15:checkout-back", "rc": 0, "s": 0.7, "err": "", "t": "12:40:30", "load1": "5.14"}
+{"step": "c15:gc-aggressive", "rc": 0, "s": 90.09, "err": "", "t": "12:42:00", "load1": "11.75"}
+{"step": "c15:fsck", "rc": 0, "s": 4.92, "err": "", "t": "12:42:05", "load1": "10.97"}
+{"step": "c15:verify-pack pack-113ce7904", "rc": 0, "s": 4.56, "err": "", "t": "12:42:09", "load1": "10.33"}
+{"step": "c15:zero4k-pages-idx", "file": "pack-113ce790408524828d790da2b412512cfe82afce.idx", "zero_page_runs": 0, "t": "12:42:09", "load1": "10.33"}
+{"step": "c15:zero4k-pages-pack", "file": "pack-113ce790408524828d790da2b412512cfe82afce.pack", "zero_page_runs": 0, "t": "12:42:10", "load1": "10.33"}
+{"step": "c15:branch-del", "rc": 0, "s": 0.05, "err": "", "t": "12:42:10", "load1": "10.33"}
+{"step": "c15:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 26.0, "t": "12:42:36", "load1": "8.02"}
+{"step": "c15:cowfs-fsck", "rc": 4, "out": "{\"error\":{\"code\":\"timeout\",\"message\":\"the server did not send a response within 30s\"}}\n", "t": "12:43:06", "load1": "6.20"}
+{"step": "c15:scratch", "ops": 468081, "bad": 0, "t": "12:43:06", "load1": "6.20"}
+{"step": "c16:branch", "rc": 0, "s": 0.18, "err": "", "t": "12:43:06", "load1": "6.20"}
+{"step": "c16:add", "rc": 0, "s": 1.06, "err": "", "t": "12:43:07", "load1": "6.20"}
+{"step": "c16:commit", "rc": 0, "s": 0.55, "err": "", "t": "12:43:08", "load1": "6.20"}
+{"step": "c16:status", "rc": 0, "s": 0.26, "err": "", "t": "12:43:08", "load1": "6.20"}
+{"step": "c16:checkout-back", "rc": 0, "s": 0.6, "err": "", "t": "12:43:09", "load1": "6.20"}
+{"step": "c16:gc", "rc": 0, "s": 5.44, "err": "", "t": "12:43:14", "load1": "5.86"}
+{"step": "c16:fsck", "rc": 0, "s": 6.6, "err": "", "t": "12:43:21", "load1": "5.57"}
+{"step": "c16:verify-pack pack-62990f540", "rc": 0, "s": 6.12, "err": "", "t": "12:43:27", "load1": "5.44"}
+{"step": "c16:zero4k-pages-idx", "file": "pack-62990f540592f2e9050571717fd19658f7b7f78f.idx", "zero_page_runs": 0, "t": "12:43:27", "load1": "5.44"}
+{"step": "c16:zero4k-pages-pack", "file": "pack-62990f540592f2e9050571717fd19658f7b7f78f.pack", "zero_page_runs": 0, "t": "12:43:27", "load1": "5.44"}
+{"step": "c16:branch-del", "rc": 0, "s": 0.02, "err": "", "t": "12:43:27", "load1": "5.44"}
+{"step": "c16:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 18.4, "t": "12:43:46", "load1": "5.24"}
+{"step": "c16:scratch", "ops": 485363, "bad": 0, "t": "12:43:46", "load1": "5.24"}
+{"step": "c17:branch", "rc": 0, "s": 0.24, "err": "", "t": "12:43:46", "load1": "5.24"}
+{"step": "c17:add", "rc": 0, "s": 1.13, "err": "", "t": "12:43:47", "load1": "5.24"}
+{"step": "c17:commit", "rc": 0, "s": 0.54, "err": "", "t": "12:43:48", "load1": "5.24"}
+{"step": "c17:status", "rc": 0, "s": 0.27, "err": "", "t": "12:43:48", "load1": "5.24"}
+{"step": "c17:checkout-back", "rc": 0, "s": 0.7, "err": "", "t": "12:43:49", "load1": "5.24"}
+{"step": "c17:repack-adf", "rc": 0, "s": 24.23, "err": "", "t": "12:44:13", "load1": "4.53"}
+{"step": "c17:fsck", "rc": 0, "s": 6.0, "err": "", "t": "12:44:19", "load1": "4.33"}
+{"step": "c17:verify-pack pack-b854fe3f6", "rc": 0, "s": 5.52, "err": "", "t": "12:44:25", "load1": "4.93"}
+{"step": "c17:zero4k-pages-idx", "file": "pack-b854fe3f66403587e8f221b5ad730000cff3bb8b.idx", "zero_page_runs": 0, "t": "12:44:25", "load1": "4.93"}
+{"step": "c17:zero4k-pages-pack", "file": "pack-b854fe3f66403587e8f221b5ad730000cff3bb8b.pack", "zero_page_runs": 0, "t": "12:44:25", "load1": "4.93"}
+{"step": "c17:branch-del", "rc": 0, "s": 0.04, "err": "", "t": "12:44:25", "load1": "4.93"}
+{"step": "c17:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 25.4, "t": "12:44:50", "load1": "4.99"}
+{"step": "c17:scratch", "ops": 508642, "bad": 0, "t": "12:44:50", "load1": "4.99"}
+{"step": "c18:branch", "rc": 0, "s": 0.23, "err": "", "t": "12:44:51", "load1": "4.99"}
+{"step": "c18:add", "rc": 0, "s": 1.62, "err": "", "t": "12:44:52", "load1": "4.99"}
+{"step": "c18:commit", "rc": 0, "s": 0.61, "err": "", "t": "12:44:53", "load1": "4.99"}
+{"step": "c18:status", "rc": 0, "s": 0.42, "err": "", "t": "12:44:53", "load1": "4.99"}
+{"step": "c18:checkout-back", "rc": 0, "s": 1.03, "err": "", "t": "12:44:54", "load1": "4.83"}
+{"step": "c18:gc-aggressive", "rc": 0, "s": 98.49, "err": "", "t": "12:46:33", "load1": "10.09"}
+{"step": "c18:fsck", "rc": 0, "s": 5.08, "err": "", "t": "12:46:38", "load1": "9.44"}
+{"step": "c18:verify-pack pack-9ffc784ec", "rc": 0, "s": 4.72, "err": "", "t": "12:46:43", "load1": "8.92"}
+{"step": "c18:zero4k-pages-idx", "file": "pack-9ffc784ec300a00623acd49e6b850313ca33c769.idx", "zero_page_runs": 0, "t": "12:46:43", "load1": "8.92"}
+{"step": "c18:zero4k-pages-pack", "file": "pack-9ffc784ec300a00623acd49e6b850313ca33c769.pack", "zero_page_runs": 0, "t": "12:46:43", "load1": "8.92"}
+{"step": "c18:branch-del", "rc": 0, "s": 0.03, "err": "", "t": "12:46:43", "load1": "8.92"}
+{"step": "c18:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 25.8, "t": "12:47:09", "load1": "6.70"}
+{"step": "c18:cowfs-fsck", "rc": 4, "out": "{\"error\":{\"code\":\"timeout\",\"message\":\"the server did not send a response within 30s\"}}\n", "t": "12:47:39", "load1": "5.22"}
+{"step": "c18:scratch", "ops": 568541, "bad": 0, "t": "12:47:39", "load1": "5.22"}
+{"step": "c19:branch", "rc": 0, "s": 0.32, "err": "", "t": "12:47:39", "load1": "5.20"}
+{"step": "c19:add", "rc": 0, "s": 1.06, "err": "", "t": "12:47:41", "load1": "5.20"}
+{"step": "c19:commit", "rc": 0, "s": 0.63, "err": "", "t": "12:47:41", "load1": "5.20"}
+{"step": "c19:status", "rc": 0, "s": 0.27, "err": "", "t": "12:47:41", "load1": "5.20"}
+{"step": "c19:checkout-back", "rc": 0, "s": 0.68, "err": "", "t": "12:47:42", "load1": "5.20"}
+{"step": "c19:gc", "rc": 0, "s": 5.25, "err": "", "t": "12:47:47", "load1": "5.11"}
+{"step": "c19:fsck", "rc": 0, "s": 7.02, "err": "", "t": "12:47:54", "load1": "5.02"}
+{"step": "c19:verify-pack pack-aed1559e8", "rc": 0, "s": 6.12, "err": "", "t": "12:48:01", "load1": "5.26"}
+{"step": "c19:zero4k-pages-idx", "file": "pack-aed1559e80fad9484de83164e4f3b2c8d6e3148b.idx", "zero_page_runs": 0, "t": "12:48:01", "load1": "5.26"}
+{"step": "c19:zero4k-pages-pack", "file": "pack-aed1559e80fad9484de83164e4f3b2c8d6e3148b.pack", "zero_page_runs": 0, "t": "12:48:01", "load1": "5.26"}
+{"step": "c19:branch-del", "rc": 0, "s": 0.02, "err": "", "t": "12:48:01", "load1": "5.26"}
+{"step": "c19:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 18.0, "t": "12:48:19", "load1": "4.77"}
+{"step": "c19:scratch", "ops": 585682, "bad": 0, "t": "12:48:19", "load1": "4.77"}
+{"step": "c20:branch", "rc": 0, "s": 0.26, "err": "", "t": "12:48:19", "load1": "4.63"}
+{"step": "c20:add", "rc": 0, "s": 1.02, "err": "", "t": "12:48:20", "load1": "4.63"}
+{"step": "c20:commit", "rc": 0, "s": 0.76, "err": "", "t": "12:48:21", "load1": "4.63"}
+{"step": "c20:status", "rc": 0, "s": 0.28, "err": "", "t": "12:48:22", "load1": "4.63"}
+{"step": "c20:checkout-back", "rc": 0, "s": 0.68, "err": "", "t": "12:48:22", "load1": "4.63"}
+{"step": "c20:repack-adf", "rc": 0, "s": 27.32, "err": "", "t": "12:48:50", "load1": "7.36"}
+{"step": "c20:fsck", "rc": 0, "s": 5.97, "err": "", "t": "12:48:55", "load1": "6.85"}
+{"step": "c20:verify-pack pack-67bf58a83", "rc": 0, "s": 5.47, "err": "", "t": "12:49:01", "load1": "6.46"}
+{"step": "c20:zero4k-pages-idx", "file": "pack-67bf58a83fc025af876b43578b66d6032e1d4d2b.idx", "zero_page_runs": 0, "t": "12:49:01", "load1": "6.46"}
+{"step": "c20:zero4k-pages-pack", "file": "pack-67bf58a83fc025af876b43578b66d6032e1d4d2b.pack", "zero_page_runs": 0, "t": "12:49:01", "load1": "6.46"}
+{"step": "c20:branch-del", "rc": 0, "s": 0.01, "err": "", "t": "12:49:01", "load1": "6.46"}
+{"step": "c20:byte-identity", "files": 25261, "mismatches": 0, "sample": [], "s": 27.4, "t": "12:49:29", "load1": "5.09"}
+{"step": "c20:scratch", "ops": 610853, "bad": 0, "t": "12:49:29", "load1": "5.09"}
+{"step": "daemon.restart", "t": "12:49:30", "load1": "4.76"}
+{"step": "final:cowfs-fsck", "rc": 4, "out": "{\"error\":{\"code\":\"timeout\",\"message\":\"the server did not send a response within 30s\"}}\n", "t": "12:50:00", "load1": "3.41"}
+{"step": "final:fsck", "rc": 0, "s": 3.72, "err": "", "t": "12:50:04", "load1": "3.41"}
+{"step": "final:verify-pack pack-67bf58a83", "rc": 0, "s": 3.54, "err": "", "t": "12:50:07", "load1": "3.22"}
+{"step": "final:zero4k-pages-idx", "file": "pack-67bf58a83fc025af876b43578b66d6032e1d4d2b.idx", "zero_page_runs": 0, "t": "12:50:07", "load1": "3.22"}
+{"step": "final:zero4k-pages-pack", "file": "pack-67bf58a83fc025af876b43578b66d6032e1d4d2b.pack", "zero_page_runs": 0, "t": "12:50:07", "load1": "3.22"}
+{"step": "final:byte-identity", "mismatches": 0, "sample": [], "t": "12:50:12", "load1": "3.52"}
+{"step": "SUMMARY", "cycles": 20, "fails": ["c6:cowfs-fsck", "c9:cowfs-fsck", "c12:cowfs-fsck", "c15:cowfs-fsck", "c18:cowfs-fsck", "final:cowfs-fsck"], "scratch_ops": 610854, "scratch_bad": 0, "t": "12:50:12", "load1": "3.52"}

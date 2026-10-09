@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""MEASUREMENT #8 follow-up: warm base made INSIDE the mount (build in place) or by cp -a into the mount, not by `cowfs import`."""
+import json, os, shutil, sys, time
+from pathlib import Path
+sys.path.insert(0, "/mnt/docs/Projects/cowfs-8-21")
+from m8 import W, B, OUT, sh, ctl, load, Daemon, walk_count, links, rep_stats
+from m8cargo import build, PROJ
+
+def main(reps):
+    res = {"host_load_start": load()}
+    d = Daemon("cargo2")
+    try:
+        # base A: source copied in, then built in place inside the mount
+        assert ctl("snapshot", "create", "baseA")[1].returncode == 0
+        a = d.mnt / "baseA"; 
+        t, p = sh(["cp", "-a", str(PROJ), str(a / "proj")]); res["cp_a_native_to_mount_s"] = t; res["cp_rc"] = p.returncode
+        res["baseA_cp_hardlinked"] = links(a / "proj"); res["native_hardlinked"] = links(PROJ)
+        res["baseA_cp_inplace_rebuild"] = build(a / "proj")        # does the copied warm target stay Fresh in place?
+        # base B: clean in-place build inside the mount
+        assert ctl("snapshot", "create", "baseB")[1].returncode == 0
+        b = d.mnt / "baseB"; sh(["cp", "-a", "--no-preserve=timestamps", str(PROJ / "Cargo.toml"), str(PROJ / "Cargo.lock"), str(PROJ / "src"), str(b)])
+        sh(["sh", "-c", f"cp -a '{PROJ}/Cargo.toml' '{PROJ}/Cargo.lock' '{PROJ}/src' '{b}/'"])
+        res["baseB_clean_build"] = build(b, ["cargo", "build", "--frozen", "-v", "-j", "4"])
+        res["baseB_hardlinked"] = links(b); res["baseB_inodes"] = walk_count(b)[1]
+        res["baseB_inplace_rebuild"] = build(b)
+        raw = []; arms = {"A_snapshot_create": [], "A_build": [], "B_snapshot_create": [], "B_build": []}
+        for r in range(reps):
+            row = {"rep": r, "load": load()}
+            for tag, base in (("A", "baseA"), ("B", "baseB")):
+                t, p = ctl("snapshot", "create", f"{tag}{r}", "--from", base); assert p.returncode == 0
+                arms[tag + "_snapshot_create"].append(t)
+                sub = d.mnt / f"{tag}{r}" / ("proj" if tag == "A" else "")
+                row[tag + "_hardlinked"] = links(sub)
+                bb = build(sub); arms[tag + "_build"].append(bb["s"]); row[tag] = bb
+                ctl("snapshot", "rm", f"{tag}{r}")
+            raw.append(row); print(json.dumps(row), flush=True)
+        res["raw"] = raw; res["arms"] = {k: rep_stats(v) for k, v in arms.items()}; res["arms_raw"] = arms
+        res["fsck_rc"] = ctl("fsck")[1].returncode
+    finally:
+        d.stop()
+    res["host_load_end"] = load()
+    (OUT / "m8-cargo2.json").write_text(json.dumps(res, indent=1)); print("DONE")
+if __name__ == "__main__": main(5)

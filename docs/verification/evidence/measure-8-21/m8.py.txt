@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""MEASUREMENT #8: snapshot create + seeding cost vs tree size, with native baselines. Runs on the cachyos box."""
+import json, os, shutil, statistics, subprocess, sys, time
+from pathlib import Path
+
+W = Path("/mnt/docs/Projects/cowfs-8-21")
+B = W / "target/release"
+SOCK = W / "sock/s.sock"
+OUT = W / "results"
+OUT.mkdir(exist_ok=True)
+
+def sh(argv, **kw):
+    t = time.perf_counter()
+    p = subprocess.run(argv, capture_output=True, text=True, **kw)
+    return time.perf_counter() - t, p
+
+def ctl(*a, timeout=3600):
+    return sh([str(B / "cowfs"), "--socket", str(SOCK), "--timeout", "3600", "--json", *a], timeout=timeout)
+
+def load(): return open("/proc/loadavg").read().split()[0]
+
+class Daemon:
+    def __init__(self, tag):
+        self.store = W / f"store-{tag}"; self.mnt = W / f"mnt-{tag}"
+        shutil.rmtree(self.store, ignore_errors=True)
+        self.store.mkdir(); self.mnt.mkdir(exist_ok=True)
+        self.p = subprocess.Popen([str(B / "cowfs-daemon"), "--store", str(self.store), "--mount", str(self.mnt),
+                                   "--socket", str(SOCK), "--backend", "core"],
+                                  stdout=open(W / f"logs/daemon-{tag}.log", "w"), stderr=subprocess.STDOUT)
+        for _ in range(100):
+            if self.p.poll() is not None: raise SystemExit("daemon died")
+            if ctl("status", timeout=10)[1].returncode == 0: break
+            time.sleep(0.2)
+    def meta(self):
+        s = (self.store / "meta.redb").stat(); return s.st_size, s.st_blocks * 512
+    def stop(self):
+        ctl("shutdown"); 
+        try: self.p.wait(60)
+        except Exception: print("daemon did not exit; pid", self.p.pid, "left for manual check")
+
+def gen_tree(root: Path, n, size=2048, per_dir=100):
+    """n files of `size` unique bytes, per_dir per directory, ~10% additional hardlinks counted inside n."""
+    root.mkdir(parents=True)
+    prev = None
+    for i in range(n):
+        d = root / f"d{i // per_dir // 100}" / f"s{i // per_dir}"
+        if i % per_dir == 0: d.mkdir(parents=True)
+        f = d / f"f{i}.dat"
+        if prev is not None and i % 10 == 9: os.link(prev, f)
+        else:
+            f.write_bytes(os.urandom(size)); prev = f
+
+def walk_count(p):
+    t, r = sh(["sh", "-c", f"find '{p}' 2>&1 | wc -l"]); return t, int(r.stdout.strip())
+
+def links(p):
+    t, r = sh(["sh", "-c", f"find '{p}' -type f -links +1 | wc -l"]); return int(r.stdout.strip())
+
+def rep_stats(xs):
+    return {"n": len(xs), "median": statistics.median(xs), "min": min(xs), "max": max(xs),
+            "stdev": statistics.stdev(xs) if len(xs) > 1 else 0.0}
+
+def main(n, reps):
+    tag = f"n{n}"
+    tree = W / f"trees/{tag}"
+    res = {"files_requested": n, "reps": reps, "host_load_start": load()}
+    if not tree.exists():
+        t0 = time.perf_counter(); gen_tree(tree, n); res["gen_s"] = time.perf_counter() - t0
+    res["tree_inodes"] = walk_count(tree)[1]; res["tree_hardlinked_files"] = links(tree)
+    res["tree_mb_apparent"] = int(sh(["du", "-sm", "--apparent-size", str(tree)])[1].stdout.split()[0])
+    d = Daemon(tag)
+    try:
+        noop = [ctl("status")[0] for _ in range(5)]
+        res["ctl_noop_status_s"] = rep_stats(noop)
+        m0 = d.meta()
+        t, p = ctl("import", str(tree), "--name", "base")
+        res["import_s"] = t; res["import_rc"] = p.returncode; res["import_out"] = p.stdout[-600:]
+        res["meta_after_import"] = d.meta(); res["meta_before_import"] = m0
+        base = d.mnt / "base"
+        print("import", p.returncode, p.stdout[-300:], p.stderr[-300:], flush=True)
+        res["mount_inodes"] = walk_count(base)[1]
+        if res["mount_inodes"] != res["tree_inodes"]:
+            res["mount_walk_stderr"] = sh(["sh", "-c", f"find '{base}' 2>&1 >/dev/null | head -3; ls '{d.mnt}' | head"])[1].stdout
+            print("MOUNT WALK MISMATCH", res["mount_inodes"], res["mount_walk_stderr"], flush=True); res["mount_hardlinked_files"] = links(base)
+        copies = W / f"copies-{tag}"; shutil.rmtree(copies, ignore_errors=True); copies.mkdir()
+        arms = {"cowfs_snapshot_create": [], "cowfs_first_walk": [], "cowfs_snapshot_rm": [],
+                "cp_a_reflink": [], "cp_a_reflink_walk": [], "cp_a_noreflink": [], "rsync_aH": [],
+                "native_walk_of_source": []}
+        meta_delta, meta_delta_alloc, loads = [], [], []
+        for r in range(reps):
+            loads.append(load())
+            sname = f"s{r}"
+            a0, b0 = d.meta()
+            t, p = ctl("snapshot", "create", sname, "--from", "base")
+            assert p.returncode == 0, p.stdout + p.stderr
+            a1, b1 = d.meta(); meta_delta.append(a1 - a0); meta_delta_alloc.append(b1 - b0)
+            arms["cowfs_snapshot_create"].append(t)
+            tw, c = walk_count(d.mnt / sname); arms["cowfs_first_walk"].append(tw)
+            if c != res["tree_inodes"]: res.setdefault("snapshot_walk_mismatch", []).append(c)
+            if r == 0:  # writable + isolation check, once
+                f = next((d.mnt / sname).rglob("f0.dat"))
+                before = (base / f.relative_to(d.mnt / sname)).read_bytes()
+                with open(f, "r+b") as fh: fh.write(b"WRITTEN")
+                res["snapshot_write_isolated_from_base"] = (base / f.relative_to(d.mnt / sname)).read_bytes() == before and f.read_bytes()[:7] == b"WRITTEN"
+            t, p = ctl("snapshot", "rm", sname); arms["cowfs_snapshot_rm"].append(t)
+            # native baselines, interleaved in the same rep
+            for key, cmd in (("cp_a_reflink", ["cp", "-a", "--reflink=auto"]), ("cp_a_noreflink", ["cp", "-a", "--reflink=never"])):
+                dst = copies / f"{key}{r}"
+                t, p = sh([*cmd, str(tree), str(dst)]); arms[key].append(t)
+                if key == "cp_a_reflink": arms["cp_a_reflink_walk"].append(walk_count(dst)[0])
+                shutil.rmtree(dst)
+            dst = copies / f"rsync{r}"
+            t, p = sh(["rsync", "-aH", str(tree) + "/", str(dst) + "/"]); arms["rsync_aH"].append(t)
+            shutil.rmtree(dst)
+            arms["native_walk_of_source"].append(walk_count(tree)[0])
+            print(tag, "rep", r, {k: round(v[-1], 3) for k, v in arms.items() if v}, flush=True)
+        res["host_load_per_rep"] = loads
+        res["arms"] = {k: rep_stats(v) for k, v in arms.items()}
+        res["arms_raw"] = arms
+        res["snapshot_create_meta_delta_bytes_st_size"] = meta_delta
+        res["snapshot_create_meta_delta_bytes_allocated"] = meta_delta_alloc
+        # bulk: 200 snapshots, amortised meta growth and per-create time (CLI process included)
+        a0, b0 = d.meta(); tb = time.perf_counter()
+        for i in range(200): assert ctl("snapshot", "create", f"bulk{i}", "--from", "base")[1].returncode == 0
+        tb = time.perf_counter() - tb; a1, b1 = d.meta()
+        res["bulk200"] = {"total_s": tb, "per_create_s": tb / 200, "meta_st_size_delta": a1 - a0, "meta_alloc_delta": b1 - b0}
+        for i in range(200): ctl("snapshot", "rm", f"bulk{i}")
+        res["status_after"] = ctl("status")[1].stdout[:500]
+        t, p = ctl("fsck"); res["fsck_rc"] = p.returncode; res["fsck_out"] = p.stdout[-300:]
+    finally:
+        d.stop()
+        shutil.rmtree(W / f"copies-{tag}", ignore_errors=True)
+    res["host_load_end"] = load()
+    (OUT / f"m8-{tag}.json").write_text(json.dumps(res, indent=1))
+    print("DONE", tag, json.dumps({k: v for k, v in res.items() if k not in ("arms_raw",)}, indent=1))
+
+if __name__ == "__main__":
+    main(int(sys.argv[1]), int(sys.argv[2]) if len(sys.argv) > 2 else 5)

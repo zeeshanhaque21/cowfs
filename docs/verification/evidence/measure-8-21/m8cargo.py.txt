@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""MEASUREMENT #8 (issue comment): seeding a warm Rust base: snapshot, mount path, first `cargo build --frozen`."""
+import json, os, re, shutil, statistics, subprocess, sys, time
+from pathlib import Path
+sys.path.insert(0, "/mnt/docs/Projects/cowfs-8-21")
+from m8 import W, B, SOCK, OUT, sh, ctl, load, Daemon, walk_count, links, rep_stats
+
+PROJ = W / "cb/base"
+CARGO = ["cargo", "build", "--frozen", "-v", "-j", "4"]
+
+def build(cwd, args=CARGO):
+    t, p = sh(args, cwd=cwd, env={**os.environ, "CARGO_TERM_COLOR": "never"})
+    out = p.stdout + p.stderr
+    return {"s": t, "rc": p.returncode, "compiling": len(re.findall(r"^\s*Compiling ", out, re.M)),
+            "fresh": len(re.findall(r"^\s*Fresh ", out, re.M)), "tail": out.strip().splitlines()[-1:] }
+
+def main(reps):
+    res = {"reps": reps, "host_load_start": load()}
+    if not PROJ.exists():
+        PROJ.parent.mkdir(exist_ok=True)
+        sh(["cargo", "new", "--bin", "--vcs", "git", str(PROJ)])
+        (PROJ / "Cargo.toml").write_text(open(PROJ / "Cargo.toml").read() +
+            'clap = { version = "4", features = ["derive"] }\nserde = { version = "1", features = ["derive"] }\n'
+            'serde_json = "1"\nregex = "1"\nanyhow = "1"\nchrono = "0.4"\n')
+        (PROJ / "src/main.rs").write_text('use clap::Parser;\n#[derive(Parser)] struct A { #[arg(long)] n: Option<String> }\n'
+            'fn main() { let a = A::parse(); let r = regex::Regex::new("a+").unwrap(); \n'
+            'println!("{} {} {:?}", serde_json::json!({"x": 1}), chrono::Utc::now(), r.is_match(a.n.as_deref().unwrap_or("a"))); }\n')
+        (PROJ / ".gitignore").write_text("target\n")
+        p = subprocess.run(["cargo", "generate-lockfile"], cwd=PROJ, capture_output=True, text=True)
+        sh(["cargo", "fetch"], cwd=PROJ)
+        subprocess.run("git add -A && git -c user.name=s -c user.email=s@s commit -qm base", shell=True, cwd=PROJ)
+    # native clean build baseline (n=3), then leave a warm debug target
+    cl = []
+    for _ in range(3):
+        shutil.rmtree(PROJ / "target", ignore_errors=True); cl.append(build(PROJ, ["cargo", "build", "--frozen", "-j", "4"]))
+    res["native_clean_build"] = {"s": rep_stats([c["s"] for c in cl]), "raw": [(round(c["s"], 2), c["compiling"], c["rc"]) for c in cl]}
+    res["base_mb_apparent"] = int(sh(["du", "-sm", "--apparent-size", str(PROJ)])[1].stdout.split()[0])
+    res["base_inodes"] = walk_count(PROJ)[1]; res["base_hardlinked_files"] = links(PROJ)
+    res["base_files"] = int(sh(["sh", "-c", f"find '{PROJ}' -type f | wc -l"])[1].stdout)
+    res["native_inplace_rebuild"] = build(PROJ)
+    d = Daemon("cargo")
+    try:
+        t, p = ctl("import", str(PROJ), "--name", "cbase"); res["import_s"] = t; res["import_out"] = p.stdout[-400:]
+        cb = d.mnt / "cbase"
+        res["mount_inodes"] = walk_count(cb)[1]; res["mount_hardlinked_files"] = links(cb)
+        arms = {k: [] for k in ("cowfs_snapshot_create", "cowfs_build", "cp_a_reflink_copy", "cp_a_reflink_build",
+                                "cp_a_noreflink_copy", "cp_a_noreflink_build", "rsync_aH_copy", "rsync_aH_build",
+                                "git_worktree_add", "git_worktree_build")}
+        raw = []; loads = []
+        cop = W / "cb/copies"; shutil.rmtree(cop, ignore_errors=True); cop.mkdir()
+        for r in range(reps):
+            loads.append(load()); row = {"rep": r}
+            t, p = ctl("snapshot", "create", f"k{r}", "--from", "cbase"); assert p.returncode == 0, p.stdout
+            arms["cowfs_snapshot_create"].append(t)
+            row["cowfs_hardlinked_files"] = links(d.mnt / f"k{r}")
+            b = build(d.mnt / f"k{r}"); arms["cowfs_build"].append(b["s"]); row["cowfs"] = b
+            ctl("snapshot", "rm", f"k{r}")
+            for key, cmd in (("cp_a_reflink", ["cp", "-a", "--reflink=auto"]), ("cp_a_noreflink", ["cp", "-a", "--reflink=never"]),
+                             ("rsync_aH", None)):
+                dst = cop / f"{key}{r}"
+                if cmd: t, _ = sh([*cmd, str(PROJ), str(dst)])
+                else: t, _ = sh(["rsync", "-aH", str(PROJ) + "/", str(dst) + "/"])
+                arms[key + "_copy"].append(t); row[key + "_hardlinked_files"] = links(dst)
+                b = build(dst); arms[key + "_build"].append(b["s"]); row[key] = b
+                shutil.rmtree(dst)
+            dst = cop / f"wt{r}"
+            t, _ = sh(["git", "worktree", "add", "-q", "--detach", str(dst)], cwd=PROJ); arms["git_worktree_add"].append(t)
+            b = build(dst); arms["git_worktree_build"].append(b["s"]); row["git_worktree"] = b
+            sh(["git", "worktree", "remove", "--force", str(dst)], cwd=PROJ)
+            raw.append(row); print("rep", r, json.dumps(row), flush=True)
+        res["host_load_per_rep"] = loads; res["raw"] = raw
+        res["arms"] = {k: rep_stats(v) for k, v in arms.items()}; res["arms_raw"] = arms
+        res["fsck_rc"] = ctl("fsck")[1].returncode
+    finally:
+        d.stop()
+    res["host_load_end"] = load()
+    (OUT / "m8-cargo.json").write_text(json.dumps(res, indent=1)); print("DONE")
+
+if __name__ == "__main__": main(int(sys.argv[1]) if len(sys.argv) > 1 else 5)
