@@ -244,11 +244,6 @@ static PRIVATE_UMASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// transient: it must not downgrade every later call to the racy chmod path.
 #[cfg(target_os = "linux")]
 fn refusal_is_permanent(errno: i32) -> bool {
-    let _ = errno;
-    true // OLD POLICY (temporary, to show the test fails)
-}
-#[cfg(target_os = "linux")]
-fn _unused(errno: i32) -> bool {
     matches!(
         errno,
         libc::EPERM | libc::EACCES | libc::EINVAL | libc::ENOSYS
