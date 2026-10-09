@@ -253,7 +253,7 @@ class RuntimeEdges(unittest.TestCase):
     def test_the_scan_finds_the_known_edges(self):
         # a guard that matches nothing would pass forever: pin that the pattern sees treehouse and daemon
         text = (Path(REAL["workspace_root"]) / "crates/cowfs-treehouse/tests/real_project_acceptance.rs").read_text()
-        self.assertRegex(text, r'sibling_bin\(\s*"cowfs-daemon"')
+        self.assertRegex(text, r'(?:sibling_bin|require_bin)\(\s*"cowfs-daemon"')
         text = (Path(REAL["workspace_root"]) / "crates/cowfs-daemon/tests/namespace_durability.rs").read_text()
         self.assertRegex(text, r'join\(\s*"cowfs"')
 
