@@ -862,3 +862,44 @@ mod rdev_tests {
         );
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod umask_cache_tests {
+    use super::run_with_private_umask;
+    use std::sync::OnceLock;
+
+    fn try_once(known: &OnceLock<bool>, errno: Option<i32>) -> Option<u8> {
+        let unshare = move || errno.map_or(Ok(()), Err);
+        run_with_private_umask(known, unshare, || Ok(7u8)).unwrap()
+    }
+
+    #[test]
+    fn a_transient_unshare_failure_is_retried_not_cached() {
+        for errno in [libc::ENOMEM, libc::EAGAIN] {
+            let known = OnceLock::new();
+            assert_eq!(
+                try_once(&known, Some(errno)),
+                None,
+                "the failing call falls back"
+            );
+            assert_eq!(known.get(), None, "errno {errno} is not remembered");
+            assert_eq!(
+                try_once(&known, None),
+                Some(7),
+                "the next call gets a private umask"
+            );
+            assert_eq!(known.get(), Some(&true));
+        }
+    }
+
+    #[test]
+    fn a_permanent_refusal_is_cached_and_not_retried() {
+        for errno in [libc::EPERM, libc::EACCES, libc::EINVAL, libc::ENOSYS] {
+            let known = OnceLock::new();
+            assert_eq!(try_once(&known, Some(errno)), None);
+            assert_eq!(known.get(), Some(&false), "errno {errno} is remembered");
+            // Even a call whose unshare would now succeed does not try again.
+            assert_eq!(try_once(&known, None), None, "errno {errno}: no retry");
+        }
+    }
+}
