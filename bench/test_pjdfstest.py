@@ -342,6 +342,27 @@ class ScriptProfile(unittest.TestCase):
         self.assertFalse(p.script_profile(SCRIPT_PLAIN)["helper_expands_assertions"])
 
 
+class LinuxMountTable(unittest.TestCase):
+    """Linux prints `src on /mp type fstype (opts)`; lines verbatim from the cachyos box, 2026-10-09."""
+    TABLE = ("cowfs on /mnt/docs/x/mnt type fuse.cowfs (rw,nosuid,nodev,relatime,user_id=1000,"
+             "group_id=1000,default_permissions)\n"
+             "/dev/nvme0n1p3 on /mnt/docs type btrfs (rw,relatime,ssd,space_cache=v2,subvol=/)\n")
+    def test_mount_point_and_type_are_split(self):
+        entries = p.mount_entries(self.TABLE)
+        self.assertEqual(entries[0][:2], ("cowfs", "/mnt/docs/x/mnt"))
+        self.assertEqual(entries[0][2].split(",")[0], "fuse.cowfs")
+        self.assertEqual(entries[1][1], "/mnt/docs")
+    def test_a_fuse_mount_is_mounted_and_typed(self):
+        with mock.patch.object(p, "mount_table", return_value=(self.TABLE, "")):
+            self.assertEqual(p.mount_state(Path("/mnt/docs/x/mnt"))[0], p.MOUNTED)
+            with mock.patch.object(p.os, "stat", return_value=mock.Mock(st_dev=42)):
+                fs = p.fs_identity(Path("/mnt/docs/x/mnt/pjd"))
+        self.assertEqual((fs["mountpoint"], fs["fstype"], fs["problem"]),
+                         ("/mnt/docs/x/mnt", "fuse.cowfs", None))
+    def test_macos_lines_are_unchanged(self):
+        self.assertEqual(p.mount_entries(MountState.TABLE),
+                         [("localhost:/cowfs-abc", "/private/tmp/m", "nfs, nodev, nosuid"),
+                          ("map auto_home", "/System/Volumes/Data/home", "autofs, nosuid")])
 class MountState(unittest.TestCase):
     TABLE = ("localhost:/cowfs-abc on /private/tmp/m (nfs, nodev, nosuid)\n"
              "map auto_home on /System/Volumes/Data/home (autofs, nosuid)\n")
