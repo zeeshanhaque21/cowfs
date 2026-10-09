@@ -132,6 +132,7 @@ macro_rules! __conformance_checks {
                 (special, mknod_socket_attrs, Cowfs),
                 (special, mknod_masks_mode, Cowfs),
                 (special, mknod_device_attrs_keep_rdev, Cowfs),
+                (special, mknod_whiteout_char_device, Cowfs),
                 (special, mknod_existing_is_exists, Cowfs),
                 (special, mknod_in_file_is_not_dir, Cowfs),
                 (special, mknod_stale_parent, Cowfs),
