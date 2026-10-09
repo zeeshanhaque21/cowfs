@@ -29,6 +29,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Fault-injection seam is absent without its feature (issue 173)
+        run: scripts/check-fault-seam-absent.sh
       - name: Bench harness unit tests
         run: python3 -m unittest discover -s bench -v
 

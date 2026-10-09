@@ -15,6 +15,9 @@ thiserror.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# Turns on the store's process-exit seam for this crate's tests only (`tests/crash_inject.rs`).
+# No release build has dev-dependency edges, and nothing else enables the feature.
+cowfs-store = { path = "../cowfs-store", features = ["fault-injection"] }
 # Only for the end-to-end test that wires the collector to the real reference side, so the
 # `ExtraRoots` contract is checked against the implementation that has to meet it.
 cowfs-core = { path = "../cowfs-core" }
