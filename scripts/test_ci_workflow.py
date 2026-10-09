@@ -143,5 +143,93 @@ class CheckAggregate(unittest.TestCase):
                 self.assertNotEqual(self.run_check({**green, job: "failure"}).returncode, 0)
 
 
+TEST_STEPS = {s["name"]: s for s in WORKFLOW_YAML["jobs"]["test"]["steps"] if "name" in s}
+LINT_STEPS = {s["name"]: s for s in WORKFLOW_YAML["jobs"]["lint"]["steps"] if "name" in s}
+
+
+def run_test_step(name, cwd, env_extra, shard=1, of=2):
+    """Run a step of the `test` job with a recording stub `cargo` and the matrix expressions filled in."""
+    step = TEST_STEPS[name]
+    script = step["run"].replace("${{ matrix.shard }}", str(shard)).replace("${{ matrix.of }}", str(of))
+    bin_dir = Path(cwd) / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "cargo").write_text(f'#!/bin/sh\necho "$@" >> "{cwd}/cargo.calls"\n')
+    (bin_dir / "cargo").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", **{k: v for k, v in step.get("env", {}).items() if "${{" not in v}, **env_extra}
+    r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], cwd=cwd, env=env, capture_output=True, text=True)
+    calls = Path(cwd, "cargo.calls")
+    return r, calls.read_text().splitlines() if calls.exists() else []
+
+
+class ChangedCrateSelection(unittest.TestCase):
+    """The test job narrows to the PR's changed crates; every other path runs what ran before."""
+
+    def tmp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        return t.name
+
+    def test_selection_runs_before_nextest_and_cannot_be_ignored(self):
+        steps = WORKFLOW_YAML["jobs"]["test"]["steps"]
+        names = [s.get("name") for s in steps]
+        self.assertLess(names.index("Select tests"), names.index("Nextest"))
+        select = TEST_STEPS["Select tests"]
+        self.assertEqual(select["id"], "select")
+        self.assertNotIn("continue-on-error", select)
+        self.assertIn("scripts/select-tests.py", select["run"])
+        self.assertEqual(select["env"]["EVENT"], "${{ github.event_name }}")
+        checkout = next(s for s in steps if s.get("uses", "").startswith("actions/checkout"))
+        self.assertGreaterEqual(checkout["with"]["fetch-depth"], 2, "HEAD^1 must exist for the PR diff")
+
+    def test_selector_error_fails_the_step(self):
+        cwd = self.tmp()  # no workspace, no git history: the selector cannot work, and must say so
+        (Path(cwd) / "scripts").symlink_to(ROOT / "scripts")
+        r = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-c", TEST_STEPS["Select tests"]["run"]],
+            cwd=cwd, env={**os.environ, "EVENT": "pull_request"}, capture_output=True, text=True,
+        )
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_check_aggregate_still_requires_the_test_job(self):
+        self.assertIn("test", WORKFLOW_YAML["jobs"]["check"]["needs"])
+
+    def test_full_mode_runs_the_whole_workspace_sharded(self):
+        r, calls = run_test_step("Nextest", self.tmp(), {"MODE": "full", "FILTERSET": ""}, shard=2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(calls, ["nextest run --workspace --profile ci --partition hash:2/2"])
+
+    def test_filtered_mode_builds_only_selected_crates_keeps_sharding_and_passes_the_filterset_as_one_argument(self):
+        filterset = "rdeps(=cowfs-core) | rdeps(=cowfs-nfs)"
+        env = {"MODE": "filtered", "FILTERSET": filterset, "PKG_ARGS": "-p cowfs-core -p cowfs-nfs"}
+        r, calls = run_test_step("Nextest", self.tmp(), env, shard=1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("--workspace", calls[0], "--workspace would compile every test binary")
+        self.assertIn("-p cowfs-core -p cowfs-nfs", calls[0])
+        self.assertIn("--partition hash:1/2", calls[0])
+        self.assertIn("--no-tests=pass", calls[0], "a shard left with no test is not a failure")
+        self.assertTrue(calls[0].endswith(f"-E {filterset}"), calls[0])
+
+    def test_empty_selection_runs_no_cargo_at_all(self):
+        r, calls = run_test_step("Nextest", self.tmp(), {"MODE": "filtered", "FILTERSET": "none()", "PKG_ARGS": ""})
+        self.assertEqual((r.returncode, calls), (0, []))
+
+    def test_doctests_full_filtered_and_empty(self):
+        r, calls = run_test_step("Doctests", self.tmp(), {"MODE": "full", "DOC_ARGS": ""})
+        self.assertEqual(calls, ["test --doc --workspace"])
+        r, calls = run_test_step("Doctests", self.tmp(), {"MODE": "filtered", "DOC_ARGS": "-p cowfs-core -p cowfs-nfs"})
+        self.assertEqual(calls, ["test --doc -p cowfs-core -p cowfs-nfs"])
+        r, calls = run_test_step("Doctests", self.tmp(), {"MODE": "filtered", "DOC_ARGS": ""})
+        self.assertEqual((r.returncode, calls), (0, []))
+
+    def test_the_selector_tests_run_in_lint(self):
+        self.assertIn("test_select_tests.py", LINT_STEPS["Test selector unit tests"]["run"])
+
+    def test_untouched_selections_stay_untouched(self):
+        # linux-fuse, linux-namespaces, fault-seam and lint are not narrowed by the selector.
+        for job in ["lint", "fault-seam", "linux-fuse", "linux-namespaces"]:
+            self.assertNotIn("select-tests", yaml.safe_dump(WORKFLOW_YAML["jobs"][job]))
+
+
 if __name__ == "__main__":
     unittest.main()

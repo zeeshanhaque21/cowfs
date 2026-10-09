@@ -4,7 +4,9 @@ The selector maps a PR's changed files to workspace crates and says which tests 
 only ever err towards running MORE: any file it cannot place forces the full run.
 """
 import importlib.util
+import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -155,6 +157,7 @@ class Outputs(unittest.TestCase):
         self.assertIn("mode=filtered", part)
         self.assertIn("filterset=rdeps(=cowfs-nfs)", part)
         self.assertIn("doc_args=-p cowfs-nfs", part)
+        self.assertIn("pkg_args=-p cowfs-nfs", part)
 
     def test_summary_names_crates_filterset_and_reason(self):
         text = sel.summary(select(["crates/cowfs-core/a.rs"]))
@@ -165,19 +168,27 @@ class Outputs(unittest.TestCase):
 
 class Cli(unittest.TestCase):
     def run_cli(self, *args):
-        return subprocess.run(["python3", str(ROOT / "scripts/select-tests.py"), *args], capture_output=True, text=True, cwd=ROOT)
+        """Run the script the way a runner does: outputs go to the files the runner names."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        out, summ = Path(tmp.name, "output"), Path(tmp.name, "summary")
+        env = {**os.environ, "GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summ)}
+        r = subprocess.run(["python3", str(ROOT / "scripts/select-tests.py"), *args], capture_output=True, text=True, cwd=ROOT, env=env)
+        read = lambda f: f.read_text() if f.exists() else ""
+        return r, read(out), read(summ)
 
     def test_non_pull_request_events_are_always_full(self):
         for event in ["push", "workflow_dispatch", "schedule"]:
             with self.subTest(event=event):
-                r = self.run_cli("--event", event, "--base", "HEAD", "--head", "HEAD", "--print")
+                r, out, summ = self.run_cli("--event", event, "--base", "HEAD", "--head", "HEAD")
                 self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertIn("mode=full", r.stdout)
-                self.assertIn(event, r.stdout + r.stderr)
+                self.assertIn("mode=full", out)
+                self.assertIn(event, summ)
 
     def test_unresolvable_base_is_an_error_not_a_silent_full(self):
-        r = self.run_cli("--event", "pull_request", "--base", "no-such-ref", "--head", "HEAD", "--print")
+        r, out, _ = self.run_cli("--event", "pull_request", "--base", "no-such-ref", "--head", "HEAD")
         self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(out, "")
 
     def test_real_workspace_places_every_crate_directory(self):
         meta = sel.cargo_metadata()

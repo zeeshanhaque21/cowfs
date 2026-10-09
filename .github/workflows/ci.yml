@@ -5,6 +5,9 @@ name: ci
 # the lint job, which runs whenever source changes. A change that touches any other file as well still
 # runs everything, and so does an edit of this workflow file. A pull request that only touches the paths
 # below gets no CI run at all, not a skipped one.
+#
+# A pull request's test job runs only the crates its diff reaches plus their dependents (see
+# scripts/select-tests.py); push to main, workflow_dispatch and any change outside the crates run all.
 on:
   push:
     branches: [main]
@@ -46,6 +49,8 @@ jobs:
         run: python3 -m unittest discover -s bench -v
       - name: CI workflow gates (issue 179)
         run: python3 -m unittest discover -s scripts -p test_ci_workflow.py -v
+      - name: Test selector unit tests
+        run: python3 -m unittest discover -s scripts -p test_select_tests.py -v
 
   # The 170 test binaries ran one after another in a single job (about 740 s of the 780 s test
   # step; compile was already cached). nextest runs the tests of every binary in one pool, and
@@ -63,7 +68,11 @@ jobs:
           - { os: macos-latest, shard: 1, of: 1 }
     runs-on: ${{ matrix.os }}
     steps:
+      # Depth 2: on a pull_request the checkout is the merge commit, so HEAD^1 is the base tip and
+      # `git diff HEAD^1 HEAD` is exactly what the PR changes. Select tests reads it.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -74,11 +83,42 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo nextest run --workspace --profile ci --partition hash:${{ matrix.shard }}/${{ matrix.of }}
+      # Only a pull_request run narrows: push to main and workflow_dispatch run everything. A
+      # selection error fails this step, so it fails the test job and the check aggregate.
+      - name: Select tests
+        id: select
+        run: python3 scripts/select-tests.py --event "$EVENT" --base HEAD^1 --head HEAD
+        env:
+          EVENT: ${{ github.event_name }}
+      - name: Nextest
+        env:
+          MODE: ${{ steps.select.outputs.mode }}
+          FILTERSET: ${{ steps.select.outputs.filterset }}
+          PKG_ARGS: ${{ steps.select.outputs.pkg_args }}
+        run: |
+          if [ "$MODE" = full ]; then
+            cargo nextest run --workspace --profile ci --partition hash:${{ matrix.shard }}/${{ matrix.of }}
+          elif [ -n "$PKG_ARGS" ]; then
+            # -p builds only the crates that can be affected; -E is the filterset shown in the summary.
+            # A shard can be left with no test at all, which is not a failure.
+            cargo nextest run $PKG_ARGS --profile ci --partition hash:${{ matrix.shard }}/${{ matrix.of }} --no-tests=pass -E "$FILTERSET"
+          else
+            echo "no crate selected: no tests"
+          fi
       # nextest does not run doctests.
       - name: Doctests
         if: ${{ matrix.shard == 1 }}
-        run: cargo test --doc --workspace
+        env:
+          MODE: ${{ steps.select.outputs.mode }}
+          DOC_ARGS: ${{ steps.select.outputs.doc_args }}
+        run: |
+          if [ "$MODE" = full ]; then
+            cargo test --doc --workspace
+          elif [ -n "$DOC_ARGS" ]; then
+            cargo test --doc $DOC_ARGS
+          else
+            echo "no selected crate has a lib target: no doctests"
+          fi
       - name: Bench harness unit tests (macos)
         if: ${{ matrix.os == 'macos-latest' }}
         run: python3 -m unittest discover -s bench -v
