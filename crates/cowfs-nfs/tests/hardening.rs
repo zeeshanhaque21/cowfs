@@ -667,8 +667,20 @@ fn null_round(flood: &mut [TcpStream]) {
     std::thread::sleep(Duration::from_millis(5));
     for x in flood {
         x.write_all(&null_frame()).unwrap();
-        assert!(answered(x));
+        assert!(answered_fully(x));
     }
+}
+
+/// Like `answered`, but consumes the whole reply: a leftover body would let the next call
+/// "be answered" at once, before the server has even stamped the connection as active.
+fn answered_fully(s: &mut TcpStream) -> bool {
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut h = [0u8; 4];
+    if s.read_exact(&mut h).is_err() {
+        return false;
+    }
+    let mut body = vec![0u8; (u32::from_be_bytes(h) & 0x7fff_ffff) as usize];
+    s.read_exact(&mut body).is_ok()
 }
 
 #[test]
@@ -705,7 +717,7 @@ fn the_pinged_nfs_socket_outlasts_the_cap_minus_one_later_connections() {
         null_round(&mut flood);
         later.push(connect_raw(s.port()));
         later.last_mut().unwrap().write_all(&null_frame()).unwrap();
-        assert!(answered(later.last_mut().unwrap()));
+        assert!(answered_fully(later.last_mut().unwrap()));
     }
     assert!(
         nfs_socket.try_getattr(&nfs_fh3::default()).is_some(),
