@@ -17,6 +17,10 @@ from pathlib import Path
 
 import xfstests_gate as gate
 
+# The directory-arm `run` is retired for g5 (see docs/g5-harness-redesign.md); these
+# tests keep exercising its pin, receipt and ownership code.
+os.environ.setdefault("COWFS_G5_OLD_ARM_MODEL", "1")
+
 
 def write(path, text, executable=False):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1090,6 +1094,19 @@ class EndToEnd(HarnessCase):
         self.use_distinct_arms()
         rc, _ = self.run_gate(self.args(cases="005"))
         self.assertEqual(rc, 3)
+
+
+class RetiredRunRefuses(unittest.TestCase):
+    def test_run_without_opt_in_is_invalid_exit_3(self):
+        saved = os.environ.pop("COWFS_G5_OLD_ARM_MODEL", None)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = gate.run(None)
+        finally:
+            if saved is not None:
+                os.environ["COWFS_G5_OLD_ARM_MODEL"] = saved
+        self.assertEqual(rc, 3)
+        self.assertIn("g5_root.sh", err.getvalue())
 
 
 if __name__ == "__main__":
