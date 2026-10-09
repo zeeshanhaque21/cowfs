@@ -65,10 +65,41 @@ fn a_hung_remove_is_answered_and_its_retry_is_not_a_cached_jukebox() {
 }
 
 #[test]
-fn a_slow_handler_under_the_watchdog_is_untouched() {
+fn fast_calls_are_untouched_by_the_watchdog() {
     let (_server, mut c) = serve(memfs(), watchdog());
     let root = c.root.clone();
     let (st, fh, _) = c.create(&root, "x", 1, sattr_mode(0o644), [0; 8]);
     assert_eq!((st, fh.is_some()), (OK, true));
     assert_eq!(c.lookup(&root, "x").0, OK);
+}
+
+/// Pins the documented hazard (`Limits::handler_timeout`): the blocking work outlives the
+/// watchdog and completes, the cancelled call was not cached, so the client's retry re-executes
+/// against the already-applied change and reports NOENT for a REMOVE that did succeed.
+#[test]
+fn a_slow_remove_that_finishes_after_the_timeout_is_not_replayed_on_retry() {
+    let vfs = HangVfs::new();
+    let (_server, mut c) = serve(vfs.clone(), watchdog());
+    let root = c.root.clone();
+    let (st, _, _) = c.create(&root, "hang", 1, sattr_mode(0o644), [0; 8]);
+    assert_eq!(st, OK);
+    let x = c.send_nfs(12, named(&root, "hang"));
+    assert_eq!(c.recv_status_within(BOUND), Some((x, JUKEBOX)));
+    // The file system comes back: the abandoned blocking unlink completes.
+    vfs.release();
+    let deadline = std::time::Instant::now() + BOUND;
+    while c.lookup(&root, "hang").0 != NOENT {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the unlink never completed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    c.set_next_xid(x);
+    c.send_nfs(12, named(&root, "hang"));
+    let (_, st) = c.recv_status_within(BOUND).expect("the retry is answered");
+    assert_eq!(
+        st, NOENT,
+        "re-executed, not replayed as OK: the documented hazard"
+    );
 }
