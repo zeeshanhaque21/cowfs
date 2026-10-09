@@ -273,7 +273,9 @@ Checks (names are the contract, and match `crates/cowfs-vfs-test/src/conformance
 `MemVfs` (the reference implementation) implements `mknod` and the above behaviours first, so the checks are red on the old trait and green on `MemVfs`.
 Conformance consumers found: `MemVfs` (`cowfs-vfs-test/tests/memvfs.rs`), Core (`cowfs-core/tests/conformance.rs`), `PathVfs` (`cowfs-vfs-path/tests/common/mod.rs`, `Options` skip list), and the FUSE mount (`cowfs-fuse/tests/conformance.rs`).
 `PathVfs` does not implement `mknod`, so its options skip the new checks with the reason "PathVfs does not implement mknod".
-The FUSE conformance run skips them, first with the reason "FUSE mknod lands in slice C" and, after slice C, with the reason "PathVfs does not implement mknod": that harness serves a host directory through `PathVfs` behind the mount, not Core or MemVfs, so the skip cannot be removed without implementing `mknod` in `PathVfs`.
+The FUSE conformance run skips them, first with the reason "FUSE mknod lands in slice C" and, after slice C, with the reason "PathVfs (the client view) does not implement mknod".
+That harness mounts a MemVfs through FUSE and drives the mounted directory with `PathVfs`, so the mount can create special files and the checks skip only because `PathVfs::mknod` is missing.
+Implementing `PathVfs::mknod` is not cheap (its node table, open handling, attrs and read/write errors all need a special-file case) and is a follow-up; it would take the run from 25 skipped to 9.
 FUSE `mknod` is covered by `special_files_through_mknod` in `cowfs-fuse/tests/mount.rs`, which runs a real mount over MemVfs, and the conformance run count (128) is unchanged.
 `assert_skip_names` catches a misspelt name but not a missing entry, so each consumer is checked by running it.
 The model-based tests (`cowfs-core/tests/model.rs`, `cowfs-vfs-test/src/model.rs`) get a `mknod` action in slice D, after the adapters exist.

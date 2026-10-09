@@ -105,12 +105,13 @@ fn mount_conformance() {
             "PathVfs has no fallocate yet (#103 slice D)".into(),
         ));
     }
-    // This harness drives the mount through `PathVfs`, which does not implement `mknod`; the
+    // This harness serves MemVfs through the mount and drives it with `PathVfs` as the client view
+    // of the mounted directory; `PathVfs` does not implement `mknod`, so the checks cannot run; the
     // FUSE `mknod` path is covered by `special_files_through_mknod` in `mount.rs`, over MemVfs.
     for c in all_checks().iter().filter(|c| c.category == "special") {
         opts.skip.push((
             c.name.into(),
-            "PathVfs does not implement mknod; see special_files_through_mknod in mount.rs".into(),
+            "PathVfs (the client view) does not implement mknod; see special_files_through_mknod in mount.rs".into(),
         ));
     }
     let report = run_all(&factory, &opts);
