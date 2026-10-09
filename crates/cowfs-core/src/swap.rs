@@ -61,6 +61,8 @@ fn intent_path(root: &Path, target: &str) -> PathBuf {
 
 #[cfg(test)]
 thread_local! {
+    /// Test seam: makes `finish_swap` fail, the one step `set_swap_fault` cannot reach at open.
+    static FAIL_FINISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test seam: forces every staging name's hash, to build the collision a real name pair needs
     /// a 2^32 search for.
     static HASH_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -164,12 +166,13 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
         // old target is already gone: the staging snapshot is then the only copy of the new tree.
         let kept = validate_snapshot_name(&name).is_ok()
             && core.inner.snap_by_name(&name).is_err()
-            && core.inner.snap_by_name_raw(&staged).is_ok()
-            && core.finish_swap(&staged, &name).is_ok();
-        if !kept {
-            if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
-                let _ = core.inner.unregister(&sc);
-            }
+            && core.inner.snap_by_name_raw(&staged).is_ok();
+        if kept {
+            // Same as the readable path: a failed roll-forward keeps the staging tree and the
+            // intent file, the only copy of the new tree, and the next open tries again.
+            core.finish_swap(&staged, &name)?;
+        } else if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
+            let _ = core.inner.unregister(&sc);
         }
         let _ = fs::remove_file(p);
         sync_dir(&core.inner.root);
@@ -430,6 +433,10 @@ impl Core {
         staged: &str,
         target: &str,
     ) -> Result<SnapshotEntry, ControlError> {
+        #[cfg(test)]
+        if FAIL_FINISH.with(std::cell::Cell::get) {
+            return Err(io("injected finish_swap failure"));
+        }
         let mut entry = None;
         if self.inner.snap_by_name(target).is_err() {
             let sc = self.inner.snap_by_name_raw(staged)?;
@@ -587,8 +594,41 @@ mod tests {
         HASH_OVERRIDE.with(|h| h.set(None));
     }
 
-    /// N3: a replacing target whose temp intent name would not fit fails on the first call, before
-    /// anything is staged, and a plain ingest of it still works.
+    /// A torn intent whose roll-forward fails keeps the staging tree and the intent file, and a
+    /// later recovery still lands the new tree.
+    #[test]
+    fn a_failed_roll_forward_of_a_torn_intent_keeps_the_only_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let v1 = src_dir(scratch.path(), "v1", "old");
+        let v2 = src_dir(scratch.path(), "v2", "new");
+        let c = Core::open(
+            dir.path(),
+            crate::Options {
+                background: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        put(&c, &v1, "abc", true).unwrap();
+        c.set_swap_fault(4);
+        assert!(put(&c, &v2, "abc", true).is_err());
+        c.set_swap_fault(0);
+        let p = intent_path(&c.inner.root, "abc");
+        fs::write(&p, "torn").unwrap();
+        FAIL_FINISH.with(|f| f.set(true));
+        assert!(recover_intent(&c, &p).is_err());
+        FAIL_FINISH.with(|f| f.set(false));
+        assert!(p.exists(), "intent kept");
+        assert!(c.inner.snap_by_name_raw(&staging_name("abc")).is_ok());
+        recover_intent(&c, &p).unwrap();
+        let v = c.snapshot_view("abc").unwrap();
+        let ino = v.lookup(ROOT_INO, b"f").unwrap().ino;
+        assert_eq!(v.read(ino, 0, 64).unwrap(), b"new");
+    }
+
+    /// N3: replacing an existing target whose temp intent name would not fit fails on the first
+    /// call, before anything is staged. A fresh name needs no intent, so it is not refused.
     #[test]
     fn a_replacing_target_too_long_for_its_intent_is_refused_on_the_first_call() {
         let dir = tempfile::tempdir().unwrap();
@@ -603,12 +643,20 @@ mod tests {
         )
         .unwrap();
         let long = "n".repeat(250);
+        // no victim: installed without an intent file, as on main
+        put(&c, &v, &long, true).unwrap();
+        let before = c.meta().snapshots().unwrap().len();
+        // a victim exists: refused up front, nothing staged
         assert!(matches!(
             put(&c, &v, &long, true),
             Err(crate::ImportError::Core(ControlError::InvalidName(_)))
         ));
-        assert!(c.meta().snapshots().unwrap().is_empty(), "nothing staged");
+        assert_eq!(
+            c.meta().snapshots().unwrap().len(),
+            before,
+            "nothing staged"
+        );
         put(&c, &v, &"n".repeat(246), true).unwrap();
-        put(&c, &v, &long, false).unwrap();
+        put(&c, &v, &"n".repeat(246), true).unwrap();
     }
 }

@@ -146,14 +146,15 @@ fn ingest_with(
         )));
     }
     crate::validate_snapshot_name(name)?;
-    if replace {
-        swap::check_target_len(name)?;
-    }
     // A swap a failed earlier call left pending for this name is finished before anything below
     // removes its staging snapshot, the only copy of that call's tree (issue 177).
     c.recover_target(name)?;
     let victim = (replace && c.inner.snap_by_name(name).is_ok()).then_some(name);
     c.inner.check_new_name_except(name, victim)?;
+    // Only a real replacement writes an intent file; a fresh name is installed without one.
+    if victim.is_some() {
+        swap::check_target_len(name)?;
+    }
     let total = plan(from);
     let staged = swap::staging_name(name);
     // A leftover staging snapshot of this name holds blocks nothing points at: a pending intent was
