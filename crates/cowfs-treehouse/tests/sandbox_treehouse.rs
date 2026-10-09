@@ -558,6 +558,7 @@ fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    let marker = s.root().join("built-at.txt");
     let common_args = [
         "--socket",
         &sock.display().to_string(),
@@ -578,14 +579,21 @@ fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
         "--root".into(),
         s.pool().display().to_string(),
         "--build".into(),
-        "echo built > built.txt && pwd > built-at.txt".to_string(),
+        // The marker is written outside the slot: the flow returns the slot after the build, and
+        // treehouse cleans a returned slot, so a file left inside it does not survive to be read.
+        format!("pwd -P > '{}'", marker.display()),
     ]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let v = json(&refs);
     assert_eq!(v["built_in_slot"], true, "{v}");
     let slot = v["slot"].as_str().expect("slot");
-    assert!(
-        PathBuf::from(slot).join("built-at.txt").is_file(),
+    assert_eq!(
+        PathBuf::from(
+            std::fs::read_to_string(&marker)
+                .expect("the build wrote its marker")
+                .trim()
+        ),
+        std::fs::canonicalize(slot).expect("the slot path resolves"),
         "the build really ran in the slot"
     );
     let snapshot = v["snapshot"].as_str().expect("snapshot");
