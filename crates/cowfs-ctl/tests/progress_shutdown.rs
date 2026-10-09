@@ -404,6 +404,101 @@ fn an_unblocked_client_still_receives_a_terminal_frame_at_shutdown() {
     assert!(terminal, "a reading client must receive its terminal frame");
 }
 
+/// Reads `chunk` bytes, then pauses `pause`, until EOF or `until`; parses nothing. A client that
+/// is reading but slower than the server writes, so a terminal frame queued behind a progress write
+/// is still on its way when the shutdown deadline passes.
+fn drain_throttled(s: &UnixStream, chunk: usize, pause: Duration, until: Instant) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+    // A unix socket read returns at most a few KiB on some platforms, so fill `chunk` per cycle.
+    'cycle: while Instant::now() < until {
+        let mut got = 0;
+        while got < chunk {
+            match (&*s).read(&mut buf) {
+                Ok(0) => break 'cycle,
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    got += n;
+                }
+                Err(_) => break,
+            }
+        }
+        thread::sleep(pause);
+    }
+    out
+}
+
+/// Starts the flood on a throttled reader and returns once the handler has started. The client
+/// keeps reading (so the connection thread is never wedged) but slowly, on its own thread.
+fn throttled_reader(
+    fx: &Fixture,
+    entered: &AtomicBool,
+    chunk: usize,
+    pause: Duration,
+) -> thread::JoinHandle<(Vec<u8>, Instant)> {
+    let s = UnixStream::connect(&fx.path).unwrap();
+    let mut w = s.try_clone().unwrap();
+    w.write_all(format!("{HELLO}\n{GC_REQUEST}\n").as_bytes())
+        .unwrap();
+    let reader = thread::spawn(move || {
+        let raw = drain_throttled(&s, chunk, pause, Instant::now() + Duration::from_secs(4));
+        (raw, Instant::now())
+    });
+    // Only `entered` is awaited: how fast `steps` advances depends on the throttled reader and on
+    // the runner's load, and this test measures `wait()`, not the reader's throughput.
+    let until = Instant::now() + Duration::from_secs(3);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(Instant::now() < until, "handler never entered");
+        thread::sleep(Duration::from_millis(5));
+    }
+    reader
+}
+
+/// #128: the wait measurement against its configured bound, with a slow but reading client (64 KiB
+/// per 100 ms, so its backlog cannot drain inside the grace and the frame may be truncated, which
+/// is the abandoned semantics). The timer covers `wait()` only, started after `shutdown()` returns,
+/// so no probe reading or setup is inside it. The bound is the one absolute grace end,
+/// `shutdown_deadline + drain_deadline`, plus the scheduling allowance the budget tests use. Measured
+/// on main this geometry returns at 1.74 to 1.81 s against the 1.8 s nominal bound (also on the
+/// source before 2257796), so it guards the bound but does not reproduce the 2322 ms of case B.
+#[test]
+fn a_slow_reading_client_does_not_stretch_wait_past_the_deadline_plus_one_grace() {
+    let shutdown_deadline = Duration::from_millis(300);
+    let drain_deadline = Duration::from_millis(1500);
+    let budget = shutdown_deadline + drain_deadline + Duration::from_millis(250);
+    let _w = Watchdog::start(180);
+    let (handler, entered, _) = flood();
+    let mut fx = start_with(
+        handler,
+        ServerOptions {
+            write_timeout: Duration::from_secs(4),
+            shutdown_deadline,
+            drain_deadline,
+            ..ServerOptions::default()
+        },
+    );
+    let reader = throttled_reader(&fx, &entered, 64 << 10, Duration::from_millis(100));
+    let server = fx.server.take().unwrap();
+    server.handle().shutdown();
+    let t0 = Instant::now();
+    server.wait();
+    let wait = t0.elapsed();
+    let (raw, eof_at) = reader.join().unwrap();
+    eprintln!(
+        "PROGRESS128 slow_reader wait_ms={} eof_ms={} budget_ms={} bytes={} terminal={:?}",
+        wait.as_millis(),
+        eof_at.duration_since(t0).as_millis(),
+        budget.as_millis(),
+        raw.len(),
+        terminal_ids(&raw)
+    );
+    assert!(
+        wait < budget,
+        "wait() took {wait:?} for a slow reading client, past the deadline plus one grace ({budget:?})"
+    );
+}
+
 /// Two connections each blocked in a progress write must both be abandoned at the deadline, not
 /// serially through the write timeout. This exercises the loop over stragglers in the deadline
 /// path: one blocked writer must not hold the second, and `wait()` must return near the deadline.
