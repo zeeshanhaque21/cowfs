@@ -29,7 +29,6 @@
 //! stage a new one, so it cannot take a staging snapshot a live operation owns.
 
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use cowfs_vfs::Error;
@@ -103,14 +102,13 @@ fn io(msg: &str) -> ControlError {
 fn write_intent(root: &Path, staged: &str, target: &str) -> Result<(), ControlError> {
     let p = intent_path(root, target);
     let tmp = tmp_path(root, target);
-    let mut f = fs::File::create(&tmp).map_err(|e| io(&e.to_string()))?;
-    f.write_all(format!("{staged}\n{target}\n").as_bytes())
+    let f = crate::fsops::create_with(&tmp, format!("{staged}\n{target}\n").as_bytes())
         .map_err(|e| io(&e.to_string()))?;
     // the record must be on the medium before the rename, and the rename on the medium before
     // anything destructive reads the intent file
     crate::fsops::sync_file(&f, &tmp).map_err(|e| io(&e.to_string()))?;
     drop(f);
-    fs::rename(&tmp, &p).map_err(|e| io(&e.to_string()))?;
+    crate::fsops::rename(&tmp, &p).map_err(|e| io(&e.to_string()))?;
     crate::fsops::note("intent_renamed");
     crate::fsops::sync_dir(root).map_err(|e| io(&e.to_string()))?;
     Ok(())
@@ -174,7 +172,7 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
         } else if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
             let _ = core.inner.unregister(&sc);
         }
-        let _ = fs::remove_file(p);
+        let _ = crate::fsops::remove_file(p);
         sync_dir(&core.inner.root);
         *core.inner.last_error.lk() = Some(format!(
             "swap recovery: {p:?} is unreadable, {} staging snapshot {staged}",
@@ -188,7 +186,7 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
     };
     if p.file_name().and_then(|n| n.to_str()) == Some(&format!("{SWAP_PREFIX}{target}.tmp")) {
         // an older release's temp file (`swap-<target>.tmp`): its swap had not started
-        let _ = fs::remove_file(p);
+        let _ = crate::fsops::remove_file(p);
         return Ok(());
     }
     match core.finish_swap(&staged, &target) {
@@ -202,7 +200,7 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
             "swap recovery: neither {target} nor its staged tree {staged} exists, intent removed"
         ));
     }
-    if fs::remove_file(p).is_ok() {
+    if crate::fsops::remove_file(p).is_ok() {
         sync_dir(&core.inner.root);
     }
     Ok(())
@@ -222,7 +220,7 @@ pub(crate) fn recover(core: &Core) {
         .flatten()
     {
         if e.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
-            let _ = fs::remove_file(e.path());
+            let _ = crate::fsops::remove_file(e.path());
         }
     }
     for p in intents(&core.inner.root) {
@@ -421,8 +419,8 @@ impl Core {
         if let Ok(sc) = self.inner.snap_by_name_raw(staged) {
             let _ = self.inner.unregister(&sc);
         }
-        let _ = fs::remove_file(intent_path(&self.inner.root, target));
-        let _ = fs::remove_file(tmp_path(&self.inner.root, target));
+        let _ = crate::fsops::remove_file(intent_path(&self.inner.root, target));
+        let _ = crate::fsops::remove_file(tmp_path(&self.inner.root, target));
         sync_dir(&self.inner.root);
     }
 
@@ -447,7 +445,7 @@ impl Core {
         if let Ok(st) = self.inner.snap_by_name_raw(staged) {
             let _ = self.inner.unregister(&st);
         }
-        if fs::remove_file(intent_path(&self.inner.root, target)).is_ok() {
+        if crate::fsops::remove_file(intent_path(&self.inner.root, target)).is_ok() {
             sync_dir(&self.inner.root);
         }
         entry.ok_or(ControlError::NotFound)

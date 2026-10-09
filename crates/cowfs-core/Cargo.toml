@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Issue 173: records the mount root's durable writes (the swap intent file) for the power-loss model
+# of tests/power_core.rs, and turns on the store's op log. No production caller enables it; the
+# self dev-dependency below does it for this crate's tests. scripts/check-fault-seam-absent.sh
+# guards it.
+fault-injection = ["cowfs-store/fault-injection"]
+
 [dependencies]
 cowfs-store = { path = "../cowfs-store" }
 cowfs-gc = { path = "../cowfs-gc" }
@@ -17,6 +24,8 @@ fs2 = "0.4"
 thiserror.workspace = true
 
 [dev-dependencies]
+# A dev-dependency on itself, as the store does: `cargo test` gets the feature without `--features`.
+cowfs-core = { path = ".", features = ["fault-injection"] }
 cowfs-vfs-test = { path = "../cowfs-vfs-test" }
 proptest.workspace = true
 tempfile.workspace = true
