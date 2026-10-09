@@ -394,6 +394,8 @@ impl Vfs for MemVfs {
     fn fallocate(&self, ino: Ino, mode: FallocMode, offset: u64, len: u64) -> Result<Attr> {
         let mut st = self.lock();
         let no_extend = st.f(Fault::ZeroRangeNoExtend);
+        let zero_len_ok = st.f(Fault::FallocZeroLenOk);
+        let no_times = st.f(Fault::FallocNoTimes);
         let (noop, shrinks, punch_grows) = (
             st.f(Fault::PunchNoop),
             st.f(Fault::AllocateShrinks),
@@ -409,12 +411,15 @@ impl Vfs for MemVfs {
             });
         };
         if len == 0 {
+            if zero_len_ok {
+                return st.attr(ino);
+            }
             return Err(Error::InvalidArgument);
         }
         let end = offset
             .checked_add(len)
             .filter(|&e| e <= MAX_FILE)
-            .ok_or(Error::NoSpace)?;
+            .ok_or(Error::FileTooBig)?;
         let (zero, extend) = match mode {
             FallocMode::Allocate => (false, true),
             FallocMode::KeepSize => (false, false),
@@ -432,7 +437,8 @@ impl Vfs for MemVfs {
         }
         let grew = p.size > old;
         let t = st.now();
-        if zero || grew {
+        if no_times {
+        } else if zero || grew {
             st.touch_data(ino, t);
         } else {
             st.bump_ctime(ino, t);

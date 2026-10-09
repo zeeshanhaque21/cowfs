@@ -1,5 +1,6 @@
 //! A snapshot shown as a plain filesystem.
 
+use cowfs_vfs::FallocMode;
 use cowfs_vfs::{
     Attr, DirEntry, FileHandle, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, Vfs,
     XattrFlags, ROOT_INO,
@@ -169,5 +170,11 @@ impl Vfs for SnapshotView {
 
     fn removexattr(&self, ino: Ino, name: &[u8]) -> Result<()> {
         self.core.removexattr(self.i(ino), name)
+    }
+
+    fn fallocate(&self, ino: Ino, mode: FallocMode, offset: u64, len: u64) -> Result<Attr> {
+        self.core
+            .fallocate(self.i(ino), mode, offset, len)
+            .map(|a| self.attr(a))
     }
 }
