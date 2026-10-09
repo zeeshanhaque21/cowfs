@@ -144,11 +144,6 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------- mount table
 
 
-def _unescape(field: str) -> str:
-    """Decode the octal escapes /sbin/mount prints inside a path."""
-    return re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1), 8)), field)
-
-
 def mount_table(timeout: int = 15) -> tuple[str | None, str]:
     """The mount table, or (None, reason). A table that could not be read whole is not evidence."""
     try:
@@ -169,11 +164,14 @@ def mount_table(timeout: int = 15) -> tuple[str | None, str]:
 
 
 def mount_entries(table: str) -> list[tuple[str, str, str]]:
-    """(source, decoded mount point, options) per line. Both OSes escape a space in a path.
+    """(source, mount point, options) per line; the first option is the filesystem type.
 
-    macOS prints `src on /mp (fstype, opts)`. Linux prints `src on /mp type fstype (opts)`; its
-    type moves to the front of the options so the first option is the type on both, and since a
-    space is escaped a literal ` type ` cannot be part of the mount point.
+    Neither OS escapes a space: macOS `/sbin/mount` and Linux util-linux `mount` both print the
+    path raw (measured 2026-10-09 with a mount at a path containing ' type '), so a mount point
+    can hold ' on ', ' (' and ' type '. The trailing `(opts)` group is the anchor. macOS prints
+    `src on /mp (fstype, opts)`. Linux prints `src on /mp type fstype (opts)` and its options
+    start with rw or ro, which no macOS filesystem type is; only then is the last ' type ' the
+    separator, so a macOS path ending in ' type x' stays whole.
     """
     entries = []
     for line in table.splitlines():
@@ -184,10 +182,10 @@ def mount_entries(table: str) -> list[tuple[str, str, str]]:
             continue
         mountpoint, options = rest.rsplit(" (", 1)
         options = options.rstrip(")")
-        if " type " in mountpoint:
+        if options.split(",")[0].strip() in ("rw", "ro") and " type " in mountpoint:
             mountpoint, fstype = mountpoint.rsplit(" type ", 1)
             options = f"{fstype},{options}"
-        entries.append((source.strip(), _unescape(mountpoint.strip()), options))
+        entries.append((source.strip(), mountpoint.strip(), options))
     return entries
 
 
@@ -204,6 +202,26 @@ def mount_state(path: Path, timeout: int = 15) -> tuple[str, str]:
         if mountpoint == target:
             return MOUNTED, f"{source} on {mountpoint} ({options})"
     return NOT_MOUNTED, f"{target} is absent from a complete mount table of {len(table.splitlines())} lines"
+
+
+# The cowfs arm must be the mount this harness started: fuse.cowfs on Linux, nfs on macOS. Separate
+# devices alone would pass a cowfs arm that is itself btrfs or apfs, and fuseblk, plain fuse, nfs4
+# or smbfs are other people's filesystems.
+COWFS_FSTYPE = {"linux": "fuse.cowfs", "macos": "nfs"}
+
+
+def host_platform(sys_platform: str | None = None) -> str | None:
+    return {"darwin": "macos", "linux": "linux"}.get(sys_platform or sys.platform)
+
+
+def identity_platform(identity: dict | None) -> str | None:
+    """The platform a run was measured on: its receipt, else what its cowfs filesystem type shows."""
+    if not isinstance(identity, dict):
+        return None
+    if identity.get("platform") in COWFS_FSTYPE:
+        return identity["platform"]
+    fstype = (identity.get("cowfs") or {}).get("fstype")
+    return next((name for name, want in COWFS_FSTYPE.items() if fstype == want), None)
 
 
 def validate_runtime_identity(identity: dict | None,
@@ -243,6 +261,14 @@ def validate_runtime_identity(identity: dict | None,
                                               f"path this run asked the daemon for, "
                                               f"{expected_cowfs_mount}"))
     native, cowfs = identity.get("native") or {}, identity.get("cowfs") or {}
+    # A receipt without a platform (older runs) accepts either family: looser than a receipt that
+    # names its platform, stricter than before, when any filesystem type was accepted.
+    platform = identity.get("platform")
+    allowed = [COWFS_FSTYPE[platform]] if platform in COWFS_FSTYPE else list(COWFS_FSTYPE.values())
+    if isinstance(cowfs.get("fstype"), str) and cowfs["fstype"] and cowfs["fstype"] not in allowed:
+        problems.append(reason(INTEGRITY, f"cowfs arm reports filesystem type {cowfs['fstype']!r}, "
+                                          f"not {' or '.join(allowed)}: it is not the mount this run "
+                                          "started"))
     if isinstance(native.get("st_dev"), int) and native.get("st_dev") == cowfs.get("st_dev"):
         problems.append(reason(INTEGRITY, f"both arms report st_dev {native['st_dev']}, so they are "
                                           "not two filesystems"))
@@ -1153,19 +1179,27 @@ def load_accepted(path: Path = ACCEPTED_DIVERGENCES) -> list[dict]:
     document = json.loads(Path(path).read_text())
     entries = document["entries"]
     for entry in entries:
-        missing = [k for k in ("test", "n", "issue", "reason", "match") if not entry.get(k)]
+        missing = [k for k in ("test", "n", "issue", "reason", "match", "platform") if not entry.get(k)]
         if missing:
             raise ValueError(f"{path}: accepted divergence {entry!r} lacks {missing}")
         re.compile(entry["match"])
+        if entry["platform"] not in ("macos", "linux", "any"):
+            raise ValueError(f"{path}: accepted divergence {entry!r} has platform "
+                             f"{entry['platform']!r}, not macos, linux or any")
     return entries
 
 
-def accepted_reasons(arms: dict, accepted: list[dict]) -> list[dict]:
+def accepted_reasons(arms: dict, accepted: list[dict], platform: str | None = None) -> list[dict]:
     """Ordinal-worse positions not covered by the accepted list FAIL; list entries that rot are named.
 
     This sits beside the established-regression rule and never relaxes it: an established
     regression stays a DIVERGENCE whether or not a position is listed here.
+
+    An entry names the platform it was observed on (macos, linux or any). One for the other
+    platform is not in play: it waives nothing and is not reported stale. A run of unknown
+    platform keeps every entry, which can only be stricter.
     """
+    accepted = [e for e in accepted if platform is None or e["platform"] in ("any", platform)]
     worse, _ = ordinal_rows(arms)
     listed = {(e["test"], e["n"]): e for e in accepted}
     def waived(row: dict) -> bool:
@@ -1339,7 +1373,8 @@ def verdict(run_dir: Path, tool: dict | None = None, tests_root: Path | None = N
     if outside_gate:
         reasons.append(reason(DIVERGENCE, f"{len(outside_gate)} established assertion(s) pass "
                                           "natively and fail on the mount"))
-    reasons += accepted_reasons(arms, load_accepted() if accepted is None else accepted)
+    reasons += accepted_reasons(arms, load_accepted() if accepted is None else accepted,
+                                identity_platform(identity))
     # An established divergence is a result and an unpairable scope is a limit on what can be
     # concluded, so coverage never changes the exit on its own.
     state = state_from(reasons)
@@ -1703,7 +1738,9 @@ def main() -> int:
         # has nothing to compare and silently proves nothing.
         native_root.mkdir(parents=True, exist_ok=True)
         native_fs, cowfs_fs = fs_identity(native_root), fs_identity(cowfs_root)
-        arm_fs = {"native": native_fs, "cowfs": cowfs_fs}
+        arm_fs = {"platform": host_platform(), "native": native_fs, "cowfs": cowfs_fs}
+        if arm_fs["platform"]:
+            arm_fs["cowfs_fstype_required"] = COWFS_FSTYPE[arm_fs["platform"]]
         log(f"native arm on {native_fs['fstype']} {native_fs['mountpoint']} dev={native_fs['st_dev']}")
         log(f"cowfs arm on {cowfs_fs['fstype']} {cowfs_fs['mountpoint']} dev={cowfs_fs['st_dev']}")
         # Fail closed before a single case runs: an arm we could not place, or two arms on one

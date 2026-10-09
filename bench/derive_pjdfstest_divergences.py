@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Regenerate bench/pjdfstest-accepted-divergences.json from a g3 run's cases.jsonl.
 
-    bench/derive_pjdfstest_divergences.py <run-dir-or-cases.jsonl> [--out FILE]
+    bench/derive_pjdfstest_divergences.py <run-dir-or-cases.jsonl> [--out FILE] [--platform macos|linux]
+
+Rules and entries carry a platform. The run's platform is --platform, else its identity.json, else
+unknown (every rule applies). Entries in --out for the other platform are kept, so regenerating from
+a Linux run does not erase the macOS entries.
 
 Every ordinal-worse position must be classified by RULES below, or this exits 2 and names the
 unclassified ones: a new worse position is a decision, never an automatic waiver.
@@ -22,15 +26,15 @@ import pjdfstest as p
 # harness now supplies the native arm's PATH_MAX to any arm that cannot answer, so those 13 cases
 # compare for real and a fresh run has no such position. A pathconf failure is a new worse position
 # again, and so is unclassified until someone decides it.
-# (issue, reason, match, test or None for any case, n or None for any position). First rule wins.
+# (issue, reason, match, test or None for any case, n or None for any position, platform). First rule wins.
 RULES = [
     ("#204", "open O_WRONLY,O_NONBLOCK on a fifo with no reader answers EACCES where native answers "
              "ENXIO; a real defect tracked in #204, listed so the ordinal position is on record while "
              "the established regression still fails the gate",
-     r"expected ENXIO, got EACCES", "open/17.t", 2),
+     r"expected ENXIO, got EACCES", "open/17.t", 2, "macos"),
     ("#109", "open O_RDONLY then unlink then fstat reports nlink 1 where native reports 0: macOS NFS "
              "silly-rename keeps nlink 1 for an open unlinked file (#109 symptom 2)",
-     r"fstat 0 nlink', expected 0, got 1", "unlink/14.t", 4),
+     r"fstat 0 nlink', expected 0, got 1", "unlink/14.t", 4, "macos"),
 ]
 
 
@@ -43,21 +47,24 @@ def load_arms(path: Path) -> dict:
     return arms
 
 
-def derive(arms: dict, derived_from: str) -> dict:
+def derive(arms: dict, derived_from: str, platform: str | None = None, existing: list | tuple = ()) -> dict:
     import re
     entries, unclassified = [], []
     for row in p.ordinal_rows(arms)[0]:
         text = row["cowfs_detail"] + "\n" + row["cowfs_stderr"]
-        for issue, why, match, test, n in RULES:
-            if test in (None, row["test"]) and n in (None, row["n"]) and re.search(match, text):
-                entries.append({"test": row["test"], "n": row["n"], "issue": issue,
-                                "reason": why, "match": match})
-                break
+        for issue, why, match, test, n, where in RULES:
+            if platform is None or where in ("any", platform):
+                if test in (None, row["test"]) and n in (None, row["n"]) and re.search(match, text):
+                    entries.append({"test": row["test"], "n": row["n"], "issue": issue,
+                                    "reason": why, "match": match, "platform": where})
+                    break
         else:
             unclassified.append(f"{row['test']} #{row['n']}")
     if unclassified:
         raise SystemExit(f"unclassified ordinal-worse positions, add a rule or fix them: "
                          f"{', '.join(unclassified)}")
+    if platform:
+        entries += [e for e in existing if e["platform"] not in ("any", platform)]
     return {"version": 2, "derived_from": derived_from, "entries": entries}
 
 
@@ -65,8 +72,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run")
     ap.add_argument("--out", type=Path, default=p.ACCEPTED_DIVERGENCES)
+    ap.add_argument("--platform", choices=("macos", "linux"))
     args = ap.parse_args()
-    doc = derive(load_arms(Path(args.run)), f"{args.run} via bench/derive_pjdfstest_divergences.py")
+    run = Path(args.run)
+    receipt = (run if run.is_dir() else run.parent) / "identity.json"
+    platform = args.platform or (p.identity_platform(json.loads(receipt.read_text()).get("runtime_identity"))
+                                 if receipt.is_file() else None)
+    existing = p.load_accepted(args.out) if args.out.is_file() else []
+    doc = derive(load_arms(run), f"{args.run} via bench/derive_pjdfstest_divergences.py", platform, existing)
     args.out.write_text(json.dumps(doc, indent=1) + "\n")
     print(f"wrote {len(doc['entries'])} entries to {args.out}")
     return 0
