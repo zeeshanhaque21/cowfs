@@ -7,8 +7,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/seam-check}"
 NEEDLE=C7D_EXIT
+# The crash-model log (issue 247) is gated by the same feature, so its entry point is a second needle.
+NEEDLE2=oplog_start
 
-count() { grep -ac "$NEEDLE" "$CARGO_TARGET_DIR"/debug/libcowfs_store.rlib || true; }
+count() { grep -ac -e "$NEEDLE" -e "$NEEDLE2" "$CARGO_TARGET_DIR"/debug/libcowfs_store.rlib || true; }
 
 cargo build -q -p cowfs-store -p cowfs-gc --lib
 if cargo tree -q -p cowfs-daemon -e features -i cowfs-store | grep -q fault-injection; then
@@ -36,7 +38,7 @@ cargo tree -q -p cowfs-daemon --features fault-injection -e normal,build,feature
   || { echo "FAIL: the daemon feature does not forward the store feature" >&2; exit 1; }
 
 # A built RELEASE cowfs-daemon without the feature carries no seam string; with it, it does.
-count_bin() { grep -ac "$NEEDLE" "$CARGO_TARGET_DIR"/release/cowfs-daemon || true; }
+count_bin() { grep -ac -e "$NEEDLE" -e "$NEEDLE2" "$CARGO_TARGET_DIR"/release/cowfs-daemon || true; }
 cargo build -q --release -p cowfs-daemon
 rel_off=$(count_bin)
 [ "$rel_off" = 0 ] || { echo "FAIL: release cowfs-daemon carries the seam ($rel_off hits)" >&2; exit 1; }

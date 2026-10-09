@@ -392,10 +392,10 @@ impl Store {
         // Nothing live in the source: there is no copy to make durable, only the free to come.
         if let Some(target) = &c.target {
             let path = pack::pack_path(g.dir, c.to);
-            fsio::oplog_marker(MARK_BEFORE_SYNC);
+            fsio::mark(MARK_BEFORE_SYNC);
             g.io.sync_file(target, &path)?;
             g.io.sync_dir(&pack::pack_dir(g.dir))?;
-            fsio::oplog_marker(MARK_AFTER_SYNC);
+            fsio::mark(MARK_AFTER_SYNC);
             for (id, loc) in &c.moved {
                 g.index.replace(*id, *loc);
             }
@@ -480,7 +480,7 @@ impl Store {
                 wm.reset(m, base, next)?;
             }
         }
-        fsio::oplog_marker(MARK_UNLINK);
+        fsio::mark(MARK_UNLINK);
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -501,7 +501,7 @@ impl Store {
             out.durability_error = Some(e.into());
             return Ok(out);
         }
-        fsio::oplog_marker(MARK_AFTER_DIRSYNC);
+        fsio::mark(MARK_AFTER_DIRSYNC);
         // Only now, with the file really gone, is a whole-pack acceptance true. Written while the
         // pack was still there it would be a wildcard: `find` treats a zero nonce as matching any,
         // so it would swallow damage reported against this pack later, and the pack id is never

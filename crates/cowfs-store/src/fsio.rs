@@ -1,6 +1,7 @@
 //! Every durability-relevant call goes through [`Io`], so tests can record the order of writes
 //! and fsyncs, and a crash model can rebuild the disk image from them.
 
+#[cfg(feature = "fault-injection")]
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -68,38 +69,52 @@ pub enum LogOp {
     Marker(u64),
 }
 
+// The crash-model log only exists with `fault-injection`, so a normal build carries no log, no
+// recording entry points and no per-write allocation. Ops are built lazily, only when a log is on.
+#[cfg(feature = "fault-injection")]
 thread_local! {
     /// Per thread, so tests that run beside each other cannot log into each other's model.
     static LOG: RefCell<Option<Vec<LogOp>>> = const { RefCell::new(None) };
 }
 
 /// Start recording data writes and fsyncs into this thread's log. For the crash model.
+#[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub fn oplog_start() {
     LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
 }
 
 /// Stop recording and take the log.
+#[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub fn oplog_take() -> Vec<LogOp> {
     LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
 }
 
 /// Put a marker in the log, so a test can tell where a sync was called.
+#[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub fn oplog_marker(v: u64) {
-    log_data(LogOp::Marker(v));
+    mark(v);
 }
 
-fn log_data(op: LogOp) {
+/// The store's own marker call; a no-op without `fault-injection`.
+pub(crate) fn mark(v: u64) {
+    log_data(|| LogOp::Marker(v));
+}
+
+/// Record `op()` if this thread is logging. `op` is not run otherwise, so nothing is allocated.
+#[cfg(feature = "fault-injection")]
+fn log_data(op: impl FnOnce() -> LogOp) {
     LOG.with(|l| {
         if let Some(v) = &mut *l.borrow_mut() {
-            v.push(op);
+            v.push(op());
         }
     });
 }
 
-// The log itself lives in the thread local above.
+#[cfg(not(feature = "fault-injection"))]
+fn log_data(_op: impl FnOnce() -> LogOp) {}
 
 /// Shared log of [`Op`]s, filled while a store built with `Store::open_traced` runs.
 #[doc(hidden)]
@@ -129,7 +144,7 @@ impl Io {
 
     pub(crate) fn created(&self, path: &Path) {
         self.log(|| Op::Create(name(path)));
-        log_data(LogOp::Create { file: name(path) });
+        log_data(|| LogOp::Create { file: name(path) });
     }
 
     /// Write at an offset and log it for the crash model.
@@ -140,7 +155,7 @@ impl Io {
         off: u64,
         buf: &[u8],
     ) -> io::Result<()> {
-        log_data(LogOp::Write {
+        log_data(|| LogOp::Write {
             file: name(path),
             off,
             data: buf.to_vec(),
@@ -153,7 +168,7 @@ impl Io {
 
     pub(crate) fn sync_file(&self, file: &File, path: &Path) -> io::Result<()> {
         self.log(|| Op::Sync(name(path)));
-        log_data(LogOp::Sync { file: name(path) });
+        log_data(|| LogOp::Sync { file: name(path) });
         if self.nosync {
             return Ok(());
         }
@@ -175,7 +190,7 @@ impl Io {
 
     pub(crate) fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         self.log(|| Op::DirSync(name(dir)));
-        log_data(LogOp::DirSync);
+        log_data(|| LogOp::DirSync);
         let d = File::open(dir)?;
         if self.nosync {
             return Ok(());
@@ -196,7 +211,7 @@ impl Io {
 
     pub(crate) fn truncate(&self, file: &File, path: &Path, len: u64) -> io::Result<()> {
         self.log(|| Op::Truncate(name(path)));
-        log_data(LogOp::SetLen {
+        log_data(|| LogOp::SetLen {
             file: name(path),
             len,
         });
@@ -227,7 +242,7 @@ impl Io {
     /// Log a whole-file write for the crash model, after the real one.
     pub(crate) fn log_whole(&self, dir: &Path, file_name: &str, data: &[u8]) {
         let _ = dir;
-        log_data(LogOp::Whole {
+        log_data(|| LogOp::Whole {
             file: file_name.to_owned(),
             data: data.to_vec(),
         });
