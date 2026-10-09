@@ -526,6 +526,12 @@ fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
     let s = Sandbox::new();
     let run_dir = dir.path().join("run");
     std::fs::create_dir_all(&run_dir).expect("mkdir run");
+    // The daemon refuses a socket directory that is not mode 0700.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod run");
+    }
     let sock = run_dir.join("control.sock");
     let mut server = Command::new(&cowfs)
         .args([

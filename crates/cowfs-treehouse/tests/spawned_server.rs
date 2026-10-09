@@ -144,7 +144,9 @@ fn a_second_process_can_drive_the_daemon_over_a_real_socket() {
     let snapshot = v["snapshot"].as_str().expect("snapshot name").to_owned();
     assert!(snapshot.ends_with("-base"), "{v}");
 
-    let v = json(&[
+    // A base that is not fresh exits 1 by design (`base status` is a freshness gate), and still
+    // prints its JSON; the stub records a synthetic commit, so it is never fresh.
+    let status_args = [
         "--socket",
         &sock,
         "--json",
@@ -154,7 +156,16 @@ fn a_second_process_can_drive_the_daemon_over_a_real_socket() {
         &s.repo().display().to_string(),
         "--ref",
         "main",
-    ]);
+    ];
+    let out = run(&status_args);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a stale base is exit 1: {out:?}"
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let v: serde_json::Value = serde_json::from_str(text.lines().last().unwrap_or(""))
+        .unwrap_or_else(|e| panic!("base status printed no JSON ({e}): {text}"));
     assert_eq!(v["snapshot"].as_str(), Some(snapshot.as_str()), "{v}");
     assert_eq!(
         v["fresh"], false,
