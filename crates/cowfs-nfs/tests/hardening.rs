@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use common::reuse::ReusingVfs;
 use common::*;
-use cowfs_nfs::{MountOptions, HANDLE_LEN};
+use cowfs_nfs::{MountOptions, Server, HANDLE_LEN};
 use nfsserve::nfs::nfs_fh3;
 use nfsserve::tcp::Limits;
 
@@ -106,6 +106,32 @@ fn a_gate_off_server_lets_everyone_mount() {
         y.mount_path("/cowfs-0123456789abcdef0123456789abcdef").0,
         MNT_NOENT
     );
+}
+
+/// What a process that never mounted learns from MOUNT EXPORT (procedure 5): the export path if
+/// the server lists one.
+fn export_list(x: &mut Nfs) -> Option<String> {
+    let (acc, mut r) = x.raw(MOUNT, 3, 5, Args::new());
+    assert_eq!(acc, 0);
+    if dec::<u32>(&mut r) == 0 {
+        return None;
+    }
+    let dir: Vec<u8> = dec(&mut r);
+    Some(String::from_utf8_lossy(&dir).into_owned())
+}
+
+#[test]
+fn export_does_not_hand_out_the_secret_export_path() {
+    // No legitimate client yet, so a process that learns the path from EXPORT mounts first.
+    let s = Server::start(memfs(), &MountOptions::default(), None).unwrap();
+    let mut spy = Nfs::attach(s.port(), nfs_fh3::default());
+    if let Some(path) = export_list(&mut spy) {
+        let (st, h) = spy.mount_path(&path);
+        panic!(
+            "EXPORT listed {path}; MNT of it then returned status {st}, root handle: {}",
+            h.is_some()
+        );
+    }
 }
 
 #[test]

@@ -32,6 +32,7 @@ Everything below is ours.
 - Security and bounds (`tcp.rs`, `rpcwire.rs`, `reply_cache.rs`):
   - `MountGate`: the first connection to send MNT gets the root handle, other connections are refused until `rearm`.
   - `PeerCheck` hook for MNT callers.
+  - MOUNT EXPORT answers an empty list: the export path is a per-server secret that only `mount_nfs` is told.
   - `Limits`: connection cap, idle timeout, per-frame slowloris deadline, in-flight requests per connection, frame size cap.
   - Records are read incrementally, so a declared but unsent frame costs nothing.
   - READDIR, READDIRPLUS and READ replies are capped whatever count the client asks for.

@@ -189,16 +189,12 @@ pub fn mountproc3_export(
     xid: u32,
     _: &mut impl Read,
     output: &mut impl Write,
-    context: &RPCContext,
+    _: &RPCContext,
 ) -> Result<(), anyhow::Error> {
     debug!("mountproc3_export({:?}) ", xid);
     make_success_reply(xid).serialize(output)?;
-    true.serialize(output)?;
-    // dirpath
-    context.export_name.as_bytes().to_vec().serialize(output)?;
-    // groups
-    false.serialize(output)?;
-    // next exports
+    // An empty export list. The export path is a secret that only `mount_nfs` is told (see the
+    // security model in cowfs-nfs), so a caller with no handle must not be able to read it here.
     false.serialize(output)?;
     Ok(())
 }
