@@ -630,6 +630,24 @@ impl Canonical {
     }
 }
 
+impl Canonical {
+    /// The command that runs a build through the helper, without running it.
+    ///
+    /// Cargo's incremental state is the one thing a canonical path cannot make reproducible: it
+    /// holds per-session random names and bytes (issue 171, measured in
+    /// `docs/verification/evidence/cargo171.md`). The route therefore sets `CARGO_INCREMENTAL=0`,
+    /// overriding any value the caller set. Only this route sets it, so a build at the slot's own
+    /// path is untouched.
+    pub fn build_command(&self, dir: &Path, command: &str) -> Command {
+        let mut child = Command::new(&self.helper);
+        child
+            .args(self.args(dir, command))
+            .current_dir(dir)
+            .env("CARGO_INCREMENTAL", "0");
+        child
+    }
+}
+
 /// Runs a build command in `dir`.
 ///
 /// With a `canonical`, the command runs inside a mount namespace where `dir` also appears at the
@@ -663,10 +681,7 @@ pub fn run_build(dir: &Path, command: &str, canonical: Option<&Canonical>) -> Re
                     crate::th::tail(&String::from_utf8_lossy(&probe.stderr))
                 )));
             }
-            let argv = c.args(dir, command);
-            let mut child = Command::new(&c.helper);
-            child.args(argv).current_dir(dir);
-            child
+            c.build_command(dir, command)
         }
     };
     let status = cmd

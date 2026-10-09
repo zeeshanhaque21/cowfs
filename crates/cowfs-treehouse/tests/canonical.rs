@@ -634,3 +634,24 @@ fn neither_flag_keeps_the_pre_existing_command_line() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Issue 171: cargo's incremental state makes rebuilds differ, so the canonical route turns it
+/// off for the build. Checked on the command itself, not on a run, because CI's rust-cache already
+/// exports `CARGO_INCREMENTAL=0` and a run-based check would pass without the fix.
+#[test]
+fn the_canonical_build_command_sets_cargo_incremental_off() {
+    let t = Tmp::new("incr");
+    let c = Canonical {
+        dir: t.dir("canonical"),
+        helper: t.dir("bin").join("ns-stub"),
+    };
+    let cmd = c.build_command(&t.dir("slot"), "cargo build");
+    let envs: Vec<_> = cmd.get_envs().collect();
+    assert_eq!(
+        envs,
+        vec![(
+            std::ffi::OsStr::new("CARGO_INCREMENTAL"),
+            Some(std::ffi::OsStr::new("0"))
+        )]
+    );
+}
