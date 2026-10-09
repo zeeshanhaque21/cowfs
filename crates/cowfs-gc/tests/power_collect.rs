@@ -10,8 +10,9 @@
 //! - the metadata database, as the writes that precede its last completed `sync_data` (every
 //!   unsynced redb write is lost, which is a legal image);
 //! - the collector's own state directory, as an arbitrary mix of its old file, its new file, a torn
-//!   prefix of the new file and no file. That state is only a hint and a derived cache, so any mix
-//!   must be safe; this is the evidence for it (see `gc_state_is_advisory`).
+//!   prefix of the new file and no file. Torn, old and missing states must be safe, and
+//!   `gc_state_is_advisory` is the evidence. Same-length corrupted bytes are NOT safe: `mark.bin`
+//!   has no checksum (see `mark_bin_bit_rot_loses_live_blocks_KNOWN_BUG`).
 //!
 //! Each image is reopened with the shipped open paths. Every block any durable snapshot references
 //! must read back byte for byte, the store must report no loss and pass `fsck`, and a second collect
@@ -609,9 +610,10 @@ fn power_loss_at_every_op_of_a_reclaiming_collect_keeps_live_blocks() {
     assert!(t.mid_missing > 0, "no image lacked the mid file");
 }
 
-/// The collector's state directory is a hint file and a derived cache, so no mix of old, new, torn
+/// The collector's state directory tolerates the states a power cut leaves: no mix of old, new, torn
 /// and missing files may lose a block or fail a collect. This is the evidence that `gcstate` needs
-/// no routing through the store's fsync model.
+/// no routing through the store's fsync model. It says nothing about same-length corrupted bytes,
+/// which `mark.bin` does not detect (the ignored test below).
 #[test]
 fn gc_state_is_advisory() {
     let run = record();
@@ -635,5 +637,46 @@ fn gc_state_is_advisory() {
         t.failures.is_empty(),
         "{:#?}",
         &t.failures[..t.failures.len().min(5)]
+    );
+}
+
+/// KNOWN BUG, pinned and ignored so CI stays green: `mark.bin` carries no checksum, so a zeroed
+/// 64-byte span (bit rot, not a power cut) parses as a valid but different set and a later cycle
+/// can free live blocks. The fsyncs make power loss safe; they do not protect against this. Run
+/// with `--ignored`; it must start passing once the file is checksummed.
+#[test]
+#[ignore = "known bug: mark.bin has no checksum, same-length corruption loses live blocks"]
+#[allow(non_snake_case)]
+fn mark_bin_bit_rot_loses_live_blocks_KNOWN_BUG() {
+    let run = record();
+    let final_store = {
+        let mut rng = Rng(7);
+        crash_image(&run.store_base, &run.ops, run.ops.len(), &mut rng, 2)
+    };
+    let mut failures = Vec::new();
+    for seed in 0..64u64 {
+        let mut rng = Rng(seed ^ 0xB17);
+        let dir = tempfile::tempdir().unwrap();
+        write_image(&final_store, &dir.path().join("store"));
+        let state = dir.path().join("gcstate");
+        fs::create_dir_all(&state).unwrap();
+        for (name, _, post) in &run.state {
+            let mut bytes = post.clone();
+            if name == "mark.bin" && bytes.len() > 80 {
+                let at = 16 + rng.below((bytes.len() - 80) as u64) as usize;
+                bytes[at..at + 64].fill(0);
+            }
+            fs::write(state.join(name), bytes).unwrap();
+        }
+        let meta_img = meta_image(&run.meta_base, &run.meta_evs, &run.ops, run.ops.len());
+        if let Err(e) = verify(&run, dir.path(), meta_img, &mut Tally::default()) {
+            failures.push(format!("seed={seed}: {e}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 64 lost: {:#?}",
+        failures.len(),
+        &failures[..failures.len().min(3)]
     );
 }

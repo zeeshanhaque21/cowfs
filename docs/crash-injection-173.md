@@ -192,9 +192,12 @@ Each image is reopened (store, meta, collector) and must: report no store loss, 
 Fail-closed asserts: some image lost a source pack and some kept all; the `late` and `mid` files are durable in some images and missing in others.
 `C173_SEEDS=n` sets the seeds (default 8; about 1100 images, 15 s on the box).
 
-Collector state is advisory, so it is not routed through the store's fsync model.
+Collector state tolerates the states a power cut leaves (old, torn, missing), so it is not routed through the store's fsync model.
 `gc_state_is_advisory` is the evidence: 64 seeds of every old/new/torn/missing mix over the final disk never lose a block or fail a collect, and a snapshot untouched since phase A (`frozen`) makes the next cycle read the persisted mark cache.
-The two fsync mutants of that cache survive, as they must (`GA1` no file fsync, `GA2` no directory fsync): the test already explores every state those fsyncs could change.
+It is NOT advisory against same-length corruption: `mark.bin` has no checksum, and flipping bytes in it or zeroing a 64-byte span loses live blocks (`atime.bin` is unaffected).
+`mark_bin_bit_rot_loses_live_blocks_KNOWN_BUG` pins that as an ignored test; it passes once the file is checksummed.
+The shipped fsyncs make power loss safe; bit rot is a separate defect.
+`GA1` (no file fsync) and `GA2` (no directory fsync) survive because the test already explores every torn, old or missing state those fsyncs could change, so they are equivalent here, not because the state is harmless.
 
 Mutants (`MUT_PKG=cowfs-gc MUT_ARGS="--test power_collect" python3 crates/cowfs-store/tests/mutate.py ...`):
 
@@ -203,7 +206,8 @@ Mutants (`MUT_PKG=cowfs-gc MUT_ARGS="--test power_collect" python3 crates/cowfs-
 - N1, no new-pack fsync: killed.
 - D1, no packs directory fsync after the unlink: killed (through the whole-pack acceptance check).
 - Survivors, with the reason: W1 and E7 (watermark before data fsync, no leading sync) need a writer with unsynced puts, which a collect does not have; the store sweeps kill them.
-  GF1 and GF2 (no metadata sync at the freeze, none at the fresh listing): each sync is the other's backup and `durable_snapshots` lists a snapshot as soon as `new_snapshot` returns, so, from reading `Gc::marked` (not isolated by experiment), neither is observable here; `race.rs` is where that window lives.
+  GF1 and GF2 (no metadata sync at the freeze, none at the fresh listing) are equivalent mutants: `live_blocks_with_root` runs `inner.sync()` itself (db.rs:2141), so the walk commits regardless.
+  Only the combination GF1+GF2+walk-sync is observable, and only with the test's `mid` hook removed (8 of 992 images, per the critic); that defence in depth is pinned by no test.
 
 Not covered: metadata unsynced writes surviving a cut (only the durable prefix is modelled; redb's own recovery is `cowfs-meta/tests/crash.rs`), the core-level timeline with the flusher thread (slice 5), `fsops.rs` intent files.
 

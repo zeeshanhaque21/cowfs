@@ -89,6 +89,9 @@ M = [
     ("E8 acknowledge_corruption skips the directory fsync after dropping index.cix", "store.rs", "            self.io.remove_file(&self.index_path())?;\n            self.io.sync_dir(&self.dir)?;\n", "            self.io.remove_file(&self.index_path())?;\n"),
     # Power loss across a whole collect (tests/power_collect.rs, MUT_PKG=cowfs-gc MUT_ARGS="--test power_collect").
     ("GM1 collect discards the new pack instead of the source", "cowfs-gc/src/lib.rs", "self.store.discard(rw.from, &rw.condemned)", "self.store.discard(rw.to, &rw.condemned)"),
+    # GF1/GF2 are EQUIVALENT: live_blocks_with_root runs inner.sync() itself (db.rs:2141). Only GF1+GF2+walk-sync together
+    # is observable (8 of 992 images, and only without the mid hook): defence in depth no test pins.
+    # GA1/GA2 survive because power_collect already explores every state their fsyncs change; mark.bin bit rot is a separate known bug.
     ("GF1 freeze skips the metadata sync", "cowfs-gc/src/lib.rs", "        self.meta.sync()?;\n        // Listed after the sync", "        // Listed after the sync"),
     ("GF2 fresh roots skip the metadata sync", "cowfs-gc/src/lib.rs", "cowfs_meta::SnapshotId)>> {\n        self.meta.sync()?;\n", "cowfs_meta::SnapshotId)>> {\n"),
     ("GA1 mark cache written without fsync", "cowfs-gc/src/state.rs", "            f.write_all(&buf)?;\n            f.sync_data()?;", "            f.write_all(&buf)?;"),
