@@ -495,3 +495,80 @@ fn an_older_temp_file_is_dropped_on_open() {
     assert!(raw_leftovers(dir.path(), &c).is_empty());
     c.check().unwrap();
 }
+
+fn replace_as(c: &Core, from: &std::path::Path, target: &str) -> Result<(), ImportError> {
+    let mut hooks = Hooks {
+        progress: &mut |_, _| true,
+    };
+    ingest_replacing(c, from, target, &mut hooks).map(|_| ())
+}
+
+/// Round-2 critic: staging names kept 200 characters of the target, so these two valid names shared
+/// one staging snapshot. A pending swap of A was destroyed by a plain ingest of B.
+#[test]
+fn long_targets_sharing_a_prefix_do_not_share_a_staging_snapshot() {
+    let a = format!("{}1", "a".repeat(200));
+    let b = format!("{}2", "a".repeat(200));
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old");
+    let va = source(scratch.path(), "va", "content of A");
+    let vb = source(scratch.path(), "vb", "content of B");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace_as(&c, &v1, &a).unwrap();
+        c.set_swap_fault(4);
+        assert!(replace_as(&c, &va, &a).is_err());
+        c.set_swap_fault(0);
+        // a plain ingest of B must leave A's pending swap alone
+        replace_as(&c, &vb, &b).unwrap();
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, &a, "f"), "content of A");
+    assert_eq!(content(&c, &b, "f"), "content of B");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+}
+
+#[test]
+fn two_long_pending_swaps_with_a_shared_prefix_both_recover() {
+    let a = format!("{}1", "a".repeat(200));
+    let b = format!("{}2", "a".repeat(200));
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old");
+    let va = source(scratch.path(), "va", "content of A");
+    let vb = source(scratch.path(), "vb", "content of B");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        for t in [&a, &b] {
+            replace_as(&c, &v1, t).unwrap();
+        }
+        c.set_swap_fault(4);
+        assert!(replace_as(&c, &va, &a).is_err());
+        assert!(replace_as(&c, &vb, &b).is_err());
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, &a, "f"), "content of A");
+    assert_eq!(content(&c, &b, "f"), "content of B");
+}
+
+/// A record cut off inside the target name must not be read as an intent for a shorter name.
+#[test]
+fn a_torn_intent_is_not_read_as_a_shorter_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old");
+    let v2 = source(scratch.path(), "v2", "new");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace_as(&c, &v1, "abc").unwrap();
+        c.set_swap_fault(4);
+        assert!(replace_as(&c, &v2, "abc").is_err());
+    }
+    let p = dir.path().join("swap-abc");
+    let text = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p, text.trim_end_matches(['\n', 'c'])).unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert!(c.snapshot_view("ab").is_err(), "a stray snapshot ab");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+}

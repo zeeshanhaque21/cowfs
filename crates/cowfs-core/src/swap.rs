@@ -59,11 +59,24 @@ fn intent_path(root: &Path, target: &str) -> PathBuf {
     root.join(format!("{SWAP_PREFIX}{target}"))
 }
 
-/// The staging name for `target`; deterministic, so recovery can clean it up without the intent
-/// file. An import stages into the same name: its crash leaves nothing a caller can see either.
+/// The staging name for `target`; deterministic, so a duplicate is found and cleaned up without the
+/// intent file. An import stages into the same name: its crash leaves nothing a caller can see.
+///
+/// A readable prefix of the target plus a hash of the whole target, so two targets never share a
+/// staging snapshot however long their common prefix is. The result is at most 200 + 17 + 12 bytes,
+/// inside `NAME_MAX`. Intents record their staging name, so one written under the older naming
+/// (200 characters of the target, no hash) still recovers; nothing compares a recorded name with
+/// this function.
 pub(crate) fn staging_name(target: &str) -> String {
-    let base: String = target.chars().take(200).collect();
-    format!("{base}{STAGING}0")
+    let mut end = target.len().min(200);
+    while !target.is_char_boundary(end) {
+        end -= 1;
+    }
+    // FNV-1a 64 of the full target; a collision needs two valid names with equal prefix and hash
+    let h = target.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{}~{h:016x}{STAGING}0", &target[..end])
 }
 
 fn sync_dir(dir: &Path) {
@@ -93,6 +106,10 @@ fn write_intent(root: &Path, staged: &str, target: &str) -> Result<(), ControlEr
 /// The staging and target names of an intent file, or `None` if it is unreadable or torn.
 fn read_intent(p: &Path) -> Option<(String, String)> {
     let s = fs::read_to_string(p).ok()?;
+    // a record is written whole and renamed into place; one without its final newline is cut off
+    if !s.ends_with('\n') {
+        return None;
+    }
     let mut it = s.lines();
     let staged = it.next()?.to_string();
     let target = it.next()?.to_string();
