@@ -437,7 +437,7 @@ class G2Unmeasurable(CliCase):
         rc, out, err = self.run_g2([4.4, 4.9, 5.2, 5.6, 4.7], [4.8, 5.0, 5.4, 5.9, 5.1])
         self.assertEqual(rc, 0, out + err)
         self.assertIn("PASS (", out)
-        rc, out, err = self.run_g2([4.4, 4.9, 5.2], [7.0, 7.1, 7.2])
+        rc, out, err = self.run_g2([4.4, 4.9, 5.2], [12.0, 12.1, 12.2])
         self.assertEqual(rc, 1, out + err)
         self.assertIn("FAIL (", out)
 
