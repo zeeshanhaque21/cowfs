@@ -669,7 +669,7 @@ pub fn random_ops(seed: u64, len: usize) -> Vec<Op> {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use proptest::test_runner::{Config, TestError, TestRunner};
+    use proptest::test_runner::{Config, RngAlgorithm, TestError, TestRng, TestRunner};
 
     use super::*;
     use crate::{Fault, MemVfs};
@@ -731,33 +731,73 @@ mod tests {
         ]
     }
 
+    /// One fixed op sequence per fault, each the minimal way to show it. The oracle's answer for
+    /// each is fixed, so catching a fault does not depend on a random search. A new fault that the
+    /// search can miss gets its witness here.
+    fn witnesses() -> Vec<(Fault, Vec<Op>)> {
+        let two_files = || vec![Op::Create(vec![0], 0o644), Op::Create(vec![1], 0o644)];
+        let with = |mut v: Vec<Op>, more: Vec<Op>| {
+            v.extend(more);
+            v
+        };
+        vec![
+            (Fault::TruncateNoZeroFill, truncate_tail_witness()),
+            (
+                Fault::RenameNoReplace,
+                with(two_files(), vec![Op::Rename(vec![0], vec![1], false)]),
+            ),
+            (
+                Fault::LinkReplaces,
+                with(two_files(), vec![Op::Link(vec![0], vec![1])]),
+            ),
+            (
+                Fault::NoHardlinkNlink,
+                vec![Op::Create(vec![0], 0o644), Op::Link(vec![0], vec![1])],
+            ),
+            // Bits above `MODE_MASK` must be dropped at create.
+            (Fault::ModeNotMasked, vec![Op::Create(vec![0], 0xFFFF)]),
+            // Reads past EOF return only the bytes that exist. The tree check after `Create` already
+            // catches the padding (10 bytes, want 0); the later ops keep the shape a real read has.
+            (
+                Fault::ReadPadsEof,
+                vec![
+                    Op::Create(vec![0], 0o644),
+                    Op::Write(vec![0], 0, 100, 7),
+                    Op::Read(vec![0], 50, 1_000),
+                ],
+            ),
+        ]
+    }
+
     #[test]
     fn oracle_catches_broken_backends() {
-        // A fault that a fixed sequence witnesses must be caught by that sequence, and the same
-        // sequence must pass on a healthy backend, or catching it would prove nothing. This goes
-        // through the same `run` and the same oracle as the sweep below, with neither changed. A
-        // second fault that flakes this way gets its own witness here.
-        let witness = truncate_tail_witness();
-        run(&MemVfs::new(), &witness).expect("the witness is valid on a healthy backend");
-        assert!(
-            run(&MemVfs::with_fault(Fault::TruncateNoZeroFill), &witness).is_err(),
-            "TruncateNoZeroFill survives its own witness"
-        );
+        // Deterministic and gating: every fault has a fixed witness, and the witness must pass on
+        // a healthy backend, or catching the fault would prove nothing. This goes through the same
+        // `run` and the same oracle as the sweeps, with neither changed.
+        for (fault, witness) in witnesses() {
+            run(&MemVfs::new(), &witness)
+                .unwrap_or_else(|e| panic!("{fault:?} witness fails on a healthy backend: {e}"));
+            assert!(
+                run(&MemVfs::with_fault(fault), &witness).is_err(),
+                "{fault:?} survives its own witness"
+            );
+        }
+    }
 
-        let faults = [
-            Fault::RenameNoReplace,
-            Fault::NoHardlinkNlink,
-            Fault::LinkReplaces,
-            Fault::TruncateNoZeroFill,
-            Fault::ModeNotMasked,
-            Fault::ReadPadsEof,
-        ];
-        for fault in faults {
-            let mut runner = TestRunner::new(Config {
-                cases: 2000,
-                failure_persistence: None,
-                ..Config::default()
-            });
+    /// The random search over the same faults, with the seed pinned so the result is the same on
+    /// every run and platform. It was unseeded and flaked once on CI; a seed that stops detecting a
+    /// fault after a generator change fails here every time, and gets a new seed or witness.
+    #[test]
+    fn random_search_finds_each_fault_with_a_small_counterexample() {
+        for (fault, _) in witnesses() {
+            let mut runner = TestRunner::new_with_rng(
+                Config {
+                    cases: 2000,
+                    failure_persistence: None,
+                    ..Config::default()
+                },
+                TestRng::from_seed(RngAlgorithm::ChaCha, &[0x5a; 32]),
+            );
             let strategy = proptest::collection::vec(op(), 1..80);
             let res = runner.run(&strategy, |ops| {
                 run(&MemVfs::with_fault(fault), &ops).map_err(TestCaseError::fail)
