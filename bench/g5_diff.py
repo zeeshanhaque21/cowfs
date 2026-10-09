@@ -102,11 +102,14 @@ def parse_console(text, rc, case):
     return out
 
 
-def parse_identity(text):
+def parse_identity(text, dups=None):
+    """key=value lines, last wins; `dups` (a list) collects every key seen twice."""
     out = {}
     for ln in (text or "").splitlines():
         k, sep, v = ln.partition("=")
         if sep:
+            if dups is not None and k.strip() in out:
+                dups.append(k.strip())
             out[k.strip()] = v.strip()
     return out
 
@@ -208,14 +211,20 @@ def pair_label(n, c):
 def build_receipt(native, cowfs, control, meta, pin, mode, requested, expect_daemon_sha256=None,
                   expect_helpers=None):
     bad = []
-    expect_helpers = {k: v for k, v in (expect_helpers or {}).items() if v}
+    expect_helpers = {k: v for k, v in (expect_helpers or {}).items() if v is not None}
+    if meta.get("_dup_keys"):
+        bad.append(f"meta: duplicate keys {meta['_dup_keys']} (a later line may override a recorded one)")
+    if meta.get("tree_status_rc", "0") != "0":
+        bad.append(f"tree: git status failed (rc {meta['tree_status_rc']}), the tree state is unknown")
+    if expect_helpers and "tree_ignored" not in meta:
+        bad.append("tree: tree_ignored was not recorded, so ignored files were never checked")
     for k in ("tree_head", "check_sha256", "cowfs_profile"):
         if not meta.get(k):
             bad.append(f"meta: {k} was not recorded before the run")
     if meta.get("tree_porcelain"):
         bad.append(f"tree: not clean ({meta['tree_porcelain']!r})")
     for k, want in expect_helpers.items():
-        if meta.get(k) != want:
+        if not want or meta.get(k) != want:
             bad.append(f"tree: {k} {meta.get(k)!r} is not the expected {want}")
     if meta.get("tree_ignored") and set(expect_helpers) != {"fsstress_sha256", "fsx_sha256"}:
         ign = meta["tree_ignored"].split()
@@ -336,7 +345,10 @@ def load_arm(run, arm, ids):
 
 def load_run(run):
     run = Path(run)
-    meta = parse_identity(_read(run / "meta.txt"))
+    dups = []
+    meta = parse_identity(_read(run / "meta.txt"), dups)
+    if dups:
+        meta["_dup_keys"] = " ".join(sorted(set(dups)))
     ids = [ln.strip() for ln in _read(run / "cases.txt").splitlines() if ln.strip()]
     ctl = load_arm(run, "control", ["generic/005"])[0] if (run / "control").is_dir() else None
     return {"meta": meta, "requested": ids, "native": load_arm(run, "native", ids),
@@ -393,6 +405,9 @@ def main(argv=None):
     rp.add_argument("--json")
     rp.add_argument("--md")
     args = ap.parse_args(argv)
+    for flag in ("fsstress_sha256", "fsx_sha256", "daemon_sha256"):
+        if getattr(args, flag) == "":
+            ap.error(f"--{flag.replace('_', '-')} must not be empty")
     return report(args)
 
 

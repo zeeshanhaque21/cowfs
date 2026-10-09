@@ -492,7 +492,7 @@ class IgnoredTree(unittest.TestCase):
     def test_given_digest_missing_from_meta_is_invalid(self):
         r = self.build(meta(), {"fsx_sha256": "x" * 64})
         self.assertEqual(r["exit"], 3)
-        self.assertRegex(self.problems(r)[0], r"fsx_sha256 None is not the expected")
+        self.assertTrue(any("fsx_sha256 None is not the expected" in p for p in self.problems(r)))
 
     def test_given_digest_different_is_invalid(self):
         r = self.build(meta(**HELPERS), {"fsstress_sha256": "0" * 64})
@@ -510,41 +510,114 @@ class IgnoredTree(unittest.TestCase):
 
 class RootRecordsIgnored(unittest.TestCase):
     """Runs the shipped g5_root.sh recording lines against a tiny repo."""
+    ENV = {"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"}
 
-    def record(self, root_text):
+    def record(self, root_text=None, planted="ltp/fsx", ignore="/ltp/fsx\n", xpg=False, git="git"):
         src = Path(__file__).with_name("g5_root.sh").read_text() if root_text is None else root_text
-        st = re.search(r"^tree_status=.*$", src, re.M)
-        po = re.search(r'^  echo "tree_porcelain=.*$', src, re.M)
-        ig = re.search(r'^  echo "tree_ignored=.*$', src, re.M)
-        lines = [st.group(0) if st else 'tree_status=$(git -C "$XFS" status --porcelain)', po.group(0)]
-        if ig:
-            lines.append(ig.group(0))
+        grab = lambda pat: [m.group(0) for m in re.finditer(pat, src, re.M)]
+        lines = grab(r"^tree_rc=0$") + grab(r"^tree_status=.*$") + grab(r"^  echo\(\) \{.*$") \
+            + grab(r'^  echo "tree_(?:status_rc|porcelain|ignored)=.*$')
+        lines = [ln.replace("git -C", git + " -C") for ln in lines]
         with tempfile.TemporaryDirectory() as d:
             x = Path(d)
-            run = lambda *a: subprocess.run(["git", "-C", d, *a], check=True, capture_output=True,
-                                            env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-                                                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
-                                                 "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"})
+            gitenv = dict(self.ENV, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                          GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+            run = lambda *a: subprocess.run(["git", "-C", d, *a], check=True, capture_output=True, env=gitenv)
             run("init", "-q")
             (x / "ltp").mkdir()
-            (x / ".gitignore").write_text("/ltp/fsx\n")
+            (x / ".gitignore").write_text(ignore)
             (x / "ltp" / "fsx.c").write_text("int main;")  # tracked sibling, like upstream ltp/
             run("add", ".gitignore", "ltp/fsx.c")
             run("commit", "-q", "-m", "pin")
-            (x / "ltp" / "fsx").write_text("stale hand-built binary")
-            out = subprocess.run(["bash", "-c", "\n".join(lines)], env={"XFS": d, "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"},
+            (x / planted).write_text("stale hand-built binary")
+            script = ("shopt -s xpg_echo\n" if xpg else "") + "\n".join(lines)
+            out = subprocess.run(["bash", "-c", script], env=dict(self.ENV, XFS=d),
                                  capture_output=True, text=True, check=True).stdout
-        return parse_kv(out)
+        return out
 
     def test_planted_ignored_helper_is_recorded(self):
-        m = self.record(None)
+        m = parse_kv(self.record())
         self.assertEqual(m["tree_porcelain"], "")
         self.assertEqual(m["tree_ignored"], "ltp/fsx")
+        self.assertEqual(m["tree_status_rc"], "0")
 
     def test_the_old_recording_line_was_blind_to_it(self):
         old = 'tree_status=$(git -C "$XFS" status --porcelain)\n  echo "tree_porcelain=$tree_status"\n'
-        self.assertEqual(self.record(old).get("tree_porcelain"), "")
-        self.assertNotIn("tree_ignored", self.record(old))
+        m = parse_kv(self.record(old))
+        self.assertEqual(m.get("tree_porcelain"), "")
+        self.assertNotIn("tree_ignored", m)
+
+    def test_failed_git_status_is_recorded_not_read_as_clean(self):
+        m = parse_kv(self.record(git="false"))
+        self.assertNotEqual(m["tree_status_rc"], "0")
+
+    CRAFTED = "ltp/x\nfsx_sha256=" + "x" * 64
+
+    def inject(self, **kw):
+        return self.record(planted=self.CRAFTED, ignore="/ltp/x*\n", xpg=True, **kw)
+
+    def test_crafted_ignored_filename_cannot_inject_a_meta_line(self):
+        out = self.inject()
+        self.assertNotIn("\nfsx_sha256=", "\n" + out)
+        dups = []
+        g.parse_identity(out, dups)
+        self.assertEqual(dups, [])
+
+    def test_the_old_echo_lines_were_injectable(self):
+        # Same crafted name through plain echo with escape expansion (dash, zsh): a real line.
+        old = (Path(__file__).with_name("g5_root.sh").read_text()
+               .replace('  echo() { printf', '  : unused() { printf'))
+        out = self.inject_old(old)
+        self.assertIn("\nfsx_sha256=", "\n" + out)
+
+    def inject_old(self, old):
+        return self.record(old, planted=self.CRAFTED, ignore="/ltp/x*\n", xpg=True)
+
+
+class DuplicateMeta(unittest.TestCase):
+    def test_duplicate_key_is_invalid_and_last_wins_no_more(self):
+        dups = []
+        m = g.parse_identity("fsx_sha256=a\nfsx_sha256=b\n", dups)
+        self.assertEqual(dups, ["fsx_sha256"])
+        n, c, ctl = good_records()
+        r = g.build_receipt(n, c, ctl, meta(_dup_keys="fsx_sha256", **HELPERS), PIN, "acceptance",
+                            IDS6, "b" * 64)
+        self.assertEqual(r["exit"], 3)
+
+    def test_load_run_flags_a_duplicate(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "meta.txt").write_text("".join(f"{k}={v}\n" for k, v in meta().items())
+                                             + "tree_head=zz\n")
+            self.assertEqual(g.load_run(d)["meta"]["_dup_keys"], "tree_head")
+
+
+class FailClosed(unittest.TestCase):
+    def build(self, m, helpers=None):
+        n, c, ctl = good_records()
+        return g.build_receipt(n, c, ctl, m, PIN, "acceptance", IDS6, "b" * 64, helpers)
+
+    def test_missing_tree_ignored_with_a_helper_flag_is_invalid(self):
+        m = meta(**HELPERS)
+        self.assertEqual(self.build(m, HELPERS)["exit"], 3)
+        self.assertEqual(self.build(m, {"fsx_sha256": "x" * 64})["exit"], 3)
+
+    def test_present_empty_tree_ignored_with_flags_passes_and_old_format_without_flags_passes(self):
+        self.assertEqual(self.build(meta(tree_ignored="", **HELPERS), HELPERS)["exit"], 0)
+        self.assertEqual(self.build(meta())["exit"], 0)
+
+    def test_failed_status_is_invalid(self):
+        r = self.build(meta(tree_status_rc="128", tree_ignored=""))
+        self.assertEqual(r["exit"], 3)
+        self.assertTrue(any("git status failed" in p for p in r["problems"]))
+
+    def test_empty_flag_values_are_a_usage_error(self):
+        for flag in ("--fsx-sha256", "--fsstress-sha256", "--daemon-sha256"):
+            with self.assertRaises(SystemExit) as e, contextlib.redirect_stderr(io.StringIO()):
+                g.main(["report", "--run", "/nonexistent", flag, ""])
+            self.assertEqual(e.exception.code, 2, flag)
+
+    def test_empty_digest_in_build_receipt_is_invalid(self):
+        self.assertEqual(self.build(meta(tree_ignored=""), {"fsx_sha256": ""})["exit"], 3)
 
 
 def parse_kv(text):
