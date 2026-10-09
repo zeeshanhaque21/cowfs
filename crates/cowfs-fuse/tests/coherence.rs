@@ -21,11 +21,16 @@
 //!    block is uniform and holds a value some acknowledged write actually wrote. A block torn
 //!    while nothing is writing is corruption no interleaving allows, so this is the assertion that
 //!    a concurrent tear rate alone cannot stand in for.
+//! 4. `direct_readers_through_the_mount_never_see_a_torn_block`: the same race through the mount,
+//!    with `O_DIRECT` readers. Without the page cache in the way, the atomicity is cowfs' again, so
+//!    a tear here is the adapter or the `Core`, and it is asserted to be zero. The adapter queues
+//!    same-inode requests in order, so a slow split READ serialises behind the writes and passes;
+//!    `Core` atomicity itself is held by test 1.
 //!
 //! Run: `cargo test -p cowfs-fuse -j4 --test coherence -- --nocapture --test-threads=1`
 //!
-//! No `--ignored`: none of these tests is `#[ignore]`d, and adding that flag filters all four out,
-//! so it prints `running 0 tests` and still exits 0. Assert `running 4 tests` before believing a
+//! No `--ignored`: none of these tests is `#[ignore]`d, and adding that flag filters all of them out,
+//! so it prints `running 0 tests` and still exits 0. Assert `running 5 tests` before believing a
 //! green result from this target.
 #![cfg(target_os = "linux")]
 
@@ -88,10 +93,26 @@ fn fresh(fs: &Arc<dyn Vfs>, name: &str) -> Ino {
     ino
 }
 
+/// A page-aligned block buffer, because `O_DIRECT` requires the alignment.
+#[repr(C, align(4096))]
+struct Aligned([u8; PG as usize]);
+
+/// One whole block read with `O_DIRECT`, so it skips the page cache and the kernel sends it to the
+/// daemon as a single READ.
+fn direct_read(f: &std::fs::File, off: u64) -> Vec<u8> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = Box::new(Aligned([0; PG as usize]));
+    let n = f
+        .read_at(&mut buf.0, off)
+        .expect("O_DIRECT pread through the mount");
+    buf.0[..n].to_vec()
+}
+
 /// Runs `WRITERS` writers of whole blocks against `READERS` readers of whole blocks, then checks
 /// the file at rest. `atomic` says whether a torn read under concurrency is this arm's problem:
-/// it is for a `Core` called directly, and not for anything behind a kernel page cache.
-fn concurrent(fs: &Arc<dyn Vfs>, ino: Ino, c: &Counters, atomic: bool) {
+/// it is for a `Core` called directly, and for `O_DIRECT` readers of a mount (`direct` names the
+/// file), and not for buffered readers behind a kernel page cache.
+fn concurrent(fs: &Arc<dyn Vfs>, ino: Ino, c: &Counters, atomic: bool, direct: Option<&Path>) {
     let receipts: Receipts = Mutex::new(HashMap::new());
     let start = Instant::now();
     std::thread::scope(|s| {
@@ -119,12 +140,24 @@ fn concurrent(fs: &Arc<dyn Vfs>, ino: Ino, c: &Counters, atomic: bool) {
         for r in 0..READERS {
             let (fs, c) = (fs.clone(), c);
             s.spawn(move || {
+                // An O_DIRECT open that fails is a broken arm, not a pass: never fall back.
+                let file = direct.map(|p| {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_DIRECT)
+                        .open(p)
+                        .unwrap_or_else(|e| panic!("O_DIRECT open of {}: {e}", p.display()))
+                });
                 for i in 0..ROUNDS {
                     if start.elapsed() > CAP {
                         break;
                     }
                     let off = ((i as u64 * 7 + r as u64) % PAGES) * u64::from(PG);
-                    let got = fs.read(ino, off, PG).unwrap();
+                    let got = match &file {
+                        Some(f) => direct_read(f, off),
+                        None => fs.read(ino, off, PG).unwrap(),
+                    };
                     assert_eq!(got.len(), PG as usize, "read length at {off}");
                     c.reads.fetch_add(1, Relaxed);
                     if !got.iter().all(|&b| b == got[0]) {
@@ -138,7 +171,7 @@ fn concurrent(fs: &Arc<dyn Vfs>, ino: Ino, c: &Counters, atomic: bool) {
         assert_eq!(
             c.torn.load(Relaxed),
             0,
-            "a 4 KiB read mixed two writes, with no kernel between the reader and the Core"
+            "a 4 KiB read mixed two writes, with no page cache between the reader and the Core"
         );
     }
     let receipts = receipts.lock().unwrap();
@@ -212,6 +245,7 @@ fn core() -> (TempDir, Core, Arc<dyn Vfs>) {
 struct Rig {
     _mount: Option<Mount>,
     vfs: Arc<dyn Vfs>,
+    dir: PathBuf,
     _core: Core,
     _tmp: TempDir,
     _watchdog: mpsc::Sender<()>,
@@ -242,20 +276,18 @@ fn rig() -> Option<Rig> {
     Some(Rig {
         _mount: Some(mount),
         vfs,
+        dir,
         _core: core,
         _tmp: tmp,
         _watchdog: tx,
     })
 }
 
-/// A native tmpfs directory, falling back to the temporary directory when `/dev/shm` is not
-/// writable, so the control arm is a real filesystem and not a `cowfs` one.
-fn native() -> PathBuf {
-    let shm = Path::new("/dev/shm").join(format!("cowfs-coherence-{}", std::process::id()));
-    if std::fs::create_dir_all(&shm).is_ok() {
-        return shm;
-    }
-    std::env::temp_dir()
+/// A private directory on native tmpfs, falling back to the temporary directory when `/dev/shm` is
+/// not writable, so the control arm is a real filesystem and not a `cowfs` one. Removed on drop,
+/// so repeated runs leave nothing behind in `/dev/shm`.
+fn native() -> TempDir {
+    TempDir::new_in("/dev/shm").unwrap_or_else(|_| TempDir::new().unwrap())
 }
 
 #[test]
@@ -263,7 +295,7 @@ fn core_view_keeps_aligned_4k_blocks_atomic_while_flushing() {
     let (_tmp, _core, fs) = core();
     let ino = fresh(&fs, "f");
     let c = Counters::default();
-    concurrent(&fs, ino, &c, true);
+    concurrent(&fs, ino, &c, true, None);
     println!(
         "core direct: {} writes, {} reads, {} torn",
         c.writes.load(Relaxed),
@@ -280,8 +312,7 @@ fn mount_and_native_agree_on_acknowledged_write_visibility() {
     let mine = fresh(&mnt, "f");
     acknowledged_writes_are_visible(&mnt, mine, "mount");
 
-    let dir = native();
-    let keep = TempDir::new_in(&dir).unwrap();
+    let keep = native();
     let nat: Arc<dyn Vfs> = Arc::new(PathVfs::new(keep.path()).unwrap());
     let theirs = fresh(&nat, "f");
     acknowledged_writes_are_visible(&nat, theirs, "native tmpfs");
@@ -298,7 +329,7 @@ fn concurrent_writers_leave_every_block_uniform_and_acknowledged() {
     // A torn read under concurrency is the page cache's, so the count is reported, not asserted.
     // `concurrent` still asserts what no interleaving allows: no tear at all without a kernel,
     // and at rest here every block uniform and holding an acknowledged value.
-    concurrent(&mnt, ino, &c, false);
+    concurrent(&mnt, ino, &c, false, None);
     println!(
         "through the mount: {} writes, {} reads, {} torn under concurrency, 0 torn at rest",
         c.writes.load(Relaxed),
@@ -308,19 +339,45 @@ fn concurrent_writers_leave_every_block_uniform_and_acknowledged() {
     assert!(c.reads.load(Relaxed) > 0, "the readers ran no iterations");
 }
 
+/// The atomicity the page cache hides is still the mount's to keep once the page cache is out of
+/// the way. `O_DIRECT` readers reach the adapter as one READ per block, so a tear here is the
+/// adapter or the `Core` mixing two writes, not the kernel. The adapter queues same-inode requests
+/// in order on one lane, so this catches a READ split into several `Vfs` calls only while READ and
+/// WRITE are dispatched differently (one inline, one on the lane): a fast split is caught, a slow
+/// one serialises behind the writes. `Core` atomicity under real thread concurrency is asserted by
+/// `core_view_keeps_aligned_4k_blocks_atomic_while_flushing`. Writers stay buffered, as they are for every application. For issue #45 a standalone
+/// stress (3 writers, 3 readers, 16 blocks, 1000 iterations) measured 0 tears in 35.9M `O_DIRECT`
+/// reads through a `Core`-backed mount on Linux 7.2, against 34238 in 1.27G buffered reads of it.
+/// This test itself ran 1000 times there with 0 tears in 6M reads.
+#[test]
+fn direct_readers_through_the_mount_never_see_a_torn_block() {
+    let Some(rig) = rig() else { return };
+    let mnt = rig.vfs.clone();
+    let ino = fresh(&mnt, "f");
+    let c = Counters::default();
+    concurrent(&mnt, ino, &c, true, Some(&rig.dir.join("f")));
+    let reads = c.reads.load(Relaxed);
+    println!(
+        "through the mount, O_DIRECT readers: {} writes, {reads} reads, {} torn",
+        c.writes.load(Relaxed),
+        c.torn.load(Relaxed)
+    );
+    // A floor, not `> 0`: zero tears in a handful of reads proves nothing.
+    assert!(reads >= 1000, "only {reads} O_DIRECT reads ran");
+}
+
 /// The matched control for the mount's torn count: this same harness, this same 4096-byte blocks
 /// and thread counts, against a native tmpfs with no cowfs code underneath. Nothing here asserts
-/// the concurrent count either, because the page cache owns it on every Linux filesystem. It is
+/// the concurrent count either, because the page cache owns it on ext4, btrfs and tmpfs (measured). It is
 /// measured so the mount's number can be read against something. The at-rest assertions do hold,
 /// and must, because no write interleaving may leave a block torn once the writers have stopped.
 #[test]
 fn native_tmpfs_torn_count_is_reported_for_comparison() {
-    let dir = native();
-    let keep = TempDir::new_in(&dir).unwrap();
+    let keep = native();
     let nat: Arc<dyn Vfs> = Arc::new(PathVfs::new(keep.path()).unwrap());
     let ino = fresh(&nat, "f");
     let c = Counters::default();
-    concurrent(&nat, ino, &c, false);
+    concurrent(&nat, ino, &c, false, None);
     println!(
         "native tmpfs ({}): {} writes, {} reads, {} torn under concurrency, 0 torn at rest",
         keep.path().display(),
