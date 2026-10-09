@@ -12,11 +12,17 @@ use std::sync::Arc;
 use cowfs_vfs::{FileKind, Vfs, ROOT_INO};
 use cowfs_vfs_path::PathVfs;
 
-/// A helper thread keeps renaming decoy fifos (mode 0o644, each also linked from a side directory)
+/// A helper thread keeps renaming decoy sockets (mode 0o644, each also linked from a side directory)
 /// over the name `mknod` creates. Before the fix, the chmod that followed `mknodat` went by name
 /// and could land on a decoy; afterwards every decoy must still have its own mode.
 #[test]
 fn mknod_mode_never_lands_on_a_node_swapped_in() {
+    if !cowfs_vfs_path::mknod_mode_is_atomic() {
+        eprintln!(
+            "SKIP: unshare(CLONE_FS) is refused here, so mknod falls back to a chmod by name"
+        );
+        return;
+    }
     let root = std::env::temp_dir().join(format!("cowfs-mknod-race-{}", std::process::id()));
     let (dir, side) = (root.join("fs"), root.join("side"));
     std::fs::create_dir_all(&dir).unwrap();

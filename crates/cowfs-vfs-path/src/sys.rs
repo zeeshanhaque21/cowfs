@@ -233,6 +233,17 @@ pub fn mknodat(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
     Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
+/// Whether a thread may detach its own umask (`unshare(CLONE_FS)`), which `mknodat_exact` needs.
+#[cfg(target_os = "linux")]
+pub fn private_umask_available() -> bool {
+    std::thread::spawn(|| {
+        // SAFETY: as in `mknodat_exact`; this short-lived thread does nothing else.
+        unsafe { libc::unshare(libc::CLONE_FS) == 0 }
+    })
+    .join()
+    .unwrap_or(false)
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn mknodat_exact(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<bool> {
     Err(io::Error::from_raw_os_error(libc::ENOTSUP))

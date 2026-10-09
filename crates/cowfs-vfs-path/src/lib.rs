@@ -682,6 +682,15 @@ pub fn host_can_make_devices(dir: &Path) -> io::Result<bool> {
     }
 }
 
+/// Whether `mknod` sets the mode as it creates the node (Linux, when a thread may detach its own
+/// umask with `unshare(CLONE_FS)`). When false it falls back to `mknodat` then a chmod by name,
+/// which a node renamed over the name in between receives. A seccomp filter that refuses
+/// `unshare`, as Docker's default profile does without `CAP_SYS_ADMIN`, makes it false.
+#[cfg(target_os = "linux")]
+pub fn mknod_mode_is_atomic() -> bool {
+    sys::private_umask_available()
+}
+
 /// Removes a directory tree even when it holds entries whose mode forbids it.
 pub fn force_remove_dir_all(path: &Path) {
     fn open_up(p: &Path) {
