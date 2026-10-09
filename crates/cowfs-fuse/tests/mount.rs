@@ -28,6 +28,73 @@ fn is_root() -> bool {
     fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
 }
 
+/// Special files through the kernel (issue #107): mkfifo and a socket node are created by the
+/// kernel's `mknod`, reported with the right type, mode and `nlink`, listed, and removed; a device
+/// needs root and keeps its device number.
+#[test]
+#[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
+fn special_files_through_mknod() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
+    let Some(fx) = Fixture::new("") else { return };
+    // The tools make the same `mknod(2)` calls the tests would; the workspace denies `unsafe`.
+    let tool = |args: &[&str]| {
+        Command::new(args[0])
+            .args(&args[1..])
+            .status()
+            .map(|s| s.success())
+            .unwrap()
+    };
+    let p = |n: &str| fx.p(n).to_str().unwrap().to_string();
+
+    assert!(tool(&["mkfifo", "-m", "640", &p("fifo")]));
+    let m = fs::symlink_metadata(fx.p("fifo")).unwrap();
+    assert!(m.file_type().is_fifo(), "{:?}", m.file_type());
+    assert_eq!((m.mode() & 0o7777, m.nlink(), m.len()), (0o640, 1, 0));
+
+    // bind(2) of a unix socket reaches the daemon as mknod(S_IFSOCK)
+    let _sock = UnixListener::bind(fx.p("sock")).unwrap();
+    assert!(fs::symlink_metadata(fx.p("sock"))
+        .unwrap()
+        .file_type()
+        .is_socket());
+
+    assert!(!tool(&["mkfifo", &p("fifo")]), "a second mkfifo is EEXIST");
+
+    let mut names: Vec<_> = fs::read_dir(fx.p(""))
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().into_string().unwrap(),
+                e.file_type().unwrap().is_fifo(),
+            )
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![("fifo".to_string(), true), ("sock".to_string(), false)]
+    );
+
+    let made = tool(&["mknod", &p("chr"), "c", "1", "3"]);
+    if is_root() {
+        assert!(made, "root can make a device node");
+        let m = fs::symlink_metadata(fx.p("chr")).unwrap();
+        assert!(m.file_type().is_char_device());
+        // 0x103 is Linux makedev(1, 3)
+        assert_eq!(m.rdev(), 0x103, "device number round trip");
+        fs::remove_file(fx.p("chr")).unwrap();
+    } else {
+        assert!(!made, "a device node needs root (EPERM)");
+        assert!(!fx.p("chr").exists());
+    }
+
+    fs::remove_file(fx.p("fifo")).unwrap();
+    fs::remove_file(fx.p("sock")).unwrap();
+    assert_eq!(fs::read_dir(fx.p("")).unwrap().count(), 0);
+}
+
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
 fn std_fs_round_trip() {
@@ -241,10 +308,6 @@ fn fallocate_modes_through_a_mount() {
 fn unsupported_operations_report_enotsup() {
     let Some(fx) = Fixture::new("") else { return };
     fs::write(fx.p("a"), b"copy me").unwrap();
-    let out = Command::new("mkfifo").arg(fx.p("fifo")).output().unwrap();
-    assert!(
-        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("not supported")
-    );
     // collapse and insert range are not supported; the other modes are (see the next test)
     let f = OpenOptions::new().write(true).open(fx.p("a")).unwrap();
     assert_eq!(falloc(&f, 0x08, 0, 4096), libc::EOPNOTSUPP);

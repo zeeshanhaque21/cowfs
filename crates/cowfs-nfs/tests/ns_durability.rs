@@ -129,6 +129,9 @@ impl Vfs for Watched {
     fn mkdir(&self, p: u64, n: &[u8], m: u32) -> Result<Attr> {
         self.inner.mkdir(p, n, m)
     }
+    fn mknod(&self, p: u64, n: &[u8], k: cowfs_vfs::FileKind, m: u32, r: u64) -> Result<Attr> {
+        self.inner.mknod(p, n, k, m, r)
+    }
     fn symlink(&self, p: u64, n: &[u8], t: &[u8]) -> Result<Attr> {
         self.inner.symlink(p, n, t)
     }

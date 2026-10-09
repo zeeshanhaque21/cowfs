@@ -198,6 +198,10 @@ fn file_type(ino: Ino, kind: FileKind) -> R<FileType> {
         FileKind::Regular => FileType::RegularFile,
         FileKind::Directory => FileType::Directory,
         FileKind::Symlink => FileType::Symlink,
+        FileKind::Fifo => FileType::NamedPipe,
+        FileKind::Socket => FileType::Socket,
+        FileKind::CharDevice => FileType::CharDevice,
+        FileKind::BlockDevice => FileType::BlockDevice,
         _ => {
             log::error!("the Vfs reported a file kind this adapter does not know for inode {ino}");
             return Err(libc::EIO);
@@ -220,7 +224,7 @@ fn file_attr(a: &Attr, uid: u32, gid: u32) -> R<FileAttr> {
         nlink: a.nlink,
         uid,
         gid,
-        rdev: 0,
+        rdev: convert::rdev_to_kernel(a.rdev),
         blksize: BLKSIZE,
         flags: 0,
     })
@@ -613,21 +617,34 @@ impl Filesystem for Fs {
 
     fn mknod(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         n: &OsStr,
         mode: u32,
         _umask: u32,
-        _rdev: u32,
+        rdev: u32,
         reply: ReplyEntry,
     ) {
-        if !convert::mknod_is_regular(mode) {
-            return reply.error(libc::ENOTSUP);
+        let special = match convert::mknod_kind(mode) {
+            Ok(k) => k,
+            Err(e) => return reply.error(e),
+        };
+        // The kernel already demands CAP_MKNOD for a device; this is the second line.
+        if special.is_some_and(FileKind::is_device) && req.uid() != 0 {
+            return reply.error(libc::EPERM);
         }
+        let rdev = if special.is_some_and(FileKind::is_device) {
+            convert::rdev_from_kernel(rdev)
+        } else {
+            0
+        };
         let n = n.to_owned();
         self.lane(Class::Meta, parent, move |c| {
             let r = name(&n).and_then(|nm| {
-                let a = c.call(|v| v.create(parent, nm, mode & MODE_MASK))?;
+                let a = match special {
+                    Some(kind) => c.call(|v| v.mknod(parent, nm, kind, mode & MODE_MASK, rdev))?,
+                    None => c.call(|v| v.create(parent, nm, mode & MODE_MASK))?,
+                };
                 c.referenced(parent, nm, &a, true)
             });
             match r {

@@ -2,11 +2,17 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cowfs_vfs::FallocMode;
-use cowfs_vfs::{Attr, FileKind, RenameFlags, Timestamp, XattrFlags, MODE_MASK};
+use cowfs_vfs::{
+    dev_major, dev_minor, makedev, Attr, FallocMode, FileKind, RenameFlags, Timestamp, XattrFlags,
+    MODE_MASK,
+};
 
 const S_IFMT: u32 = 0o170_000;
 const S_IFREG: u32 = 0o100_000;
+const S_IFIFO: u32 = 0o010_000;
+const S_IFCHR: u32 = 0o020_000;
+const S_IFBLK: u32 = 0o060_000;
+const S_IFSOCK: u32 = 0o140_000;
 const RENAME_NOREPLACE: u32 = 1;
 const RENAME_EXCHANGE: u32 = 2;
 const XATTR_CREATE: i32 = 1;
@@ -48,9 +54,33 @@ pub fn from_system_time(t: SystemTime) -> Timestamp {
     }
 }
 
-/// True when the `mknod` mode asks for a regular file (the only type cowfs supports).
-pub fn mknod_is_regular(mode: u32) -> bool {
-    matches!(mode & S_IFMT, 0 | S_IFREG)
+/// What a `mknod` mode asks for: `Ok(None)` is a regular file (type bits 0 or `S_IFREG`),
+/// `Ok(Some(kind))` a fifo, socket or device, and any other type (a directory, a symlink) is
+/// `EINVAL`, as on Linux.
+pub fn mknod_kind(mode: u32) -> Result<Option<FileKind>, i32> {
+    match mode & S_IFMT {
+        0 | S_IFREG => Ok(None),
+        S_IFIFO => Ok(Some(FileKind::Fifo)),
+        S_IFSOCK => Ok(Some(FileKind::Socket)),
+        S_IFCHR => Ok(Some(FileKind::CharDevice)),
+        S_IFBLK => Ok(Some(FileKind::BlockDevice)),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+/// The cowfs device number of the kernel's `rdev` in the Linux "new" `dev_t` encoding
+/// (12 bit major, 20 bit minor), which is what FUSE carries on every platform it runs on.
+pub fn rdev_from_kernel(rdev: u32) -> u64 {
+    let major = (rdev & 0xfff00) >> 8;
+    let minor = (rdev & 0xff) | ((rdev >> 12) & 0xfff00);
+    makedev(major, minor)
+}
+
+/// The kernel `rdev` for a cowfs device number. A device made by another client with a major
+/// above 12 bits or a minor above 20 bits has no such encoding; its high bits are dropped.
+pub fn rdev_to_kernel(rdev: u64) -> u32 {
+    let (major, minor) = (dev_major(rdev), dev_minor(rdev));
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & 0xfff00) << 12)
 }
 
 /// Maps `renameat2` flags. `RENAME_EXCHANGE` and unknown flags are refused with an errno.
@@ -277,14 +307,36 @@ mod tests {
     }
 
     #[test]
-    fn mknod_accepts_only_regular_files() {
-        assert!(mknod_is_regular(0o100_644));
-        assert!(mknod_is_regular(0o644));
-        for kind in [
-            0o010_000, 0o020_000, 0o060_000, 0o140_000, 0o040_000, 0o120_000,
-        ] {
-            assert!(!mknod_is_regular(kind | 0o644), "{kind:o}");
+    fn mknod_kind_maps_every_type() {
+        assert_eq!(mknod_kind(0o100_644), Ok(None));
+        assert_eq!(mknod_kind(0o644), Ok(None));
+        assert_eq!(mknod_kind(0o010_644), Ok(Some(FileKind::Fifo)));
+        assert_eq!(mknod_kind(0o140_644), Ok(Some(FileKind::Socket)));
+        assert_eq!(mknod_kind(0o020_644), Ok(Some(FileKind::CharDevice)));
+        assert_eq!(mknod_kind(0o060_644), Ok(Some(FileKind::BlockDevice)));
+        for kind in [0o040_000, 0o120_000] {
+            assert_eq!(mknod_kind(kind | 0o644), Err(libc::EINVAL), "{kind:o}");
         }
+    }
+
+    #[test]
+    fn kernel_rdev_round_trips_and_matches_linux_makedev() {
+        // glibc makedev(8, 16) = 0x810, makedev(259, 70000) puts the high minor bits above bit 31
+        assert_eq!(rdev_from_kernel(0x810), makedev(8, 16));
+        assert_eq!(rdev_to_kernel(makedev(8, 16)), 0x810);
+        for (major, minor) in [(0, 0), (1, 3), (4095, 1_048_575), (259, 70_000), (8, 255)] {
+            let k = rdev_to_kernel(makedev(major, minor));
+            assert_eq!(
+                rdev_from_kernel(k),
+                makedev(major, minor),
+                "{major}:{minor}"
+            );
+        }
+        // a number from a client with wider fields loses the bits Linux cannot carry
+        assert_eq!(
+            rdev_from_kernel(rdev_to_kernel(makedev(5000, 3))),
+            makedev(5000 & 0xfff, 3)
+        );
     }
 
     #[test]

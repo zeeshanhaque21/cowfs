@@ -118,7 +118,8 @@ impl Default for MountOptions {
 
 impl MountOptions {
     /// The `-o` string for `mount_nfs`. `locallocks` is required: without it flock and fcntl
-    /// fail and rustc incremental compilation aborts.
+    /// fail and rustc incremental compilation aborts. `nodev,nosuid` keep a stored device node or
+    /// setuid bit from being honoured on the client when the daemon runs as root.
     pub fn nfs_option_string(&self, port: u16) -> String {
         let retry = if self.soft {
             format!("soft,timeo={},retrans={}", self.timeo, self.retrans)
@@ -126,7 +127,7 @@ impl MountOptions {
             "hard".to_string()
         };
         format!(
-            "locallocks,vers=3,tcp,rsize={},wsize={},actimeo={},{},port={port},mountport={port}",
+            "locallocks,nodev,nosuid,vers=3,tcp,rsize={},wsize={},actimeo={},{},port={port},mountport={port}",
             self.rsize, self.wsize, self.actimeo, retry
         )
     }
@@ -435,7 +436,7 @@ mod tests {
         let s = MountOptions::default().nfs_option_string(4711);
         assert_eq!(
             s,
-            "locallocks,vers=3,tcp,rsize=131072,wsize=131072,actimeo=120,hard,port=4711,mountport=4711"
+            "locallocks,nodev,nosuid,vers=3,tcp,rsize=131072,wsize=131072,actimeo=120,hard,port=4711,mountport=4711"
         );
         let soft = MountOptions {
             soft: true,
@@ -452,7 +453,7 @@ mod tests {
             ..MountOptions::default()
         };
         let s = custom.nfs_option_string(1);
-        assert!(s.starts_with("locallocks,vers=3,tcp,"));
+        assert!(s.starts_with("locallocks,nodev,nosuid,vers=3,tcp,"));
         assert!(
             s.contains("rsize=1048576,wsize=65536,actimeo=0,hard,port=1,mountport=1"),
             "{s}"

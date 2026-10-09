@@ -115,6 +115,10 @@ impl Vfs for CountingVfs {
         self.named(n);
         self.inner.mkdir(p, n, m).map(|a| self.got(a))
     }
+    fn mknod(&self, p: Ino, n: &[u8], k: cowfs_vfs::FileKind, m: u32, r: u64) -> Result<Attr> {
+        self.named(n);
+        self.inner.mknod(p, n, k, m, r).map(|a| self.got(a))
+    }
     fn symlink(&self, p: Ino, n: &[u8], t: &[u8]) -> Result<Attr> {
         self.named(n);
         self.inner.symlink(p, n, t).map(|a| self.got(a))

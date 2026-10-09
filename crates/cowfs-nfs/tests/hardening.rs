@@ -406,6 +406,17 @@ fn every_non_idempotent_procedure_replays() {
     );
     twice(&mut c, &mut |c| c.mkdir(&root, "d").0, "MKDIR");
     twice(&mut c, &mut |c| c.symlink(&root, "l", "t").0, "SYMLINK");
+    twice(
+        &mut c,
+        &mut |c| {
+            let a = Args::new()
+                .put(&dirop(&root, "p"))
+                .put(&(nfsserve::nfs::ftype3::NF3FIFO as u32))
+                .put(&sattr_mode(0o600));
+            c.call(11, a).0
+        },
+        "MKNOD",
+    );
     let f = c.must_lookup(&root, "f");
     twice(&mut c, &mut |c| c.link(&f, &root, "h").0, "LINK");
     twice(&mut c, &mut |c| c.rename(&root, "f", &root, "f2"), "RENAME");

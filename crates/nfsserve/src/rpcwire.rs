@@ -26,7 +26,7 @@ const NFS_METADATA_PROGRAM: u32 = 200024;
 
 /// Procedures whose second execution would give a different answer: SETATTR, CREATE, MKDIR,
 /// SYMLINK, REMOVE, RMDIR, RENAME, LINK. Their replies are cached for retransmissions.
-const NON_IDEMPOTENT: [u32; 8] = [2, 8, 9, 10, 12, 13, 14, 15];
+const NON_IDEMPOTENT: [u32; 9] = [2, 8, 9, 10, 11, 12, 13, 14, 15];
 
 async fn handle_rpc(
     input: &mut impl Read,
