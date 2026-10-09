@@ -197,11 +197,13 @@ fn request_for(command: &Command) -> Result<Option<Request>, String> {
                     repo,
                     git_ref,
                     name,
+                    replace,
                 },
         } => Request::BaseRefresh(BaseRefreshParams {
             repo: utf8_path(repo)?,
             git_ref: git_ref.clone(),
             name: name.clone(),
+            replace: *replace,
         }),
         Command::Ps { snapshot } => Request::Ps(PsParams {
             snapshot: snapshot.clone(),

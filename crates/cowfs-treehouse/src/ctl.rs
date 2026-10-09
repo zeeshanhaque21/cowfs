@@ -211,6 +211,7 @@ impl Daemon {
             repo: crate::naming::canonical(repo).display().to_string(),
             git_ref: git_ref.to_owned(),
             name: name.map(str::to_owned),
+            replace: false,
         };
         self.take(Request::BaseRefresh(params), "base_refresh", |r| match r {
             Response::BaseRefresh(b) => Some(b),

@@ -157,5 +157,8 @@ pub enum BaseCommand {
         /// Base snapshot name (default: derived from the repository)
         #[arg(long)]
         name: Option<String>,
+        /// Replace an existing snapshot of that name that has no base record
+        #[arg(long)]
+        replace: bool,
     },
 }

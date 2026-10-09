@@ -16,6 +16,16 @@ use unicode_normalization::UnicodeNormalization;
 /// Longest snapshot name in bytes.
 pub const NAME_MAX: usize = 255;
 
+/// Longest name a base can have, in bytes.
+///
+/// A base is published and refreshed through names derived from it that live in a filesystem
+/// directory, so each must itself fit in [`NAME_MAX`]: the Core's `swap-<name>.tmp` intent file
+/// (9 extra bytes), the path backend's `.cowfs-import-<name>` staging directory (14) and its
+/// `<name>.cowfs-swap0` staging name (12).
+/// The longest is 14, so a base name leaves that much headroom and a name that passes here cannot
+/// be published and then fail to refresh or promote.
+pub const BASE_NAME_MAX: usize = NAME_MAX - 15;
+
 /// Reserved in a snapshot name, because it is the marker of a staged swap
 /// (`<target>.cowfs-swap<N>`), and a caller must not be able to create or move a snapshot into it.
 pub const RESERVED: &str = ".cowfs-swap";
@@ -27,6 +37,8 @@ pub enum NameError {
     Empty,
     /// Longer than [`NAME_MAX`] bytes.
     TooLong,
+    /// A base name longer than [`BASE_NAME_MAX`] bytes.
+    BaseTooLong,
     /// Starts with a dot.
     LeadingDot,
     /// Contains [`RESERVED`].
@@ -45,6 +57,7 @@ impl NameError {
         match self {
             Self::Empty => "empty",
             Self::TooLong => "longer than 255 bytes",
+            Self::BaseTooLong => "a base name is at most 240 bytes",
             Self::LeadingDot => "must not start with a dot",
             Self::Reserved => "is reserved for an interrupted snapshot swap",
             Self::Slash => "must not contain a slash",
@@ -82,6 +95,15 @@ pub fn validate_snapshot_name(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
+/// [`validate_snapshot_name`], and short enough to be a base: see [`BASE_NAME_MAX`].
+pub fn validate_base_name(name: &str) -> Result<(), NameError> {
+    validate_snapshot_name(name)?;
+    if name.len() > BASE_NAME_MAX {
+        return Err(NameError::BaseTooLong);
+    }
+    Ok(())
+}
+
 /// [`validate_snapshot_name`] for bytes that came off a wire or a path.
 pub fn validate_snapshot_name_bytes(name: &[u8]) -> Result<(), NameError> {
     let s = std::str::from_utf8(name).map_err(|_| NameError::NotUtf8)?;
@@ -112,6 +134,21 @@ pub fn name_key(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_base_name_leaves_room_for_the_names_derived_from_it() {
+        assert!(validate_base_name(&"x".repeat(BASE_NAME_MAX)).is_ok());
+        assert_eq!(
+            validate_base_name(&"x".repeat(BASE_NAME_MAX + 1)),
+            Err(NameError::BaseTooLong)
+        );
+        // still a snapshot name first
+        assert_eq!(validate_base_name(".x"), Err(NameError::LeadingDot));
+        // the longest derived name still fits a directory entry
+        assert!("swap-".len() + BASE_NAME_MAX + ".tmp".len() <= NAME_MAX);
+        assert!(".cowfs-import-".len() + BASE_NAME_MAX <= NAME_MAX);
+        assert!(BASE_NAME_MAX + ".cowfs-swap0".len() <= NAME_MAX);
+    }
 
     #[test]
     fn names() {

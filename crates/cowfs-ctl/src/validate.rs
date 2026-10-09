@@ -2,6 +2,8 @@ use crate::error::{CtlError, CtlResult};
 
 /// Longest snapshot name in bytes.
 pub const MAX_NAME_BYTES: usize = cowfs_snapname::NAME_MAX;
+/// Longest base name in bytes.
+pub const BASE_NAME_MAX: usize = cowfs_snapname::BASE_NAME_MAX;
 /// Longest path in bytes.
 pub const MAX_PATH_BYTES: usize = 4096;
 /// Longest git ref in bytes.
@@ -29,6 +31,14 @@ pub fn escape_control(s: &str) -> String {
 pub fn validate_snapshot_name(name: &str) -> CtlResult<()> {
     cowfs_snapname::validate_snapshot_name(name)
         .map_err(|e| CtlError::invalid(format!("invalid snapshot name {name:?}: {}", e.why())))
+}
+
+/// [`validate_snapshot_name`], and short enough to be a base (`cowfs_snapname::BASE_NAME_MAX`).
+/// Applied where a base is published, so a name that cannot be refreshed or promoted is refused
+/// at the first call instead of being published and then stuck.
+pub fn validate_base_name(name: &str) -> CtlResult<()> {
+    cowfs_snapname::validate_base_name(name)
+        .map_err(|e| CtlError::invalid(format!("invalid base name {name:?}: {}", e.why())))
 }
 
 /// A directory named relative to the daemon's mount, which is what `ps` accepts for a treehouse
