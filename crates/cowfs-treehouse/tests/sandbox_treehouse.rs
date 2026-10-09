@@ -558,6 +558,7 @@ fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    let marker = s.root().join("built-at.txt");
     let common_args = [
         "--socket",
         &sock.display().to_string(),
@@ -578,14 +579,21 @@ fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
         "--root".into(),
         s.pool().display().to_string(),
         "--build".into(),
-        "echo built > built.txt && pwd > built-at.txt".to_string(),
+        // The marker is written outside the slot: the flow returns the slot after the build, and
+        // treehouse cleans a returned slot, so a file left inside it does not survive to be read.
+        format!("pwd -P > '{}'", marker.display()),
     ]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let v = json(&refs);
     assert_eq!(v["built_in_slot"], true, "{v}");
     let slot = v["slot"].as_str().expect("slot");
-    assert!(
-        PathBuf::from(slot).join("built-at.txt").is_file(),
+    assert_eq!(
+        PathBuf::from(
+            std::fs::read_to_string(&marker)
+                .expect("the build wrote its marker")
+                .trim()
+        ),
+        std::fs::canonicalize(slot).expect("the slot path resolves"),
         "the build really ran in the slot"
     );
     let snapshot = v["snapshot"].as_str().expect("snapshot");
@@ -594,10 +602,15 @@ fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
 
     // The slot the build ran in was returned by the flow, so the pool is clean again.
     let status = s.treehouse_ok(&["status", "--json"]);
-    assert!(
-        !status.contains(slot),
-        "the build slot was returned: {status}"
-    );
+    // A returned slot stays in the pool as `available`; what must not remain is the lease.
+    let entries: serde_json::Value = serde_json::from_str(&status).expect("status --json");
+    let leased: Vec<&serde_json::Value> = entries
+        .as_array()
+        .expect("status --json is an array")
+        .iter()
+        .filter(|e| e["status"] == "leased")
+        .collect();
+    assert!(leased.is_empty(), "the build slot was returned: {status}");
 
     // A second refresh reports the previous commit.
     let mut args: Vec<String> = common_args.iter().map(|a| (*a).to_owned()).collect();

@@ -604,12 +604,13 @@ fn the_sandbox_shim_refuses_a_call_that_would_leave() {
     let s = Sandbox::new();
     let shim = s.shim();
     let call = |args: &[&str]| -> std::process::Output {
-        Command::new(&shim)
-            .args(args)
-            .current_dir(s.repo())
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("the shim runs")
+        common::output_retrying_etxtbsy(
+            Command::new(&shim)
+                .args(args)
+                .current_dir(s.repo())
+                .stdin(std::process::Stdio::null()),
+        )
+        .expect("the shim runs")
     };
     let sh_out = call(&[
         "status",

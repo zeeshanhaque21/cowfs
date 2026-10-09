@@ -61,6 +61,8 @@ pub enum TreehouseMissing {
     NotFound,
     /// Something is there but does not answer `--version`.
     Unusable(String),
+    /// Older than [`MIN_TREEHOUSE`], which first had `get --lease --json`.
+    TooOld(String),
 }
 
 impl std::fmt::Display for TreehouseMissing {
@@ -73,8 +75,21 @@ impl std::fmt::Display for TreehouseMissing {
             TreehouseMissing::Unusable(why) => {
                 write!(f, "treehouse is present but unusable: {why}")
             }
+            TreehouseMissing::TooOld(why) => f.write_str(why),
         }
     }
+}
+
+/// The oldest treehouse these tests can drive: 3.1.0 is the first with `get --lease --json`. An
+/// older binary fails 13 of the 15 sandbox tests with "unknown flag: --json".
+pub const MIN_TREEHOUSE: (u32, u32, u32) = (3, 1, 0);
+
+/// `major.minor.patch` out of `treehouse --version` output such as `v3.1.2`.
+pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    let core = text.trim().trim_start_matches('v');
+    let core = core.split(['-', '+', ' ']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
 }
 
 /// The real treehouse binary: `COWFS_TREEHOUSE_BIN`, then PATH, then `$HOME/.local/bin`.
@@ -102,21 +117,29 @@ pub fn find_treehouse() -> Result<PathBuf, TreehouseMissing> {
         if !candidate.is_file() {
             continue;
         }
-        let ok = Command::new(candidate)
+        let out = Command::new(candidate)
             .arg("--version")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if ok {
-            return Ok(candidate.clone());
-        }
-        // Present but cannot answer: keep looking, and report it if nothing better turns up.
-        return Err(TreehouseMissing::Unusable(format!(
-            "{} does not answer --version",
-            candidate.display()
-        )));
+            .output();
+        let Some(out) = out.ok().filter(|o| o.status.success()) else {
+            return Err(TreehouseMissing::Unusable(format!(
+                "{} does not answer --version",
+                candidate.display()
+            )));
+        };
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        return match parse_version(&text) {
+            Some(v) if v >= MIN_TREEHOUSE => Ok(candidate.clone()),
+            Some(_) | None => Err(TreehouseMissing::TooOld(format!(
+                "treehouse {text:?} at {} is older than {}.{}.{} (or its version is unreadable); \
+                 `get --lease --json` needs 3.1.0 or newer",
+                candidate.display(),
+                MIN_TREEHOUSE.0,
+                MIN_TREEHOUSE.1,
+                MIN_TREEHOUSE.2
+            ))),
+        };
     }
     Err(TreehouseMissing::NotFound)
 }
@@ -131,19 +154,54 @@ pub fn treehouse_available() -> bool {
     find_treehouse().is_ok()
 }
 
-/// Skips the current test with a visible reason, so an absent treehouse never looks like a pass.
+/// True when an absent treehouse must fail the test instead of skipping it: `CI` is set (every CI
+/// provider sets it) or `COWFS_REQUIRE_TREEHOUSE` is set to anything but empty or `0`.
+///
+/// libtest reports a test that printed "skipping" and returned as `ok`, so on a runner that never
+/// installed treehouse the whole sandbox family was a silent pass (issue 259). ci.yml installs a
+/// pinned treehouse, so on CI an absent one is a broken runner, never a host limitation.
+pub fn treehouse_required() -> bool {
+    let set = |name: &str, unset: &[&str]| {
+        std::env::var(name).is_ok_and(|v| !v.is_empty() && !unset.contains(&v.as_str()))
+    };
+    set("CI", &[]) || set("COWFS_REQUIRE_TREEHOUSE", &["0"])
+}
+
+/// The treehouse binary, `None` (skip) when it is absent and not required, and a panic when it is
+/// absent and `required`.
+pub fn treehouse_or_skip(
+    required: bool,
+    found: Result<PathBuf, TreehouseMissing>,
+) -> Option<PathBuf> {
+    match found {
+        Ok(bin) => Some(bin),
+        Err(why) if required => panic!(
+            "treehouse is required here (CI or COWFS_REQUIRE_TREEHOUSE is set) and is missing: \
+             {why}. A skip would report this test as passed (issue 259); install treehouse \
+             (scripts/install-treehouse.sh) or fix PATH."
+        ),
+        Err(why) => {
+            eprintln!(
+                "skipping {}: {why}",
+                std::thread::current().name().unwrap_or("?")
+            );
+            None
+        }
+    }
+}
+
+/// Skips the current test with a visible reason when treehouse is absent and optional, and fails it
+/// when `CI` or `COWFS_REQUIRE_TREEHOUSE` says treehouse is required, so a missing binary can never
+/// look like a pass on a runner.
 #[macro_export]
 macro_rules! require_treehouse {
     () => {
-        match $crate::common::treehouse_bin() {
-            Ok(bin) => bin,
-            Err(why) => {
-                eprintln!(
-                    "skipping {}: {why}",
-                    std::thread::current().name().unwrap_or("?")
-                );
-                return;
-            }
+        match $crate::common::treehouse_or_skip(
+            $crate::common::treehouse_required(),
+            $crate::common::treehouse_bin(),
+        ) {
+            Some(bin) => bin,
+            None => return,
         }
     };
 }
@@ -265,16 +323,17 @@ exec '{real}' "$@"
 
     /// Runs treehouse against this sandbox through the shim, and guards the output.
     pub fn treehouse_at(&self, root: &Path, args: &[&str]) -> Output {
-        let out = Command::new(self.shim())
-            .args(args)
-            .arg("--root")
-            .arg(root)
-            .env_remove("TREEHOUSE_ROOT")
-            .env_remove("TREEHOUSE_LEASE_HOLDER")
-            .current_dir(self.repo())
-            .stdin(Stdio::null())
-            .output()
-            .unwrap_or_else(|e| panic!("cannot run treehouse: {e}"));
+        let out = output_retrying_etxtbsy(
+            Command::new(self.shim())
+                .args(args)
+                .arg("--root")
+                .arg(root)
+                .env_remove("TREEHOUSE_ROOT")
+                .env_remove("TREEHOUSE_LEASE_HOLDER")
+                .current_dir(self.repo())
+                .stdin(Stdio::null()),
+        )
+        .unwrap_or_else(|e| panic!("cannot run treehouse: {e}"));
         assert_sandboxed(args, &out);
         out
     }
@@ -298,6 +357,24 @@ exec '{real}' "$@"
     /// Every slot directory in the pool, `{pool}/.treehouse/{pool}/{slot}`.
     pub fn slots(&self) -> Vec<PathBuf> {
         cowfs_treehouse::pool_slots(&self.pool())
+    }
+}
+
+/// Runs a command that executes a script this process just wrote, retrying on ETXTBSY.
+///
+/// A sibling test thread that forks while the script is still open for writing holds a write
+/// descriptor until its own exec, and Linux refuses to execute the file meanwhile. The script is
+/// complete; only the spawn is retried (a flake seen on the cachyos box, issue 259).
+pub fn output_retrying_etxtbsy(cmd: &mut Command) -> std::io::Result<Output> {
+    let mut attempt = 0;
+    loop {
+        match cmd.output() {
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 20 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            other => return other,
+        }
     }
 }
 
