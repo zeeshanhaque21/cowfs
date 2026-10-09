@@ -328,10 +328,10 @@ The import test that expects a fifo to be refused (`crates/cowfs-core/tests/impo
 
 ## Known limits
 
-- macOS NFS client: `open(2)` of a fifo on the mount fails with `EACCES` (issue #204, kept open as a labelled limit).
+- macOS NFS client: `open(2)` of a fifo on the mount fails with `EACCES` (issue #204, kept open as a known limit).
   Cause: the client's `nfs_vnop_open` returns `EACCES` for any vnode that is not a regular file, directory or symlink, so the server sees no RPC.
   No server change and no mount option helps.
-  `mkfifo`, `stat`, `rename` and `unlink` of a fifo work.
+  `mkfifo` and `stat` of a fifo work; rename and unlink were not exercised.
   pjdfstest `open/17.t` #2 (expects `ENXIO`, macOS NFS gives `EACCES`) is this limit.
   Evidence: `docs/verification/evidence/nfs204-fifo-open.md`.
   The Linux FUSE path is not affected.
