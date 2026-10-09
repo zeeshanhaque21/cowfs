@@ -87,6 +87,30 @@ fn mknod_of_a_device_needs_root_but_a_fifo_does_not() {
     }
 }
 
+/// The whiteout (character device 0:0) is exempt from the root rule exactly as in the FUSE
+/// adapter; a block 0:0 and any other character device are not.
+#[test]
+fn mknod_whiteout_is_allowed_for_any_caller_but_no_other_device() {
+    let (_s, mut c) = serve(memfs(), MountOptions::default());
+    let root = c.root.clone();
+    let perm = nfsstat3::NFS3ERR_PERM as u32;
+    let (st, _) = c.call_as(
+        1000,
+        11,
+        mknod_args(&root, "wo", ftype3::NF3CHR, 0o644, (0, 0)),
+    );
+    assert_eq!(st, OK, "whiteout as uid 1000");
+    for (kind, n, dev) in [
+        (ftype3::NF3BLK, "blk00", (0, 0)),
+        (ftype3::NF3CHR, "chr01", (0, 1)),
+        (ftype3::NF3BLK, "blk80", (8, 0)),
+    ] {
+        let (st, _) = c.call_as(1000, 11, mknod_args(&root, n, kind, 0o600, dev));
+        assert_eq!(st, perm, "MKNOD {n} as uid 1000");
+        assert_eq!(c.lookup(&root, n).0, NOENT, "{n} must not exist");
+    }
+}
+
 #[test]
 fn pathconf_reports_the_advertised_values() {
     let (_s, mut c) = serve(memfs(), MountOptions::default());
