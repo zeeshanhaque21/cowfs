@@ -10,7 +10,7 @@ difference between the two runs is the path.
 Gates, in fixed order:
 
   g1  clean `cargo build` of a pinned clone of this repo, CARGO_TARGET_DIR in DIR
-  g2  warm edit-and-rebuild: edit cowfs-ctl, `cargo build` again (3 libs rebuilt, 2 bins relinked)
+  g2  warm edit-and-rebuild: edit cowfs-vfs, `cargo build` again (13 units rebuilt, 3 bins relinked)
   g3  `git status` on a generated 100k+ file tree, warm and with 1% touched
   g4  tree walk plus a small-file read pass over 20k files
   g5  large sequential 1 GiB write and read back, fsync, MiB/s
@@ -44,7 +44,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "bench" / "out"
-DEFAULT_SHA = "c1619ec16df3a6b11dd5a1e08e8a512b4fedd240"
+# The g1/g2 corpus pin. Retired pin c1619ec16df3 had no cowfs-core or cowfs-daemon, so g2
+# rebuilt ~1 s of work and a 1.5x ratio on it was noise. This one is a green main commit
+# (macOS, Linux, FUSE and namespace CI) with both. compare.py refuses any result file whose
+# meta corpus_sha is not this value, so data from an older pin is never compared.
+DEFAULT_SHA = "3f4fba25f1aa54dd083bcd38ca69ec42e60c0dba"
 
 FULL = {
     "small_files": 100_000,
@@ -62,16 +66,16 @@ SMALL_BYTES = 256
 SMALL_PER_DIR = 256
 GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
 
-# g2 edits this file: cowfs-ctl is the one crate at the pinned sha whose
-# dependents (cowfs-cli, cowfs-treehouse) are the workspace's only binaries, so a
-# one-line change here rebuilds three libs and relinks two executables, which is
-# what an edit-rebuild loop does. (The earlier target, cowfs-vfs-path/src/cookies.rs,
-# had no binary downstream at that sha and cost cargo ~0.3 s: see
-# docs/verification/g1-g2-readiness-20261009.md.) EDIT_CRATE is its lib target name.
-EDIT_TARGET = "crates/cowfs-ctl/src/lib.rs"
-EDIT_CRATE = "cowfs_ctl"
+# g2 edits this file: cowfs-vfs is the trait crate every other crate builds on, so a
+# one-line change here rebuilds 13 units (vfs, vfs-path, vfs-test, fuse, nfs, core, ctl, daemon,
+# treehouse and cli) and relinks all three executables
+# (cowfs, cowfs-daemon, cowfs-treehouse), which is the widest realistic edit-rebuild at the
+# pinned sha. Per-edit measurements: docs/verification/g1-g2-readiness-20261009.md.
+# EDIT_CRATE is its lib target name.
+EDIT_TARGET = "crates/cowfs-vfs/src/lib.rs"
+EDIT_CRATE = "cowfs_vfs"
 # A g2 rep that rebuilt fewer units than this, or relinked no executable, is refused.
-# Measured at the pinned sha: 5 units (3 libs, 2 bins). compare.py repeats this number.
+# Measured at the pinned sha: 13 units, 3 bins. compare.py repeats this number.
 G2_MIN_UNITS = 3
 
 
@@ -297,6 +301,8 @@ class Ctx:
 
     def g2(self):
         leaf = self.corpus / EDIT_TARGET
+        # Reset first so the file never grows across reps: each rep is the pinned file plus one comment.
+        checked(["git", "-C", str(self.corpus), "checkout", "--quiet", "--", EDIT_TARGET])
         leaf.write_text(
             leaf.read_text() + f"\n// cowfs bench g2 edit {time.time_ns()}\n"
         )

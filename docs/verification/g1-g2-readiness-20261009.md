@@ -7,6 +7,31 @@ Tracker bar (changed 2026-10-09): native APFS (this Mac) plus a Linux native fil
 Moonscape is dropped from this gate.
 The cachyos native filesystem is btrfs, so the Linux number is a btrfs number, not ext4.
 
+## Re-pin of 2026-10-09: the g1/g2 corpus moved, old samples are invalid
+
+Decision (Zee, 2026-10-09): `DEFAULT_SHA` in `bench/gates.py` moved from `c1619ec16df3a6b11dd5a1e08e8a512b4fedd240` to `3f4fba25f1aa54dd083bcd38ca69ec42e60c0dba`.
+The old pin had no `cowfs-core` or `cowfs-daemon`, so the g2 edit rebuilt about 1 s of work and a 1.5x ratio on it was noise.
+Accepted consequence: g1 (the clean build) changes too, because it builds the pinned corpus, so g1 and g2 results taken at the old pin do not describe the new workload.
+Every existing Linux and macOS sample is invalidated, including `lsample3` and the harness dry runs quoted below under the old pin.
+Those numbers are kept in this document as history only.
+
+How the invalidation is enforced, not just written down:
+- `bench/compare.py` (`meta_problem`) refuses, exit 3 with an `INVALID` line naming both shas, any input file whose meta `corpus_sha` is missing or is not `gates.DEFAULT_SHA`.
+  This applies to the native, cowfs and noise-floor files alike, so old-pin and new-pin data can never be compared, and a file from `COWFS_BENCH_CORPUS_SHA` overrides is also refused.
+- `gates.py` already matched the meta `corpus_sha` before resuming a file, so an old-pin file is never resumed into a new run.
+- Tests: `bench/test_compare_coverage.py` (`CorpusPin`) and `bench/test_gates.py` (`CorpusPinShape`).
+
+Pin choice, with evidence:
+- `3f4fba2` is the merge of PR 208, the commit before current main `84bd305`.
+  Its CI run was green on every job: test on macos-latest and ubuntu-latest (both shards), lint, fault-seam, linux-fuse and linux-namespaces.
+  `84bd305` had its macOS job still running when the pin was chosen, and the only difference is PR 210 (special files in core and vfs-path), so the green commit was taken.
+- It has `cowfs-core` and `cowfs-daemon` (and `cowfs-gc`, `cowfs-meta`, `cowfs-store`, `cowfs-fuse`, `cowfs-nfs`), and a plain `cargo build --locked` builds three executables: `cowfs`, `cowfs-daemon`, `cowfs-treehouse`.
+- Scratch-clone build on macOS (this Mac, load1 6 to 11): `cargo build --locked -j 4` of `3f4fba2` compiles clean.
+  The harness itself did a clean build of the pinned corpus in a fresh clone three times (g1, 16.05 to 16.28 s, see the dry run below).
+  An earlier scratch build of `84bd305` also compiled clean (16 s, deps cached).
+  The Linux side is covered by the ubuntu CI jobs above, not by a local Linux build.
+- The pin is reachable from the local clone the corpus is cloned from: `ensure_corpus` fetches it by sha from the repo, and the commit is in the history of main.
+
 ## Name mapping
 
 Tracker g1 is harness gates `g1` (clean build) plus `g2` (edit and rebuild) in `bench/gates.py`.
@@ -34,7 +59,7 @@ A valid run needs all of: a private release daemon and store, a validated small 
 
 ## The workload
 
-- Project: this repo pinned at `c1619ec16df3a6b11dd5a1e08e8a512b4fedd240` (`DEFAULT_SHA` in `bench/gates.py`), the cowfs Rust workspace, cloned `--no-hardlinks` into each arm.
+- Project: this repo pinned at `3f4fba25f1aa54dd083bcd38ca69ec42e60c0dba` (`DEFAULT_SHA` in `bench/gates.py`; was `c1619ec` before the 2026-10-09 re-pin), the cowfs Rust workspace, cloned `--no-hardlinks` into each arm.
 - Tree for git status: generated, 100,000 files of 256 bytes in 256 directories plus 64 files of 8 MiB, committed in a fresh git repo (`ensure_tree`).
   This is a synthetic tree, not a large real tracked repo.
 - Shared `CARGO_HOME` at `bench/out/cargo-home` on APFS, outside every arm, filled once by an untimed `cargo fetch --locked` (needs network on the first run).
@@ -51,16 +76,42 @@ Warm no-op rebuild is the same command again with nothing changed.
 `bench/gates.py` does not time it.
 Only `scripts/measure-live-trial.py` does, and its cowfs arm path is tied to where the repo lives, so it is not used here.
 
-Edit rebuild (harness g2): append `// cowfs bench g2 edit <ns>` to `crates/cowfs-ctl/src/lib.rs`, then:
+Edit rebuild (harness g2): reset `crates/cowfs-vfs/src/lib.rs` to the pinned content with `git checkout`, append one `// cowfs bench g2 edit <ns>` line, then:
 
     cargo build --offline --locked -j 4 --message-format=json
 
 The `--message-format=json` output is parsed for `compiler-artifact` records with `fresh` false.
-A rep is refused (no row recorded) unless `cowfs_ctl` itself was rebuilt, at least 3 units were rebuilt, and at least one executable was relinked.
+A rep is refused (no row recorded) unless `cowfs_vfs` itself was rebuilt, at least 3 units were rebuilt, and at least one executable was relinked.
 Each recorded g2 rep carries `rebuilt_count`, `bins_relinked` and `rebuilt_units`, and `compare.py` marks a g2 rep without them (any pre-fix file) INVALID.
 The two checks use the same minimum (`G2_MIN_UNITS`, pinned equal by a test).
+The file is reset before every rep, so the corpus file holds exactly one appended comment and does not grow across reps (the earlier code appended a line per rep).
 
-### Why this edit (decision of 2026-10-09)
+### Edit at the new pin (decision of 2026-10-09, after the re-pin)
+
+Measured on a scratch clone of `3f4fba2` (`cargo build --locked -j 4 --message-format=json`, debug, incremental as the harness leaves it, load1 6 to 8 on a busy Mac, 3 reps each, NOT A GATE RESULT):
+
+| Edit (one comment line appended) | Units rebuilt | Executables relinked | Wall |
+| --- | --- | --- | --- |
+| `cowfs-daemon/src/lib.rs` | 4: `cowfs_daemon`, `cowfs_cli`, bins `cowfs-daemon`, `cowfs` | 2 | 0.65 to 0.68 s |
+| `cowfs-core/src/lib.rs` | 5: adds `cowfs_core` | 2 (`cowfs-daemon`, `cowfs`) | 0.82 to 0.85 s |
+| `cowfs-ctl/src/lib.rs` | 7: `cowfs_ctl`, `cowfs_treehouse`, `cowfs_cli`, `cowfs_daemon`, 3 bins | 3 | 0.99 to 1.00 s |
+| `cowfs-store/src/lib.rs` | 8: `cowfs_store`, `cowfs_meta`, `cowfs_gc`, `cowfs_core`, `cowfs_daemon`, `cowfs_cli`, 2 bins | 2 | 1.35 to 1.39 s |
+| `cowfs-vfs/src/lib.rs` (chosen) | 13: `cowfs_vfs`, `cowfs_vfs_path`, `cowfs_vfs_test`, `cowfs_fuse`, `cowfs_nfs`, `cowfs_core`, `cowfs_ctl`, `cowfs_daemon`, `cowfs_treehouse`, `cowfs_cli`, 3 bins | 3 | 1.52 to 1.64 s |
+
+Finding to read before trusting the new pin: the daemon and core edits Zee suggested do relink the daemon, but at this pin they cost only 0.65 to 0.85 s, no more than the old `cowfs-ctl` edit (about 1 s).
+Re-pinning by itself did not make a core or daemon edit "several seconds long".
+The choice therefore maximises the rebuilt set instead: `cowfs-vfs/src/lib.rs` is the trait crate every crate builds on, so 13 units are rebuilt and all three executables relink, and it is the slowest edit measured (about 1.5 s).
+The validity rule is unchanged (edited crate rebuilt, at least 3 units, at least 1 executable relinked); only `EDIT_TARGET`, `EDIT_CRATE` and the measured counts in comments changed.
+If Zee prefers a daemon-centred edit, `cowfs-store/src/lib.rs` (8 units, 1.35 s) or `cowfs-core/src/lib.rs` (5 units, 0.84 s) is a one-line change of `EDIT_TARGET` and `EDIT_CRATE`.
+Whether about 1.5 s of native work is enough signal for a 1.5x Linux ratio is still unmeasured on Linux, and the bar decision below is therefore still open.
+
+Harness dry run, native only, no mount, `-j 4`, load1 8 to 11 (busy host), NOT A GATE RESULT: `python3 bench/gates.py --gates g1,g2 --reps 3`.
+- g1 (clean build of the pin): 16.05 s, 16.28 s, 16.24 s.
+- g2: 1.27 s, 1.29 s, 1.37 s, each with `rebuilt_count` 13 and `bins_relinked` 3.
+It shows the machinery works end to end at the new pin (clone, fetch of the pinned sha, reset-and-edit, json parse, validity rule, JSONL rows with the new `corpus_sha`).
+The times are inflated by the busy host and mean nothing about cowfs; no quiet-host run exists, so no gate result is produced.
+
+### Why the earlier edit, history at the retired pin `c1619ec` (superseded by the section above)
 
 The previous edit appended a comment to `crates/cowfs-vfs-path/src/cookies.rs`.
 At the pinned sha `c1619ec` (the corpus the harness builds, not current main) the workspace has two binaries, `cowfs` (cowfs-cli) and `cowfs-treehouse`, and both depend only on `cowfs-ctl`.
@@ -92,7 +143,7 @@ Bar decision:
   At 1 s a 1.5x ratio leaves a few hundred ms of allowed added time, and the old FUSE cost was about 0.2 s, so Linux g2 may now be borderline rather than failing by construction.
   Unmeasured, stated as expectation only: that the FUSE cost grows with the real work (three rlibs and two debug executables written through the mount), and that a budget would only hide a slowdown.
   No Linux native number exists for the new edit.
-  Zee's call after the first quiet cachyos run, if g2 is borderline: (a) add a Linux added-seconds budget, or (b) re-pin `DEFAULT_SHA` to a commit that has `cowfs-core` and `cowfs-daemon` so the edit is several seconds long.
+  Zee's call after the first quiet cachyos run, if g2 is borderline (option (b) was taken on 2026-10-09, see the re-pin section; (a) is still open): (a) add a Linux added-seconds budget, or (b) re-pin `DEFAULT_SHA` to a commit that has `cowfs-core` and `cowfs-daemon` so the edit is several seconds long.
   Option (b) also changes g1 and invalidates the existing Linux samples.
   On current main the binaries are `cowfs`, `cowfs-daemon` and `cowfs-treehouse`; `cowfs-daemon` depends on `cowfs-core`, `cowfs-ctl`, `cowfs-vfs` and `cowfs-vfs-path`, so an edit there would relink the daemon.
 
@@ -222,7 +273,7 @@ What the Linux arm does differently (all in `bench/g12_run.py`):
 - Cargo and temp: `CARGO_HOME`, `COWFS_BENCH_CARGO_HOME` and `TMPDIR` default to `<base>/cargo-home` and `<base>/tmp`, and the path check refuses an override outside the base.
   The rustup toolchain stays in `~/.rustup` (read only).
 
-Shipping the tree: a `git bundle` of the branch cloned on the box (the gate corpus clone needs the pinned sha `c1619ec`, which `git archive` has no history for), then the changed files copied over.
+Shipping the tree: a `git bundle` of the branch cloned on the box (the gate corpus clone needs the pinned sha `3f4fba2`, which `git archive` has no history for), then the changed files copied over.
 There are no GitHub credentials on the box.
 
 Optional proxy, explicitly labelled loop-on-btrfs: an ext4 loop image under `/mnt/docs`.
@@ -298,7 +349,8 @@ Neither macOS sample ran cargo builds through the NFS mount, which stays unvalid
 - [x] cargo-home populated in this lease (`bench/out/cargo-home`); a new lease needs network once.
 - [ ] Release binaries present in the lease (rebuild if the lease was returned).
 - [ ] Time budget: 100k-file tree generation through NFS plus 4 arms x 5 reps of clean builds; expect hours, not minutes.
-- [x] Linux harness g2 trivial-workload problem: g2 now edits `cowfs-ctl` (5 units, 2 relinks, refused if fewer); decision recorded in "Why this edit". UNVALIDATED on Linux: no cachyos run with the new edit yet.
+- [x] Linux harness g2 trivial-workload problem: g2 now edits `cowfs-vfs` at pin `3f4fba2` (13 units, 3 relinks, refused if fewer); decision recorded in "Edit at the new pin". UNVALIDATED on Linux: no cachyos run at the new pin yet, and all earlier samples are invalid.
+- [ ] Re-run any Linux or macOS sample at the new pin before quoting a g1 or g2 number; old-pin files are refused by `compare.py`.
 - [ ] Linux arm on cachyos (btrfs): driver exists, g3 samples passed their plumbing and a cargo build through FUSE ran once (1 rep, not validated); the full run is not done.
 - [ ] The foreign CPU rule, the plateau cool-down and the induced set have never run live with a real baseline, on either platform: unit tests, a `ps` parse on this Mac, and the 20 s Linux samples only.
 - [ ] Cargo build through the mount is still unvalidated on a quiet host (Linux: one sample rep only, see above).
