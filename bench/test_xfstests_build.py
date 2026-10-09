@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for bench/xfstests_build.sh (issue 101). Run: python3 -m unittest discover -s bench -v
+"""Tests for bench/xfstests_build.sh (issue 101). Run: python3 bench/test_xfstests_build.py -v
 
 No network, no make: every case here must be refused before the build starts.
 """
@@ -32,7 +32,6 @@ class Pins(unittest.TestCase):
         self.assertRegex(allow, r"(?m)^tree_sha [0-9a-f]{40}$")
         src = SCRIPT.read_text()
         self.assertIn("xfstests-allowlist.txt", src)
-        self.assertRegex(src, r"(?m)^TREE=3683cb11c7dde850a567042e89b4e35e5d082b8e\b")
 
     def test_suite_flags_are_not_altered(self):
         # issue 101 declined hand-written config.h; the build must be the suite's own make.
@@ -56,10 +55,12 @@ class Refusals(unittest.TestCase):
         self.tmp.cleanup()
 
     def seed(self):
+        # Like the real tree: build outputs are gitignored upstream.
         self.xfs.mkdir()
         git(self.xfs, "init", "-q")
         (self.xfs / "Makefile").write_text("default:\n\ttouch MAKE_RAN\n")
-        git(self.xfs, "add", "Makefile")
+        (self.xfs / ".gitignore").write_text("/ltp/fsx\n/include/config.h\nMAKE_RAN\n")
+        git(self.xfs, "add", "Makefile", ".gitignore")
         git(self.xfs, "commit", "-q", "-m", "not the pin")
 
     def test_present_tree_at_another_commit_is_refused_before_make(self):
@@ -68,6 +69,36 @@ class Refusals(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertRegex(r.stderr, r"refusing: .* is at [0-9a-f]{40}, the pin is 3e1ee800")
         self.assertFalse((self.xfs / "MAKE_RAN").exists())
+
+    def test_ignored_build_output_is_refused_before_anything_else(self):
+        # A stale or planted helper is gitignored, so plain `git status --porcelain` is
+        # blind to it. It must be refused before make, and before the commit check, so
+        # this needs no network and no pinned commit.
+        self.seed()
+        (self.xfs / "ltp").mkdir()
+        (self.xfs / "ltp" / "fsx").write_text("#!/bin/sh\necho All 200 operations completed A-OK!\n")
+        plain = subprocess.run(["git", "-C", str(self.xfs), "status", "--porcelain"],
+                               capture_output=True, text=True).stdout
+        self.assertEqual(plain, "", "the planted file must be invisible to plain porcelain")
+        r = run(self.xfs)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("holds files outside the commit, ignored ones included", r.stderr)
+        self.assertIn("!! ltp/", r.stderr)
+        self.assertFalse((self.xfs / "MAKE_RAN").exists())
+
+    def test_untracked_file_is_refused(self):
+        self.seed()
+        (self.xfs / "include").mkdir()
+        (self.xfs / "include" / "notes.txt").write_text("x")
+        r = run(self.xfs)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("holds files outside the commit", r.stderr)
+
+    def test_failed_fetch_leaves_no_half_initialised_repo(self):
+        r = run(self.xfs, XFSTESTS_UPSTREAM=str(Path(self.tmp.name) / "nowhere"))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("could not fetch", r.stderr)
+        self.assertFalse((self.xfs / ".git").exists())
 
     def test_unverifiable_fetch_is_refused(self):
         # an upstream that does not have the pinned commit: the fetch fails, nothing builds

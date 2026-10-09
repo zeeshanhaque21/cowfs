@@ -5,8 +5,13 @@
 #   bench/xfstests_build.sh XFS_DIR
 #
 # XFS_DIR absent: init it and fetch exactly the pinned commit. XFS_DIR present: no fetch,
-# but the same pin checks run, so a tree at any other commit is refused before make.
-# Writes XFS_DIR.identity.txt (key=value) with the helper sha256s the g5 meta records.
+# but the same checks run before make: the tree must hold NOTHING outside the commit,
+# ignored files included (every build output is gitignored upstream, so a stale or
+# hand-made ltp/fsx or include/config.h would otherwise pass), and HEAD must be the pin.
+# A second run in the same directory is therefore refused until `git clean -xdf`; that is
+# the point, the recorded digests must be of binaries this run built.
+# Writes next to XFS_DIR: .build.log, .smoke-fsx.txt, .smoke-fsstress.txt and
+# .identity.txt (key=value) with the helper sha256s the g5 meta records.
 # The digests embed the build path (DW_AT_comp_dir from -g), so they are per host AND per
 # path: build where the harness runs (g5_box.sh uses $G5_W/ref/xfstests).
 set -eu
@@ -15,22 +20,24 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 UPSTREAM=${XFSTESTS_UPSTREAM:-https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git}
 # The commit pin is the allowlist's, so the build and the reviewed cases cannot drift apart.
 COMMIT=$(sed -n 's/^tree_sha \([0-9a-f]\{40\}\)$/\1/p' "$HERE/xfstests-allowlist.txt")
-TREE=3683cb11c7dde850a567042e89b4e35e5d082b8e  # git tree object of $COMMIT
 XFS=${1:?usage: xfstests_build.sh XFS_DIR}
 [ -n "$COMMIT" ] || { echo "refusing: no tree_sha in xfstests-allowlist.txt" >&2; exit 1; }
 
 if [ ! -d "$XFS/.git" ]; then
   git init -q "$XFS"
   git -C "$XFS" remote add origin "$UPSTREAM"
-  GIT_TERMINAL_PROMPT=0 git -C "$XFS" fetch -q --depth 1 origin "$COMMIT"
+  # git checks every fetched object's hash, and HEAD is compared with the pin below.
+  GIT_TERMINAL_PROMPT=0 git -C "$XFS" fetch -q --depth 1 origin "$COMMIT" \
+    || { rm -rf -- "$XFS/.git"; echo "refusing: could not fetch $COMMIT from $UPSTREAM" >&2; exit 1; }
   git -C "$XFS" checkout -q FETCH_HEAD
 fi
+dirty=$(git -C "$XFS" status --porcelain --ignored)
+[ -z "$dirty" ] || { printf 'refusing: %s holds files outside the commit, ignored ones included (git clean -xdf):\n%s\n' \
+  "$XFS" "$(printf '%s\n' "$dirty" | head -n 20)" >&2; exit 1; }
 got=$(git -C "$XFS" rev-parse HEAD)
 [ "$got" = "$COMMIT" ] || { echo "refusing: $XFS is at $got, the pin is $COMMIT" >&2; exit 1; }
-got=$(git -C "$XFS" rev-parse HEAD^{tree})
-[ "$got" = "$TREE" ] || { echo "refusing: tree object $got, the pin is $TREE" >&2; exit 1; }
-dirty=$(git -C "$XFS" status --porcelain)
-[ -z "$dirty" ] || { echo "refusing: $XFS is dirty before the build: $dirty" >&2; exit 1; }
+# The commit id already binds the tree; it is recorded, not separately pinned.
+TREE=$(git -C "$XFS" rev-parse "HEAD^{tree}")
 
 # The suite's own top-level build, unmodified flags. -k: src/locktest does not compile on
 # kernel 7.2 headers, and one broken src/ helper must not hide the rest. Failed targets
@@ -53,15 +60,17 @@ dirty=$(git -C "$XFS" status --porcelain)
 
 # Smoke on the native filesystem under the build dir: a no-op helper must not pass.
 sm=$(mktemp -d "$XFS.smoke.XXXXXX")
+trap 'rm -rf -- "$sm"' EXIT
 "$XFS/ltp/fsx" -N 200 -S 1 "$sm/fsx.dat" > "$XFS.smoke-fsx.txt" 2>&1
 grep -q "All 200 operations completed A-OK" "$XFS.smoke-fsx.txt" \
   || { echo "fsx smoke failed, see $XFS.smoke-fsx.txt" >&2; exit 1; }
 "$XFS/ltp/fsstress" -v -d "$sm/fss" -n 50 -p 1 -s 1 > "$XFS.smoke-fsstress.txt" 2>&1
 ops=$(grep -o '^0/[0-9]*: ' "$XFS.smoke-fsstress.txt" | sort -u | wc -l)
-# Not every op logs a 0/N line (btrfs-only ops print otherwise), so the bar is "ran and
-# logged ops", not exactly 50. The count is recorded.
-[ "$ops" -gt 0 ] || { echo "fsstress smoke logged no ops" >&2; exit 1; }
-rm -rf -- "$sm"
+# Not every op logs a 0/N line. Measured on the cachyos box with -s 1: 45 of 50; op 27
+# (btrfs subvol_delete) prints `0:27:` instead, and ops 20, 36, 37 and 38 print nothing.
+# The bar is half of -n, which a no-op or a helper that stops early cannot meet; it is
+# not a claim that every op ran. The count is recorded.
+[ "$ops" -ge 25 ] || { echo "fsstress smoke logged $ops ops, want at least 25 of 50" >&2; exit 1; }
 
 {
   echo "xfstests_commit=$COMMIT"
