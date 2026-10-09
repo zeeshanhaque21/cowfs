@@ -170,8 +170,12 @@ Any failure or crash from step 3 on leaves the intent file, and the next `Core::
 So a snapshot name never disappears without a record that explains it, and a failed swap never costs the old base.
 The two forks change the snapshot id, so every inode number in the new snapshot differs from the old one's.
 Import uses the same finish step.
+A swap or replacing import of a name with a pending intent finishes that intent first (`Core::recover_target`), so a retry never deletes the only copy of the new tree.
+After the intents, `Core::open` removes every staging snapshot no intent names (a crash during staging leaves one); it holds the store's flock, so no live operation owns a staging snapshot then.
 
 Test: `promote_base_survives_a_failure_at_every_step` injects a failure at each of the five steps (`Core::set_swap_fault`, a doc-hidden test seam), checks the content before the reopen, reopens, and checks that recovery completed the swap or left the old base, with no staging snapshot and no intent file left.
+`ingest_replacing_survives_a_failure_at_every_step` does the same for the replacing import (faults 2 to 4 of `replace_with_staged`), and the retry and orphan-sweep tests are in the same file.
+The intent writer's temp file is `tmp-swap-<target>`, a prefix no intent (`swap-<target>`) can have, so a target named `base.tmp` is not mistaken for a temp file; a leftover `swap-<X>.tmp` from the older naming is dropped on open.
 
 ## One damaged block poisons one file, not the snapshot
 
@@ -522,6 +526,7 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `ns::adjust_kids` | st.wr | 2 |
 | `ns::rename_dir` | st.wr, nodes, dents | 2 |
 | `ns::refresh_dir_attr` | st.wr, snap. | 2 then 3 |
+| `swap::recover_intent` | last_error | leaf |
 | `swap::recover` | last_error | leaf |
 | `swap::swap_snapshot` | last_error | leaf |
 | `swap::stage_and_intent` | snap. | 3 |
@@ -607,7 +612,7 @@ Counts are from the runs recorded below (`cargo test -p cowfs-core` after mergin
 | Conformance | `conformance.rs` | 132 pass, 2 heavy | the whole `cowfs-vfs-test` suite through a `Core` snapshot view (levels Posix, Portable, Cowfs), plus the 2 heavy checks run separately |
 | Core behaviour | `core.rs` | 18 | mount root, snapshot rules, fork isolation both ways, persistence, dedup by byte counts, 1 TiB sparse file with RSS bound, forget accounting over 100,000 create and unlink cycles, batching, corrupt block is EIO, damaged store refused, Merkle root iff content, control plane, unlink while open, elision, background flusher, inode numbers never reused |
 | Locks | `locks.rs` | 2 | the critic's deadlock repro as a test with a stack-dumping watchdog, plus a 60 s mixed stress of every multi-lock operation |
-| Swap | `swap.rs` | 3 | failure injected at every step of a snapshot replacement, the intent record's recovery on reopen, a damaged store inside a swap, rename failure safety |
+| Swap | `swap.rs` | 12 | failure injected at every step of a snapshot replacement and of a replacing import, the intent record's recovery on reopen, a same-name retry over a pending intent, the orphan staging sweep, a damaged store inside a swap, rename failure safety |
 | Poison | `poison.rs` | 3 | a damaged chunk is EIO at the write, poisons only its own file, leaves other files' `fsync` durable, and does not stop a promote |
 | Names and inode numbers | `names_ino.rs` | 4 | the CLI's name rules and collision keys, virtual numbers never reused across a clean reopen or a process that aborts |
 | Aliases | `alias.rs` | 2 | the alias table stays bounded over 20,000 (and 500,000) creates, a referenced or open file keeps its number |

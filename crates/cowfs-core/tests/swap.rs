@@ -56,7 +56,7 @@ fn leftovers(dir: &std::path::Path, c: &Core) -> Vec<String> {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("swap-")),
+            .filter(|n| n.starts_with("swap-") || n.starts_with("tmp-swap-")),
     );
     v
 }
@@ -179,4 +179,396 @@ fn rename_snapshot_is_failure_safe() {
     names.sort();
     assert_eq!(names, ["b".to_string(), "taken".to_string()]);
     c.check().unwrap();
+}
+
+// ---- the replacing ingest (issues 176 and 177) -------------------------------------------------
+
+use cowfs_core::{ingest_replacing, Hooks, ImportError};
+
+/// A source directory holding one file `f`.
+fn source(root: &std::path::Path, tag: &str, body: &str) -> std::path::PathBuf {
+    let d = root.join(format!("src-{tag}"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("f"), body).unwrap();
+    d
+}
+
+fn replace(c: &Core, from: &std::path::Path) -> Result<(), ImportError> {
+    let mut hooks = Hooks {
+        progress: &mut |_, _| true,
+    };
+    ingest_replacing(c, from, "base", &mut hooks).map(|_| ())
+}
+
+/// A retry that fails or is cancelled after its own staging started.
+fn replace_cancelled(c: &Core, from: &std::path::Path) -> Result<(), ImportError> {
+    let mut hooks = Hooks {
+        progress: &mut |_, _| false,
+    };
+    ingest_replacing(c, from, "base", &mut hooks).map(|_| ())
+}
+
+/// Every snapshot name the metadata holds, staging ones included, plus the swap intent files.
+fn raw_leftovers(dir: &std::path::Path, c: &Core) -> Vec<String> {
+    let mut v: Vec<String> = c
+        .meta()
+        .snapshots()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.name)
+        .filter(|n| n.contains("cowfs-swap"))
+        .collect();
+    v.extend(
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("swap-") || n.starts_with("tmp-swap-")),
+    );
+    v
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let p = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &p);
+        } else {
+            std::fs::copy(e.path(), &p).unwrap();
+        }
+    }
+}
+
+/// F2 for the replacing ingest: a failure before the old target goes keeps it, one after leaves the
+/// name missing only while the intent file explains it, and the next open finishes the swap.
+#[test]
+fn ingest_replacing_survives_a_failure_at_every_step() {
+    for step in 2..=4u8 {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let v1 = source(scratch.path(), "v1", "old base");
+        let v2 = source(scratch.path(), "v2", "new content");
+        {
+            let c = Core::open(dir.path(), test_opts()).unwrap();
+            replace(&c, &v1).unwrap();
+            c.set_swap_fault(step);
+            let res = replace(&c, &v2);
+            assert!(res.is_err(), "step {step} was not injected: {res:?}");
+            if step <= 3 {
+                assert_eq!(content(&c, "base", "f"), "old base", "step {step}");
+                assert!(raw_leftovers(dir.path(), &c).is_empty(), "step {step}");
+            } else {
+                assert!(c.snapshot_view("base").is_err(), "step {step}");
+            }
+        }
+        let c = Core::open(dir.path(), test_opts()).expect("reopen");
+        let want = if step >= 4 { "new content" } else { "old base" };
+        assert_eq!(content(&c, "base", "f"), want, "step {step} after reopen");
+        assert!(
+            raw_leftovers(dir.path(), &c).is_empty(),
+            "step {step}: {:?}",
+            raw_leftovers(dir.path(), &c)
+        );
+        c.check().unwrap();
+    }
+}
+
+/// Issue 177: `finish_swap` failed after the old target was removed, so the staged tree and the
+/// intent are all that is left of the new content. A retry of the same name that then fails must
+/// not delete them: the pending intent is rolled forward before the retry starts.
+#[test]
+fn a_failed_same_name_retry_does_not_destroy_a_pending_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "second");
+    let v3 = source(scratch.path(), "v3", "third");
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    replace(&c, &v1).unwrap();
+    c.set_swap_fault(4);
+    assert!(replace(&c, &v2).is_err());
+    c.set_swap_fault(0);
+    assert!(replace_cancelled(&c, &v3).is_err());
+    assert_eq!(
+        content(&c, "base", "f"),
+        "second",
+        "the pending swap was lost"
+    );
+    assert!(
+        raw_leftovers(dir.path(), &c).is_empty(),
+        "{:?}",
+        raw_leftovers(dir.path(), &c)
+    );
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "second", "after reopen");
+    c.check().unwrap();
+}
+
+/// Issue 177, the promote side: the same pending intent met by `promote_base` of the same name.
+#[test]
+fn a_failed_promote_does_not_destroy_a_pending_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "second");
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    replace(&c, &v1).unwrap();
+    c.create_snapshot("src").unwrap();
+    let rs = root_entry(&c, "src").ino;
+    mkfile(&c, rs, "f", b"promoted");
+    c.sync().unwrap();
+    c.set_swap_fault(4);
+    assert!(replace(&c, &v2).is_err());
+    c.set_swap_fault(1);
+    assert!(c.promote_base("src", "base").is_err());
+    c.set_swap_fault(0);
+    assert_eq!(
+        content(&c, "base", "f"),
+        "second",
+        "the pending swap was lost"
+    );
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}
+
+/// Issue 177, the success path: a retry that works replaces the rolled-forward tree.
+#[test]
+fn a_same_name_retry_after_a_pending_swap_lands_the_new_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "second");
+    let v3 = source(scratch.path(), "v3", "third");
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    replace(&c, &v1).unwrap();
+    c.set_swap_fault(4);
+    assert!(replace(&c, &v2).is_err());
+    c.set_swap_fault(0);
+    replace(&c, &v3).unwrap();
+    assert_eq!(content(&c, "base", "f"), "third");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}
+
+/// Issue 176: a crash during the long staging write leaves a hidden staging snapshot and no intent.
+/// The crash image is the store directory copied while the ingest is mid-write.
+#[test]
+fn open_removes_a_staging_snapshot_that_has_no_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let image = scratch.path().join("image");
+    let v1 = source(scratch.path(), "v1", "kept");
+    std::fs::write(v1.join("g"), vec![7u8; 100_000]).unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    {
+        let mut taken = false;
+        let mut hooks = Hooks {
+            progress: &mut |done, _| {
+                if done > 0 && !taken {
+                    taken = true;
+                    copy_dir(dir.path(), &image);
+                }
+                true
+            },
+        };
+        ingest_replacing(&c, &v1, "fresh", &mut hooks).unwrap();
+    }
+    drop(c);
+    let c = Core::open(&image, test_opts()).unwrap();
+    assert!(
+        c.meta()
+            .snapshots()
+            .unwrap()
+            .iter()
+            .all(|i| !i.name.contains("cowfs-swap")),
+        "an orphan staging snapshot survived open: {:?}",
+        raw_leftovers(&image, &c)
+    );
+    assert!(c.snapshot_view("fresh").is_err());
+    c.check().unwrap();
+}
+
+/// Issue 176, the other side: the sweep must not take what a pending intent needs, and a second
+/// open is a no-op.
+#[test]
+fn open_recovers_a_pending_swap_and_a_second_open_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "second");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace(&c, &v1).unwrap();
+        c.set_swap_fault(4);
+        assert!(replace(&c, &v2).is_err());
+    }
+    // open twice: the first finishes the swap, the sweep must not have touched what it needed
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "second");
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "second");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+}
+
+/// Critic of PR 220: the intent file of a target named `base.tmp` is `swap-base.tmp`, which the
+/// intent scan once mistook for the writer's temp file of `base`. Open then swept the staging
+/// snapshot of a swap past its point of no return. Names that end like a temp file, or that equal
+/// another target plus a suffix, must recover like any other.
+#[test]
+fn a_target_named_like_a_temp_file_is_rolled_forward() {
+    for target in ["base.tmp", "tmp-swap-x", "swap-y"] {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let v1 = source(scratch.path(), "v1", "old base");
+        let v2 = source(scratch.path(), "v2", "new content");
+        let run = |c: &Core, from: &std::path::Path| {
+            let mut hooks = Hooks {
+                progress: &mut |_, _| true,
+            };
+            ingest_replacing(c, from, target, &mut hooks).map(|_| ())
+        };
+        {
+            let c = Core::open(dir.path(), test_opts()).unwrap();
+            run(&c, &v1).unwrap();
+            c.set_swap_fault(4);
+            assert!(run(&c, &v2).is_err());
+        }
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        assert_eq!(content(&c, target, "f"), "new content", "{target}");
+        assert!(raw_leftovers(dir.path(), &c).is_empty(), "{target}");
+        c.check().unwrap();
+    }
+}
+
+/// An intent and the temp file of another swap never share a file name: `base` and `base.tmp`
+/// pending together both recover.
+#[test]
+fn two_pending_swaps_whose_names_differ_by_a_suffix_both_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old");
+    let v2 = source(scratch.path(), "v2", "new");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        for t in ["base", "base.tmp"] {
+            let mut h = Hooks {
+                progress: &mut |_, _| true,
+            };
+            ingest_replacing(&c, &v1, t, &mut h).unwrap();
+            c.set_swap_fault(4);
+            let mut h = Hooks {
+                progress: &mut |_, _| true,
+            };
+            assert!(ingest_replacing(&c, &v2, t, &mut h).is_err());
+            c.set_swap_fault(0);
+        }
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "new");
+    assert_eq!(content(&c, "base.tmp", "f"), "new");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+}
+
+/// A temp file the older release named `swap-<target>.tmp` is dropped on open, not read as the
+/// intent of a target called `<target>.tmp`.
+#[test]
+fn an_older_temp_file_is_dropped_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "kept");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace(&c, &v1).unwrap();
+    }
+    let stale = dir.path().join("swap-base.tmp");
+    std::fs::write(&stale, "base.cowfs-swap0\nbase\n").unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert!(!stale.exists());
+    assert_eq!(content(&c, "base", "f"), "kept");
+    drop(c);
+    // a crash before the rename leaves the new-style temp, which open removes too
+    std::fs::write(dir.path().join("tmp-swap-base"), "x").unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}
+
+fn replace_as(c: &Core, from: &std::path::Path, target: &str) -> Result<(), ImportError> {
+    let mut hooks = Hooks {
+        progress: &mut |_, _| true,
+    };
+    ingest_replacing(c, from, target, &mut hooks).map(|_| ())
+}
+
+/// Round-2 critic: staging names kept 200 characters of the target, so these two valid names shared
+/// one staging snapshot. A pending swap of A was destroyed by a plain ingest of B.
+#[test]
+fn long_targets_sharing_a_prefix_do_not_share_a_staging_snapshot() {
+    let a = format!("{}1", "a".repeat(200));
+    let b = format!("{}2", "a".repeat(200));
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old");
+    let va = source(scratch.path(), "va", "content of A");
+    let vb = source(scratch.path(), "vb", "content of B");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace_as(&c, &v1, &a).unwrap();
+        c.set_swap_fault(4);
+        assert!(replace_as(&c, &va, &a).is_err());
+        c.set_swap_fault(0);
+        // a plain ingest of B must leave A's pending swap alone
+        replace_as(&c, &vb, &b).unwrap();
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, &a, "f"), "content of A");
+    assert_eq!(content(&c, &b, "f"), "content of B");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+}
+
+#[test]
+fn two_long_pending_swaps_with_a_shared_prefix_both_recover() {
+    let a = format!("{}1", "a".repeat(200));
+    let b = format!("{}2", "a".repeat(200));
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old");
+    let va = source(scratch.path(), "va", "content of A");
+    let vb = source(scratch.path(), "vb", "content of B");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        for t in [&a, &b] {
+            replace_as(&c, &v1, t).unwrap();
+        }
+        c.set_swap_fault(4);
+        assert!(replace_as(&c, &va, &a).is_err());
+        assert!(replace_as(&c, &vb, &b).is_err());
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, &a, "f"), "content of A");
+    assert_eq!(content(&c, &b, "f"), "content of B");
+}
+
+/// A record cut off inside the target name must not be read as an intent for a shorter name.
+#[test]
+fn a_torn_intent_is_not_read_as_a_shorter_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old");
+    let v2 = source(scratch.path(), "v2", "new");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace_as(&c, &v1, "abc").unwrap();
+        c.set_swap_fault(4);
+        assert!(replace_as(&c, &v2, "abc").is_err());
+    }
+    let p = dir.path().join("swap-abc");
+    let text = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p, text.trim_end_matches(['\n', 'c'])).unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert!(c.snapshot_view("ab").is_err(), "a stray snapshot ab");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
 }
