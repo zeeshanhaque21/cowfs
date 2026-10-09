@@ -1,0 +1,20 @@
+FSTYP         -- fuse
+PLATFORM      -- Linux/x86_64 cachyos-x8664 7.2.8-2-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 01 Oct 2026 21:19:14 +0000
+
+generic/025        - output mismatch (see /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/025/results/generic/025.out.bad)
+    --- tests/generic/025.out	2026-10-08 17:46:34.124221077 -0700
+    +++ /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/025/results/generic/025.out.bad	2026-10-08 20:13:27.338091446 -0700
+    @@ -5,47 +5,47 @@
+     samedir  none/dire -> No such file or directory
+     samedir  none/tree -> No such file or directory
+     samedir  regu/none -> No such file or directory
+    -samedir  regu/regu -> regu/regu.
+    -samedir  regu/symb -> symb/regu.
+    -samedir  regu/dire -> dire/regu.
+    -samedir  regu/tree -> tree/regu.
+    ...
+    (Run 'diff -u /mnt/docs/Projects/cowfs-g5/ref/xfstests/tests/generic/025.out /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/025/results/generic/025.out.bad'  to see the entire diff)
+Ran: generic/025
+Failures: generic/025
+Failed 1 of 1 tests
+

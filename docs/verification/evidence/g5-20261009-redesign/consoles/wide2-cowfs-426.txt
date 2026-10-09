@@ -1,0 +1,20 @@
+FSTYP         -- fuse
+PLATFORM      -- Linux/x86_64 cachyos-x8664 7.2.8-2-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 01 Oct 2026 21:19:14 +0000
+
+generic/426        - output mismatch (see /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/426/results/generic/426.out.bad)
+    --- tests/generic/426.out	2026-10-08 17:46:34.139221198 -0700
+    +++ /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/426/results/generic/426.out.bad	2026-10-08 20:29:28.392356855 -0700
+    @@ -1,5 +1,3077 @@
+     QA output created by 426
+     test_file_handles TEST_DIR/426-dir -d
+     test_file_handles TEST_DIR/426-dir
+    +open_by_handle(/mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/mnt/426-dir/file000000) returned 116 incorrectly on a linked file!
+    +open_by_handle(/mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/mnt/426-dir/file000001) returned 116 incorrectly on a linked file!
+    +open_by_handle(/mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/mnt/426-dir/file000002) returned 116 incorrectly on a linked file!
+    +open_by_handle(/mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/mnt/426-dir/file000003) returned 116 incorrectly on a linked file!
+    ...
+    (Run 'diff -u /mnt/docs/Projects/cowfs-g5/ref/xfstests/tests/generic/426.out /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/426/results/generic/426.out.bad'  to see the entire diff)
+Ran: generic/426
+Failures: generic/426
+Failed 1 of 1 tests
+

@@ -1,7 +1,7 @@
 {
- "verdict": "PASS",
+ "verdict": "DIAGNOSTIC",
  "exit": 0,
- "mode": "acceptance",
+ "mode": "diagnostic",
  "problems": [],
  "counts": {
   "both_pass": 6
@@ -13,6 +13,7 @@
  "cowfs_status": {
   "PASS": 6
  },
+ "other": {},
  "worse": [],
  "gap": {},
  "emulated": [],
@@ -48,31 +49,37 @@
   "status": "FAIL",
   "problems": []
  },
- "label": "acceptance evidence",
+ "label": "diagnostic only, not acceptance",
  "cases": {
   "generic/005": {
    "native": "PASS",
-   "cowfs": "PASS"
+   "cowfs": "PASS",
+   "reason": null
   },
   "generic/236": {
    "native": "PASS",
-   "cowfs": "PASS"
+   "cowfs": "PASS",
+   "reason": null
   },
   "generic/245": {
    "native": "PASS",
-   "cowfs": "PASS"
+   "cowfs": "PASS",
+   "reason": null
   },
   "generic/309": {
    "native": "PASS",
-   "cowfs": "PASS"
+   "cowfs": "PASS",
+   "reason": null
   },
   "generic/360": {
    "native": "PASS",
-   "cowfs": "PASS"
+   "cowfs": "PASS",
+   "reason": null
   },
   "generic/755": {
    "native": "PASS",
-   "cowfs": "PASS"
+   "cowfs": "PASS",
+   "reason": null
   }
  }
 }

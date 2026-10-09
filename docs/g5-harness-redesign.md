@@ -138,17 +138,18 @@ A PASS that skips a rule does not exist.
 6. The recorded identity of the cowfs arm is a `fuse*` fstype with source `cowfs`.
    This is what stops a cowfs arm that is secretly native.
 7. Exactly one mount has the arm's source in the namespace the case ran in.
-8. The two arms have different `TEST_DIR` and different fstype.
+8. The two arms have different `TEST_DIR`.
+   The fstype difference is enforced by rule 4 and rules 5 and 6.
 9. No record is `NO_RESULT`.
 10. The bare mount and stash directories are empty after every cowfs case.
-11. A negative control ran and was judged `FAIL`: `generic/005` on a read-only remount of a fresh snapshot.
+11. A negative control ran and was judged `FAIL` with the `Read-only file system` error in its console: `generic/005` on a read-only remount of a fresh snapshot.
     A report without a failing control cannot tell a pass from a rubber stamp.
 
 On top of validity, the verdict is:
 
 - `UNMEASURABLE` (exit 2) when either arm has no clean `PASS` at all, which is the empty or all-skipped run on native or on cowfs.
 - `FAIL` (exit 1) when the `worse` list is not empty.
-- `PASS` (exit 0) only in acceptance mode, only on the reviewed id set from the allowlist, only on a release daemon, and only when every case is `PASS` on both arms.
+- `PASS` (exit 0) only in acceptance mode, only on the reviewed id set from the allowlist, only on a release daemon whose sha256 equals the one given to the report and whose build revision (a 40-hex git revision, from `COWFS_REV` or a `BUILD_REV` file next to the binaries) is recorded, and only when every case is `PASS` on both arms.
   In acceptance mode every other valid result exits 2 or 1, never 0.
 - `DIAGNOSTIC` (exit 0) for any other id set that is valid.
   It prints the counts and lists and never says PASS.
@@ -167,7 +168,8 @@ Exit codes are the same set `bench/compare.py` and the old gate use.
 
 The evidence is in `docs/verification/evidence/g5-20261009-redesign/`.
 The cowfs daemon was the release build with the sha256 in `*-meta.txt`; its source revision was not recorded, because the box copy is not a git checkout.
-The sample is the six reviewed ids: acceptance mode, PASS, native 6 of 6 and cowfs 6 of 6, control failed correctly.
+The sample is the six reviewed ids: native 6 of 6 and cowfs 6 of 6, control failed correctly.
+It is labelled diagnostic, not acceptance evidence, because the daemon's source revision was not recorded and acceptance now refuses that.
 The wide run is the 155 diagnostic ids: valid, verdict FAIL by the rules above, so diagnostic and not acceptance.
 Native took about 14 minutes with a fresh filesystem per case, and cowfs about 21 minutes on the release build.
 generic/247 unmounts `TEST_DIR` and never restores it, and the shim log caught it as `PASS_EMULATED`.
@@ -181,6 +183,27 @@ Stopped by request, with the harness, report, unit tests and two box runs (sampl
 Remaining before this can close g5: a critic review, the `xfstests_gate.py preflight` reason fix verified on the box (it has no unit test yet), a lint check of `bench/`, and a diagnosis of generic/127.
 The 6-id sample is repeatable, the wide run is not part of CI.
 `wide-receipt` was produced by an intermediate `g5_root.sh` (before the teardown wait and `NOSHIM` edits), which only affects teardown counting and a diagnostic switch.
+
+## Re-run required (critic block on PR 200)
+
+The wide list and the sample must be re-run on the final script, with `COWFS_REV` (or `BUILD_REV`) set from `git rev-parse HEAD` of the tree that built the release daemon, and `--daemon-sha256` given to the report.
+The consoles of the eight worse cases and of generic/127 must then be copied into the evidence directory.
+Neither was done in this round, to avoid the cost.
+Existing receipts are diagnostic evidence only.
+`BUILD_REV` is written at build time, for example: `git archive <sha>` to the box, build there, then `echo <sha> > target/release/BUILD_REV`.
+Acceptance on the box is not possible until that rebuild happens, because the current `src` there is not a git checkout.
+The `--daemon-sha256` value must come from that build step; copying it from `meta.txt` would make the check circular.
+A `NOSHIM` run is never acceptable, since it logs no mount cycles.
+generic/127 on cowfs failed three times, each with rc 1 and an output mismatch, never a harness timeout (`TMO` was 900).
+The missing `All 100000 operations completed A-OK!` lines differed: two in the wide run, one in each of the two single-case reruns.
+The second rerun had the shim disabled (`NOSHIM=1`) and failed the same way.
+Its cause is undiagnosed.
+The consoles are in `consoles/`, produced by the intermediate script, together with those of the eight worse cases.
+`g5_box.sh start` now checks that the box is idle, that the workspace is under `/mnt/docs`, and runs `sudo -v` once before anything else.
+
+Preflight was run once on the box, unprivileged and read-only.
+Its reason is no longer empty: `the suite refused a probe case with exit 1: common/config: TEST_DEV (...) is not a block device or a network filesystem`.
+That is the old arm model's own refusal, which `check` raises before the root check; the root refusal text is covered by a unit test.
 
 ## Not done here
 

@@ -1,0 +1,17 @@
+FSTYP         -- fuse
+PLATFORM      -- Linux/x86_64 cachyos-x8664 7.2.8-2-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 01 Oct 2026 21:19:14 +0000
+
+generic/448        [failed, exit status 1]- output mismatch (see /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/448/results/generic/448.out.bad)
+    --- tests/generic/448.out	2026-10-08 17:46:34.140221206 -0700
+    +++ /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/448/results/generic/448.out.bad	2026-10-08 20:31:09.190131240 -0700
+    @@ -1,2 +1,3 @@
+     QA output created by 448
+    -Silence is golden
+    +seek sanity check failed!
+    +(see /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/448/results/generic/448.full for details)
+    ...
+    (Run 'diff -u /mnt/docs/Projects/cowfs-g5/ref/xfstests/tests/generic/448.out /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/448/results/generic/448.out.bad'  to see the entire diff)
+Ran: generic/448
+Failures: generic/448
+Failed 1 of 1 tests
+

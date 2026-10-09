@@ -178,6 +178,7 @@ def make_record(arm, case, console, rc, identity_text, cycle_text, residue_text=
     reason = parsed["reason"]
     return {"arm": arm, "case": case, "status": status, "reason": reason,
             "class": classify_reason(reason) if reason else None, "cycles": cycles,
+            "erofs": "Read-only file system" in console,
             "why": parsed["why"], "problems": problems, "identity": ident}
 
 
@@ -197,7 +198,7 @@ def pair_label(n, c):
     return "other"
 
 
-def build_receipt(native, cowfs, control, meta, pin, mode, requested):
+def build_receipt(native, cowfs, control, meta, pin, mode, requested, expect_daemon_sha256=None):
     bad = []
     for k in ("tree_head", "check_sha256", "cowfs_profile"):
         if not meta.get(k):
@@ -217,10 +218,21 @@ def build_receipt(native, cowfs, control, meta, pin, mode, requested):
     if mode == "acceptance":
         if set(requested) != reviewed:
             bad.append("acceptance: the requested ids are not exactly the reviewed set")
+        if not re.fullmatch(r"[0-9a-f]{40}", meta.get("cowfs_rev") or ""):
+            bad.append(f"acceptance: cowfs_rev {meta.get('cowfs_rev')!r} is not a recorded git "
+                       "revision of the tree that built the daemon")
+        if meta.get("noshim"):
+            bad.append("acceptance: the run used NOSHIM, so mount cycles were not logged")
+        if not expect_daemon_sha256:
+            bad.append("acceptance: no expected daemon sha256 was given (--daemon-sha256)")
+        elif meta.get("cowfs_bin_sha256") != expect_daemon_sha256:
+            bad.append(f"acceptance: daemon sha256 {meta.get('cowfs_bin_sha256')} is not the "
+                       f"expected {expect_daemon_sha256}")
         if meta.get("cowfs_profile") != "release":
             bad.append(f"acceptance: cowfs daemon is a {meta.get('cowfs_profile')!r} build, need release")
-    if control is None or control["status"] != "FAIL" or control["problems"]:
-        bad.append("control: the read-only negative control did not fail correctly "
+    if (control is None or control["status"] != "FAIL" or control["problems"]
+            or not control.get("erofs")):
+        bad.append("control: the read-only negative control did not fail for the read-only reason "
                    f"({None if control is None else control['status']})")
     nids, cids = [r["case"] for r in native], [r["case"] for r in cowfs]
     for name, ids in (("native", nids), ("cowfs", cids)):
@@ -238,6 +250,7 @@ def build_receipt(native, cowfs, control, meta, pin, mode, requested):
     if len(dirs) == 2 and dirs["native"] == dirs["cowfs"]:
         bad.append("arms: native and cowfs share one TEST_DIR")
     by_case = {r["case"]: r for r in cowfs}
+    by_native = {r["case"]: r for r in native}
     labels = {}
     for n in native:
         c = by_case.get(n["case"])
@@ -267,6 +280,8 @@ def build_receipt(native, cowfs, control, meta, pin, mode, requested):
         "counts": dict(counts), "requested": len(requested),
         "native_status": dict(Counter(r["status"] for r in native)),
         "cowfs_status": dict(Counter(r["status"] for r in cowfs)),
+        "other": {k: f"native {by_native[k]['status']}, cowfs {by_case[k]['status']}"
+                  for k, v in labels.items() if v == "other"},
         "worse": worse, "gap": {k: sorted(v) for k, v in gap.items()},
         "emulated": sorted(k for k, v in labels.items() if v == "emulated"),
         "better": sorted(k for k, v in labels.items() if v == "better"),
@@ -320,12 +335,15 @@ def render_md(r):
     L.append(f"Worse than native ({len(r['worse'])}): {' '.join(r['worse']) or 'none'}")
     for cls, ids in sorted(r["gap"].items()):
         L.append(f"Gap, native passes and cowfs does not run, {cls} ({len(ids)}): {' '.join(ids)}")
+    L.append(f"Other combinations, not pass and not worse ({len(r['other'])}): {r['other']}")
     L.append(f"Emulated mount cycle on cowfs: {' '.join(r['emulated']) or 'none'}")
     L.append(f"Cowfs not-run by class: {r['cowfs_not_run_by_class']}")
     L.append(f"Native not-run by class: {r['native_not_run_by_class']}")
     if r["unclassified"]:
         L.append(f"Unclassified reasons: {r['unclassified']}")
     L.append(f"Control: {r['control']}")
+    if r["meta"].get("noshim"):
+        L.append("WARNING: NOSHIM run, mount cycles were not logged, so no PASS here is clean.")
     for p in r["problems"][:40]:
         L.append(f"INVALID: {p}")
     return "\n".join(L) + "\n"
@@ -338,7 +356,7 @@ def report(args):
         return 3
     run = load_run(args.run)
     r = build_receipt(run["native"], run["cowfs"], run["control"], run["meta"], pin,
-                      args.mode, run["requested"])
+                      args.mode, run["requested"], args.daemon_sha256)
     r["records"] = {"native": run["native"], "cowfs": run["cowfs"], "control": run["control"]}
     Path(args.json or Path(args.run) / "receipt.json").write_text(json.dumps(r, indent=1, default=str))
     Path(args.md or Path(args.run) / "receipt.md").write_text(render_md(r))
@@ -352,6 +370,7 @@ def main(argv=None):
     rp = sub.add_parser("report")
     rp.add_argument("--run", required=True)
     rp.add_argument("--mode", choices=("acceptance", "diagnostic"), default="diagnostic")
+    rp.add_argument("--daemon-sha256", help="expected sha256 of cowfs-daemon (acceptance needs it)")
     rp.add_argument("--json")
     rp.add_argument("--md")
     args = ap.parse_args(argv)

@@ -115,6 +115,8 @@ class Tree:
                       'echo "Passed all 1 tests"\nexit 0\n',
             # Exits 0 and says nothing about passing: the shape that made this
             # gate wrong in the first place.
+            # What the real suite does when run unprivileged: stderr only, exit 1.
+            "rootrefuse": 'echo "check: QA must be run as root" >&2\nexit 1\n',
             "silent": 'printf "Ran: %s\\n" "$__seq"\nexit 0\n',
             # Prints the success line but exits nonzero: the two must agree.
             "liar": 'printf "Ran: %s\\n" "$__seq"\necho "Passed all 1 tests"\nexit 1\n',
@@ -764,6 +766,18 @@ class MissingProbe(HarnessCase):
         gate.ALLOWLIST_FILE = self.tmp_path / "reviewed-allowlist.txt"
         rc, _ = self.run_gate(self.args(cases="005"))
         self.assertEqual(rc, 2)
+
+
+class PreflightSaysWhy(HarnessCase):
+    def test_root_refusal_is_named_in_the_reason(self):
+        self.open_gate()
+        self.tree.passing("010")
+        self.tree.check("rootrefuse")
+        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("010",))
+        rec = gate.preflight(self.tree.root, Path(self.out()), pin_check=False)
+        self.assertEqual(rec["verdict"], "UNMEASURABLE")
+        self.assertIn("must be run as root", rec["reason"])
+        self.assertIn("g5_root.sh", rec["reason"])
 
 
 # --- finding 9: report exits nonzero on a bad run ---------------------------

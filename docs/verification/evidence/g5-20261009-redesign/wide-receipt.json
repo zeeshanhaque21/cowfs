@@ -24,6 +24,9 @@
   "FAIL": 9,
   "PASS_EMULATED": 1
  },
+ "other": {
+  "generic/473": "native FAIL, cowfs NOT_RUN"
+ },
  "worse": [
   "generic/025",
   "generic/087",

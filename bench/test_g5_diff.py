@@ -258,7 +258,7 @@ IDS6 = ["generic/005", "generic/236", "generic/245", "generic/309", "generic/360
 def meta(**kw):
     m = dict(tree_head="T" * 40, tree_porcelain="", check_sha256="C" * 64,
              cowfs_bin="/w/target/release/cowfs-daemon", cowfs_profile="release",
-             cowfs_bin_sha256="b" * 64)
+             cowfs_bin_sha256="b" * 64, cowfs_rev="a" * 40)
     m.update({f"case_sha.{i.split('/')[1]}": "s" for i in IDS6})
     m.update(kw)
     return m
@@ -272,12 +272,14 @@ def good_records(cases=IDS6, cow="PASS"):
     n = [rec("native", c, "PASS") for c in cases]
     c = [rec("cowfs", x, cow) for x in cases]
     ctl = rec("control", "generic/005", "FAIL")
+    ctl["erofs"] = True
     return n, c, ctl
 
 
 class Verdict(unittest.TestCase):
-    def build(self, n, c, ctl, mode="acceptance", m=None, requested=IDS6, pin=PIN):
-        return g.build_receipt(n, c, ctl, meta() if m is None else m, pin, mode, requested)
+    def build(self, n, c, ctl, mode="acceptance", m=None, requested=IDS6, pin=PIN,
+              sha="b" * 64):
+        return g.build_receipt(n, c, ctl, meta() if m is None else m, pin, mode, requested, sha)
 
     def test_acceptance_pass(self):
         r = self.build(*good_records())
@@ -326,7 +328,7 @@ class Verdict(unittest.TestCase):
         n, c, ctl = good_records()
         ctl["status"] = "PASS"
         self.assertEqual(self.build(n, c, ctl)["verdict"], "INVALID")
-        r = g.build_receipt(n, c, None, meta(), PIN, "acceptance", IDS6)
+        r = g.build_receipt(n, c, None, meta(), PIN, "acceptance", IDS6, "b" * 64)
         self.assertEqual(r["verdict"], "INVALID")
 
     def test_record_problem_is_invalid(self):
@@ -361,6 +363,42 @@ class Verdict(unittest.TestCase):
 
     def test_missing_meta_invalid(self):
         self.assertEqual(self.build(*good_records(), m={})["verdict"], "INVALID")
+
+    def test_noshim_run_is_not_acceptable(self):
+        r = self.build(*good_records(), m=meta(noshim="1"))
+        self.assertEqual(r["verdict"], "INVALID")
+        self.assertIn("NOSHIM", " ".join(r["problems"]))
+
+    def test_unrecorded_cowfs_rev_is_refused(self):
+        for rev in ("unrecorded", "", "abc"):
+            r = self.build(*good_records(), m=meta(cowfs_rev=rev))
+            self.assertEqual(r["verdict"], "INVALID", rev)
+        self.assertIn("cowfs_rev", " ".join(r["problems"]))
+
+    def test_daemon_binary_must_match_the_expected_sha(self):
+        r = self.build(*good_records(), sha="c" * 64)
+        self.assertEqual(r["verdict"], "INVALID")
+        self.assertIn("daemon sha256", " ".join(r["problems"]))
+        r = self.build(*good_records(), sha=None)
+        self.assertEqual(r["verdict"], "INVALID")
+
+    def test_diagnostic_does_not_need_rev_or_sha(self):
+        r = self.build(*good_records(), mode="diagnostic",
+                       m=meta(cowfs_rev="unrecorded"), sha=None, requested=IDS6)
+        self.assertEqual(r["verdict"], "DIAGNOSTIC")
+
+    def test_control_must_fail_for_the_read_only_reason(self):
+        n, c, ctl = good_records()
+        ctl["erofs"] = False
+        self.assertEqual(self.build(n, c, ctl)["verdict"], "INVALID")
+
+    def test_other_combinations_are_listed(self):
+        ids = IDS6 + ["generic/473"]
+        n, c, ctl = good_records(ids)
+        n[-1]["status"] = "FAIL"
+        c[-1]["status"], c[-1]["class"] = "NOT_RUN", "missing_feature"
+        r = self.build(n, c, ctl, mode="diagnostic", requested=ids)
+        self.assertEqual(r["other"], {"generic/473": "native FAIL, cowfs NOT_RUN"})
 
     def test_debug_daemon_not_acceptable(self):
         r = self.build(*good_records(), m=meta(cowfs_profile="debug"))
