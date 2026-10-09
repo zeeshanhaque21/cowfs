@@ -25,7 +25,9 @@
 //!
 //! What this does not model, on purpose: see `docs/crash-injection-173.md` (slice 5).
 //!
-//! `COWFS_POWER_SEEDS` sets the images per cut (default 6), `COWFS_POWER_THREADS` the workers.
+//! `COWFS_POWER_SEEDS` sets the images per cut (default 5), `COWFS_POWER_WORKLOADS` the seeded
+//! workloads (default 2), `COWFS_POWER_THREADS` the workers. A failing image is kept on disk and
+//! its path is in the message; the op count of a run varies (see `docs/crash-injection-173.md`).
 //! The older `crash.rs`, `durability.rs`, `ns_durability*.rs` and `kill9.rs` stay: they cut the
 //! store with a cruder rule or by killing a process, and see what a process crash can see.
 
@@ -185,9 +187,10 @@ struct Expect {
     may_exist: BTreeSet<String>,
     /// Acknowledged snapshots whose removal or rename is not yet acknowledged.
     may_vanish: BTreeSet<String>,
-    /// A snapshot a swap or rename put a whole new tree under: it must equal its acknowledged tree
-    /// or one of these, exactly.
-    alt: BTreeMap<String, Vec<Tree>>,
+    /// A snapshot a swap or rename put a whole new tree under: it must match its acknowledged tree
+    /// (less what changed in it since) or one of these, each with the paths whose bytes were not
+    /// yet committed when it was taken.
+    alt: BTreeMap<String, Vec<(Tree, HashSet<String>)>>,
     /// (old, new) of a snapshot rename: one metadata transaction, so one of the two must exist.
     renamed: Vec<(String, String)>,
     /// Files changed since the acknowledgement; their bytes are not checked.
@@ -251,6 +254,105 @@ impl World {
         self.touch(s, path);
     }
 
+    fn write_at(&mut self, s: &str, path: &str, off: usize, data: &[u8]) {
+        self.guard_alt(s);
+        let fs = self.view(s);
+        let a = fs.lookup(ROOT_INO, path.as_bytes()).unwrap();
+        write_all(&fs, a.ino, off as u64, data);
+        forget(&fs, a.ino);
+        let old = self.live.get_mut(s).unwrap().get_mut(path).unwrap();
+        if old.len() < off + data.len() {
+            old.resize(off + data.len(), 0);
+        }
+        old[off..off + data.len()].copy_from_slice(data);
+        self.touch(s, path);
+    }
+
+    fn truncate_file(&mut self, s: &str, path: &str, size: usize) {
+        self.guard_alt(s);
+        let fs = self.view(s);
+        let a = fs.lookup(ROOT_INO, path.as_bytes()).unwrap();
+        common::truncate(&fs, a.ino, size as u64).unwrap();
+        forget(&fs, a.ino);
+        self.live
+            .get_mut(s)
+            .unwrap()
+            .get_mut(path)
+            .unwrap()
+            .resize(size, 0);
+        self.touch(s, path);
+    }
+
+    /// The seeded part of the workload, in the spirit of `crash.rs`'s `step`: create, overwrite at
+    /// an offset, truncate, rename over an existing name, unlink, fsync, fork, drop a fork and
+    /// flush, on files `r0..r5` of whichever snapshot is not in the middle of a swap check.
+    fn rand_phase(&mut self, seed: u64, steps: usize) {
+        let mut rng = common::Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let pool: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
+        let mut forks = 0;
+        let size = |rng: &mut common::Rng| match rng.below(10) {
+            0 => 0,
+            1..=5 => rng.below(3000) as usize,
+            6..=8 => rng.below(25_000) as usize,
+            _ => 30_000 + rng.below(10_000) as usize,
+        };
+        for _ in 0..steps {
+            let names: Vec<String> = self
+                .live
+                .keys()
+                .filter(|n| !self.cur.alt.contains_key(*n))
+                .cloned()
+                .collect();
+            let s = names[rng.below(names.len() as u64) as usize].clone();
+            let have: Vec<String> = pool
+                .iter()
+                .filter(|p| self.live[&s].contains_key(*p))
+                .cloned()
+                .collect();
+            let any = |rng: &mut common::Rng| have[rng.below(have.len() as u64) as usize].clone();
+            match rng.below(11) {
+                0..=2 => {
+                    let p = pool[rng.below(pool.len() as u64) as usize].clone();
+                    let n = size(&mut rng);
+                    self.put(&s, &p, &data(n, rng.next()));
+                }
+                3 if !have.is_empty() => {
+                    let p = any(&mut rng);
+                    let off = rng.below(self.live[&s][&p].len() as u64 + 500) as usize;
+                    let n = size(&mut rng).min(12_000) + 1;
+                    self.write_at(&s, &p, off, &data(n, rng.next()));
+                }
+                4 if !have.is_empty() => {
+                    let p = any(&mut rng);
+                    let len = self.live[&s][&p].len() as u64;
+                    let to = rng.below(len + len / 2 + 10) as usize;
+                    self.truncate_file(&s, &p, to);
+                }
+                5 if !have.is_empty() => {
+                    let from = any(&mut rng);
+                    let to = pool[rng.below(pool.len() as u64) as usize].clone();
+                    if from != to {
+                        self.rename_file(&s, &from, &to);
+                    }
+                }
+                6 if !have.is_empty() => {
+                    let p = any(&mut rng);
+                    self.unlink(&s, &p);
+                }
+                7 if !have.is_empty() => {
+                    let p = any(&mut rng);
+                    self.fsync(&s, &p);
+                }
+                8 if forks < 2 => {
+                    forks += 1;
+                    self.new_snapshot(&format!("q{forks}"), Some(&s));
+                }
+                9 if self.live.contains_key("q1") => self.remove_snapshot("q1"),
+                _ => self.core.flush().unwrap(),
+            }
+        }
+    }
+
     fn unlink(&mut self, s: &str, path: &str) {
         self.guard_alt(s);
         self.view(s).unlink(ROOT_INO, path.as_bytes()).unwrap();
@@ -295,7 +397,8 @@ impl World {
     fn rename_snapshot(&mut self, from: &str, to: &str) {
         self.core.rename_snapshot(from, to).unwrap();
         let t = self.live.remove(from).unwrap();
-        self.cur.alt.insert(to.into(), vec![t.clone()]);
+        let loose = self.cur.touched.get(from).cloned().unwrap_or_default();
+        self.cur.alt.insert(to.into(), vec![(t.clone(), loose)]);
         self.live.insert(to.into(), t);
         self.cur.may_exist.insert(to.into());
         self.cur.may_vanish.insert(from.into());
@@ -305,7 +408,9 @@ impl World {
     fn promote(&mut self, src: &str, target: &str) {
         self.core.promote_base(src, target).unwrap();
         let t = self.live[src].clone();
-        self.cur.alt.insert(target.into(), vec![t.clone()]);
+        self.cur
+            .alt
+            .insert(target.into(), vec![(t.clone(), HashSet::new())]);
         self.live.insert(target.into(), t);
         self.cur.may_exist.insert(target.into());
     }
@@ -379,7 +484,7 @@ struct Run {
 
 /// `hook` false drops the store sync that Core wires before every durable metadata commit: the
 /// negative control that the whole machinery must be able to see.
-fn record(hook: bool) -> Run {
+fn record(hook: bool, wseed: u64) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let backend = Backend::default();
     let core = Core::open_with_meta(dir.path(), core_opts(), |_p, mo| {
@@ -434,6 +539,7 @@ fn record(hook: bool) -> Run {
     w.unlink("s1", "c");
     w.sync();
 
+    w.rand_phase(wseed, 16);
     w.new_snapshot("s3", None);
     w.put("s3", "e", &data(15_000, 7));
     // flushed but not synced: the removal's own commit is the first durable one to carry it
@@ -539,8 +645,8 @@ fn meta_image(run: &Run, k: usize, mode: u64, rng: &mut Rng) -> Vec<u8> {
 /// The mount root's files after a cut at store op `k`. An op completed if it was stamped before `k`
 /// (the next op cannot start before it returns); the op stamped at `k` may or may not have run.
 /// Model: file data is durable once its file was fsynced, else any prefix of it; a directory entry
-/// change (create, rename, unlink) is durable once the root was fsynced after it, and the rest
-/// reach the disk as a prefix, in order, as a journalling filesystem writes them.
+/// change (create, rename, unlink) is durable once the root was fsynced after it, and each of the
+/// rest reaches the disk or not on its own, in order, a rename of a missing source doing nothing.
 fn root_image(run: &Run, k: usize, rng: &mut Rng) -> BTreeMap<String, Vec<u8>> {
     struct Node {
         data: Vec<u8>,
@@ -595,9 +701,11 @@ fn root_image(run: &Run, k: usize, rng: &mut Rng) -> BTreeMap<String, Vec<u8>> {
             _ => {}
         }
     }
-    let keep = durable_entries + rng.below((entries.len() - durable_entries) as u64 + 1) as usize;
     let mut out_ns: BTreeMap<String, usize> = BTreeMap::new();
-    for e in &entries[..keep] {
+    for (i, e) in entries.iter().enumerate() {
+        if i >= durable_entries && rng.below(2) == 0 {
+            continue;
+        }
         match e {
             Entry::Set(n, Some(i)) => {
                 out_ns.insert(n.clone(), *i);
@@ -671,8 +779,24 @@ struct Tally {
     failures: Vec<String>,
 }
 
-fn same_tree(a: &Tree, b: &Tree) -> bool {
-    a == b
+impl Tally {
+    fn merge(&mut self, o: Tally) {
+        self.images += o.images;
+        self.with_intent += o.with_intent;
+        self.torn_intent += o.torn_intent;
+        self.old_tree += o.old_tree;
+        self.new_tree += o.new_tree;
+        self.failures.extend(o.failures);
+    }
+}
+
+/// `got` is `want`, except for the paths in `loose`, whose bytes or presence are not pinned.
+fn same_tree(want: &Tree, got: &Tree, loose: &HashSet<String>) -> bool {
+    want.iter()
+        .all(|(p, b)| loose.contains(p) || got.get(p) == Some(b))
+        && got
+            .keys()
+            .all(|p| want.contains_key(p) || loose.contains(p))
 }
 
 fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
@@ -745,9 +869,11 @@ fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
         walk(&fs, ROOT_INO, "", &mut got).map_err(|e| format!("snapshot {n:?}: {e}"))?;
         if let Some(alts) = ex.alt.get(n) {
             let old = ex.acked.get(n);
-            if old.is_some_and(|a| same_tree(a, &got)) {
+            let none = HashSet::new();
+            let loose = ex.touched.get(n).unwrap_or(&none);
+            if old.is_some_and(|a| same_tree(a, &got, loose)) {
                 t.old_tree += 1;
-            } else if alts.iter().any(|a| same_tree(a, &got)) {
+            } else if alts.iter().any(|(a, loose)| same_tree(a, &got, loose)) {
                 t.new_tree += 1;
             } else {
                 return Err(format!(
@@ -773,6 +899,14 @@ fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
                         ))
                     }
                     Some(_) => {}
+                }
+            }
+            // and nothing extra: an acknowledged unlink or rename must not come back
+            for path in got.keys() {
+                if !want.contains_key(path) && !touched.is_some_and(|t| t.contains(path)) {
+                    return Err(format!(
+                        "{n}/{path} is not in the acknowledged tree and nothing changed it since"
+                    ));
                 }
             }
         }
@@ -830,6 +964,21 @@ fn brief(op: &LogOp) -> String {
     }
 }
 
+/// The image of a cut at store op `k` for `seed`, written under `dir`. Deterministic.
+fn build_image(run: &Run, k: usize, seed: u64, dir: &Path) {
+    let mut rng = Rng(seed ^ ((k as u64) << 20) ^ 0x57A1);
+    let img = crash_image(&run.store_base, &run.ops, k, &mut rng, seed % 4);
+    write_image(&img, &dir.join("store"));
+    fs::write(
+        dir.join("meta.redb"),
+        meta_image(run, k, seed % 3, &mut rng),
+    )
+    .unwrap();
+    for (n, b) in root_image(run, k, &mut rng) {
+        fs::write(dir.join(n), b).unwrap();
+    }
+}
+
 fn sweep(run: &Run, seeds: u64, threads: usize) -> Tally {
     let total = Mutex::new(Tally::default());
     std::thread::scope(|sc| {
@@ -847,36 +996,24 @@ fn sweep(run: &Run, seeds: u64, threads: usize) -> Tally {
                         .unwrap_or(&run.ack_at[0]);
                     let ex = &run.acks[j.min(run.acks.len() - 1)];
                     for seed in 0..seeds {
-                        let mut rng = Rng(seed ^ ((k as u64) << 20) ^ 0x57A1);
-                        let img = crash_image(&run.store_base, &run.ops, k, &mut rng, seed % 4);
                         let tag = format!(
                             "k={k}/{} seed={seed} op={}",
                             run.ops.len(),
                             run.ops.get(k).map_or_else(|| "(all done)".into(), brief)
                         );
                         let dir = tempfile::tempdir().unwrap();
-                        write_image(&img, &dir.path().join("store"));
-                        fs::write(
-                            dir.path().join("meta.redb"),
-                            meta_image(run, k, seed % 3, &mut rng),
-                        )
-                        .unwrap();
-                        for (n, b) in root_image(run, k, &mut rng) {
-                            fs::write(dir.path().join(n), b).unwrap();
-                        }
+                        build_image(run, k, seed, dir.path());
                         t.images += 1;
                         if let Err(e) = verify(dir.path(), ex, &mut t) {
-                            t.failures.push(format!("{tag}: {e}"));
+                            // `verify` writes into the image, so rebuild the cut image to keep
+                            let keep = tempfile::tempdir().unwrap().keep();
+                            build_image(run, k, seed, &keep);
+                            t.failures
+                                .push(format!("{tag} image {}: {e}", keep.display()));
                         }
                     }
                 }
-                let mut g = total.lock().unwrap();
-                g.images += t.images;
-                g.with_intent += t.with_intent;
-                g.torn_intent += t.torn_intent;
-                g.old_tree += t.old_tree;
-                g.new_tree += t.new_tree;
-                g.failures.extend(t.failures);
+                total.lock().unwrap().merge(t);
             });
         }
     });
@@ -901,51 +1038,51 @@ fn report(run: &Run, t: &Tally) {
 
 #[test]
 fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() {
-    let run = record(true);
+    let mut all = Tally::default();
+    for wseed in 0..env("COWFS_POWER_WORKLOADS", 2) as u64 {
+        let run = record(true, wseed);
+        assert!(
+            run.ops.len() > 200,
+            "the timeline is too short to mean anything: {}",
+            run.ops.len()
+        );
+        assert!(
+            run.gc_unlinked > 0,
+            "the recorded gc cycle reclaims nothing"
+        );
+        assert_eq!(
+            run.rops
+                .iter()
+                .filter(|o| matches!(o, RootOp::Rename(..)))
+                .count(),
+            run.swaps,
+            "the swaps left the wrong intent-file ops"
+        );
+        let t = sweep(
+            &run,
+            env("COWFS_POWER_SEEDS", 5) as u64,
+            env("COWFS_POWER_THREADS", 4),
+        );
+        report(&run, &t);
+        all.merge(t);
+    }
+    assert!(all.images > 1000);
     assert!(
-        run.ops.len() > 200,
-        "the timeline is too short to mean anything: {}",
-        run.ops.len()
-    );
-    assert!(
-        run.gc_unlinked > 0,
-        "the recorded gc cycle reclaims nothing"
-    );
-    assert!(
-        run.rops.iter().any(|o| matches!(o, RootOp::Rename(..)))
-            && run.rops.iter().any(|o| matches!(o, RootOp::Unlink(_))),
-        "the swaps left no intent-file ops"
-    );
-    assert_eq!(
-        run.rops
-            .iter()
-            .filter(|o| matches!(o, RootOp::Rename(..)))
-            .count(),
-        run.swaps
-    );
-    let t = sweep(
-        &run,
-        env("COWFS_POWER_SEEDS", 6) as u64,
-        env("COWFS_POWER_THREADS", 4),
-    );
-    report(&run, &t);
-    assert!(t.images > 1000);
-    assert!(
-        t.with_intent > 0,
+        all.with_intent > 0,
         "no image caught a swap with its intent file on disk"
     );
     assert!(
-        t.old_tree > 0 && t.new_tree > 0,
+        all.old_tree > 0 && all.new_tree > 0,
         "a swap target never came back as both outcomes"
     );
-    for f in t.failures.iter().take(8) {
+    for f in all.failures.iter().take(8) {
         eprintln!("FAIL {f}");
     }
     assert!(
-        t.failures.is_empty(),
+        all.failures.is_empty(),
         "{} of {} power-cut images failed",
-        t.failures.len(),
-        t.images
+        all.failures.len(),
+        all.images
     );
 }
 
@@ -960,7 +1097,7 @@ fn the_recorded_log_replays_to_the_real_disk() {
         !o.background && !o.meta.background,
         "a background thread would log nowhere"
     );
-    let run = record(true);
+    let run = record(true, 0);
     let n = run.ops.len();
     let mut rng = Rng(1);
     let img = crash_image(&run.store_base, &run.ops, n, &mut rng, 3);
@@ -1036,16 +1173,16 @@ fn the_recorded_log_replays_to_the_real_disk() {
 /// crash model instead of a pack cut.
 #[test]
 fn the_power_test_notices_a_missing_store_sync_before_metadata_commits() {
-    let run = record(false);
+    let run = record(false, 0);
     let t = sweep(
         &run,
-        env("COWFS_POWER_SEEDS", 6) as u64,
+        env("COWFS_POWER_SEEDS", 5) as u64,
         env("COWFS_POWER_THREADS", 4),
     );
     report(&run, &t);
     assert!(
-        !t.failures.is_empty(),
-        "no image of {} failed without the store sync hook: the test is blind",
+        t.failures.iter().any(|f| f.contains("MissingLiveBlock")),
+        "no image of {} lost a live block without the store sync hook: the test is blind",
         t.images
     );
     println!(
