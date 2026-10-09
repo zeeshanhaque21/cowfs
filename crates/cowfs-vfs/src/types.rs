@@ -41,6 +41,45 @@ pub enum FileKind {
     Regular,
     Directory,
     Symlink,
+    /// A named pipe. Only a name and attributes: opening and I/O are the client's.
+    Fifo,
+    /// A unix domain socket node. Only a name and attributes.
+    Socket,
+    /// A character device node: attributes plus `Attr::rdev`.
+    CharDevice,
+    /// A block device node: attributes plus `Attr::rdev`.
+    BlockDevice,
+}
+
+impl FileKind {
+    /// True for the four kinds `Vfs::mknod` creates.
+    pub fn is_special(self) -> bool {
+        matches!(
+            self,
+            FileKind::Fifo | FileKind::Socket | FileKind::CharDevice | FileKind::BlockDevice
+        )
+    }
+
+    /// True for the kinds that carry a device number.
+    pub fn is_device(self) -> bool {
+        matches!(self, FileKind::CharDevice | FileKind::BlockDevice)
+    }
+}
+
+/// Builds the cowfs device number `(major << 32) | minor`. This is not a host `dev_t`: each
+/// adapter converts to and from its own encoding, so a store is portable across systems.
+pub const fn makedev(major: u32, minor: u32) -> u64 {
+    ((major as u64) << 32) | minor as u64
+}
+
+/// The major number of a cowfs device number.
+pub const fn dev_major(rdev: u64) -> u32 {
+    (rdev >> 32) as u32
+}
+
+/// The minor number of a cowfs device number.
+pub const fn dev_minor(rdev: u64) -> u32 {
+    rdev as u32
 }
 
 /// A point in time with nanosecond resolution. `nanos` is below 1_000_000_000. Protocols with
@@ -95,6 +134,8 @@ pub struct Attr {
     /// 512-byte units of logical allocation of non-hole data, for `st_blocks`. Allocation
     /// granularity is the backend's: one byte of data may report several blocks.
     pub blocks: u64,
+    /// Device number (`makedev`) of a `CharDevice` or `BlockDevice`, `0` for every other kind.
+    pub rdev: u64,
     pub atime: Timestamp,
     pub mtime: Timestamp,
     pub ctime: Timestamp,
@@ -186,4 +227,23 @@ pub fn validate_name(name: &[u8]) -> Result<()> {
         return Err(Error::NameTooLong);
     }
     Ok(())
+}
+
+/// What `Vfs::fallocate` does to the range `[offset, offset + len)`. The kernel's `fallocate`
+/// mode bits map to these: `0`, `KEEP_SIZE`, `PUNCH_HOLE|KEEP_SIZE`, `ZERO_RANGE`,
+/// `ZERO_RANGE|KEEP_SIZE`. A punch never changes the size, so there is no variant that does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FallocMode {
+    /// The size becomes `max(size, offset + len)`. Existing bytes are untouched and new bytes
+    /// read as zeros. A backend without preallocation reserves nothing.
+    Allocate,
+    /// Checks the inode and range and changes no data and no size.
+    KeepSize,
+    /// The part of the range inside the file reads as zeros. The size is unchanged.
+    PunchHole,
+    /// Like `PunchHole`, and the size becomes `max(size, offset + len)`.
+    ZeroRange,
+    /// Like `PunchHole`, with the kernel's `ZERO_RANGE|KEEP_SIZE` spelling.
+    ZeroRangeKeepSize,
 }

@@ -1,0 +1,17 @@
+FSTYP         -- fuse
+PLATFORM      -- Linux/x86_64 cachyos-x8664 7.2.8-2-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 01 Oct 2026 21:19:14 +0000
+
+generic/127        - output mismatch (see /mnt/docs/Projects/cowfs-g5/out/g5-r127/cowfs/127/results/generic/127.out.bad)
+    --- tests/generic/127.out	2026-10-08 17:46:34.128221109 -0700
+    +++ /mnt/docs/Projects/cowfs-g5/out/g5-r127/cowfs/127/results/generic/127.out.bad	2026-10-08 20:39:33.490021933 -0700
+    @@ -4,4 +4,3 @@
+     All 100000 operations completed A-OK!
+     All 100000 operations completed A-OK!
+     All 100000 operations completed A-OK!
+    -All 100000 operations completed A-OK!
+    ...
+    (Run 'diff -u /mnt/docs/Projects/cowfs-g5/ref/xfstests/tests/generic/127.out /mnt/docs/Projects/cowfs-g5/out/g5-r127/cowfs/127/results/generic/127.out.bad'  to see the entire diff)
+Ran: generic/127
+Failures: generic/127
+Failed 1 of 1 tests
+

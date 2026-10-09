@@ -67,8 +67,9 @@ write (`best_effort_abandon`, which skips a held write lock) and then `kill`s th
 readable peer still gets `shutting_down` and no connection is left open behind a spawn failure.
 
 The change is confined to the deadline branch.
-The graceful path (before the deadline) and the connection thread's own `abandon_inflight` are
-unchanged, which is why `a4_a_terminal_frame_being_written_is_not_cut_by_shutdown` still holds.
+The graceful path (before the deadline) is unchanged, which is why `a4_a_terminal_frame_being_written_is_not_cut_by_shutdown` still holds.
+Separately, the connection thread's own teardown now calls `abandon_inflight_until`, which waits for
+a terminal write already in progress, bounded by the grace end, before it kills (#127).
 
 ## Why the frame is not cut
 
@@ -224,9 +225,12 @@ counterexample was measured on that source and not on the working tree.
    does not mean its handler is gone, which the spawn-failure variant demonstrated
    (`handler_alive_at_return=true`, `connection_closed_at_return=false`, `fds_at_return` 10 of 12).
    `Conn::released` is the predicate the accept loop waits on, bounded by the same grace.
-3. **Close without draining when the connection was already killed.** `drain_and_close` read away
-   what the peer sent, for up to `drain_deadline`. Past the grace there is nobody left to be polite
-   to, and that read is what held the socket open after `wait()` returned.
+3. **Close without draining once the shutdown deadline has passed.** `drain_and_close` reads away
+   what the peer sent, for up to `drain_deadline`. Past the deadline there is nobody left to be
+   polite to, and that read is what held the socket open after `wait()` returned. Every earlier
+   close still drains, as `v1-control-api.md` says. An earlier version keyed the skip on the
+   connection being killed, which `run_connection`'s caller does before every close, so it skipped
+   the drain on every teardown.
 
 ## Spawn-failure and full-buffer fallback
 

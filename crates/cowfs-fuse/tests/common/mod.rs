@@ -109,6 +109,9 @@ impl Vfs for Probe {
     fn mkdir(&self, p: Ino, n: &[u8], m: u32) -> Result<Attr> {
         self.hand(self.inner.mkdir(p, n, m))
     }
+    fn mknod(&self, p: Ino, n: &[u8], k: cowfs_vfs::FileKind, m: u32, r: u64) -> Result<Attr> {
+        self.hand(self.inner.mknod(p, n, k, m, r))
+    }
     fn symlink(&self, p: Ino, n: &[u8], t: &[u8]) -> Result<Attr> {
         self.hand(self.inner.symlink(p, n, t))
     }
@@ -250,6 +253,9 @@ impl Vfs for Probe {
     }
     fn removexattr(&self, i: Ino, n: &[u8]) -> Result<()> {
         self.inner.removexattr(i, n)
+    }
+    fn fallocate(&self, i: Ino, m: FallocMode, o: u64, l: u64) -> Result<Attr> {
+        self.inner.fallocate(i, m, o, l)
     }
 }
 

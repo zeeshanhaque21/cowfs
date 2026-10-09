@@ -107,6 +107,14 @@ pub enum FileType {
     Dir,
     /// Symbolic link.
     Symlink,
+    /// Named pipe.
+    Fifo,
+    /// Unix domain socket node.
+    Socket,
+    /// Character device node.
+    CharDevice,
+    /// Block device node.
+    BlockDevice,
 }
 
 impl FileType {
@@ -115,7 +123,24 @@ impl FileType {
             FileType::File => 1,
             FileType::Dir => 2,
             FileType::Symlink => 3,
+            FileType::Fifo => 4,
+            FileType::Socket => 5,
+            FileType::CharDevice => 6,
+            FileType::BlockDevice => 7,
         }
+    }
+
+    /// True for the four kinds that only exist as a name with attributes.
+    pub fn is_special(self) -> bool {
+        matches!(
+            self,
+            FileType::Fifo | FileType::Socket | FileType::CharDevice | FileType::BlockDevice
+        )
+    }
+
+    /// True for the kinds that carry a device number.
+    pub fn is_device(self) -> bool {
+        matches!(self, FileType::CharDevice | FileType::BlockDevice)
     }
 
     pub(crate) fn from_code(c: u8) -> Result<Self> {
@@ -123,6 +148,10 @@ impl FileType {
             1 => Ok(FileType::File),
             2 => Ok(FileType::Dir),
             3 => Ok(FileType::Symlink),
+            4 => Ok(FileType::Fifo),
+            5 => Ok(FileType::Socket),
+            6 => Ok(FileType::CharDevice),
+            7 => Ok(FileType::BlockDevice),
             _ => Err(Error::Corrupt(format!("unknown file type {c}"))),
         }
     }
@@ -163,6 +192,9 @@ pub struct Attr {
     pub nlink: u32,
     /// Size in bytes (files: logical size, symlinks: target length, directories: 0).
     pub size: u64,
+    /// Device number of a character or block device (cowfs encoding, `(major << 32) | minor`),
+    /// `0` for every other kind.
+    pub rdev: u64,
     /// Last access time.
     pub atime: Timestamp,
     /// Last modification time.
@@ -300,10 +332,14 @@ pub(crate) struct InodeRec {
     pub covered: u64,
     /// Bumped by every content change; the compare-and-swap token of `splice_content`.
     pub cversion: u64,
+    /// Device number; stored only for character and block devices, `0` otherwise.
+    pub rdev: u64,
 }
 
 const INODE_V: u8 = 2;
 const INODE_LEN: usize = 2 + 4 + 4 + 8 + 3 * 12 + 8 + 8 + 8 + 8;
+/// A device record is the plain record with `rdev` appended; no other kind has the extra bytes.
+const INODE_DEV_LEN: usize = INODE_LEN + 8;
 
 impl InodeRec {
     pub(crate) fn encode(&self) -> Vec<u8> {
@@ -321,12 +357,21 @@ impl InodeRec {
         b.extend(self.next_cookie.to_le_bytes());
         b.extend(self.covered.to_le_bytes());
         b.extend(self.cversion.to_le_bytes());
+        if self.kind.is_device() {
+            b.extend(self.rdev.to_le_bytes());
+        }
         b
     }
 
     pub(crate) fn decode(b: &[u8]) -> Result<Self> {
-        if b.len() != INODE_LEN || b[0] != INODE_V {
+        if (b.len() != INODE_LEN && b.len() != INODE_DEV_LEN) || b[0] != INODE_V {
             return Err(Error::Corrupt("bad inode record".into()));
+        }
+        let kind = FileType::from_code(b[1])?;
+        if (b.len() == INODE_DEV_LEN) != kind.is_device() {
+            return Err(Error::Corrupt(
+                "inode record length does not fit its type".into(),
+            ));
         }
         let ts = |pos| -> Result<Timestamp> {
             Ok(Timestamp {
@@ -335,7 +380,7 @@ impl InodeRec {
             })
         };
         Ok(Self {
-            kind: FileType::from_code(b[1])?,
+            kind,
             mode: u32::from_le_bytes(rd(b, 2)?),
             nlink: u32::from_le_bytes(rd(b, 6)?),
             size: u64::from_le_bytes(rd(b, 10)?),
@@ -346,6 +391,11 @@ impl InodeRec {
             next_cookie: u64::from_le_bytes(rd(b, 62)?),
             covered: u64::from_le_bytes(rd(b, 70)?),
             cversion: u64::from_le_bytes(rd(b, 78)?),
+            rdev: if b.len() == INODE_DEV_LEN {
+                u64::from_le_bytes(rd(b, INODE_LEN)?)
+            } else {
+                0
+            },
         })
     }
 
@@ -356,6 +406,7 @@ impl InodeRec {
             mode: self.mode,
             nlink: self.nlink,
             size: self.size,
+            rdev: self.rdev,
             atime: self.atime,
             mtime: self.mtime,
             ctime: self.ctime,

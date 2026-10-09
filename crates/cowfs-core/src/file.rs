@@ -238,6 +238,58 @@ impl FileData {
         self.chunks = Arc::new(list);
         Ok(())
     }
+
+    /// Makes `[a, b)` read as zeros with hole refs. The caller has flushed. Bytes at or past the
+    /// chunk-covered total are an implicit hole already, so `b` is clamped to it. A stored chunk
+    /// cut at an edge is read, verified and its surviving bytes re-chunked, as truncate does; a
+    /// chunk inside the range is dropped unread. The new list is built before it is published, so
+    /// on error nothing changes.
+    pub(crate) fn punch(
+        &mut self,
+        blocks: &Blocks,
+        entry: &Entry<'_>,
+        a: u64,
+        b: u64,
+    ) -> Result<()> {
+        if !self.dirty.is_empty() {
+            return Err(Error::Io("punch with unflushed data".into()));
+        }
+        let b = b.min(self.chunks.total());
+        if a >= b {
+            return Ok(());
+        }
+        let mut list = (*self.chunks).clone();
+        let (i, j) = (list.find(a), list.find(b - 1));
+        let (si, sj, ej) = (list.start(i), list.start(j), list.ends[j]);
+        let (first, last) = (list.refs[i], list.refs[j]);
+        let mut new = Vec::new();
+        if a > si {
+            if is_hole(&first) {
+                new = hole_refs(a - si);
+            } else {
+                let bytes = blocks.get(first.id)?;
+                check_len(&bytes, first)?;
+                for piece in chunks(&bytes[..(a - si) as usize]) {
+                    new.push(put_piece(blocks, entry, piece)?);
+                }
+            }
+        }
+        new.extend(hole_refs(b - a));
+        if b < ej {
+            if is_hole(&last) {
+                new.extend(hole_refs(ej - b));
+            } else {
+                let bytes = blocks.get(last.id)?;
+                check_len(&bytes, last)?;
+                for piece in chunks(&bytes[(b - sj) as usize..]) {
+                    new.push(put_piece(blocks, entry, piece)?);
+                }
+            }
+        }
+        list.replace(i..j + 1, new);
+        self.chunks = Arc::new(list);
+        Ok(())
+    }
 }
 
 fn check_len(bytes: &[u8], c: ChunkRef) -> Result<()> {
@@ -518,6 +570,82 @@ mod tests {
         f.truncate(&b, &gate.enter(), 0).unwrap();
         assert_eq!(f.chunks.total(), 0);
         assert!(f.chunks.refs.is_empty());
+    }
+
+    fn assert_refs_valid(f: &FileData) {
+        for r in &f.chunks.refs {
+            assert!(r.len > 0, "a zero-length ref");
+            assert_eq!(r.id == HOLE, is_hole(r), "hole flag and sentinel disagree");
+            assert!(
+                !is_hole(r) || r.len <= cowfs_store::HOLE_MAX,
+                "a hole longer than HOLE_MAX: {}",
+                r.len
+            );
+        }
+    }
+
+    #[test]
+    fn punch_keeps_refs_valid_and_matches_the_model() {
+        let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
+        let data = pattern(3 << 20, 8);
+        let mut f = FileData::default();
+        f.write(0, &data);
+        f.flush(&b, &gate.enter()).unwrap();
+        let total = f.chunks.total();
+        // unaligned edges inside stored chunks, a punch that spans many chunks, a punch inside
+        // an existing hole, and one that runs past the chunk-covered total
+        let mut m = data.clone();
+        for (a, e) in [
+            (1000u64, 2000u64),
+            (500_000, 1_900_000),
+            (700_000, 800_000),
+            (total - 5, total + 1_000_000),
+        ] {
+            f.punch(&b, &gate.enter(), a, e).unwrap();
+            m[a as usize..(e.min(total)) as usize].fill(0);
+            assert_eq!(f.chunks.total(), total, "punch changed the covered total");
+            assert_refs_valid(&f);
+            assert_eq!(read_range(&b, &f.chunks, &[], 0, total).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn a_punch_on_chunk_boundaries_touches_no_surviving_chunk() {
+        let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
+        let data = pattern(3 << 20, 9);
+        let mut f = FileData::default();
+        f.write(0, &data);
+        f.flush(&b, &gate.enter()).unwrap();
+        let before = f.chunks.refs.clone();
+        let ends = f.chunks.ends.clone();
+        assert!(ends.len() > 6, "the file must span many chunks");
+        let (k, m) = (1usize, 4usize);
+        f.punch(&b, &gate.enter(), ends[k], ends[m]).unwrap();
+        // refs 0..=k and m+1.. are the same stored chunks, byte for byte, and nothing was re-put
+        let after = &f.chunks.refs;
+        assert_eq!(&after[..=k], &before[..=k]);
+        assert_eq!(
+            &after[after.len() - (before.len() - m - 1)..],
+            &before[m + 1..]
+        );
+        assert!(after[k + 1..after.len() - (before.len() - m - 1)]
+            .iter()
+            .all(is_hole));
+        assert_eq!(f.chunks.total(), *ends.last().unwrap());
+    }
+
+    #[test]
+    fn a_punch_across_the_longest_hole_ref_splits_it_validly() {
+        let (_d, b) = blocks();
+        let gate = crate::gate::Gate::new();
+        let n = 3 * u64::from(cowfs_store::HOLE_MAX);
+        let mut f = FileData::new(hole_refs(n));
+        f.punch(&b, &gate.enter(), 1, n - 1).unwrap();
+        assert_eq!(f.chunks.total(), n);
+        assert_refs_valid(&f);
+        assert_eq!(f.chunks.stored_bytes(), 0);
     }
 
     #[test]

@@ -192,6 +192,12 @@ impl Vfs for SharedBackend {
         self.leave();
         r
     }
+    fn mknod(&self, p: Ino, n: &[u8], k: cowfs_vfs::FileKind, m: u32, r: u64) -> Result<Attr> {
+        self.enter();
+        let res = self.inner.mknod(p, n, k, m, r);
+        self.leave();
+        res
+    }
     fn symlink(&self, p: Ino, n: &[u8], t: &[u8]) -> Result<Attr> {
         self.enter();
         let r = self.inner.symlink(p, n, t);

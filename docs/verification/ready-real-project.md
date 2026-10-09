@@ -72,8 +72,9 @@ otherwise passes, so it is counted inside the 14.
 
 `acceptance.jsonl` is the file the run recorded here wrote, and nothing else wrote to it: 28 rows,
 24 carrying `outcome: "measured"`, 4 carrying `outcome: "cleanup"`, and **zero rows without an
-outcome**, which `the_acceptance_receipt_states_what_was_measured` asserts. Its own summary row
-reads 27, because it counted before appending itself.
+outcome**, which `the_receipt_of_a_real_run_states_what_was_measured` asserts (and each row is
+checked as it is written). That audit is `#[ignore]`d and run after the acceptance, because it reads
+the receipt of a real run. Its own summary row reads 27, because it counted before appending itself.
 
 `acceptance-a64e118-pre.jsonl` is a different file from an earlier run: 42 rows, 37 `measured`, 5
 `cleanup`, 0 without an outcome. **Neither row count is a count of tests.** Executions are counted
@@ -91,7 +92,7 @@ Each is a synthetic input or a process this lane starts. No mount, no daemon, no
 | `a_recycled_pid_with_the_same_argv_is_refused` | 2 | PASS: same argv with a different start time is refused |
 | `a_claim_of_a_published_warm_base_is_refused_in_both_shapes` | 9 | PASS: both claim shapes refused, five non-claims not read as claims, typed serialisation proven |
 | `the_mount_readback_is_tri_state_and_never_foreign` | 5 | PASS: empty and unparsable tables are Unknown, prefix siblings excluded |
-| `the_acceptance_receipt_states_what_was_measured` | live | PASS on a clean receipt |
+| `the_acceptance_receipt_states_what_was_measured` | live | PASS: builds its own receipts in a tempdir, clean one passes, empty, skip-when-required, warm claims in four shapes and outcome-less rows refused |
 
 Four negative controls that must fail, each observed failing:
 

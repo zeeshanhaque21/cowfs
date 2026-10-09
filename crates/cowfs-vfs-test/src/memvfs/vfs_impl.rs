@@ -64,9 +64,9 @@ impl Vfs for MemVfs {
             match kind {
                 FileKind::Directory => return Err(Error::IsDir),
                 FileKind::Symlink => return Err(Error::InvalidArgument),
-                FileKind::Regular if size > MAX_FILE => return Err(Error::NoSpace),
+                FileKind::Regular if size > MAX_FILE => return Err(Error::FileTooBig),
                 FileKind::Regular => {}
-                _ => return Err(Error::NotSupported),
+                _ => return Err(Error::InvalidArgument),
             }
         }
         let t = st.now();
@@ -135,6 +135,31 @@ impl Vfs for MemVfs {
     fn mkdir(&self, parent: Ino, name: &[u8], mode: u32) -> Result<Attr> {
         self.lock()
             .new_entry(parent, name, Body::Dir(Dir::new(parent)), mode)
+    }
+
+    fn mknod(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<Attr> {
+        if !kind.is_special() || (rdev != 0 && !kind.is_device()) {
+            return Err(Error::InvalidArgument);
+        }
+        let mut st = self.lock();
+        let rdev = if st.f(Fault::MknodDropsRdev) { 0 } else { rdev };
+        let skip_times = st.f(Fault::MknodNoParentTimes);
+        let before = st.nodes.get(&parent).map(|n| (n.mtime, n.ctime));
+        let a = st.new_entry(parent, name, Body::Special { kind, rdev }, mode)?;
+        if let (true, Some((m, c))) = (skip_times, before) {
+            if let Some(n) = st.nodes.get_mut(&parent) {
+                n.mtime = m;
+                n.ctime = c;
+            }
+        }
+        Ok(a)
     }
 
     fn symlink(&self, parent: Ino, name: &[u8], target: &[u8]) -> Result<Attr> {
@@ -352,7 +377,8 @@ impl Vfs for MemVfs {
                 Ok(data)
             }
             Body::Dir(_) => Err(Error::IsDir),
-            Body::Symlink { .. } => Err(Error::InvalidArgument),
+            Body::Special { .. } if st.f(Fault::SpecialReadOk) => Ok(Vec::new()),
+            Body::Symlink { .. } | Body::Special { .. } => Err(Error::InvalidArgument),
         }
     }
 
@@ -373,7 +399,7 @@ impl Vfs for MemVfs {
             });
         };
         if offset.saturating_add(u64::from(len)) > MAX_FILE {
-            return Err(Error::NoSpace);
+            return Err(Error::FileTooBig);
         }
         if len == 0 {
             return Ok(0);
@@ -389,6 +415,61 @@ impl Vfs for MemVfs {
         } else {
             len
         })
+    }
+
+    fn fallocate(&self, ino: Ino, mode: FallocMode, offset: u64, len: u64) -> Result<Attr> {
+        let mut st = self.lock();
+        let no_extend = st.f(Fault::ZeroRangeNoExtend);
+        let zero_len_ok = st.f(Fault::FallocZeroLenOk);
+        let no_times = st.f(Fault::FallocNoTimes);
+        let (noop, shrinks, punch_grows) = (
+            st.f(Fault::PunchNoop),
+            st.f(Fault::AllocateShrinks),
+            st.f(Fault::PunchChangesSize),
+        );
+        let n = st.node_mut(ino)?;
+        let kind = n.kind();
+        let Body::File(p) = &mut n.body else {
+            return Err(if kind == FileKind::Directory {
+                Error::IsDir
+            } else {
+                Error::InvalidArgument
+            });
+        };
+        if len == 0 {
+            if zero_len_ok {
+                return st.attr(ino);
+            }
+            return Err(Error::InvalidArgument);
+        }
+        let end = offset
+            .checked_add(len)
+            .filter(|&e| e <= MAX_FILE)
+            .ok_or(Error::FileTooBig)?;
+        let (zero, extend) = match mode {
+            FallocMode::Allocate => (false, true),
+            FallocMode::KeepSize => (false, false),
+            FallocMode::PunchHole => (true, punch_grows),
+            FallocMode::ZeroRangeKeepSize => (true, false),
+            FallocMode::ZeroRange => (true, !no_extend),
+            _ => return Err(Error::NotSupported),
+        };
+        let old = p.size;
+        if zero && !noop {
+            p.punch(offset, end.min(old));
+        }
+        if extend && (end > old || shrinks && mode == FallocMode::Allocate) {
+            p.size = end;
+        }
+        let grew = p.size > old;
+        let t = st.now();
+        if no_times {
+        } else if zero || grew {
+            st.touch_data(ino, t);
+        } else {
+            st.bump_ctime(ino, t);
+        }
+        st.attr(ino)
     }
 
     fn flush(&self, ino: Ino) -> Result<()> {

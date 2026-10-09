@@ -61,7 +61,12 @@ fn next_store_id() -> u64 {
 
 /// "COWFSMET": identifies a cowfs-meta database among redb files.
 pub(crate) const MAGIC: u64 = 0x434f_5746_534d_4554;
+/// The version a new store is created with.
 pub(crate) const FORMAT_VERSION: u64 = 2;
+/// The version of a store that holds, or has held, a special file. It is written by the same
+/// commit that first persists one, so a build that only knows version 2 refuses the store up
+/// front instead of meeting an inode type it cannot decode (which poisons its session).
+pub(crate) const SPECIAL_VERSION: u64 = 3;
 const REAP_BUDGET: usize = 256;
 const REAP_DURABLE_EVERY: u64 = 16;
 const REAP_TIME: Duration = Duration::from_millis(4);
@@ -329,6 +334,9 @@ pub(crate) struct Session {
     /// closed session is refused because it is not in this set.
     pub(crate) reserved: std::collections::HashSet<Ino>,
     pub(crate) next_snapshot: u64,
+    /// The store holds a special file, or this session has made one: commits write
+    /// `SPECIAL_VERSION`.
+    pub(crate) special: bool,
     applied: u64,
     durable: u64,
     pending_ops: u32,
@@ -706,6 +714,7 @@ impl Inner {
                                     next_cookie: 1,
                                     covered: 0,
                                     cversion: 0,
+                                    rdev: 0,
                                 };
                                 let empty = Lazy::new(&self.db, &self.cache);
                                 tree.insert(&empty, &key(ROOT_INO, K_INODE, &[]), rec.encode())?;
@@ -760,6 +769,9 @@ impl Inner {
                     s.ino.reserved
                 };
                 meta.insert("ino_reserved", reserved)?;
+                if s.special {
+                    meta.insert("version", SPECIAL_VERSION)?;
+                }
             }
             #[cfg(test)]
             if commit_fault() == 1 {
@@ -1033,6 +1045,7 @@ impl Inner {
             }
             let e = s.snaps.get_mut(&id).ok_or(Error::NoSuchSnapshot)?;
             let saved = e.tree.clone();
+            let saved_special = s.special;
             let lazy = Lazy::new(&self.db, &self.cache);
             let reserve = |n: u64| self.reserve_durable(n);
             // numbers spent inside this one transaction; a second create at the same number in the
@@ -1043,6 +1056,7 @@ impl Inner {
                     tree: &mut e.tree,
                     src: &lazy,
                     ino: &mut s.ino,
+                    special: &mut s.special,
                     reserve: &reserve,
                     store,
                     reserved: &s.reserved,
@@ -1054,10 +1068,12 @@ impl Inner {
             let out = match res {
                 Err(p) => {
                     e.tree = saved;
+                    s.special = saved_special;
                     resume_unwind(p);
                 }
                 Ok(Err(er)) => {
                     e.tree = saved;
+                    s.special = saved_special;
                     self.note(&er);
                     return Err(er);
                 }
@@ -1659,9 +1675,9 @@ impl Meta {
             ));
         }
         let version = meta_get(&meta, "version")?;
-        if version != FORMAT_VERSION {
+        if version != FORMAT_VERSION && version != SPECIAL_VERSION {
             return Err(Error::Format(format!(
-                "format version {version}, this build reads {FORMAT_VERSION}"
+                "format version {version}, this build reads {FORMAT_VERSION} and {SPECIAL_VERSION}"
             )));
         }
         let node_max = usize::try_from(meta_get(&meta, "node_size")?)
@@ -1705,6 +1721,7 @@ impl Meta {
                 block: stored_block.unwrap_or(ino_block),
             },
             next_snapshot: meta_get(&meta, "next_snapshot")?,
+            special: version == SPECIAL_VERSION,
             reserved: HashSet::new(),
             applied: 0,
             durable: 0,
@@ -1981,6 +1998,8 @@ forward_writes! {
     mkdir(dir: Ino, name: &[u8], mode: u32) -> Attr;
     /// Creates a symbolic link. See [`Tx::symlink`].
     symlink(dir: Ino, name: &[u8], target: &[u8]) -> Attr;
+    /// Creates a fifo, socket or device node. See [`Tx::mknod`].
+    mknod(dir: Ino, name: &[u8], kind: FileType, mode: u32, rdev: u64) -> Attr;
     /// Adds a hardlink. See [`Tx::link`].
     link(ino: Ino, dir: Ino, name: &[u8]) -> Attr;
     /// Removes a name of a file or symlink. See [`Tx::unlink`].
@@ -2826,6 +2845,33 @@ mod tests {
         let s2 = again.snapshot_by_id(SnapshotId(1)).unwrap();
         let err = s2.batch(|tx| tx.create_at(ROOT_INO, b"x", 0o644, &tickets[0]));
         assert!(err.is_err(), "a stale ticket was accepted: {err:?}");
+    }
+
+    /// The format version moves in the same write transaction as the first special file: when that
+    /// commit fails, neither the node nor version 3 reaches the disk.
+    #[test]
+    fn a_failed_commit_of_the_first_special_file_leaves_version_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = open_durable(dir.path(), "m.redb");
+        let s = m.new_snapshot("s").unwrap();
+        set_commit_fault(1);
+        let failed = s.mknod(ROOT_INO, b"p", FileType::Fifo, 0o644, 0);
+        let closed = m.close();
+        set_commit_fault(0);
+        assert!(failed.is_err() && closed.is_err(), "{failed:?} {closed:?}");
+        drop(s);
+        drop(m);
+        let again = Meta::open(dir.path().join("m.redb"), opts_durable()).unwrap();
+        let rtx = again.h.inner.db.begin_read().unwrap();
+        let version = meta_get(&rtx.open_table(META).unwrap(), "version").unwrap();
+        assert_eq!(version, FORMAT_VERSION);
+        drop(rtx);
+        let reopened = again.snapshot_by_id(SnapshotId(1)).unwrap();
+        assert!(matches!(
+            reopened.lookup(ROOT_INO, b"p"),
+            Err(Error::NotFound)
+        ));
+        again.check().unwrap();
     }
 
     // T12: a closure error does not spend the ticket, so a retry uses the same number.

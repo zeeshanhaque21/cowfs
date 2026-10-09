@@ -168,6 +168,9 @@ pub fn digest(m: &Meta) -> [u8; 32] {
                             h.update(&s.readlink(e.ino).unwrap());
                         }
                         FileType::Dir => work.push(e.ino),
+                        _ => {
+                            h.update(&a.rdev.to_le_bytes());
+                        }
                     }
                     for x in s.listxattr(e.ino).unwrap() {
                         h.update(&x);

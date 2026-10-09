@@ -1,0 +1,85 @@
+{
+ "verdict": "DIAGNOSTIC",
+ "exit": 0,
+ "mode": "diagnostic",
+ "problems": [],
+ "counts": {
+  "both_pass": 6
+ },
+ "requested": 6,
+ "native_status": {
+  "PASS": 6
+ },
+ "cowfs_status": {
+  "PASS": 6
+ },
+ "other": {},
+ "worse": [],
+ "gap": {},
+ "emulated": [],
+ "better": [],
+ "cowfs_not_run_by_class": {},
+ "native_not_run_by_class": {},
+ "unclassified": [],
+ "labels": {
+  "generic/005": "both_pass",
+  "generic/236": "both_pass",
+  "generic/245": "both_pass",
+  "generic/309": "both_pass",
+  "generic/360": "both_pass",
+  "generic/755": "both_pass"
+ },
+ "meta": {
+  "tree_head": "3e1ee800e52a0f53d7d9a7809be1ffc80ec1788f",
+  "tree_porcelain": "",
+  "check_sha256": "53dd21653ec6eabd15b3d7e73b821b9fcc98202d3c791a65768329897bd69e18",
+  "cowfs_bin": "/mnt/docs/Projects/cowfs-g5/target/release/cowfs-daemon",
+  "cowfs_bin_sha256": "bf6d2e1104b227ddb4061f341848c0edccc5209dc139475915e046fb9bbacebc",
+  "cowfs_profile": "release",
+  "cowfs_rev": "unrecorded",
+  "kernel": "7.2.8-2-cachyos",
+  "case_sha.005": "a71a9caf6b970c124daeddd9d0276216f4508e81b27443f5d1a3ecae7bd63abf",
+  "case_sha.236": "57623690df623c908188a624063e22e073253055f080af51ed457d10f8faed5f",
+  "case_sha.245": "2931ec29e7019431de5f48d5606153e8cf7e8656abe3f8ecc3cb13aced0c8063",
+  "case_sha.309": "3991c44729210922e8b0083dd9fa810530e9f912c7673d7d06b946b87739cd46",
+  "case_sha.360": "b9a0832d1cab29c7367ae641d1c35e65c0b9356a5bc1a818a895b0ca7929a393",
+  "case_sha.755": "933ebd3dce19deadd0c0a4cef6a3fee41c7c69aa0bdab6c9c81a8dbfd6ac1520"
+ },
+ "control": {
+  "status": "FAIL",
+  "problems": []
+ },
+ "label": "diagnostic only, not acceptance",
+ "cases": {
+  "generic/005": {
+   "native": "PASS",
+   "cowfs": "PASS",
+   "reason": null
+  },
+  "generic/236": {
+   "native": "PASS",
+   "cowfs": "PASS",
+   "reason": null
+  },
+  "generic/245": {
+   "native": "PASS",
+   "cowfs": "PASS",
+   "reason": null
+  },
+  "generic/309": {
+   "native": "PASS",
+   "cowfs": "PASS",
+   "reason": null
+  },
+  "generic/360": {
+   "native": "PASS",
+   "cowfs": "PASS",
+   "reason": null
+  },
+  "generic/755": {
+   "native": "PASS",
+   "cowfs": "PASS",
+   "reason": null
+  }
+ }
+}

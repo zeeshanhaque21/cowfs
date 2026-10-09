@@ -30,6 +30,7 @@ impl Inner {
             gid: self.gid,
             size: DIR_SIZE,
             blocks: DIR_SIZE / 512,
+            rdev: 0,
             atime: t,
             mtime: t,
             ctime: t,
@@ -195,6 +196,11 @@ impl Inner {
             Create::File => (FileKind::Regular, 1, 0, None, mode & MODE_MASK),
             Create::Dir => (FileKind::Directory, 2, 0, None, mode & MODE_MASK),
             Create::Symlink(t) => (FileKind::Symlink, 1, t.len() as u64, Some(t.clone()), 0o777),
+            Create::Special { kind, .. } => (*kind, 1, 0, None, mode & MODE_MASK),
+        };
+        let rdev = match &what {
+            Create::Special { rdev, .. } => *rdev,
+            _ => 0,
         };
         let st = NodeState {
             attr: Attr {
@@ -206,6 +212,7 @@ impl Inner {
                 gid: self.gid,
                 size,
                 blocks: 0,
+                rdev,
                 atime: now,
                 mtime: now,
                 ctime: now,

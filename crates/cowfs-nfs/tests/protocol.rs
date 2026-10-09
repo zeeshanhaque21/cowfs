@@ -21,14 +21,14 @@ fn null_and_unknown_procedures() {
     assert_eq!(acc, 3, "PROC_UNAVAIL");
     let (acc, _) = c.raw(100_999, 3, 0, Args::new());
     assert_eq!(acc, 1, "PROG_UNAVAIL");
-    let (st, _) = c.call(11, Args::new());
-    assert_eq!(st, NOTSUPP, "MKNOD");
 }
 
 #[test]
 fn malformed_arguments_get_garbage_args() {
     let (_s, mut c) = setup();
-    for proc in [1, 2, 3, 6, 7, 8, 9, 10, 12, 14, 15, 16, 17, 18, 19, 20, 21] {
+    for proc in [
+        1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21,
+    ] {
         let (acc, _) = c.raw(100_003, 3, proc, Args::new().put(&1u32));
         assert_eq!(acc, 4, "proc {proc}");
     }
@@ -226,6 +226,18 @@ fn setattr_variants() {
     assert_eq!(c.setattr(&root, sattr_size(0)).0, ISDIR);
     let (st, _) = c.setattr(&f, sattr3_default());
     assert_eq!(st, OK, "empty setattr succeeds");
+}
+
+/// g3: macOS ftruncate(2) to 999999999999999 must see EFBIG (pjdfstest ftruncate/12.t), which
+/// the NFS client takes from NFS3ERR_FBIG, not ENOSPC from NFS3ERR_NOSPC.
+#[test]
+fn setattr_size_past_the_file_limit_is_fbig() {
+    let (_s, mut c) = setup();
+    let root = c.root.clone();
+    let f = c.create_file(&root, "f");
+    let (st, _) = c.setattr(&f, sattr_size(999_999_999_999_999));
+    assert_eq!(st, nfsstat3::NFS3ERR_FBIG as u32);
+    assert_eq!(c.attrs(&f).size, 0, "a refused truncate changes nothing");
 }
 
 #[test]

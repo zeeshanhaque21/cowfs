@@ -33,6 +33,27 @@ const FAST: &[(Fault, &[&str])] = &[
         &["appledouble_names_are_ordinary"],
     ),
     (Fault::UnlinkLeaksSpace, &["statfs_free_after_unlink"]),
+    (
+        Fault::PunchNoop,
+        &["fallocate_punch_reads_zeros_keeps_size"],
+    ),
+    (
+        Fault::AllocateShrinks,
+        &["fallocate_allocate_and_keep_size"],
+    ),
+    (Fault::MknodDropsRdev, &["mknod_device_attrs_keep_rdev"]),
+    (Fault::SpecialReadOk, &["special_io_is_invalid"]),
+    (Fault::MknodNoParentTimes, &["mknod_fifo_attrs"]),
+    (
+        Fault::PunchChangesSize,
+        &["fallocate_punch_reads_zeros_keeps_size"],
+    ),
+    (Fault::ZeroRangeNoExtend, &["fallocate_zero_range_modes"]),
+    (Fault::FallocZeroLenOk, &["fallocate_errors"]),
+    (
+        Fault::FallocNoTimes,
+        &["fallocate_content_change_bumps_mtime_and_ctime"],
+    ),
 ];
 
 #[test]

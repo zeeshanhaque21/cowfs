@@ -198,6 +198,10 @@ fn file_type(ino: Ino, kind: FileKind) -> R<FileType> {
         FileKind::Regular => FileType::RegularFile,
         FileKind::Directory => FileType::Directory,
         FileKind::Symlink => FileType::Symlink,
+        FileKind::Fifo => FileType::NamedPipe,
+        FileKind::Socket => FileType::Socket,
+        FileKind::CharDevice => FileType::CharDevice,
+        FileKind::BlockDevice => FileType::BlockDevice,
         _ => {
             log::error!("the Vfs reported a file kind this adapter does not know for inode {ino}");
             return Err(libc::EIO);
@@ -220,7 +224,7 @@ fn file_attr(a: &Attr, uid: u32, gid: u32) -> R<FileAttr> {
         nlink: a.nlink,
         uid,
         gid,
-        rdev: 0,
+        rdev: convert::rdev_to_kernel(a.rdev),
         blksize: BLKSIZE,
         flags: 0,
     })
@@ -445,6 +449,14 @@ impl Core {
         Ok((n.min(max), stale))
     }
 
+    /// The kernel updates its own size and drops the page-cache range after a success, so there is
+    /// no attribute to hand back.
+    fn fallocate(&self, ino: Ino, mode: i32, off: i64, len: i64) -> R<()> {
+        let mode = convert::falloc_mode(mode)?;
+        let (off, len) = (offset(off)?, offset(len)?);
+        self.call(|v| v.fallocate(ino, mode, off, len)).map(|_| ())
+    }
+
     fn invalidate_attr(&self, ino: Ino) {
         if let Some(n) = self.sh.notifier.get() {
             if let Err(e) = n.inval_inode(ino, -1, 0) {
@@ -605,21 +617,34 @@ impl Filesystem for Fs {
 
     fn mknod(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         n: &OsStr,
         mode: u32,
         _umask: u32,
-        _rdev: u32,
+        rdev: u32,
         reply: ReplyEntry,
     ) {
-        if !convert::mknod_is_regular(mode) {
-            return reply.error(libc::ENOTSUP);
+        let special = match convert::mknod_kind(mode) {
+            Ok(k) => k,
+            Err(e) => return reply.error(e),
+        };
+        // The kernel already demands CAP_MKNOD for a device; this is the second line.
+        if special.is_some_and(FileKind::is_device) && req.uid() != 0 {
+            return reply.error(libc::EPERM);
         }
+        let rdev = if special.is_some_and(FileKind::is_device) {
+            convert::rdev_from_kernel(rdev)
+        } else {
+            0
+        };
         let n = n.to_owned();
         self.lane(Class::Meta, parent, move |c| {
             let r = name(&n).and_then(|nm| {
-                let a = c.call(|v| v.create(parent, nm, mode & MODE_MASK))?;
+                let a = match special {
+                    Some(kind) => c.call(|v| v.mknod(parent, nm, kind, mode & MODE_MASK, rdev))?,
+                    None => c.call(|v| v.create(parent, nm, mode & MODE_MASK))?,
+                };
                 c.referenced(parent, nm, &a, true)
             });
             match r {
@@ -992,14 +1017,16 @@ impl Filesystem for Fs {
     fn fallocate(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
-        _offset: i64,
-        _length: i64,
-        _mode: i32,
+        offset: i64,
+        length: i64,
+        mode: i32,
         reply: ReplyEmpty,
     ) {
-        reply.error(libc::ENOTSUP);
+        self.lane(Class::Write, ino, move |c| {
+            empty(c.fallocate(ino, mode, offset, length), reply)
+        });
     }
 
     fn copy_file_range(
@@ -1037,6 +1064,7 @@ mod tests {
             gid: 0,
             size: 9,
             blocks: 1,
+            rdev: 0,
             atime: t,
             mtime: t,
             ctime: t,

@@ -1,0 +1,20 @@
+FSTYP         -- fuse
+PLATFORM      -- Linux/x86_64 cachyos-x8664 7.2.8-2-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 01 Oct 2026 21:19:14 +0000
+
+generic/087        - output mismatch (see /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/087/results/generic/087.out.bad)
+    --- tests/generic/087.out	2026-10-08 17:46:34.126221093 -0700
+    +++ /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/087/results/generic/087.out.bad	2026-10-08 20:15:04.827313449 -0700
+    @@ -1,7 +1,7 @@
+     QA output created by 087
+    -t a 600 file owned by (99/99) as user/group(99/99)  PASS
+    -T a 600 file owned by (99/99) as user/group(99/99)  PASS
+    +t a 600 file owned by (99/99) as user/group(99/99)  FAIL
+    +T a 600 file owned by (99/99) as user/group(99/99)  FAIL
+     t a 600 file owned by (99/99) as user/group(100/99)  PASS
+     T a 600 file owned by (99/99) as user/group(100/99)  PASS
+    ...
+    (Run 'diff -u /mnt/docs/Projects/cowfs-g5/ref/xfstests/tests/generic/087.out /mnt/docs/Projects/cowfs-g5/out/g5-wide2/cowfs/087/results/generic/087.out.bad'  to see the entire diff)
+Ran: generic/087
+Failures: generic/087
+Failed 1 of 1 tests
+

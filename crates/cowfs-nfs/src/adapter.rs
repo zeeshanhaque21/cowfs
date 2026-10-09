@@ -10,12 +10,12 @@ use cowfs_vfs::{
     Vfs, NAME_MAX, ROOT_INO,
 };
 use nfsserve::nfs::{
-    cookie3, count3, createverf3, fattr3, fileid3, filename3, fsstat3, nfs_fh3, nfspath3, nfsstat3,
-    sattr3, set_mode3, set_uid3,
+    cookie3, count3, createverf3, fattr3, fileid3, filename3, fsstat3, ftype3, nfs_fh3, nfspath3,
+    nfsstat3, sattr3, set_mode3, set_uid3, specdata3,
 };
 use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult};
 
-use crate::convert::{fattr, set_attr};
+use crate::convert::{self, fattr, set_attr};
 use crate::errors::nfsstat;
 use crate::handle::{HandleCodec, Kind};
 use crate::sidecar::{PerIno, SidecarBuffers};
@@ -699,6 +699,39 @@ impl Adapter {
         })
     }
 
+    pub fn mknod(
+        &self,
+        dir: fileid3,
+        name: &[u8],
+        ftype: ftype3,
+        attr: &sattr3,
+        dev: specdata3,
+    ) -> NfsResult<(fileid3, fattr3)> {
+        let d = self.ident(dir);
+        not_side(d)?;
+        new_name(name)?;
+        let kind = convert::mknod_kind(ftype).ok_or(nfsstat3::NFS3ERR_BADTYPE)?;
+        let rdev = if kind.is_device() {
+            convert::rdev(dev)
+        } else {
+            0
+        };
+        self.with_names(d.ino, || {
+            self.not_a_view(d.ino, name)?;
+            let mode = match attr.mode {
+                set_mode3::mode(m) => m,
+                set_mode3::Void => 0o644,
+            };
+            let a = self
+                .vfs
+                .mknod(d.ino, name, kind, mode, rdev)
+                .map_err(stat)?;
+            self.handed_out(Some(d.ino), &a);
+            self.durable(d.ino)?;
+            Ok((self.id_of(Id::plain(a.ino)), self.fa(&a, Kind::Plain)?))
+        })
+    }
+
     pub fn symlink(
         &self,
         dir: fileid3,
@@ -1102,6 +1135,19 @@ impl NFSFileSystem for CowNfs {
     ) -> NfsResult<(fileid3, fattr3)> {
         let (name, attr) = (name.clone(), *attr);
         self.run(move |a| a.mkdir(dirid, &name, &attr)).await
+    }
+
+    async fn mknod(
+        &self,
+        dirid: fileid3,
+        name: &filename3,
+        ftype: ftype3,
+        attr: &sattr3,
+        rdev: specdata3,
+    ) -> NfsResult<(fileid3, fattr3)> {
+        let (name, attr) = (name.clone(), *attr);
+        self.run(move |a| a.mknod(dirid, &name, ftype, &attr, rdev))
+            .await
     }
 
     async fn symlink(

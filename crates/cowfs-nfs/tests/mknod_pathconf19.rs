@@ -1,39 +1,90 @@
-//! MKNOD refusals and PATHCONF values over raw NFSv3, against the in-process server over `MemVfs`.
+//! MKNOD and PATHCONF values over raw NFSv3, against the in-process server over `MemVfs`.
 mod common;
 
 use common::*;
 use cowfs_nfs::MountOptions;
-use nfsserve::nfs::{ftype3, nfs_fh3, post_op_attr, specdata3};
+use nfsserve::nfs::{ftype3, nfs_fh3, nfsstat3, post_op_attr, specdata3};
 
-fn mknod(c: &mut Nfs, dir: &nfs_fh3, n: &str, kind: ftype3) -> u32 {
+fn mknod_args(dir: &nfs_fh3, n: &str, kind: ftype3, mode: u32, dev: (u32, u32)) -> Args {
     let mut a = Args::new()
         .put(&dirop(dir, n))
         .put(&(kind as u32))
-        .put(&sattr_mode(0o600));
+        .put(&sattr_mode(mode));
     if matches!(kind, ftype3::NF3CHR | ftype3::NF3BLK) {
         a = a.put(&specdata3 {
-            specdata1: 1,
-            specdata2: 3,
+            specdata1: dev.0,
+            specdata2: dev.1,
         });
     }
-    c.call(11, a).0
+    a
+}
+
+/// MKNOD as root (AUTH_NULL counts as root).
+fn mknod(c: &mut Nfs, dir: &nfs_fh3, n: &str, kind: ftype3, dev: (u32, u32)) -> u32 {
+    c.call(11, mknod_args(dir, n, kind, 0o640, dev)).0
 }
 
 #[test]
-fn mknod_refuses_fifo_socket_and_devices_without_creating_anything() {
+fn mknod_creates_fifo_socket_and_devices_with_type_mode_and_rdev() {
+    let (_s, mut c) = serve(memfs(), MountOptions::default());
+    let root = c.root.clone();
+    for (kind, n, dev) in [
+        (ftype3::NF3FIFO, "fifo", (0, 0)),
+        (ftype3::NF3SOCK, "sock", (0, 0)),
+        (ftype3::NF3CHR, "chr", (1, 3)),
+        (ftype3::NF3BLK, "blk", (8, 16)),
+    ] {
+        assert_eq!(mknod(&mut c, &root, n, kind, dev), OK, "MKNOD {n}");
+        let fh = c.must_lookup(&root, n);
+        let (st, a) = c.getattr(&fh);
+        let a = a.expect("attributes");
+        assert_eq!(st, OK);
+        assert_eq!(a.ftype as u32, kind as u32, "{n} type");
+        assert_eq!(a.mode, 0o640, "{n} mode");
+        assert_eq!((a.nlink, a.size), (1, 0), "{n} nlink and size");
+        assert_eq!((a.rdev.specdata1, a.rdev.specdata2), dev, "{n} rdev");
+        assert_eq!(
+            mknod(&mut c, &root, n, kind, dev),
+            EXIST,
+            "second MKNOD {n}"
+        );
+    }
+}
+
+#[test]
+fn mknod_refuses_regular_and_directory_types_with_badtype_and_creates_nothing() {
     let (_s, mut c) = serve(memfs(), MountOptions::default());
     let root = c.root.clone();
     let before = c.names(&root);
+    let badtype = nfsstat3::NFS3ERR_BADTYPE as u32;
     for (kind, n) in [
-        (ftype3::NF3FIFO, "fifo"),
-        (ftype3::NF3SOCK, "sock"),
-        (ftype3::NF3CHR, "chr"),
-        (ftype3::NF3BLK, "blk"),
+        (ftype3::NF3REG, "reg"),
+        (ftype3::NF3DIR, "dir"),
+        (ftype3::NF3LNK, "lnk"),
     ] {
-        assert_eq!(mknod(&mut c, &root, n, kind), NOTSUPP, "MKNOD {n}");
+        let a = Args::new().put(&dirop(&root, n)).put(&(kind as u32));
+        assert_eq!(c.call(11, a).0, badtype, "MKNOD {n}");
         assert_eq!(c.lookup(&root, n).0, NOENT, "{n} must not exist");
     }
     assert_eq!(c.names(&root), before, "readdir shows no new entry");
+}
+
+#[test]
+fn mknod_of_a_device_needs_root_but_a_fifo_does_not() {
+    let (_s, mut c) = serve(memfs(), MountOptions::default());
+    let root = c.root.clone();
+    let perm = nfsstat3::NFS3ERR_PERM as u32;
+    for (kind, n) in [(ftype3::NF3CHR, "chr"), (ftype3::NF3BLK, "blk")] {
+        let (st, _) = c.call_as(1000, 11, mknod_args(&root, n, kind, 0o600, (1, 3)));
+        assert_eq!(st, perm, "MKNOD {n} as uid 1000");
+        assert_eq!(c.lookup(&root, n).0, NOENT, "{n} must not exist");
+        let (st, _) = c.call_as(0, 11, mknod_args(&root, n, kind, 0o600, (1, 3)));
+        assert_eq!(st, OK, "MKNOD {n} as root");
+    }
+    for (kind, n) in [(ftype3::NF3FIFO, "fifo"), (ftype3::NF3SOCK, "sock")] {
+        let (st, _) = c.call_as(1000, 11, mknod_args(&root, n, kind, 0o600, (0, 0)));
+        assert_eq!(st, OK, "MKNOD {n} as uid 1000");
+    }
 }
 
 #[test]

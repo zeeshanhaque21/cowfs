@@ -1,5 +1,7 @@
 //! Conversions between `cowfs_vfs` types and NFSv3 wire types.
-use cowfs_vfs::{Attr, FileKind, SetAttr, SetTime, Timestamp, MODE_MASK};
+use cowfs_vfs::{
+    dev_major, dev_minor, makedev, Attr, FileKind, SetAttr, SetTime, Timestamp, MODE_MASK,
+};
 use nfsserve::nfs::{
     fattr3, ftype3, nfsstat3, nfstime3, sattr3, set_atime, set_mode3, set_mtime, set_size3,
     specdata3,
@@ -30,6 +32,10 @@ pub fn ftype(kind: FileKind) -> Result<ftype3, nfsstat3> {
         FileKind::Regular => ftype3::NF3REG,
         FileKind::Directory => ftype3::NF3DIR,
         FileKind::Symlink => ftype3::NF3LNK,
+        FileKind::Fifo => ftype3::NF3FIFO,
+        FileKind::Socket => ftype3::NF3SOCK,
+        FileKind::CharDevice => ftype3::NF3CHR,
+        FileKind::BlockDevice => ftype3::NF3BLK,
         other => {
             eprintln!("cowfs-nfs: the Vfs reported an unknown file kind: {other:?}");
             return Err(nfsstat3::NFS3ERR_SERVERFAULT);
@@ -46,13 +52,32 @@ pub fn fattr(a: &Attr) -> Result<fattr3, nfsstat3> {
         gid: a.gid,
         size: a.size,
         used: a.blocks.saturating_mul(512),
-        rdev: specdata3::default(),
+        rdev: specdata3 {
+            specdata1: dev_major(a.rdev),
+            specdata2: dev_minor(a.rdev),
+        },
         fsid: FSID,
         fileid: a.ino,
         atime: nfstime(a.atime),
         mtime: nfstime(a.mtime),
         ctime: nfstime(a.ctime),
     })
+}
+
+/// The node kind MKNOD creates for a wire type; `None` for a type MKNOD does not make.
+pub fn mknod_kind(t: ftype3) -> Option<FileKind> {
+    match t {
+        ftype3::NF3FIFO => Some(FileKind::Fifo),
+        ftype3::NF3SOCK => Some(FileKind::Socket),
+        ftype3::NF3CHR => Some(FileKind::CharDevice),
+        ftype3::NF3BLK => Some(FileKind::BlockDevice),
+        _ => None,
+    }
+}
+
+/// The cowfs device number of a wire `specdata3`.
+pub fn rdev(s: specdata3) -> u64 {
+    makedev(s.specdata1, s.specdata2)
 }
 
 /// uid and gid are dropped: everything belongs to the mounter.
@@ -94,6 +119,7 @@ mod tests {
             gid: 20,
             size: 1234,
             blocks: 3,
+            rdev: 0,
             atime: Timestamp { secs: 10, nanos: 1 },
             mtime: Timestamp {
                 secs: 11,

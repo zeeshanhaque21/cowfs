@@ -91,7 +91,7 @@ xdr_enum_serde!(auth_flavor);
 pub struct auth_unix {
     stamp: u32,
     machinename: Vec<u8>,
-    uid: u32,
+    pub uid: u32,
     gid: u32,
     gids: Vec<u32>,
 }

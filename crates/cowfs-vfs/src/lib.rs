@@ -12,9 +12,11 @@ mod types;
 mod vfs;
 
 pub use error::{Error, Result};
+pub use types::FallocMode;
 pub use types::{
-    validate_name, Attr, DirEntry, DirEntryPlus, FileHandle, FileKind, Ino, ReadDir, ReadDirPlus,
-    RenameFlags, SetAttr, SetTime, StatFs, Timestamp, XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
+    dev_major, dev_minor, makedev, validate_name, Attr, DirEntry, DirEntryPlus, FileHandle,
+    FileKind, Ino, ReadDir, ReadDirPlus, RenameFlags, SetAttr, SetTime, StatFs, Timestamp,
+    XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
 };
 pub use vfs::Vfs;
 
@@ -52,6 +54,7 @@ mod tests {
             (Error::InvalidArgument, libc::EINVAL),
             (Error::NameTooLong, libc::ENAMETOOLONG),
             (Error::NoSpace, libc::ENOSPC),
+            (Error::FileTooBig, libc::EFBIG),
             (Error::PermissionDenied, libc::EACCES),
             (Error::TooManyLinks, libc::EMLINK),
             (Error::NotSupported, libc::ENOTSUP),

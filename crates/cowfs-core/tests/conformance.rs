@@ -44,7 +44,10 @@ macro_rules! forward {
     };
 }
 
-use cowfs_vfs::{Attr, FileHandle, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, XattrFlags};
+use cowfs_vfs::FallocMode;
+use cowfs_vfs::{
+    Attr, FileHandle, FileKind, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, XattrFlags,
+};
 
 forward! {
     lookup(parent: Ino, name: &[u8]) -> Result<Attr>;
@@ -54,6 +57,7 @@ forward! {
     readlink(ino: Ino) -> Result<Vec<u8>>;
     create(parent: Ino, name: &[u8], mode: u32) -> Result<Attr>;
     mkdir(parent: Ino, name: &[u8], mode: u32) -> Result<Attr>;
+    mknod(parent: Ino, name: &[u8], kind: FileKind, mode: u32, rdev: u64) -> Result<Attr>;
     symlink(parent: Ino, name: &[u8], target: &[u8]) -> Result<Attr>;
     link(ino: Ino, new_parent: Ino, new_name: &[u8]) -> Result<Attr>;
     unlink(parent: Ino, name: &[u8]) -> Result<()>;
@@ -71,6 +75,7 @@ forward! {
     setxattr(ino: Ino, name: &[u8], value: &[u8], flags: XattrFlags) -> Result<()>;
     listxattr(ino: Ino) -> Result<Vec<Vec<u8>>>;
     removexattr(ino: Ino, name: &[u8]) -> Result<()>;
+    fallocate(ino: Ino, mode: FallocMode, offset: u64, len: u64) -> Result<Attr>;
 }
 
 conformance_tests!(|| -> Arc<dyn Vfs> { factory() });
@@ -81,4 +86,33 @@ fn run_all_prints_a_table() {
     let report = run_all(&f, &SuiteOptions::default());
     println!("{}", report.table());
     assert!(report.passed(), "{}", report.table());
+    // Core implements fallocate: the six checks must run and pass, never be skipped or missing.
+    assert!(
+        report
+            .skipped
+            .iter()
+            .all(|k| !k.check.name.starts_with("fallocate")),
+        "{}",
+        report.table()
+    );
+    let ran = |n: &str| {
+        report
+            .results
+            .iter()
+            .any(|r| r.check.name == n && r.outcome.is_ok())
+    };
+    for n in [
+        "fallocate_punch_reads_zeros_keeps_size",
+        "fallocate_zero_range_modes",
+        "fallocate_allocate_and_keep_size",
+        "fallocate_errors",
+        "fallocate_content_change_bumps_mtime_and_ctime",
+        "fallocate_random_sequence_matches_model",
+    ] {
+        assert!(
+            ran(n),
+            "{n} did not run and pass on Core\n{}",
+            report.table()
+        );
+    }
 }
