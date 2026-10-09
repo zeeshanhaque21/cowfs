@@ -12,6 +12,7 @@ pub fn nfsstat(e: &Error) -> nfsstat3 {
         Error::InvalidArgument | Error::Range => nfsstat3::NFS3ERR_INVAL,
         Error::NameTooLong => nfsstat3::NFS3ERR_NAMETOOLONG,
         Error::NoSpace => nfsstat3::NFS3ERR_NOSPC,
+        Error::FileTooBig => nfsstat3::NFS3ERR_FBIG,
         Error::PermissionDenied => nfsstat3::NFS3ERR_ACCES,
         Error::TooManyLinks => nfsstat3::NFS3ERR_MLINK,
         Error::NotSupported | Error::NoAttr => nfsstat3::NFS3ERR_NOTSUPP,
@@ -37,7 +38,7 @@ mod tests {
     use super::*;
 
     /// One more than `KNOWN` has entries whenever the trait gains a variant.
-    const VARIANTS: usize = 19;
+    const VARIANTS: usize = 20;
 
     #[test]
     fn every_error_has_its_status() {
@@ -50,6 +51,7 @@ mod tests {
             (Error::InvalidArgument, nfsstat3::NFS3ERR_INVAL),
             (Error::NameTooLong, nfsstat3::NFS3ERR_NAMETOOLONG),
             (Error::NoSpace, nfsstat3::NFS3ERR_NOSPC),
+            (Error::FileTooBig, nfsstat3::NFS3ERR_FBIG),
             (Error::PermissionDenied, nfsstat3::NFS3ERR_ACCES),
             (Error::TooManyLinks, nfsstat3::NFS3ERR_MLINK),
             (Error::NotSupported, nfsstat3::NFS3ERR_NOTSUPP),
@@ -80,6 +82,7 @@ mod tests {
         Error::InvalidArgument,
         Error::NameTooLong,
         Error::NoSpace,
+        Error::FileTooBig,
         Error::PermissionDenied,
         Error::TooManyLinks,
         Error::NotSupported,

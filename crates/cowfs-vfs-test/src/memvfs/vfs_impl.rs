@@ -64,7 +64,7 @@ impl Vfs for MemVfs {
             match kind {
                 FileKind::Directory => return Err(Error::IsDir),
                 FileKind::Symlink => return Err(Error::InvalidArgument),
-                FileKind::Regular if size > MAX_FILE => return Err(Error::NoSpace),
+                FileKind::Regular if size > MAX_FILE => return Err(Error::FileTooBig),
                 FileKind::Regular => {}
                 _ => return Err(Error::NotSupported),
             }
@@ -373,7 +373,7 @@ impl Vfs for MemVfs {
             });
         };
         if offset.saturating_add(u64::from(len)) > MAX_FILE {
-            return Err(Error::NoSpace);
+            return Err(Error::FileTooBig);
         }
         if len == 0 {
             return Ok(0);

@@ -228,6 +228,18 @@ fn setattr_variants() {
     assert_eq!(st, OK, "empty setattr succeeds");
 }
 
+/// g3: macOS ftruncate(2) to 999999999999999 must see EFBIG (pjdfstest ftruncate/12.t), which
+/// the NFS client takes from NFS3ERR_FBIG, not ENOSPC from NFS3ERR_NOSPC.
+#[test]
+fn setattr_size_past_the_file_limit_is_fbig() {
+    let (_s, mut c) = setup();
+    let root = c.root.clone();
+    let f = c.create_file(&root, "f");
+    let (st, _) = c.setattr(&f, sattr_size(999_999_999_999_999));
+    assert_eq!(st, nfsstat3::NFS3ERR_FBIG as u32);
+    assert_eq!(c.attrs(&f).size, 0, "a refused truncate changes nothing");
+}
+
 #[test]
 fn chown_to_another_uid_is_refused_and_changes_nothing() {
     use nfsserve::nfs::{set_gid3, set_uid3};

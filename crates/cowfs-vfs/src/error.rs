@@ -25,6 +25,8 @@ pub enum Error {
     NameTooLong,
     #[error("no space left on device")]
     NoSpace,
+    #[error("file too large")]
+    FileTooBig,
     #[error("permission denied")]
     PermissionDenied,
     #[error("too many links")]
@@ -63,6 +65,7 @@ impl Error {
             Error::InvalidArgument => libc::EINVAL,
             Error::NameTooLong => libc::ENAMETOOLONG,
             Error::NoSpace => libc::ENOSPC,
+            Error::FileTooBig => libc::EFBIG,
             Error::PermissionDenied => libc::EACCES,
             Error::TooManyLinks => libc::EMLINK,
             Error::NotSupported => libc::ENOTSUP,
