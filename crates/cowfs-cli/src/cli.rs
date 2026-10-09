@@ -159,3 +159,5 @@ pub enum BaseCommand {
         name: Option<String>,
     },
 }
+
+// ci-trial trial/edge-full (throwaway)
