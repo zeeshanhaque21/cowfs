@@ -443,8 +443,8 @@ class G2Unmeasurable(CliCase):
         self.assertIn("FAIL (", out)
 
     def test_ranges_that_straddle_the_bar_are_unmeasurable_not_judged_on_medians(self):
-        # The old fixture: 1.1 to 1.2 s apart in ranges, medians pass, but a median inside the observed ranges could fail.
-        self.assertUnmeasurable([4.4, 4.9, 5.2, 5.6, 4.7], [4.8, 5.0, 5.4, 5.9, 5.1], "could")
+        # Medians 5.1 and 5.5 look fine on both platforms, but the ranges allow a 3.0 s add (macOS) and 8.0 vs 7.5 s (Linux).
+        self.assertUnmeasurable([5.0, 5.1, 5.2], [4.8, 5.5, 8.0], "could")
 
     def test_parameters_are_the_stated_ones(self):
         self.assertEqual((compare.G2_NATIVE_FLOOR_S, compare.G2_SPREAD_MAX, compare.G2_MIN_REPS), (3.0, 2.0, 3))
