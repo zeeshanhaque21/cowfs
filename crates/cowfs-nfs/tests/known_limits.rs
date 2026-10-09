@@ -2,6 +2,12 @@ mod common;
 
 use std::sync::Arc;
 
+// Client-side limits are not listed here: this file drives the server over RPC, and a limit that
+// lives in the macOS NFS client needs a real mount. Issue #204 (open(2) of a fifo gives EACCES,
+// pjdfstest open/17.t #2 expects ENXIO) sends no RPC, so no test in this file can express it. It is
+// recorded in docs/special-files-107.md, README.md and the cowfs-nfs crate docs, with the evidence
+// in docs/verification/evidence/nfs204-fifo-open.md.
+
 use cowfs_nfs::{MountOptions, Server};
 use cowfs_vfs_test::MemVfs;
 use nfsserve::nfs::{nfsstat3, sattr3, set_mode3};
