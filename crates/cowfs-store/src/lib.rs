@@ -3,6 +3,9 @@
 mod ack;
 mod chunk;
 mod compact;
+#[cfg(feature = "fault-injection")]
+#[doc(hidden)]
+pub mod crashmodel;
 mod error;
 mod fdcache;
 mod fsio;

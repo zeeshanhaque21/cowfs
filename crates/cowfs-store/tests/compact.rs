@@ -869,7 +869,7 @@ fn the_packs_directory_is_fsynced_after_the_unlink() {
 
     let (before, after) = window(&ops, 9_001, 9_002);
     assert!(
-        ops[before..after].iter().any(|o| matches!(o, LogOp::DirSync)),
+        ops[before..after].iter().any(|o| matches!(o, LogOp::DirSync { .. })),
         "the packs directory was not fsynced after the unlink, so the unlink can be lost while the \
          watermark already says the pack is gone: {ops:?}"
     );

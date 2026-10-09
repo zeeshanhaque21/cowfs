@@ -481,7 +481,7 @@ impl Store {
             }
         }
         fsio::mark(MARK_UNLINK);
-        match fs::remove_file(&path) {
+        match g.io.remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 self.forget_pack(id);
