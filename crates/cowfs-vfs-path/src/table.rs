@@ -432,6 +432,7 @@ impl State {
             gid: st.gid,
             size: st.size,
             blocks: st.blocks,
+            rdev: 0,
             atime: ts(st.atime),
             mtime: ts(st.mtime),
             ctime: ts(st.ctime),

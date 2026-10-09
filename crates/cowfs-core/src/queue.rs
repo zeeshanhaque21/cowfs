@@ -16,6 +16,11 @@ pub(crate) enum Create {
     File,
     Dir,
     Symlink(Arc<[u8]>),
+    /// A fifo, socket or device node; `rdev` is `0` unless it is a device.
+    Special {
+        kind: cowfs_vfs::FileKind,
+        rdev: u64,
+    },
 }
 
 /// One deferred meta operation, replayed in queue order inside one batch.

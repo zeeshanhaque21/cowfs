@@ -1,7 +1,8 @@
 //! `Vfs` for `Core`.
 
 use cowfs_vfs::{
-    Attr, FileHandle, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, Vfs, XattrFlags,
+    Attr, Error, FileHandle, FileKind, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, Vfs,
+    XattrFlags,
 };
 
 use crate::queue::Create;
@@ -34,6 +35,21 @@ impl Vfs for Core {
 
     fn mkdir(&self, parent: Ino, name: &[u8], mode: u32) -> Result<Attr> {
         self.inner.make(parent, name, Create::Dir, mode)
+    }
+
+    fn mknod(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<Attr> {
+        if !kind.is_special() || (rdev != 0 && !kind.is_device()) {
+            return Err(Error::InvalidArgument);
+        }
+        self.inner
+            .make(parent, name, Create::Special { kind, rdev }, mode)
     }
 
     fn symlink(&self, parent: Ino, name: &[u8], target: &[u8]) -> Result<Attr> {
