@@ -333,17 +333,39 @@ struct Worker {
     jobs: std::sync::mpsc::Sender<Job>,
     done: std::sync::mpsc::Receiver<io::Result<()>>,
     thread: std::thread::JoinHandle<()>,
+    /// The process that started it. After `fork` the child holds the channels but not the thread.
+    pid: u32,
 }
 
 /// The umask-0 worker of one `PathVfs`, started on the first creation call and joined on drop.
 /// It replaces a thread spawned per call, which cost about 29 us each. The semantics are those
 /// of `with_private_umask`: the worker's umask is thread-private (`CLONE_FS`), the process umask
 /// is never touched, a refusal of `unshare` means "no private umask" (`Ok(false)`, nothing made),
-/// and a panic inside a job comes back as an error without killing the worker.
-#[derive(Default)]
+/// and a panic inside a job comes back as an error without killing the worker. After a `fork`
+/// only the forking thread exists in the child, so a worker started by the parent is abandoned
+/// (leaked, never joined) and a fresh one is started on the next call, rather than hanging.
 pub struct UmaskWorker {
     #[cfg(target_os = "linux")]
     live: Option<Worker>,
+    /// What is known of `unshare(CLONE_FS)` here, and the unshare-then-umask(0) step; both
+    /// injectable so a test can drive the refusal rule (a test must never call `umask`).
+    #[cfg(target_os = "linux")]
+    known: &'static std::sync::OnceLock<bool>,
+    #[cfg(target_os = "linux")]
+    unshare: fn() -> Result<(), i32>,
+}
+
+impl Default for UmaskWorker {
+    fn default() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            live: None,
+            #[cfg(target_os = "linux")]
+            known: &PRIVATE_UMASK,
+            #[cfg(target_os = "linux")]
+            unshare: detach_umask,
+        }
+    }
 }
 
 impl std::fmt::Debug for UmaskWorker {
@@ -354,13 +376,14 @@ impl std::fmt::Debug for UmaskWorker {
 
 #[cfg(target_os = "linux")]
 impl UmaskWorker {
-    fn start() -> io::Result<Option<Worker>> {
+    fn start(&self) -> io::Result<Option<Worker>> {
+        let unshare = self.unshare;
         let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
         let (done_tx, done) = std::sync::mpsc::channel::<io::Result<()>>();
         let thread = std::thread::Builder::new()
             .name("cowfs-umask0".into())
             .spawn(move || {
-                let started = detach_umask().map_err(io::Error::from_raw_os_error);
+                let started = unshare().map_err(io::Error::from_raw_os_error);
                 let ok = started.is_ok();
                 if done_tx.send(started).is_err() || !ok {
                     return;
@@ -373,16 +396,21 @@ impl UmaskWorker {
                     }
                 }
             })?;
-        let w = Worker { jobs, done, thread };
+        let w = Worker {
+            jobs,
+            done,
+            thread,
+            pid: std::process::id(),
+        };
         match w.done.recv() {
             Ok(Ok(())) => {
-                let _ = PRIVATE_UMASK.set(true);
+                let _ = self.known.set(true);
                 Ok(Some(w))
             }
             Ok(Err(e)) => {
                 let _ = w.thread.join();
                 if e.raw_os_error().is_some_and(refusal_is_permanent) {
-                    let _ = PRIVATE_UMASK.set(false);
+                    let _ = self.known.set(false);
                 }
                 Ok(None)
             }
@@ -392,11 +420,12 @@ impl UmaskWorker {
 
     /// Runs `f` with umask 0. `Ok(false)`: no private umask here, `f` did not run.
     fn run(&mut self, f: impl FnOnce() -> io::Result<()> + Send + 'static) -> io::Result<bool> {
-        if PRIVATE_UMASK.get() == Some(&false) {
+        if self.known.get() == Some(&false) {
             return Ok(false);
         }
+        self.forget_stale();
         if self.live.is_none() {
-            self.live = Self::start()?;
+            self.live = self.start()?;
         }
         let Some(w) = &self.live else {
             return Ok(false);
@@ -416,6 +445,17 @@ impl UmaskWorker {
                 }
                 Err(io::Error::other("the umask-0 thread died"))
             }
+        }
+    }
+
+    /// Abandons a worker that a parent process started: its thread does not exist here.
+    fn forget_stale(&mut self) {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|w| w.pid != std::process::id())
+        {
+            std::mem::forget(self.live.take());
         }
     }
 
@@ -444,6 +484,7 @@ impl UmaskWorker {
 #[cfg(target_os = "linux")]
 impl Drop for UmaskWorker {
     fn drop(&mut self) {
+        self.forget_stale();
         if let Some(w) = self.live.take() {
             drop(w.jobs); // ends the worker's loop
             let _ = w.thread.join();
@@ -1056,6 +1097,55 @@ mod umask_worker_tests {
             })
             .is_err());
         assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    static ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    fn fake_unshare() -> Result<(), i32> {
+        match ERRNO.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => Ok(()),
+            e => Err(e),
+        }
+    }
+
+    fn worker() -> UmaskWorker {
+        UmaskWorker {
+            live: None,
+            known: Box::leak(Box::default()),
+            unshare: fake_unshare,
+        }
+    }
+
+    /// The refusal rule of `refusal_is_permanent`, inside the worker. One test owns `ERRNO`.
+    #[test]
+    fn permanent_refusals_are_cached_and_transient_ones_retried() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS, libc::EINVAL] {
+            let mut w = worker();
+            ERRNO.store(errno, SeqCst);
+            assert!(!w.run(|| Ok(())).unwrap(), "errno {errno}: nothing ran");
+            assert_eq!(w.known.get(), Some(&false), "errno {errno} is remembered");
+            ERRNO.store(0, SeqCst);
+            assert!(!w.run(|| Ok(())).unwrap(), "errno {errno}: no retry");
+            assert!(w.live.is_none());
+        }
+        for errno in [libc::ENOMEM, libc::EAGAIN] {
+            let mut w = worker();
+            ERRNO.store(errno, SeqCst);
+            assert!(!w.run(|| Ok(())).unwrap());
+            assert_eq!(w.known.get(), None, "errno {errno} is not remembered");
+            assert!(
+                w.live.is_none(),
+                "a worker that failed to start is not kept"
+            );
+            ERRNO.store(0, SeqCst);
+            assert!(
+                w.run(|| Ok(())).unwrap(),
+                "errno {errno}: the next call retries"
+            );
+            assert_eq!(w.known.get(), Some(&true));
+        }
+        ERRNO.store(0, SeqCst);
     }
 
     #[test]
