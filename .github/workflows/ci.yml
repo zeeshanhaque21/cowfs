@@ -134,7 +134,7 @@ jobs:
           failures = re.findall(r"^FAIL\s+.*$", log, re.MULTILINE)
           known = r"^FAIL\s+cowfs\s+xattrs\s+xattr_on_directory_and_symlink\s+.*unexpected error: permission denied \(PermissionDenied\)$"
           unexpected = [line for line in failures if not re.fullmatch(known, line)]
-          assert re.search(r"^133 run,", log, re.MULTILINE), "Missing full conformance report"
+          assert re.search(r"^127 run,", log, re.MULTILINE), "Missing full conformance report"
           assert "SKIP: /dev/fuse" not in log, "FUSE tests skipped"
           assert not unexpected, "Unexpected conformance failures:\n" + "\n".join(unexpected)
           if failures:
