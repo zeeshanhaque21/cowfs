@@ -378,3 +378,29 @@ pub fn special_dir_ops_error(c: &Ctx) -> Outcome {
     }
     Ok(())
 }
+
+/// The character device 0:0 is Linux's whiteout: the kernel lets anyone make it, so a backend a
+/// normal user reaches (a client of a mount, a native directory) must not refuse it (issue #243).
+/// It keeps its kind, mode and an `rdev` of 0, and has no data. Off Linux a device needs
+/// privilege, so `PermissionDenied` passes there.
+pub fn mknod_whiteout_char_device(c: &Ctx) -> Outcome {
+    let a = match c.mknod(ROOT_INO, b"wo", FileKind::CharDevice, 0o644, 0) {
+        Err(Error::PermissionDenied) if !cfg!(target_os = "linux") => return Ok(()),
+        r => r?,
+    };
+    ensure_eq!(
+        (a.kind, a.mode, a.rdev, a.nlink, a.size, a.blocks),
+        (FileKind::CharDevice, 0o644, 0, 1, 0, 0),
+        "kind, mode, rdev, nlink, size, blocks"
+    );
+    ensure_eq!(c.lookup(ROOT_INO, b"wo")?, a, "lookup after mknod");
+    let listed = c.fs.readdir_attrs(ROOT_INO, 0, 1000)?;
+    let e = listed.entries.iter().find(|e| e.entry.name == b"wo");
+    ensure_eq!(
+        e.map(|e| (e.entry.kind, e.attr.rdev)),
+        Some((FileKind::CharDevice, 0)),
+        "readdir_attrs"
+    );
+    c.fs.unlink(ROOT_INO, b"wo")?;
+    Ok(())
+}
