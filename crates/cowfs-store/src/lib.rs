@@ -18,10 +18,10 @@ use std::fmt;
 pub use chunk::{chunks, Chunks, AVG_CHUNK_LEN, MAX_CHUNK_LEN, MIN_CHUNK_LEN};
 pub use compact::{Compaction, Discarded, PackInfo, PackPlan, Rewrite};
 pub use error::{Error, Result};
-#[doc(hidden)]
-pub use fsio::{Op, Trace};
 #[cfg(feature = "fault-injection")]
 pub use fsio::{oplog_marker, oplog_start, oplog_take, LogOp};
+#[doc(hidden)]
+pub use fsio::{Op, Trace};
 pub use store::Store;
 pub use types::{
     CorruptRegion, Damage, FsckReport, Gap, Options, RecoveryReport, SalvageReport, Stats,

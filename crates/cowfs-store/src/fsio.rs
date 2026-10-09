@@ -319,9 +319,14 @@ mod alloc_tests {
         io.write_at(&file, &path, 0, &buf).unwrap(); // warm up
         let (b0, a0) = (BYTES.get(), ALLOCS.get());
         for i in 0..64 {
-            io.write_at(&file, &path, i * buf.len() as u64, &buf).unwrap();
+            io.write_at(&file, &path, i * buf.len() as u64, &buf)
+                .unwrap();
         }
         let (bytes, allocs) = (BYTES.get() - b0, ALLOCS.get() - a0);
-        assert_eq!((bytes, allocs), (0, 0), "write_at allocated on the no-log path");
+        assert_eq!(
+            (bytes, allocs),
+            (0, 0),
+            "write_at allocated on the no-log path"
+        );
     }
 }
