@@ -11,6 +11,7 @@ the coverage report reads is the one the harness actually writes.
 
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,7 @@ ALL = ["g1", "g2", "g3", "g4", "g5", "g6"]
 OLD_PIN = "c1619ec16df3a6b11dd5a1e08e8a512b4fedd240"
 
 
-def meta(gates, big_bytes=GIB, label="arm", scale=100, sha=None):
+def meta(gates, big_bytes=GIB, label="arm", scale=100, sha=None, platform="Darwin", measured_on=None):
     row = {
         "kind": "meta",
         "label": label,
@@ -45,12 +46,16 @@ def meta(gates, big_bytes=GIB, label="arm", scale=100, sha=None):
         "cargo_home": "/private/cargo-home",
         "cargo_jobs": "4",
         "host": "unit-test",
-        "platform": "Darwin",
+        "platform": platform,
         "python": "3.12.2",
         "started": 0.0,
     }
     if scale is not None:
         row["scale"] = scale
+    if platform is None:
+        del row["platform"]
+    if measured_on is not None:
+        row["measured_on"] = measured_on
     return row
 
 
@@ -446,6 +451,13 @@ class G2Unmeasurable(CliCase):
         # Medians 5.1 and 5.5 look fine on both platforms, but the ranges allow a 3.0 s add (macOS) and 8.0 vs 7.5 s (Linux).
         self.assertUnmeasurable([5.0, 5.1, 5.2], [4.8, 5.5, 8.0], "could")
 
+    def test_other_gates_are_not_subject_to_the_g2_rule(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.arm(d, "n.jsonl", "nat", ["g1"], [rep("g1", 0, 0.5)])
+            cow = self.arm(d, "c.jsonl", "cow", ["g1"], [rep("g1", 0, 0.6)])
+            rc, out, err = self.cli([nat], cow)
+            self.assertEqual(rc, 0, out + err)
+
     def test_parameters_are_the_stated_ones(self):
         self.assertEqual((compare.G2_NATIVE_FLOOR_S, compare.G2_SPREAD_MAX, compare.G2_MIN_REPS), (3.0, 2.0, 3))
 
@@ -479,6 +491,105 @@ class G2NoFlip(unittest.TestCase):
         self.assertEqual(self.d(nat, [45.0, 46.0, 47.0], False), "FAIL")
 
 
+class G2PinnedToVerdict(unittest.TestCase):
+    """g2_decision restates the two verdict() formulas; verdict() is monotone in each median, so the four min/max corners decide."""
+
+    @staticmethod
+    def corners(nat, cow, mac, budget):
+        (nlo, nhi), (clo, chi) = compare.spread(nat), compare.spread(cow)
+        seen = {compare.verdict("g2", n, c, 0, 0, mac, budget)[0] for n in (nlo, nhi) for c in (clo, chi)}
+        return seen.pop() if len(seen) == 1 else None
+
+    def test_decision_equals_the_four_corners_seeded_fuzz(self):
+        rnd = random.Random(265)
+        decided = 0
+        for _ in range(20000):
+            base, budget, mac = rnd.choice([3.0, 5.0, 23.0, 40.0]), rnd.choice([0.5, 1.0, 2.0]), rnd.random() < 0.5
+            nat = [{"wall_s": base * rnd.uniform(0.8, 1.6)} for _ in range(rnd.randint(1, 6))]
+            cow = [{"wall_s": base * rnd.uniform(0.8, 3.0) + rnd.choice([0.0, 0.5, 1.0])} for _ in range(rnd.randint(1, 6))]
+            got = compare.g2_decision(nat, cow, mac, budget)
+            self.assertEqual(got, self.corners(nat, cow, mac, budget), (nat, cow, mac, budget))
+            decided += got is not None
+            for _ in range(3):  # and a median anywhere inside the ranges gives the decided answer
+                if got:
+                    n, c = rnd.uniform(*compare.spread(nat)), rnd.uniform(*compare.spread(cow))
+                    self.assertEqual(compare.verdict("g2", n, c, 0, 0, mac, budget)[0], got)
+        self.assertTrue(2000 < decided < 18000, decided)  # the fuzz exercises both outcomes
+
+    def test_the_boundaries_are_the_same_inequalities(self):
+        r = lambda *w: [{"wall_s": x} for x in w]
+        for mac, cow, want in ((True, 6.0, "FAIL"), (True, 5.99, "PASS"), (False, 7.5, "PASS"), (False, 7.51, "FAIL")):
+            self.assertEqual(compare.g2_decision(r(5.0, 5.0), r(cow, cow), mac, 1.0), want)
+            self.assertEqual(compare.verdict("g2", 5.0, cow, 0, 0, mac, 1.0)[0], want)
+
+    def test_exact_equality_on_the_range_edges(self):
+        r = lambda *w: [{"wall_s": x} for x in w]
+        # macOS: max_cow - min_nat == budget exactly is not a PASS (PASS is strictly under); min_nat 4.0, max_cow 5.0
+        self.assertIsNone(compare.g2_decision(r(4.0, 5.0), r(4.5, 5.0), True, 1.0))
+        # Linux: min_cow == 1.5 * max_nat exactly is not a FAIL (FAIL is strictly over); max_nat 4.0, min_cow 6.0
+        self.assertIsNone(compare.g2_decision(r(2.0, 4.0), r(6.0, 9.0), False, 1.0))
+
+
+class G2MeasuringPlatform(CliCase):
+    """The g2 rule follows where the reps were measured, not where compare.py runs."""
+
+    NAT, COW = [5.0, 5.1, 5.2], [6.3, 6.4, 6.5]  # add 1.1 s: FAIL under the macOS budget, PASS under the 1.5x Linux ratio
+
+    def run_g2(self, **kw):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.arm(d, "n.jsonl", "nat", ["g2"], [rep("g2", i, w) for i, w in enumerate(self.NAT)], **kw)
+            cow = self.arm(d, "c.jsonl", "cow", ["g2"], [rep("g2", i, w) for i, w in enumerate(self.COW)], **kw)
+            return self.cli([nat], cow)
+
+    def test_macos_data_gets_the_budget_on_any_host(self):
+        rc, out, err = self.run_g2(platform="macOS-14.5-arm64", measured_on="macos")
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("measured on   macos", out)
+
+    def test_linux_data_gets_the_ratio_on_any_host(self):
+        rc, out, err = self.run_g2(platform="Linux-6.8", measured_on="linux")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("measured on   linux", out)
+
+    def test_measured_on_disagreeing_with_the_platform_string_is_invalid(self):
+        for kw in ({"platform": "Darwin", "measured_on": "linux"}, {"platform": "Linux-6.8", "measured_on": "macos"}):
+            rc, out, err = self.run_g2(**kw)
+            self.assertEqual(rc, 3, (kw, out, err))
+            self.assertIn("disagrees", err)
+        self.assertEqual(self.run_g2(platform="Plan9", measured_on="linux")[0], 0)  # an unreadable legacy string cannot contradict
+
+    def test_data_without_measured_on_falls_back_to_the_platform_string(self):
+        self.assertEqual(self.run_g2(platform="Darwin")[0], 1)
+        self.assertEqual(self.run_g2(platform="macOS-14.5-arm64")[0], 1)
+        self.assertEqual(self.run_g2(platform="Linux-6.8.0-x86_64")[0], 0)
+
+    def test_unknown_platform_is_invalid_not_guessed(self):
+        for kw in ({"platform": None}, {"platform": "Plan9"}, {"platform": "Darwin", "measured_on": "windows"}):
+            rc, out, err = self.run_g2(**kw)
+            self.assertEqual(rc, 3, (kw, out, err))
+            self.assertIn("measuring platform", err)
+
+    def test_arms_measured_on_different_platforms_are_invalid(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.arm(d, "n.jsonl", "nat", ["g2"], [rep("g2", i, w) for i, w in enumerate(self.NAT)], platform="Darwin", measured_on="macos")
+            cow = self.arm(d, "c.jsonl", "cow", ["g2"], [rep("g2", i, w) for i, w in enumerate(self.COW)], platform="Linux-6.8", measured_on="linux")
+            rc, out, err = self.cli([nat], cow)
+        self.assertEqual(rc, 3, out + err)
+        self.assertIn("different platforms", err)
+
+    def test_gates_without_g2_need_no_platform(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.arm(d, "n.jsonl", "nat", ["g1"], [rep("g1", 0, 1.0)], platform=None)
+            cow = self.arm(d, "c.jsonl", "cow", ["g1"], [rep("g1", 0, 1.1)], platform=None)
+            self.assertEqual(self.cli([nat], cow)[0], 0)
+
+    def test_gates_py_writes_measured_on(self):
+        want = {"darwin": "macos", "linux": "linux"}.get(sys.platform, sys.platform)
+        with tempfile.TemporaryDirectory() as d:
+            m = gates_mod.meta(Path(d), "x", 1, ["g1"], {"big_bytes": GIB})
+        self.assertEqual(m["measured_on"], want)
+
+
 class ExitPrecedence(CliCase):
     """Issue #232: INVALID(3) before any verdict, then FAIL(1) > UNMEASURABLE(2) > PASS(0)."""
 
@@ -509,14 +620,6 @@ class ExitPrecedence(CliCase):
             self.assertEqual(rc, 3, out + err)
             self.assertIn("rebuilt", err)
             self.assertNotIn("RESULT: FAIL", out)
-
-
-    def test_other_gates_are_not_subject_to_the_g2_rule(self):
-        with tempfile.TemporaryDirectory() as d:
-            nat = self.arm(d, "n.jsonl", "nat", ["g1"], [rep("g1", 0, 0.5)])
-            cow = self.arm(d, "c.jsonl", "cow", ["g1"], [rep("g1", 0, 0.6)])
-            rc, out, err = self.cli([nat], cow)
-            self.assertEqual(rc, 0, out + err)
 
 
 if __name__ == "__main__":
