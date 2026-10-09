@@ -62,6 +62,23 @@ impl Pages {
         self.size = self.size.max(offset + data.len() as u64);
     }
 
+    /// Makes `[a, b)` read as zeros: whole pages are dropped, partial ones zeroed. The caller
+    /// has clamped `b` to the size, so the size does not change.
+    pub fn punch(&mut self, a: u64, b: u64) {
+        if a >= b {
+            return;
+        }
+        for idx in a / PAGE..=(b - 1) / PAGE {
+            let start = idx * PAGE;
+            let (lo, hi) = (a.max(start), b.min(start + PAGE));
+            if hi - lo == PAGE {
+                self.map.remove(&idx);
+            } else if let Some(page) = self.map.get_mut(&idx) {
+                page[(lo - start) as usize..(hi - start) as usize].fill(0);
+            }
+        }
+    }
+
     pub fn truncate(&mut self, new_size: u64, zero_tail: bool, keep: bool) {
         if new_size < self.size {
             if !keep {
