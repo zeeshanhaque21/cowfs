@@ -690,7 +690,10 @@ mod tests {
         m.save(&HashSet::new()).unwrap();
         let path = d.path().join("mark.bin");
         let good = fs::read(&path).unwrap();
-        assert!(Marks::load(d.path(), 64).has_root(&k), "control: intact file is reused");
+        assert!(
+            Marks::load(d.path(), 64).has_root(&k),
+            "control: intact file is reused"
+        );
 
         let mut flip = good.clone();
         flip[good.len() / 2] ^= 1;
