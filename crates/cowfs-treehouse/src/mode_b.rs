@@ -541,6 +541,11 @@ impl BaseRefresh<'_> {
                     self.build.as_deref().unwrap_or_default(),
                     self.canonical.as_ref(),
                 )?;
+                // The build is the slot's only job: the daemon snapshots the main checkout, so the
+                // slot goes back now. Commit 28ba955 replaced this release with `keep()` and leaked a
+                // slot per refresh, which the sandbox test caught only where treehouse was installed
+                // (issue 259). A failed release is an error, as it was before.
+                th.return_slot(&slot, true, guard.lease_id())?;
                 guard.keep();
                 (true, Some(slot))
             }
