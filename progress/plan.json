@@ -378,7 +378,7 @@
           "id": "15",
           "title": "#15 treehouse mode (a) transparent",
           "state": "done",
-          "status_note": "PR #38 merged 2026-10-01 and scoped real mounted lease smoke completed. Implementation is not still building. Full real-project build/cache-hook and production acceptance remain queued, not proved by usage duration.",
+          "status_note": "PR248 merged: scripts/treehouse-cowfs.sh (parameterized launcher) is now tracked.",
           "issue": 15,
           "owner": "lead",
           "pr": "#38",
@@ -608,7 +608,7 @@
           "id": "16",
           "title": "#16 treehouse mode (b) snapshot-native slots and warm base",
           "state": "done",
-          "status_note": "PR #38 merged 2026-10-01: companion implementation landed. Old builder/slot assignment below is historical. Real Core warm-base/cache-hook reuse and measured real-project benefit remain queued acceptance work, not an active worker or validated speedup.",
+          "status_note": "PR253 merged: stale mount_snapshot refusal text corrected. Real gap: companion does not call mount_snapshot (#123 row 2).",
           "issue": 16,
           "owner": "subagent (space bunny)",
           "pr": "#38",
@@ -651,18 +651,19 @@
         {
           "id": "121",
           "title": "#121 Unblocked shutdown client terminal-frame flake",
-          "state": "active",
+          "state": "blocked",
           "pause_receipt_note": "Worker confirms PAUSED/head4b210de unchanged/treeclean/no new runs or signals/shared15263 untouched. Existing121spike immutable/reportee080a51 preserved. Static correction: reportedwait2322 clock began BEFOREwarmup+400mspark, therefore notshutdown-only latency and NOTevidence productionbudgetviolation. No confirming corrected run performed. Derived1800 bound differs fromsmaller documentedshutdown promise, follow-on128 remainsDEFERRED/unconcluded. control128-timing scratch NEVERCOMPILED/knownmissingTrace.num_fb/notrunnableevidence. No restart/newissue/investigation authorized; finish existingPRdelivery first.",
           "scope_freeze_note": "User explicitly ordered stop increasing scope and finish existing work first. Original121spikecomplete/earlyEOF eventUNREPRODUCED; proposed127/128follow-on investigations PARKED, pause instruction sent to worker without killing buffered work or modifying PR79/sharedresources. No new issues/features/investigation lanes. Prioritize existing PR fixes/checks/pinned merges, preserve unresolved acceptance status rather than expanding discovery.",
           "issue": 121,
           "worker_session": "ses_eff8a48ecffeLDy1vy5IJotMHy",
           "latest_outcome": "Canonicalfixture-finalreview confirmsoriginalfailurecaptureNOTPRESERVED onlyprose;73reps0failnotresolution. 332mswouldindicateearlyEOF/cutframe ratherthantwo-secondtimeout; alternativeunproven dead-onlydrain+competingfinish/killordering. Original79builderassignedboundedREADONLYpublictopologyfive-step spike literalcontract/sourcehash+rawbyteEOF/PID/directrc/per-itemflush preserveevidence; no newhooks/retries/assertrelax/fullstress/theory-onlyfix. Canonicalprimaryevidence/control-terminal121-spike.md ownedruntimeartifacts only/head4bunchanged/shareddaemonprotected. MERGEBLOCKremainsuntilactualdiagnosis/regression.",
-          "status_note": "2026-10-09: still open on purpose: PR194 (merged) is the plausible cause (EOF at 332 ms after a 300 ms deadline) but the match is inference; close with its own evidence (30/30 loop used the faster client, so weak).",
+          "status_note": "Does not reproduce (200 loaded runs; original test passes 100/100 on current and pre-PR194 servers). PR230 merged: wait-bound measurement test only. One CI sample wait_ms=1687 with no frame, bytes received not logged: an early kill is not excluded. Kept open until a CI failure with bytes logged appears.",
           "log_20261008": [
             "Refs from PR79 (merged): check whether the terminal-frame flake still reproduces after the a4/progress_shutdown measurement fixes; close with evidence or keep.",
             "Launched 2026-10-09: status audit with loop reproduction (N reported), the progress-after-terminal ordering race, drain_and_close doc-vs-code; output docs/reviews/ctl-issues-status-20261009.md.",
             "2026-10-09 ctl audit (docs/reviews/ctl-issues-status-20261009.md, untracked in primary): #121 NOT reproduced (30/30 pass with the faster client of dfee8b4: weak evidence); plausible mechanism = the #127 race (Conn::finish removes the id from inflight before writing the terminal frame; abandon_inflight finds nothing; both teardown paths call kill() which does not check finishing; the queued terminal write fails; peer sees a bare EOF - fits EOF at 332 ms after a 300 ms deadline; inference). Close #121 only after PR194 merges, with the unit test as the guard. #166: fixed in code (7b52f97, c97ea82; 30/30, 10 --nocapture runs both 250 and 400 ms cases asserted); the issue asked to derive the resume from the server's observed close, PR79 measures the actual resume time instead - owner decision; hosted CI cannot show whether the 400 ms case asserts. #128: likely fixed (2257796 single absolute grace_end, dfee8b4 test client); the 2322 vs 1800 ms case B geometry was measured on the older server blob and not re-run on main. PRs (draft, all in crates/cowfs-ctl/src/server.rs): #194 kill vs finishing (fixes #127 race; test failed first); #193 no progress frame after its terminal frame (Refs #127; narrow); #196 drain_and_close skip scoped to after the shutdown deadline (docs v1-control-api.md and control-progress-shutdown.md matched; test failed first). Follow-ups (text): re-run #128 case B on main; log unconditionally in a4 whether the 400 ms case asserted; best_effort_abandon has the same kill-without-finishing shape (left alone: accept thread, must not block).",
-            "2026-10-09: still open on purpose: PR194 (merged) is the plausible cause (EOF at 332 ms after a 300 ms deadline) but the match is inference; close with its own evidence (30/30 loop used the faster client, so weak)."
+            "2026-10-09: still open on purpose: PR194 (merged) is the plausible cause (EOF at 332 ms after a 300 ms deadline) but the match is inference; close with its own evidence (30/30 loop used the faster client, so weak).",
+            "Does not reproduce (200 loaded runs; original test passes 100/100 on current and pre-PR194 servers). PR230 merged: wait-bound measurement test only. One CI sample wait_ms=1687 with no frame, bytes received not logged: an early kill is not excluded. Kept open until a CI failure with bytes logged appears."
           ],
           "owner": "critic reviewing ctl PRs 193/194/196"
         },
@@ -750,7 +751,7 @@
           "title": "#123 Tree-native Core warm-base publication contract",
           "state": "active",
           "issue": 123,
-          "status_note": "2026-10-08: PR163 MERGED 0a85a3a5408fe4c1dfa323b9cfdeca94e5d9e026 pinned f78dff8bcb4cbe0026b110a0e4f675616fe44d8e (round-2 critic PASS at 1f9942e; lead reviewed the f78dff8 delta: comment/doc corrections + unconditional length-limit assertion; CI 3/3 green, linux-fuse log has no FAILED). Core base_refresh now publishes a warm base tree-natively (staging under hidden <name>.cowfs-swap0, replace_with_staged). Issue 123 stays OPEN: remaining = warm target/ in the Core base, companion mount_snapshot call, fresh-daemon readback, acceptance test in CI/Linux (warm_base_acceptance_over_a_real_core is #[ignore]d, 17 min; passed locally 788s per author, unverified). Tracked: 167 (no per-name lock), 170 (names >~250 bytes), 176 (orphan staging cleanup), 177 (retry after failed swap), 178 (refuse replacing unrecorded snapshot). #98 acceptance test un-ignore depends on the remaining slice.",
+          "status_note": "Source-only warm base DONE via tree-native ingest (PRs 134,163,231). Two rows need Zee: (1) built tree (warm target/) cannot reach the base without a wire change (optional source path on base_refresh), (2) companion never calls mount_snapshot (flip create/mount order, slot under --export-root, unmount owner). Memo docs/warm-base-123-decision-20261009.md recommends splitting #123 into one issue per remainder.",
           "owner": "remaining slice items; issue stays open",
           "log_20261008": [
             "Builder launched 2026-10-08. Design to docs/specs/warm-base-publication-123.md first, advisor before implementing.",
@@ -759,7 +760,8 @@
             "2026-10-08: PR163 repaired (head 1f9942e, CI 3/3 green): data loss fixed via cowfs_core::ingest_replacing (hidden <name>.cowfs-swap0 staging + replace_with_staged; daemon touches nothing in the user namespace); regression a_user_snapshot_named_like_staging_survives_every_core_refresh (publish, replace, injected cancelled ingest, case-variant) + 255-byte name test; companion gate strengthened and now panics instead of silently returning; stale docs fixed. Author claims acceptance test re-run with --ignored passed on repair head (788s), unverified. Admitted gap: no fault-injection test for a failure after the old tree is removed (roll-forward in Core::open). Refresh replaces a plain user snapshot of the same name (documented passthrough contract; critic assessing). New issues: #167 no per-name lock for concurrent same-name base_refresh; #170 base names over ~250 bytes cannot be refreshed/promoted on the Core. Round-2 critic launched.",
             "2026-10-08 round-2 critic PASS on PR163 head 1f9942e (docs/reviews/163-critic-round2-20261008.md): data loss gone (before/after repro), crash safety OK via existing swap intent + Core::open roll-forward. Items sent to builder before merge: false doc claim that Core::open removes orphan *.cowfs-swap0 (it does not; blocks leak after a crash during staging) -> fix docs + file issue; stale text in linux-namespaces.md:151, handler.rs can_ingest comment, base_meta.rs; weak length-limit assertion; retry-after-failed-swap hazard. Product decision filed as issue not code: refuse refresh over a plain user snapshot of the same name unless an explicit replace flag.",
             "2026-10-08 restart: stopped builder replaced by a fresh one to finish PR163 (head f78dff8). Follow-up issues filed: 176 (Core::open does not remove orphan staging snapshots), 177 (retry after failed swap), 178 (refuse replacing an unrecorded snapshot unless asked).",
-            "2026-10-08: PR163 MERGED 0a85a3a5408fe4c1dfa323b9cfdeca94e5d9e026 pinned f78dff8bcb4cbe0026b110a0e4f675616fe44d8e (round-2 critic PASS at 1f9942e; lead reviewed the f78dff8 delta: comment/doc corrections + unconditional length-limit assertion; CI 3/3 green, linux-fuse log has no FAILED). Core base_refresh now publishes a warm base tree-natively (staging under hidden <name>.cowfs-swap0, replace_with_staged). Issue 123 stays OPEN: remaining = warm target/ in the Core base, companion mount_snapshot call, fresh-daemon readback, acceptance test in CI/Linux (warm_base_acceptance_over_a_real_core is #[ignore]d, 17 min; passed locally 788s per author, unverified). Tracked: 167 (no per-name lock), 170 (names >~250 bytes), 176 (orphan staging cleanup), 177 (retry after failed swap), 178 (refuse replacing unrecorded snapshot). #98 acceptance test un-ignore depends on the remaining slice."
+            "2026-10-08: PR163 MERGED 0a85a3a5408fe4c1dfa323b9cfdeca94e5d9e026 pinned f78dff8bcb4cbe0026b110a0e4f675616fe44d8e (round-2 critic PASS at 1f9942e; lead reviewed the f78dff8 delta: comment/doc corrections + unconditional length-limit assertion; CI 3/3 green, linux-fuse log has no FAILED). Core base_refresh now publishes a warm base tree-natively (staging under hidden <name>.cowfs-swap0, replace_with_staged). Issue 123 stays OPEN: remaining = warm target/ in the Core base, companion mount_snapshot call, fresh-daemon readback, acceptance test in CI/Linux (warm_base_acceptance_over_a_real_core is #[ignore]d, 17 min; passed locally 788s per author, unverified). Tracked: 167 (no per-name lock), 170 (names >~250 bytes), 176 (orphan staging cleanup), 177 (retry after failed swap), 178 (refuse replacing unrecorded snapshot). #98 acceptance test un-ignore depends on the remaining slice.",
+            "Source-only warm base DONE via tree-native ingest (PRs 134,163,231). Two rows need Zee: (1) built tree (warm target/) cannot reach the base without a wire change (optional source path on base_refresh), (2) companion never calls mount_snapshot (flip create/mount order, slot under --export-root, unmount owner). Memo docs/warm-base-123-decision-20261009.md recommends splitting #123 into one issue per remainder."
           ],
           "pr": 163
         },
@@ -934,7 +936,7 @@
           "original_race_review_rejected_outcome_proof_repair_assigned": "Verified review SHA25699a65885d5a0f1f146286921504d48af1978278869d343111640200493b4fa17: head8c3f81683276ae7857530ea2e9e9d0420642a3ea CI37522657769 green but raw test ignores create(doc) status, permitting false green through skipped shadow assertion. Namespace/bytes proof missing; cloned-handle probe proves only same-snapshot. 10004 is NOTSUPP from invalid-prefix refusal, not IO; valid-payload defect unestablished. NFS author resumed bounded falsifiable RPC-status/legal-namespace/doc-byte and valid-vs-invalid channel correction in READY7 tests. New translate43-rpc-outcome-and-valid-channel-correction.md assigned. Legal preexisting real sidecar directories must not be blanket-rejected. No merge/43 closure/new scope/local run without resource preflight; historical receipts immutable and deletion provenance unknown.",
           "original_race_regression_author_done_independent_audit_assigned": "NFS author reports ordinary commit8c3f816 onPR143: permanent raw-RPC stale-lookup guard fixture OLD89353e17 named assertion fails, NEW legal serial fallback passes. Reports 51unit/all integration/fmt/clippy and run37522657769 success; these are author claims pending independent exact-head/log audit. Author retracts directVfs residual citing sharedCore sc.ns; reviewer must trace separateAdapters/aliases/caller reachability, not infer universality from400round unpublishedprobe. Separate sequential doc/._doc channel-write status10004 persists both versions; protocol status interpretation and existing43 channel/bytes acceptance remain unverified, no whole43 closure. Independent wbuddy ses_eed284117ffewH5d699OcxjbAP assigned READONLY new pr143-original-race-final-wbuddy-review.md, conditional assertion strength, actual OLDFAIL/NEWPASS provenance, CI suite coverage, resource preflight and remaining obligations. No new issue/item, runner/cap/lease/sharedresource changes or overlap with activeCore worker; PR143 stays held pending review.",
           "title": "#43 NFS Translate, security and dead-server follow-ups",
-          "state": "blocked",
+          "state": "done",
           "namespace143_review_original_outcome_gap": "Independentpr143-nfs-namespace-race-wbuddy-review.md checksumverified69d5688541f86b02ace1234ca26071949917c02b1d712189ecfe312784fda739 (coordinatorsplitlines173). Verdictadapter-onlysubsetSOURCEPASS/originaldirectwriterresidualNOTFIXED/requiredCIPENDING. Revieweractualfixedrawsampleprintsreal_dir_took_the_name=true/names._doc,doc; conditionalif!real skipschannelassertion andnobytescheck, sopeakdepth1GREENNOToriginalcontractproof. SeparateAdaptermaps/resolvedstorealiasindependentVfshandles evadeadapterlocks; lookuppeekunguarded. Local155PASSlogs lackheadpin/fmtartifact, no blanketruntimeacceptance. Author ses_ef6d6f10cffeA7SelmYbknZnIX resumed tocommitpermanentEXACToriginaldeterministicMAIN-between-peek-and-mutation rawRPCregressionwithunconditionalnamespace/channel/bytesassertions appropriatelegitimatefallback, preserveadapterconcurrencytestswithoutcallingthemclosure. OwnedREADY7NFS testsfirst, sharedlayerfixonlyafteractualRED/ownershiphandoff; noCorelib/ns/inner/queue overlapwithREADY3retryworker. Newcanonical translate43-original-race-regression.md assigned. Fullartifactpreflight/projectionbeforelocalexecution/no capwaiver/cleanup/offload/runner/leaseactions. Existing43unfinished/fixed68.",
           "namespace_race143_adapter_subset_not_original_closure": "Authordeliveredadapter-onlymutexsourcePR143head11e5c136abff8afee1bbd1c10a9e71202f307ed3 draft/base89353e17, ownedNFSadapter/sidecar/newnamespace_race tests. Canonicaltranslate43-existing-race-repair.md verified161lines/SHA2560f4cc6a898539c83198ca084fb7c59be3285eee394634b83bc5cda5114ecb80b. AuthorclaimsrawRPCanddirectadapterOLDpeakdepth2/1PASS2FAIL vsNEWpeakdepth1/3PASS plus155NFSsuitePASS/fmt/clippy; exactlogbinding/fullartifactpreflight notyet independentlyverified. OriginalrecordedRaceVfsout-of-bandMAINinsertion STILLreproducesfixedtree (direct-injection-probe.log); adaptermutexcannotcloseallwriter/sharedVfsrace. WorkcompleteheadlineNOTwhole43completion, no issueclosure/acceptance. IndependentGENERALwbuddy ses_eedaa6bdeffe7vM9oRVbgX4OAu assigned exacthead/source/rawfinalstate/notonlydepth/log/cap/actualCI coverage audit andminimalsharedresponsiblelayerproposal, newcanonicalpr143-nfs-namespace-race-wbuddy-review.md. AuthorstoppedREADY7nootherwriter; CorecommitretryworkerretainsREADY3. Existing68scope/no newissue/runner/lease/sharedresource changes.",
           "wbuddy_existing_race_repair_assigned": "Existing READY7 lane resumed on wbuddy for the already-recorded RaceVfs main-name insertion between Translate peek and mutation, not a new issue/feature/validation lane. Worker ses_ef6d6f10cffeA7SelmYbknZnIX owns NFS Translate namespace source/tests only after held-lease/branch/dirty/process verification. Must recover the exact raw-TCP fixture and reproduce on current unmodified main before repairing; distinguish adapter concurrency from out-of-band backend mutation and preserve legitimate stored-sidecar fallback semantics. Full artifact preflight/projection required before any local execution; no cleanup/offload/cap waiver/runner changes/reruns/shared deployment/lease changes. Canonical translate43-existing-race-repair.md assigned; older review/receipts immutable. Other #43 conformance/performance/second-uid/Store-mode obligations remain incomplete; no whole43 completion or acceptance claim. Active Meta worker owns disjoint READY5 paths; Core142 tests remain held, no overlapping edits.",
@@ -943,7 +945,7 @@
           "pr": "#145",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/145",
           "review_session": "ses_ef63e82dbffe0x9vQcZiu0bRf6",
-          "status_note": "2026-10-09: dead-server experiment done (docs/verification/evidence/nfs43-dead-server.md, uncommitted): SIGTERM/SIGINT exit in 0.13s with clean unmount, restart 0.3s; SIGKILL leaves the stale mount (ls/touch hang past a 20s cap, stat cached), restart sweeps it (1.4-4.8s) with checksums identical in 4/4 runs. Hang duration unmeasured. #43 remains open for conformance rerun through the NFS mount and warm-build timing (g1).",
+          "status_note": "PR245 merged (3 hardening fixes: EXPORT returns empty list, one-shot MNT gate, NULL calls no longer count for eviction; failing-first verified by the critic on cachyos). Follow-ups #262: mount-start DoS via NULL flood, first-MNT theft window, 2 tests pin old behaviour, macOS real-mount suite not run. The live daemon pid 15263 runs an older build without these fixes until rebuilt and restarted (Zee).",
           "issue": 43,
           "owner": "remaining items need a review, a real mount or a timed measurement",
           "existing_security_translate_runtime_audit": "Canonical nfs43-existing-security-translate-runtime-audit.md binds source5be872d/NFSunchangedto verifiedmain7f7b505/tree3719beb CI75b3246 run37555619010 macOS112581048020+Ubuntu112581048044 thirteen namedsecurity/Translate testsPASS. SourcehandlekeyedMAC/constantbytecompare/decodeguards and side_writeperinolock reviewed. same_user allowsunknown/lsoffailure: sourceverifiedlimit, nosecondUIDexploit/isolationclaim. Actualforgerysample1999notdiagnostic2000. Independentround3/fullserialreview/Storecheckout/deadserver/mountedconformance/warmbudget remainOPEN; no newbehavior/runtime/scope/fixed68accepted43unchanged.",
@@ -952,13 +954,14 @@
             "2026-10-09: status audit launched; output docs/reviews/issue43-57-status-20261008.md; #57 loop of 30 runs, no fix for an unreproduced EBADF.",
             "2026-10-09 audit (docs/reviews/issue43-57-status-20261008.md), no small reproducible defect found. MET: Store-mode sidecar assertion (PR155); check-then-act race on adapter-reachable paths (PR111, PR143, PR145). PARTIAL/UNPROVEN: round-3 Translate+security critic review (only PR111 independently reviewed); dead-server handling wired (prepare_platform sweeps stale mounts, own ordered signal handler) but no killed-daemon mount experiment run; security review: second-uid run impossible on this machine, export path in mount_nfs argv is a documented residual. NOT MET: conformance re-run through the NFS mount; warm-build measurement vs the under-1-second macOS budget (g1).",
             "2026-10-09: builder launched for the killed-daemon mount experiment (evidence docs/verification/evidence/nfs43-dead-server.md).",
-            "2026-10-09: dead-server experiment done (docs/verification/evidence/nfs43-dead-server.md, uncommitted): SIGTERM/SIGINT exit in 0.13s with clean unmount, restart 0.3s; SIGKILL leaves the stale mount (ls/touch hang past a 20s cap, stat cached), restart sweeps it (1.4-4.8s) with checksums identical in 4/4 runs. Hang duration unmeasured. #43 remains open for conformance rerun through the NFS mount and warm-build timing (g1)."
+            "2026-10-09: dead-server experiment done (docs/verification/evidence/nfs43-dead-server.md, uncommitted): SIGTERM/SIGINT exit in 0.13s with clean unmount, restart 0.3s; SIGKILL leaves the stale mount (ls/touch hang past a 20s cap, stat cached), restart sweeps it (1.4-4.8s) with checksums identical in 4/4 runs. Hang duration unmeasured. #43 remains open for conformance rerun through the NFS mount and warm-build timing (g1).",
+            "PR245 merged (3 hardening fixes: EXPORT returns empty list, one-shot MNT gate, NULL calls no longer count for eviction; failing-first verified by the critic on cachyos). Follow-ups #262: mount-start DoS via NULL flood, first-MNT theft window, 2 tests pin old behaviour, macOS real-mount suite not run. The live daemon pid 15263 runs an older build without these fixes until rebuilt and restarted (Zee)."
           ]
         },
         {
           "id": "45",
           "title": "#45 Linux FUSE intermittent concurrent torn read",
-          "state": "blocked",
+          "state": "done",
           "delivery_state": "merged",
           "completion_note": "PR105 scopedtest/docs delivery merged80df0fccac26f59fd0b643359350863a332f517e pinned009280460ace2fc4b6d1cc39724dd1b9a1074d35/all3exactCIgreen. Independent review339d3d2d16f0abafef9ee08f564eabd0ef63d787f65d8003b3f34128d6e6a628 verified; finaldeltaonlytwoMarkdownpaths correctssourcehash/clippynodeps/duplicaterow and discloses manualVERDICTnotverifier. Current-main sourceintegration conflictfree tree8bda64803f0397cd37c93dc14ac4bc611ac75c04 mergedexact/no branchfileoverlap/productionuntouched/reviewedcoherencetest+Cargo.tomlpreserved. Two canonical mirrors exact before adoption/mainFFsafe. Aftercarefull4602Bbody0images/tmplinksNONE/historyclosingdirectivesNONE/mergedGraphQLrefsEMPTY/#45OPEN/evidencecommitted/pipelineuninitialized/browserUNVERIFIED. RepeatedFUSEacceptance unproved/rep7rc143 and protected987929D retained/no signal; membershiporacleNOTlastwritewins orzero-data-loss. No new combinedLinux-runtime or full45PASS claim. Shared daemon/store/mount/allleases untouched. Graphdetect_changes86ran for99+105.",
           "resume_verification_note": "Exact PR105 reviewed documentationhead009280460ace2fc4b6d1cc39724dd1b9a1074d35 unchanged/open; all3requiredCIcompletedSUCCESS in one coordinator snapshot afterresume mainc07aabce. Prior independent source/doc proof retained; safe integration/history closing-reference checks stillrequired beforemerge, no mergeperformed. Interrupted repetition rc143 and protectedPID987929D remain unresolved/notPASS; CIgreen does not establish repeated FUSE acceptance or authorize signalling the preserved process.",
@@ -967,12 +970,13 @@
           "pr": "#105",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/105",
           "review_session": "ses_ef697f682ffeREdVREp51FvrVS",
-          "status_note": "2026-10-08 read-only review (no Linux result run by the agent): diagnosis comment says normal Linux page-cache behaviour; ci.yml gates both checks with native controls (PR44 merged 2026-10-02); conformance.rs skips both with reasons. Recommend closing as settled-by-design after confirming tests/coherence.rs coverage (not read). Open question without an issue: new Level in cowfs-vfs-test vs per-harness skip list (thread cites #12, which is the macOS NFS issue, wrong).",
+          "status_note": "2026-10-09: root cause = Linux kernel page cache (POSIX XSH 2.9.7 requires read/write atomicity; cached reads tear on tmpfs, btrfs, ext4 too), not cowfs. With O_DIRECT readers the cowfs mount showed 0 tears in ~78M reads. PR249 merged: O_DIRECT test only, no production change. Design choice left to Zee: FOPEN_DIRECT_IO (atomic cached reads, costs page cache, shared mmap, throughput); recommended: leave. Open: Core test pinning a 4 KiB block across a chunk boundary.",
           "issue": 45,
           "owner": "Space Bunny repair delivered / independent ready-wave13 final-delta review active",
           "detail": "Issue remains open despite FUSE implementation merge. Requires bounded real Linux concurrent reader/writer reproduction with native control; no claim it is resolved by unrelated NFS/resource fixes. Do not alter or dispatch hosted runners to reproduce it.",
           "log_20261008": [
-            "2026-10-08 read-only review (no Linux result run by the agent): diagnosis comment says normal Linux page-cache behaviour; ci.yml gates both checks with native controls (PR44 merged 2026-10-02); conformance.rs skips both with reasons. Recommend closing as settled-by-design after confirming tests/coherence.rs coverage (not read). Open question without an issue: new Level in cowfs-vfs-test vs per-harness skip list (thread cites #12, which is the macOS NFS issue, wrong)."
+            "2026-10-08 read-only review (no Linux result run by the agent): diagnosis comment says normal Linux page-cache behaviour; ci.yml gates both checks with native controls (PR44 merged 2026-10-02); conformance.rs skips both with reasons. Recommend closing as settled-by-design after confirming tests/coherence.rs coverage (not read). Open question without an issue: new Level in cowfs-vfs-test vs per-harness skip list (thread cites #12, which is the macOS NFS issue, wrong).",
+            "2026-10-09: root cause = Linux kernel page cache (POSIX XSH 2.9.7 requires read/write atomicity; cached reads tear on tmpfs, btrfs, ext4 too), not cowfs. With O_DIRECT readers the cowfs mount showed 0 tears in ~78M reads. PR249 merged: O_DIRECT test only, no production change. Design choice left to Zee: FOPEN_DIRECT_IO (atomic cached reads, costs page cache, shared mmap, throughput); recommended: leave. Open: Core test pinning a 4 KiB block across a chunk boundary."
           ]
         },
         {
@@ -1084,11 +1088,12 @@
         {
           "id": "98",
           "title": "#98 base refresh warm-base provenance persisted and discoverable",
-          "state": "blocked",
+          "state": "done",
           "issue": 98,
-          "status_note": "Provenance fix b54ed1b on main with reopen tests; #115 and #124 follow-ups done. Open: end-to-end acceptance test real_project_acceptance.rs:2824 is ignored (chain broken at can_ingest gate, #123). Close when #123 slice un-ignores it.",
+          "status_note": "CLOSED 2026-10-09: provenance persisted and discoverable on both backends (PRs 134, 163, 231).",
           "log_20261008": [
-            "Provenance fix b54ed1b on main with reopen tests; #115 and #124 follow-ups done. Open: end-to-end acceptance test real_project_acceptance.rs:2824 is ignored (chain broken at can_ingest gate, #123). Close when #123 slice un-ignores it."
+            "Provenance fix b54ed1b on main with reopen tests; #115 and #124 follow-ups done. Open: end-to-end acceptance test real_project_acceptance.rs:2824 is ignored (chain broken at can_ingest gate, #123). Close when #123 slice un-ignores it.",
+            "CLOSED 2026-10-09: provenance persisted and discoverable on both backends (PRs 134, 163, 231)."
           ]
         },
         {
@@ -1116,25 +1121,27 @@
         {
           "id": "108",
           "title": "#108 pathconf PATH_MAX unreadable on the mount (g3)",
-          "state": "blocked",
+          "state": "done",
           "owner": "decision needed: record g3 divergence",
           "issue": 108,
-          "status_note": "Triaged 2026-10-08: NFSv3 PATHCONF3resok has no path-max field, so no server can supply it; NAME_MAX 255 answered correctly (PR157 test). EINVAL is inferred to come from the macOS NFS client (unproven). About 13 pjdfstest cases will keep failing on macOS NFS. Findings posted on the issue.",
+          "status_note": "CLOSED: macOS client limitation (nfs_vnop_pathconf has no _PC_PATH_MAX case); PR219 evidence, PR233 harness supplies native PATH_MAX only for the exact known case.",
           "log_20261008": [
-            "Triaged 2026-10-08: NFSv3 PATHCONF3resok has no path-max field, so no server can supply it; NAME_MAX 255 answered correctly (PR157 test). EINVAL is inferred to come from the macOS NFS client (unproven). About 13 pjdfstest cases will keep failing on macOS NFS. Findings posted on the issue."
+            "Triaged 2026-10-08: NFSv3 PATHCONF3resok has no path-max field, so no server can supply it; NAME_MAX 255 answered correctly (PR157 test). EINVAL is inferred to come from the macOS NFS client (unproven). About 13 pjdfstest cases will keep failing on macOS NFS. Findings posted on the issue.",
+            "CLOSED: macOS client limitation (nfs_vnop_pathconf has no _PC_PATH_MAX case); PR219 evidence, PR233 harness supplies native PATH_MAX only for the exact known case."
           ]
         },
         {
           "id": "109",
           "title": "#109 rmdir trailing '..' errno and nlink after unlinking an open file (g3)",
-          "state": "blocked",
+          "state": "pending",
           "owner": "decision needed: nlink-after-unlink-of-open-file as g3 exception or follow-up",
           "issue": 109,
-          "status_note": "2026-10-08: PR162 MERGED c3806e7a6104692f356da054e459dbfb25068ce4 pinned ecc7022eb00ab65649ad146919ef52b56d77e4fe after independent critic PASS (rmdir of '..' now NFS3ERR_NOTEMPTY; FUSE needs no guard, verified against Linux v6.12 namei.c). Issue stays open (Refs): nlink 1 after unlink of an open file is the macOS NFS client silly-rename, not a server bug. Non-blocking: unlink/rename of '.' or '..' still EINVAL (Linux EISDIR/EBUSY), same validate_name root; follow up only if a wider pjdfstest run flags them. Review docs/reviews/162-critic-20261008.md.",
+          "status_note": "Symptom 1 (rmdir trailing ..) fixed by ecc7022; symptom 2 (unlink/14.t #4 nlink) = macOS NFS client silly-rename (PR215 evidence + test); g3 accepted entry in PR217. Closed by the triage; kept for the known_limits entry.",
           "log_20261008": [
             "Builder launched 2026-10-08, branch fix/rmdir-dotdot-109 if a real bug.",
             "2026-10-08: PR162 draft (12e95a5, Refs 109): rmdir of '..' now NFS3ERR_NOTEMPTY (was EINVAL) in Adapter::rmdir; unit test failed on main with 'answered 22'; CI 3/3 green. NOT fixed: nlink 1 after unlinking an open file - macOS NFS client silly-renames (.nfs.*), link is real, server cannot answer 0; GETATTR after REMOVE with a handle held returns STALE. Decision needed: known g3 exception or follow-up issue. Independent critic launched.",
-            "2026-10-08: PR162 MERGED c3806e7a6104692f356da054e459dbfb25068ce4 pinned ecc7022eb00ab65649ad146919ef52b56d77e4fe after independent critic PASS (rmdir of '..' now NFS3ERR_NOTEMPTY; FUSE needs no guard, verified against Linux v6.12 namei.c). Issue stays open (Refs): nlink 1 after unlink of an open file is the macOS NFS client silly-rename, not a server bug. Non-blocking: unlink/rename of '.' or '..' still EINVAL (Linux EISDIR/EBUSY), same validate_name root; follow up only if a wider pjdfstest run flags them. Review docs/reviews/162-critic-20261008.md."
+            "2026-10-08: PR162 MERGED c3806e7a6104692f356da054e459dbfb25068ce4 pinned ecc7022eb00ab65649ad146919ef52b56d77e4fe after independent critic PASS (rmdir of '..' now NFS3ERR_NOTEMPTY; FUSE needs no guard, verified against Linux v6.12 namei.c). Issue stays open (Refs): nlink 1 after unlink of an open file is the macOS NFS client silly-rename, not a server bug. Non-blocking: unlink/rename of '.' or '..' still EINVAL (Linux EISDIR/EBUSY), same validate_name root; follow up only if a wider pjdfstest run flags them. Review docs/reviews/162-critic-20261008.md.",
+            "Symptom 1 (rmdir trailing ..) fixed by ecc7022; symptom 2 (unlink/14.t #4 nlink) = macOS NFS client silly-rename (PR215 evidence + test); g3 accepted entry in PR217. Closed by the triage; kept for the known_limits entry."
           ],
           "pr": 162
         },
@@ -1166,10 +1173,10 @@
         {
           "id": "103",
           "title": "#103 cowfs-fuse fallocate answers ENOTSUP for every mode (no fsx hole coverage)",
-          "state": "active",
+          "state": "done",
           "owner": "critic reviewing PR203 (slice C)",
           "issue": 103,
-          "status_note": "2026-10-09: PR205 (slice D: PathVfs::fallocate via fallocate(2), six fuse fallocate skips removed, CI conformance count derived) MERGED after critic PASS WITH NOTES (docs/reviews/205-critic-20261009.md); CI 4/4 on the head, main run on the merge green. linux-fuse '134 run, 1 failed (known xattr), 19 skipped, 2 heavy', all six fallocate_* ok. Notes (not filed): fallocate_modes_reach_the_kernel SKIP path is a silent pass on CI (should panic when CI is set); len==0 and range checks should precede open_rw; symlink and macOS branches untested; FallocMode import ungrouped; `special` union term in ci.yml goes away with #107 slice D. g4 fsx matrix on cachyos Core: 18/18 seed pairs PASS incl. allocate, keep-size, punch, zero-range (docs/reviews/g4-status-20261009.md, uncommitted); known difference zero-range drops cowfs st_blocks 128 to 64 vs btrfs 128, not compared by fsx. Issue 103 can close once the notes are filed or waived.",
+          "status_note": "CLOSED 2026-10-09. Slices A-D merged (#198, #203, #205): Vfs::fallocate on Core, PathVfs::fallocate via fallocate(2), six fuse fallocate skips removed, CI conformance count derived. g4 fsx matrix PASS on cachyos 18/18 incl. allocate/keep-size/punch/zero-range.",
           "log_20261008": [
             "2026-10-08: needs a new Vfs method. Design: Vfs::fallocate(ino, FallocMode{Allocate,KeepSize,PunchHole,ZeroRange}, offset, len) with default NotSupported; Core implements via hole_refs on the truncate/write path under the inode lock; FUSE maps mode bits, ENOTSUP for collapse/insert/unshare; tests in cowfs-vfs-test and a CI-only mount test; re-run bench/fsx-gate/fallocate-matrix.py. KEEP_SIZE-only in the adapter gives no hole coverage. Touches cowfs-vfs, cowfs-core, cowfs-fuse.",
             "Overlap with #107 on cowfs-vfs/core/fuse: each adds only its own lines and rebases before each PR.",
@@ -1181,7 +1188,8 @@
             "PR198 (slice B) MERGED 9e5b6d5b2a532ddbb405da99eb9a8c5a0aaff5eb pinned 8955ddd3ad5fe035c9aeb11ad9e8219545152efa: critic PASS at d90bea4 + rebase onto main (both conflicts additive: Fault variants + Fault::ALL, Core conformance imports incl. the mknod forward kept from both sides) + clock read inside the node lock in op_fallocate + Core past-max test pinned to FileTooBig; CI 4/4 on the exact head (ubuntu, macOS, linux-fuse, namespaces); linux-fuse log: 0 FAILED, only the known xattr failure, six fallocate checks SKIP (PathVfs slice D), '128 run, 1 failed, 25 skipped'. Local: vfs-test suites, Core lib/conformance/fallocate, clippy -D warnings, lock_audit --check pass; mutations_full NOT re-run on the merged tree. Slice C (FUSE mapping + GuardedView forward + Linux mount test) started; slice D (PathVfs, unskip six fuse-harness checks, derive the conformance count) after C is reviewed.",
             "2026-10-09 PR203 (slice C, FUSE fallocate mapping; head 4db0080f37fcabd867527bf6faf5658dcb4ff94d): modes -> FallocMode, ENOTSUP for collapse/insert/unshare, oversize -> EFBIG, forward through the daemon GuardedView, CI-only Linux mount test fallocate_modes_through_a_mount (fixture = MemVfs behind Probe: proves the FUSE mapping, NOT Core through a mount), unsupported_operations_report_enotsup updated, new unit test convert::tests::fallocate_modes_map_and_the_rest_are_enotsup; first CI run failed the unsafe_code deny lint in mount.rs -> #[allow(unsafe_code)] on the one syscall helper; CI 4/4 green on the head; linux-fuse log: three tests ok, 0 FAILED, known xattr failure only, '128 run' with the six fallocate conformance checks still SKIPPED (slice D); panicked lines at tests/common/mod.rs:185 assumed deliberate fault injection (not checked). UNVERIFIED (from memory): which mode bits the kernel forwards; special files get ENODEV/ESPIPE before FUSE sees them. fsx fallocate matrix on Core NOT run (cachyos). Slice D (PathVfs, unskip six, derive the count) after review. Critic launched.",
             "PR203 (slice C) MERGED aff5537e499e95a70aba2516ca0df9204bd806c6 pinned 4db0080f37fcabd867527bf6faf5658dcb4ff94d after critic PASS (docs/reviews/203-critic-20261009.md): CI 4/4 on the exact head, linux-fuse 0 FAILED, three tests ok (fallocate_modes_through_a_mount, unsupported_operations_report_enotsup, convert::tests::fallocate_modes_map_and_the_rest_are_enotsup); the panicked lines at common/mod.rs:185 are the deliberate 'injected Vfs panic' (repeated_vfs_panics_fail_the_mount_with_enotconn, ends ok). Mode mapping matches kernel v6.8 source (fetched; not the runner's kernel): fuse_file_fallocate accepts only KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE so COLLAPSE/INSERT never reach FUSE; ESPIPE/ENODEV for special files confirmed in vfs_fallocate v6.8 (the 'from memory' caveat can be dropped for that kernel). Notes: mount-test refusals for collapse/insert/unshare/len-0 EINVAL are answered by the kernel, only the 1<<42 EFBIG assertion exercises adapter+Vfs; the mount test cannot detect swapping PunchHole with ZeroRangeKeepSize (MemVfs treats them identically; only the unit test catches it); cowfs-nfs test wrappers and runner.rs Bad don't forward fallocate (nothing calls it); #[allow(unsafe_code)] only on the single falloc helper. Slice D (PathVfs fallocate, unskip the six fuse-harness checks, derive the conformance count) NOT started: waits for PR201 (#107) to merge to avoid both adding PathVfs methods. fsx matrix on Core (cachyos) still not run.",
-            "2026-10-09: PR205 (slice D: PathVfs::fallocate via fallocate(2), six fuse fallocate skips removed, CI conformance count derived) MERGED after critic PASS WITH NOTES (docs/reviews/205-critic-20261009.md); CI 4/4 on the head, main run on the merge green. linux-fuse '134 run, 1 failed (known xattr), 19 skipped, 2 heavy', all six fallocate_* ok. Notes (not filed): fallocate_modes_reach_the_kernel SKIP path is a silent pass on CI (should panic when CI is set); len==0 and range checks should precede open_rw; symlink and macOS branches untested; FallocMode import ungrouped; `special` union term in ci.yml goes away with #107 slice D. g4 fsx matrix on cachyos Core: 18/18 seed pairs PASS incl. allocate, keep-size, punch, zero-range (docs/reviews/g4-status-20261009.md, uncommitted); known difference zero-range drops cowfs st_blocks 128 to 64 vs btrfs 128, not compared by fsx. Issue 103 can close once the notes are filed or waived."
+            "2026-10-09: PR205 (slice D: PathVfs::fallocate via fallocate(2), six fuse fallocate skips removed, CI conformance count derived) MERGED after critic PASS WITH NOTES (docs/reviews/205-critic-20261009.md); CI 4/4 on the head, main run on the merge green. linux-fuse '134 run, 1 failed (known xattr), 19 skipped, 2 heavy', all six fallocate_* ok. Notes (not filed): fallocate_modes_reach_the_kernel SKIP path is a silent pass on CI (should panic when CI is set); len==0 and range checks should precede open_rw; symlink and macOS branches untested; FallocMode import ungrouped; `special` union term in ci.yml goes away with #107 slice D. g4 fsx matrix on cachyos Core: 18/18 seed pairs PASS incl. allocate, keep-size, punch, zero-range (docs/reviews/g4-status-20261009.md, uncommitted); known difference zero-range drops cowfs st_blocks 128 to 64 vs btrfs 128, not compared by fsx. Issue 103 can close once the notes are filed or waived.",
+            "CLOSED 2026-10-09. Slices A-D merged (#198, #203, #205): Vfs::fallocate on Core, PathVfs::fallocate via fallocate(2), six fuse fallocate skips removed, CI conformance count derived. g4 fsx matrix PASS on cachyos 18/18 incl. allocate/keep-size/punch/zero-range."
           ],
           "pr": 203
         },
@@ -1230,10 +1238,10 @@
         {
           "id": "171",
           "title": "#171 namespaces follow-ups: CI userns, cargo canonical build, Linux treehouse lease run, fs matrix",
-          "state": "done",
+          "state": "active",
           "owner": "critics reviewing PR172 and PR180; rows 3-4 queued (cachyos, sudo via .env)",
           "issue": 171,
-          "status_note": "PR182 MERGED 1f3bb54a066da2545cf3fc4d2e9fadba90c39210 pinned 29f6e9ae08d52224cfe85ac86b0ab757a90854dc after critic PASS (docs/reviews/182-critic-20261009.md): rows 3-4 evidence on cachyos (treehouse v3.1.2 real lease, btrfs/ext4/XFS matrix). #171 rows 1-4 all delivered. Non-blocking notes (text only): fsimg.sh has no cleanup trap; lease171.sh:67 returns slots without --force; onfs.sh sources env.sh not in the PR; 'repeated 3 times on XFS' has no retained log; XFS 'because' wording is inference; password-in-local-sed finding recorded accurately (rotate CACHY_OS_PASS); cargo171.md mislabels /mnt/docs as ext4 (it is btrfs). Still uncovered: kernels < 6.12, loop-on-btrfs device layer, leased slot on FUSE, Core backend, release builds, registry deps.",
+          "status_note": "4 of 5 acceptance rows met on main (CI job, cargo canonical build, core-backend base_refresh re-run on cachyos, real lease). Unmet: older kernels; needs a floor decision (cheapest: a second hosted-runner image such as ubuntu-22.04 in linux-namespaces). docs/reviews/namespaces-171-remaining-20261009.md.",
           "log_20261008": [
             "Builder launched 2026-10-08 on rows 1 and 2 (branch ci/userns-and-cargo-canonical-171). Rows 3 (real Linux treehouse lease run, needs a Linux host with treehouse) and 4 (btrfs/XFS/older-kernel) not started.",
             "2026-10-08: builder on rows 1-2 running. Rows 3-4 (real Linux treehouse lease run; btrfs/XFS/older-kernel matrix) approved to run on the cachyos box (Zee said yes) but the box is OFFLINE: tailscale shows cachyos-x8664 offline, last seen 44 min before 2026-10-08 evening check, ssh times out. Not started. Prereqs from the cachyos-gpu skill: check disk first, work under /mnt/docs, no passwordless sudo (so no mkfs/loop mounts for btrfs/XFS unless existing partitions are available), no GitHub creds on the box (ship a git archive), launch long jobs with nohup. Box may need to be woken.",
@@ -1246,7 +1254,8 @@
             "2026-10-09: Zee released the hold on rows 3-4: builder launched on the cachyos box (sudo via CACHY_OS_PASS, everything under /mnt/docs; ext4/XFS/btrfs loop matrix; real treehouse lease if the binary is obtainable; older kernel not possible).",
             "PR180 MERGED 43fe43cb54c96b4ebfdbe2c81c7e0083a15f9336 pinned c1071a2565ba3f44ee401a0f5f12966b2ef9ca31 after critic PASS + required doc edit (cost of CARGO_INCREMENTAL=0); CI 3/3 + namespaces green, linux-fuse log no FAILED, unit test ok on both OSes. Rows 1 and 2 DONE (PR172, PR180). Rows 3-4: cachyos builder running.",
             "2026-10-09: rows 3-4 DONE by the cachyos builder (PR182, docs+evidence, CI green, critic launched). Row 3: prebuilt treehouse v3.1.2 linux-amd64 (sha256 matches release checksums.txt), real `base refresh --build --canonical` leased 3 slots, target trees byte-identical 43/43, native-path 4th lease differed in 15 path-embedding files, route set CARGO_INCREMENTAL=0, warm base fresh, all slots returned. Row 4 (btrfs /mnt/docs, 4G ext4 and XFS loop images on btrfs): isolation 9/9 + 7/7 refusals each; canonical CARGO_INCREMENTAL=0 builds byte-identical N=6 each; native control differs 15/15/16 files (XFS also dep-bin-app, cause inferred); CARGO_INCREMENTAL=1 canonical differs in 81 paths. NOT covered: kernels older than 6.12 (one kernel 7.2.8), loop images on btrfs, leased slot on FUSE, Core backend, release builds, registry deps. PROCESS FINDING: 4 Mac-side calls briefly exposed the sudo password in local sed argv; recommend Zee rotates CACHY_OS_PASS. cargo171.md labels /mnt/docs ext4 but it is btrfs.",
-            "PR182 MERGED 1f3bb54a066da2545cf3fc4d2e9fadba90c39210 pinned 29f6e9ae08d52224cfe85ac86b0ab757a90854dc after critic PASS (docs/reviews/182-critic-20261009.md): rows 3-4 evidence on cachyos (treehouse v3.1.2 real lease, btrfs/ext4/XFS matrix). #171 rows 1-4 all delivered. Non-blocking notes (text only): fsimg.sh has no cleanup trap; lease171.sh:67 returns slots without --force; onfs.sh sources env.sh not in the PR; 'repeated 3 times on XFS' has no retained log; XFS 'because' wording is inference; password-in-local-sed finding recorded accurately (rotate CACHY_OS_PASS); cargo171.md mislabels /mnt/docs as ext4 (it is btrfs). Still uncovered: kernels < 6.12, loop-on-btrfs device layer, leased slot on FUSE, Core backend, release builds, registry deps."
+            "PR182 MERGED 1f3bb54a066da2545cf3fc4d2e9fadba90c39210 pinned 29f6e9ae08d52224cfe85ac86b0ab757a90854dc after critic PASS (docs/reviews/182-critic-20261009.md): rows 3-4 evidence on cachyos (treehouse v3.1.2 real lease, btrfs/ext4/XFS matrix). #171 rows 1-4 all delivered. Non-blocking notes (text only): fsimg.sh has no cleanup trap; lease171.sh:67 returns slots without --force; onfs.sh sources env.sh not in the PR; 'repeated 3 times on XFS' has no retained log; XFS 'because' wording is inference; password-in-local-sed finding recorded accurately (rotate CACHY_OS_PASS); cargo171.md mislabels /mnt/docs as ext4 (it is btrfs). Still uncovered: kernels < 6.12, loop-on-btrfs device layer, leased slot on FUSE, Core backend, release builds, registry deps.",
+            "4 of 5 acceptance rows met on main (CI job, cargo canonical build, core-backend base_refresh re-run on cachyos, real lease). Unmet: older kernels; needs a floor decision (cheapest: a second hosted-runner image such as ubuntu-22.04 in linux-namespaces). docs/reviews/namespaces-171-remaining-20261009.md."
           ],
           "pr": 172
         },
@@ -1256,13 +1265,14 @@
           "state": "active",
           "owner": "slice 2 builder: daemon-level reach for the gc_crash case",
           "issue": 173,
-          "status_note": "Slices 1 (PR183) and 2 (PR189) merged. g6 still open: power loss (slice 3: extend the oplog_* model that drops unsynced writes to a recorded Gc::collect; real claim needs a VM harness), metadata-commit edge and freeze meta.sync window (no Io boundary), client-write ordering, mutation 2 (fault_boundary after remove_file shifts hard-coded n in store tests), the sweep is a manual stage not CI.",
+          "status_note": "#173: slices 1-2 merged. PR261 made the oplog lazy and compiled only with fault-injection (zero cost when disabled; #247). Design memo docs/crash-injection-173-power-loss-design-20261009.md recommends (a) write-ordering simulation at the store Io + redb StorageBackend seams; slice 3 builder running (runs the memo's falsifying spike first). Remaining: slice 4 gc under power loss, slice 5 core timeline.",
           "log_20261008": [
             "Constraint: #88 forbade fault APIs, so the seam must be compiled out of release builds, no public control-API surface, zero cost when disabled.",
             "2026-10-09: Zee released the hold; builder launched. Constraint: compiled out of release builds, no control-protocol surface.",
             "2026-10-09: slice 1 delivered in draft PR183 (e19ccb5, CI 4/4 green incl. new check-fault-seam-absent step): crate-level mid-GC crash evidence. Design docs/crash-injection-173.md; advisor changed the design: the store already exits 77 at every Io boundary via C7D_EXIT_BOUNDARY_N, so NO production code added. Test cowfs-gc/tests/crash_inject.rs: 72 crashes over 73 boundaries, 28 after an unlink, control freed 118856 bytes in 4 packs; after each crash store opens, fsck clean, every live block reads back exact bytes, second collect ok. Failing-first (dev-dependency line removed -> 'crashed only 0 times'). Mutation 1 caught; mutation 2 (unlink before durable watermark raise) NOT caught because an unsynced write survives a process exit; stated in the doc. NO daemon-level or power-loss claim; g6 stays open. Remaining: daemon fault-injection feature + flag in scripts/verify-daemon-crash.py (gc_crash case still frees 0 bytes); metadata-commit edge and freeze meta.sync window (not through Io); power loss = extend the oplog_* model (drops unsynced writes) to a recorded Gc::collect, real claim needs VM harness; fault_boundary after remove_file shifts hard-coded n in store tests. Critic launched.",
             "PR183 MERGED 8f8534f3a56cb3efdc699709c17019b951a696ec pinned e19ccb5977b4c3bf61e2e0e99f2dc396f4b10f07 after critic PASS (docs/reviews/183-critic-20261009.md): seam absent from a normal release daemon (resolver 2, dev-dependency edges only; release cowfs-daemon has 0 C7D_EXIT hits), sweep not vacuous (all 72 crashes inside collect; critic's own mutation fails with 'live block lost'), mutation 2 uncatchable and documented. Non-blocking: PR body says 28 crashes after an unlink, critic measured 26 on macOS (other figures match); check-fault-seam-absent.sh checks only the daemon feature graph + a debug rlib (a workspace-wide cargo tree check returns 0 matches); add a CI grep of a built daemon for C7D_EXIT; mid_reclaim>0 is a weak floor; closing mutation 2 needs a fault_boundary after remove_file (shifts hard-coded n in store tests). Slice 2 = daemon fault-injection feature that only forwards the store's hook + a flag in scripts/verify-daemon-crash.py so gc_crash frees bytes. g6 remains open (power loss, metadata-commit edge, freeze meta.sync window).",
-            "Slices 1 (PR183) and 2 (PR189) merged. g6 still open: power loss (slice 3: extend the oplog_* model that drops unsynced writes to a recorded Gc::collect; real claim needs a VM harness), metadata-commit edge and freeze meta.sync window (no Io boundary), client-write ordering, mutation 2 (fault_boundary after remove_file shifts hard-coded n in store tests), the sweep is a manual stage not CI."
+            "Slices 1 (PR183) and 2 (PR189) merged. g6 still open: power loss (slice 3: extend the oplog_* model that drops unsynced writes to a recorded Gc::collect; real claim needs a VM harness), metadata-commit edge and freeze meta.sync window (no Io boundary), client-write ordering, mutation 2 (fault_boundary after remove_file shifts hard-coded n in store tests), the sweep is a manual stage not CI.",
+            "#173: slices 1-2 merged. PR261 made the oplog lazy and compiled only with fault-injection (zero cost when disabled; #247). Design memo docs/crash-injection-173-power-loss-design-20261009.md recommends (a) write-ordering simulation at the store Io + redb StorageBackend seams; slice 3 builder running (runs the memo's falsifying spike first). Remaining: slice 4 gc under power loss, slice 5 core timeline."
           ],
           "pr": 183
         },
@@ -1292,14 +1302,16 @@
         {
           "id": "167",
           "title": "#167 concurrent same-name base_refresh has no per-name lock",
-          "state": "pending",
-          "issue": 167
+          "state": "done",
+          "issue": 167,
+          "status_note": "Fixed by PR231 (per-store per-name in-flight guard)."
         },
         {
           "id": "170",
           "title": "#170 Core: base names over ~250 bytes cannot be refreshed or promoted",
-          "state": "pending",
-          "issue": 170
+          "state": "done",
+          "issue": 170,
+          "status_note": "Fixed by PR231 (240-byte base name limit at the first call)."
         },
         {
           "id": "quiet-host",
@@ -1333,10 +1345,11 @@
           "title": "g3 pjdfstest rerun after #110/#109 fixes",
           "state": "active",
           "note": "Builder running; output docs/reviews/g3-status-20261009.md.",
-          "status_note": "2026-10-09: full rerun on main 9c32468 (daemon sha256 dba32eee...): 238 cases, 8686 assertions per arm; native 2985 vs cowfs 2914 passing; harness reports 1 established regression (was 77), 0 candidates. That one is open/17.t #2 = #204 (macOS client). Ordinal differential worse 71 / better 0: 69 are #108 pathconf (13 cases; 46 empty generated name, 8 expected ENAMETOOLONG got 0, 15 downstream ENOENT), 1 is #204, 1 is unlink/14.t #4 (#109). Nothing UNEXPLAINED. mkfifo/00, mknod/00, unlink/00, ftruncate/12, truncate/12 now match native. PR209 MERGED (docs/reviews/g3-status-20261009b.md). g3 NOT closed: Linux FUSE arm unmeasured; harness prints PASS on coverage reasons while worse positions exist. DECIDED (Zee, 2026-10-09): accept #108 as a documented macOS client divergence (do not make the harness supply a name length); #108 stays open for the real pathconf fix; harness must stop printing PASS when worse positions exist (follow-up, unfiled); g3 stays open until the Linux FUSE arm is measured.",
+          "status_note": "macOS arm: 1 established regression (open/17.t #2 = #204), 69 #108 rows gone after PR233 (harness supplies native PATH_MAX only for the exact EINVAL-with-NAME_MAX-equal case, else UNMEASURABLE). Linux FUSE arm FIRST MEASURED 2026-10-09 (docs/reviews/g3-linux-fuse-status-20261009.md, 238 cases): 2 new worse positions mknod/08.t #19/#24 = #243, fixed by PR255 (whiteout 0:0 char device allowed for non-root). PR241 made the harness read the Linux mount table; PR256 (rebuilt after a stale-base BLOCK) requires fuse.cowfs/nfs arms and per-platform accepted divergences. Remaining: rerun Linux after PR255/271 for a clean verdict; #204 decision.",
           "log_20261008": [
             "2026-10-09: full rerun on main 9c32468 (daemon sha256 dba32eee...): 238 cases, 8686 assertions per arm; native 2985 vs cowfs 2914 passing; harness reports 1 established regression (was 77), 0 candidates. That one is open/17.t #2 = #204 (macOS client). Ordinal differential worse 71 / better 0: 69 are #108 pathconf (13 cases; 46 empty generated name, 8 expected ENAMETOOLONG got 0, 15 downstream ENOENT), 1 is #204, 1 is unlink/14.t #4 (#109). Nothing UNEXPLAINED. mkfifo/00, mknod/00, unlink/00, ftruncate/12, truncate/12 now match native. PR209 MERGED (docs/reviews/g3-status-20261009b.md). g3 NOT closed: Linux FUSE arm unmeasured; harness prints PASS on coverage reasons while worse positions exist. DECISION NEEDED (Zee): accept #108 as a documented client divergence, or make the harness supply a name length.",
-            "2026-10-09: full rerun on main 9c32468 (daemon sha256 dba32eee...): 238 cases, 8686 assertions per arm; native 2985 vs cowfs 2914 passing; harness reports 1 established regression (was 77), 0 candidates. That one is open/17.t #2 = #204 (macOS client). Ordinal differential worse 71 / better 0: 69 are #108 pathconf (13 cases; 46 empty generated name, 8 expected ENAMETOOLONG got 0, 15 downstream ENOENT), 1 is #204, 1 is unlink/14.t #4 (#109). Nothing UNEXPLAINED. mkfifo/00, mknod/00, unlink/00, ftruncate/12, truncate/12 now match native. PR209 MERGED (docs/reviews/g3-status-20261009b.md). g3 NOT closed: Linux FUSE arm unmeasured; harness prints PASS on coverage reasons while worse positions exist. DECIDED (Zee, 2026-10-09): accept #108 as a documented macOS client divergence (do not make the harness supply a name length); #108 stays open for the real pathconf fix; harness must stop printing PASS when worse positions exist (follow-up, unfiled); g3 stays open until the Linux FUSE arm is measured."
+            "2026-10-09: full rerun on main 9c32468 (daemon sha256 dba32eee...): 238 cases, 8686 assertions per arm; native 2985 vs cowfs 2914 passing; harness reports 1 established regression (was 77), 0 candidates. That one is open/17.t #2 = #204 (macOS client). Ordinal differential worse 71 / better 0: 69 are #108 pathconf (13 cases; 46 empty generated name, 8 expected ENAMETOOLONG got 0, 15 downstream ENOENT), 1 is #204, 1 is unlink/14.t #4 (#109). Nothing UNEXPLAINED. mkfifo/00, mknod/00, unlink/00, ftruncate/12, truncate/12 now match native. PR209 MERGED (docs/reviews/g3-status-20261009b.md). g3 NOT closed: Linux FUSE arm unmeasured; harness prints PASS on coverage reasons while worse positions exist. DECIDED (Zee, 2026-10-09): accept #108 as a documented macOS client divergence (do not make the harness supply a name length); #108 stays open for the real pathconf fix; harness must stop printing PASS when worse positions exist (follow-up, unfiled); g3 stays open until the Linux FUSE arm is measured.",
+            "macOS arm: 1 established regression (open/17.t #2 = #204), 69 #108 rows gone after PR233 (harness supplies native PATH_MAX only for the exact EINVAL-with-NAME_MAX-equal case, else UNMEASURABLE). Linux FUSE arm FIRST MEASURED 2026-10-09 (docs/reviews/g3-linux-fuse-status-20261009.md, 238 cases): 2 new worse positions mknod/08.t #19/#24 = #243, fixed by PR255 (whiteout 0:0 char device allowed for non-root). PR241 made the harness read the Linux mount table; PR256 (rebuilt after a stale-base BLOCK) requires fuse.cowfs/nfs arms and per-platform accepted divergences. Remaining: rerun Linux after PR255/271 for a clean verdict; #204 decision."
           ]
         },
         {
@@ -1366,7 +1379,8 @@
           "title": "#101 g5 blocked: xfstests needs ltp/fsstress and ltp/fsx",
           "state": "active",
           "issue": 101,
-          "note": "Being unblocked by the g5 builder using sudo on the cachyos box."
+          "note": "Being unblocked by the g5 builder using sudo on the cachyos box.",
+          "status_note": "PR240 merged: bench/xfstests_build.sh builds fsstress/fsx without root on cachyos at the pinned commit (dirty-tree check made ignored-aware after a critic BLOCK). g5 still blocked on root for the suite's check (no sudo password); #251 hardening merged (PR267)."
         },
         {
           "id": "daemon-fault-slice",
@@ -1483,9 +1497,10 @@
           "id": "PAUSE",
           "title": "RESUMED 2026-10-09 (was: PAUSED by Zee, stop burning tokens): #197 #198 #199 #200 #201 #203 #205 #208 merged after critics; #207 #209 (docs) merged on Zee instruction; #175 merged by Zee",
           "state": "done",
-          "status_note": "To resume: (1) review+merge #197/#199 (flakes), #198 (fallocate B), #200 (g5 harness) each with a critic; (2) #107 B+C together then D; (3) #103 C, D; (4) quiet-host run of g1/g2 macOS sample; Linux driver for cachyos; (5) g6 slice 3 (power loss); (6) PR175 final comparison; (7) rotate CACHY_OS_PASS; (8) commit the untracked docs/reviews pile.",
+          "status_note": "RESUMED 2026-10-09. Merged since the restart: 214,220,229,230,231,233,240,241,242,245,248,249,250,253,255,256,257,260,261,264,266,267,268,269,270.",
           "log_20261008": [
-            "To resume: (1) review+merge #197/#199 (flakes), #198 (fallocate B), #200 (g5 harness) each with a critic; (2) #107 B+C together then D; (3) #103 C, D; (4) quiet-host run of g1/g2 macOS sample; Linux driver for cachyos; (5) g6 slice 3 (power loss); (6) PR175 final comparison; (7) rotate CACHY_OS_PASS; (8) commit the untracked docs/reviews pile."
+            "To resume: (1) review+merge #197/#199 (flakes), #198 (fallocate B), #200 (g5 harness) each with a critic; (2) #107 B+C together then D; (3) #103 C, D; (4) quiet-host run of g1/g2 macOS sample; Linux driver for cachyos; (5) g6 slice 3 (power loss); (6) PR175 final comparison; (7) rotate CACHY_OS_PASS; (8) commit the untracked docs/reviews pile.",
+            "RESUMED 2026-10-09. Merged since the restart: 214,220,229,230,231,233,240,241,242,245,248,249,250,253,255,256,257,260,261,264,266,267,268,269,270."
           ]
         },
         {
@@ -1493,12 +1508,118 @@
           "title": "#204 macOS NFS mount: open() of a fifo gives EACCES (pjdfstest open/17.t #2, expected ENXIO)",
           "state": "pending",
           "issue": 204,
-          "status_note": "2026-10-09: investigated, macOS NFS CLIENT limitation, not a cowfs server bug. nfs_vnop_open returns EACCES for any vnode that is not reg/dir/lnk (apple-oss NFS kext/nfs_vnops.c); fifo gets regular NFS vnode ops (FIFO undefined in the NFS build, inferred from pathconf equal to a regular file). Open sends zero RPCs; fails for modes 000-777, O_EVTONLY/O_SYMLINK/O_EXEC, sandbox off, without the provenance xattr. No mount option helps. PR207 MERGED (docs only, Refs #204, evidence docs/verification/evidence/nfs204-fifo-open.md). Issue stays OPEN as a documented known limit. Follow-ups (not filed): note limit in docs/special-files-107.md, README and cowfs-nfs lib.rs; record open/17.t #2 in crates/cowfs-nfs/tests/known_limits.rs. DECIDED 2026-10-09: keep #204 open as a labelled known limit; follow-ups (note in docs/special-files-107.md, README, cowfs-nfs lib.rs; known_limits.rs entry for open/17.t #2) not yet done.",
+          "status_note": "Open as a documented known limit (macOS NFS client nfs_vnop_open returns EACCES for non reg/dir/lnk vnodes; no server change or mount option helps). Evidence PR207, limit docs PR212, g3 accepted-divergence entry PR217. g3 stays FAIL on open/17.t #2 (the one established regression) until Zee decides whether to add an accepted-established-regression class with sign-off.",
           "log_20261008": [
             "Cause undetermined (XNU source not found). Ruled out: MKNOD reply state, nodev/nosuid. Native APFS works. Blocks g3 open/17.t (3 cases) and fifo use through the mount; creation, type, mode, rdev, unlink and bind(2) sockets work.",
             "2026-10-09: investigated, macOS NFS CLIENT limitation, not a cowfs server bug. nfs_vnop_open returns EACCES for any vnode that is not reg/dir/lnk (apple-oss NFS kext/nfs_vnops.c); fifo gets regular NFS vnode ops (FIFO undefined in the NFS build, inferred from pathconf equal to a regular file). Open sends zero RPCs; fails for modes 000-777, O_EVTONLY/O_SYMLINK/O_EXEC, sandbox off, without the provenance xattr. No mount option helps. PR207 MERGED (docs only, Refs #204, evidence docs/verification/evidence/nfs204-fifo-open.md). Issue stays OPEN as a documented known limit. Follow-ups (not filed): note limit in docs/special-files-107.md, README and cowfs-nfs lib.rs; record open/17.t #2 in crates/cowfs-nfs/tests/known_limits.rs.",
-            "2026-10-09: investigated, macOS NFS CLIENT limitation, not a cowfs server bug. nfs_vnop_open returns EACCES for any vnode that is not reg/dir/lnk (apple-oss NFS kext/nfs_vnops.c); fifo gets regular NFS vnode ops (FIFO undefined in the NFS build, inferred from pathconf equal to a regular file). Open sends zero RPCs; fails for modes 000-777, O_EVTONLY/O_SYMLINK/O_EXEC, sandbox off, without the provenance xattr. No mount option helps. PR207 MERGED (docs only, Refs #204, evidence docs/verification/evidence/nfs204-fifo-open.md). Issue stays OPEN as a documented known limit. Follow-ups (not filed): note limit in docs/special-files-107.md, README and cowfs-nfs lib.rs; record open/17.t #2 in crates/cowfs-nfs/tests/known_limits.rs. DECIDED 2026-10-09: keep #204 open as a labelled known limit; follow-ups (note in docs/special-files-107.md, README, cowfs-nfs lib.rs; known_limits.rs entry for open/17.t #2) not yet done."
+            "2026-10-09: investigated, macOS NFS CLIENT limitation, not a cowfs server bug. nfs_vnop_open returns EACCES for any vnode that is not reg/dir/lnk (apple-oss NFS kext/nfs_vnops.c); fifo gets regular NFS vnode ops (FIFO undefined in the NFS build, inferred from pathconf equal to a regular file). Open sends zero RPCs; fails for modes 000-777, O_EVTONLY/O_SYMLINK/O_EXEC, sandbox off, without the provenance xattr. No mount option helps. PR207 MERGED (docs only, Refs #204, evidence docs/verification/evidence/nfs204-fifo-open.md). Issue stays OPEN as a documented known limit. Follow-ups (not filed): note limit in docs/special-files-107.md, README and cowfs-nfs lib.rs; record open/17.t #2 in crates/cowfs-nfs/tests/known_limits.rs. DECIDED 2026-10-09: keep #204 open as a labelled known limit; follow-ups (note in docs/special-files-107.md, README, cowfs-nfs lib.rs; known_limits.rs entry for open/17.t #2) not yet done.",
+            "Open as a documented known limit (macOS NFS client nfs_vnop_open returns EACCES for non reg/dir/lnk vnodes; no server change or mount option helps). Evidence PR207, limit docs PR212, g3 accepted-divergence entry PR217. g3 stays FAIL on open/17.t #2 (the one established regression) until Zee decides whether to add an accepted-established-regression class with sign-off."
           ]
+        },
+        {
+          "id": "ci-changed-tests",
+          "title": "CI: run only tests affected by the PR (nextest rdeps filterset), full run on main",
+          "state": "pending",
+          "owner": "queued: start after the #179 CI-exit-status PR lands (both edit ci.yml)",
+          "status_note": "PR222 (nextest rdeps per-PR selection) open, NOT merged. Round-1 critic BLOCK fixed (RUNTIME_EDGES treehouse->cli,daemon, scan guard, fail-closed). Round-2 critic PASS WITH NOTES on code but Zee's pre-registered rule NOT MET as written: break-pair wall-clock 1309 s vs 1101 s full (macOS queue wait 1035 s vs 145 s); macOS job time wins in all three pairs (417/1042, 318/1022, 268/950 s), nothing dropped under the declared-edge model. DECISION (Zee): re-scope wall-clock to exclude queue wait (recommended), require another pair, or close. Residual risks: binary paths the scan cannot see, one sample per arm, per-package vs workspace features on PRs (push to main stays full)."
+        },
+        {
+          "id": "128",
+          "title": "#128 slow-client shutdown wait vs configured bound",
+          "state": "blocked",
+          "owner": "lead",
+          "status_note": "Fix and bound test in; the exact 2322 ms geometry was not re-run (PR230 measured 1693-1818 ms against the 1800 ms bound). Decision: close or one re-run."
+        },
+        {
+          "id": "211",
+          "title": "#211 PathVfs::mknod chmod follows symlinks + coverage gaps",
+          "state": "active",
+          "owner": "lead",
+          "status_note": "PR214 (chmod nofollow) and PR250 (CAP_MKNOD probe, model rdev, mknodat_exact with CLONE_FS umask(0)) merged. Open: mount.rs:27 /proc/self root check, root branch never runs in CI, attrs read by name after mknod. Follow-up #254."
+        },
+        {
+          "id": "254",
+          "title": "#254 PathVfs mode contract and mkdir race",
+          "state": "active",
+          "owner": "lead",
+          "status_note": "PR266 merged (Refs): PathVfs::mkdir race closed on Linux via private umask(0) thread, one exact-mode contract, transient unshare errors retried (only EPERM/EACCES/ENOSYS/EINVAL cached). NOT fixed on macOS (always chmod-by-name). Cost +29 us per mkdir. ACL test CI run unconfirmed."
+        },
+        {
+          "id": "258",
+          "title": "#258 NFS vs FUSE mknod privilege rule",
+          "state": "active",
+          "owner": "lead",
+          "status_note": "PR271 open: premise was stale (nfsserve already refused devices for non-root); real gap was two disagreeing rules (NFS refused the 0:0 whiteout). Shared cowfs_vfs::mknod_needs_root used by FUSE and NFS. Critic running."
+        },
+        {
+          "id": "252",
+          "title": "#252 swap recovery hardening",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR268 merged: forced staging-hash collision refused, torn intent keeps the only copy (failed roll-forward keeps staging + intent), name-length check only where an intent is written, promote vs base_refresh race did not reproduce."
+        },
+        {
+          "id": "244",
+          "title": "#244 silently passing treehouse tests",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR260 merged: cowfs_bin() looked in target/debug/deps so the cowfs serve tests silently passed; now they run and a missing binary panics. #259 (treehouse family silent in CI) open."
+        },
+        {
+          "id": "259",
+          "title": "#259 require_treehouse! silent skip in CI",
+          "state": "pending",
+          "owner": "lead",
+          "status_note": "CI installs no treehouse and require_treehouse! skips silently: the whole sandbox/treehouse family is a silent pass in CI. Needs ci.yml (owned by PR222 decision)."
+        },
+        {
+          "id": "263",
+          "title": "#263 serve shutdown wait",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR269 merged: test bug (Serve::drop called a nonexistent companion shutdown subcommand and ignored the exit); serve tests 10 s -> 0.12 s."
+        },
+        {
+          "id": "232",
+          "title": "#232 g2 spread rules",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR257 merged: no-flip interval rule, 115-unit floor, FAIL>UNMEASURABLE precedence. g2 on a Mac is now nearly vacuous on normal noise (#265)."
+        },
+        {
+          "id": "246",
+          "title": "#246 g3 harness follow-ups",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR256 merged (rebuilt after a stale-base BLOCK that would have reverted 5 merged commits and deleted 35 tests)."
+        },
+        {
+          "id": "176",
+          "title": "#176 orphan staging snapshots",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "Fixed by PR220 (orphan *.cowfs-swap0 swept on open under store/LOCK). Residual notes #252/PR268."
+        },
+        {
+          "id": "177",
+          "title": "#177 pending swap intent roll-forward",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "Fixed by PR220 (recover_target rolls a pending swap forward before a same-name retry; 2 BLOCKs fixed over 3 critic rounds)."
+        },
+        {
+          "id": "178",
+          "title": "#178 base_refresh refuse unrecorded replace",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "Fixed by PR231 (refuse replacing an unrecorded snapshot unless --replace; also #167 per-name guard, #170 240-byte limit)."
+        },
+        {
+          "id": "247",
+          "title": "#247 zero-cost oplog",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR261 merged: Io::write_at no longer allocates/copies when no crash log is active; oplog compiled only with fault-injection. Measured on cachyos: -2056 allocs, -268 MB over 256 MiB of puts."
         }
       ]
     },
@@ -1550,7 +1671,7 @@
           "pr": "#106",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/106",
           "review_session": "ses_ef59f50c9ffecEFbjrVtUt4mVP",
-          "status_note": "2026-10-09: full rerun on main 9c32468 (daemon sha256 dba32eee...): 238 cases, 8686 assertions per arm; native 2985 vs cowfs 2914 passing; harness reports 1 established regression (was 77), 0 candidates. That one is open/17.t #2 = #204 (macOS client). Ordinal differential worse 71 / better 0: 69 are #108 pathconf (13 cases; 46 empty generated name, 8 expected ENAMETOOLONG got 0, 15 downstream ENOENT), 1 is #204, 1 is unlink/14.t #4 (#109). Nothing UNEXPLAINED. mkfifo/00, mknod/00, unlink/00, ftruncate/12, truncate/12 now match native. PR209 MERGED (docs/reviews/g3-status-20261009b.md). g3 NOT closed: Linux FUSE arm unmeasured; harness prints PASS on coverage reasons while worse positions exist. DECIDED (Zee, 2026-10-09): accept #108 as a documented macOS client divergence (do not make the harness supply a name length); #108 stays open for the real pathconf fix; harness must stop printing PASS when worse positions exist (follow-up, unfiled); g3 stays open until the Linux FUSE arm is measured.",
+          "status_note": "macOS arm: 1 established regression (open/17.t #2 = #204), 69 #108 rows gone after PR233 (harness supplies native PATH_MAX only for the exact EINVAL-with-NAME_MAX-equal case, else UNMEASURABLE). Linux FUSE arm FIRST MEASURED 2026-10-09 (docs/reviews/g3-linux-fuse-status-20261009.md, 238 cases): 2 new worse positions mknod/08.t #19/#24 = #243, fixed by PR255 (whiteout 0:0 char device allowed for non-root). PR241 made the harness read the Linux mount table; PR256 (rebuilt after a stale-base BLOCK) requires fuse.cowfs/nfs arms and per-platform accepted divergences. Remaining: rerun Linux after PR255/271 for a clean verdict; #204 decision.",
           "detail": "Acceptance blocked by reported applicable macOS regressions and missing Linux matched coverage. Independent reviewer audits TAP plans, case pairing, privilege exclusions, tool feature probes, real mount identity, cleanup and numerical attribution. Harness delivery review is separate from filesystem acceptance.",
           "owner": "builder: status doc + one validated sample, then standard categories once at modest load",
           "log_20261008": [
@@ -1573,7 +1694,7 @@
           "pr": "#102",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/102",
           "review_session": "ses_ef6967982ffec6MqBRra1BE4vn",
-          "status_note": "2026-10-09: mounted fsx on cachyos (Core backend, btrfs native arm, no root): 18/18 seed pairs PASS, 36 cases, 0 failed, byte-identical, hole operations really ran (fallocate 120, punch_hole 102, zero_range 107, none ENOTSUP). Caveats: native arm btrfs not ext4 (collapse/insert range disabled on both); fsx binary digest differs from manifest so a box-local config copy was used (committed config untouched). Not committed: status doc docs/reviews/g4-status-20261009.md. Follow-ups: commit a standing fallocate mode, per-host fsx digest, record st_blocks, ext4 arm if root approved, rerun after slice D (now merged).",
+          "status_note": "2026-10-09: mounted fsx on cachyos (Core, btrfs native arm): 18/18 seed pairs PASS. Caveats: btrfs not ext4, collapse/insert range off on both, st_blocks not compared. docs/reviews/g4-status-20261009.md.",
           "detail": "Queued matched native/private mounted fsx acceptance. Prior library/model fsx checks do not establish the complete mounted gate; tool availability, fixed seeds, real readback and executed counts must be proved first.",
           "log_20261008": [
             "2026-10-09: mounted fsx on cachyos (Core backend, btrfs native arm, no root): 18/18 seed pairs PASS, 36 cases, 0 failed, byte-identical, hole operations really ran (fallocate 120, punch_hole 102, zero_range 107, none ENOTSUP). Caveats: native arm btrfs not ext4 (collapse/insert range disabled on both); fsx binary digest differs from manifest so a box-local config copy was used (committed config untouched). Not committed: status doc docs/reviews/g4-status-20261009.md. Follow-ups: commit a standing fallocate mode, per-host fsx digest, record st_blocks, ext4 arm if root approved, rerun after slice D (now merged)."
