@@ -679,9 +679,15 @@ fn a_crash_between_the_rename_and_the_intent_removal_is_dropped_on_open() {
     {
         let c = promotable(dir.path());
         c.set_swap_fault(6);
-        assert!(c.promote_base("src", "base").is_err(), "fault 6 not injected");
+        assert!(
+            c.promote_base("src", "base").is_err(),
+            "fault 6 not injected"
+        );
         assert_eq!(content(&c, "base", "f"), "new content", "rename is done");
-        assert!(dir.path().join("swap-base").exists(), "the crash keeps the intent");
+        assert!(
+            dir.path().join("swap-base").exists(),
+            "the crash keeps the intent"
+        );
     }
     let c = Core::open(dir.path(), test_opts()).unwrap();
     assert_eq!(content(&c, "base", "f"), "new content");
