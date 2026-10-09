@@ -233,10 +233,27 @@ pub fn mknodat(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
     Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
-/// Whether unshare(CLONE_FS) is allowed here; learned from the first attempt and never retried
-/// once refused (a seccomp filter refuses it every time, and each attempt costs a thread).
+/// What is known of `unshare(CLONE_FS)` here: `true` once it worked, `false` once refused for good.
+/// Unset while unknown, including after a transient failure, which the next call retries.
 #[cfg(target_os = "linux")]
 static PRIVATE_UMASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether an `unshare` errno is a standing refusal, worth remembering (each retry costs a
+/// thread): a seccomp filter answers `EPERM`, `EACCES` or `ENOSYS`, and `EINVAL` means the
+/// kernel or sandbox does not support the flag. Anything else (`ENOMEM`, `EAGAIN`, ...) is
+/// transient: it must not downgrade every later call to the racy chmod path.
+#[cfg(target_os = "linux")]
+fn refusal_is_permanent(errno: i32) -> bool {
+    let _ = errno;
+    true // OLD POLICY (temporary, to show the test fails)
+}
+#[cfg(target_os = "linux")]
+fn _unused(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::EPERM | libc::EACCES | libc::EINVAL | libc::ENOSYS
+    )
+}
 
 /// Runs `f` on a short-lived thread that detaches its own umask with `unshare(CLONE_FS)` and
 /// sets it to 0, so a creation call there gets exactly the mode it names (a parent's default ACL
@@ -247,20 +264,43 @@ static PRIVATE_UMASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 pub fn with_private_umask<R: Send>(
     f: impl FnOnce() -> io::Result<R> + Send,
 ) -> io::Result<Option<R>> {
-    if PRIVATE_UMASK.get() == Some(&false) {
+    run_with_private_umask(&PRIVATE_UMASK, detach_umask, f)
+}
+
+#[cfg(target_os = "linux")]
+fn detach_umask() -> Result<(), i32> {
+    // SAFETY: `unshare(CLONE_FS)` gives only this thread a private copy of its cwd, root and
+    // umask; it touches no memory. The thread ends right after.
+    if unsafe { libc::unshare(libc::CLONE_FS) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EPERM))
+    }
+}
+
+/// `with_private_umask` with the cache and the `unshare` call passed in, so a test can inject one.
+#[cfg(target_os = "linux")]
+fn run_with_private_umask<R: Send>(
+    known: &std::sync::OnceLock<bool>,
+    unshare: impl FnOnce() -> Result<(), i32> + Send,
+    f: impl FnOnce() -> io::Result<R> + Send,
+) -> io::Result<Option<R>> {
+    if known.get() == Some(&false) {
         return Ok(None);
     }
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .name("cowfs-umask0".into())
             .spawn_scoped(s, || {
-                // SAFETY: `unshare(CLONE_FS)` gives only this thread a private copy of its cwd,
-                // root and umask; it touches no memory. The thread ends right after.
-                let ok = unsafe { libc::unshare(libc::CLONE_FS) } == 0;
-                let _ = PRIVATE_UMASK.set(ok);
-                if !ok {
+                if let Err(errno) = unshare() {
+                    if refusal_is_permanent(errno) {
+                        let _ = known.set(false);
+                    }
                     return Ok(None);
                 }
+                let _ = known.set(true);
                 // SAFETY: `umask` cannot fail; after the unshare it affects this thread only.
                 unsafe { libc::umask(0) };
                 f().map(Some)
