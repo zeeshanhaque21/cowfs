@@ -33,6 +33,18 @@ const FAST: &[(Fault, &[&str])] = &[
         &["appledouble_names_are_ordinary"],
     ),
     (Fault::UnlinkLeaksSpace, &["statfs_free_after_unlink"]),
+    (
+        Fault::PunchNoop,
+        &["fallocate_punch_reads_zeros_keeps_size"],
+    ),
+    (
+        Fault::AllocateShrinks,
+        &["fallocate_allocate_and_keep_size"],
+    ),
+    (
+        Fault::PunchChangesSize,
+        &["fallocate_punch_reads_zeros_keeps_size"],
+    ),
 ];
 
 #[test]

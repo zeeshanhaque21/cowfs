@@ -161,6 +161,11 @@ impl Shared {
             .map(|d| d.grace_end)
     }
 
+    /// The end of the shutdown grace, fixed when shutdown began.
+    fn grace_end(&self) -> Option<Instant> {
+        self.deadlines.get().map(|d| d.grace_end)
+    }
+
     fn abandoned(&self) -> bool {
         self.abandoned_grace_end().is_some()
     }
@@ -325,7 +330,7 @@ fn accept_loop(
                 match thread::Builder::new()
                     .name("cowfs-ctl-abandon".into())
                     .spawn(move || {
-                        owned.abandon_inflight();
+                        owned.abandon_inflight_until(grace_end);
                         owned.kill();
                         let _ = done_tx.send(());
                     }) {
@@ -604,10 +609,15 @@ fn admit(
             let mut reader = BufReader::new(clone);
             let _ = run_connection(&mut reader, &conn, &handler, &opts, &shared2);
             if shared2.stopping() {
-                conn.abandon_inflight();
+                conn.abandon_inflight_until(shared2.grace_end().unwrap_or_else(Instant::now));
             }
             conn.kill();
-            conn.drain_and_close(&mut reader, opts.drain_deadline);
+            let drain = if shared2.abandoned() {
+                Duration::ZERO
+            } else {
+                opts.drain_deadline
+            };
+            conn.drain_and_close(&mut reader, drain);
             lock(&shared2.conns).remove(&id);
         }
     });
@@ -755,6 +765,19 @@ impl Conn {
         }
     }
 
+    /// `abandon_inflight`, then waits for terminal writes that are already in progress, up to
+    /// `until`. A handler that finished by itself has taken its id out of the map, so
+    /// `abandon_inflight` finds nothing for it while its terminal frame may still be queued behind a
+    /// progress write; `kill` would then cut that frame. Every teardown calls this before `kill`.
+    /// `until` is the one absolute grace end, so this never adds a wait: a write that cannot finish
+    /// by then is cut by the accept loop's own `kill`, exactly as before.
+    fn abandon_inflight_until(&self, until: Instant) {
+        self.abandon_inflight();
+        while self.finishing.load(Ordering::SeqCst) != 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Same as `abandon_inflight`, but the terminal write is skipped when the write lock is held.
     /// Used on the shutdown deadline when no helper thread could be spawned, so the deadline path
     /// never blocks behind a peer that stopped reading, while a readable peer still gets its frame.
@@ -812,14 +835,13 @@ impl Conn {
         let _ = reader
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(50)));
-        // A connection that was already killed has had its delivery grace: the write side is closed
-        // and the peer either got its terminal frame or never will. Reading away what the peer sent
-        // is politeness for a peer that is still there, and it is what would otherwise hold this
-        // socket, and the handler behind it, open for the whole drain deadline after `wait()`
-        // returned. Close now instead; the contract only promises the close.
+        // `deadline` is zero once the shutdown deadline has passed: the grace is spent, nobody is
+        // left to be polite to, and this read is what would hold the socket, and the handler behind
+        // it, open after `wait()` returned. Every other close reads away what the peer sent, so a
+        // reset cannot destroy a frame the peer has not read yet.
         let until = Instant::now() + deadline;
         let mut sink = [0u8; 8192];
-        while !self.dead.load(Ordering::SeqCst) && Instant::now() < until {
+        while Instant::now() < until {
             match reader.read(&mut sink) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
@@ -1295,6 +1317,78 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(conn.dead.load(Ordering::SeqCst));
         assert!(pending.is_cancelled());
+    }
+
+    /// A close that is not part of an abandoned shutdown still reads away what the peer already
+    /// sent (`v1-control-api.md`, Shutdown). `kill` runs right before the drain on every teardown,
+    /// so `dead` cannot be what decides to skip it. The drain only returns once a read finds nothing
+    /// more (the 50 ms read timeout) when the peer stays open, so the lower bound cannot flake on a
+    /// slow machine.
+    #[test]
+    fn a_normal_close_reads_away_what_the_peer_sent() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let conn = Conn::new(&server).unwrap();
+        let mut reader = BufReader::new(server.try_clone().unwrap());
+        client.write_all(&[b'x'; 5000]).unwrap();
+        conn.kill();
+        let t0 = Instant::now();
+        conn.drain_and_close(&mut reader, Duration::from_secs(2));
+        assert!(
+            t0.elapsed() >= Duration::from_millis(40),
+            "the drain returned without reading ({:?})",
+            t0.elapsed()
+        );
+    }
+
+    /// The two shutdown teardown paths (abandon worker, connection thread) both end a connection
+    /// with `abandon_inflight` then `kill`. A request whose handler already claimed its terminal
+    /// frame is no longer in the map, so `abandon_inflight` finds nothing; `kill` must still not cut
+    /// that terminal write. Refs #127.
+    #[test]
+    fn teardown_does_not_cut_a_terminal_write_that_is_in_flight() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let conn = Arc::new(Conn::new(&server).unwrap());
+        lock(&conn.inflight).insert(1, CancelToken::new());
+        let terminal = ServerFrame::Error {
+            id: Some(1),
+            error: CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
+        };
+        let expected = terminal.encode();
+        // The terminal write cannot complete: its writer parks on the write lock held here, as it
+        // would behind a progress write the client is still draining.
+        let write = lock(&conn.write_lock);
+        let finisher = thread::spawn({
+            let conn = Arc::clone(&conn);
+            move || conn.finish(1, &terminal)
+        });
+        let spin = Instant::now() + Duration::from_secs(2);
+        while conn.finishing.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < spin, "finisher did not reach the write");
+            thread::yield_now();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let teardown = thread::spawn({
+            let conn = Arc::clone(&conn);
+            move || {
+                conn.abandon_inflight_until(Instant::now() + Duration::from_secs(10));
+                conn.kill();
+                tx.send(conn.finishing.load(Ordering::SeqCst)).unwrap();
+            }
+        });
+        // A teardown that respects the in-flight write cannot return while the lock is held, so this
+        // wait times out. One that does not has already killed the connection. The timeout only
+        // gives the wrong code time to show itself; the right code never depends on it.
+        let early = rx.recv_timeout(Duration::from_millis(200));
+        drop(write);
+        finisher.join().unwrap();
+        teardown.join().unwrap();
+        assert!(
+            early.is_err(),
+            "teardown killed the connection with {early:?} terminal write(s) still in flight"
+        );
+        let mut actual = Vec::new();
+        client.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected, "the terminal frame must reach the peer");
     }
 
     #[test]
