@@ -432,9 +432,8 @@ fn covers_whole_pack(bytes: &[u8], pack: u32) -> bool {
 
 /// A crash at any step of `discard_pack` leaves the store readable and never reports a lost pack.
 ///
-/// `remove_file` is not in the op log, so this cannot be replayed from the log. Instead a child
-/// process dies at the Nth fault boundary inside the discard, which is the only place the ordering
-/// can go wrong, and the parent inspects what survived.
+/// This is the process-crash view: a child process dies at the Nth fault boundary inside the
+/// discard and the parent inspects what survived. Power loss is `power_discard.rs`.
 #[test]
 fn a_crash_at_every_step_of_a_discard_leaves_the_store_clean() {
     use std::process::Command;
@@ -869,7 +868,7 @@ fn the_packs_directory_is_fsynced_after_the_unlink() {
 
     let (before, after) = window(&ops, 9_001, 9_002);
     assert!(
-        ops[before..after].iter().any(|o| matches!(o, LogOp::DirSync)),
+        ops[before..after].iter().any(|o| matches!(o, LogOp::DirSync { .. })),
         "the packs directory was not fsynced after the unlink, so the unlink can be lost while the \
          watermark already says the pack is gone: {ops:?}"
     );

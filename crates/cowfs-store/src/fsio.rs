@@ -63,8 +63,16 @@ pub enum LogOp {
         /// File name.
         file: String,
     },
-    /// A directory was fsynced.
-    DirSync,
+    /// A file was unlinked. Durable only once a later [`LogOp::DirSync`] of its directory ran.
+    Unlink {
+        /// File name.
+        file: String,
+    },
+    /// A directory was fsynced. `dir` is its name, `packs` for the pack directory.
+    DirSync {
+        /// Directory name.
+        dir: String,
+    },
     /// A marker the test placed in the log.
     Marker(u64),
 }
@@ -190,7 +198,7 @@ impl Io {
 
     pub(crate) fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         self.log(|| Op::DirSync(name(dir)));
-        log_data(|| LogOp::DirSync);
+        log_data(|| LogOp::DirSync { dir: name(dir) });
         let d = File::open(dir)?;
         if self.nosync {
             return Ok(());
@@ -198,6 +206,15 @@ impl Io {
         d.sync_all()?;
         #[cfg(feature = "fault-injection")]
         fault_boundary("sync");
+        Ok(())
+    }
+
+    /// Unlink a file, logged for the crash model. A `NotFound` is returned without a log entry.
+    pub(crate) fn remove_file(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)?;
+        log_data(|| LogOp::Unlink { file: name(path) });
+        #[cfg(feature = "fault-injection")]
+        fault_boundary("unlink");
         Ok(())
     }
 

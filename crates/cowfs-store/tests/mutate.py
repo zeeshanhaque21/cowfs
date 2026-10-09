@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutation check for cowfs-store. Usage: python3 tests/mutate.py [TAG ...]
+"""Mutation check for cowfs-store. Usage: [MUT_ARGS="--test crash --test power_discard"] python3 tests/mutate.py [TAG ...]
 
 Copies the repo to target/mut/work, applies one textual mutation at a time to the store
 sources, runs the store test suite with its own CARGO_TARGET_DIR, and records whether any test
@@ -14,6 +14,18 @@ work = f"{mut}/work"
 src = f"{root}/crates/cowfs-store/src"
 dst = f"{work}/crates/cowfs-store/src"
 
+
+def move_wm_after_unlink(t):
+    """Mutation 2 of docs/crash-injection-173.md: the watermark raise runs after the unlink."""
+    a = t.index("        {\n            let mut wm =\n                g.wm.lock()")
+    b = t.index("        fsio::mark(MARK_UNLINK);")
+    block = t[a:b]
+    t = t[:a] + t[b:]
+    anchor = "        self.forget_pack(id);\n        let mut out = Discarded {"
+    if anchor not in t:
+        raise ValueError(anchor)
+    return t.replace(anchor, "        self.forget_pack(id);\n" + block + "        let mut out = Discarded {", 1)
+
 M = [
     ("G1 get skips BLAKE3 check", "store.rs", "if BlockId::of(&data) != id {\n            return Err(Error::HashMismatch(id));", "if false {\n            return Err(Error::HashMismatch(id));"),
     ("G2 get skips record CRC", "store.rs", "if Header::expected_crc(raw, payload) != header.crc {\n            return Err(corrupt(\"checksum mismatch\"));", "if false {\n            return Err(corrupt(\"checksum mismatch\"));"),
@@ -21,7 +33,7 @@ M = [
     ("G4 torn detection ignores the watermark", "store.rs", "if is_last && offset >= dur && !exhausted && torn_from.is_none() {", "if is_last && !exhausted && torn_from.is_none() {"),
     ("G5 torn tail not saved to sidecar", "store.rs", "save_torn(&dir, id, &file, t, len);", ""),
     ("G6 records after a torn region not moved down", "store.rs", "file.write_all_at(&buf, w)?;", "let _ = &buf;"),
-    ("W1 watermark written before data fsync", "store.rs", "            self.io.sync_file(&file, &pack::pack_path(&self.dir, id))?;\n            self.wm\n                .lock()\n                .unwrap_or_else(PoisonError::into_inner)\n                .advance(&self.io, Mark { pack: id, len })?;", "            self.wm\n                .lock()\n                .unwrap_or_else(PoisonError::into_inner)\n                .advance(&self.io, Mark { pack: id, len })?;\n            self.io.sync_file(&file, &pack::pack_path(&self.dir, id))?;"),
+    ("W1 watermark written before data fsync", "store.rs", "            self.io.sync_file(&file, &pack::pack_path(&self.dir, id))?;\n            self.wm\n                .lock()\n                .unwrap_or_else(PoisonError::into_inner)\n                .advance(Mark { pack: id, len })?;", "            self.wm\n                .lock()\n                .unwrap_or_else(PoisonError::into_inner)\n                .advance(Mark { pack: id, len })?;\n            self.io.sync_file(&file, &pack::pack_path(&self.dir, id))?;"),
     ("W2 watermark write not fsynced", "wm.rs", "        io.sync_file(&self.file, &self.path)?;\n        self.seq = seq;", "        self.seq = seq;"),
     ("W3 watermark slot CRC ignored", "wm.rs", "if crc32c::crc32c(&b[..24]).to_le_bytes() != b[24..28] {", "if false {"),
     ("W4 pick the OLDER watermark slot", "wm.rs", ".max_by_key(|(seq, _, _)| *seq);", ".min_by_key(|(seq, _, _)| *seq);"),
@@ -65,6 +77,9 @@ M = [
     ("F1 fd cache never evicts", "fdcache.rs", "while g.len() > self.cap {", "while false && g.len() > self.cap {"),
     ("F2 fd cache evicts the id just inserted", "fdcache.rs", ".filter(|(k, _)| **k != id)", ".filter(|(k, _)| **k == id)"),
     ("F3 no EMFILE retry", "fdcache.rs", "Err(e) if matches!(e.raw_os_error(), Some(23 | 24)) => {", "Err(e) if false && matches!(e.raw_os_error(), Some(23 | 24)) => {"),
+    ("M2 discard unlinks the pack before the watermark is raised", "compact.rs", move_wm_after_unlink, None),
+    ("N1 finish_compaction skips the new pack's fsync", "compact.rs", "            g.io.sync_file(target, &path)?;\n            g.io.sync_dir(&pack::pack_dir(g.dir))?;", "            g.io.sync_dir(&pack::pack_dir(g.dir))?;"),
+    ("D1 discard skips the packs directory fsync after the unlink", "compact.rs", "        if let Err(e) = g.io.sync_dir(&pack::pack_dir(g.dir)) {\n            out.durability_error = Some(e.into());\n            return Ok(out);\n        }\n", ""),
 ]
 
 only = sys.argv[1:]
@@ -82,15 +97,22 @@ for name, f, a, b in M:
     for fn in os.listdir(src):
         shutil.copy(f"{src}/{fn}", f"{dst}/{fn}")
     t = open(f"{dst}/{f}").read()
-    if a not in t:
+    if callable(a):
+        try:
+            mutated = a(t)
+        except ValueError:
+            out.write(f"{name}: PATTERN NOT FOUND\n"); out.flush(); continue
+    elif a not in t:
         out.write(f"{name}: PATTERN NOT FOUND\n"); out.flush(); continue
-    open(f"{dst}/{f}", "w").write(t.replace(a, b, 1))
+    else:
+        mutated = t.replace(a, b, 1)
+    open(f"{dst}/{f}", "w").write(mutated)
     tgt = f"{mut}/tm_{tag}"
     shutil.rmtree(tgt, ignore_errors=True)
-    subprocess.run(["cp", "-cR", base, tgt], check=True)
+    subprocess.run(["cp", "-cR" if sys.platform == "darwin" else "-a", base, tgt], check=True)
     env = dict(os.environ, CARGO_TARGET_DIR=tgt)
     try:
-        r = subprocess.run(["cargo", "test", "-j4", "--no-fail-fast", "-p", "cowfs-store"], cwd=work, env=env, capture_output=True, text=True, timeout=900)
+        r = subprocess.run(["cargo", "test", "-j4", "--no-fail-fast", "-p", "cowfs-store", *os.environ.get("MUT_ARGS", "").split()], cwd=work, env=env, capture_output=True, text=True, timeout=900)
         txt = r.stdout + r.stderr
         failed = sorted(set(re.findall(r"^test (\S+) \.\.\. FAILED", txt, re.M)))
         if "could not compile" in txt:

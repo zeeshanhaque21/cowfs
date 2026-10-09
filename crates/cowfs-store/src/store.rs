@@ -177,7 +177,7 @@ fn create_pack(io: &Io, store: &Path, id: u32) -> io::Result<File> {
     match made {
         Ok(()) => Ok(file),
         Err(e) => {
-            let _ = fs::remove_file(&path);
+            let _ = io.remove_file(&path);
             Err(e)
         }
     }
@@ -246,7 +246,7 @@ fn save_torn(
         .write_at(&f, &path, 0, &buf)
         .and_then(|()| io.sync_file(&f, &path));
     if let Err(e) = written {
-        let _ = fs::remove_file(&path);
+        let _ = io.remove_file(&path);
         return Err(quarantine(&e));
     }
     io.sync_dir(&pack::pack_dir(dir))?;
@@ -267,7 +267,7 @@ fn save_torn(
     let mut total: u64 = all.iter().map(|(_, _, n)| *n).sum();
     while all.len() > keep || (total > options.max_torn_sidecar_bytes && all.len() > 1) {
         let (pack, i, size) = all.remove(0);
-        if fs::remove_file(torn_path(dir, pack, i)).is_ok() {
+        if io.remove_file(&torn_path(dir, pack, i)).is_ok() {
             io.sync_dir(&pack::pack_dir(dir))?;
             recovery.sidecars_pruned += 1;
             total = total.saturating_sub(size);
@@ -1547,7 +1547,7 @@ impl Store {
         ack::save(&self.io, &self.dir, entries)?;
         // A stale checkpoint can name a pack that no longer exists, so it must not be trusted.
         if self.index_path().exists() {
-            fs::remove_file(self.index_path())?;
+            self.io.remove_file(&self.index_path())?;
             self.io.sync_dir(&self.dir)?;
         }
         // A pack that is on disk again was never a lost pack, so its acceptance is not recorded and

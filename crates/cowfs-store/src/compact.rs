@@ -365,7 +365,8 @@ impl Store {
                 offset: c.len,
                 reason: "new pack past the 4 GiB limit",
             })?;
-            target.write_all_at(&raw, c.len)?;
+            let g = self.guts();
+            g.io.write_at(&target, &pack::pack_path(g.dir, c.to), c.len, &raw)?;
             c.len += need;
             c.moved.push((
                 id,
@@ -481,7 +482,7 @@ impl Store {
             }
         }
         fsio::mark(MARK_UNLINK);
-        match fs::remove_file(&path) {
+        match g.io.remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 self.forget_pack(id);
