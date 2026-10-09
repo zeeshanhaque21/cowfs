@@ -545,6 +545,19 @@ impl Vfs for GuardedView {
         self.leave();
         r
     }
+    fn mknod(
+        &self,
+        p: Ino,
+        n: &[u8],
+        k: cowfs_vfs::FileKind,
+        m: u32,
+        r: u64,
+    ) -> cowfs_vfs::Result<Attr> {
+        self.enter();
+        let res = self.inner.mknod(p, n, k, m, r);
+        self.leave();
+        res
+    }
     fn symlink(&self, p: Ino, n: &[u8], t: &[u8]) -> cowfs_vfs::Result<Attr> {
         self.enter();
         let r = self.inner.symlink(p, n, t);

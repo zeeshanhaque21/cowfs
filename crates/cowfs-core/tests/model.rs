@@ -31,6 +31,8 @@ enum MOp {
     SetMode(Path, u16),
     Read(Path, u32, u32),
     Xattr(Path, u8, Option<u8>),
+    /// Path, mode, kind index (modulo 4) and device byte.
+    Mknod(Path, u16, u8, u8),
     Hold(Path),
     HeldRead(u8, u32, u32),
     HeldWrite(u8, u32, u32, u8),
@@ -87,6 +89,7 @@ fn op() -> impl Strategy<Value = MOp> {
     prop_oneof![
         4 => (path(), any::<u16>()).prop_map(|(p, m)| MOp::Create(p, m)),
         3 => (path(), any::<u16>()).prop_map(|(p, m)| MOp::Mkdir(p, m)),
+        2 => (path(), any::<u16>(), 0u8..4, 0u8..5).prop_map(|(p, m, k, d)| MOp::Mknod(p, m, k, d)),
         2 => (path(), 0u8..4).prop_map(|(p, t)| MOp::Symlink(p, t)),
         3 => (path(), path()).prop_map(|(a, b)| MOp::Link(a, b)),
         4 => path().prop_map(MOp::Unlink),
@@ -194,6 +197,24 @@ fn apply_inner(side: &mut Fs, op: &MOp, refs: &mut Vec<Ino>) -> Out {
             let (pp, n) = split(p);
             let parent = walk(fs, pp, refs)?;
             let a = fs.mkdir(parent, &comp(n), u32::from(*mode))?;
+            refs.push(a.ino);
+            Ok(Vec::new())
+        }
+        MOp::Mknod(p, mode, k, dev) => {
+            let (pp, n) = split(p);
+            let parent = walk(fs, pp, refs)?;
+            let kind = [
+                FileKind::Fifo,
+                FileKind::Socket,
+                FileKind::CharDevice,
+                FileKind::BlockDevice,
+            ][usize::from(*k % 4)];
+            let rdev = if kind.is_device() {
+                cowfs_vfs::makedev(u32::from(*dev), u32::from(*dev) * 3 + 1)
+            } else {
+                0
+            };
+            let a = fs.mknod(parent, &comp(n), kind, u32::from(*mode), rdev)?;
             refs.push(a.ino);
             Ok(Vec::new())
         }
@@ -579,6 +600,7 @@ fn op_side(op: &MOp, n: usize) -> Option<usize> {
         MOp::Create(p, _)
         | MOp::Mkdir(p, _)
         | MOp::Symlink(p, _)
+        | MOp::Mknod(p, ..)
         | MOp::Unlink(p)
         | MOp::Rmdir(p)
         | MOp::Truncate(p, _)

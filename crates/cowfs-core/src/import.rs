@@ -11,8 +11,11 @@
 //! keeps are its own compressed, deduplicated blocks, reported as `stored_bytes`.
 //!
 //! Symlinks are kept as symlinks and never followed, so the imported tree hashes the same as the
-//! source under `cowfs_ctl::hash_tree`. Anything that is not a regular file, a directory or a
-//! symlink (a fifo, a socket, a device) is refused: the core has no way to represent one, and
+//! source under `cowfs_ctl::hash_tree`. A fifo, a socket or a device node is imported as the same
+//! kind of node (`Vfs::mknod`), with its permission bits and, for a device, its device number
+//! converted from the host's `st_rdev` encoding to the cowfs one; nothing is created on the host
+//! and no privilege is needed, because the store only records the node. The read-back compares
+//! kind, mode and device number, never content. Any other kind of entry is refused, because
 //! silently dropping it would make the imported tree differ from the source. No directory is
 //! special-cased, `.git` included: the source is copied as it is found.
 
@@ -21,7 +24,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 
 use cowfs_vfs::{Attr, FileKind, Ino, Vfs, ROOT_INO};
@@ -32,7 +35,8 @@ use crate::{control_meta, swap, ControlError, Core, SnapshotView};
 pub const CHUNK: usize = 64 << 10;
 
 /// One entry of a directory on either side of the comparison.
-type Entry = (FileKind, Ino, u32, u64);
+/// Kind, inode, permission bits, size, device number.
+type Entry = (FileKind, Ino, u32, u64, u64);
 
 /// What an ingest did to the store.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -255,9 +259,16 @@ fn write_tree(
                 .map_err(core)?;
         } else if md.is_file() {
             n.bytes += write_file(view, parent, key, &path, mode, hooks, n)?;
+        } else if let Some(kind) = special_kind(&md) {
+            let rdev = if kind.is_device() {
+                cowfs_rdev(md.rdev())
+            } else {
+                0
+            };
+            view.mknod(parent, key, kind, mode, rdev).map_err(core)?;
         } else {
             return Err(ImportError::Invalid(format!(
-                "{} is not a regular file, a directory or a symlink, so it cannot be ingested",
+                "{} is not a regular file, a directory, a symlink, a fifo, a socket or a device, so it cannot be ingested",
                 path.display()
             )));
         }
@@ -266,6 +277,37 @@ fn write_tree(
         }
     }
     Ok(())
+}
+
+/// The special kind of a source entry, if it is one.
+fn special_kind(md: &std::fs::Metadata) -> Option<FileKind> {
+    let t = md.file_type();
+    if t.is_fifo() {
+        Some(FileKind::Fifo)
+    } else if t.is_socket() {
+        Some(FileKind::Socket)
+    } else if t.is_char_device() {
+        Some(FileKind::CharDevice)
+    } else if t.is_block_device() {
+        Some(FileKind::BlockDevice)
+    } else {
+        None
+    }
+}
+
+/// The cowfs device number of a host `st_rdev`: macOS packs an 8 bit major above a 24 bit minor,
+/// Linux the glibc layout with a 12 bit major and a 20 bit minor spread over 64 bits.
+#[cfg(target_os = "macos")]
+fn cowfs_rdev(rdev: u64) -> u64 {
+    let rdev = rdev & 0xffff_ffff;
+    cowfs_vfs::makedev(((rdev >> 24) & 0xff) as u32, (rdev & 0xff_ffff) as u32)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cowfs_rdev(rdev: u64) -> u64 {
+    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+    cowfs_vfs::makedev(major as u32, minor as u32)
 }
 
 /// The entries of `dir`, sorted by name bytes so an import of unchanged content does the same
@@ -356,7 +398,10 @@ fn compare_dir(view: &SnapshotView, parent: Ino, dir: &Path) -> Result<(), Impor
         let page = view.readdir(parent, cookie, 64).map_err(core)?;
         for e in &page.entries {
             let attr: Attr = view.getattr(e.ino).map_err(core)?;
-            imported.insert(e.name.clone(), (attr.kind, e.ino, attr.mode, attr.size));
+            imported.insert(
+                e.name.clone(),
+                (attr.kind, e.ino, attr.mode, attr.size, attr.rdev),
+            );
         }
         if page.eof {
             break;
@@ -376,7 +421,7 @@ fn compare_dir(view: &SnapshotView, parent: Ino, dir: &Path) -> Result<(), Impor
         view.forget(e.1, 1);
     }
     for (name, path, md) in entries(dir)? {
-        let Some(&(kind, ino, mode, size)) = imported.get(name.as_bytes()) else {
+        let Some(&(kind, ino, mode, size, rdev)) = imported.get(name.as_bytes()) else {
             return Err(ImportError::Mismatch {
                 path: path.display().to_string(),
                 reason: "missing from the imported snapshot".into(),
@@ -386,6 +431,8 @@ fn compare_dir(view: &SnapshotView, parent: Ino, dir: &Path) -> Result<(), Impor
             FileKind::Directory
         } else if md.is_symlink() {
             FileKind::Symlink
+        } else if let Some(k) = special_kind(&md) {
+            k
         } else {
             FileKind::Regular
         };
@@ -403,6 +450,15 @@ fn compare_dir(view: &SnapshotView, parent: Ino, dir: &Path) -> Result<(), Impor
                 reason: format!(
                     "imported with mode {mode:o}, the source has {:o}",
                     md.mode() & 0o7777
+                ),
+            });
+        }
+        if kind.is_device() && rdev != cowfs_rdev(md.rdev()) {
+            return Err(ImportError::Mismatch {
+                path: path.display().to_string(),
+                reason: format!(
+                    "imported with device number {rdev:x}, the source has {:x}",
+                    cowfs_rdev(md.rdev())
                 ),
             });
         }
