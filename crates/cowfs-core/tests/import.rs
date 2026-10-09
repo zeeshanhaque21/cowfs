@@ -315,3 +315,99 @@ fn list(dir: &std::path::Path) -> Vec<(String, u64, u32)> {
     out.sort();
     out
 }
+
+fn set_mtime(path: &std::path::Path, secs: u64, nanos: u32) {
+    let t = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+    fs::File::open(path).unwrap().set_modified(t).unwrap();
+}
+
+/// Issue 290: a build tool decides what is fresh from mtimes, so a copy that resets them looks
+/// changed and is rebuilt.
+#[test]
+fn keeps_the_modification_time_of_every_node_to_the_nanosecond() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("d/file"), b"content").unwrap();
+    fs::write(src.join("empty"), b"").unwrap();
+    symlink("d/file", src.join("link")).unwrap();
+    // Set last: writing a child moves its parent's time.
+    set_mtime(&src.join("d/file"), 1_600_000_000, 123_456_789);
+    set_mtime(&src.join("empty"), 1_500_000_000, 1);
+    set_mtime(&src.join("d"), 1_400_000_000, 999_999_999);
+    set_mtime(&src, 1_300_000_000, 5);
+
+    run(&f.core, &src, "times").unwrap();
+    let view = f.core.snapshot_view("times").unwrap();
+    let mtime = |ino| {
+        let m = view.getattr(ino).unwrap().mtime;
+        (m.secs, m.nanos)
+    };
+    let d = view.lookup(ROOT_INO, b"d").unwrap();
+    let file = view.lookup(d.ino, b"file").unwrap();
+    let empty = view.lookup(ROOT_INO, b"empty").unwrap();
+    assert_eq!(mtime(file.ino), (1_600_000_000, 123_456_789));
+    assert_eq!(mtime(empty.ino), (1_500_000_000, 1));
+    assert_eq!(mtime(d.ino), (1_400_000_000, 999_999_999));
+    assert_eq!(mtime(ROOT_INO), (1_300_000_000, 5));
+    let link = view.lookup(ROOT_INO, b"link").unwrap();
+    let want = fs::symlink_metadata(src.join("link")).unwrap();
+    assert_eq!(
+        mtime(link.ino),
+        (want.mtime() as u64, want.mtime_nsec() as u32)
+    );
+}
+
+#[test]
+fn keeps_hard_links_as_one_file_counting_only_the_names_inside_the_tree() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(src.join("deps")).unwrap();
+    fs::write(src.join("a"), b"shared bytes").unwrap();
+    fs::hard_link(src.join("a"), src.join("deps/b")).unwrap();
+    fs::hard_link(src.join("a"), src.join("deps/c")).unwrap();
+    fs::write(src.join("other"), b"shared bytes").unwrap();
+    // A second name outside the imported tree is not a name inside it.
+    fs::write(src.join("kept"), b"kept").unwrap();
+    fs::hard_link(src.join("kept"), f.dir.path().join("outside")).unwrap();
+
+    let got = run(&f.core, &src, "links").unwrap();
+    assert_eq!((got.files, got.bytes), (5, 12 * 4 + 4), "{got:?}");
+
+    let view = f.core.snapshot_view("links").unwrap();
+    let deps = view.lookup(ROOT_INO, b"deps").unwrap();
+    let a = view.lookup(ROOT_INO, b"a").unwrap();
+    let b = view.lookup(deps.ino, b"b").unwrap();
+    let c = view.lookup(deps.ino, b"c").unwrap();
+    assert_eq!((a.ino, a.nlink), (b.ino, 3), "{a:?} {b:?}");
+    assert_eq!(c.ino, a.ino);
+    assert_eq!(common::read_all(&view, c.ino), b"shared bytes");
+    let other = view.lookup(ROOT_INO, b"other").unwrap();
+    assert_ne!(other.ino, a.ino, "equal content is not the same file");
+    assert_eq!(other.nlink, 1);
+    let kept = view.lookup(ROOT_INO, b"kept").unwrap();
+    assert_eq!(kept.nlink, 1, "{kept:?}");
+}
+
+/// A caller that gives up on silence needs the read-back and the count of the source to report
+/// too, not only the write (issue 290).
+#[test]
+fn reports_progress_while_it_counts_the_source_and_while_it_reads_back() {
+    let f = common::fixture();
+    let src = f.dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    for i in 0..10 {
+        fs::write(src.join(format!("f{i}")), b"").unwrap();
+    }
+    let mut calls = 0u32;
+    let mut hooks = Hooks {
+        progress: &mut |_, _| {
+            calls += 1;
+            true
+        },
+    };
+    ingest(&f.core, &src, "quiet", &mut hooks).unwrap();
+    // Empty files have no bytes to report, so each phase reports once per entry: count, write,
+    // read back.
+    assert!(calls >= 30, "{calls} calls");
+}
