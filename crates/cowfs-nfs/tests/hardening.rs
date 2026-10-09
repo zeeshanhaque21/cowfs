@@ -647,3 +647,84 @@ fn a_flood_of_null_calls_does_not_evict_the_client_that_uses_handles() {
         "the connection that carries file handles was evicted by cheap NULL traffic"
     );
 }
+
+// ---- mount start under a NULL flood (#262) -----------------------------------------------------
+
+/// A server with a cap of 4 and a held, NULL-flooding attacker on the first three connections.
+fn flooded_server() -> (Server, Vec<TcpStream>) {
+    let mut o = opts(Limits {
+        max_connections: 4,
+        ..Limits::default()
+    });
+    o.check_peer_uid = false;
+    let s = Server::start(memfs(), &o, None).unwrap();
+    let flood = (0..3).map(|_| connect_raw(s.port())).collect();
+    (s, flood)
+}
+
+fn null_round(flood: &mut [TcpStream]) {
+    // Sleep so every refresh is strictly later than the kernel socket's ping.
+    std::thread::sleep(Duration::from_millis(5));
+    for x in flood {
+        x.write_all(&null_frame()).unwrap();
+        assert!(answered_fully(x));
+    }
+}
+
+/// Like `answered`, but consumes the whole reply: a leftover body would let the next call
+/// "be answered" at once, before the server has even stamped the connection as active.
+fn answered_fully(s: &mut TcpStream) -> bool {
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut h = [0u8; 4];
+    if s.read_exact(&mut h).is_err() {
+        return false;
+    }
+    let mut body = vec![0u8; (u32::from_be_bytes(h) & 0x7fff_ffff) as usize];
+    s.read_exact(&mut body).is_ok()
+}
+
+#[test]
+fn a_null_flood_does_not_evict_the_nfs_socket_while_the_mount_starts() {
+    // The kernel opens its NFS socket and pings it (NULL), then opens a second connection for MNT.
+    // That second connection arrives at the cap. The pinged socket has served nothing yet and
+    // the flood keeps the others fresher, so eviction by recency picked the kernel's socket and
+    // the mount died mid-start (and mount_nfs's retry hit the closed gate).
+    let (s, mut flood) = flooded_server();
+    null_round(&mut flood);
+    let mut nfs_socket = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(
+        nfs_socket.raw(100_003, 3, 0, Args::new()).0,
+        0,
+        "the NULL ping"
+    );
+    null_round(&mut flood);
+    let mut mnt_socket = Nfs::attach(s.port(), nfs_fh3::default());
+    let (st, root) = mnt_socket.mount_path(&format!("/{}", s.export_name()));
+    assert_eq!(st, 0, "MNT");
+    assert_eq!(
+        nfs_socket.try_getattr(&root.unwrap()),
+        Some(OK),
+        "the flood evicted the kernel's NFS socket mid-mount"
+    );
+}
+
+#[test]
+fn the_pinged_nfs_socket_outlasts_the_cap_minus_one_later_connections() {
+    // Eviction is by connection age among sockets that served nothing, so an attacker has to
+    // open max_connections - 1 = 3 newer connections before the kernel's socket is the oldest
+    // (recency alone needed one). The residual window is stated in the PR for #262.
+    let (s, _flood) = flooded_server();
+    let mut nfs_socket = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(nfs_socket.raw(100_003, 3, 0, Args::new()).0, 0);
+    let mut later = vec![];
+    // The first three are the flood's own connections being evicted, oldest first.
+    for _ in 0..3 {
+        later.push(connect_raw(s.port()));
+        later.last_mut().unwrap().write_all(&null_frame()).unwrap();
+        assert!(answered_fully(later.last_mut().unwrap()));
+    }
+    assert!(
+        nfs_socket.try_getattr(&nfs_fh3::default()).is_some(),
+        "the socket was evicted by fewer than cap-1 newer connections"
+    );
+}
