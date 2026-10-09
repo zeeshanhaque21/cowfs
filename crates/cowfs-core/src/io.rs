@@ -62,7 +62,7 @@ impl Inner {
         let len = u32::try_from(data.len()).map_err(|_| Error::InvalidArgument)?;
         let (sc, node) = self.file_node(ino)?;
         if off.saturating_add(u64::from(len)) > MAX_FILE {
-            return Err(Error::NoSpace);
+            return Err(Error::FileTooBig);
         }
         if len == 0 {
             return Ok(0);
@@ -158,7 +158,7 @@ impl Inner {
         if let Some(size) = ch.size {
             match kind {
                 FileKind::Directory => return Err(Error::IsDir),
-                FileKind::Regular if size > MAX_FILE => return Err(Error::NoSpace),
+                FileKind::Regular if size > MAX_FILE => return Err(Error::FileTooBig),
                 FileKind::Regular => {}
                 _ => return Err(Error::InvalidArgument),
             }

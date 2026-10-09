@@ -52,6 +52,7 @@ pub(crate) fn io_err(e: io::Error) -> Error {
         libc::EINVAL => Error::InvalidArgument,
         libc::ENAMETOOLONG => Error::NameTooLong,
         libc::ENOSPC | libc::EDQUOT => Error::NoSpace,
+        libc::EFBIG => Error::FileTooBig,
         libc::EACCES | libc::EPERM => Error::PermissionDenied,
         libc::EMLINK => Error::TooManyLinks,
         n if n == libc::ENOTSUP || n == libc::EOPNOTSUPP => Error::NotSupported,

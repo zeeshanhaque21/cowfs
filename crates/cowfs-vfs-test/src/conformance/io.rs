@@ -235,6 +235,29 @@ pub fn truncate_shrink_then_grow_zero_fills(c: &Ctx) -> Outcome {
     Ok(())
 }
 
+/// cowfs contract: a size or write end past the 4 TiB file limit is `FileTooBig` (EFBIG, as
+/// pjdfstest ftruncate/12.t requires), never `NoSpace`, and a refused truncate changes nothing.
+pub fn size_past_file_limit_is_file_too_big(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    c.write_all(f, 0, b"abc")?;
+    let huge = SetAttr {
+        size: Some(999_999_999_999_999),
+        ..Default::default()
+    };
+    ensure_err!(
+        c.fs.setattr(f, huge),
+        Error::FileTooBig,
+        "truncate past the limit"
+    );
+    ensure_err!(
+        c.fs.write(f, 999_999_999_999_999, b"x"),
+        Error::FileTooBig,
+        "write past the limit"
+    );
+    ensure_eq!(c.fs.getattr(f)?.size, 3, "size after the refused calls");
+    Ok(())
+}
+
 pub fn truncate_to_same_size(c: &Ctx) -> Outcome {
     for (i, len) in [0usize, 1, 4096, 5000, 12_289].into_iter().enumerate() {
         let f = c.file(ROOT_INO, &format!("f{i}"))?;

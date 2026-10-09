@@ -391,6 +391,7 @@ mod tests {
             Error::InvalidArgument,
             Error::NameTooLong,
             Error::NoSpace,
+            Error::FileTooBig,
             Error::PermissionDenied,
             Error::TooManyLinks,
             Error::NotSupported,

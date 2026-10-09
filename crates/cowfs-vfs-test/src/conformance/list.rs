@@ -29,6 +29,7 @@ macro_rules! __conformance_checks {
                 (io, overwrite_in_middle, Posix),
                 (io, sparse_write_far_past_eof, Portable),
                 (io, truncate_shrink_then_grow_zero_fills, Posix),
+                (io, size_past_file_limit_is_file_too_big, Cowfs),
                 (io, truncate_to_same_size, Posix),
                 (io, truncate_to_same_size_bumps_ctime, Cowfs),
                 (io, write_updates_mtime_and_ctime, Portable),
