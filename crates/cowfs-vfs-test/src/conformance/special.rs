@@ -136,7 +136,7 @@ pub fn mknod_in_file_is_not_dir(c: &Ctx) -> Outcome {
 
 pub fn mknod_stale_parent(c: &Ctx) -> Outcome {
     ensure_err!(
-        c.mknod(4_000_000_000, b"x", FileKind::Fifo, 0o644, 0),
+        c.mknod(super::basic::BOGUS, b"x", FileKind::Fifo, 0o644, 0),
         Error::Stale,
         "mknod in a parent that never existed"
     );
@@ -294,14 +294,13 @@ pub fn special_hardlink_unlink_rename(c: &Ctx) -> Outcome {
         );
         c.fs.unlink(ROOT_INO, b"alias")?;
         let b = c.mknod(ROOT_INO, &n, kind, 0o644, rdev)?;
-        let d = c.dir(ROOT_INO, "dir")?;
+        c.dir(ROOT_INO, "dir")?;
         ensure_err!(
             c.fs.rename(ROOT_INO, &n, ROOT_INO, b"dir", RenameFlags::default()),
             Error::IsDir,
             "rename {kind:?} over a directory"
         );
         c.fs.rmdir(ROOT_INO, b"dir")?;
-        let _ = d;
         c.fs.rename(ROOT_INO, &n, ROOT_INO, b"moved", RenameFlags::default())?;
         ensure_eq!(
             c.lookup(ROOT_INO, b"moved")?.ino,

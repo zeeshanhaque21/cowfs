@@ -219,6 +219,21 @@ pub(crate) fn kind_of(t: cowfs_meta::FileType) -> FileKind {
         cowfs_meta::FileType::File => FileKind::Regular,
         cowfs_meta::FileType::Dir => FileKind::Directory,
         cowfs_meta::FileType::Symlink => FileKind::Symlink,
+        cowfs_meta::FileType::Fifo => FileKind::Fifo,
+        cowfs_meta::FileType::Socket => FileKind::Socket,
+        cowfs_meta::FileType::CharDevice => FileKind::CharDevice,
+        cowfs_meta::FileType::BlockDevice => FileKind::BlockDevice,
+    }
+}
+
+/// The meta type of a special kind; anything else is a caller bug that `mknod` already refused.
+fn meta_type(k: FileKind) -> std::result::Result<cowfs_meta::FileType, cowfs_meta::Error> {
+    match k {
+        FileKind::Fifo => Ok(cowfs_meta::FileType::Fifo),
+        FileKind::Socket => Ok(cowfs_meta::FileType::Socket),
+        FileKind::CharDevice => Ok(cowfs_meta::FileType::CharDevice),
+        FileKind::BlockDevice => Ok(cowfs_meta::FileType::BlockDevice),
+        _ => Err(cowfs_meta::Error::Invalid("not a special file kind")),
     }
 }
 
@@ -314,7 +329,7 @@ impl Inner {
             gid: self.gid,
             size: a.size,
             blocks: 0,
-            rdev: 0,
+            rdev: a.rdev,
             atime: from_meta_ts(a.atime),
             mtime: from_meta_ts(a.mtime),
             ctime: from_meta_ts(a.ctime),
@@ -833,6 +848,7 @@ impl Inner {
                                     Create::File => FileKind::Regular,
                                     Create::Dir => FileKind::Directory,
                                     Create::Symlink(_) => FileKind::Symlink,
+                                    Create::Special { kind, .. } => *kind,
                                 };
                                 self.dents.retarget(*parent, name, *child, (meta_ino, kind));
                             }
@@ -966,9 +982,15 @@ impl Inner {
                             (Some(ticket), Create::Symlink(t)) => {
                                 tx.symlink_at(p, name, t, ticket)?
                             }
+                            (Some(ticket), Create::Special { kind, rdev }) => {
+                                tx.mknod_at(p, name, meta_type(*kind)?, *mode, *rdev, ticket)?
+                            }
                             (None, Create::File) => tx.create(p, name, *mode)?,
                             (None, Create::Dir) => tx.mkdir(p, name, *mode)?,
                             (None, Create::Symlink(t)) => tx.symlink(p, name, t)?,
+                            (None, Create::Special { kind, rdev }) => {
+                                tx.mknod(p, name, meta_type(*kind)?, *mode, *rdev)?
+                            }
                         };
                         newly.insert(*child, a.ino.0);
                     }

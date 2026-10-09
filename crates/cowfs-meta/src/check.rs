@@ -5,7 +5,7 @@
 
 use crate::db::{
     decode_snap, meta_get, Inner, FORMAT_VERSION, MAGIC, META, NODES, REAP, REFS, SNAPSHOTS,
-    SNAP_NAMES,
+    SNAP_NAMES, SPECIAL_VERSION,
 };
 use crate::node::NodeId;
 use crate::ptree::{Cursor, IdHasher, NodeSource, TableSource};
@@ -47,7 +47,8 @@ pub(crate) fn check(inner: &Inner) -> Result<()> {
     if meta.get("magic")?.map(|g| g.value()) != Some(MAGIC) {
         errs.push("missing or wrong magic".into());
     }
-    if meta_get(&meta, "version")? != FORMAT_VERSION {
+    let version = meta_get(&meta, "version")?;
+    if version != FORMAT_VERSION && version != SPECIAL_VERSION {
         errs.push("unsupported format version".into());
     }
     let reserved = meta_get(&meta, "ino_reserved")?;
@@ -147,7 +148,13 @@ pub(crate) fn check(inner: &Inner) -> Result<()> {
 
     for info in &infos {
         let mut e = Errs::default();
-        check_snapshot(&src, &info.root, reserved, &mut e)?;
+        check_snapshot(
+            &src,
+            &info.root,
+            reserved,
+            version == SPECIAL_VERSION,
+            &mut e,
+        )?;
         for m in e.0 {
             errs.push(format!("snapshot {:?}: {m}", info.name));
         }
@@ -251,6 +258,10 @@ fn kind_code(k: FileType) -> u8 {
         FileType::File => 1,
         FileType::Dir => 2,
         FileType::Symlink => 3,
+        FileType::Fifo => 4,
+        FileType::Socket => 5,
+        FileType::CharDevice => 6,
+        FileType::BlockDevice => 7,
     }
 }
 
@@ -263,7 +274,13 @@ fn entry_hash(cookie: u64, child: u64, kind: FileType, name: &[u8]) -> u64 {
     u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap_or([0; 8]))
 }
 
-fn finish(g: Group, reserved: u64, infos: &mut HashMap<u64, Info>, errs: &mut Errs) {
+fn finish(
+    g: Group,
+    reserved: u64,
+    allow_special: bool,
+    infos: &mut HashMap<u64, Info>,
+    errs: &mut Errs,
+) {
     let ino = g.ino;
     if ino == 0 || ino >= reserved {
         errs.push(format!("inode number {ino} outside 1..{reserved}"));
@@ -279,6 +296,11 @@ fn finish(g: Group, reserved: u64, infos: &mut HashMap<u64, Info>, errs: &mut Er
     if g.name_rows != g.cookie_rows || g.name_sum != g.cookie_sum {
         errs.push(format!(
             "directory {ino} name rows and cookie rows disagree"
+        ));
+    }
+    if rec.kind.is_special() && !allow_special {
+        errs.push(format!(
+            "special file {ino} in a store whose format version does not allow them"
         ));
     }
     match rec.kind {
@@ -312,6 +334,11 @@ fn finish(g: Group, reserved: u64, infos: &mut HashMap<u64, Info>, errs: &mut Er
                 errs.push(format!("directory {ino} has file data"));
             }
         }
+        FileType::Fifo | FileType::Socket | FileType::CharDevice | FileType::BlockDevice => {
+            if g.extents != 0 || g.link.is_some() || rec.size != 0 || rec.covered != 0 {
+                errs.push(format!("special file {ino} has file data"));
+            }
+        }
     }
     let e = infos.entry(ino).or_default();
     e.kind = kind_code(rec.kind);
@@ -324,6 +351,7 @@ fn check_snapshot(
     src: &TableSource<'_>,
     root: &NodeId,
     reserved: u64,
+    allow_special: bool,
     errs: &mut Errs,
 ) -> Result<()> {
     let mut infos: HashMap<u64, Info> = HashMap::new();
@@ -343,7 +371,7 @@ fn check_snapshot(
         };
         if group.as_ref().is_some_and(|g| g.ino != ino.0) {
             if let Some(g) = group.take() {
-                finish(g, reserved, &mut infos, errs);
+                finish(g, reserved, allow_special, &mut infos, errs);
             }
         }
         let g = group.get_or_insert_with(|| Group::new(ino.0));
@@ -414,7 +442,7 @@ fn check_snapshot(
         prev = Some(k);
     }
     if let Some(g) = group.take() {
-        finish(g, reserved, &mut infos, errs);
+        finish(g, reserved, allow_special, &mut infos, errs);
     }
     check_graph(&infos, errs);
     Ok(())
@@ -563,6 +591,117 @@ mod tests {
 
     fn inode_of(t: &MemTree, src: &Lazy<'_>, ino: u64) -> InodeRec {
         InodeRec::decode(&t.get(src, &key(Ino(ino), K_INODE, &[])).unwrap().unwrap()).unwrap()
+    }
+
+    fn stored_version(m: &Meta) -> u64 {
+        let rtx = m.h.inner.db.begin_read().unwrap();
+        let meta = rtx.open_table(META).unwrap();
+        meta_get(&meta, "version").unwrap()
+    }
+
+    #[test]
+    fn first_special_file_bumps_the_format_version_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+        let opts = || Options {
+            background: false,
+            ..Options::default()
+        };
+        {
+            let m = Meta::open(&path, opts()).unwrap();
+            let s = m.new_snapshot("s").unwrap();
+            s.create(ROOT_INO, b"f", 0o644).unwrap();
+            m.sync().unwrap();
+            assert_eq!(stored_version(&m), FORMAT_VERSION, "no special file yet");
+            // a failed batch must not bump the version
+            let failed = s.batch(|tx| {
+                tx.mknod(ROOT_INO, b"gone", FileType::Fifo, 0o600, 0)?;
+                Err::<(), _>(Error::Invalid("rollback"))
+            });
+            assert!(failed.is_err());
+            s.create(ROOT_INO, b"g", 0o644).unwrap();
+            m.sync().unwrap();
+            assert_eq!(stored_version(&m), FORMAT_VERSION, "rolled back batch");
+            let dev = s
+                .mknod(ROOT_INO, b"c", FileType::CharDevice, 0o600, (1 << 32) | 2)
+                .unwrap();
+            assert_eq!((dev.kind, dev.rdev), (FileType::CharDevice, (1 << 32) | 2));
+            m.sync().unwrap();
+            assert_eq!(stored_version(&m), SPECIAL_VERSION);
+            m.check().unwrap();
+        }
+        let m = Meta::open(&path, opts()).unwrap();
+        assert_eq!(stored_version(&m), SPECIAL_VERSION);
+        m.check().unwrap();
+        let s = m.snapshot("s").unwrap();
+        assert_eq!(s.lookup(ROOT_INO, b"c").unwrap().rdev, (1 << 32) | 2);
+        // a build that only knows version 2 must refuse the store up front
+        drop(s);
+        drop(m);
+        let db = redb::Database::open(&path).unwrap();
+        let wtx = db.begin_write().unwrap();
+        wtx.open_table(META)
+            .unwrap()
+            .insert("version", 99u64)
+            .unwrap();
+        wtx.commit().unwrap();
+        drop(db);
+        assert!(matches!(Meta::open(&path, opts()), Err(Error::Format(_))));
+    }
+
+    #[test]
+    fn special_file_in_a_version_two_store_is_reported() {
+        let (_d, m) = open();
+        let s = m.snapshot("s").unwrap();
+        s.mknod(ROOT_INO, b"p", FileType::Fifo, 0o644, 0).unwrap();
+        m.sync().unwrap();
+        m.check().unwrap();
+        let wtx = m.h.inner.db.begin_write().unwrap();
+        wtx.open_table(META)
+            .unwrap()
+            .insert("version", FORMAT_VERSION)
+            .unwrap();
+        wtx.commit().unwrap();
+        expect(&m, "special file");
+    }
+
+    #[test]
+    fn special_file_with_data_is_reported() {
+        let (_d, m) = open();
+        let s = m.snapshot("s").unwrap();
+        let p = s.mknod(ROOT_INO, b"p", FileType::Fifo, 0o644, 0).unwrap();
+        m.sync().unwrap();
+        tamper(&m, |t, src| {
+            let mut r = inode_of(t, src, p.ino.0);
+            r.size = 5;
+            t.insert(src, &key(p.ino, K_INODE, &[]), r.encode())
+                .unwrap();
+        });
+        expect(&m, "special file");
+    }
+
+    #[test]
+    fn special_inode_record_lengths_follow_the_type() {
+        let (_d, m) = open();
+        let s = m.snapshot("s").unwrap();
+        let p = s.mknod(ROOT_INO, b"p", FileType::Fifo, 0o644, 0).unwrap();
+        let c = s
+            .mknod(ROOT_INO, b"c", FileType::BlockDevice, 0o644, 7)
+            .unwrap();
+        m.sync().unwrap();
+        tamper(&m, |t, src| {
+            let fifo = inode_of(t, src, p.ino.0);
+            let dev = inode_of(t, src, c.ino.0);
+            assert_eq!((fifo.encode().len(), dev.encode().len()), (86, 94));
+            assert_eq!(dev.rdev, 7);
+            assert!(InodeRec::decode(&dev.encode()[..86]).is_err());
+            let mut long = fifo.encode();
+            long.extend([0u8; 8]);
+            assert!(InodeRec::decode(&long).is_err());
+            t.insert(src, &key(c.ino, K_INODE, &[]), dev.encode()[..86].to_vec())
+                .unwrap();
+        });
+        assert!(m.check().is_err());
     }
 
     #[test]

@@ -425,7 +425,9 @@ Heavy runs (release):
    A crash loses the applied-but-not-durable changes.
 4. The hook runs after the closure and before the redb transaction, once per commit.
 5. No unlink-while-open support in this crate.
-6. Only regular files, directories, and symlinks: no device nodes, FIFOs, or sockets, and no uid or gid.
+6. Regular files, directories, symlinks, and special files (fifo, socket, character and block device nodes, see `docs/special-files-107.md`): no uid or gid.
+   A special file has no data; a device record is 8 bytes longer and carries its device number.
+   A store is created at format version 2 and the commit that first persists a special file writes version 3, which a build that only knows version 2 refuses up front.
 7. `setattr(size)` shrinks only to a chunk boundary, otherwise `NeedsRechunk`.
 8. Removed snapshots are freed by the reaper in steps of at most 256 nodes per transaction, so the writer stall is one step, not the tree.
    Until the reaper finishes, the removed snapshot's nodes still occupy file space.

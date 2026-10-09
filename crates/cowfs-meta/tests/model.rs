@@ -224,6 +224,7 @@ impl Model {
             FileType::Symlink => 0o777,
             FileType::Dir => 0o755,
             FileType::File => 0o644,
+            _ => unreachable!("the model never makes special files"),
         };
         let mut i = MI::new(kind, mode, dir);
         if kind == FileType::Symlink {
@@ -357,6 +358,7 @@ impl Model {
             FileType::Dir => return Err("IsDir"),
             FileType::Symlink => return Err("Invalid"),
             FileType::File => {}
+            _ => return Err("Invalid"),
         }
         let total: u64 = chunks.iter().map(|c| u64::from(c.len)).sum();
         if size < total {
@@ -385,6 +387,7 @@ impl Model {
             FileType::Dir => return Err("IsDir"),
             FileType::Symlink => return Err("Invalid"),
             FileType::File => {}
+            _ => return Err("Invalid"),
         }
         let i = t.inodes.get_mut(&ino).unwrap();
         if i.version != expected {
@@ -427,6 +430,7 @@ impl Model {
                 FileType::Dir => return Err("IsDir"),
                 FileType::Symlink => return Err("Invalid"),
                 FileType::File => {}
+                _ => return Err("Invalid"),
             }
             let i = t.inodes.get_mut(&ino).unwrap();
             if size != i.size {
@@ -668,6 +672,7 @@ fn verify(m: &Meta, model: &Model) -> Result<(), TestCaseError> {
                 FileType::Dir => {
                     prop_assert_eq!(s.lookup(Ino(ino), b"..").unwrap().ino.0, mi.parent);
                 }
+                _ => unreachable!("the model never makes special files"),
             }
             let xs = s.listxattr(Ino(ino)).unwrap();
             prop_assert_eq!(&xs, &mi.xattrs.keys().cloned().collect::<Vec<_>>());

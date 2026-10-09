@@ -15,7 +15,7 @@ use cowfs_vfs::{
 
 use super::{Ctx, Outcome};
 
-const BOGUS: Ino = 0x00FF_FFFF_FFFF_F001;
+pub(super) const BOGUS: Ino = 0x00FF_FFFF_FFFF_F001;
 const SLACK_SECS: i64 = 5;
 
 /// True when every field except `atime` matches (a backend may update atime on read).

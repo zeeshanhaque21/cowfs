@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use cowfs_vfs::Vfs;
 use cowfs_vfs_path::{force_remove_dir_all, PathVfs};
-use cowfs_vfs_test::conformance::{run_all, Options};
+use cowfs_vfs_test::conformance::{all_checks, run_all, Options};
 
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
@@ -103,6 +103,14 @@ fn mount_conformance() {
         opts.skip.push((
             name.into(),
             "PathVfs has no fallocate yet (#103 slice D)".into(),
+        ));
+    }
+    // FUSE `mknod` for special files is wired in a later slice of issue #107 (slice C); until
+    // then the mount refuses them with ENOTSUP and these checks cannot pass.
+    for c in all_checks().iter().filter(|c| c.category == "special") {
+        opts.skip.push((
+            c.name.into(),
+            "FUSE mknod of special files lands in slice C of issue #107".into(),
         ));
     }
     let report = run_all(&factory, &opts);
