@@ -3,6 +3,13 @@
 
 Usage:
   g5_diff.py report --run DIR [--mode acceptance|diagnostic] [--json OUT] [--md OUT]
+                    [--daemon-sha256 HEX] [--fsstress-sha256 HEX] [--fsx-sha256 HEX]
+
+Intended invocation: take the helper digests from the build identity that
+bench/xfstests_build.sh wrote, `grep ^fsstress_sha256= $XFS.identity.txt` and the same for
+fsx_sha256, and pass both. The tree is built, so its build outputs are gitignored; meta.txt
+tree_ignored lists them, and a non-empty list passes only when both helper digests were given
+and match. A given digest that is missing from meta or different is INVALID.
 
 No root and no mounts here. `bench/g5_root.sh` does all the privileged work and
 leaves plain text evidence per arm and case; this module reads it, applies the
@@ -95,11 +102,14 @@ def parse_console(text, rc, case):
     return out
 
 
-def parse_identity(text):
+def parse_identity(text, dups=None):
+    """key=value lines, last wins; `dups` (a list) collects every key seen twice."""
     out = {}
     for ln in (text or "").splitlines():
         k, sep, v = ln.partition("=")
         if sep:
+            if dups is not None and k.strip() in out:
+                dups.append(k.strip())
             out[k.strip()] = v.strip()
     return out
 
@@ -198,13 +208,28 @@ def pair_label(n, c):
     return "other"
 
 
-def build_receipt(native, cowfs, control, meta, pin, mode, requested, expect_daemon_sha256=None):
+def build_receipt(native, cowfs, control, meta, pin, mode, requested, expect_daemon_sha256=None,
+                  expect_helpers=None):
     bad = []
+    expect_helpers = {k: v for k, v in (expect_helpers or {}).items() if v is not None}
+    if meta.get("_dup_keys"):
+        bad.append(f"meta: duplicate keys {meta['_dup_keys']} (a later line may override a recorded one)")
+    if meta.get("tree_status_rc", "0") != "0":
+        bad.append(f"tree: git status failed (rc {meta['tree_status_rc']}), the tree state is unknown")
+    if expect_helpers and "tree_ignored" not in meta:
+        bad.append("tree: tree_ignored was not recorded, so ignored files were never checked")
     for k in ("tree_head", "check_sha256", "cowfs_profile"):
         if not meta.get(k):
             bad.append(f"meta: {k} was not recorded before the run")
     if meta.get("tree_porcelain"):
         bad.append(f"tree: not clean ({meta['tree_porcelain']!r})")
+    for k, want in expect_helpers.items():
+        if not want or meta.get(k) != want:
+            bad.append(f"tree: {k} {meta.get(k)!r} is not the expected {want}")
+    if meta.get("tree_ignored") and set(expect_helpers) != {"fsstress_sha256", "fsx_sha256"}:
+        ign = meta["tree_ignored"].split()
+        bad.append(f"tree: {len(ign)} ignored paths (first {ign[:5]}) and the helper digests were not "
+                   "both pinned (--fsstress-sha256 --fsx-sha256)")
     if meta.get("tree_head") and meta["tree_head"] != pin.get("tree_sha"):
         bad.append(f"tree: head {meta['tree_head']} is not the reviewed {pin.get('tree_sha')}")
     want_check = (pin.get("runner") or {}).get("check")
@@ -320,7 +345,10 @@ def load_arm(run, arm, ids):
 
 def load_run(run):
     run = Path(run)
-    meta = parse_identity(_read(run / "meta.txt"))
+    dups = []
+    meta = parse_identity(_read(run / "meta.txt"), dups)
+    if dups:
+        meta["_dup_keys"] = " ".join(sorted(set(dups)))
     ids = [ln.strip() for ln in _read(run / "cases.txt").splitlines() if ln.strip()]
     ctl = load_arm(run, "control", ["generic/005"])[0] if (run / "control").is_dir() else None
     return {"meta": meta, "requested": ids, "native": load_arm(run, "native", ids),
@@ -356,7 +384,8 @@ def report(args):
         return 3
     run = load_run(args.run)
     r = build_receipt(run["native"], run["cowfs"], run["control"], run["meta"], pin,
-                      args.mode, run["requested"], args.daemon_sha256)
+                      args.mode, run["requested"], args.daemon_sha256,
+                      {"fsstress_sha256": args.fsstress_sha256, "fsx_sha256": args.fsx_sha256})
     r["records"] = {"native": run["native"], "cowfs": run["cowfs"], "control": run["control"]}
     Path(args.json or Path(args.run) / "receipt.json").write_text(json.dumps(r, indent=1, default=str))
     Path(args.md or Path(args.run) / "receipt.md").write_text(render_md(r))
@@ -371,9 +400,14 @@ def main(argv=None):
     rp.add_argument("--run", required=True)
     rp.add_argument("--mode", choices=("acceptance", "diagnostic"), default="diagnostic")
     rp.add_argument("--daemon-sha256", help="expected sha256 of cowfs-daemon (acceptance needs it)")
+    rp.add_argument("--fsstress-sha256", help="expected ltp/fsstress sha256 (xfstests_build identity)")
+    rp.add_argument("--fsx-sha256", help="expected ltp/fsx sha256 (xfstests_build identity)")
     rp.add_argument("--json")
     rp.add_argument("--md")
     args = ap.parse_args(argv)
+    for flag in ("fsstress_sha256", "fsx_sha256", "daemon_sha256"):
+        if getattr(args, flag) == "":
+            ap.error(f"--{flag.replace('_', '-')} must not be empty")
     return report(args)
 
 

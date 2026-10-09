@@ -121,11 +121,22 @@ trap teardown EXIT
 for p in $(git -C "$XFS" status --porcelain | sed -n 's/^?? \(tmp\.[^ ]*\)$/\1/p'); do
   echo "removed stray root-owned $p" >> "$OUT/cleanup.txt"; rm -rf -- "${XFS:?}/$p"
 done
+# --ignored: every xfstests build output is gitignored, so plain porcelain cannot see a stale or
+# hand-built helper. Ignored paths go to tree_ignored, g5_diff.py accepts them only when the
+# helper digests below were pinned.
+# A failed status must not read as a clean tree: its exit status is recorded and g5_diff.py checks it.
+tree_rc=0
+tree_status=$(git -C "$XFS" status --porcelain --ignored) || tree_rc=$?
 profile=unknown
 case "$BIN" in */release|*/release/) profile=release;; */debug|*/debug/) profile=debug;; esac
 {
+  # Shell echo may expand backslash escapes (dash, zsh), and git quotes a hostile path as text like
+  # "a\nfsx_sha256=..", which would become a real meta line. Print values verbatim, one line each.
+  echo() { printf '%s\n' "$(printf '%s' "$*" | tr '\n\r' '  ')"; }
+  echo "tree_status_rc=$tree_rc"
   echo "tree_head=$(git -C "$XFS" rev-parse HEAD)"
-  echo "tree_porcelain=$(git -C "$XFS" status --porcelain | tr '\n' ' ' | sed 's/ *$//')"
+  echo "tree_porcelain=$(printf '%s\n' "$tree_status" | grep -v '^!! ' | tr '\n' ' ' | sed 's/ *$//')"
+  echo "tree_ignored=$(printf '%s\n' "$tree_status" | sed -n 's/^!! //p' | tr '\n' ' ' | sed 's/ *$//')"
   echo "check_sha256=$(sha256sum "$XFS/check" | cut -d' ' -f1)"
   echo "fsstress_sha256=$(sha256sum "$XFS/ltp/fsstress" | cut -d' ' -f1)"
   echo "fsx_sha256=$(sha256sum "$XFS/ltp/fsx" | cut -d' ' -f1)"
