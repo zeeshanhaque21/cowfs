@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{pattern, write_all};
@@ -965,6 +966,9 @@ fn brief(op: &LogOp) -> String {
 }
 
 /// The image of a cut at store op `k` for `seed`, written under `dir`. Deterministic.
+const KEEP_MAX: usize = 4;
+static KEPT: AtomicUsize = AtomicUsize::new(0);
+
 fn build_image(run: &Run, k: usize, seed: u64, dir: &Path) {
     let mut rng = Rng(seed ^ ((k as u64) << 20) ^ 0x57A1);
     let img = crash_image(&run.store_base, &run.ops, k, &mut rng, seed % 4);
@@ -979,7 +983,9 @@ fn build_image(run: &Run, k: usize, seed: u64, dir: &Path) {
     }
 }
 
-fn sweep(run: &Run, seeds: u64, threads: usize) -> Tally {
+/// `keep` leaves the first failing images on disk (at most `KEEP_MAX`), for the sweep that must pass;
+/// the negative control fails by design and keeps nothing.
+fn sweep(run: &Run, seeds: u64, threads: usize, keep: bool) -> Tally {
     let total = Mutex::new(Tally::default());
     std::thread::scope(|sc| {
         for th in 0..threads {
@@ -1005,11 +1011,15 @@ fn sweep(run: &Run, seeds: u64, threads: usize) -> Tally {
                         build_image(run, k, seed, dir.path());
                         t.images += 1;
                         if let Err(e) = verify(dir.path(), ex, &mut t) {
-                            // `verify` writes into the image, so rebuild the cut image to keep
-                            let keep = tempfile::tempdir().unwrap().keep();
-                            build_image(run, k, seed, &keep);
-                            t.failures
-                                .push(format!("{tag} image {}: {e}", keep.display()));
+                            let kept = if keep && KEPT.fetch_add(1, Ordering::Relaxed) < KEEP_MAX {
+                                // `verify` writes into the image, so rebuild the cut image
+                                let d = tempfile::tempdir().unwrap().keep();
+                                build_image(run, k, seed, &d);
+                                format!(" image {}", d.display())
+                            } else {
+                                String::new()
+                            };
+                            t.failures.push(format!("{tag}{kept}: {e}"));
                         }
                     }
                 }
@@ -1062,6 +1072,7 @@ fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() 
             &run,
             env("COWFS_POWER_SEEDS", 5) as u64,
             env("COWFS_POWER_THREADS", 4),
+            true,
         );
         report(&run, &t);
         all.merge(t);
@@ -1178,6 +1189,7 @@ fn the_power_test_notices_a_missing_store_sync_before_metadata_commits() {
         &run,
         env("COWFS_POWER_SEEDS", 5) as u64,
         env("COWFS_POWER_THREADS", 4),
+        false,
     );
     report(&run, &t);
     assert!(

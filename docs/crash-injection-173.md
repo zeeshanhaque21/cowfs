@@ -233,7 +233,7 @@ Workload, one thread, `background: false` for Core and for meta:
 
 Size: 280 to 410 store ops, about 190 metadata events, 14 root ops and 5 or 6 acknowledgements per workload, 5 seeds per cut, so about 3600 images and 60 s on the box with 4 threads.
 The op count has two modes, which differ from the very first op: Core iterates a `HashMap` of snapshots with a per-process random seed, so the order in which it flushes two snapshots changes.
-A failing tag (`k=... seed=...`) is therefore not reproducible by number; the failing image itself is kept on disk and its path is in the message, and it opens with `Core::open`.
+A failing tag (`k=... seed=...`) is therefore not reproducible by number; the first failing images are kept on disk and their paths are in the message, and it opens with `Core::open`.
 The fail-closed asserts hold in both modes: 14 consecutive runs at 2 seeds per cut all passed, with 355 to 412 ops.
 
 Each image is reopened with the shipped `Core::open` and must:
