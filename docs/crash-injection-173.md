@@ -51,7 +51,9 @@ Constraint from issue 88:
 - `scripts/check-fault-seam-absent.sh`, run as a CI step, builds the library crates in a separate target dir without the feature.
   It fails if `cowfs-daemon`'s feature graph enables the feature, or if the rlib contains the seam's env key `C7D_EXIT_BOUNDARY_N`.
   It then rebuilds with the feature as a positive control and fails if the key is not found, so the check cannot be blind.
-  The release `cowfs-daemon` is also searched for `oplog_start` and `crashmodel`; those two have no positive control of their own, because an unused item is dropped from a release binary.
+  The release `cowfs-daemon` is also searched for `C7D_EXIT` and `oplog_start`; the feature-on hit is the positive control for the pair, and `oplog_start` has none of its own because an unused item is dropped from a release binary.
+  `crashmodel` is not searched: the daemon never links it even with the feature on (0 hits), so a grep would pass whether or not the module were gated.
+  The compiler is that gate: `crashmodel` imports `LogOp`, whose re-export is `cfg(feature)`, so removing the cfg from `pub mod crashmodel` fails a feature-off build with E0432 (issue 276, tried on the box).
   It is a separate cargo invocation because `cargo test --workspace` turns the feature on through the dev-dependency edges.
 - Known pre-existing caveat, unchanged: `cargo build --workspace --all-targets` unifies the feature onto the lib (see `docs/verification/gc-daemon-e2e.md`).
   The CI workflow has no release build step, so the library graph above is the artifact checked.
