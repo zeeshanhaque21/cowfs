@@ -404,6 +404,9 @@ pub fn run(cli: Cli) -> i32 {
             stub_delay_ms,
             stub_ignore_cancel,
         } => {
+            if *stub {
+                return EXIT_ERROR; // ci-trial: deliberately broken stub serve
+            }
             let kind = if *stub {
                 BackendKind::Stub {
                     work_delay: Duration::from_millis(*stub_delay_ms),
