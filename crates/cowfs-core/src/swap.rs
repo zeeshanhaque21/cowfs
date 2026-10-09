@@ -129,9 +129,15 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
         return Ok(());
     };
     match core.finish_swap(&staged, &target) {
-        // `NotFound`: the target already existed, nothing was left to fork
+        // `NotFound` is also what a swap whose staged tree is gone returns (a store the old
+        // issue 177 already damaged); the intent still has to go or the name stays blocked
         Ok(_) | Err(ControlError::NotFound) => {}
         Err(e) => return Err(e),
+    }
+    if core.inner.snap_by_name(&target).is_err() {
+        *core.inner.last_error.lk() = Some(format!(
+            "swap recovery: neither {target} nor its staged tree {staged} exists, intent removed"
+        ));
     }
     if fs::remove_file(p).is_ok() {
         sync_dir(&core.inner.root);
@@ -156,7 +162,9 @@ pub(crate) fn recover(core: &Core) {
 /// Removes every staging snapshot that no intent file names (issue 176): a crash during the staging
 /// write leaves one, and nothing else would ever remove a name that is not ingested again.
 ///
-/// Runs only from `recover`, inside `Core::open`, when no operation can own a staging snapshot yet.
+/// Runs only from `recover`, inside `Core::open`, when no operation can own a staging snapshot yet:
+/// the store's `LOCK` file is held by flock for the life of the `Core`, so no other process or `Core`
+/// can be staging into this store while it opens.
 /// An intent that could not be recovered still protects its staging snapshot.
 fn sweep_orphans(core: &Core) {
     let named: std::collections::HashSet<String> = intents(&core.inner.root)
@@ -388,5 +396,27 @@ mod tests {
         let listing = c.readdir(ROOT_INO, 0, 100).unwrap();
         assert!(listing.entries.iter().all(|e| e.name != staged.as_bytes()));
         c.rollback(&staged, "new");
+    }
+
+    #[test]
+    fn sweep_keeps_a_staging_snapshot_an_intent_names_and_drops_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Core::open(
+            dir.path(),
+            crate::Options {
+                background: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        c.create_snapshot("src").unwrap();
+        let sc = c.inner.snap_by_name("src").unwrap();
+        let staged = staging_name("new");
+        c.stage_and_intent(&sc, &staged, "new").unwrap();
+        sweep_orphans(&c);
+        assert!(c.inner.snap_by_name_raw(&staged).is_ok(), "intent names it");
+        fs::remove_file(intent_path(&c.inner.root, "new")).unwrap();
+        sweep_orphans(&c);
+        assert!(c.inner.snap_by_name_raw(&staged).is_err(), "orphan stays");
     }
 }
