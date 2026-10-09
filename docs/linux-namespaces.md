@@ -156,6 +156,24 @@ Promise, for a build run through the canonical route on Linux:
 
 The default for a build outside the canonical route is unchanged.
 
+## Measured with real leases and three filesystems
+
+Issue 171 rows 3 and 4, on the cachyos box (kernel 7.2.8-2-cachyos, rustc 1.99.0, treehouse v3.1.2 release binary).
+Evidence and exact commands: `docs/verification/evidence/namespaces171-matrix.md`.
+
+- Real leases: `cowfs-treehouse base refresh --build 'cargo build --workspace' --root R --canonical C` without `--slot` leased 3 slots from a real treehouse pool and built in each through the namespace helper.
+  The 3 `target` trees were byte-identical (43 of 43 files).
+  A 4th lease built natively at its own path differed in 15 files.
+  `base status` reported the published base fresh.
+  The slots sat on btrfs, not on the FUSE mount, and the path backend was used.
+- Filesystems: the 9 isolation tests and the 7 refusal tests passed on btrfs, ext4 and XFS.
+  Six canonical `cargo build --workspace` runs with `CARGO_INCREMENTAL=0` were byte-identical on each (43 of 43 files).
+  The same builds with `CARGO_INCREMENTAL=1` were all different, 81 paths each, on each.
+  The ext4 and XFS filesystems were 4 GiB loop images on a btrfs file.
+- On XFS the native control differs in one more file (`dep-bin-app`) than on the others, because it lists its two dependencies in a different order.
+  Canonical builds were unaffected.
+- Not covered: any kernel older than 6.12, the core backend, a leased slot on the FUSE mount, release builds, registry dependencies, incremental rebuilds, N above 6.
+
 ## Limits
 
 - Linux only, by design. macOS gets `--remap-path-prefix`.
@@ -169,9 +187,9 @@ The default for a build outside the canonical route is unchanged.
   The helper sets nothing and removes nothing (the treehouse wiring is the exception: it sets `CARGO_INCREMENTAL=0`, overriding any caller value, see "What is promised for cargo"), so `TMPDIR`, `CARGO_TARGET_DIR` and friends reach the command as the caller set them.
 - The namespace is per command, not per session.
   A shell started inside one keeps it; a new command gets a new one.
-- The treehouse wiring uses `--slot`, not a treehouse lease.
-  moonscape has no `treehouse` binary, so the integration run builds in the snapshot itself.
+- The moonscape integration run uses `--slot`, not a treehouse lease, because moonscape has no `treehouse` binary.
   That is the same `run_build` call site a leased slot takes; only the slot provider differs.
+  A real lease run was done on the cachyos box, see the section "Measured with real leases and three filesystems".
 - The integration run used the path backend, not the core backend, because at the time `base_refresh` copied a
   directory into the store and the core backend refused that.
   The core backend now publishes `base_refresh` tree-natively (issue 123), but this run predates that.
@@ -179,8 +197,9 @@ The default for a build outside the canonical route is unchanged.
 - `base_refresh` no longer depends on what git prints: the checkout path is passed as an argument and
   nothing is read from stdout. That removes the version question entirely rather than answering it, and
   nothing here claims what 2.56 prints.
-- Verified on one kernel (6.12) and one filesystem (ext4 under the mount, `fuse.cowfs` for the source).
-  Not verified on btrfs, XFS, or an older kernel.
+- The moonscape run was one kernel (6.12) and one filesystem (ext4 under the mount, `fuse.cowfs` for the source).
+  The isolation tests and a cargo build were later measured on btrfs, ext4 and XFS on kernel 7.2.8, see the section "Measured with real leases and three filesystems".
+  No kernel older than 6.12 has been measured.
 
 ## Running it
 
@@ -346,9 +365,10 @@ It is not evidence that a warm base was published, because none was, and it is n
 - No Core backend result in this run. The core backend now publishes `base_refresh` tree-natively (issue 123), but this measurement predates that.
 - No `fsck` result: the path backend has no block store and says so.
 - No crash safety and no no-data-loss claim. The readback is a daemon restart, not crash injection.
-- No leased-slot result: moonscape has no `treehouse` binary, so the run uses `--slot`, the same
+- No leased-slot result on moonscape: it has no `treehouse` binary, so the run uses `--slot`, the same
   `run_build` call site with a different slot provider.
-- No `cargo`-level canonical build, no btrfs or XFS, no kernel older than 6.12.
+  The cachyos box has one, see the section "Measured with real leases and three filesystems".
+- No `cargo`-level canonical build on moonscape, and no kernel older than 6.12 anywhere.
 
 ## A flake in the wiring tests, measured and not fixed
 
