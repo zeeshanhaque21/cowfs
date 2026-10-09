@@ -274,14 +274,25 @@ snapshot and the NFS and FUSE writers reach the store without it.
 `Gc::note_access` records the last-access epoch second of a block in memory.
 A read never writes: the map is only touched, and flushed in batches.
 
+**Status: OPEN.**
+The store and the ordering exist in this crate, but no read path calls `Gc::note_access` outside the gc tests.
+So `atime.bin` is always empty in production, every pack has coldness 0, and "coldest first" is not active.
+The sweep then falls back to the tie-break, most dead bytes first.
+Feeding the hints is tracked in `docs/gc-scheduling-10-20261009.md` and issue #10.
+
 - In memory: `HashMap<BlockId, u32>`, capped at `Options::max_hints` (default 1,048,576).
   When the cap is hit, new ids are not recorded and `GcReport::hints_dropped` counts them.
   A dropped hint is a lost optimisation, never a lost block.
 - On disk: `<state>/atime.bin`, 36 byte records of a 32 byte id and a 4 byte epoch second,
   appended, each append fsynced, a torn last record dropped on load, and the maximum per id kept.
   Flushing happens at the end of a cycle, and on `Gc::flush_hints`.
-- Hints are a **hint only**. They order sweep candidates so the coldest pack is rewritten first,
-  and they can raise a pack's effective dead ratio by a small amount (`Options::cold_dead_bonus`).
+- There is no compaction of `atime.bin`.
+  `Hints::flush` only appends and `load` dedups in memory without rewriting the file, so the file would grow without bound once fed.
+  Compaction is OPEN.
+- Hints are a **hint only**. They order sweep candidates so the coldest pack is rewritten first
+  (when fed, see above).
+  They never change whether a pack is a candidate.
+  There is no `cold_dead_bonus` option: an earlier version of this document named one, but `Options` has no such field and the dead ratio test uses `dead_ratio` alone.
   They are never the reason a block is freed: reachability decides that, and the barrier in step 5
   re-checks reachability.
 
@@ -291,6 +302,12 @@ A read never writes: the map is only touched, and flushed in batches.
   bytes (default 0.5) and at least `Options::min_dead_bytes` (default 8 MiB) are dead.
 - The order is coldest first, by the mean last-access second of the pack's live records, so a run
   under a write load reclaims cold packs first.
+  This holds only once hints are fed (see Access-time hints, OPEN).
+  Today every pack has coldness 0 and the order is most dead bytes first.
+- The policy is per pack.
+  There is no per-block age threshold.
+- GC runs on demand only (`cowfs gc`).
+  Scheduling a cycle, or triggering one on low space, is OPEN (`docs/gc-scheduling-10-20261009.md`, issue #10).
 - `Options::io_budget_bytes` bounds the bytes copied per cycle (default 2 GiB, 0 means no bound),
   which bounds a cycle's duration and its I/O rate.
 - Progress is reported through `Gc::set_progress` after each pack copied and after each pack

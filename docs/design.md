@@ -38,10 +38,19 @@ So a hashed block store is the core, and the OS layer is only the mount mechanis
 
 ### Garbage collection
 
-- Mark-and-sweep from snapshot roots, on demand and on a schedule.
+- Mark-and-sweep from snapshot roots.
 - Marking is incremental: subtrees already marked are skipped.
-- Each block records a last-accessed time, kept in memory and flushed in batches so reads do not become writes.
-- Sweep candidates are unmarked blocks older than a threshold.
+- GC runs on demand only today (`cowfs gc`).
+  Running it on a schedule is OPEN: nothing in the daemon starts a cycle.
+  See `docs/gc-scheduling-10-20261009.md` and issue #10.
+- The sweep is per pack, not per block.
+  A pack is a candidate when its dead record bytes pass `dead_ratio` and `min_dead_bytes`.
+  There is no age threshold on blocks.
+  Whether to add one is OPEN (decision D3 in the memo, issue #10).
+- Each block is meant to carry a last-accessed time, kept in memory and flushed in batches so reads do not become writes.
+  The hint store exists in `cowfs-gc` (`Gc::note_access`, `atime.bin`), but no read path calls it, so the file stays empty and "coldest first" is not active in production.
+  Feeding it is OPEN (memo and issue #10).
+  `atime.bin` is append-only with no compaction, so it would grow without bound once fed.
 - Access time is a hint only.
   It is never the sole reason to free a block, because a cold block may still be referenced by a live snapshot.
 - The same timestamps can later drive tiering of cold blocks to slower or remote storage.
