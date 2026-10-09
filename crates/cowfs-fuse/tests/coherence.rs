@@ -341,8 +341,10 @@ fn concurrent_writers_leave_every_block_uniform_and_acknowledged() {
 /// the way. `O_DIRECT` readers reach the adapter as one READ per block, so a tear here is the
 /// adapter or the `Core` mixing two writes, not the kernel: an adapter that split a READ into
 /// several `Vfs` calls, or a `Core` read that assembled chunks across a concurrent write, fails
-/// this. Writers stay buffered, as they are for every application. Issue #45 measured 0 tears in
-/// about 36M such reads on Linux 7.2, against 92 torn runs of 1000 for buffered readers.
+/// this. Writers stay buffered, as they are for every application. For issue #45 a standalone
+/// stress (3 writers, 3 readers, 16 blocks, 1000 iterations) measured 0 tears in 35.9M `O_DIRECT`
+/// reads through a `Core`-backed mount on Linux 7.2, against 34238 in 1.27G buffered reads of it.
+/// This test itself ran 1000 times there with 0 tears in 6M reads.
 #[test]
 fn direct_readers_through_the_mount_never_see_a_torn_block() {
     let Some(rig) = rig() else { return };
