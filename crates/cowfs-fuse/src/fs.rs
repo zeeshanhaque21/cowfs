@@ -629,15 +629,20 @@ impl Filesystem for Fs {
             Ok(k) => k,
             Err(e) => return reply.error(e),
         };
-        // The kernel already demands CAP_MKNOD for a device; this is the second line.
-        if special.is_some_and(FileKind::is_device) && req.uid() != 0 {
-            return reply.error(libc::EPERM);
-        }
-        let rdev = if special.is_some_and(FileKind::is_device) {
+        let device = special.is_some_and(FileKind::is_device);
+        let rdev = if device {
             convert::rdev_from_kernel(rdev)
         } else {
             0
         };
+        // The kernel already demands CAP_MKNOD for a device; this is the second line. The one
+        // exception is Linux's whiteout, the character device 0:0, which anyone may make
+        // (`vfs_mknod`), so the kernel forwards it from a normal user and so must we. It has no
+        // data and no device behind it.
+        let whiteout = special == Some(FileKind::CharDevice) && rdev == 0;
+        if device && !whiteout && req.uid() != 0 {
+            return reply.error(libc::EPERM);
+        }
         let n = n.to_owned();
         self.lane(Class::Meta, parent, move |c| {
             let r = name(&n).and_then(|nm| {
