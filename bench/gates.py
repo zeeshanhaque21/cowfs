@@ -33,6 +33,7 @@ Environment:
 
 import argparse
 import json
+import math
 import os
 import platform
 import random
@@ -73,10 +74,11 @@ GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
 # EDIT_CRATE is its lib target name.
 EDIT_TARGET = "crates/cowfs-vfs/src/lib.rs"
 EDIT_CRATE = "cowfs_vfs"
-# A g2 rep that rebuilt fewer units than this, or relinked no executable, is refused.
-# A floor on shape, not an expected count: at the pinned sha `--tests` rebuilds about 127 units and relinks about 117
-# executables (plain build: 13 and 3). compare.py repeats this number.
-G2_MIN_UNITS = 3
+# A g2 rep that rebuilt fewer than G2_MIN_UNITS units, or relinked no executable, is refused.
+# At the pinned sha `--tests` rebuilds 127 units (plain build: 13), so a rep far under 127 is a different workload
+# (a partial rebuild or a changed target set). 90 percent leaves room for a few units to drop out; compare.py imports this.
+G2_EXPECTED_UNITS = 127
+G2_MIN_UNITS = math.ceil(0.9 * G2_EXPECTED_UNITS)  # 115
 
 
 def load1() -> float:

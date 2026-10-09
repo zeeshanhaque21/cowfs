@@ -64,7 +64,7 @@ def rep(gate, index, wall, label="arm", load=1.0):
         "wall_s": wall,
         "load1_before": load,
         "load1_after": load,
-        "metrics": {"rebuilt_count": 5, "bins_relinked": 2} if gate == "g2" else {},
+        "metrics": {"rebuilt_count": 127, "bins_relinked": 3} if gate == "g2" else {},
         "ts": 0.0,
     }
 
@@ -434,15 +434,80 @@ class G2Unmeasurable(CliCase):
         self.assertUnmeasurable([5.0, 5.1], [5.0, 5.1], "need 3")
 
     def test_long_steady_work_is_still_judged(self):
-        rc, out, err = self.run_g2([4.4, 4.9, 5.2, 5.6, 4.7], [4.8, 5.0, 5.4, 5.9, 5.1])
+        # Ranges well inside the budget on both platforms (issue #232): every median in them gives the same answer.
+        rc, out, err = self.run_g2([5.0, 5.1, 5.2], [5.1, 5.2, 5.3])
         self.assertEqual(rc, 0, out + err)
         self.assertIn("PASS (", out)
         rc, out, err = self.run_g2([4.4, 4.9, 5.2], [12.0, 12.1, 12.2])
         self.assertEqual(rc, 1, out + err)
         self.assertIn("FAIL (", out)
 
+    def test_ranges_that_straddle_the_bar_are_unmeasurable_not_judged_on_medians(self):
+        # The old fixture: 1.1 to 1.2 s apart in ranges, medians pass, but a median inside the observed ranges could fail.
+        self.assertUnmeasurable([4.4, 4.9, 5.2, 5.6, 4.7], [4.8, 5.0, 5.4, 5.9, 5.1], "could")
+
     def test_parameters_are_the_stated_ones(self):
         self.assertEqual((compare.G2_NATIVE_FLOOR_S, compare.G2_SPREAD_MAX, compare.G2_MIN_REPS), (3.0, 2.0, 3))
+
+
+class G2NoFlip(unittest.TestCase):
+    """Issue #232: a g2 verdict needs every median inside the observed [min, max] ranges to agree."""
+
+    def d(self, nat, cow, mac):
+        rows = lambda ws: [{"wall_s": w} for w in ws]
+        return compare.g2_decision(rows(nat), rows(cow), mac, 1.0)
+
+    def test_macos_budget(self):
+        self.assertEqual(self.d([5.0, 5.1, 5.2], [5.1, 5.2, 5.3], True), "PASS")
+        self.assertEqual(self.d([5.0, 5.1, 5.2], [6.3, 6.4, 6.5], True), "FAIL")   # min_cow - max_nat = 1.1 >= 1
+        self.assertIsNone(self.d([5.0, 5.1, 5.2], [5.5, 6.0, 6.5], True))         # 0.3 < 1 but 1.5 >= 1
+        self.assertEqual(self.d([5.0, 5.0, 5.0], [6.0, 6.0, 6.0], True), "FAIL")  # exactly the budget fails, as verdict() did
+        self.assertEqual(self.d([5.0, 5.0, 5.0], [5.9, 5.9, 5.9], True), "PASS")
+
+    def test_linux_ratio(self):
+        self.assertEqual(self.d([5.0, 5.1, 5.2], [5.1, 5.2, 5.3], False), "PASS")
+        self.assertEqual(self.d([5.0, 5.1, 5.2], [10.0, 10.1, 10.2], False), "FAIL")  # 10.0 > 1.5 * 5.2
+        self.assertIsNone(self.d([5.0, 5.1, 5.2], [7.0, 7.9, 8.0], False))           # 8.0 > 7.5 but 7.0 <= 7.8
+        self.assertEqual(self.d([5.0, 5.0, 5.0], [7.5, 7.5, 7.5], False), "PASS")     # 1.5x exactly passes
+        self.assertEqual(self.d([5.0, 5.0, 5.0], [7.6, 7.6, 7.6], False), "FAIL")
+
+    def test_a_twelve_second_range_on_a_23_second_workload_only_decides_far_results(self):
+        nat = [17.0, 23.0, 29.0]
+        self.assertIsNone(self.d(nat, [18.0, 24.0, 30.0], True))
+        self.assertIsNone(self.d(nat, [18.0, 24.0, 30.0], False))
+        self.assertEqual(self.d(nat, [31.0, 32.0, 33.0], True), "FAIL")
+        self.assertEqual(self.d(nat, [45.0, 46.0, 47.0], False), "FAIL")
+
+
+class ExitPrecedence(CliCase):
+    """Issue #232: INVALID(3) before any verdict, then FAIL(1) > UNMEASURABLE(2) > PASS(0)."""
+
+    def two_gates(self, g1_cow, g2_native, g2_cow):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.arm(d, "n.jsonl", "nat", ["g1", "g2"],
+                           [rep("g1", i, 1.0) for i in range(3)] + [rep("g2", i, w) for i, w in enumerate(g2_native)])
+            cow = self.arm(d, "c.jsonl", "cow", ["g1", "g2"],
+                           [rep("g1", i, g1_cow) for i in range(3)] + [rep("g2", i, w) for i, w in enumerate(g2_cow)])
+            return self.cli([nat], cow)
+
+    def test_fail_beats_unmeasurable_and_the_result_line_shows_both(self):
+        rc, out, err = self.two_gates(5.0, [1.0, 1.1, 1.0], [1.0, 1.1, 1.0])  # g1 5x FAIL, g2 under the floor
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("RESULT: FAIL (1), 1 unmeasurable", out)
+
+    def test_unmeasurable_alone_still_exits_two(self):
+        rc, out, err = self.two_gates(1.0, [1.0, 1.1, 1.0], [1.0, 1.1, 1.0])
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("RESULT: 1 gate(s) unmeasurable, 0 failed", out)
+
+    def test_invalid_beats_a_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.arm(d, "n.jsonl", "nat", ["g1"], [rep("g1", i, 1.0) for i in range(3)])
+            cow = self.arm(d, "c.jsonl", "cow", ["g1", "g2"],
+                           [rep("g1", i, 5.0) for i in range(3)] + [{**rep("g2", 0, 9.0), "metrics": {"rebuilt_count": 100, "bins_relinked": 3}}])
+            rc, out, err = self.cli([nat], cow)
+            self.assertEqual(rc, 3, out + err)
+
 
     def test_other_gates_are_not_subject_to_the_g2_rule(self):
         with tempfile.TemporaryDirectory() as d:

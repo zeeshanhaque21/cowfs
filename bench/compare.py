@@ -77,13 +77,19 @@ RATIO_BAR = 1.5
 LOAD_CEILING = 30.0
 LOAD_SKEW = 2.0
 GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
-# g2 is UNMEASURABLE, never a PASS or FAIL, unless it is long and steady enough to test its bar (issue #221).
-# Chosen from the PR 216 critic data (docs/reviews/216-critic-20261009.md), not derived:
-#   floor: macOS budget is 1.0 s added and Linux is 1.5x, so a 1.4 s native median leaves a 0.7 to 1.0 s margin that a
-#   single rep's noise (1.3 to 12.8 s same edit, same host, load 11 to 17) exceeds. 3 s is the critic's figure and makes
-#   the 1.0 s budget at most a 33 percent margin.
-#   spread: a quiet cowfs-daemon edit varied 4.40 to 5.64 s (1.28x), cowfs-vfs 2.50 to 4.30 s (1.72x), and the load-11-to-17
-#   ctl and core edits 9.3x and 5.4x. 2.0x admits the first two and refuses the last two.
+# g2 is UNMEASURABLE, never a PASS or FAIL, unless it is long and steady enough to test its bar (issues #221, #232).
+#   no-flip rule: g2 is decided only if every median inside the observed [min, max] ranges gives the same answer.
+#   macOS, added-seconds budget B: FAIL if min_cow - max_nat >= B, PASS if max_cow - min_nat < B, else UNMEASURABLE.
+#   Linux, 1.5x ratio: PASS if max_cow <= 1.5 * min_nat, FAIL if min_cow > 1.5 * max_nat, else UNMEASURABLE.
+#   The workload is `cargo build --tests` after a cowfs-vfs edit, about 23 s native (127 units). A fixed spread
+#   bound cannot be argued from that: a range of about 12 s on 23 s of work is within 2x yet moves the added time by
+#   more than the whole 1.0 s budget, so the old bound let medians decide results the ranges could not support.
+#   Consequence: only results far from the budget are decided. With a 12 s native range and a 12 s cowfs range, the
+#   added time can only be called when it is over about 12 s (FAIL) or under about -11 s (PASS); a tight run, such as
+#   5.0 to 5.2 s against 5.1 to 5.3 s, is decided. An undecided run needs a quieter host, not a looser rule.
+#   floor: the native median must be at least 3 s, so the 1.0 s budget is at most a 33 percent margin.
+#   spread: max/min over 2.0x in either arm is load contamination (the PR 216 data: 9.3x and 5.4x at load 11 to 17), a
+#   sanity check kept besides the no-flip rule, not the decision rule.
 #   reps: a spread of fewer than 3 reps says nothing.
 G2_NATIVE_FLOOR_S = 3.0
 G2_SPREAD_MAX = 2.0
@@ -247,9 +253,6 @@ def g5_problem(row, meta_bytes):
     return None
 
 
-G2_MIN_UNITS = 3  # same number as gates.py; a test pins them equal
-
-
 def g2_problem(row):
     """Why a g2 rep did not rebuild and relink enough to be an edit-rebuild, or None."""
     m = row.get("metrics")
@@ -258,7 +261,7 @@ def g2_problem(row):
     n, b = m.get("rebuilt_count"), m.get("bins_relinked")
     if not is_int(n) or not is_int(b):
         return f"rebuilt_count {n!r} or bins_relinked {b!r} is missing or not an integer (a pre-fix g2 file)"
-    if n < G2_MIN_UNITS or b < 1:
+    if n < gates.G2_MIN_UNITS or b < 1:
         return f"only {n} unit(s) rebuilt and {b} executable(s) relinked: not an edit-rebuild workload"
     return None
 
@@ -365,7 +368,7 @@ def ratios(a, b):
     return [r for r in pairs if not math.isnan(r)]
 
 
-def g2_unmeasurable(native, cowfs):
+def g2_unmeasurable(native, cowfs, on_macos, budget):
     """Why g2 cannot be ruled on, or None. Both arms are checked: a noisy cowfs arm is as unusable as a noisy native one."""
     fix = "run it on a quiet host, or use a heavier edit target so native work is several seconds"
     for arm, rows in (("native", native), ("cowfs", cowfs)):
@@ -377,8 +380,19 @@ def g2_unmeasurable(native, cowfs):
     for arm, rows in (("native", native), ("cowfs", cowfs)):
         lo, hi = spread(rows)
         if lo <= 0 or hi / lo > G2_SPREAD_MAX:
-            return f"{arm} reps span {lo:.2f}s to {hi:.2f}s, over the {G2_SPREAD_MAX:.1f}x spread bound; {fix}"
+            return f"{arm} reps span {lo:.2f}s to {hi:.2f}s, over the {G2_SPREAD_MAX:.1f}x spread bound (load contamination); {fix}"
+    if g2_decision(native, cowfs, on_macos, budget) is None:
+        return (f"native {spread(native)[0]:.2f} to {spread(native)[1]:.2f}s and cowfs {spread(cowfs)[0]:.2f} to "
+                f"{spread(cowfs)[1]:.2f}s: a median inside those ranges could pass or fail; {fix}")
     return None
+
+
+def g2_decision(native, cowfs, on_macos, budget):
+    """"PASS" or "FAIL" if every median inside the observed ranges agrees, else None. See the no-flip rule above."""
+    (nlo, nhi), (clo, chi) = spread(native), spread(cowfs)
+    if on_macos:
+        return "FAIL" if clo - nhi >= budget else "PASS" if chi - nlo < budget else None
+    return "PASS" if chi <= RATIO_BAR * nlo else "FAIL" if clo > RATIO_BAR * nhi else None
 
 
 def verdict(gate, med_a, med_b, mn, mx, on_macos, budget):
@@ -471,7 +485,7 @@ def main() -> int:
             unmeasurable += 1
             continue
         if gate == "g2":
-            why = g2_unmeasurable(a, b)
+            why = g2_unmeasurable(a, b, on_macos, args.budget_add)
             if why:
                 print(f"UNMEASURABLE: {why}")
                 unmeasurable += 1
@@ -522,11 +536,16 @@ def main() -> int:
     if not any(g5n.values()):
         print("g5   not run (no input has g5 reps)")
     scope = scope_text(compared)
+    # Exit precedence: INVALID (3, returned above) before any verdict, then FAIL (1) > UNMEASURABLE (2) > PASS (0).
+    if fails:
+        extra = f", {unmeasurable} unmeasurable" if unmeasurable else ""
+        print(f"RESULT: FAIL ({fails}){extra}  scope: {scope}")
+        return 1
     if unmeasurable:
-        print(f"RESULT: {unmeasurable} gate(s) unmeasurable, {fails} failed  scope: {scope}")
+        print(f"RESULT: {unmeasurable} gate(s) unmeasurable, 0 failed  scope: {scope}")
         return 2
-    print(f"RESULT: {'PASS' if fails == 0 else f'FAIL ({fails})'}  scope: {scope}")
-    return 1 if fails else 0
+    print(f"RESULT: PASS  scope: {scope}")
+    return 0
 
 
 if __name__ == "__main__":
