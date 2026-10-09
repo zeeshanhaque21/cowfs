@@ -176,8 +176,8 @@ Each one is decided here.
 | `cowfs-core/src/inner.rs` `kind_of` | exhaustive over `meta::FileType` | add four arms (compile error otherwise) |
 | `cowfs-core/src/ns.rs` rename onto a special destination | rename logic tests only `Directory` | confirm by test: replace allowed |
 | `cowfs-core/src/import.rs` | refuses specials | slice D |
-| `cowfs-nfs/src/convert.rs` `ftype` | `NFS3ERR_SERVERFAULT` | add four arms in slice A (so a Core with specials is servable), MKNOD itself in slice B |
-| `cowfs-fuse/src/fs.rs` kind to `FileType` and `dir.rs` `DT_*` | wildcard | add four arms in slice A, `mknod` itself in slice C |
+| `cowfs-nfs/src/convert.rs` `ftype` | `NFS3ERR_SERVERFAULT` | unchanged in slice A (only `rdev: 0` is added to the `Attr` constructor); four arms and MKNOD in slice B |
+| `cowfs-fuse/src/fs.rs` kind to `FileType` and `dir.rs` `DT_*` | wildcard (`EIO`) | unchanged in slice A; four arms and `mknod` in slice C |
 | `cowfs-vfs-path/src/lib.rs`, `table.rs` | `NotSupported` | keep: PathVfs does not model specials |
 | `cowfs-vfs-test` `MemVfs` | exhaustive `Body` enum | add a `Special` body |
 | `cowfs-ctl/src/treehash.rs` | `other` | keep (see Import) |
@@ -273,7 +273,7 @@ Conformance consumers found: `MemVfs` (`cowfs-vfs-test/tests/memvfs.rs`), Core (
 `PathVfs` does not implement `mknod`, so its options skip the new checks with the reason "PathVfs does not implement mknod".
 The FUSE conformance run skips them in slice A with the reason "FUSE mknod lands in slice C", and slice C removes that skip.
 `assert_skip_names` catches a misspelt name but not a missing entry, so each consumer is checked by running it.
-Core and the model-based tests (`cowfs-core/tests/model.rs`, `cowfs-vfs-test/src/model.rs`) get a `mknod` action so the random sequences cover it.
+The model-based tests (`cowfs-core/tests/model.rs`, `cowfs-vfs-test/src/model.rs`) get a `mknod` action in slice D, after the adapters exist.
 `cowfs-core` adds reopen tests: kind and `rdev` survive a clean reopen and a crash replay, and a fork keeps them.
 `cowfs-meta` adds record tests: encode and decode round trip for each kind, length 94 only for devices, fsck rules.
 
@@ -282,12 +282,12 @@ Core and the model-based tests (`cowfs-core/tests/model.rs`, `cowfs-vfs-test/src
 | slice | crates | contents | proof |
 | --- | --- | --- | --- |
 | design | docs | this document | CI runs (path is not docs-only) |
-| A | `cowfs-vfs`, `cowfs-vfs-test`, `cowfs-core`, `cowfs-meta` | type, `Vfs::mknod`, `rdev`, `MemVfs`, meta storage and fsck, core `Create::Special`, conformance and reopen tests, adapter compile fixes (`rdev: 0`, wildcard arms) | conformance red first on MemVfs, then green on MemVfs and Core; meta tests; CI both OS |
+| A | `cowfs-vfs`, `cowfs-vfs-test`, `cowfs-core`, `cowfs-meta` | type, `Vfs::mknod`, `rdev`, `MemVfs`, meta storage and fsck, core `Create::Special`, conformance and reopen tests, adapter compile fixes (`rdev: 0` only), skip entries for the PathVfs and FUSE conformance runs | conformance red first on MemVfs, then green on MemVfs and Core; meta tests; CI both OS |
 | B | `nfsserve`, `cowfs-nfs` | MKNOD handler, fattr `rdev`, device uid check, update `mknod_pathconf19.rs` | wire-level tests; live run of `mkfifo/00.t` and `mknod/00.t` on this Mac's NFS mount |
 | C | `cowfs-fuse` | `mknod` dispatch, rdev encoding, `FileType` maps | unit tests for encode and decode; Linux FUSE mount test in CI |
 | D | `cowfs-core::import` | import of special nodes, docs | import tests with a real fifo and socket; device only where root |
 
-Slice A has to compile every other crate, so it includes the mechanical `rdev: 0` and wildcard edits in `cowfs-nfs` and `cowfs-fuse` (no behaviour change there; the refusals stay until B and C).
+Slice A has to compile every other crate, so it includes the mechanical `rdev: 0` edit in `cowfs-nfs` and `cowfs-fuse` (no behaviour change there; the refusals stay until B and C, and a special node reached through an adapter before then answers `EIO` or `NFS3ERR_SERVERFAULT`).
 Slice D may merge into A if the diff stays small; it is kept separate so a critic can read the import verification change alone.
 
 ## Failing first
