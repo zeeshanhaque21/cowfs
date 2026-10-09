@@ -222,13 +222,22 @@ class FakeSampler:
 
 
 class RunPaths(unittest.TestCase):
-    def go(self, linux=False, native_fs="apfs", **over):
+    def go(self, linux=False, native_fs="apfs", compare_rcs=None, compare_out="", **over):
         FakeDaemon.launched, FakeDaemon.pre, FakeQuiet.ok, FakeQuiet.good, FakeSampler.value = True, [], True, True, 0.0
         for k, v in over.items():
             for cls in (FakeDaemon, FakeQuiet, FakeSampler):
                 if hasattr(cls, k):
                     setattr(cls, k, v)
         calls = []
+        rcs = iter(compare_rcs or [])
+
+        def fake_run(cmd, **k):
+            calls.append(cmd)
+            if compare_rcs is not None and str(cmd[1]).endswith("compare.py"):
+                return types.SimpleNamespace(returncode=next(rcs), stdout=compare_out, stderr="")
+            return types.SimpleNamespace(returncode=0)
+
+        full = [{"kind": "rep", "gate": gt, "rep": i, "wall_s": 1.0} for gt in ("g1", "g2", "g3") for i in range(5)]
         args = types.SimpleNamespace(run_id="t", scale=100, gates="g1,g2,g3", sample=False, reps=5, load_cap=4.0, baseline_window=300, wait=0)
         verdict = {"problems": []}
         with tempfile.TemporaryDirectory() as t, mock.patch.object(g, "acquire_lock", lambda w: None), \
@@ -236,7 +245,8 @@ class RunPaths(unittest.TestCase):
                 mock.patch.object(g, "Daemon", FakeDaemon), mock.patch.object(g, "Quiet", FakeQuiet), \
                 mock.patch.object(g, "ArmSampler", FakeSampler), mock.patch.object(g, "cool_down", lambda *a, **k: (True, 0.5)), \
                 mock.patch.object(g, "fstype", lambda p: native_fs), mock.patch.object(g, "LINUX", linux), mock.patch.object(g, "LOCK", Path(t) / "lock"), \
-                mock.patch.object(g.subprocess, "run", lambda cmd, **k: calls.append(cmd) or types.SimpleNamespace(returncode=0)):
+                mock.patch.object(g.subprocess, "run", fake_run), \
+                mock.patch.object(g, "newest", lambda label: Path(label)), mock.patch.object(g, "reps_of", lambda f: ({}, full)):
             (Path(t) / "lock").mkdir()
             res = g.run(args, Path(t), verdict)
         return res, verdict, calls
@@ -266,6 +276,34 @@ class RunPaths(unittest.TestCase):
         res, v, calls = self.go(linux=True, native_fs="fuse.cowfs")
         self.assertEqual((res, calls), ("INVALID", []))
         self.assertTrue(any("native root" in p for p in v["problems"]))
+
+    # compare.py exit codes: 0 PASS, 1 FAIL (may carry UNMEASURABLE gates), 2 UNMEASURABLE alone, 3 INVALID
+    G2_UNMEASURABLE = ("g1    5     5    1.0000    5.0000   5.000   5.000   5.000    1.0  FAIL (bar 1.5x)\n"
+                       "g2    5     5    1.0000    1.1000   1.100   1.100   1.100    1.0  UNMEASURABLE: native reps span 1.00s to 9.00s\n"
+                       "RESULT: FAIL (1), 1 unmeasurable  scope: compared 2 of 6\n")
+
+    def test_mixed_fail_and_unmeasurable_records_both(self):
+        res, v, calls = self.go(compare_rcs=[1, 0], compare_out=self.G2_UNMEASURABLE)
+        self.assertEqual((res, v["compare_rc"], v["problems"]), ("FAIL", [1, 0], []))
+        self.assertEqual(v["unmeasurable_gates"], [["g2"], ["g2"]])
+
+    def test_clean_fail_records_no_unmeasurable_gate(self):
+        res, v, _ = self.go(compare_rcs=[1, 1], compare_out="g1    5 5 1 5 5 5 5 1.0  FAIL (bar 1.5x)\nRESULT: FAIL (1)  scope: x\n")
+        self.assertEqual((res, v["unmeasurable_gates"]), ("FAIL", [[], []]))
+
+    def test_unmeasurable_alone_in_one_pair_is_invalid(self):
+        res, v, _ = self.go(compare_rcs=[2, 0], compare_out=self.G2_UNMEASURABLE)
+        self.assertEqual((res, v["compare_rc"]), ("INVALID", [2, 0]))
+        self.assertTrue(any("compare.py rc [2, 0]" in p for p in v["problems"]))
+        self.assertEqual(v["unmeasurable_gates"][0], ["g2"])
+
+    def test_both_pairs_pass_and_mixed_pass_fail(self):
+        self.assertEqual(self.go(compare_rcs=[0, 0])[0], "PASS")
+        self.assertEqual(self.go(compare_rcs=[0, 1])[0], "FAIL")
+
+    def test_invalid_compare_rc_is_invalid(self):
+        res, v, _ = self.go(compare_rcs=[0, 3])
+        self.assertEqual(res, "INVALID")
 
     def test_foreign_cpu_high_stops_the_arm(self):
         res, v, calls = self.go(value=500.0)
