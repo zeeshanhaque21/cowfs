@@ -1469,6 +1469,7 @@ def run_case_check(observer, case_rel, test_dir, tmpdir, result_dir, tree_root, 
         "test_dir": str(test_dir),
         "log": str(log),
         "suite_verdict": verdict,
+        "witness_tail": witness_text[-2000:],
         "receipt": rec,
         "scan": scan_log(text),
         "log_text": text,
@@ -1743,6 +1744,7 @@ def preflight(tree, out_dir, timeout=DEFAULT_TIMEOUT, pin_check=True):
                      "outcome": probe_rec["outcome"], "why": probe_rec["outcome_why"],
                      "runner": probe_rec["runner"],
                      "suite_verdict": probe_rec.get("suite_verdict"),
+                     "witness_tail": probe_rec.get("witness_tail", ""),
                      "log_text": probe_rec.get("log_text", "")[-4000:],
                      "observer": probe_rec["observer"], "timeout_s": timeout}
         except (OSError, ValueError) as exc:
@@ -1763,12 +1765,19 @@ def preflight(tree, out_dir, timeout=DEFAULT_TIMEOUT, pin_check=True):
         else:
             tail = (probe.get("log_text") or probe.get("observer", {}).get("raw_tail") or [])
             ignored = (probe.get("suite_verdict") or {}).get("ignored") or []
-            if ignored:
+            wtail = probe.get("witness_tail") or ""
+            if "must be run as root" in wtail:
+                rec["reason"] = ("the suite's check refused to run unprivileged (QA must be "
+                                 "run as root); the g5 differential runs through "
+                                 "bench/g5_root.sh, see docs/g5-harness-redesign.md")
+            elif ignored:
                 rec["reason"] = (f"the suite did not run the probe case {ignored[0]!r}; "
                                  "check could not resolve it, which needs the group.list "
                                  "the suite build generates")
             else:
                 first = next((l for l in tail if "_fatal" in l or "not found" in l), "")
+                if not first and wtail.strip():
+                    first = wtail.strip().splitlines()[-1][:200]
                 rec["reason"] = f"the suite refused a probe case with exit {probe['rc']}: {first}"
     # Evidence is written whatever happened, including a missing probe case.
     append_jsonl(out_dir / f"preflight-{run_id}.jsonl", rec)
@@ -1809,6 +1818,13 @@ def verdict_for_case(native, cowfs):
 
 
 def run(args):
+    if not os.environ.get("COWFS_G5_OLD_ARM_MODEL"):
+        print("INVALID: the directory-arm model cannot drive the pinned suite (check needs root, "
+              "a real TEST_DEV and a TEST_DIR that is its mount target). Use bench/g5_root.sh "
+              "and `bench/g5_diff.py report`; see docs/g5-harness-redesign.md. "
+              "COWFS_G5_OLD_ARM_MODEL=1 keeps the old path for its unit tests only.",
+              file=sys.stderr)
+        return 3
     tree_root = tests_dir(args.xfstests).parent
     out = Path(args.out).resolve()
     if os.getuid() == 0:

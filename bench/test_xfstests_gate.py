@@ -17,6 +17,10 @@ from pathlib import Path
 
 import xfstests_gate as gate
 
+# The directory-arm `run` is retired for g5 (see docs/g5-harness-redesign.md); these
+# tests keep exercising its pin, receipt and ownership code.
+os.environ.setdefault("COWFS_G5_OLD_ARM_MODEL", "1")
+
 
 def write(path, text, executable=False):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +115,8 @@ class Tree:
                       'echo "Passed all 1 tests"\nexit 0\n',
             # Exits 0 and says nothing about passing: the shape that made this
             # gate wrong in the first place.
+            # What the real suite does when run unprivileged: stderr only, exit 1.
+            "rootrefuse": 'echo "check: QA must be run as root" >&2\nexit 1\n',
             "silent": 'printf "Ran: %s\\n" "$__seq"\nexit 0\n',
             # Prints the success line but exits nonzero: the two must agree.
             "liar": 'printf "Ran: %s\\n" "$__seq"\necho "Passed all 1 tests"\nexit 1\n',
@@ -762,6 +768,18 @@ class MissingProbe(HarnessCase):
         self.assertEqual(rc, 2)
 
 
+class PreflightSaysWhy(HarnessCase):
+    def test_root_refusal_is_named_in_the_reason(self):
+        self.open_gate()
+        self.tree.passing("010")
+        self.tree.check("rootrefuse")
+        gate.ALLOWLIST_FILE = self.tree.pin(self.tmp_path / "allowlist.txt", ("010",))
+        rec = gate.preflight(self.tree.root, Path(self.out()), pin_check=False)
+        self.assertEqual(rec["verdict"], "UNMEASURABLE")
+        self.assertIn("must be run as root", rec["reason"])
+        self.assertIn("g5_root.sh", rec["reason"])
+
+
 # --- finding 9: report exits nonzero on a bad run ---------------------------
 
 class ReportExit(HarnessCase):
@@ -1090,6 +1108,19 @@ class EndToEnd(HarnessCase):
         self.use_distinct_arms()
         rc, _ = self.run_gate(self.args(cases="005"))
         self.assertEqual(rc, 3)
+
+
+class RetiredRunRefuses(unittest.TestCase):
+    def test_run_without_opt_in_is_invalid_exit_3(self):
+        saved = os.environ.pop("COWFS_G5_OLD_ARM_MODEL", None)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = gate.run(None)
+        finally:
+            if saved is not None:
+                os.environ["COWFS_G5_OLD_ARM_MODEL"] = saved
+        self.assertEqual(rc, 3)
+        self.assertIn("g5_root.sh", err.getvalue())
 
 
 if __name__ == "__main__":
