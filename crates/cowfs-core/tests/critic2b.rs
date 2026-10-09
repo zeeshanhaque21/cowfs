@@ -265,7 +265,7 @@ fn pinned_blocks_never_omits_a_block_a_writer_or_handle_references() {
 
 /// B2: the API answers `Busy` instead of something partial, and the contract says so.
 #[test]
-fn pinned_blocks_contract_is_documented_and_never_partial() {
+fn pinned_blocks_are_never_partial() {
     let dir = tempfile::tempdir().unwrap();
     let c = Core::open(
         dir.path(),
@@ -295,15 +295,6 @@ fn pinned_blocks_contract_is_documented_and_never_partial() {
     // once committed with no handle, nothing names them any more
     c.sync().unwrap();
     assert!(c.pinned_blocks().expect("pinned").is_empty());
-    let doc = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/v1-core.md"
-    ))
-    .unwrap();
-    assert!(
-        doc.contains("pinned_blocks") && doc.contains("never partial"),
-        "docs/v1-core.md must state the pinned_blocks contract GC depends on"
-    );
 }
 
 // ---------------------------------------------------------------- B5: physical reservation identity
@@ -529,106 +520,6 @@ fn encode_mark(n: u64) -> [u8; 16] {
     b[..8].copy_from_slice(&n.to_le_bytes());
     b[8..].copy_from_slice(&n.to_le_bytes());
     b
-}
-
-// ---------------------------------------------------------------- B6: the lock audit table
-
-/// B6: every function in `src/` that takes a lock is listed in the audit table in
-/// `docs/v1-core.md`, so the table cannot rot. Mechanical: extract the lock sites from the source
-/// and check each against the doc.
-#[test]
-fn every_lock_site_is_in_the_audit_table() {
-    let doc = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/v1-core.md"
-    ))
-    .unwrap();
-    let table: Vec<&str> = doc
-        .split("| Site | Locks held together | Order |")
-        .nth(1)
-        .expect("the audit table")
-        .lines()
-        .skip(2)
-        .collect();
-    let mut missing = Vec::new();
-    let mut checked = 0usize;
-    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let src = std::fs::read_to_string(&path).unwrap();
-        for (name, body) in fns(&src) {
-            let takes = body.contains(".rd()")
-                || body.contains(".wr()")
-                || body.contains(".lk()")
-                || body.contains(".try_read()")
-                || body.contains(".try_write()")
-                || body.contains(".try_lock()")
-                || body.contains("snap.")
-                || body.contains("blocks.get")
-                || body.contains("blocks.put");
-            if !takes {
-                continue;
-            }
-            checked += 1;
-            let short = name.rsplit("::").next().unwrap();
-            if !table.iter().any(|row| row.contains(short)) {
-                missing.push(format!(
-                    "{}::{name}",
-                    path.file_name().unwrap().to_string_lossy()
-                ));
-            }
-        }
-    }
-    assert!(
-        missing.is_empty(),
-        "{} of {checked} lock-taking functions are not in the audit table of docs/v1-core.md: {}",
-        missing.len(),
-        missing.join(", ")
-    );
-}
-
-/// Function name and body of every `fn` in `src`, by brace counting.
-fn fns(src: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let bytes = src.as_bytes();
-    let mut i = 0usize;
-    while let Some(p) = src[i..].find("fn ") {
-        let at = i + p;
-        let name_start = at + 3;
-        let name_end = src[name_start..]
-            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .map_or(src.len(), |n| name_start + n);
-        let name = src[name_start..name_end].to_string();
-        let mut depth = 0i32;
-        let mut body = String::new();
-        let mut j = at;
-        let mut started = false;
-        while j < bytes.len() {
-            let c = bytes[j] as char;
-            match c {
-                '{' => {
-                    depth += 1;
-                    started = true;
-                }
-                '}' => {
-                    depth -= 1;
-                    if started && depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            body.push(c);
-            j += 1;
-        }
-        if started {
-            out.push((name, body));
-        }
-        i = j.max(at + 3);
-    }
-    out
 }
 
 // ---------------------------------------------------------------- B8: a zero-id chunk ref

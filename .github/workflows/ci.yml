@@ -1,14 +1,28 @@
 name: ci
 
+# A change that touches only documentation or the progress tracker does not start CI. No test reads a
+# doc: the generated lock-audit table in docs/v1-core.md is checked by scripts/lock_audit.py --check in
+# the lint job, which runs whenever source changes. A change that touches any other file as well still
+# runs everything, and so does an edit of this workflow file. A pull request that only touches the paths
+# below gets no CI run at all, not a skipped one.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'progress/**'
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'LICENSE'
+      - 'NOTICE'
   pull_request:
-
-# A new push to a PR cancels that PR's running checks. Other runs (main) get a unique group, so none is cancelled.
-concurrency:
-  group: ci-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+    paths-ignore:
+      - 'docs/**'
+      - 'progress/**'
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'LICENSE'
+      - 'NOTICE'
 
 jobs:
   # fmt and clippy run beside the test shards, not before them.
@@ -26,6 +40,8 @@ jobs:
           save-if: false
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Lock-audit table in docs/v1-core.md is current
+        run: python3 scripts/lock_audit.py --check
       - name: Bench harness unit tests (ubuntu)
         run: python3 -m unittest discover -s bench -v
 
@@ -65,16 +81,32 @@ jobs:
         if: ${{ matrix.os == 'macos-latest' }}
         run: python3 -m unittest discover -s bench -v
 
-  # One name to require: fails unless lint and every test shard passed.
+  # Issue 173: the fault-injection seam must not be in a normal release build. Two release builds, so
+  # it runs beside the tests, not inside lint.
+  fault-seam:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          # Restore only. The test shards own the cache entry.
+          save-if: false
+      - name: Fault-injection seam is absent without its feature (issue 173)
+        run: scripts/check-fault-seam-absent.sh
+
+  # One name to require: fails unless lint, fault-seam and every test shard passed.
   check:
-    needs: [lint, test]
+    needs: [lint, fault-seam, test]
     # Not always(): a superseded PR run is cancelled, and must not start a check that then fails.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - run: |
-          echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }}"
+          echo "lint=${{ needs.lint.result }} fault-seam=${{ needs.fault-seam.result }} test=${{ needs.test.result }}"
           test "${{ needs.lint.result }}" = success
+          test "${{ needs.fault-seam.result }}" = success
           test "${{ needs.test.result }}" = success
 
   # Issue 171: the namespace isolation tests skip on a host that denies unprivileged user namespaces.
