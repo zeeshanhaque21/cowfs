@@ -175,7 +175,11 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
         sync_dir(&core.inner.root);
         *core.inner.last_error.lk() = Some(format!(
             "swap recovery: {p:?} is unreadable, {} staging snapshot {staged}",
-            if kept { "rolled forward" } else { "removed any" }
+            if kept {
+                "rolled forward"
+            } else {
+                "removed any"
+            }
         ));
         return Ok(());
     };
@@ -540,8 +544,12 @@ mod tests {
     #[test]
     fn a_staging_hash_collision_with_a_pending_swap_is_refused_and_loses_nothing() {
         HASH_OVERRIDE.with(|h| h.set(Some(0xdead_beef)));
-        let (a, b) = ("alpha", "bravo");
-        assert_eq!(staging_name(a).replace(a, ""), staging_name(b).replace(b, ""));
+        // the same 200-byte prefix, so only the (forced) hash could tell the staging names apart
+        let (a, b) = (
+            &format!("{}1", "p".repeat(200)),
+            &format!("{}2", "p".repeat(200)),
+        );
+        assert_eq!(staging_name(a), staging_name(b));
         let dir = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let v1 = src_dir(scratch.path(), "v1", "old");
