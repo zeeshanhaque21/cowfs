@@ -507,6 +507,8 @@ class ExitPrecedence(CliCase):
                            [rep("g1", i, 5.0) for i in range(3)] + [{**rep("g2", 0, 9.0), "metrics": {"rebuilt_count": 100, "bins_relinked": 3}}])
             rc, out, err = self.cli([nat], cow)
             self.assertEqual(rc, 3, out + err)
+            self.assertIn("rebuilt", err)
+            self.assertNotIn("RESULT: FAIL", out)
 
 
     def test_other_gates_are_not_subject_to_the_g2_rule(self):

@@ -81,7 +81,7 @@ Edit rebuild (harness g2): reset `crates/cowfs-vfs/src/lib.rs` to the pinned con
     cargo build --offline --locked -j 4 --message-format=json
 
 The `--message-format=json` output is parsed for `compiler-artifact` records with `fresh` false.
-A rep is refused (no row recorded) unless `cowfs_vfs` itself was rebuilt, at least 3 units were rebuilt, and at least one executable was relinked.
+A rep is refused (no row recorded) unless `cowfs_vfs` itself was rebuilt, at least `gates.G2_MIN_UNITS` (115, issue 232) units were rebuilt, and at least one executable was relinked.
 Each recorded g2 rep carries `rebuilt_count`, `bins_relinked` and `rebuilt_units`, and `compare.py` marks a g2 rep without them (any pre-fix file) INVALID.
 The two checks share one minimum, `gates.G2_MIN_UNITS` (115, see issue 232 below).
 The file is reset before every rep, so the corpus file holds exactly one appended comment and does not grow across reps (the earlier code appended a line per rep).
@@ -101,7 +101,7 @@ Measured on a scratch clone of `3f4fba2` (`cargo build --locked -j 4 --message-f
 Finding to read before trusting the new pin: the daemon and core edits Zee suggested do relink the daemon, but at this pin they cost only 0.65 to 0.85 s, no more than the old `cowfs-ctl` edit (about 1 s).
 Re-pinning by itself did not make a core or daemon edit "several seconds long".
 The choice therefore maximises the rebuilt set instead: `cowfs-vfs/src/lib.rs` is the trait crate every crate builds on, so 13 units are rebuilt and all three executables relink, and it is the slowest edit measured (about 1.5 s).
-The validity rule is unchanged (edited crate rebuilt, at least 3 units, at least 1 executable relinked); only `EDIT_TARGET`, `EDIT_CRATE` and the measured counts in comments changed.
+The validity rule is unchanged (edited crate rebuilt, at least 3 units then, 115 since issue 232, at least 1 executable relinked); only `EDIT_TARGET`, `EDIT_CRATE` and the measured counts in comments changed.
 If Zee prefers a daemon-centred edit, `cowfs-store/src/lib.rs` (8 units, 1.35 s) or `cowfs-core/src/lib.rs` (5 units, 0.84 s) is a one-line change of `EDIT_TARGET` and `EDIT_CRATE`.
 Whether about 1.5 s of native work is enough signal for a 1.5x Linux ratio is still unmeasured on Linux, and the bar decision below is therefore still open.
 
@@ -124,7 +124,7 @@ Changes:
 | Parameter | Value | Why |
 | --- | --- | --- |
 | `G2_NATIVE_FLOOR_S` | 3.0 s native median | At 1.4 s native, the 1.0 s budget is a 70 percent margin that one rep's noise (1.3 to 12.8 s) exceeds. At 3 s the budget is at most 33 percent. 3 s is the critic's figure. |
-| `G2_SPREAD_MAX` | 2.0 (max/min of the reps), each arm | Critic's quiet `cowfs-daemon` reps spanned 1.28x and `cowfs-vfs` 1.72x; the load 11 to 17 `cowfs-ctl` and `cowfs-core` edits spanned 9.3x and 5.4x. 2.0 admits the first two and refuses the last two. Chosen, not derived. |
+| `G2_SPREAD_MAX` | 2.0 (max/min of the reps), each arm; since issue 232 only a load-contamination check, the decision rule is the no-flip rule below | Critic's quiet `cowfs-daemon` reps spanned 1.28x and `cowfs-vfs` 1.72x; the load 11 to 17 `cowfs-ctl` and `cowfs-core` edits spanned 9.3x and 5.4x. 2.0 admits the first two and refuses the last two. Chosen, not derived. |
 | `G2_MIN_REPS` | 3 per arm | A spread of fewer than 3 reps says nothing. |
 
 The verdict text says what to do: run it on a quiet host, or use a heavier edit target so native work is several seconds.
@@ -164,7 +164,7 @@ Every number below is from the earlier noisy-host measurements and is NOT A GATE
   A g2 rep with `rebuilt_count` 5 or 100 is INVALID (exit 3).
 - Exit codes: INVALID (3) is decided before any verdict, then FAIL (1) beats UNMEASURABLE (2) beats PASS (0).
   A FAIL on any gate returns 1 even if another gate is UNMEASURABLE, and the RESULT line shows both: `FAIL (n), m unmeasurable`.
-  `bench/g12_run.py` already treats compare rc 1 as a FAIL verdict and rc 2 or 3 as INVALID, so a mixed run reports FAIL there.
+  `bench/g12_run.py` needed no change: by reading the code (not by a test), compare rc 2 or 3 records a problem (INVALID) and any other code that is not `[0, 0]`, including a mixed-run rc 1, gives FAIL.
 
 ### Why the earlier edit, history at the retired pin `c1619ec` (superseded by the section above)
 
@@ -404,7 +404,7 @@ Neither macOS sample ran cargo builds through the NFS mount, which stays unvalid
 - [x] cargo-home populated in this lease (`bench/out/cargo-home`); a new lease needs network once.
 - [ ] Release binaries present in the lease (rebuild if the lease was returned).
 - [ ] Time budget: 100k-file tree generation through NFS plus 4 arms x 5 reps of clean builds; expect hours, not minutes.
-- [x] Linux harness g2 trivial-workload problem: g2 now edits `cowfs-vfs` at pin `3f4fba2` (13 units, 3 relinks, refused if fewer); decision recorded in "Edit at the new pin". UNVALIDATED on Linux: no cachyos run at the new pin yet, and all earlier samples are invalid.
+- [x] Linux harness g2 trivial-workload problem: g2 now edits `cowfs-vfs` at pin `3f4fba2` (13 units, 3 relinks, refused if fewer; since issue 221 `--tests`, 127 units, and since issue 232 refused under 115); decision recorded in "Edit at the new pin". UNVALIDATED on Linux: no cachyos run at the new pin yet, and all earlier samples are invalid.
 - [ ] Re-run any Linux or macOS sample at the new pin before quoting a g1 or g2 number; old-pin files are refused by `compare.py`.
 - [ ] Linux arm on cachyos (btrfs): driver exists, g3 samples passed their plumbing and a cargo build through FUSE ran once (1 rep, not validated); the full run is not done.
 - [ ] The foreign CPU rule, the plateau cool-down and the induced set have never run live with a real baseline, on either platform: unit tests, a `ps` parse on this Mac, and the 20 s Linux samples only.

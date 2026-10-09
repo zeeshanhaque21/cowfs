@@ -85,7 +85,7 @@ GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
 #   bound cannot be argued from that: a range of about 12 s on 23 s of work is within 2x yet moves the added time by
 #   more than the whole 1.0 s budget, so the old bound let medians decide results the ranges could not support.
 #   Consequence: only results far from the budget are decided. With a 12 s native range and a 12 s cowfs range, the
-#   added time can only be called when it is over about 12 s (FAIL) or under about -11 s (PASS); a tight run, such as
+#   added time can only be called when it is over about 13 s (FAIL) or under about -11 s (PASS); a tight run, such as
 #   5.0 to 5.2 s against 5.1 to 5.3 s, is decided. An undecided run needs a quieter host, not a looser rule.
 #   floor: the native median must be at least 3 s, so the 1.0 s budget is at most a 33 percent margin.
 #   spread: max/min over 2.0x in either arm is load contamination (the PR 216 data: 9.3x and 5.4x at load 11 to 17), a
