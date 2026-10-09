@@ -260,7 +260,10 @@ class RuntimeEdges(unittest.TestCase):
 
 class FeatureUnification(unittest.TestCase):
     """-p builds do not unify cowfs-store/fault-injection the way --workspace does; that is safe only
-    while nothing outside store and gc is gated on it."""
+    while nothing outside store, gc and core is gated on it. Core (issue 173 slice 5) records the swap
+    intent file's writes under its own `fault-injection` feature, which forwards the store's; like the
+    store, its tests turn it on through a dev-dependency on itself, so a `-p cowfs-core` build has it
+    and any other crate's build compiles core without it, which nothing outside core's tests reads."""
 
     def test_fault_injection_cfg_is_confined_to_store_and_gc(self):
         root = Path(REAL["workspace_root"])
@@ -268,7 +271,7 @@ class FeatureUnification(unittest.TestCase):
         for f in (root / "crates").rglob("*.rs"):
             if re.search(r'feature\s*=\s*"fault-injection"|fault-injection', f.read_text()):
                 users.add(f.relative_to(root).parts[1])
-        self.assertLessEqual(users, {"cowfs-store", "cowfs-gc"}, users)
+        self.assertLessEqual(users, {"cowfs-store", "cowfs-gc", "cowfs-core"}, users)
 
     def test_only_gc_enables_fault_injection_on_store_from_a_dependency_edge(self):
         root = Path(REAL["workspace_root"])

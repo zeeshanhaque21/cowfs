@@ -20,7 +20,15 @@ NEEDLE2=oplog_start
 
 count() { grep -ac "$NEEDLE" "$CARGO_TARGET_DIR"/debug/libcowfs_store.rlib || true; }
 
-cargo build -q -p cowfs-store -p cowfs-gc --lib
+# Slice 5: cowfs-core records the swap intent file's durable writes under its own `fault-injection`
+# feature (`fsops::rootlog`). The recorder's panic message is a string literal in a function body
+# that `write_intent` reaches, so it is in the rlib only when the code is compiled in. The feature-on
+# build below is its positive control; the release daemon is not used for it because the daemon's
+# feature forwards only the store's.
+NEEDLE3=cowfs-rootlog
+count_core() { grep -ac "$NEEDLE3" "$CARGO_TARGET_DIR"/debug/libcowfs_core.rlib || true; }
+
+cargo build -q -p cowfs-store -p cowfs-gc -p cowfs-core --lib
 if cargo tree -q -p cowfs-daemon -e features -i cowfs-store | grep -q fault-injection; then
   echo "FAIL: cowfs-daemon's graph enables fault-injection" >&2; exit 1
 fi
@@ -28,11 +36,17 @@ cargo tree -q -p cowfs-store -e features --features fault-injection | grep -q fa
   || { echo "FAIL: cargo tree positive control found nothing" >&2; exit 1; }
 off=$(count)
 [ "$off" = 0 ] || { echo "FAIL: seam present in a build without the feature ($off hits)" >&2; exit 1; }
+core_off=$(count_core)
+[ "$core_off" = 0 ] || { echo "FAIL: core's root-op recorder present in a build without the feature ($core_off hits)" >&2; exit 1; }
 
 touch crates/cowfs-store/src/lib.rs
 cargo build -q -p cowfs-store --lib --features fault-injection
 on=$(count)
 [ "$on" -gt 0 ] || { echo "FAIL: positive control found no seam with the feature on; the check is blind" >&2; exit 1; }
+touch crates/cowfs-core/src/lib.rs
+cargo build -q -p cowfs-core --lib --features fault-injection
+core_on=$(count_core)
+[ "$core_on" -gt 0 ] || { echo "FAIL: positive control found no root-op recorder with core's feature on; the check is blind" >&2; exit 1; }
 
 # Slice 2: the whole workspace's normal and build edges must not enable the feature anywhere; only a
 # dev-dependency edge (and the daemon's own opt-in feature) may. The dev-inclusive tree is the
@@ -45,6 +59,12 @@ cargo tree -q -p cowfs-daemon --features fault-injection -e normal,build,feature
   | grep -q 'cowfs-daemon feature "fault-injection"' \
   || { echo "FAIL: the daemon feature does not forward the store feature" >&2; exit 1; }
 
+# The same for core's own feature: no normal or build edge may enable it, and a dev edge does.
+cargo tree -q --workspace -e normal,build,features -i cowfs-core | grep -q fault-injection \
+  && { echo "FAIL: a normal or build edge in the workspace enables cowfs-core's fault-injection" >&2; exit 1; }
+cargo tree -q --workspace -e normal,build,dev,features -i cowfs-core | grep -q fault-injection \
+  || { echo "FAIL: core feature tree positive control (dev edges) found nothing" >&2; exit 1; }
+
 # A built RELEASE cowfs-daemon without the feature carries no seam string; with it, it does.
 count_bin() { grep -ac -e "$NEEDLE" -e "$NEEDLE2" "$CARGO_TARGET_DIR"/release/cowfs-daemon || true; }
 cargo build -q --release -p cowfs-daemon
@@ -56,3 +76,4 @@ rel_on=$(count_bin)
 [ "$rel_on" -gt 0 ] || { echo "FAIL: release daemon with the feature has no seam; the binary check is blind" >&2; exit 1; }
 echo "ok: release cowfs-daemon seam absent without the feature (0 hits), present with it ($rel_on hits)"
 echo "ok: seam absent without the feature (0 hits), present with it ($on hits)"
+echo "ok: core's root-op recorder absent without the feature (0 hits), present with it ($core_on hits)"
