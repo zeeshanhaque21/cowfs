@@ -15,8 +15,9 @@ pub struct RPCContext {
     pub conn: u64,
     /// When this connection last had a request, so the accept loop can kick the quiet one.
     pub active: Arc<std::sync::atomic::AtomicU64>,
-    /// How many requests this connection has carried, so the accept loop can kick one that has
-    /// carried none.
+    /// How many requests with a valid file handle (or a successful MNT) this connection has
+    /// carried, so the accept loop kicks the ones that have carried none (NULL calls, refused
+    /// MNT, bad handles) first.
     pub served: Arc<std::sync::atomic::AtomicU64>,
     pub client_addr: String,
     pub client_ip: IpAddr,

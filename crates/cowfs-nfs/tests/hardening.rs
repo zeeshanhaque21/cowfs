@@ -618,3 +618,32 @@ fn a_record_may_not_exceed_the_cap_across_fragments() {
     );
     assert_eq!(c.getattr(&root).0, OK, "the server is unharmed");
 }
+
+#[test]
+fn a_flood_of_null_calls_does_not_evict_the_client_that_uses_handles() {
+    let limits = Limits {
+        max_connections: 4,
+        ..Limits::default()
+    };
+    let (s, mut c) = serve(memfs(), opts(limits));
+    let root = c.root.clone();
+    assert_eq!(c.getattr(&root).0, OK);
+    let mut flood = vec![];
+    for _ in 0..3 {
+        let mut x = connect_raw(s.port());
+        for _ in 0..50 {
+            x.write_all(&null_frame()).unwrap();
+            assert!(answered(&mut x));
+        }
+        flood.push(x);
+    }
+    // The cap is full: a fourth connection makes the server drop one.
+    let mut late = connect_raw(s.port());
+    late.write_all(&null_frame()).unwrap();
+    assert!(answered(&mut late));
+    assert_eq!(
+        c.getattr(&root).0,
+        OK,
+        "the connection that carries file handles was evicted by cheap NULL traffic"
+    );
+}

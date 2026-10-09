@@ -104,7 +104,9 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
 }
 
 /// One served connection, so the accept loop can make room by dropping the one that has been
-/// quiet longest instead of refusing whoever arrives next.
+/// quiet longest instead of refusing whoever arrives next. `served` counts only requests that
+/// carried a valid file handle or a successful MNT, so cheap traffic (NULL, refused MNT, forged
+/// handles) cannot raise a connection above the real client.
 #[derive(Debug)]
 struct Live {
     id: u64,

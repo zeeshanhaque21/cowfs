@@ -137,6 +137,10 @@ pub async fn mountproc3_mnt(
             auth_flavors: vec![auth_flavor::AUTH_NULL as u32, auth_flavor::AUTH_UNIX as u32],
         };
         debug!("{:?} --> {:?}", xid, response);
+        // Holding the root handle proves as much as presenting one, see `fh_or_fail`.
+        context
+            .served
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(ref chan) = context.mount_signal {
             let _ = chan.send(true).await;
         }
