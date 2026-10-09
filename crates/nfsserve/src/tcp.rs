@@ -103,8 +103,8 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     next_conn: AtomicU64,
 }
 
-/// One served connection, so the accept loop can make room by dropping the one that has been
-/// quiet longest instead of refusing whoever arrives next. `served` counts only requests that
+/// One served connection, so the accept loop can make room by dropping the least served, oldest
+/// one instead of refusing whoever arrives next. `served` counts only requests that
 /// carried a valid file handle or a successful MNT, so cheap traffic (NULL, refused MNT, forged
 /// handles) cannot raise a connection above the real client.
 #[derive(Debug)]
@@ -283,9 +283,8 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 }
 
 impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
-    /// Records a new connection, and if the cap is full kicks the one that has been quiet
-    /// longest. A local process cannot be told apart from the real client by address, so
-    /// refusing the newcomer is what lets it lock the client out.
+    /// Records a new connection, and if the cap is full kicks the least served one, oldest first.
+    /// A local process cannot be told apart from the real client by address, so refusing the newcomer is what lets it lock the client out.
     fn enter(
         &self,
         conn: u64,
@@ -299,12 +298,10 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             if let Some(i) = live
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, l)| {
-                    (
-                        l.served.load(Ordering::Relaxed),
-                        l.active.load(Ordering::Relaxed),
-                    )
-                })
+                // Oldest connection first among the least served. Recency (`active`) is no tie-break:
+                // a NULL flood keeps its connections fresh and the kernel's NFS socket, pinged
+                // once and then quiet while the MNT connection arrives, would lose to it (#262).
+                .min_by_key(|(_, l)| (l.served.load(Ordering::Relaxed), l.id))
                 .map(|(i, _)| i)
             {
                 let victim = live.remove(i);

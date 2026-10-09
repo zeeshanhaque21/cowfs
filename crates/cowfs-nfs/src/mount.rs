@@ -171,6 +171,14 @@ impl Server {
         let port = listener.get_listen_port();
         // The only thing that answers MNT is this path, and only `mount_nfs` is told what it is.
         // A local process that polls the port learns the port, not the path.
+        // Residual (#262), no better mechanism exists: the path is the per-mount token, and it
+        // is in `mount_nfs`'s argv (visible to `ps` for the few ms to the first MNT) because
+        // that is the only way to hand a source to it. A second token in the mount options
+        // would sit in the same argv. Binding MNT to the child's pid or uid is not possible:
+        // the kernel NFS client sends MNT from a socket no process owns (`peer.rs`), and the
+        // uid check only helps against another user. A racer who wins the first MNT can use the
+        // filesystem until `Mount::new` tears the server down after mount_nfs fails. That is
+        // bounded by `command_timeout` (20 s by default); an observed value was not measured.
         let export = secret_path()?;
         listener.with_export_name(export.clone());
         listener.set_limits(opts.limits.clone());
