@@ -122,6 +122,39 @@ struct Tally {
     failures: Vec<String>,
 }
 
+/// Apply every op of the log with nothing lost: the disk the process left if the cut came last.
+fn replay_lossless(base: &Image, ops: &[LogOp]) -> Image {
+    let mut img = base.clone();
+    for op in ops {
+        match op {
+            LogOp::Create { file } => {
+                img.entry(file.clone()).or_default();
+            }
+            LogOp::Write { file, off, data } => {
+                let b = img.entry(file.clone()).or_default();
+                let end = *off as usize + data.len();
+                if b.len() < end {
+                    b.resize(end, 0);
+                }
+                b[*off as usize..end].copy_from_slice(data);
+            }
+            LogOp::SetLen { file, len } => {
+                img.entry(file.clone())
+                    .or_default()
+                    .resize(*len as usize, 0);
+            }
+            LogOp::Whole { file, data } => {
+                img.insert(file.clone(), data.clone());
+            }
+            LogOp::Unlink { file } => {
+                img.remove(file);
+            }
+            LogOp::Sync { .. } | LogOp::DirSync { .. } | LogOp::Marker(_) => {}
+        }
+    }
+    img
+}
+
 /// An op without its payload, for failure messages.
 fn brief(op: &LogOp) -> String {
     match op {
