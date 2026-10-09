@@ -596,7 +596,8 @@ class CompareRefuses(unittest.TestCase):
             self.assertEqual(rc, 3, out)
             self.assertIn("g2 rep", err)
             new = self.write(d, "new.jsonl", [meta(), {**g2, "metrics": {"rebuilt_count": 5, "bins_relinked": 2}}])
-            self.assertEqual(self.run_compare([new], new)[0], 0)
+            # Valid, but one 1 s rep is UNMEASURABLE (rc 2), not invalid (rc 3) and not a pass (issue #221).
+            self.assertEqual(self.run_compare([new], new)[0], 2)
 
     def test_gates_writes_scale_into_meta_that_compare_accepts(self):
         with tempfile.TemporaryDirectory() as d:
@@ -681,6 +682,7 @@ class G2RebuildValidity(unittest.TestCase):
             done = mock.Mock(stdout=stdout, stderr="", returncode=0)
             with mock.patch.object(gates, "checked", return_value=done) as ck:
                 try:
+                    ctx.g2_prep()
                     return ctx.g2(), ck
                 finally:
                     self.assertIn("--message-format=json", ck.call_args[0][0])
@@ -702,8 +704,55 @@ class G2RebuildValidity(unittest.TestCase):
             fake = lambda cmd, **kw: real(cmd, **kw) if cmd[0] == "git" else done
             with mock.patch.object(gates, "checked", side_effect=fake):
                 for _ in range(3):
+                    ctx.g2_prep()
                     ctx.g2()
             self.assertEqual(target.read_text().count("// cowfs bench g2 edit"), 1)
+
+    def test_the_reset_and_the_edit_are_outside_the_timed_region(self):
+        """Issue #221: the git reset ran inside the timed g2 region and added a process to every rep."""
+        events = []
+        ctx = mock.Mock()
+        ctx.g2_prep.side_effect = lambda: events.append("prep")
+        ctx.g2.side_effect = lambda: events.append("g2") or {}
+        clock = iter([100.0, 107.5])
+        with mock.patch.object(gates.time, "monotonic", side_effect=lambda: events.append("clock") or next(clock)):
+            wall, _ = gates.timed_rep(ctx, "g2")
+        self.assertEqual(events, ["prep", "clock", "g2", "clock"])
+        self.assertEqual(wall, 7.5)
+
+    def test_g2_itself_never_runs_git_or_writes_the_edit(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = gates.Ctx(Path(d), {})
+            target = ctx.corpus / gates.EDIT_TARGET
+            target.parent.mkdir(parents=True)
+            target.write_text("// lib\n")
+            done = mock.Mock(stdout=NEW_EDIT_OUT, stderr="", returncode=0)
+            with mock.patch.object(gates, "checked", return_value=done) as ck:
+                ctx.g2()
+            self.assertEqual([c[0][0][0] for c in ck.call_args_list], ["cargo"])
+            self.assertEqual(target.read_text(), "// lib\n")
+
+    def test_a_gate_without_a_prep_step_is_just_timed(self):
+        ctx = mock.Mock(spec=["g1"])
+        ctx.g1.return_value = {}
+        self.assertEqual(gates.timed_rep(ctx, "g1")[1], {})
+
+    def test_g2_rebuilds_the_test_executables_too(self):
+        """Issue #221: plain `cargo build` after the vfs edit is about 2.6 s of native work, `--tests` is about 23 s."""
+        _, ck = self.run_g2(NEW_EDIT_OUT)
+        self.assertIn("--tests", ck.call_args[0][0])
+
+    def test_g2_test_targets_are_built_untimed_before_the_first_rep(self):
+        """Otherwise rep 0 would carry a cold build of every test target and its dev-dependencies."""
+        self.assertIn("warm_tests", gates.SETUP["g2"])
+        self.assertLess(gates.SETUP["g2"].index("warm_target"), gates.SETUP["g2"].index("warm_tests"))
+        with tempfile.TemporaryDirectory() as d:
+            ctx = gates.Ctx(Path(d), {})
+            done = mock.Mock(stdout="", stderr="", returncode=0)
+            with mock.patch.object(gates, "checked", return_value=done) as ck:
+                ctx.warm_tests()
+            self.assertEqual(ck.call_args[0][0][:3], ["cargo", "build", "--tests"])
+            self.assertIn("--offline", ck.call_args[0][0])
 
     def test_g2_records_the_rebuilt_units(self):
         m, _ = self.run_g2(NEW_EDIT_OUT)

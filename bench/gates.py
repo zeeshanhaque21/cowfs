@@ -66,16 +66,16 @@ SMALL_BYTES = 256
 SMALL_PER_DIR = 256
 GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
 
-# g2 edits this file: cowfs-vfs is the trait crate every other crate builds on, so a
-# one-line change here rebuilds 13 units (vfs, vfs-path, vfs-test, fuse, nfs, core, ctl, daemon,
-# treehouse and cli) and relinks all three executables
-# (cowfs, cowfs-daemon, cowfs-treehouse), which is the widest realistic edit-rebuild at the
-# pinned sha. Per-edit measurements: docs/verification/g1-g2-readiness-20261009.md.
+# g2 edits this file and runs `cargo build --tests`: cowfs-vfs is the trait crate every other crate builds on, so a
+# one-line change here rebuilds every crate above it and relinks every test executable as well as the three
+# bins (cowfs, cowfs-daemon, cowfs-treehouse). Plain `cargo build` was 13 units, 3 relinks and about 2.6 s of
+# native work, too short and too noisy to rule on (issue #221). Measurements: docs/verification/g1-g2-readiness-20261009.md.
 # EDIT_CRATE is its lib target name.
 EDIT_TARGET = "crates/cowfs-vfs/src/lib.rs"
 EDIT_CRATE = "cowfs_vfs"
 # A g2 rep that rebuilt fewer units than this, or relinked no executable, is refused.
-# Measured at the pinned sha: 13 units, 3 bins. compare.py repeats this number.
+# A floor on shape, not an expected count: at the pinned sha `--tests` rebuilds about 127 units and relinks about 117
+# executables (plain build: 13 and 3). compare.py repeats this number.
 G2_MIN_UNITS = 3
 
 
@@ -218,6 +218,14 @@ class Ctx:
                 env=self.env,
             )
 
+    def warm_tests(self):
+        """Build every test target once, untimed, so g2 rep 0 is an edit and not a cold test build."""
+        checked(
+            ["cargo", "build", "--tests", "--offline", "--locked", *jobs()],
+            cwd=self.corpus,
+            env=self.env,
+        )
+
     def ensure_tree(self):
         marker = self.tree / ".generated"
         want = f"{self.n['small_files']} {self.n['large_files']} {self.n['large_bytes']} {SEED}"
@@ -299,15 +307,19 @@ class Ctx:
             env=self.env,
         )
 
-    def g2(self):
+    def g2_prep(self):
+        """The edit, applied untimed: the git reset and the file read/write are not cargo work (issue #221)."""
         leaf = self.corpus / EDIT_TARGET
         # Reset first so the file never grows across reps: each rep is the pinned file plus one comment.
         checked(["git", "-C", str(self.corpus), "checkout", "--quiet", "--", EDIT_TARGET])
         leaf.write_text(
             leaf.read_text() + f"\n// cowfs bench g2 edit {time.time_ns()}\n"
         )
+
+    def g2(self):
+        """Only the rebuild; the caller runs g2_prep first, outside the timed region."""
         p = checked(
-            ["cargo", "build", "--offline", "--locked", *jobs(), "--message-format=json"],
+            ["cargo", "build", "--tests", "--offline", "--locked", *jobs(), "--message-format=json"],
             cwd=self.corpus,
             env=self.env,
         )
@@ -462,7 +474,7 @@ class Ctx:
 
 SETUP = {
     "g1": ("ensure_corpus", "warm_target"),
-    "g2": ("ensure_corpus", "warm_target"),
+    "g2": ("ensure_corpus", "warm_target", "warm_tests"),
     "g3": ("ensure_corpus", "ensure_tree"),
     "g4": ("ensure_corpus", "ensure_tree"),
     "g5": (),
@@ -524,6 +536,16 @@ def open_out(root: Path, label: str, want: dict, resume: bool) -> Path:
     return path
 
 
+def timed_rep(ctx, gate):
+    """Run the gate's untimed prep step if it has one, then time only the gate itself."""
+    prep = getattr(ctx, f"{gate}_prep", None)
+    if prep:
+        prep()
+    t0 = time.monotonic()
+    metrics = getattr(ctx, gate)()
+    return time.monotonic() - t0, metrics
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", required=True)
@@ -557,9 +579,7 @@ def main() -> int:
             if (gate, rep) in done:
                 continue
             before = load1()
-            t0 = time.monotonic()
-            metrics = getattr(ctx, gate)()
-            wall = time.monotonic() - t0
+            wall, metrics = timed_rep(ctx, gate)
             after = load1()
             row = {
                 "kind": "rep",

@@ -20,6 +20,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(HERE))
+import compare  # noqa: E402
 import gates as gates_mod  # noqa: E402
 
 COMPARE = HERE / "compare.py"
@@ -158,7 +159,7 @@ class OneSidedGates(CliCase):
 
     def test_every_one_sided_direction_of_a_three_gate_pair(self):
         """Each arm's own extra gate is reported, and the matched one still runs."""
-        rows = {"g1": [rep("g1", 0, 8.0)], "g2": [rep("g2", 0, 4.0)], "g3": [rep("g3", 0, 2.0)]}
+        rows = {"g1": [rep("g1", 0, 8.0)], "g2": [rep("g2", i, 4.0 + i / 10) for i in range(3)], "g3": [rep("g3", 0, 2.0)]}
         with tempfile.TemporaryDirectory() as d:
             for native_gates, cowfs_gates, expect_rc in (
                 (["g1"], ["g1", "g2"], 0),
@@ -395,6 +396,60 @@ class CorpusPin(CliCase):
             rc, out, err = self.cli([nat], cow)
             self.assertEqual(rc, 3, out)
             self.assertIn("corpus_sha", err)
+
+
+class G2Unmeasurable(CliCase):
+    """Issue #221: g2 is never a PASS or FAIL when it is too short, too noisy or too thin to test its bar."""
+
+    def run_g2(self, native, cowfs):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.arm(d, "n.jsonl", "nat", ["g2"], [rep("g2", i, w) for i, w in enumerate(native)])
+            cow = self.arm(d, "c.jsonl", "cow", ["g2"], [rep("g2", i, w) for i, w in enumerate(cowfs)])
+            return self.cli([nat], cow)
+
+    def assertUnmeasurable(self, native, cowfs, needle):
+        rc, out, err = self.run_g2(native, cowfs)
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("UNMEASURABLE", out)
+        self.assertIn(needle, out)
+        self.assertIn("quiet host", out)
+        self.assertIn("heavier edit", out)
+        self.assertNotIn("PASS (", out)
+        self.assertNotIn("FAIL (", out)
+
+    def test_short_native_work_is_never_a_pass(self):
+        # The 1.4 s regime of PR 216: an equal cowfs arm would otherwise PASS.
+        self.assertUnmeasurable([1.4, 1.5, 1.4], [1.5, 1.5, 1.6], "floor")
+
+    def test_short_native_work_is_never_a_fail_either(self):
+        self.assertUnmeasurable([1.0, 1.1, 1.0], [9.0, 9.5, 9.2], "floor")
+
+    def test_wide_native_spread_is_unmeasurable(self):
+        self.assertUnmeasurable([4.0, 4.1, 9.0, 4.2, 4.0], [4.2, 4.3, 4.2], "native reps span")
+
+    def test_wide_cowfs_spread_is_unmeasurable(self):
+        self.assertUnmeasurable([4.0, 4.1, 4.2], [4.0, 9.5, 4.3], "cowfs reps span")
+
+    def test_too_few_reps_is_unmeasurable(self):
+        self.assertUnmeasurable([5.0, 5.1], [5.0, 5.1], "need 3")
+
+    def test_long_steady_work_is_still_judged(self):
+        rc, out, err = self.run_g2([4.4, 4.9, 5.2, 5.6, 4.7], [4.8, 5.0, 5.4, 5.9, 5.1])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("PASS (", out)
+        rc, out, err = self.run_g2([4.4, 4.9, 5.2], [7.0, 7.1, 7.2])
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("FAIL (", out)
+
+    def test_parameters_are_the_stated_ones(self):
+        self.assertEqual((compare.G2_NATIVE_FLOOR_S, compare.G2_SPREAD_MAX, compare.G2_MIN_REPS), (3.0, 2.0, 3))
+
+    def test_other_gates_are_not_subject_to_the_g2_rule(self):
+        with tempfile.TemporaryDirectory() as d:
+            nat = self.arm(d, "n.jsonl", "nat", ["g1"], [rep("g1", 0, 0.5)])
+            cow = self.arm(d, "c.jsonl", "cow", ["g1"], [rep("g1", 0, 0.6)])
+            rc, out, err = self.cli([nat], cow)
+            self.assertEqual(rc, 0, out + err)
 
 
 if __name__ == "__main__":
