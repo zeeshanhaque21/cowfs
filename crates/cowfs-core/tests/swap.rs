@@ -1,24 +1,26 @@
 //! Snapshot replacement: failure injection at every step of the swap (F2) and the intent record's
 //! recovery on the next open.
 //!
-//! The swap forks the source once into a hidden staging snapshot, writes an intent file, removes
-//! the old target, renames the staging snapshot to the target name (one metadata transaction, the
-//! id is kept) and removes the intent file. The states a failure may leave are:
+//! The swap forks the source once into a hidden staging snapshot, writes an intent file, then
+//! replaces the target with the staging snapshot in ONE metadata transaction (`Meta::replace_snapshot`:
+//! the staging snapshot takes the target's name and keeps its id, the old target is removed) and
+//! removes the intent file. At every step exactly one of the old tree and the new tree answers to
+//! the target name. The states a failure may leave are:
 //!
 //! | fault at | before reopen | after reopen |
 //! |---|---|---|
 //! | none | base is the new content | same |
 //! | 1, promote only (staging fork) | base is the old content | same |
 //! | 2 (intent file) | base is the old content | same |
-//! | 3 (remove old) | base is the old content | same |
-//! | 4, import (after the old target went) | `base` is absent, intent file present, the call returns `Err` | base is the new content |
-//! | 4, promote (after the old target went) | base is the new content, error logged, the swap rolls forward and returns `Ok` | same |
-//! | 5, promote only (after the swap completed) | base is the new content, error logged | same |
-//! | 6 (rename done, intent kept: a crash) | base is the new content, intent file present | base is the new content, intent dropped |
+//! | 3 (before the replace) | base is the old content | same |
+//! | 4 (the replace not run) | base is the old content, intent file present | base is the new content |
+//! | 5 (after the swap completed) | base is the new content | same |
+//! | 6 (replace done, intent kept: a crash) | base is the new content, intent file present | base is the new content, intent dropped |
 //! | 7 (intent removal fails) | base is the new content, error logged, intent file present | same as 6 |
 //!
-//! So the only window in which a name is missing is the one the intent record explains, and a
-//! failed swap never destroys the old base.
+//! A failed swap never destroys the old base, and the name is never missing. A store an older
+//! release left half swapped (the old target already removed, the intent file present) is rolled
+//! forward by the same recovery.
 
 mod common;
 
@@ -245,8 +247,8 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
-/// F2 for the replacing ingest: a failure before the old target goes keeps it, one after leaves the
-/// name missing only while the intent file explains it, and the next open finishes the swap.
+/// F2 for the replacing ingest: a failure before the replace commit keeps the old target, and the
+/// next open finishes a pending swap.
 #[test]
 fn ingest_replacing_survives_a_failure_at_every_step() {
     for step in 2..=4u8 {
@@ -264,7 +266,8 @@ fn ingest_replacing_survives_a_failure_at_every_step() {
                 assert_eq!(content(&c, "base", "f"), "old base", "step {step}");
                 assert!(raw_leftovers(dir.path(), &c).is_empty(), "step {step}");
             } else {
-                assert!(c.snapshot_view("base").is_err(), "step {step}");
+                // the old target stays until the replace commit, which this fault skips
+                assert_eq!(content(&c, "base", "f"), "old base", "step {step}");
             }
         }
         let c = Core::open(dir.path(), test_opts()).expect("reopen");
@@ -571,6 +574,9 @@ fn a_torn_intent_is_not_read_as_a_shorter_name() {
         replace_as(&c, &v1, "abc").unwrap();
         c.set_swap_fault(4);
         assert!(replace_as(&c, &v2, "abc").is_err());
+        // the image an older release left: the old target removed before the rename. A torn intent
+        // only rolls forward then; with the old target still standing it keeps it (next test)
+        let _ = c.remove_snapshot("abc");
     }
     let p = dir.path().join("swap-abc");
     let text = std::fs::read_to_string(&p).unwrap();
@@ -756,4 +762,92 @@ fn a_promoted_snapshot_records_the_source_as_its_parent() {
         let e = c.promote_base("src", target).unwrap();
         assert_eq!(e.parent, Some(src.id), "{target}");
     }
+}
+
+/// D13 (issue 286): at no fault point is the target name missing, for a promote or a replacing
+/// import, before or after a reopen. Exactly one of the old and the new tree answers to it.
+#[test]
+fn the_target_is_never_absent_at_any_fault_point() {
+    let one_of = |c: &Core, tag: &str| {
+        let v = c
+            .snapshot_view("base")
+            .unwrap_or_else(|e| panic!("{tag}: the target name is missing: {e:?}"));
+        let a = v.lookup(ROOT_INO, b"f").expect("lookup");
+        let got = String::from_utf8(read_all(&v, a.ino)).expect("utf8");
+        assert!(
+            got == "old base" || got == "new content",
+            "{tag}: neither tree: {got}"
+        );
+    };
+    for step in 1..=7u8 {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let c = promotable(dir.path());
+            c.set_swap_fault(step);
+            let _ = c.promote_base("src", "base");
+            c.set_swap_fault(0);
+            one_of(&c, &format!("promote, fault {step}"));
+        }
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        one_of(&c, &format!("promote, fault {step}, reopened"));
+        c.check().unwrap();
+    }
+    for step in 2..=7u8 {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let v1 = source(scratch.path(), "v1", "old base");
+        let v2 = source(scratch.path(), "v2", "new content");
+        {
+            let c = Core::open(dir.path(), test_opts()).unwrap();
+            replace(&c, &v1).unwrap();
+            c.set_swap_fault(step);
+            let _ = replace(&c, &v2);
+            c.set_swap_fault(0);
+            one_of(&c, &format!("import, fault {step}"));
+        }
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        one_of(&c, &format!("import, fault {step}, reopened"));
+        c.check().unwrap();
+    }
+}
+
+/// Recovery of the image an older release left: the old target already removed, the staging
+/// snapshot and the intent file present. The roll-forward is the same rename it always was.
+#[test]
+fn a_store_left_half_swapped_by_an_older_release_is_rolled_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "new content");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace(&c, &v1).unwrap();
+        c.set_swap_fault(4);
+        assert!(replace(&c, &v2).is_err());
+        c.set_swap_fault(0);
+        // the older order removed the target before this point
+        let _ = c.remove_snapshot("base");
+        assert!(c.snapshot_view("base").is_err());
+    }
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "new content");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}
+
+/// A target with an open handle cannot be replaced: the promote is refused with the mount as it was,
+/// and succeeds once the handle is closed.
+#[test]
+fn a_promote_over_a_target_with_an_open_handle_is_busy_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = promotable(dir.path());
+    let rb = root_entry(&c, "base").ino;
+    let f = c.lookup(rb, b"f").unwrap().ino;
+    let h = c.open(f).unwrap();
+    assert_eq!(c.promote_base("src", "base"), Err(ControlError::Busy));
+    assert_eq!(content(&c, "base", "f"), "old base");
+    assert!(leftovers(dir.path(), &c).is_empty());
+    c.release(h).unwrap();
+    c.promote_base("src", "base").unwrap();
+    assert_eq!(content(&c, "base", "f"), "new content");
 }

@@ -1337,8 +1337,8 @@ mod tests {
     /// #124: a swap that fails past the staged swap's point of no return must not leave the old
     /// commit describing the tree that ends up under the name.
     ///
-    /// The fault is the third durable commit, which is the fork of the staging snapshot into the
-    /// target. Past that point the core rolls forward, so the swap returns `Err` with the intent
+    /// The fault is the second durable commit, which replaces the target by the staging snapshot
+    /// (the first is the staging fork). Past that point the core rolls forward, so the swap returns `Err` with the intent
     /// file pending and the next open installs the new tree. The record must read unknown, because
     /// the error alone cannot tell that rollback from a failed roll-forward.
     ///
@@ -1353,11 +1353,11 @@ mod tests {
             seeded_pair(&seed);
         }
 
-        let s = core_snaps_with_failing_commit(&store, 3);
+        let s = core_snaps_with_failing_commit(&store, 2);
         let res = s.swap("base", "srcB");
         assert!(
             res.is_err(),
-            "the third commit must fail, so the swap reports the failure"
+            "the second commit must fail, so the swap reports the failure"
         );
         let intent_pending = store.join("swap-base").exists();
         drop(s);

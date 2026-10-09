@@ -503,7 +503,7 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `lib::snap_by_name_raw` | leaf | 1 |
 | `lib::check_new_name_except` | leaf | 1 |
 | `lib::register` | root_time, last_error, snap. | 3 then leaf |
-| `lib::unregister` | sc.ns, sc.flush, sc.q, st.try_read, nodes, dents, aliases, root_time | 1 then 2 then leaf |
+| `lib::purge_live` | sc.ns, sc.flush, sc.q, st.try_read, nodes, dents, aliases, root_time | 1 then 2 then leaf |
 | `lib::stats` | sc.q, nodes, dents, aliases | 1 then 2 then leaf |
 | `lib::health` | sc.q, nodes, last_error | 1 then 2 then leaf |
 | `lib::unpoison` | sc.q | 1 |
@@ -530,7 +530,9 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `swap::recover` | last_error | leaf |
 | `swap::swap_snapshot` | last_error | leaf |
 | `swap::stage_and_intent` | snap. | 3 |
+| `swap::parent_of` | snap. | 3 |
 | `swap::drop_intent` | last_error | leaf |
+| `swap::a_target_forked_from_the_staging_snapshot_is_kept_and_the_staging_snapshot_dropped` | snap. | 3 |
 | `util::lk` | leaf | 1 |
 | `util::try_lk` | leaf | 1 |
 | `util::shard` | leaf | 1 |

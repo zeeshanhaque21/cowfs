@@ -1,32 +1,36 @@
 //! Crash-safe snapshot replacement: stage a fork, record the intent, then move it into place.
 //!
 //! This is the replacement path, for promotion. A rename moves a name inside one metadata
-//! transaction and does not come here; a promotion has to destroy the target it replaces, and
-//! that cannot be one transaction. Two rules make the replacement safe without one:
+//! transaction and does not come here; a promotion replaces the tree under a name, which needs a
+//! staged copy first. Two rules make the replacement safe:
 //!
 //! - The staging snapshot's name carries the reserved suffix `.cowfs-swap<N>`. The name rules
 //!   refuse it, so no caller can create or move a snapshot into it, and the synthetic root filters
 //!   it out of the listing, so it is never visible.
-//! - An operation that returns `Err` leaves the mount exactly as it was, unless the old target was
-//!   already removed, in which case the swap is rolled forward and the call returns `Ok`. There is
-//!   no third state: a name is never missing from the live mount without an intent file that
-//!   explains it.
+//! - The old target stays under its name until ONE metadata transaction (`Meta::replace_snapshot`)
+//!   gives the staging snapshot that name and removes the old target. So the name is never missing:
+//!   at every step exactly one of the old tree and the new tree answers to it. An operation that
+//!   returns `Err` leaves the mount exactly as it was, or leaves an intent file that the next
+//!   `Core::open` (or the next call for the target) rolls forward.
 //!
 //! The order, with the point of no return at step 3:
 //!
 //! 1. fork the source into a staging name (a failure here changes nothing),
 //! 2. write and sync the intent file `<root>/swap-<target>`, naming the staging and target snapshots,
-//! 3. remove the old target if there is one,          <- rollback is no longer possible
-//! 4. rename the staging snapshot to the target name (one metadata transaction, the id is kept),
-//! 5. (nothing: the staging name left with the rename; an older release forked and removed here),
-//! 6. remove the intent file.
+//! 3. replace the target: the staging snapshot takes the target name (its id is kept) and the old
+//!    target is removed, in one metadata transaction,   <- rollback is no longer possible
+//! 4. remove the intent file; a failure is reported and a leftover file is dropped on open.
 //!
-//! A crash or error from step 3 on leaves the intent file, and the next `Core::open` finishes
-//! steps 4 to 6 before serving anything. A swap or replacing import of a target with a pending
-//! intent finishes that intent first (`Core::recover_target`), so a retry never deletes the only
-//! copy of a tree. A crash before step 3 leaves a hidden staging snapshot with no intent file;
-//! `Core::open` removes every such orphan once the intents are recovered, before anything can
-//! stage a new one, so it cannot take a staging snapshot a live operation owns.
+//! A crash or error from step 3 on leaves the intent file, and the next `Core::open` finishes the
+//! swap before serving anything. A swap or replacing import of a target with a pending intent
+//! finishes that intent first (`Core::recover_target`), so a retry never deletes the only copy of a
+//! tree. A crash before step 3 leaves a hidden staging snapshot with no intent file; `Core::open`
+//! removes every such orphan once the intents are recovered, before anything can stage a new one,
+//! so it cannot take a staging snapshot a live operation owns.
+//!
+//! Recovery also finishes the images older releases left: the old target already removed (the
+//! staging snapshot is then renamed into the name), and a target that is a fork of the staging
+//! snapshot (only the staging snapshot goes).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -307,7 +311,9 @@ impl Core {
     /// rather than replacing one and does not come here: it has no victim to remove and needs no
     /// staging, so `Core::rename_snapshot` commits the name directly.
     /// Returns `Ok` only when the new name is in place. Returns `Err` with the mount unchanged,
-    /// except after the old target was removed, where the swap is rolled forward instead.
+    /// except when the metadata commit that replaces the target failed or was cut short: the old
+    /// target then stays live with the intent file pending, and the next open or call for the
+    /// target installs the new tree (anything written to the old target in between is discarded).
     /// The one fork gives the new snapshot a new id, which it keeps under the target name, so every
     /// inode number in it differs from the old target's.
     pub(crate) fn swap_snapshot(
@@ -341,27 +347,20 @@ impl Core {
             self.rollback(&staged, new);
             return Err(e);
         }
-        if let Err(e) = self.fault(3) {
+        // the last point that can roll back: an old target with an open handle cannot be replaced
+        if let Err(e) = self.fault(3).and_then(|()| self.check_target_idle(new)) {
             self.rollback(&staged, new);
             return Err(e);
-        }
-        // point of no return: the old target is about to go
-        if let Some(v) = victim {
-            let sc = self.inner.snap_by_name(v)?;
-            if let Err(e) = self.inner.unregister(&sc) {
-                self.rollback(&staged, new);
-                return Err(e);
-            }
-            crate::fsops::note("victim_removed");
         }
         // Past this point an error cannot be reported as "nothing happened", so the swap is rolled
         // forward instead and the call succeeds. The only exception is a failure of the roll
         // forward itself (an I/O error), which returns `Err` with the intent file on disk: the next
-        // `Core::open` completes it.
+        // `Core::open` completes it. The old target is still visible until `finish_swap` replaces
+        // it in the one metadata commit.
         if let Err(e) = self.fault(4) {
             *self.inner.last_error.lk() = Some(format!("swap: {e}, rolled forward"));
         }
-        let done = self.finish_swap(&staged, new);
+        let done = self.finish_live(&staged, new);
         if let Err(e) = self.fault(5) {
             *self.inner.last_error.lk() = Some(format!("swap: {e} after the swap completed"));
         }
@@ -399,17 +398,28 @@ impl Core {
             self.rollback(staged, target);
             return Err(e);
         }
-        if let Ok(old) = self.inner.snap_by_name(target) {
-            if let Err(e) = self.inner.unregister(&old) {
-                self.rollback(staged, target);
-                return Err(e);
-            }
+        // the last point that can roll back: an old target with an open handle cannot be replaced
+        if let Err(e) = self.check_target_idle(target) {
+            self.rollback(staged, target);
+            return Err(e);
         }
-        // Past this point the old target is gone and only `staged` holds the new tree, so an error
-        // is returned as it is and nothing is cleaned up: the intent file makes `Core::open`, or the
-        // next call for this target, finish. Fault 4 is that error without running `finish_swap`.
+        // Past this point an error is returned as it is and nothing is cleaned up: the intent file
+        // makes `Core::open`, or the next call for this target, finish. The old target is still
+        // visible until `finish_swap` replaces it in the one metadata commit. Fault 4 is that error
+        // without running `finish_swap`.
         self.fault(4)?;
-        self.finish_swap(staged, target)
+        self.finish_live(staged, target)
+    }
+
+    /// `Busy` when the target a swap replaces has an open handle: checked before the commit, while a
+    /// rollback is still possible.
+    fn check_target_idle(&self, target: &str) -> Result<(), ControlError> {
+        match self.inner.snap_by_name(target) {
+            Ok(v) if v.open_handles.load(std::sync::atomic::Ordering::Acquire) > 0 => {
+                Err(ControlError::Busy)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Steps 1 and 2. A failure in either leaves nothing behind.
@@ -444,23 +454,84 @@ impl Core {
         sync_dir(&self.inner.root);
     }
 
-    /// Steps 4 to 6: rename the staging snapshot to the target name, remove the intent file.
+    /// Steps 3 and 4 for recovery: install the staging snapshot under the target name, remove the
+    /// intent file. A failure leaves the intent pending, whatever the step.
     pub(crate) fn finish_swap(
         &self,
         staged: &str,
         target: &str,
+    ) -> Result<SnapshotEntry, ControlError> {
+        self.finish(staged, target, false)
+    }
+
+    /// [`Core::finish_swap`] for a live call. With `undo`, a failure that is certain to have
+    /// changed nothing, because it happens before the metadata commit (the target is `Busy`, or the
+    /// staged tree cannot be flushed), is rolled back like any earlier step: the old target is
+    /// still live and writable, so leaving an intent that a restart would act on later would
+    /// discard whatever is written to it in between. An error from the commit itself stays pending.
+    pub(crate) fn finish_live(
+        &self,
+        staged: &str,
+        target: &str,
+    ) -> Result<SnapshotEntry, ControlError> {
+        self.finish(staged, target, true)
+    }
+
+    fn finish(
+        &self,
+        staged: &str,
+        target: &str,
+        undo: bool,
     ) -> Result<SnapshotEntry, ControlError> {
         #[cfg(test)]
         if FAIL_FINISH.with(std::cell::Cell::get) {
             return Err(io("injected finish_swap failure"));
         }
         let mut entry = None;
-        if self.inner.snap_by_name(target).is_err() {
-            let sc = self.inner.snap_by_name_raw(staged)?;
-            self.inner.flush_snapshot(&sc)?;
-            entry = Some(self.move_name(&sc, staged, target)?);
+        match self.inner.snap_by_name(target) {
+            Err(_) => {
+                // no target: a first install, or an older release's swap that removed it first
+                let sc = self.inner.snap_by_name_raw(staged)?;
+                self.inner.flush_snapshot(&sc)?;
+                entry = Some(self.move_name(&sc, staged, target, None)?);
+            }
+            Ok(old) => {
+                // The old target still stands: replace it by name in one metadata commit. The
+                // exception is an older release's swap that forked `staged` into the target and
+                // crashed before dropping the staging snapshot; that target is a fork of `staged`
+                // (its parent), already the new tree, and only the staging snapshot goes below.
+                if let Ok(sc) = self.inner.snap_by_name_raw(staged) {
+                    if self.parent_of(&old) != Some(sc.id) {
+                        let r = self
+                            .inner
+                            .flush_snapshot(&sc)
+                            .map_err(ControlError::from)
+                            .and_then(|()| {
+                                // the intent file and its directory entry are durable: the old tree
+                                // may go
+                                crate::fsops::note("victim_removed");
+                                self.move_name(&sc, staged, target, Some(&old))
+                            });
+                        match r {
+                            Ok(e) => entry = Some(e),
+                            // Busy and a flush failure happen before the commit and change nothing
+                            Err(e @ (ControlError::Busy | ControlError::Fs(_))) if undo => {
+                                if self
+                                    .inner
+                                    .snap_by_name(target)
+                                    .is_ok_and(|t| t.id == old.id)
+                                {
+                                    self.rollback(staged, target);
+                                }
+                                return Err(e);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
         }
-        // Only an old target that already existed (a crash left both names) leaves a staging
+        // Only a target that is a fork of `staged` (a crash of an older release) leaves a staging
         // snapshot here; after the rename above there is none.
         if let Ok(st) = self.inner.snap_by_name_raw(staged) {
             let _ = self.inner.unregister(&st);
@@ -469,6 +540,16 @@ impl Core {
         self.fault(6)?;
         self.drop_intent(target);
         entry.ok_or(ControlError::NotFound)
+    }
+
+    /// The recorded parent id of `sc`.
+    fn parent_of(&self, sc: &crate::queue::SnapCtx) -> Option<u64> {
+        let snap = self
+            .inner
+            .meta
+            .snapshot_by_id(cowfs_meta::SnapshotId(sc.id))
+            .ok()?;
+        snap.info().ok()?.parent.map(|p| p.0)
     }
 
     /// Step 6: removes the intent file of `target`. The new name is already in place, so a failure
@@ -633,7 +714,8 @@ mod tests {
     }
 
     /// A torn intent whose roll-forward fails keeps the staging tree and the intent file, and a
-    /// later recovery still lands the new tree.
+    /// later recovery still lands the new tree (here from the image of an older release, where the
+    /// old target was already removed: the torn record only rolls forward when the target is gone).
     #[test]
     fn a_failed_roll_forward_of_a_torn_intent_keeps_the_only_copy() {
         let dir = tempfile::tempdir().unwrap();
@@ -652,6 +734,9 @@ mod tests {
         c.set_swap_fault(4);
         assert!(put(&c, &v2, "abc", true).is_err());
         c.set_swap_fault(0);
+        // the image an older release left: the old target removed before the rename
+        let old = c.inner.snap_by_name("abc").unwrap();
+        c.inner.unregister(&old).unwrap();
         let p = intent_path(&c.inner.root, "abc");
         fs::write(&p, "torn").unwrap();
         FAIL_FINISH.with(|f| f.set(true));
@@ -696,5 +781,82 @@ mod tests {
         );
         put(&c, &v, &"n".repeat(246), true).unwrap();
         put(&c, &v, &"n".repeat(246), true).unwrap();
+    }
+
+    /// An older release forked the staging snapshot into the target name, then crashed before it
+    /// dropped the staging snapshot: the target is a fork of `staged` and already the new tree.
+    /// Recovery keeps it and drops the staging snapshot, instead of replacing it with its parent.
+    #[test]
+    fn a_target_forked_from_the_staging_snapshot_is_kept_and_the_staging_snapshot_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let v1 = src_dir(scratch.path(), "v1", "old");
+        let v2 = src_dir(scratch.path(), "v2", "new");
+        let c = Core::open(
+            dir.path(),
+            crate::Options {
+                background: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        put(&c, &v1, "abc", true).unwrap();
+        c.set_swap_fault(4);
+        assert!(put(&c, &v2, "abc", true).is_err());
+        c.set_swap_fault(0);
+        let staged = staging_name("abc");
+        let old = c.inner.snap_by_name("abc").unwrap();
+        c.inner.unregister(&old).unwrap();
+        let st = c.inner.snap_by_name_raw(&staged).unwrap();
+        c.inner.register(st.snap.fork("abc").unwrap()).unwrap();
+        let p = intent_path(&c.inner.root, "abc");
+        assert!(p.exists());
+        recover_intent(&c, &p).unwrap();
+        assert!(!p.exists());
+        assert!(
+            c.inner.snap_by_name_raw(&staged).is_err(),
+            "staging dropped"
+        );
+        let v = c.snapshot_view("abc").unwrap();
+        let ino = v.lookup(ROOT_INO, b"f").unwrap().ino;
+        assert_eq!(v.read(ino, 0, 64).unwrap(), b"new");
+    }
+
+    /// A target that turns `Busy` between the up-front check and the commit (a handle opened in
+    /// that window) is rolled back like any earlier step: the old target stays live and writable,
+    /// so no intent may stay behind for a restart to act on.
+    #[test]
+    fn a_target_that_turns_busy_at_the_commit_is_rolled_back_not_left_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Core::open(
+            dir.path(),
+            crate::Options {
+                background: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        c.create_snapshot("src").unwrap();
+        c.create_snapshot("abc").unwrap();
+        let root = c.lookup(ROOT_INO, b"abc").unwrap().ino;
+        let f = c.create(root, b"f", 0o644).unwrap().ino;
+        let h = c.open(f).unwrap();
+        let staged = staging_name("abc");
+        let src = c.inner.snap_by_name("src").unwrap();
+        c.stage_and_intent(&src, &staged, "abc").unwrap();
+        assert_eq!(
+            c.finish_live(&staged, "abc").err(),
+            Some(ControlError::Busy)
+        );
+        assert!(
+            !intent_path(&c.inner.root, "abc").exists(),
+            "no intent left"
+        );
+        assert!(
+            c.inner.snap_by_name_raw(&staged).is_err(),
+            "staging dropped"
+        );
+        c.write(f, 0, b"still writable").unwrap();
+        c.release(h).unwrap();
     }
 }

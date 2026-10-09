@@ -196,8 +196,8 @@ fn ingest_with(
         c.finish_swap(&staged, name)
     };
     if let Err(e) = installed {
-        // On the replacing path the old target may already be gone and `staged` is the only copy of
-        // the new tree, which `Core::open` rolls forward from the intent file, so it is kept.
+        // On the replacing path the swap either rolled itself back (the staging snapshot is gone)
+        // or keeps `staged` pending in the intent file, which `Core::open` rolls forward.
         if victim.is_none() {
             if let Ok(sc) = c.inner.snap_by_name_raw(&staged) {
                 let _ = c.inner.unregister(&sc);
