@@ -25,10 +25,13 @@ INTENT_RM = (
 
 def hook_after_commit(t):
     """Meta runs the store-sync hook AFTER the metadata transaction commits instead of before."""
-    if HOOK not in t or t.count("            wtx.commit()?;\n") != 1:
+    c = t.index("    fn commit(\n")
+    commit = "            wtx.commit()?;\n"
+    i = t.index(commit, c)
+    if HOOK not in t[c:i]:
         raise ValueError
-    t = t.replace(HOOK, "        if !has_work {\n            self.run_hook()?;\n            return Ok(None);\n        }\n", 1)
-    return t.replace("            wtx.commit()?;\n", "            wtx.commit()?;\n            self.run_hook()?;\n", 1)
+    t = t[:c] + t[c:i].replace(HOOK, "        if !has_work {\n            self.run_hook()?;\n            return Ok(None);\n        }\n", 1) + commit + "            self.run_hook()?;\n" + t[i + len(commit):]
+    return t
 
 
 def intent_removed_before_rename(t):
@@ -57,9 +60,9 @@ M = [
      "        store.sync().map_err(|e| match e {\n            cowfs_store::Error::Io(e) => e,\n            e => std::io::Error::other(e.to_string()),\n        })\n",
      "        let _ = &store;\n        Ok(())\n"),
     ("E2 store sync runs AFTER the metadata commit", "cowfs-meta/src/db.rs", hook_after_commit, None),
-    ("E3 snapshot-add commit (swap staging) skips the store sync", "cowfs-meta/src/db.rs", hook_skipped_for("Add"), None),
-    ("E4 snapshot-rename commit (the swap rename) skips the store sync", "cowfs-meta/src/db.rs", hook_skipped_for("Rename"), None),
-    ("E5 snapshot-remove commit (the swap victim) skips the store sync", "cowfs-meta/src/db.rs", hook_skipped_for("Remove"), None),
+    ("E3 snapshot-add commit (fork_snapshot, the swap staging fork) skips the store sync", "cowfs-meta/src/db.rs", hook_skipped_for("Add"), None),
+    ("E4 snapshot-rename commit (rename_snapshot, the swap rename) skips the store sync", "cowfs-meta/src/db.rs", hook_skipped_for("Rename"), None),
+    ("E5 snapshot-remove commit (remove_snapshot, the swap victim) skips the store sync", "cowfs-meta/src/db.rs", hook_skipped_for("Remove"), None),
     ("I1 intent file: no directory fsync after the rename", "cowfs-core/src/swap.rs",
      "    crate::fsops::sync_dir(root).map_err(|e| io(&e.to_string()))?;\n    Ok(())\n}\n\n/// The staging and target names",
      "    Ok(())\n}\n\n/// The staging and target names"),

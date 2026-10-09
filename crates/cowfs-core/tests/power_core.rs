@@ -104,6 +104,10 @@ impl Backend {
         r.data.clone()
     }
 
+    fn current(&self) -> Vec<u8> {
+        self.0.lock().unwrap().data.clone()
+    }
+
     fn events(&self) -> Vec<Ev> {
         self.0.lock().unwrap().log.clone()
     }
@@ -208,7 +212,11 @@ impl World {
     }
 
     fn touch(&mut self, s: &str, path: &str) {
-        self.cur.touched.entry(s.into()).or_default().insert(path.into());
+        self.cur
+            .touched
+            .entry(s.into())
+            .or_default()
+            .insert(path.into());
     }
 
     fn guard_alt(&self, s: &str) {
@@ -363,6 +371,10 @@ struct Run {
     acks: Vec<Expect>,
     gc_unlinked: u64,
     swaps: usize,
+    /// The real disk after the workload, for the replay check.
+    final_store: Image,
+    final_meta: Vec<u8>,
+    final_root: Vec<String>,
 }
 
 /// `hook` false drops the store sync that Core wires before every durable metadata commit: the
@@ -404,7 +416,10 @@ fn record(hook: bool) -> Run {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("swap-") || n.starts_with("tmp-swap-"))
         .collect();
-    assert!(root_base.is_empty(), "setup left intent files: {root_base:?}");
+    assert!(
+        root_base.is_empty(),
+        "setup left intent files: {root_base:?}"
+    );
 
     oplog_start();
     rootlog::start();
@@ -421,8 +436,9 @@ fn record(hook: bool) -> Run {
 
     w.new_snapshot("s3", None);
     w.put("s3", "e", &data(15_000, 7));
-    w.remove_snapshot("s2");
+    // flushed but not synced: the removal's own commit is the first durable one to carry it
     w.core.flush().unwrap();
+    w.remove_snapshot("s2");
     // replacing swap: the victim `base` is acknowledged and `s1` has unsynced changes to flush
     w.put("s1", "g", &data(12_000, 8));
     w.promote("s1", "base");
@@ -432,8 +448,9 @@ fn record(hook: bool) -> Run {
     // non-replacing swap, then a rename of a snapshot, neither acknowledged until the end
     w.promote("s3", "fresh");
     w.sync();
-    w.rename_snapshot("s1", "s1r");
     w.put("s3", "h", &data(9000, 10));
+    w.core.flush().unwrap();
+    w.rename_snapshot("s1", "s1r");
 
     let collector = w.core.collector(gc_opts()).unwrap();
     let rep = collector.collect().unwrap();
@@ -455,9 +472,21 @@ fn record(hook: bool) -> Run {
             }
         }
     }
-    assert!(root_at.iter().all(|&p| p != usize::MAX), "a root op was not stamped");
+    assert!(
+        root_at.iter().all(|&p| p != usize::MAX),
+        "a root op was not stamped"
+    );
     w.acks.push(w.cur.clone());
+    let final_root = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("swap-") || n.starts_with("tmp-swap-"))
+        .collect();
     Run {
+        final_store: read_image(&dir.path().join("store")),
+        final_meta: backend.current(),
+        final_root,
         store_base,
         meta_base,
         meta_evs: backend.events(),
@@ -485,14 +514,19 @@ fn meta_image(run: &Run, k: usize, mode: u64, rng: &mut Rng) -> Vec<u8> {
     let mut img = run.meta_base.clone();
     let Some(d) = done else { return img };
     let evs = &run.meta_evs[..=d];
-    let synced = evs.iter().rposition(|e| matches!(e, Ev::Sync)).map_or(0, |i| i + 1);
+    let synced = evs
+        .iter()
+        .rposition(|e| matches!(e, Ev::Sync))
+        .map_or(0, |i| i + 1);
     let upto = if mode == 1 { evs.len() } else { synced };
     evs[..upto].iter().for_each(|e| apply(&mut img, e, None));
     if mode == 2 {
         for e in &evs[synced..] {
             if rng.below(2) == 0 {
                 let torn = match e {
-                    Ev::Write(_, d) if rng.below(3) == 0 => Some(rng.below(d.len() as u64 + 1) as usize),
+                    Ev::Write(_, d) if rng.below(3) == 0 => {
+                        Some(rng.below(d.len() as u64 + 1) as usize)
+                    }
                     _ => None,
                 };
                 apply(&mut img, e, torn);
@@ -529,7 +563,10 @@ fn root_image(run: &Run, k: usize, rng: &mut Rng) -> BTreeMap<String, Vec<u8>> {
         }
         match op {
             RootOp::Create(n) => {
-                inodes.push(Node { data: Vec::new(), synced: None });
+                inodes.push(Node {
+                    data: Vec::new(),
+                    synced: None,
+                });
                 ns.insert(n.clone(), inodes.len() - 1);
                 entries.push(Entry::Set(n.clone(), Some(inodes.len() - 1)));
             }
@@ -591,7 +628,9 @@ fn root_image(run: &Run, k: usize, rng: &mut Rng) -> BTreeMap<String, Vec<u8>> {
 fn walk(fs: &dyn Vfs, dir: Ino, prefix: &str, out: &mut Tree) -> Result<(), String> {
     let mut cookie = 0;
     loop {
-        let r = fs.readdir(dir, cookie, 50).map_err(|e| format!("readdir: {e:?}"))?;
+        let r = fs
+            .readdir(dir, cookie, 50)
+            .map_err(|e| format!("readdir: {e:?}"))?;
         for e in &r.entries {
             let name = format!("{prefix}{}", String::from_utf8_lossy(&e.name));
             match e.kind {
@@ -624,6 +663,8 @@ struct Tally {
     images: u32,
     /// images where an intent file was on disk at open
     with_intent: u32,
+    /// images whose intent file was not a whole record (an unsynced one cut short)
+    torn_intent: u32,
     /// swap targets that came back as the old tree, and as the new one
     old_tree: u32,
     new_tree: u32,
@@ -640,6 +681,12 @@ fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
         .flatten()
         .any(|e| e.file_name().to_string_lossy().starts_with("swap-"));
     t.with_intent += u32::from(had_intent);
+    for e in fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+        if e.file_name().to_string_lossy().starts_with("swap-") {
+            let s = fs::read_to_string(e.path()).unwrap_or_default();
+            t.torn_intent += u32::from(!s.ends_with('\n') || s.lines().count() != 2);
+        }
+    }
     let c = Core::open(dir, core_opts()).map_err(|e| format!("reopen failed: {e:?}"))?;
     if c.store().recovery().has_corruption() {
         return Err(format!("store reported a loss: {:?}", c.store().recovery()));
@@ -652,7 +699,10 @@ fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
     // hidden snapshots: a staging name left after recovery is a leak
     for info in c.meta().snapshots().map_err(|e| format!("{e:?}"))? {
         if cowfs_snapname::is_reserved(&info.name) {
-            return Err(format!("a staging snapshot {:?} survived recovery", info.name));
+            return Err(format!(
+                "a staging snapshot {:?} survived recovery",
+                info.name
+            ));
         }
     }
     let left: Vec<String> = fs::read_dir(dir)
@@ -677,12 +727,16 @@ fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
     }
     for n in ex.acked.keys() {
         if !visible.contains(n) && !ex.may_vanish.contains(n) {
-            return Err(format!("durable snapshot {n:?} is missing (visible {visible:?})"));
+            return Err(format!(
+                "durable snapshot {n:?} is missing (visible {visible:?})"
+            ));
         }
     }
     for (old, new) in &ex.renamed {
         if !visible.contains(old) && !visible.contains(new) {
-            return Err(format!("renamed snapshot {old:?} -> {new:?} exists under neither name"));
+            return Err(format!(
+                "renamed snapshot {old:?} -> {new:?} exists under neither name"
+            ));
         }
     }
     for n in &visible {
@@ -698,7 +752,9 @@ fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
             } else {
                 return Err(format!(
                     "snapshot {n:?} is neither its old tree nor the swapped-in one: {:?}",
-                    got.iter().map(|(k, v)| (k.clone(), v.len())).collect::<Vec<_>>()
+                    got.iter()
+                        .map(|(k, v)| (k.clone(), v.len()))
+                        .collect::<Vec<_>>()
                 ));
             }
         } else if let Some(want) = ex.acked.get(n) {
@@ -723,20 +779,27 @@ fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
     }
     // a second operation: a new snapshot with data, then a promotion, then a reopen
     let probe = data(18_000, 99);
-    c.create_snapshot("zz-after").map_err(|e| format!("create after crash: {e:?}"))?;
+    c.create_snapshot("zz-after")
+        .map_err(|e| format!("create after crash: {e:?}"))?;
     let fs = c.snapshot_view("zz-after").map_err(|e| format!("{e:?}"))?;
-    let a = fs.create(ROOT_INO, b"p", 0o644).map_err(|e| format!("{e:?}"))?;
+    let a = fs
+        .create(ROOT_INO, b"p", 0o644)
+        .map_err(|e| format!("{e:?}"))?;
     write_all(&fs, a.ino, 0, &probe);
-    fs.fsync(a.ino, false).map_err(|e| format!("fsync after crash: {e:?}"))?;
+    fs.fsync(a.ino, false)
+        .map_err(|e| format!("fsync after crash: {e:?}"))?;
     fs.forget(a.ino, 1);
     drop(fs);
-    c.promote_base("zz-after", "zz-promoted").map_err(|e| format!("promote after crash: {e:?}"))?;
+    c.promote_base("zz-after", "zz-promoted")
+        .map_err(|e| format!("promote after crash: {e:?}"))?;
     c.sync().map_err(|e| format!("{e:?}"))?;
     drop(c);
     let c = Core::open(dir, core_opts()).map_err(|e| format!("second reopen failed: {e:?}"))?;
     c.check().map_err(|e| format!("second check: {e:?}"))?;
     for name in ["zz-after", "zz-promoted"] {
-        let fs = c.snapshot_view(name).map_err(|e| format!("{name}: {e:?}"))?;
+        let fs = c
+            .snapshot_view(name)
+            .map_err(|e| format!("{name}: {e:?}"))?;
         let mut got = Tree::new();
         walk(&fs, ROOT_INO, "", &mut got)?;
         if got.get("p") != Some(&probe) {
@@ -750,7 +813,10 @@ fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
 }
 
 fn env(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn brief(op: &LogOp) -> String {
@@ -773,7 +839,12 @@ fn sweep(run: &Run, seeds: u64, threads: usize) -> Tally {
                 let mut t = Tally::default();
                 for k in (0..=run.ops.len()).filter(|k| k % threads == th) {
                     // the interval the cut falls in: the last acknowledgement stamped before k
-                    let (_, j) = *run.ack_at.iter().rev().find(|(p, _)| *p < k).unwrap_or(&run.ack_at[0]);
+                    let (_, j) = *run
+                        .ack_at
+                        .iter()
+                        .rev()
+                        .find(|(p, _)| *p < k)
+                        .unwrap_or(&run.ack_at[0]);
                     let ex = &run.acks[j.min(run.acks.len() - 1)];
                     for seed in 0..seeds {
                         let mut rng = Rng(seed ^ ((k as u64) << 20) ^ 0x57A1);
@@ -785,7 +856,11 @@ fn sweep(run: &Run, seeds: u64, threads: usize) -> Tally {
                         );
                         let dir = tempfile::tempdir().unwrap();
                         write_image(&img, &dir.path().join("store"));
-                        fs::write(dir.path().join("meta.redb"), meta_image(run, k, seed % 3, &mut rng)).unwrap();
+                        fs::write(
+                            dir.path().join("meta.redb"),
+                            meta_image(run, k, seed % 3, &mut rng),
+                        )
+                        .unwrap();
                         for (n, b) in root_image(run, k, &mut rng) {
                             fs::write(dir.path().join(n), b).unwrap();
                         }
@@ -798,6 +873,7 @@ fn sweep(run: &Run, seeds: u64, threads: usize) -> Tally {
                 let mut g = total.lock().unwrap();
                 g.images += t.images;
                 g.with_intent += t.with_intent;
+                g.torn_intent += t.torn_intent;
                 g.old_tree += t.old_tree;
                 g.new_tree += t.new_tree;
                 g.failures.extend(t.failures);
@@ -809,13 +885,14 @@ fn sweep(run: &Run, seeds: u64, threads: usize) -> Tally {
 
 fn report(run: &Run, t: &Tally) {
     println!(
-        "{} power-cut images over {} ops ({} root ops, {} metadata events, {} acks), {} with an intent file on disk, swap targets old/new = {}/{}, gc unlinked {} packs",
+        "{} power-cut images over {} ops ({} root ops, {} metadata events, {} acks), {} with an intent file on disk ({} torn), swap targets old/new = {}/{}, gc unlinked {} packs",
         t.images,
         run.ops.len(),
         run.rops.len(),
         run.meta_evs.len(),
         run.ack_at.len() - 1,
         t.with_intent,
+        t.torn_intent,
         t.old_tree,
         t.new_tree,
         run.gc_unlinked,
@@ -825,23 +902,116 @@ fn report(run: &Run, t: &Tally) {
 #[test]
 fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() {
     let run = record(true);
-    assert!(run.ops.len() > 200, "the timeline is too short to mean anything: {}", run.ops.len());
-    assert!(run.gc_unlinked > 0, "the recorded gc cycle reclaims nothing");
+    assert!(
+        run.ops.len() > 200,
+        "the timeline is too short to mean anything: {}",
+        run.ops.len()
+    );
+    assert!(
+        run.gc_unlinked > 0,
+        "the recorded gc cycle reclaims nothing"
+    );
     assert!(
         run.rops.iter().any(|o| matches!(o, RootOp::Rename(..)))
             && run.rops.iter().any(|o| matches!(o, RootOp::Unlink(_))),
         "the swaps left no intent-file ops"
     );
-    assert_eq!(run.rops.iter().filter(|o| matches!(o, RootOp::Rename(..))).count(), run.swaps);
-    let t = sweep(&run, env("COWFS_POWER_SEEDS", 6) as u64, env("COWFS_POWER_THREADS", 4));
+    assert_eq!(
+        run.rops
+            .iter()
+            .filter(|o| matches!(o, RootOp::Rename(..)))
+            .count(),
+        run.swaps
+    );
+    let t = sweep(
+        &run,
+        env("COWFS_POWER_SEEDS", 6) as u64,
+        env("COWFS_POWER_THREADS", 4),
+    );
     report(&run, &t);
     assert!(t.images > 1000);
-    assert!(t.with_intent > 0, "no image caught a swap with its intent file on disk");
-    assert!(t.old_tree > 0 && t.new_tree > 0, "a swap target never came back as both outcomes");
+    assert!(
+        t.with_intent > 0,
+        "no image caught a swap with its intent file on disk"
+    );
+    assert!(
+        t.old_tree > 0 && t.new_tree > 0,
+        "a swap target never came back as both outcomes"
+    );
     for f in t.failures.iter().take(8) {
         eprintln!("FAIL {f}");
     }
-    assert!(t.failures.is_empty(), "{} of {} power-cut images failed", t.failures.len(), t.images);
+    assert!(
+        t.failures.is_empty(),
+        "{} of {} power-cut images failed",
+        t.failures.len(),
+        t.images
+    );
+}
+
+/// The model is only as good as the log. Cut after the last op, nothing is in flight, and the image
+/// must be the disk the workload really left: no store, metadata or root write went round the log
+/// (for instance on another thread, which a thread-local log cannot see).
+#[test]
+fn the_recorded_log_replays_to_the_real_disk() {
+    let o = core_opts();
+    assert!(
+        !o.background && !o.meta.background,
+        "a background thread would log nowhere"
+    );
+    let run = record(true);
+    let n = run.ops.len();
+    let mut rng = Rng(1);
+    let img = crash_image(&run.store_base, &run.ops, n, &mut rng, 3);
+    let packs = |i: &Image| -> Image {
+        i.iter()
+            .filter(|(k, _)| k.starts_with("pack-"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    assert!(
+        packs(&img) == packs(&run.final_store),
+        "the store's log does not replay to its disk"
+    );
+    assert!(
+        meta_image(&run, n, 0, &mut rng) == run.final_meta,
+        "the metadata log does not replay to its file"
+    );
+    let mut root: Vec<String> = root_image(&run, n, &mut rng).into_keys().collect();
+    root.sort();
+    assert_eq!(
+        root, run.final_root,
+        "the root log does not replay to its directory"
+    );
+    // and it is not trivially empty: every kind of op is in it
+    for (what, seen) in [
+        (
+            "create",
+            run.rops.iter().any(|o| matches!(o, RootOp::Create(_))),
+        ),
+        (
+            "write",
+            run.rops.iter().any(|o| matches!(o, RootOp::Write(..))),
+        ),
+        (
+            "sync",
+            run.rops.iter().any(|o| matches!(o, RootOp::Sync(_))),
+        ),
+        (
+            "dirsync",
+            run.rops.iter().any(|o| matches!(o, RootOp::DirSync)),
+        ),
+        (
+            "unlink",
+            run.rops.iter().any(|o| matches!(o, RootOp::Unlink(_))),
+        ),
+        (
+            "store unlink",
+            run.ops.iter().any(|o| matches!(o, LogOp::Unlink { .. })),
+        ),
+    ] {
+        assert!(seen, "no {what} op in the recorded log");
+    }
 }
 
 /// The test must be able to see the bug it guards against: without the store sync before durable
@@ -850,12 +1020,21 @@ fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() 
 #[test]
 fn the_power_test_notices_a_missing_store_sync_before_metadata_commits() {
     let run = record(false);
-    let t = sweep(&run, env("COWFS_POWER_SEEDS", 6) as u64, env("COWFS_POWER_THREADS", 4));
+    let t = sweep(
+        &run,
+        env("COWFS_POWER_SEEDS", 6) as u64,
+        env("COWFS_POWER_THREADS", 4),
+    );
     report(&run, &t);
     assert!(
         !t.failures.is_empty(),
         "no image of {} failed without the store sync hook: the test is blind",
         t.images
     );
-    println!("hook off: {} of {} images fail, first: {}", t.failures.len(), t.images, t.failures[0]);
+    println!(
+        "hook off: {} of {} images fail, first: {}",
+        t.failures.len(),
+        t.images,
+        t.failures[0]
+    );
 }

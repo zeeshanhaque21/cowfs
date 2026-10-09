@@ -200,11 +200,11 @@ pub mod rootlog {
         let idx = LOG.with(|l| {
             l.borrow_mut().as_mut().map(|v| {
                 v.push(op());
-                v.len() as u64 - 1
+                u32::try_from(v.len() - 1).expect("cowfs-rootlog: more than 2^32 recorded ops")
             })
         });
         if let Some(i) = idx {
-            cowfs_store::oplog_marker(ROOT_MARK | i);
+            cowfs_store::oplog_marker(ROOT_MARK | u64::from(i));
         }
     }
 }
