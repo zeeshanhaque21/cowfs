@@ -1009,6 +1009,23 @@ mod tests {
     }
 
     #[test]
+    fn jukebox_carries_the_failure_body_of_its_procedure() {
+        let tail = |proc| {
+            let mut out = Vec::new();
+            jukebox_reply(7, proc, &mut out).unwrap();
+            let at = out
+                .windows(4)
+                .rposition(|w| w == 10008_u32.to_be_bytes())
+                .expect("status");
+            assert!(out[at + 4..].iter().all(|b| *b == 0));
+            out.len() - at - 4
+        };
+        // GETATTR: status only; LOOKUP: post_op_attr; SETATTR: wcc_data; LINK: attr + wcc;
+        // RENAME: two wcc_data.
+        assert_eq!([tail(1), tail(3), tail(2), tail(15), tail(14)], [0, 4, 8, 12, 16]);
+    }
+
+    #[test]
     fn access_follows_the_owner_bits() {
         let all = 0x3f;
         let file = attr(0o644, ftype3::NF3REG);
