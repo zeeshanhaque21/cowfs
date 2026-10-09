@@ -1671,7 +1671,7 @@ fn a_torn_marks_file_is_walked_in_full_and_the_cycle_still_reclaims() {
     let whole = fs::read(&path).expect("the first cycle wrote a marks file");
     assert_eq!(
         &whole[..8],
-        b"COWMARK3",
+        b"COWMARK4",
         "the file under test is the format this change writes"
     );
     // Keep one whole group and cut the next one short, so a loader that only checked the first group
@@ -1702,7 +1702,7 @@ fn a_torn_marks_file_is_walked_in_full_and_the_cycle_still_reclaims() {
 /// walk shared a subtree is *not* written, and the only observable for that is the file itself.
 fn recorded_roots(path: &Path) -> Vec<[u8; 32]> {
     let bytes = std::fs::read(path).expect("marks file");
-    assert_eq!(&bytes[..8], b"COWMARK3", "unexpected marks format");
+    assert_eq!(&bytes[..8], b"COWMARK4", "unexpected marks format");
     let n = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
     let mut rest = &bytes[16..];
     let mut out = Vec::new();

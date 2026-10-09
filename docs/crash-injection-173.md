@@ -194,9 +194,10 @@ Fail-closed asserts: some image lost a source pack and some kept all; the `late`
 
 Collector state tolerates the states a power cut leaves (old, torn, missing), so it is not routed through the store's fsync model.
 `gc_state_is_advisory` is the evidence: 64 seeds of every old/new/torn/missing mix over the final disk never lose a block or fail a collect, and a snapshot untouched since phase A (`frozen`) makes the next cycle read the persisted mark cache.
-It is NOT advisory against same-length corruption: `mark.bin` has no checksum, and flipping bytes in it or zeroing a 64-byte span loses live blocks (`atime.bin` is unaffected).
-`mark_bin_bit_rot_loses_live_blocks_KNOWN_BUG` pins that as an ignored test; it passes once the file is checksummed.
-The shipped fsyncs make power loss safe; bit rot is a separate defect.
+It is advisory against same-length corruption too: `mark.bin` ends in a BLAKE3 hash of everything before it (`COWMARK4`), and a mismatch discards the cache so every root is walked in full (issue 288).
+`mark_bin_bit_rot_is_rebuilt` zeroes a 64-byte span of `mark.bin` over 64 seeds and checks no block is lost; it was the ignored `mark_bin_bit_rot_loses_live_blocks_KNOWN_BUG`, which lost live blocks on 58 of 64 seeds.
+`atime.bin` needs no hash: it only orders work and never decides what is freed.
+The shipped fsyncs make power loss safe; the hash covers bit rot and partial overwrites.
 `GA1` (no file fsync) and `GA2` (no directory fsync) survive because the test already explores every torn, old or missing state those fsyncs could change, so they are equivalent here, not because the state is harmless.
 
 Mutants (`MUT_PKG=cowfs-gc MUT_ARGS="--test power_collect" python3 crates/cowfs-store/tests/mutate.py ...`):
