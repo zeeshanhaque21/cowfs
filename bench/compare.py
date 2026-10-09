@@ -57,7 +57,7 @@ unmeasurable gates (`RESULT: FAIL (1), 1 unmeasurable`); exit 2 means no gate fa
 
 The g2 rule (macOS budget or Linux ratio) follows the platform the reps were MEASURED on, not the one compare.py runs on:
 meta `measured_on` ("macos" or "linux", written by gates.py), else for older data the meta `platform` string
-(macOS/Darwin or Linux). Neither, or arms measured on different platforms, is INVALID (3) when g2 reps are present.
+(macOS/Darwin or Linux). Neither, fields that disagree, or arms measured on different platforms, is INVALID (3) when g2 reps are present.
 
 Criterion (docs/design.md, amended by issue #18):
   g1 clean cargo build      ratio <= 1.5 on every platform
@@ -260,20 +260,22 @@ def g5_problem(row, meta_bytes):
     return None
 
 
+def legacy_platform(meta):
+    """"macos", "linux" or None from the meta `platform` string (platform.platform(): macOS/Darwin or Linux)."""
+    v = meta.get("platform")
+    low = v.lower() if isinstance(v, str) else ""
+    return "macos" if low.startswith(("macos", "darwin")) else "linux" if low.startswith("linux") else None
+
+
 def measured_on(meta):
     """"macos", "linux" or None: where the reps were measured, which is not where compare.py runs.
 
-    Rule: meta `measured_on` (written by gates.py) wins. Data from before that field falls back to the meta
-    `platform` string (platform.platform(), starting "macOS"/"Darwin" or "Linux"). Anything else is unknown.
+    Rule: meta `measured_on` (written by gates.py) is used when valid; data from before that field uses the meta
+    `platform` string. Anything else is unknown. g2_platform refuses a record whose two fields disagree.
     """
-    v = meta.get("measured_on")
-    if v in ("macos", "linux"):
-        return v
-    legacy = meta.get("platform")
-    if "measured_on" not in meta and isinstance(legacy, str):
-        low = legacy.lower()
-        return "macos" if low.startswith(("macos", "darwin")) else "linux" if low.startswith("linux") else None
-    return None
+    if "measured_on" in meta:
+        return meta["measured_on"] if meta["measured_on"] in ("macos", "linux") else None
+    return legacy_platform(meta)
 
 
 def g2_platform(paths):
@@ -288,6 +290,8 @@ def g2_platform(paths):
         if where is None:
             bad.append(f"{path}: g2 reps but the meta names no measuring platform (measured_on {meta.get('measured_on')!r}, platform {meta.get('platform')!r}): "
                        "the macOS budget or the Linux ratio cannot be chosen, re-run the arm")
+        elif legacy_platform(meta) not in (None, where):
+            bad.append(f"{path}: meta measured_on {where!r} disagrees with platform {meta.get('platform')!r}: the record contradicts itself, re-run the arm")
         else:
             seen[path] = where
     if len(set(seen.values())) > 1:

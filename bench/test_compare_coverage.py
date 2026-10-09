@@ -522,6 +522,13 @@ class G2PinnedToVerdict(unittest.TestCase):
             self.assertEqual(compare.g2_decision(r(5.0, 5.0), r(cow, cow), mac, 1.0), want)
             self.assertEqual(compare.verdict("g2", 5.0, cow, 0, 0, mac, 1.0)[0], want)
 
+    def test_exact_equality_on_the_range_edges(self):
+        r = lambda *w: [{"wall_s": x} for x in w]
+        # macOS: max_cow - min_nat == budget exactly is not a PASS (PASS is strictly under); min_nat 4.0, max_cow 5.0
+        self.assertIsNone(compare.g2_decision(r(4.0, 5.0), r(4.5, 5.0), True, 1.0))
+        # Linux: min_cow == 1.5 * max_nat exactly is not a FAIL (FAIL is strictly over); max_nat 4.0, min_cow 6.0
+        self.assertIsNone(compare.g2_decision(r(2.0, 4.0), r(6.0, 9.0), False, 1.0))
+
 
 class G2MeasuringPlatform(CliCase):
     """The g2 rule follows where the reps were measured, not where compare.py runs."""
@@ -544,9 +551,12 @@ class G2MeasuringPlatform(CliCase):
         self.assertEqual(rc, 0, out + err)
         self.assertIn("measured on   linux", out)
 
-    def test_measured_on_wins_over_the_platform_string(self):
-        rc, out, err = self.run_g2(platform="Darwin", measured_on="linux")
-        self.assertEqual(rc, 0, out + err)
+    def test_measured_on_disagreeing_with_the_platform_string_is_invalid(self):
+        for kw in ({"platform": "Darwin", "measured_on": "linux"}, {"platform": "Linux-6.8", "measured_on": "macos"}):
+            rc, out, err = self.run_g2(**kw)
+            self.assertEqual(rc, 3, (kw, out, err))
+            self.assertIn("disagrees", err)
+        self.assertEqual(self.run_g2(platform="Plan9", measured_on="linux")[0], 0)  # an unreadable legacy string cannot contradict
 
     def test_data_without_measured_on_falls_back_to_the_platform_string(self):
         self.assertEqual(self.run_g2(platform="Darwin")[0], 1)
@@ -561,8 +571,8 @@ class G2MeasuringPlatform(CliCase):
 
     def test_arms_measured_on_different_platforms_are_invalid(self):
         with tempfile.TemporaryDirectory() as d:
-            nat = self.arm(d, "n.jsonl", "nat", ["g2"], [rep("g2", i, w) for i, w in enumerate(self.NAT)], measured_on="macos")
-            cow = self.arm(d, "c.jsonl", "cow", ["g2"], [rep("g2", i, w) for i, w in enumerate(self.COW)], measured_on="linux")
+            nat = self.arm(d, "n.jsonl", "nat", ["g2"], [rep("g2", i, w) for i, w in enumerate(self.NAT)], platform="Darwin", measured_on="macos")
+            cow = self.arm(d, "c.jsonl", "cow", ["g2"], [rep("g2", i, w) for i, w in enumerate(self.COW)], platform="Linux-6.8", measured_on="linux")
             rc, out, err = self.cli([nat], cow)
         self.assertEqual(rc, 3, out + err)
         self.assertIn("different platforms", err)
