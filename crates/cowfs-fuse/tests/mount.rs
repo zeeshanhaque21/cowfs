@@ -308,10 +308,6 @@ fn fallocate_modes_through_a_mount() {
 fn unsupported_operations_report_enotsup() {
     let Some(fx) = Fixture::new("") else { return };
     fs::write(fx.p("a"), b"copy me").unwrap();
-    let out = Command::new("mkfifo").arg(fx.p("fifo")).output().unwrap();
-    assert!(
-        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("not supported")
-    );
     // collapse and insert range are not supported; the other modes are (see the next test)
     let f = OpenOptions::new().write(true).open(fx.p("a")).unwrap();
     assert_eq!(falloc(&f, 0x08, 0, 4096), libc::EOPNOTSUPP);

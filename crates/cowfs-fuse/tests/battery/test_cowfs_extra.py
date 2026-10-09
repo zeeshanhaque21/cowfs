@@ -93,7 +93,8 @@ check("xattr remove", sorted(os.listxattr(P("x"))) == ["user.big"] and errno_of(
 
 os.mknod(P("reg"), stat.S_IFREG | 0o644)
 check("mknod regular file", stat.S_ISREG(os.stat(P("reg")).st_mode))
-check("mknod fifo is refused", errno_of(os.mkfifo, P("fifo")) != 0 and not os.path.exists(P("fifo")))
+os.mkfifo(P("fifo"), 0o640)
+check("mknod fifo is a fifo", stat.S_ISFIFO(os.lstat(P("fifo")).st_mode) and stat.S_IMODE(os.lstat(P("fifo")).st_mode) == 0o640)
 
 sv = os.statvfs(W)
 check("statfs", sv.f_bsize > 0 and sv.f_blocks > 0 and sv.f_namemax == 255, str(sv))
