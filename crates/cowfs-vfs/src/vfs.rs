@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::types::FallocMode;
 use crate::types::{
     Attr, DirEntryPlus, FileHandle, Ino, ReadDir, ReadDirPlus, RenameFlags, SetAttr, StatFs,
     XattrFlags,
@@ -171,4 +172,18 @@ pub trait Vfs: Send + Sync {
 
     /// `Error::NoAttr` if absent.
     fn removexattr(&self, ino: Ino, name: &[u8]) -> Result<()>;
+
+    /// Allocates, punches or zeroes `[offset, offset + len)` of a regular file atomically and
+    /// returns the new attributes. See `FallocMode` for each mode.
+    ///
+    /// `len == 0` is `Error::InvalidArgument`. A range past the largest file size is an error
+    /// and changes nothing. A directory is `Error::IsDir` and a symlink `Error::InvalidArgument`.
+    /// `PunchHole` and both `ZeroRange` modes are content changes, so they set mtime and ctime.
+    /// There is no preallocation: no mode consumes space, and `blocks` never grows.
+    ///
+    /// The default is `Error::NotSupported`. An implementation that forwards calls to another
+    /// `Vfs` must forward this one, or it hides the capability.
+    fn fallocate(&self, _ino: Ino, _mode: FallocMode, _offset: u64, _len: u64) -> Result<Attr> {
+        Err(crate::Error::NotSupported)
+    }
 }

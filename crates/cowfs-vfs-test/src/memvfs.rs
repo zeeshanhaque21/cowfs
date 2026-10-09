@@ -7,6 +7,8 @@ use cowfs_vfs::{
     SetAttr, SetTime, StatFs, Timestamp, Vfs, XattrFlags, MODE_MASK, ROOT_INO,
 };
 
+use cowfs_vfs::FallocMode;
+
 use crate::pages::{Pages, MAX_FILE, PAGE};
 
 /// Default limit on the number of names of one file or symlink (like ext4's 65000).
@@ -76,6 +78,14 @@ pub enum Fault {
     XattrNameUnchecked,
     InoReuse,
     ReaddirAttrsNoAttrs,
+    /// `fallocate` punch and zero-range leave the old bytes in place.
+    PunchNoop,
+    /// `fallocate` mode `Allocate` sets the size to `offset + len` even when that shrinks it.
+    AllocateShrinks,
+    /// `fallocate` `PunchHole` extends the size like `ZeroRange` does.
+    PunchChangesSize,
+    /// `fallocate` `ZeroRange` past the end zeroes but leaves the size alone.
+    ZeroRangeNoExtend,
 }
 
 impl Fault {
@@ -140,6 +150,10 @@ impl Fault {
         Fault::XattrNameUnchecked,
         Fault::InoReuse,
         Fault::ReaddirAttrsNoAttrs,
+        Fault::PunchNoop,
+        Fault::AllocateShrinks,
+        Fault::PunchChangesSize,
+        Fault::ZeroRangeNoExtend,
     ];
 }
 

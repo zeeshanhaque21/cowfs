@@ -5,6 +5,7 @@
 //! file size for a fully written file, less than the file size for a sparse one); read and
 //! write on a directory are `IsDir`, on a symlink `InvalidArgument`.
 
+use cowfs_vfs::FallocMode;
 use cowfs_vfs::{Error, SetAttr, SetTime, Timestamp, ROOT_INO};
 
 use super::basic::near;
@@ -443,6 +444,224 @@ pub fn read_huge_size_on_small_file(c: &Ctx) -> Outcome {
     ensure!(
         c.fs.read(f, 4, u32::MAX)?.is_empty(),
         "read of u32::MAX bytes at the end returned data"
+    );
+    Ok(())
+}
+
+/// The byte model of `fallocate`: `[off, off + len)` is zeroed inside the file, and the file
+/// grows to `off + len` when `extend`.
+fn model_fallocate(model: &mut Vec<u8>, off: usize, len: usize, zero: bool, extend: bool) {
+    let end = off + len;
+    if zero {
+        let hi = end.min(model.len());
+        if off < hi {
+            model[off..hi].fill(0);
+        }
+    }
+    if extend && end > model.len() {
+        model.resize(end, 0);
+    }
+}
+
+const FALLOC_MODES: [(FallocMode, bool, bool); 5] = [
+    (FallocMode::Allocate, false, true),
+    (FallocMode::KeepSize, false, false),
+    (FallocMode::PunchHole, true, false),
+    (FallocMode::ZeroRange, true, true),
+    (FallocMode::ZeroRangeKeepSize, true, false),
+];
+
+/// A punch makes the range inside the file read as zeros, leaves every other byte and the size
+/// alone, and frees whole pages. A range that crosses or lies past the end changes no size.
+pub fn fallocate_punch_reads_zeros_keeps_size(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    let data = pattern(65_536, 11);
+    c.write_all(f, 0, &data)?;
+    let full = c.fs.getattr(f)?.blocks;
+    let mut model = data;
+    for (off, len) in [
+        (5000u64, 20_000u64),
+        (8192, 16_384),
+        (60_000, 100_000),
+        (70_000, 10),
+    ] {
+        let a = c.fs.fallocate(f, FallocMode::PunchHole, off, len)?;
+        model_fallocate(&mut model, off as usize, len as usize, true, false);
+        ensure_eq!(a.size, 65_536, "size after punch {off}+{len}");
+        ensure!(
+            c.content(f)? == model,
+            "content differs from the model after punch {off}+{len}"
+        );
+    }
+    ensure!(
+        c.fs.getattr(f)?.blocks < full,
+        "punching whole pages did not lower blocks"
+    );
+    Ok(())
+}
+
+/// `ZeroRange` zeroes like a punch and grows the file to the end of the range; with
+/// `ZeroRangeKeepSize` the size stays.
+pub fn fallocate_zero_range_modes(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    let data = pattern(10_000, 3);
+    c.write_all(f, 0, &data)?;
+    let a =
+        c.fs.fallocate(f, FallocMode::ZeroRangeKeepSize, 9000, 5000)?;
+    ensure_eq!(
+        a.size,
+        10_000,
+        "ZeroRangeKeepSize past the end changed the size"
+    );
+    let mut model = data;
+    model_fallocate(&mut model, 9000, 5000, true, false);
+    ensure!(c.content(f)? == model, "ZeroRangeKeepSize content");
+    let a = c.fs.fallocate(f, FallocMode::ZeroRange, 9000, 5000)?;
+    ensure_eq!(
+        a.size,
+        14_000,
+        "ZeroRange past the end did not extend the size"
+    );
+    model_fallocate(&mut model, 9000, 5000, true, true);
+    ensure!(c.content(f)? == model, "ZeroRange content");
+    let a = c.fs.fallocate(f, FallocMode::ZeroRange, 100, 200)?;
+    ensure_eq!(a.size, 14_000, "ZeroRange inside the file changed the size");
+    model_fallocate(&mut model, 100, 200, true, true);
+    ensure!(c.content(f)? == model, "ZeroRange inside the file");
+    Ok(())
+}
+
+/// `Allocate` grows the file with zeros and keeps its bytes, and never shrinks it. `KeepSize`
+/// changes nothing. No mode keeps the size smaller than it was.
+pub fn fallocate_allocate_and_keep_size(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    let data = pattern(5000, 8);
+    c.write_all(f, 0, &data)?;
+    let a = c.fs.fallocate(f, FallocMode::Allocate, 4000, 100)?;
+    ensure_eq!(a.size, 5000, "Allocate inside the file changed the size");
+    ensure!(
+        c.content(f)? == data,
+        "Allocate inside the file changed bytes"
+    );
+    let a = c.fs.fallocate(f, FallocMode::KeepSize, 4000, 1 << 20)?;
+    ensure_eq!(a.size, 5000, "KeepSize past the end changed the size");
+    ensure!(c.content(f)? == data, "KeepSize changed bytes");
+    let a = c.fs.fallocate(f, FallocMode::Allocate, 4000, 6000)?;
+    ensure_eq!(
+        a.size,
+        10_000,
+        "Allocate past the end did not extend the size"
+    );
+    let mut model = data;
+    model.resize(10_000, 0);
+    ensure!(
+        c.content(f)? == model,
+        "Allocate past the end: bytes or zero fill"
+    );
+    let a = c.fs.fallocate(f, FallocMode::Allocate, 0, 1)?;
+    ensure_eq!(a.size, 10_000, "Allocate at the start shrank the file");
+    Ok(())
+}
+
+pub fn fallocate_errors(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    c.write_all(f, 0, b"hello")?;
+    let d = c.dir(ROOT_INO, "d")?;
+    let l = c.symlink(ROOT_INO, b"l", b"f")?.ino;
+    for (mode, _, _) in FALLOC_MODES {
+        ensure_err!(
+            c.fs.fallocate(f, mode, 0, 0),
+            Error::InvalidArgument,
+            "{mode:?} with length 0"
+        );
+        ensure_err!(
+            c.fs.fallocate(d, mode, 0, 10),
+            Error::IsDir,
+            "{mode:?} on a directory"
+        );
+        ensure_err!(
+            c.fs.fallocate(l, mode, 0, 10),
+            Error::InvalidArgument,
+            "{mode:?} on a symlink"
+        );
+        ensure_err!(
+            c.fs.fallocate(0x00FF_FFFF_FFFF_F001, mode, 0, 10),
+            Error::Stale,
+            "{mode:?} on a never existing inode"
+        );
+        for (off, len) in [(1u64 << 42, 1u64), (u64::MAX, 2), (1, u64::MAX)] {
+            ensure!(
+                c.fs.fallocate(f, mode, off, len).is_err(),
+                "{mode:?} {off}+{len} past the largest file succeeded"
+            );
+        }
+    }
+    ensure_eq!(
+        c.fs.getattr(f)?.size,
+        5,
+        "a failed fallocate changed the size"
+    );
+    ensure!(
+        c.content(f)? == b"hello",
+        "a failed fallocate changed bytes"
+    );
+    Ok(())
+}
+
+/// cowfs contract: a punch or zero-range changes content, so it sets mtime and ctime.
+pub fn fallocate_content_change_bumps_mtime_and_ctime(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    c.write_all(f, 0, &pattern(10_000, 2))?;
+    for (mode, _, _) in FALLOC_MODES.iter().filter(|m| m.1) {
+        set_old_times(c, f)?;
+        let old = c.fs.getattr(f)?;
+        c.tick();
+        let a = c.fs.fallocate(f, *mode, 100, 200)?;
+        ensure!(a.mtime > old.mtime, "{mode:?} did not update mtime");
+        ensure!(a.ctime > old.ctime, "{mode:?} did not update ctime");
+    }
+    Ok(())
+}
+
+/// A seeded mix of writes and every `fallocate` mode against a byte model.
+pub fn fallocate_random_sequence_matches_model(c: &Ctx) -> Outcome {
+    let f = c.file(ROOT_INO, "f")?;
+    let mut model: Vec<u8> = Vec::new();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = |m: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % m
+    };
+    for i in 0..300u64 {
+        let off = next(60_000) as usize;
+        let len = 1 + next(12_000) as usize;
+        let pick = next(6) as usize;
+        if pick == 5 {
+            let data = pattern(len, i + 7);
+            c.write_all(f, off as u64, &data)?;
+            if model.len() < off + len {
+                model.resize(off + len, 0);
+            }
+            model[off..off + len].copy_from_slice(&data);
+        } else {
+            let (mode, zero, extend) = FALLOC_MODES[pick];
+            c.fs.fallocate(f, mode, off as u64, len as u64)?;
+            model_fallocate(&mut model, off, len, zero, extend);
+        }
+        ensure_eq!(
+            c.fs.getattr(f)?.size,
+            model.len() as u64,
+            "size after step {i} (pick {pick}, {off}+{len})"
+        );
+        if i % 10 == 9 {
+            ensure!(c.content(f)? == model, "content differs after step {i}");
+        }
+    }
+    ensure!(
+        c.content(f)? == model,
+        "final content differs from the model"
     );
     Ok(())
 }
