@@ -234,10 +234,19 @@ pub fn mknodat(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
 }
 
 /// `fchmodat` by name, for a node that has no descriptor `fchmod` accepts (an `O_PATH` one).
+/// Never follows a final symlink: one planted at the name makes this fail (Linux, `ENOTSUP`)
+/// or change the link itself (macOS), not its target.
 pub fn fchmodat(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<()> {
     let name = cstr(name)?;
     // SAFETY: see module docs.
-    cvt(unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) })?;
+    cvt(unsafe {
+        libc::fchmodat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
     Ok(())
 }
 

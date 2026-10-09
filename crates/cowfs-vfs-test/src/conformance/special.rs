@@ -17,10 +17,16 @@ const ALL_KINDS: [(FileKind, u64); 4] = [
     (FileKind::BlockDevice, makedev(8, 16)),
 ];
 
+/// Whether this process is root, by the owner of `/proc/self` (Linux; `false` elsewhere).
+fn is_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
+}
+
 /// The kinds this backend can create. A device node needs privilege on a real kernel: a backend
-/// that answers `PermissionDenied` to a device (a client of a mount, run as a normal user) is
-/// checked with the fifo and the socket only, and the device case is left to the backends that
-/// allow it (MemVfs, Core).
+/// declared `devices_need_privilege` that answers `PermissionDenied` to a device while this
+/// process is not root is checked with the fifo and the socket only, and the device case is left
+/// to the backends that allow it (MemVfs, Core). Any other `PermissionDenied` is a failure.
 fn kinds(c: &Ctx) -> std::result::Result<Vec<(FileKind, u64)>, Failure> {
     match c.mknod(
         ROOT_INO,
@@ -34,7 +40,9 @@ fn kinds(c: &Ctx) -> std::result::Result<Vec<(FileKind, u64)>, Failure> {
             c.forget_all(a.ino);
             Ok(ALL_KINDS.to_vec())
         }
-        Err(Error::PermissionDenied) => Ok(ALL_KINDS[..2].to_vec()),
+        Err(Error::PermissionDenied) if c.devices_need_privilege && !is_root() => {
+            Ok(ALL_KINDS[..2].to_vec())
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -59,8 +67,13 @@ pub fn mknod_fifo_attrs(c: &Ctx) -> Outcome {
         (1, 0, 0, 0),
         "nlink, size, blocks, rdev"
     );
-    // ctime is not compared: a backend that applies the mode after creating the node bumps it.
+    // ctime is not compared for equality: a backend that applies the mode after creating the node
+    // bumps it. It must never be older than the creation time.
     ensure!(a.atime == a.mtime, "a new node has one creation time");
+    ensure!(
+        a.ctime >= a.mtime,
+        "ctime must not precede the creation time"
+    );
     let l = c.lookup(ROOT_INO, b"p")?;
     ensure_eq!(l, a, "lookup after mknod");
     ensure_eq!(c.fs.getattr(a.ino)?, a, "getattr after mknod");
