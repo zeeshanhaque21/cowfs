@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use cowfs_vfs::Vfs;
-use cowfs_vfs_test::conformance::run_named;
+use cowfs_vfs_test::conformance::{run_all, run_named, Options};
 use cowfs_vfs_test::{Fault, MemVfs};
 
 const FAST: &[(Fault, &[&str])] = &[
@@ -42,6 +42,7 @@ const FAST: &[(Fault, &[&str])] = &[
         &["fallocate_allocate_and_keep_size"],
     ),
     (Fault::MknodDropsRdev, &["mknod_device_attrs_keep_rdev"]),
+    (Fault::MknodDeviceDenied, &["mknod_device_attrs_keep_rdev"]),
     (Fault::SpecialReadOk, &["special_io_is_invalid"]),
     (Fault::MknodNoParentTimes, &["mknod_fifo_attrs"]),
     (
@@ -77,6 +78,28 @@ fn fast_faults_are_caught() {
             assert!(caught, "{fault:?} was not caught by any expected check");
         }
     });
+}
+
+/// A kernel without `CAP_MKNOD` answers `PermissionDenied` to a device. The fallback to the fifo
+/// and the socket follows only the host probe's answer (`no_device_privilege`), never who this
+/// process claims to be: uid 0 in a user namespace has no `CAP_MKNOD` either (issue #211).
+#[test]
+fn device_permission_denied_falls_back_only_without_privilege() {
+    let denied = || -> Arc<dyn Vfs> { Arc::new(MemVfs::with_fault(Fault::MknodDeviceDenied)) };
+    for no_device_privilege in [true, false] {
+        let opts = Options {
+            filter: Some("mknod_device_attrs_keep_rdev".into()),
+            no_device_privilege,
+            ..Options::default()
+        };
+        let report = run_all(&denied, &opts);
+        assert_eq!(
+            report.passed(),
+            no_device_privilege,
+            "no_device_privilege = {no_device_privilege}:\n{}",
+            report.table()
+        );
+    }
 }
 
 #[test]

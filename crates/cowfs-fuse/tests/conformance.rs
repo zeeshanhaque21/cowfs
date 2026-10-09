@@ -68,8 +68,11 @@ fn mount_conformance() {
     };
     eprintln!("suite base directory: {}", base.display());
     let mut opts = Options::from_env();
-    // A real kernel: a device node needs root, so non-root runs check the fifo and the socket.
-    opts.devices_need_privilege = true;
+    // A real kernel makes device nodes only with CAP_MKNOD: ask it, by a probe mknod where the
+    // checks run, rather than guess from the uid (uid 0 in a user namespace lacks it). Without
+    // it the device checks fall back to the fifo and the socket.
+    opts.no_device_privilege =
+        !cowfs_vfs_path::host_can_make_devices(&base).expect("probe mknod of a device");
     if opts.timeout.is_none() {
         opts.timeout = std::time::Duration::from_secs(300).into();
     }

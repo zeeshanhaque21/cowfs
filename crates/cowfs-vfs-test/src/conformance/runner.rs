@@ -206,11 +206,13 @@ pub struct Options {
     /// the timeout. `None` means the check is reported as skipped. Native filesystems allow
     /// 65,000 or more, so the check is meant for backends that declare a smaller one.
     pub link_limit: Option<u32>,
-    /// The backend reaches a real kernel, where a device node needs root: the device checks fall
-    /// back to the fifo and the socket when this process is not root and the probe answers
+    /// The backend reaches a real kernel that refuses this process device nodes (no
+    /// `CAP_MKNOD`), as a probe `mknod` on the host found (`cowfs_vfs_path::host_can_make_devices`):
+    /// the device checks then fall back to the fifo and the socket when the backend answers
     /// `PermissionDenied`. Left false, a `PermissionDenied` to a device is a failure, so a backend
-    /// that must allow devices (MemVfs, Core) cannot regress to it unnoticed.
-    pub devices_need_privilege: bool,
+    /// that must allow devices (MemVfs, Core, or a kernel run with the privilege) cannot regress
+    /// to it unnoticed.
+    pub no_device_privilege: bool,
 }
 
 impl Options {
@@ -230,7 +232,7 @@ impl Options {
                 std::env::var("COWFS_CONFORMANCE_XATTR_NAMES").as_deref(),
                 Ok("1") | Ok("prefixed")
             ),
-            devices_need_privilege: false,
+            no_device_privilege: false,
             link_limit: std::env::var("COWFS_CONFORMANCE_LINK_LIMIT")
                 .ok()
                 .and_then(|v| v.parse().ok()),

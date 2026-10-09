@@ -149,6 +149,9 @@ impl Vfs for MemVfs {
             return Err(Error::InvalidArgument);
         }
         let mut st = self.lock();
+        if kind.is_device() && st.f(Fault::MknodDeviceDenied) {
+            return Err(Error::PermissionDenied);
+        }
         let rdev = if st.f(Fault::MknodDropsRdev) { 0 } else { rdev };
         let skip_times = st.f(Fault::MknodNoParentTimes);
         let before = st.nodes.get(&parent).map(|n| (n.mtime, n.ctime));

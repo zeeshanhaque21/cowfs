@@ -92,6 +92,8 @@ pub enum Fault {
     FallocNoTimes,
     /// `mknod` forgets the device number.
     MknodDropsRdev,
+    /// `mknod` of a device answers `PermissionDenied`, like a kernel without `CAP_MKNOD`.
+    MknodDeviceDenied,
     /// `read` of a special file succeeds with no bytes instead of `InvalidArgument`.
     SpecialReadOk,
     /// `mknod` leaves the parent's mtime and ctime alone.
@@ -167,6 +169,7 @@ impl Fault {
         Fault::FallocZeroLenOk,
         Fault::FallocNoTimes,
         Fault::MknodDropsRdev,
+        Fault::MknodDeviceDenied,
         Fault::SpecialReadOk,
         Fault::MknodNoParentTimes,
     ];

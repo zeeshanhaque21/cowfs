@@ -300,9 +300,14 @@ impl Vfs for PathVfs {
         let mut s = self.lock();
         let dir = s.dir_fd(parent)?;
         s.invalidate(parent);
-        sys::mknodat(dir.file.as_fd(), name, ty | 0o600, host).map_err(io_err)?;
-        // Set the mode explicitly: the creation mode is filtered by the umask.
-        sys::fchmodat(dir.file.as_fd(), name, mode & MODE_MASK).map_err(io_err)?;
+        let mode = mode & MODE_MASK;
+        // The mode goes in at creation, unfiltered by the umask: a chmod after `mknodat` can only
+        // go by name, and lands on whatever another process renamed over the name in between.
+        // Without a thread-private umask, fall back to that chmod and its race.
+        if !sys::mknodat_exact(dir.file.as_fd(), name, ty | mode, host).map_err(io_err)? {
+            sys::mknodat(dir.file.as_fd(), name, ty | 0o600, host).map_err(io_err)?;
+            sys::fchmodat(dir.file.as_fd(), name, mode).map_err(io_err)?;
+        }
         let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
         let ino = s.register(parent, &dir.file, name, &st)?;
         s.add_ref(ino);
@@ -643,6 +648,47 @@ impl Vfs for PathVfs {
         check_xattr_name(name)?;
         self.with_xattr(ino, |t| sys::removexattr(t, name))
     }
+}
+
+/// Whether this process may make device nodes under `dir`: a probe `mknod` of a character
+/// device in a fresh scratch directory there, removed afterwards. `EPERM` means no: no
+/// `CAP_MKNOD`, which uid 0 in a user namespace, a root container without that capability and
+/// any non-root process all lack, whatever the owner of `/proc/self` says. Always false off
+/// Linux, where `PathVfs` cannot make special files at all.
+pub fn host_can_make_devices(dir: &Path) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let scratch = dir.join(format!(".cowfs-mknod-probe-{}", std::process::id()));
+        std::fs::create_dir(&scratch)?;
+        let made = std::fs::File::open(&scratch).and_then(|d| {
+            match sys::mknodat(
+                d.as_fd(),
+                b"c",
+                sys::S_IFCHR | 0o600,
+                sys::cowfs_to_host(cowfs_vfs::makedev(1, 3)),
+            ) {
+                Ok(()) => Ok(true),
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => Ok(false),
+                Err(e) => Err(e),
+            }
+        });
+        force_remove_dir_all(&scratch);
+        made
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        Ok(false)
+    }
+}
+
+/// Whether `mknod` sets the mode as it creates the node (Linux, when a thread may detach its own
+/// umask with `unshare(CLONE_FS)`). When false it falls back to `mknodat` then a chmod by name,
+/// which a node renamed over the name in between receives. A seccomp filter that refuses
+/// `unshare`, as Docker's default profile does without `CAP_SYS_ADMIN`, makes it false.
+#[cfg(target_os = "linux")]
+pub fn mknod_mode_is_atomic() -> bool {
+    sys::private_umask_available()
 }
 
 /// Removes a directory tree even when it holds entries whose mode forbids it.
