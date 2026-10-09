@@ -594,7 +594,12 @@ fn a_torn_intent_with_the_target_still_present_keeps_the_target() {
 }
 
 fn max_id(c: &Core) -> u64 {
-    c.list_snapshots().unwrap().iter().map(|e| e.id).max().unwrap()
+    c.list_snapshots()
+        .unwrap()
+        .iter()
+        .map(|e| e.id)
+        .max()
+        .unwrap()
 }
 
 /// Issue 42 (a): a promotion forks once. The staged snapshot is renamed into the target name and
