@@ -262,10 +262,22 @@ impl Vfs for PathVfs {
         let mut s = self.lock();
         let dir = s.dir_fd(parent)?;
         s.invalidate(parent);
-        sys::mkdirat(dir.file.as_fd(), name, 0o700).map_err(io_err)?;
+        let mode = mode & MODE_MASK;
+        // The mode goes in at creation, unfiltered by the umask, so no fchmod follows on a
+        // descriptor opened by name (it would land on whatever was renamed over the name). It
+        // takes a follow-up only when the kernel may change the mode (see `mode_may_change`) or
+        // when the owner could not open the directory afterwards. Without a thread-private
+        // umask it always does.
+        let first = mode | 0o700;
+        let exact = sys::mkdirat_exact(dir.file.as_fd(), name, first).map_err(io_err)?;
+        if !exact {
+            sys::mkdirat(dir.file.as_fd(), name, 0o700).map_err(io_err)?;
+        }
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
         let fd = sys::openat(dir.file.as_fd(), name, flags, 0).map_err(io_err)?;
-        sys::fchmod(fd.as_fd(), mode & MODE_MASK).map_err(io_err)?;
+        if !exact || first != mode || mode_may_change(dir.file.as_fd(), true) {
+            sys::fchmod(fd.as_fd(), mode).map_err(io_err)?;
+        }
         let open = open_from(fd, false);
         let st = sys::fstat(open.file.as_fd()).map_err(io_err)?;
         let ino = s.register(parent, &dir.file, name, &st)?;
@@ -303,9 +315,13 @@ impl Vfs for PathVfs {
         let mode = mode & MODE_MASK;
         // The mode goes in at creation, unfiltered by the umask: a chmod after `mknodat` can only
         // go by name, and lands on whatever another process renamed over the name in between.
-        // Without a thread-private umask, fall back to that chmod and its race.
-        if !sys::mknodat_exact(dir.file.as_fd(), name, ty | mode, host).map_err(io_err)? {
+        // That chmod is left for when the kernel may change the mode (a default ACL on the
+        // parent) or no thread-private umask exists.
+        let exact = sys::mknodat_exact(dir.file.as_fd(), name, ty | mode, host).map_err(io_err)?;
+        if !exact {
             sys::mknodat(dir.file.as_fd(), name, ty | 0o600, host).map_err(io_err)?;
+        }
+        if !exact || mode_may_change(dir.file.as_fd(), false) {
             sys::fchmodat(dir.file.as_fd(), name, mode).map_err(io_err)?;
         }
         let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
@@ -650,6 +666,22 @@ impl Vfs for PathVfs {
     }
 }
 
+/// Whether creating under `dir` can leave a mode other than the one asked, even with no umask:
+/// a default ACL filters it, and a setgid parent gives a new directory its setgid bit. Anything
+/// that cannot be told counts as yes. The contract is the exact mode, for `create`, `mkdir`
+/// and `mknod` alike.
+fn mode_may_change(dir: std::os::fd::BorrowedFd<'_>, new_dir: bool) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let none = [libc::ENODATA, libc::ENOTSUP];
+        let acl = sys::getxattr(&sys::XTarget::Fd(dir), b"system.posix_acl_default");
+        if !matches!(&acl, Err(e) if e.raw_os_error().is_some_and(|c| none.contains(&c))) {
+            return true;
+        }
+    }
+    new_dir && sys::fstat(dir).map_or(true, |st| st.mode & 0o2000 != 0)
+}
+
 /// Whether this process may make device nodes under `dir`: a probe `mknod` of a character
 /// device in a fresh scratch directory there, removed afterwards. `EPERM` means no: no
 /// `CAP_MKNOD`, which uid 0 in a user namespace, a root container without that capability and
@@ -659,6 +691,8 @@ pub fn host_can_make_devices(dir: &Path) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
         let scratch = dir.join(format!(".cowfs-mknod-probe-{}", std::process::id()));
+        // A killed run (or a recycled pid) leaves its probe directory behind: clear it.
+        force_remove_dir_all(&scratch);
         std::fs::create_dir(&scratch)?;
         let made = std::fs::File::open(&scratch).and_then(|d| {
             match sys::mknodat(

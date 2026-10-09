@@ -233,56 +233,65 @@ pub fn mknodat(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
     Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
-/// Whether a thread may detach its own umask (`unshare(CLONE_FS)`), which `mknodat_exact` needs.
+/// Whether unshare(CLONE_FS) is allowed here; learned from the first attempt and never retried
+/// once refused (a seccomp filter refuses it every time, and each attempt costs a thread).
 #[cfg(target_os = "linux")]
-pub fn private_umask_available() -> bool {
-    std::thread::spawn(|| {
-        // SAFETY: as in `mknodat_exact`; this short-lived thread does nothing else.
-        unsafe { libc::unshare(libc::CLONE_FS) == 0 }
-    })
-    .join()
-    .unwrap_or(false)
-}
+static PRIVATE_UMASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-#[cfg(not(target_os = "linux"))]
-pub fn mknodat_exact(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<bool> {
-    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
-}
-
-/// `mknodat` with the permission bits of `mode` exactly as given: no umask filters them, so no
-/// chmod by name has to follow (one could land on another node renamed over the name in
-/// between). It runs on a short-lived thread that detaches its own umask with
-/// `unshare(CLONE_FS)` and sets it to 0; the process umask is never touched. `Ok(false)` means
-/// that thread could not get its own umask (a seccomp filter may refuse `unshare`) and nothing
-/// was made. A parent directory's default ACL still applies, as it would to a native `mknod`.
+/// Runs `f` on a short-lived thread that detaches its own umask with `unshare(CLONE_FS)` and
+/// sets it to 0, so a creation call there gets exactly the mode it names (a parent's default ACL
+/// still applies, as it would to a native call). The process umask is never touched. `Ok(None)`
+/// means no private umask is available (a seccomp filter may refuse `unshare`, and macOS has no
+/// per thread umask) and `f` did not run.
 #[cfg(target_os = "linux")]
-pub fn mknodat_exact(dir: BorrowedFd<'_>, name: &[u8], mode: u32, rdev: u64) -> io::Result<bool> {
-    let name = cstr(name)?;
+pub fn with_private_umask<R: Send>(f: impl FnOnce() -> io::Result<R> + Send) -> io::Result<Option<R>> {
+    if PRIVATE_UMASK.get() == Some(&false) {
+        return Ok(None);
+    }
     std::thread::scope(|s| {
         std::thread::Builder::new()
-            .name("cowfs-mknod".into())
+            .name("cowfs-umask0".into())
             .spawn_scoped(s, || {
                 // SAFETY: `unshare(CLONE_FS)` gives only this thread a private copy of its cwd,
                 // root and umask; it touches no memory. The thread ends right after.
-                if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
-                    return Ok(false);
+                let ok = unsafe { libc::unshare(libc::CLONE_FS) } == 0;
+                let _ = PRIVATE_UMASK.set(ok);
+                if !ok {
+                    return Ok(None);
                 }
                 // SAFETY: `umask` cannot fail; after the unshare it affects this thread only.
                 unsafe { libc::umask(0) };
-                // SAFETY: see module docs; `dir` is borrowed for the whole scope.
-                cvt(unsafe {
-                    libc::mknodat(
-                        dir.as_raw_fd(),
-                        name.as_ptr(),
-                        mode as libc::mode_t,
-                        rdev as libc::dev_t,
-                    )
-                })?;
-                Ok(true)
+                f().map(Some)
             })?
             .join()
-            .unwrap_or_else(|_| Err(io::Error::other("the mknod thread panicked")))
+            .unwrap_or_else(|_| Err(io::Error::other("the umask-0 thread panicked")))
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn with_private_umask<R: Send>(_: impl FnOnce() -> io::Result<R> + Send) -> io::Result<Option<R>> {
+    Ok(None)
+}
+
+/// Whether a thread may detach its own umask, which `mknodat_exact` and `mkdirat_exact` need.
+#[cfg(target_os = "linux")]
+pub fn private_umask_available() -> bool {
+    if PRIVATE_UMASK.get().is_none() {
+        let _ = with_private_umask(|| Ok(()));
+    }
+    PRIVATE_UMASK.get() == Some(&true)
+}
+
+/// `mknodat` with the permission bits of `mode` exactly as given, no umask filtering them, so no
+/// chmod by name has to follow (one could land on another node renamed over the name in
+/// between). `Ok(false)` means no private umask: nothing was made.
+pub fn mknodat_exact(dir: BorrowedFd<'_>, name: &[u8], mode: u32, rdev: u64) -> io::Result<bool> {
+    Ok(with_private_umask(|| mknodat(dir, name, mode, rdev))?.is_some())
+}
+
+/// `mkdirat` with `mode` unfiltered by the umask; `Ok(false)` as for `mknodat_exact`.
+pub fn mkdirat_exact(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<bool> {
+    Ok(with_private_umask(|| mkdirat(dir, name, mode))?.is_some())
 }
 
 /// `fchmodat` by name, for a node that has no descriptor `fchmod` accepts (an `O_PATH` one).
