@@ -275,7 +275,9 @@ impl Vfs for PathVfs {
         }
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
         let fd = sys::openat(dir.file.as_fd(), name, flags, 0).map_err(io_err)?;
-        if !exact || first != mode || mode_may_change(dir.file.as_fd(), true) {
+        // (`mkdirat` drops setuid and setgid.)
+        if !exact || first != mode || mode & 0o6000 != 0 || mode_may_change(dir.file.as_fd(), true)
+        {
             sys::fchmod(fd.as_fd(), mode).map_err(io_err)?;
         }
         let open = open_from(fd, false);

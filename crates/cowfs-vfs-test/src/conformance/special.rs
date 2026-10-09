@@ -90,6 +90,7 @@ pub fn mknod_socket_attrs(c: &Ctx) -> Outcome {
     Ok(())
 }
 
+/// The mode is exact: no umask and no default ACL on the parent filters it, as for `create`/`mkdir`.
 pub fn mknod_masks_mode(c: &Ctx) -> Outcome {
     let a = c.mknod(ROOT_INO, b"p", FileKind::Fifo, 0o170644, 0)?;
     ensure_eq!(a.mode, 0o644, "type bits are not permission bits");

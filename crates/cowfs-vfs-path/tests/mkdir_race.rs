@@ -62,5 +62,8 @@ fn mkdir_mode_never_lands_on_a_directory_swapped_in() {
     let (decoys, hit) = helper.join().expect("helper");
     drop(fs);
     cowfs_vfs_path::force_remove_dir_all(&root);
-    assert_eq!(hit, 0, "{hit} of {decoys} decoys had their mode changed by mkdir");
+    assert_eq!(
+        hit, 0,
+        "{hit} of {decoys} decoys had their mode changed by mkdir"
+    );
 }

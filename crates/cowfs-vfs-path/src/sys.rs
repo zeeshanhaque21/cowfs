@@ -244,7 +244,9 @@ static PRIVATE_UMASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// means no private umask is available (a seccomp filter may refuse `unshare`, and macOS has no
 /// per thread umask) and `f` did not run.
 #[cfg(target_os = "linux")]
-pub fn with_private_umask<R: Send>(f: impl FnOnce() -> io::Result<R> + Send) -> io::Result<Option<R>> {
+pub fn with_private_umask<R: Send>(
+    f: impl FnOnce() -> io::Result<R> + Send,
+) -> io::Result<Option<R>> {
     if PRIVATE_UMASK.get() == Some(&false) {
         return Ok(None);
     }
@@ -269,7 +271,9 @@ pub fn with_private_umask<R: Send>(f: impl FnOnce() -> io::Result<R> + Send) -> 
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn with_private_umask<R: Send>(_: impl FnOnce() -> io::Result<R> + Send) -> io::Result<Option<R>> {
+pub fn with_private_umask<R: Send>(
+    _: impl FnOnce() -> io::Result<R> + Send,
+) -> io::Result<Option<R>> {
     Ok(None)
 }
 
