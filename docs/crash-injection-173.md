@@ -51,7 +51,9 @@ Constraint from issue 88:
 - `scripts/check-fault-seam-absent.sh`, run as a CI step, builds the library crates in a separate target dir without the feature.
   It fails if `cowfs-daemon`'s feature graph enables the feature, or if the rlib contains the seam's env key `C7D_EXIT_BOUNDARY_N`.
   It then rebuilds with the feature as a positive control and fails if the key is not found, so the check cannot be blind.
-  The release `cowfs-daemon` is also searched for `oplog_start` and `crashmodel`; those two have no positive control of their own, because an unused item is dropped from a release binary.
+  The release `cowfs-daemon` is also searched for `C7D_EXIT` and `oplog_start`; the feature-on hit is the positive control for the pair, and `oplog_start` has none of its own because an unused item is dropped from a release binary.
+  `crashmodel` is not searched: the daemon never links it even with the feature on (0 hits), so a grep would pass whether or not the module were gated.
+  The compiler is that gate: `crashmodel` imports `LogOp`, whose re-export is `cfg(feature)`, so removing the cfg from `pub mod crashmodel` fails a feature-off build with E0432 (issue 276, tried on the box).
   It is a separate cargo invocation because `cargo test --workspace` turns the feature on through the dev-dependency edges.
 - Known pre-existing caveat, unchanged: `cargo build --workspace --all-targets` unifies the feature onto the lib (see `docs/verification/gc-daemon-e2e.md`).
   The CI workflow has no release build step, so the library graph above is the artifact checked.
@@ -164,12 +166,54 @@ Mutants (`crates/cowfs-store/tests/mutate.py`, run with `MUT_ARGS="--test crash 
 - N1, no new-pack fsync in `finish_compaction`: killed by the compaction plus discard sweep.
 - D1, no packs directory fsync after the unlink: killed by the discard sweep.
 
+Issue 276 follow-ups, killed by the same harness (`MUT_ARGS="--test crash --test power_discard"`):
+
+- E7, `discard` skips its leading `sync()`: killed by `discard_makes_earlier_puts_durable`.
+  A cut inside the discard cannot show it, because the base is already durable; the test puts blocks after the last sync and checks the end state (`crash_image` takes `k == ops.len()` for "after the last op returned").
+- E8, `acknowledge_corruption` skips the directory fsync after dropping `index.cix`: killed by `dropping_the_stale_checkpoint_is_followed_by_a_directory_fsync`, a static ordering check.
+  The sweep `power_loss_at_every_op_of_acknowledge_corruption_keeps_live_blocks` now reaches that path, but it cannot kill E8: `open` re-validates a resurrected checkpoint against the packs and ignores one that names a missing pack, so both outcomes of the removal are safe.
+  The removal is defence in depth, and its fsync is pinned by order, not by a loss.
+
 M2 is also killed by the process-crash test `a_crash_at_every_step_of_a_discard_leaves_the_store_clean` now that the unlink is a boundary.
 Not done: `LogOp::Rename`, because the only renames in the store are inside `write_whole`, which the model already treats as one atomic `Whole` write.
 
+## Slice 4: power loss over a whole `Gc::collect`
+
+`crates/cowfs-gc/tests/power_collect.rs`, test-only, behind the dev-dependency `fault-injection` edge; no production code, public API or on-disk format changes.
+One thread-local op log carries three timelines in one order:
+
+- the store, rebuilt by `crashmodel::crash_image` at every op index of a real reclaiming collect;
+- the metadata database, on a recording redb `StorageBackend` passed to `Meta::open_with_backend`; each backend event stamps a marker (`1 << 40 | n`) into the store log, and the image at a cut is the base plus every event up to the last completed `sync_data` (all unsynced redb writes lost);
+- the collector's state directory (`atime.bin`, `mark.bin`), as any mix of old file, new file, torn prefix and no file.
+
+The meta database runs with the mount's `before_sync` hook (store sync before metadata commit), and the recorded cycle contains two commits on purpose: a `late` snapshot whose file is committed by the freeze, and a `mid` snapshot created after the freeze listing and committed by the sweep's fresh listing; a final `meta.sync()` after the collect plays the mount's background commit.
+Both snapshots name blocks that are garbage in the store until they do, so a lost commit-before-unlink ordering shows as a missing block.
+Each image is reopened (store, meta, collector) and must: report no store loss, hold no whole-pack acceptance of a pack still on disk, pass `meta.check`, read back byte for byte every block of every durable snapshot, pass `fsck`, and survive a second collect with no error and the same receipts.
+Fail-closed asserts: some image lost a source pack and some kept all; the `late` and `mid` files are durable in some images and missing in others.
+`C173_SEEDS=n` sets the seeds (default 8; about 1100 images, 15 s on the box).
+
+Collector state tolerates the states a power cut leaves (old, torn, missing), so it is not routed through the store's fsync model.
+`gc_state_is_advisory` is the evidence: 64 seeds of every old/new/torn/missing mix over the final disk never lose a block or fail a collect, and a snapshot untouched since phase A (`frozen`) makes the next cycle read the persisted mark cache.
+It is NOT advisory against same-length corruption: `mark.bin` has no checksum, and flipping bytes in it or zeroing a 64-byte span loses live blocks (`atime.bin` is unaffected).
+`mark_bin_bit_rot_loses_live_blocks_KNOWN_BUG` pins that as an ignored test; it passes once the file is checksummed.
+The shipped fsyncs make power loss safe; bit rot is a separate defect.
+`GA1` (no file fsync) and `GA2` (no directory fsync) survive because the test already explores every torn, old or missing state those fsyncs could change, so they are equivalent here, not because the state is harmless.
+
+Mutants (`MUT_PKG=cowfs-gc MUT_ARGS="--test power_collect" python3 crates/cowfs-store/tests/mutate.py ...`):
+
+- GM1, `collect` discards the new pack instead of the source: killed.
+- M2, unlink before the watermark raise: killed.
+- N1, no new-pack fsync: killed.
+- D1, no packs directory fsync after the unlink: killed (through the whole-pack acceptance check).
+- Survivors, with the reason: W1 and E7 (watermark before data fsync, no leading sync) need a writer with unsynced puts, which a collect does not have; the store sweeps kill them.
+  GF1 and GF2 (no metadata sync at the freeze, none at the fresh listing) are equivalent mutants: `live_blocks_with_root` runs `inner.sync()` itself (db.rs:2141), so the walk commits regardless.
+  Only the combination GF1+GF2+walk-sync is observable, and only with the test's `mid` hook removed (8 of 992 images, per the critic); that defence in depth is pinned by no test.
+
+Not covered: metadata unsynced writes surviving a cut (only the durable prefix is modelled; redb's own recovery is `cowfs-meta/tests/crash.rs`), the core-level timeline with the flusher thread (slice 5), `fsops.rs` intent files.
+
 ## Out of scope and next slices
 
-- Slice 3: power loss (store part done, see above).
+- Slice 3 and 4: power loss (store and gc parts done, see above).
   Chosen mechanism: a store-boundary write-ordering simulation, extending the existing `oplog_*` crash model (which already drops unsynced writes) to a recorded `Gc::collect`.
   It proves the store's fsync ordering under modelled filesystem rules, not that a real kernel, NFS or disk honours fsync.
   Real power loss needs the VM power-cut harness (`qa4-vm.sh` and `qa5-vm.sh` show the shape); out of scope.

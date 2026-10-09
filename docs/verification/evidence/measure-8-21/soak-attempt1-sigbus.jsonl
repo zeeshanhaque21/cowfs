@@ -1,0 +1,41 @@
+{"step": "daemon.start", "pid": 1624573, "t": "12:10:53", "load1": "9.85"}
+{"step": "ctl:clone", "rc": 0, "s": 10.14, "err": "", "t": "12:11:03", "load1": "10.11"}
+{"step": "ctl:repack", "rc": 0, "s": 17.51, "err": "", "t": "12:11:21", "load1": "11.74"}
+{"step": "ctl-clean:fsck", "rc": 0, "s": 5.4, "err": "", "t": "12:11:26", "load1": "11.52"}
+{"step": "ctl-clean:verify-pack pack-0fc76f18c", "rc": 0, "s": 5.67, "err": "", "t": "12:11:32", "load1": "11.32"}
+{"step": "ctl-clean:zero4k-pages-idx", "file": "pack-0fc76f18c33e090fa13a2ddc6180e8a0eebe06b6.idx", "zero_page_runs": 0, "t": "12:11:32", "load1": "11.32"}
+{"step": "ctl-clean:zero4k-pages-pack", "file": "pack-0fc76f18c33e090fa13a2ddc6180e8a0eebe06b6.pack", "zero_page_runs": 0, "t": "12:11:32", "load1": "11.32"}
+{"step": "ctl-zeroed-idx:fsck", "rc": 11, "s": 5.67, "err": "9e023b2495bf999518d7afb41: invalid sha1 pointer in cache-tree of .git/index\nerror: 520cb6bca1971c796d760fccdfe1f338b73b2c13: invalid sha1 pointer in cache-tree of .git/index\nerror: Could not read 510e1718994d2d874f3c5c00d5505db0ce106e32\nerror: Could not read 51082ea7a525379a926f8262739419939a2ad1dc\n", "t": "12:11:38", "load1": "11.13"}
+{"step": "ctl-zeroed-idx:verify-pack pack-0fc76f18c", "rc": 1, "s": 5.36, "err": "fatal: sha1 file '/mnt/docs/Projects/cowfs-8-21/native-ctl/.git/objects/pack/pack-0fc76f18c33e090fa13a2ddc6180e8a0eebe06b6.idx' validation error\n", "t": "12:11:43", "load1": "11.28"}
+{"step": "ctl-zeroed-idx:zero4k-pages-idx", "file": "pack-0fc76f18c33e090fa13a2ddc6180e8a0eebe06b6.idx", "zero_page_runs": 1, "t": "12:11:43", "load1": "11.28"}
+{"step": "ctl-zeroed-idx:zero4k-pages-pack", "file": "pack-0fc76f18c33e090fa13a2ddc6180e8a0eebe06b6.pack", "zero_page_runs": 0, "t": "12:11:43", "load1": "11.28"}
+{"step": "positive-control", "clean_ok": true, "zeroed_idx_detected": true, "t": "12:11:43", "load1": "11.28"}
+{"step": "import", "rc": 0, "s": 15.0, "out": "{\"bytes\":883971260,\"files\":25290,\"hash_algorithm\":\"blake3\",\"imported_root_hash\":\"a4ec9964cc46452ed3026fe6558f84ecce8f7e3c4f66da1978c1b7ef57ee68a6\",\"mismatches\":[],\"mismatches_truncated\":false,\"name\":\"soak\",\"source_root_hash\":\"a4ec9964cc46452ed3026fe6558f84ecce8f7e3c4f66da1978c1b7ef57ee68a6\",\"stored_bytes\":300727986,\"verified\":true}\n", "t": "12:11:59", "load1": "11.15"}
+{"step": "manifest.src", "files": 25261, "s": 3.1, "t": "12:12:02", "load1": "11.15"}
+{"step": "head", "rc": 0, "s": 0.0, "err": "", "t": "12:12:02", "load1": "11.15"}
+{"step": "git rev-parse --abbrev-ref HEAD", "rc": 0, "s": 0.0, "err": "", "t": "12:12:02", "load1": "11.15"}
+{"step": "c0:fsck", "rc": 0, "s": 5.38, "err": "", "t": "12:12:07", "load1": "10.98"}
+{"step": "c0:verify-pack pack-5671cffe7", "rc": 0, "s": 5.7, "err": "", "t": "12:12:13", "load1": "10.90"}
+{"step": "c0:zero4k-pages-idx", "file": "pack-5671cffe7fd736a3d597b238f6bfffd01e883ea2.idx", "zero_page_runs": 0, "t": "12:12:13", "load1": "10.90"}
+{"step": "c0:zero4k-pages-pack", "file": "pack-5671cffe7fd736a3d597b238f6bfffd01e883ea2.pack", "zero_page_runs": 0, "t": "12:12:13", "load1": "10.90"}
+{"step": "c1:branch", "rc": 0, "s": 13.02, "err": "", "t": "12:12:26", "load1": "10.87"}
+{"step": "c1:add", "rc": -7, "s": 5.09, "err": "", "t": "12:12:32", "load1": "10.80"}
+{"step": "c1:commit", "rc": 128, "s": 0.25, "err": "fatal: Unable to create '/mnt/docs/Projects/cowfs-8-21/mnt-soak/soak/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository, or the lock file may be stale\n", "t": "12:12:32", "load1": "10.80"}
+{"step": "c1:status", "rc": 0, "s": 0.56, "err": "", "t": "12:12:33", "load1": "10.80"}
+{"step": "c1:checkout-back", "rc": 128, "s": 0.01, "err": "fatal: Unable to create '/mnt/docs/Projects/cowfs-8-21/mnt-soak/soak/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository, or the lock file may be stale\n", "t": "12:12:33", "load1": "10.80"}
+{"step": "c1:gc", "rc": 0, "s": 10.55, "err": "", "t": "12:12:43", "load1": "10.60"}
+{"step": "c1:fsck", "rc": 0, "s": 7.93, "err": "", "t": "12:12:51", "load1": "10.74"}
+{"step": "c1:verify-pack pack-0b0fda12d", "rc": 0, "s": 0.56, "err": "", "t": "12:12:52", "load1": "10.74"}
+{"step": "c1:zero4k-pages-idx", "file": "pack-0b0fda12ddff1aefe7380f1d8214d36b395d9ab0.idx", "zero_page_runs": 0, "t": "12:12:52", "load1": "10.74"}
+{"step": "c1:verify-pack pack-8f05a9225", "rc": 0, "s": 7.56, "err": "", "t": "12:12:59", "load1": "10.86"}
+{"step": "c1:zero4k-pages-idx", "file": "pack-8f05a922533d023ebd8ddbf4a8feb00b05bb3b0c.idx", "zero_page_runs": 0, "t": "12:12:59", "load1": "10.86"}
+{"step": "c1:zero4k-pages-pack", "file": "pack-0b0fda12ddff1aefe7380f1d8214d36b395d9ab0.pack", "zero_page_runs": 0, "t": "12:12:59", "load1": "10.86"}
+{"step": "c1:zero4k-pages-pack", "file": "pack-8f05a922533d023ebd8ddbf4a8feb00b05bb3b0c.pack", "zero_page_runs": 0, "t": "12:13:00", "load1": "10.86"}
+{"step": "c1:branch-del", "rc": 1, "s": 0.01, "err": "error: cannot delete branch 't1' used by worktree at '/mnt/docs/Projects/cowfs-8-21/mnt-soak/soak'\n", "t": "12:13:00", "load1": "10.86"}
+{"step": "c1:byte-identity", "files": 25262, "mismatches": 300, "sample": ["docs/assets/flags/in.svg", "open-sse/handlers/imageGeneration/providers/geminiInline.ts", "src/shared/constants/modelConcurrency.ts", "docs/i18n/no/docs/guides/I18N.md", "docs/i18n/bn/docs/ops/QUALITY_GATE_PLAYBOOK.md"], "s": 30.3, "t": "12:13:30", "load1": "11.33"}
+{"step": "c1:scratch", "ops": 21291, "bad": 0, "t": "12:13:30", "load1": "11.33"}
+{"step": "c2:branch", "rc": 128, "s": 0.02, "err": "fatal: Unable to create '/mnt/docs/Projects/cowfs-8-21/mnt-soak/soak/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository, or the lock file may be stale\n", "t": "12:13:30", "load1": "11.33"}
+{"step": "c2:add", "rc": 128, "s": 0.0, "err": "fatal: Unable to create '/mnt/docs/Projects/cowfs-8-21/mnt-soak/soak/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository, or the lock file may be stale\n", "t": "12:13:30", "load1": "11.33"}
+{"step": "c2:commit", "rc": 128, "s": 0.27, "err": "fatal: Unable to create '/mnt/docs/Projects/cowfs-8-21/mnt-soak/soak/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository, or the lock file may be stale\n", "t": "12:13:30", "load1": "11.33"}
+{"step": "c2:status", "rc": 0, "s": 0.44, "err": "", "t": "12:13:31", "load1": "11.33"}
+{"step": "c2:checkout-back", "rc": 128, "s": 0.01, "err": "fatal: Unable to create '/mnt/docs/Projects/cowfs-8-21/mnt-soak/soak/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository, or the lock file may be stale\n", "t": "12:13:31", "load1": "11.33"}

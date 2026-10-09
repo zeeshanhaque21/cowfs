@@ -359,6 +359,18 @@ impl Core {
         }
         // the name this snapshot is giving up cannot collide with itself
         self.inner.check_new_name_except(new, Some(old))?;
+        self.move_name(&sc, old, new)
+    }
+
+    /// Moves the name of `sc`, currently `old`, to `new` in one metadata transaction, then brings
+    /// the live registry in line. Staging names are allowed: the swap moves its staged tree into the
+    /// target name this way. The caller has checked `new`.
+    pub(crate) fn move_name(
+        &self,
+        sc: &Arc<SnapCtx>,
+        old: &str,
+        new: &str,
+    ) -> Result<SnapshotEntry, ControlError> {
         let id = SnapshotId(sc.id);
         self.inner
             .meta

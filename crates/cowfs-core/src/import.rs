@@ -3,8 +3,8 @@
 //! The bytes go into a staging snapshot whose name is reserved, so a crash or a kill -9 leaves
 //! nothing visible: the name the caller asked for appears only after the whole tree is written,
 //! made durable, and read back through the `Vfs` and compared with the source byte for byte. The
-//! switch is then one fork of the staging snapshot into the real name, so it is a single root
-//! write like any other snapshot operation.
+//! switch is then a rename of the staging snapshot to the real name, so it is a single metadata
+//! transaction like any other snapshot operation.
 //!
 //! Peak extra disk is bounded by construction: the source is never written to, no uncompressed
 //! copy is ever staged on disk, and one 64 KiB buffer is in flight per file. The bytes the store

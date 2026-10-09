@@ -498,6 +498,7 @@ def meta(root: Path, label: str, reps: int, gates: list, n: dict) -> dict:
         "cargo_jobs": os.environ.get("COWFS_BENCH_CARGO_JOBS", "4"),
         "host": platform.node(),
         "platform": platform.platform(),
+        "measured_on": {"darwin": "macos", "linux": "linux"}.get(sys.platform, sys.platform),  # compare.py picks the g2 rule from this
         "python": platform.python_version(),
         "started": time.time(),
     }

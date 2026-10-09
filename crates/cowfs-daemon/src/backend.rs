@@ -830,9 +830,9 @@ impl Snapshots for CoreSnapshots {
             self.with(|c| c.promote_base(from, name).map_err(control_io).map(|_| ()))
         })?;
         let mut info = self.info(name)?;
-        // The core forks twice: `from` into a staging name, then the staging name into `name`. So
-        // the parent it records is the staging snapshot, which the swap then removes. The
-        // protocol's `parent` is the snapshot this one was cloned from, which is `from`.
+        // The core forks `from` into a staging name and renames it to `name`. Only the daemon
+        // reports `parent` as `from` explicitly: that is the protocol's meaning, whatever the core
+        // records.
         info.parent = Some(from.to_owned());
         Ok(info)
     }

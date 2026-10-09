@@ -24,7 +24,7 @@
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ack;
@@ -346,6 +346,8 @@ impl Store {
     pub fn copy_batch(&self, c: &mut Compaction, budget: u64) -> Result<bool> {
         let budget = if budget == 0 { DEFAULT_BATCH } else { budget };
         let mut used = 0;
+        // Built once per call, not per record: only the crash-model log reads the name.
+        let mut target_path: Option<PathBuf> = None;
         while c.at < c.ids.len() {
             let id = c.ids[c.at];
             let loc = c.locs[c.at];
@@ -366,7 +368,8 @@ impl Store {
                 reason: "new pack past the 4 GiB limit",
             })?;
             let g = self.guts();
-            g.io.write_at(&target, &pack::pack_path(g.dir, c.to), c.len, &raw)?;
+            let path = target_path.get_or_insert_with(|| pack::pack_path(g.dir, c.to));
+            g.io.write_at(&target, path, c.len, &raw)?;
             c.len += need;
             c.moved.push((
                 id,

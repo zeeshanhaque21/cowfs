@@ -1,0 +1,462 @@
+{
+ "reps": 5,
+ "host_load_start": "9.91",
+ "native_clean_build": {
+  "s": {
+   "n": 3,
+   "median": 9.969099586014636,
+   "min": 9.96696275594877,
+   "max": 10.019346541026607,
+   "stdev": 0.029646201189434045
+  },
+  "raw": [
+   [
+    9.97,
+    34,
+    0
+   ],
+   [
+    9.97,
+    34,
+    0
+   ],
+   [
+    10.02,
+    34,
+    0
+   ]
+  ]
+ },
+ "base_mb_apparent": 221,
+ "base_inodes": 566,
+ "base_hardlinked_files": 18,
+ "base_files": 462,
+ "native_inplace_rebuild": {
+  "s": 0.04467644199030474,
+  "rc": 0,
+  "compiling": 0,
+  "fresh": 34,
+  "tail": [
+   "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s"
+  ]
+ },
+ "import_s": 3.203979819023516,
+ "import_out": "{\"bytes\":302764445,\"files\":462,\"hash_algorithm\":\"blake3\",\"imported_root_hash\":\"2dbdafaaeddd46f2918519277ac3c011d16bd7601bea05ccbe14c8d6e93ce5a8\",\"mismatches\":[],\"mismatches_truncated\":false,\"name\":\"cbase\",\"source_root_hash\":\"2dbdafaaeddd46f2918519277ac3c011d16bd7601bea05ccbe14c8d6e93ce5a8\",\"stored_bytes\":49016019,\"verified\":true}\n",
+ "mount_inodes": 566,
+ "mount_hardlinked_files": 0,
+ "host_load_per_rep": [
+  "11.11",
+  "12.81",
+  "12.79",
+  "12.36",
+  "12.53"
+ ],
+ "raw": [
+  {
+   "rep": 0,
+   "cowfs_hardlinked_files": 0,
+   "cowfs": {
+    "s": 9.447231050988194,
+    "rc": 0,
+    "compiling": 19,
+    "fresh": 15,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.42s"
+    ]
+   },
+   "cp_a_reflink_hardlinked_files": 18,
+   "cp_a_reflink": {
+    "s": 0.06344295298913494,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   },
+   "cp_a_noreflink_hardlinked_files": 18,
+   "cp_a_noreflink": {
+    "s": 0.06437188002746552,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   },
+   "rsync_aH_hardlinked_files": 18,
+   "rsync_aH": {
+    "s": 0.07015510997734964,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   },
+   "git_worktree": {
+    "s": 9.824959004996344,
+    "rc": 0,
+    "compiling": 34,
+    "fresh": 0,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.80s"
+    ]
+   }
+  },
+  {
+   "rep": 1,
+   "cowfs_hardlinked_files": 0,
+   "cowfs": {
+    "s": 9.597243848955259,
+    "rc": 0,
+    "compiling": 19,
+    "fresh": 15,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.57s"
+    ]
+   },
+   "cp_a_reflink_hardlinked_files": 18,
+   "cp_a_reflink": {
+    "s": 0.04592103901086375,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s"
+    ]
+   },
+   "cp_a_noreflink_hardlinked_files": 18,
+   "cp_a_noreflink": {
+    "s": 0.06561984797008336,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   },
+   "rsync_aH_hardlinked_files": 18,
+   "rsync_aH": {
+    "s": 0.07971609599189833,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   },
+   "git_worktree": {
+    "s": 9.895021893025842,
+    "rc": 0,
+    "compiling": 34,
+    "fresh": 0,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.87s"
+    ]
+   }
+  },
+  {
+   "rep": 2,
+   "cowfs_hardlinked_files": 0,
+   "cowfs": {
+    "s": 9.398806834011339,
+    "rc": 0,
+    "compiling": 19,
+    "fresh": 15,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.37s"
+    ]
+   },
+   "cp_a_reflink_hardlinked_files": 18,
+   "cp_a_reflink": {
+    "s": 0.046707779983989894,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s"
+    ]
+   },
+   "cp_a_noreflink_hardlinked_files": 18,
+   "cp_a_noreflink": {
+    "s": 0.07936908502597362,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s"
+    ]
+   },
+   "rsync_aH_hardlinked_files": 18,
+   "rsync_aH": {
+    "s": 0.06382982700597495,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   },
+   "git_worktree": {
+    "s": 9.600692779989913,
+    "rc": 0,
+    "compiling": 34,
+    "fresh": 0,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.58s"
+    ]
+   }
+  },
+  {
+   "rep": 3,
+   "cowfs_hardlinked_files": 0,
+   "cowfs": {
+    "s": 9.24356006103335,
+    "rc": 0,
+    "compiling": 19,
+    "fresh": 15,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.22s"
+    ]
+   },
+   "cp_a_reflink_hardlinked_files": 18,
+   "cp_a_reflink": {
+    "s": 0.06344670098042116,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   },
+   "cp_a_noreflink_hardlinked_files": 18,
+   "cp_a_noreflink": {
+    "s": 0.08817378705134615,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   },
+   "rsync_aH_hardlinked_files": 18,
+   "rsync_aH": {
+    "s": 0.06739575299434364,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s"
+    ]
+   },
+   "git_worktree": {
+    "s": 9.932381679012906,
+    "rc": 0,
+    "compiling": 34,
+    "fresh": 0,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.91s"
+    ]
+   }
+  },
+  {
+   "rep": 4,
+   "cowfs_hardlinked_files": 0,
+   "cowfs": {
+    "s": 9.258843074960168,
+    "rc": 0,
+    "compiling": 19,
+    "fresh": 15,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.23s"
+    ]
+   },
+   "cp_a_reflink_hardlinked_files": 18,
+   "cp_a_reflink": {
+    "s": 0.05618680699262768,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s"
+    ]
+   },
+   "cp_a_noreflink_hardlinked_files": 18,
+   "cp_a_noreflink": {
+    "s": 0.05917170603061095,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   },
+   "rsync_aH_hardlinked_files": 18,
+   "rsync_aH": {
+    "s": 0.06071177602279931,
+    "rc": 0,
+    "compiling": 0,
+    "fresh": 34,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+    ]
+   },
+   "git_worktree": {
+    "s": 10.11466790601844,
+    "rc": 0,
+    "compiling": 34,
+    "fresh": 0,
+    "tail": [
+     "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.09s"
+    ]
+   }
+  }
+ ],
+ "arms": {
+  "cowfs_snapshot_create": {
+   "n": 5,
+   "median": 0.018241348036099225,
+   "min": 0.012391205003950745,
+   "max": 0.02838519000215456,
+   "stdev": 0.005959729557375504
+  },
+  "cowfs_build": {
+   "n": 5,
+   "median": 9.398806834011339,
+   "min": 9.24356006103335,
+   "max": 9.597243848955259,
+   "stdev": 0.14572751721388646
+  },
+  "cp_a_reflink_copy": {
+   "n": 5,
+   "median": 0.03556547802872956,
+   "min": 0.026862029975745827,
+   "max": 0.037404571019578725,
+   "stdev": 0.004402414039233085
+  },
+  "cp_a_reflink_build": {
+   "n": 5,
+   "median": 0.05618680699262768,
+   "min": 0.04592103901086375,
+   "max": 0.06344670098042116,
+   "stdev": 0.008589640343747767
+  },
+  "cp_a_noreflink_copy": {
+   "n": 5,
+   "median": 0.14570182596798986,
+   "min": 0.1327884320053272,
+   "max": 0.1483209419529885,
+   "stdev": 0.0061345264559280474
+  },
+  "cp_a_noreflink_build": {
+   "n": 5,
+   "median": 0.06561984797008336,
+   "min": 0.05917170603061095,
+   "max": 0.08817378705134615,
+   "stdev": 0.012012335308064096
+  },
+  "rsync_aH_copy": {
+   "n": 5,
+   "median": 0.3596615439746529,
+   "min": 0.35738345299614593,
+   "max": 0.37266969203483313,
+   "stdev": 0.006170854199697869
+  },
+  "rsync_aH_build": {
+   "n": 5,
+   "median": 0.06739575299434364,
+   "min": 0.06071177602279931,
+   "max": 0.07971609599189833,
+   "stdev": 0.007282356950115558
+  },
+  "git_worktree_add": {
+   "n": 5,
+   "median": 0.006169413973111659,
+   "min": 0.005182848020922393,
+   "max": 0.00756153097609058,
+   "stdev": 0.001097699243877864
+  },
+  "git_worktree_build": {
+   "n": 5,
+   "median": 9.895021893025842,
+   "min": 9.600692779989913,
+   "max": 10.11466790601844,
+   "stdev": 0.18632780281832148
+  }
+ },
+ "arms_raw": {
+  "cowfs_snapshot_create": [
+   0.019929256988689303,
+   0.016020624025259167,
+   0.012391205003950745,
+   0.018241348036099225,
+   0.02838519000215456
+  ],
+  "cowfs_build": [
+   9.447231050988194,
+   9.597243848955259,
+   9.398806834011339,
+   9.24356006103335,
+   9.258843074960168
+  ],
+  "cp_a_reflink_copy": [
+   0.03556547802872956,
+   0.036775375017896295,
+   0.026862029975745827,
+   0.037404571019578725,
+   0.03167141502490267
+  ],
+  "cp_a_reflink_build": [
+   0.06344295298913494,
+   0.04592103901086375,
+   0.046707779983989894,
+   0.06344670098042116,
+   0.05618680699262768
+  ],
+  "cp_a_noreflink_copy": [
+   0.1483209419529885,
+   0.14608600200153887,
+   0.14450837898766622,
+   0.14570182596798986,
+   0.1327884320053272
+  ],
+  "cp_a_noreflink_build": [
+   0.06437188002746552,
+   0.06561984797008336,
+   0.07936908502597362,
+   0.08817378705134615,
+   0.05917170603061095
+  ],
+  "rsync_aH_copy": [
+   0.3596615439746529,
+   0.35862939700018615,
+   0.3627598069724627,
+   0.37266969203483313,
+   0.35738345299614593
+  ],
+  "rsync_aH_build": [
+   0.07015510997734964,
+   0.07971609599189833,
+   0.06382982700597495,
+   0.06739575299434364,
+   0.06071177602279931
+  ],
+  "git_worktree_add": [
+   0.0072364790248684585,
+   0.005182848020922393,
+   0.006169413973111659,
+   0.00756153097609058,
+   0.005256946024019271
+  ],
+  "git_worktree_build": [
+   9.824959004996344,
+   9.895021893025842,
+   9.600692779989913,
+   9.932381679012906,
+   10.11466790601844
+  ]
+ },
+ "fsck_rc": 0,
+ "host_load_end": "12.24"
+}
