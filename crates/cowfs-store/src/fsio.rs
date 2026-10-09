@@ -264,3 +264,47 @@ fn fault_boundary(kind: &str) {
         std::process::exit(77);
     }
 }
+
+#[cfg(test)]
+mod alloc_tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct Counting;
+    thread_local! {
+        static BYTES: Cell<usize> = const { Cell::new(0) };
+        static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    }
+    // SAFETY: forwards to `System`; the counters are const-initialised thread locals, so counting
+    // never allocates.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let _ = BYTES.try_with(|b| b.set(b.get() + l.size()));
+            let _ = ALLOCS.try_with(|a| a.set(a.get() + 1));
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) }
+        }
+    }
+    #[global_allocator]
+    static A: Counting = Counting;
+
+    /// Issue 247: with no crash-model log active, a write must not copy its buffer or build a name.
+    #[test]
+    fn write_at_allocates_nothing_without_a_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pack-00000001.cpk");
+        let file = File::create(&path).unwrap();
+        let io = Io::new(None, true);
+        let buf = vec![7u8; 1 << 20];
+        io.write_at(&file, &path, 0, &buf).unwrap(); // warm up
+        let (b0, a0) = (BYTES.get(), ALLOCS.get());
+        for i in 0..64 {
+            io.write_at(&file, &path, i * buf.len() as u64, &buf).unwrap();
+        }
+        let (bytes, allocs) = (BYTES.get() - b0, ALLOCS.get() - a0);
+        assert_eq!((bytes, allocs), (0, 0), "write_at allocated on the no-log path");
+    }
+}
