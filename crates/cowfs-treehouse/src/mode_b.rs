@@ -11,9 +11,10 @@ use crate::th::Treehouse;
 
 /// How a snapshot is made to appear at a slot's path.
 ///
-/// This is the one thing mode (b) needs from the mount that the control API does not have yet, so
-/// the seam exists to keep everything else testable today and to name the missing request exactly
-/// once. See `docs/v1-treehouse.md`, gap 1.
+/// This is the one thing mode (b) needs from the mount that the companion does not drive yet: the
+/// daemon and `cowfs-ctl` have `mount_snapshot` and `unmount_snapshot`, but nothing here calls them.
+/// The seam keeps everything else testable today and names the missing wiring exactly once. See
+/// `docs/v1-treehouse.md`, gap 1.
 pub trait Materialiser {
     /// Makes `snapshot` the content of `path`, which must be a directory treehouse has just
     /// created and is about to use as a git worktree.
@@ -24,16 +25,20 @@ pub trait Materialiser {
     }
 }
 
-/// The real one: a request the control protocol does not have yet.
+/// The real one, not wired yet: it would call the daemon's `mount_snapshot`. That needs
+/// `Provision::run` to create the snapshot before mounting, the slot under `--export-root`, and an
+/// owner that calls `unmount_snapshot` when the slot is returned.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CowfsMaterialiser;
 
 impl Materialiser for CowfsMaterialiser {
     fn materialise(&self, snapshot: &str, path: &Path) -> Result<()> {
         Err(Error::Unsupported(format!(
-            "this daemon cannot make snapshot {snapshot:?} appear at {}: the control protocol has \
-             no mount_snapshot method (docs/v1-treehouse.md, gap 1). The rest of mode (b) is \
-             implemented and tested; this call is the only thing waiting on the real backend.",
+            "this daemon cannot make snapshot {snapshot:?} appear at {}: the \
+             companion does not call the daemon's mount_snapshot yet (docs/v1-treehouse.md, gap 1): Provision::run must create \
+             the snapshot first, the slot must live under --export-root, and something must own \
+             unmount_snapshot at return. The rest of mode (b) is implemented and tested; this call \
+             is the only thing waiting on that wiring.",
             path.display()
         )))
     }
