@@ -55,6 +55,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// The nested `cargo test` workload: the library unit tests and the wire-format tests of cowfs-ctl.
+///
+/// The workload only has to be a real, deterministic test run on the export. The rest of
+/// `cowfs-ctl` (admission, progress_shutdown, regress, server, flood) measures wall-clock shutdown
+/// windows and runs exclusively in the main nextest run (`.config/nextest.toml`). Re-running it
+/// here under default parallelism on a loaded runner flaked (issue 283, same family as 121/128).
+const NESTED_TEST_ARGS: &[&str] = &["test", "-p", "cowfs-ctl", "--lib", "--test", "wire"];
+
 /// How a gate ended. Written to the receipt so a skip can never read as a measurement.
 const MEASURED: &str = "measured";
 const SKIPPED_CAPABILITY: &str = "skipped-capability";
@@ -1286,7 +1294,7 @@ fn native_control_builds_and_tests_the_sample_project() {
         .output()
         .expect("cargo build runs");
     let test = Command::new("cargo")
-        .args(["test", "-p", "cowfs-ctl"])
+        .args(NESTED_TEST_ARGS)
         .current_dir(sample.path())
         .env("CARGO_TARGET_DIR", &target)
         .stdin(Stdio::null())
@@ -1996,7 +2004,7 @@ fn a_real_project_builds_and_tests_inside_an_exported_slot_snapshot() {
             .unwrap_or_else(|e| panic!("{e}"))
     };
     let build = in_slot(deadline, &["build", "-p", "cowfs-ctl"]);
-    let test = in_slot(deadline, &["test", "-p", "cowfs-ctl"]);
+    let test = in_slot(deadline, NESTED_TEST_ARGS);
     let rlib = slot.join("target").join("debug").join("libcowfs_ctl.rlib");
 
     let mut fields = binary_manifest(deadline);
@@ -3076,7 +3084,7 @@ fn warm_base_acceptance_over_a_real_core() {
             deadline,
             &slot,
             "cargo",
-            &["test", "-p", "cowfs-ctl"],
+            NESTED_TEST_ARGS,
             Duration::from_secs(1800),
         )
         .unwrap_or_else(|e| panic!("{e}"));
