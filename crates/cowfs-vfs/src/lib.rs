@@ -53,6 +53,7 @@ mod tests {
             (Error::InvalidArgument, libc::EINVAL),
             (Error::NameTooLong, libc::ENAMETOOLONG),
             (Error::NoSpace, libc::ENOSPC),
+            (Error::FileTooBig, libc::EFBIG),
             (Error::PermissionDenied, libc::EACCES),
             (Error::TooManyLinks, libc::EMLINK),
             (Error::NotSupported, libc::ENOTSUP),

@@ -271,6 +271,26 @@ fn rss_kib() -> u64 {
         .unwrap_or(0)
 }
 
+/// g3: pjdfstest ftruncate/12.t and truncate/12.t accept only EFBIG, EINVAL or success for a
+/// size no file can have. ENOSPC is a different condition (the device is full).
+#[test]
+fn a_size_or_write_offset_past_the_file_limit_is_file_too_big() {
+    let f = fixture();
+    let c = &f.core;
+    c.create_snapshot("s").unwrap();
+    let r = root_entry(c, "s").ino;
+    let ino = c.create(r, b"big", 0o644).unwrap().ino;
+    let err = truncate(c, ino, 999_999_999_999_999).unwrap_err();
+    assert_eq!(err.errno(), libc::EFBIG, "truncate: {err:?}");
+    let err = c.write(ino, 999_999_999_999_999, b"x").unwrap_err();
+    assert_eq!(err.errno(), libc::EFBIG, "write: {err:?}");
+    assert_eq!(
+        c.getattr(ino).unwrap().size,
+        0,
+        "a refused truncate changes nothing"
+    );
+}
+
 #[test]
 fn a_terabyte_sparse_file_costs_no_memory() {
     let f = fixture();
