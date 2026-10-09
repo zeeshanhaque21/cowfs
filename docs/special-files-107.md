@@ -159,7 +159,8 @@ Reopening a store restores kind and `rdev` from the inode record.
 The `Create` queue (`queue.rs`, `Op::Create`) is in memory only; `swap.rs` persists snapshot names, not operations.
 So `Create::Special` is not an on-disk format.
 What is replayed after a crash is the meta store's last durable commit, and a special node created after it is lost like any other uncommitted create.
-The reopen tests therefore cover a clean reopen and a kill after `fsync`, not an operation journal.
+The reopen test covers a clean sync, drop and reopen, and a meta test injects a failing commit (the existing `commit_fault` seam) and shows that neither the node nor version 3 reaches the disk.
+A kill -9 test is not added: the node is an ordinary inode record in the same redb transaction as any other create.
 
 ## Wildcard audit
 
@@ -251,22 +252,21 @@ That matches native semantics and needs no code.
 ## Conformance suite (`cowfs-vfs-test`)
 
 New module `special`.
-Levels: `Posix` where the behaviour is believed identical on ext4, btrfs and APFS, `Cowfs` for the contract decisions.
-Checks (names are the contract):
+Levels: `mknod_fifo_attrs` is `Posix` (believed identical on ext4, btrfs and APFS, but no native run backs that label yet, because PathVfs skips every special check), all others are `Cowfs` contract decisions.
+Checks (names are the contract, and match `crates/cowfs-vfs-test/src/conformance/list.rs`):
 
-- `mknod_fifo_attrs` (Posix): kind, masked mode, `nlink` 1, `size` 0, `blocks` 0, `rdev` 0, times, and parent mtime and ctime moved.
-- `mknod_socket_attrs` (Posix).
-- `mknod_device_attrs_keep_rdev` (Cowfs): char and block, `rdev` round trips through `getattr`, `lookup` and `readdir_attrs`.
-- `mknod_existing_is_exists` (Posix), `mknod_in_file_is_not_dir` (Posix), `mknod_stale_parent` (Cowfs), `mknod_invalid_names` (Cowfs).
-- `mknod_rejects_non_special_kinds` (Cowfs): Regular, Directory, Symlink are `InvalidArgument`.
-- `mknod_rejects_rdev_on_fifo` (Cowfs).
-- `special_readdir_kinds` (Cowfs): `readdir` and `readdir_attrs` report the right kind.
-- `special_io_is_invalid` (Cowfs): `read`, `write`, `setattr` size are `InvalidArgument`.
-- `special_setattr_mode_and_times` (Posix): chmod and utimes apply and bump ctime.
-- `special_open_release` (Cowfs).
-- `special_hardlink_unlink_rename` (Posix): hardlink shares inode and `nlink`, unlink of one name keeps the other, rename over a fifo replaces it, rename of a fifo over a directory is `IsDir`.
-- `special_unlinked_with_handle_survives` (Cowfs): `getattr` through the inode still works until `release`.
-- `special_dir_ops_error` (Posix): `rmdir` of a fifo is `NotDir`, `unlink` of a directory unchanged.
+- `mknod_fifo_attrs`: kind, mode, `nlink` 1, `size` 0, `blocks` 0, `rdev` 0, one creation time, lookup and getattr agree, and the parent's mtime and ctime moved.
+- `mknod_socket_attrs`, `mknod_masks_mode` (type bits are not permission bits, setuid, setgid, sticky and rwx are kept).
+- `mknod_device_attrs_keep_rdev`: char and block, `rdev` round trips through `mknod`, `getattr`, `lookup` and `readdir_attrs`, including the largest major and minor.
+- `mknod_existing_is_exists`, `mknod_in_file_is_not_dir`, `mknod_stale_parent`, `mknod_invalid_names`.
+- `mknod_rejects_bad_arguments`: Regular, Directory and Symlink kinds, and a device number on a fifo or socket, are `InvalidArgument` and create nothing.
+- `special_readdir_kinds`.
+- `special_io_is_invalid`: `read`, `write`, `setattr` size and `readlink` are `InvalidArgument`.
+- `special_setattr_mode_and_times`: chmod and utimes apply and bump ctime.
+- `special_open_release`.
+- `special_hardlink_unlink_rename`: hardlink shares inode and `nlink`, unlink of one name keeps the other, rename over a special node replaces it, rename of a special node over a directory is `IsDir`.
+- `special_unlinked_with_handle_survives`: `getattr` through the inode still works until `release`.
+- `special_dir_ops_error`: `rmdir` of a special node is `NotDir`, `mkdir` over one is `Exists`.
 
 `MemVfs` (the reference implementation) implements `mknod` and the above behaviours first, so the checks are red on the old trait and green on `MemVfs`.
 Conformance consumers found: `MemVfs` (`cowfs-vfs-test/tests/memvfs.rs`), Core (`cowfs-core/tests/conformance.rs`), `PathVfs` (`cowfs-vfs-path/tests/common/mod.rs`, `Options` skip list), and the FUSE mount (`cowfs-fuse/tests/conformance.rs`).
