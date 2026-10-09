@@ -31,6 +31,7 @@
   .fill { height: 100%; background: #3b82f6; transition: width .6s; }
   .fill.done { background: #2a9a4a; }
   .count { color: #999; font-weight: normal; font-size: 13px; }
+  .grp { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #888; margin: 10px 0 4px; }
   details.phase { margin-top: 12px; }
   details.phase > summary { cursor: pointer; list-style: none; }
   details.phase > summary::-webkit-details-marker { display: none; }
@@ -40,7 +41,7 @@
 <h1>cowfs build train</h1>
 <div class="meta" id="meta">loading…</div>
 <div class="bar" id="loop"></div>
-<div class="ctl"><button onclick="setAll(true)">Expand all</button><button onclick="setAll(false)">Collapse all</button></div>
+<div class="ctl"><button onclick="setAll(true)">Expand all</button><button onclick="setAll(false)">Collapse all</button><button id="hideDone" onclick="toggleDone()"></button> <a href="/graph" style="color:#8bf;font-size:12px">Dependency graph</a></div>
 <div id="phases"></div>
 <script>
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
@@ -55,6 +56,20 @@ function toggled(el) {
   if (el.open) { opened.add(id); shut.delete(id); } else { opened.delete(id); shut.add(id); }
   save();
 }
+let hideDone = localStorage.getItem("cowfsHideDone") === "1";
+function toggleDone() {
+  hideDone = !hideDone;
+  localStorage.setItem("cowfsHideDone", hideDone ? "1" : "0");
+  load();
+}
+const GROUPS = ["Active", "Blocked", "Queued", "Done"];
+function groupOf(i) {
+  const st = String(i.state ?? "").trim().toLowerCase();
+  if (i.done || st === "done") return "Done";
+  if (st === "blocked" || st === "failed") return "Blocked";
+  if (st === "pending" || st === "ready") return "Queued";
+  return "Active";
+}
 function setAll(open) { document.querySelectorAll("details.item").forEach(d => { d.open = open; toggled(d); }); }
 async function load() {
   try {
@@ -62,11 +77,12 @@ async function load() {
     const s = await r.json();
     document.getElementById("meta").textContent =
       `${s.totals.closed}/${s.totals.slices} items closed · plan ${s.updated} · refreshed ${new Date().toLocaleTimeString()}`;
+    document.getElementById("hideDone").textContent = hideDone ? "Show done" : "Hide done";
     document.getElementById("loop").innerHTML = `<b>Loop:</b> ${esc(s.loop)}<br><b>Bar:</b> ${esc(s.bar)}`;
     document.getElementById("phases").innerHTML = s.phases.map(p => {
       const d = p.items.filter(i => i.done).length;
       const pid = "phase:" + p.name;
-      const tiles = p.items.map(i => {
+      const tileOf = i => {
         const id = String(i.id ?? i.title);
         const slug = String(i.state ?? "").trim().toLowerCase().replace(/\s+/g, "-");
         const isOpen = opened.has(id) || (slug === "running" && !shut.has(id));
@@ -78,15 +94,21 @@ async function load() {
         <details class="item" data-id="${esc(id)}" ${isOpen ? "open" : ""} ontoggle="toggled(this)">
           <summary><input type="checkbox" disabled ${i.done ? "checked" : ""}>
           <span class="title">${esc(i.title)}</span><span class="state ${esc(slug)}">${esc(i.state)}</span>
-          ${i.owner ? `<span class="owner">${esc(i.owner)}</span>` : ""}
-          ${i.ci ? `<span class="ci">${esc(i.ci)}</span>` : ""}</summary>
+          ${i.owner ? `<span class="owner">${esc(i.status_note && i.done ? "Implementation merged / acceptance separate" : i.owner)}</span>` : ""}
+          ${i.ci && !i.status_note ? `<span class="ci">${esc(i.ci)}</span>` : ""}</summary>
           <div class="body">
           ${links ? `<div class="detail">${links}</div>` : ""}
-          ${i.detail ? `<div class="detail">${esc(i.detail)}</div>` : ""}
+          ${i.status_note ? `<div class="detail"><b>Current status:</b> ${esc(i.status_note)}</div>` : ""}
+          ${i.detail ? (i.status_note ? `<details><summary>Historical evidence and limitations</summary><div class="detail">${esc(i.detail)}</div></details>` : `<div class="detail">${esc(i.detail)}</div>`) : ""}
           ${i.numbers ? `<div class="detail"><b>numbers:</b> ${esc(i.numbers)}</div>` : ""}
           ${i.verdict ? `<div class="detail"><b>critic:</b> ${esc(i.verdict)}</div>` : ""}
           ${bar}
           </div></details>`;
+      };
+      const shown = p.items.filter(i => !(hideDone && i.done));
+      const tiles = GROUPS.map(g => {
+        const gi = shown.filter(i => groupOf(i) === g);
+        return gi.length ? `<div class="grp">${g} <span class="count">${gi.length}</span></div>` + gi.map(tileOf).join("") : "";
       }).join("");
       return `<details class="phase" data-id="${esc(pid)}" open>
               <summary><h2>${esc(p.name)} <span class="count">${d}/${p.items.length}</span></h2></summary>${tiles}</details>`;

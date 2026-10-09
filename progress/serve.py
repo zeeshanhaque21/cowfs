@@ -145,6 +145,8 @@ class H(BaseHTTPRequestHandler):
                 self._send(500, "text/plain", str(e).encode())
         elif path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", open(os.path.join(HERE, "index.html"), "rb").read())
+        elif path in ("/graph", "/graph.html"):
+            self._send(200, "text/html; charset=utf-8", open(os.path.join(HERE, "graph.html"), "rb").read())
         else:
             self._send(404, "text/plain", b"not found")
 
