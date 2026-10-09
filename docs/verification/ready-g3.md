@@ -7,6 +7,18 @@ No production source was patched by this lane.
 Every number below is derived from the preserved raw records by `bench/pjdfstest.py`, and the
 derivation is re-runnable.
 
+## Post-fix result, 2026-10-09 (supersedes the numbers below)
+
+Re-run at cowfs source SHA `9c32468143ddad93b1c95be71e9b6e3b13d0f949` from a clean committed tree, `cowfs-daemon` sha256 `dba32eee4f3c00abb4199b9b1f5f6a193e8fd210a1d2303a70bdbd55fbe1eef1`.
+Full run `20261009T071336Z`, 238 cases, 8686 assertions per arm, identity valid.
+macOS adapter is still **FAIL**, but now with 1 established regression (was 77) and 71 ordinal worse positions (was 700), better 0.
+Passing: native 2985, cowfs 2914.
+The one established regression is `open/17.t` #2 (fifo write-open `EACCES` instead of `ENXIO`, issue #204, macOS NFS client, mechanism under investigation).
+The other 70 worse positions are 69 in the 13 #108 pathconf cases and `unlink/14.t` #4 (#109 silly-rename).
+Nothing is unexplained.
+Details and the sample receipt are in `docs/reviews/g3-status-20261009b.md`.
+Linux FUSE arm remains UNMEASURABLE.
+
 ## Two record sets, and which one says what
 
 | record set | what it is | what it can support |
