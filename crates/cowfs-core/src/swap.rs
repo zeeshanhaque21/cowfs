@@ -59,6 +59,13 @@ fn intent_path(root: &Path, target: &str) -> PathBuf {
     root.join(format!("{SWAP_PREFIX}{target}"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: forces every staging name's hash, to build the collision a real name pair needs
+    /// a 2^32 search for.
+    static HASH_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// The staging name for `target`; deterministic, so a duplicate is found and cleaned up without the
 /// intent file. An import stages into the same name: its crash leaves nothing a caller can see.
 ///
@@ -68,6 +75,10 @@ fn intent_path(root: &Path, target: &str) -> PathBuf {
 /// (200 characters of the target, no hash) still recovers; nothing compares a recorded name with
 /// this function.
 pub(crate) fn staging_name(target: &str) -> String {
+    #[cfg(test)]
+    if let Some(h) = HASH_OVERRIDE.with(std::cell::Cell::get) {
+        return format!("{}~{h:016x}{STAGING}0", &target[..target.len().min(200)]);
+    }
     let mut end = target.len().min(200);
     while !target.is_char_boundary(end) {
         end -= 1;
@@ -137,7 +148,9 @@ fn intents(root: &Path) -> Vec<PathBuf> {
 
 /// Completes one swap a crash or an error left half done, from its intent file `p`.
 ///
-/// A torn intent file names nothing, so the staging name its target implies is removed with it.
+/// A torn intent file names nothing, so the staging name its file name implies is used: kept and
+/// rolled forward when the target is gone, removed with the file when the target still exists.
+/// The writer is temp, sync, rename, directory sync, so this needs media corruption to happen.
 fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
     let Some((staged, target)) = read_intent(p) else {
         let name = p
@@ -147,12 +160,22 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
             .map(str::to_string)
             .unwrap_or_default();
         let staged = staging_name(&name);
-        if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
-            let _ = core.inner.unregister(&sc);
+        // The file name carries the target, so a torn record can still be rolled forward when the
+        // old target is already gone: the staging snapshot is then the only copy of the new tree.
+        let kept = validate_snapshot_name(&name).is_ok()
+            && core.inner.snap_by_name(&name).is_err()
+            && core.inner.snap_by_name_raw(&staged).is_ok()
+            && core.finish_swap(&staged, &name).is_ok();
+        if !kept {
+            if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
+                let _ = core.inner.unregister(&sc);
+            }
         }
         let _ = fs::remove_file(p);
+        sync_dir(&core.inner.root);
         *core.inner.last_error.lk() = Some(format!(
-            "swap recovery: {p:?} is unreadable, removed any staging snapshot named {staged}"
+            "swap recovery: {p:?} is unreadable, {} staging snapshot {staged}",
+            if kept { "rolled forward" } else { "removed any" }
         ));
         return Ok(());
     };
@@ -227,7 +250,38 @@ fn sweep_orphans(core: &Core) {
     }
 }
 
+/// Refuses a replacement of `target` that could not write its intent file: the writer's temp file
+/// `tmp-swap-<target>` is 9 bytes longer than `swap-<target>`. Checked before anything is staged,
+/// so the first call fails the way every later one would.
+pub(crate) fn check_target_len(target: &str) -> Result<(), ControlError> {
+    if TMP_PREFIX.len() + target.len() > cowfs_snapname::NAME_MAX {
+        return Err(ControlError::InvalidName(
+            "too long to replace: the swap's intent file name must fit in 255 bytes",
+        ));
+    }
+    Ok(())
+}
+
 impl Core {
+    /// Removes the leftover staging snapshot `staged` of `target`, unless an intent for another
+    /// target names it (a staging-hash collision): that snapshot is the only copy of that swap's
+    /// new tree, so the call is refused before it changes anything.
+    pub(crate) fn clear_leftover(&self, staged: &str, target: &str) -> Result<(), ControlError> {
+        let taken = intents(&self.inner.root)
+            .iter()
+            .filter_map(|p| read_intent(p))
+            .any(|(s, t)| s == staged && t != target);
+        if taken {
+            return Err(ControlError::InvalidName(
+                "its staging name is held by another pending swap",
+            ));
+        }
+        if let Ok(leftover) = self.inner.snap_by_name_raw(staged) {
+            let _ = self.inner.unregister(&leftover);
+        }
+        Ok(())
+    }
+
     /// Replaces snapshot `new` with a clone of `src`, for the promotion path. A rename moves a name
     /// rather than replacing one and does not come here: it has no victim to remove and needs no
     /// staging, so `Core::rename_snapshot` commits the name directly.
@@ -241,6 +295,7 @@ impl Core {
         new: &str,
     ) -> Result<SnapshotEntry, ControlError> {
         validate_snapshot_name(new)?;
+        check_target_len(new)?;
         if src == new {
             return Err(ControlError::InvalidName(
                 "source and target are the same snapshot",
@@ -258,9 +313,7 @@ impl Core {
         let staged = staging_name(new);
         // A pending intent for this target was finished above, so a leftover staging snapshot is
         // garbage from a crash before the intent.
-        if let Ok(leftover) = self.inner.snap_by_name_raw(&staged) {
-            let _ = self.inner.unregister(&leftover);
-        }
+        self.clear_leftover(&staged, new)?;
         self.inner.flush_snapshot(&src_sc)?;
         self.stage_and_intent(&src_sc, &staged, new)?;
         if let Err(e) = self.fault(1).and_then(|()| self.fault(2)) {
@@ -462,5 +515,92 @@ mod tests {
         fs::remove_file(intent_path(&c.inner.root, "new")).unwrap();
         sweep_orphans(&c);
         assert!(c.inner.snap_by_name_raw(&staged).is_err(), "orphan stays");
+    }
+
+    fn src_dir(root: &Path, tag: &str, body: &str) -> PathBuf {
+        let d = root.join(tag);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("f"), body).unwrap();
+        d
+    }
+
+    fn put(c: &Core, from: &Path, name: &str, replace: bool) -> Result<(), crate::ImportError> {
+        let mut hooks = crate::Hooks {
+            progress: &mut |_, _| true,
+        };
+        if replace {
+            crate::ingest_replacing(c, from, name, &mut hooks).map(|_| ())
+        } else {
+            crate::ingest(c, from, name, &mut hooks).map(|_| ())
+        }
+    }
+
+    /// N1 (PR 220 round 3): two targets that collide under the staging hash. A pending swap of `a`
+    /// owns the staging snapshot; any call for `b` is refused before it touches that snapshot.
+    #[test]
+    fn a_staging_hash_collision_with_a_pending_swap_is_refused_and_loses_nothing() {
+        HASH_OVERRIDE.with(|h| h.set(Some(0xdead_beef)));
+        let (a, b) = ("alpha", "bravo");
+        assert_eq!(staging_name(a).replace(a, ""), staging_name(b).replace(b, ""));
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let v1 = src_dir(scratch.path(), "v1", "old");
+        let va = src_dir(scratch.path(), "va", "content of A");
+        let vb = src_dir(scratch.path(), "vb", "content of B");
+        let opts = || crate::Options {
+            background: false,
+            ..Default::default()
+        };
+        {
+            let c = Core::open(dir.path(), opts()).unwrap();
+            put(&c, &v1, a, true).unwrap();
+            c.create_snapshot("src").unwrap();
+            c.set_swap_fault(4);
+            assert!(put(&c, &va, a, true).is_err());
+            c.set_swap_fault(0);
+            let staged = staging_name(a);
+            assert!(c.inner.snap_by_name_raw(&staged).is_ok());
+            // a plain ingest, a replacing ingest and a promote of `b` are all refused
+            for r in [
+                put(&c, &vb, b, false).is_err(),
+                put(&c, &vb, b, true).is_err(),
+                c.swap_snapshot("src", b).is_err(),
+            ] {
+                assert!(r, "a colliding call must be refused");
+            }
+            assert!(c.inner.snap_by_name_raw(&staged).is_ok(), "A's tree kept");
+            assert!(intent_path(&c.inner.root, a).exists(), "A's intent kept");
+            assert!(c.inner.snap_by_name(b).is_err(), "B created nothing");
+        }
+        let c = Core::open(dir.path(), opts()).unwrap();
+        let v = c.snapshot_view(a).unwrap();
+        let ino = v.lookup(ROOT_INO, b"f").unwrap().ino;
+        assert_eq!(v.read(ino, 0, 64).unwrap(), b"content of A");
+        HASH_OVERRIDE.with(|h| h.set(None));
+    }
+
+    /// N3: a replacing target whose temp intent name would not fit fails on the first call, before
+    /// anything is staged, and a plain ingest of it still works.
+    #[test]
+    fn a_replacing_target_too_long_for_its_intent_is_refused_on_the_first_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let v = src_dir(scratch.path(), "v", "x");
+        let c = Core::open(
+            dir.path(),
+            crate::Options {
+                background: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let long = "n".repeat(250);
+        assert!(matches!(
+            put(&c, &v, &long, true),
+            Err(crate::ImportError::Core(ControlError::InvalidName(_)))
+        ));
+        assert!(c.meta().snapshots().unwrap().is_empty(), "nothing staged");
+        put(&c, &v, &"n".repeat(246), true).unwrap();
+        put(&c, &v, &long, false).unwrap();
     }
 }

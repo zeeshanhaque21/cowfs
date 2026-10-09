@@ -146,6 +146,9 @@ fn ingest_with(
         )));
     }
     crate::validate_snapshot_name(name)?;
+    if replace {
+        swap::check_target_len(name)?;
+    }
     // A swap a failed earlier call left pending for this name is finished before anything below
     // removes its staging snapshot, the only copy of that call's tree (issue 177).
     c.recover_target(name)?;
@@ -155,9 +158,7 @@ fn ingest_with(
     let staged = swap::staging_name(name);
     // A leftover staging snapshot of this name holds blocks nothing points at: a pending intent was
     // finished above, and `Core::open` removes the orphans a crash left.
-    if let Ok(leftover) = c.inner.snap_by_name_raw(&staged) {
-        let _ = c.inner.unregister(&leftover);
-    }
+    c.clear_leftover(&staged, name)?;
     let snap = c.inner.meta.new_snapshot(&staged).map_err(control_meta)?;
     let entry = c.inner.register(snap)?;
     let view = SnapshotView::new(c.clone(), entry.ino);
