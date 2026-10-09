@@ -44,6 +44,8 @@ jobs:
         run: python3 scripts/lock_audit.py --check
       - name: Bench harness unit tests (ubuntu)
         run: python3 -m unittest discover -s bench -v
+      - name: CI workflow gates (issue 179)
+        run: python3 -m unittest discover -s scripts -p test_ci_workflow.py -v
 
   # The 170 test binaries ran one after another in a single job (about 740 s of the 780 s test
   # step; compile was already cached). nextest runs the tests of every binary in one pool, and
@@ -96,18 +98,22 @@ jobs:
       - name: Fault-injection seam is absent without its feature (issue 173)
         run: scripts/check-fault-seam-absent.sh
 
-  # One name to require: fails unless lint, fault-seam and every test shard passed.
+  # One name to require: fails unless lint, fault-seam, every test shard, linux-fuse and
+  # linux-namespaces passed. The last two are the FUSE conformance run and the namespace isolation
+  # gate: each refuses to go green unless its checks ran, so a red one must fail this aggregate.
   check:
-    needs: [lint, fault-seam, test]
+    needs: [lint, fault-seam, test, linux-fuse, linux-namespaces]
     # Not always(): a superseded PR run is cancelled, and must not start a check that then fails.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - run: |
-          echo "lint=${{ needs.lint.result }} fault-seam=${{ needs.fault-seam.result }} test=${{ needs.test.result }}"
+          echo "lint=${{ needs.lint.result }} fault-seam=${{ needs.fault-seam.result }} test=${{ needs.test.result }} linux-fuse=${{ needs.linux-fuse.result }} linux-namespaces=${{ needs.linux-namespaces.result }}"
           test "${{ needs.lint.result }}" = success
           test "${{ needs.fault-seam.result }}" = success
           test "${{ needs.test.result }}" = success
+          test "${{ needs.linux-fuse.result }}" = success
+          test "${{ needs.linux-namespaces.result }}" = success
 
   # Issue 171: the namespace isolation tests skip on a host that denies unprivileged user namespaces.
   # ubuntu-24.04 does (kernel.apparmor_restrict_unprivileged_userns=1, measured on the runner), so
@@ -161,10 +167,12 @@ jobs:
       - name: Native xattr control
         env:
           COWFS_CONFORMANCE_FILTER: xattr_on_directory_and_symlink
+        shell: bash  # bash -e -o pipefail, so a failing cargo fails the step through the tee
         run: cargo test -p cowfs-vfs-path --test native -j4 -- --ignored --nocapture --test-threads=1 2>&1 | tee native-xattr.log
       - name: Native page-cache control
         env:
           COWFS_CONFORMANCE_FILTER: concurrent_readers_and_writers_of_one_file
+        shell: bash  # || true swallows the whole pipeline, pipefail included; the Enforce step's `1 run,` assertion is what catches a cargo failure here
         run: cargo test -p cowfs-vfs-path --test native -j4 -- --ignored --nocapture --test-threads=1 2>&1 | tee native-page-cache.log || true
       - name: Native forget control
         env:
@@ -172,12 +180,14 @@ jobs:
           # tmpfs, not the runner's disk: this check asserts blocks_free returns exactly, which a
           # filesystem sharing free space with the rest of the machine cannot promise.
           COWFS_PATHVFS_NATIVE_DIR: /dev/shm/cowfs-native-control
+        shell: bash  # bash -e -o pipefail, so a failing cargo fails the step through the tee
         run: |
           mkdir -p /dev/shm/cowfs-native-control
           cargo test -p cowfs-vfs-path --test native -j4 -- --ignored --nocapture --test-threads=1 2>&1 | tee native-forget.log
       - name: Test FUSE mounts and conformance
         env:
           COWFS_CONFORMANCE_XATTR_NAMES: prefixed
+        shell: bash  # bash -e -o pipefail, so a failing cargo fails the step through the tee
         run: cargo test -p cowfs-fuse -j4 -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee fuse-tests.log
       - name: Enforce conformance results
         run: |
@@ -218,6 +228,10 @@ jobs:
           }
           assert skipped == expected_skips, f"Skipped checks differ: extra {sorted(skipped - expected_skips)}, missing {sorted(expected_skips - skipped)}"
           assert "SKIP: /dev/fuse" not in log, "FUSE tests skipped"
+          # Issue 179: cargo's own verdict. The known xattr failure above is a conformance FAIL line in a
+          # test that still passes, so a libtest FAILED is never expected.
+          libtest = re.findall(r"^(?:test .* \.\.\. FAILED|test result: FAILED.*)$", log, re.MULTILINE)
+          assert not libtest, "cargo test failed:\n" + "\n".join(libtest)
           assert not unexpected, "Unexpected conformance failures:\n" + "\n".join(unexpected)
           if failures:
               assert len(failures) == 1 and re.search(known, control, re.MULTILINE), "Native control did not reproduce the known failure"
