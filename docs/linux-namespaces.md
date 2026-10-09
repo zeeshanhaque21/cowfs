@@ -172,7 +172,7 @@ Evidence and exact commands: `docs/verification/evidence/namespaces171-matrix.md
   The ext4 and XFS filesystems were 4 GiB loop images on a btrfs file.
 - On XFS the native control differs in one more file (`dep-bin-app`) than on the others, because it lists its two dependencies in a different order.
   Canonical builds were unaffected.
-- Not covered: any kernel older than 6.12, the core backend, a leased slot on the FUSE mount, release builds, registry dependencies, incremental rebuilds, N above 6.
+- Not covered: any kernel older than 6.8 (the isolation tests only, see "Kernel floor"), the core backend, a leased slot on the FUSE mount, release builds, registry dependencies, incremental rebuilds, N above 6.
 
 ## Limits
 
@@ -199,7 +199,8 @@ Evidence and exact commands: `docs/verification/evidence/namespaces171-matrix.md
   nothing here claims what 2.56 prints.
 - The moonscape run was one kernel (6.12) and one filesystem (ext4 under the mount, `fuse.cowfs` for the source).
   The isolation tests and a cargo build were later measured on btrfs, ext4 and XFS on kernel 7.2.8, see the section "Measured with real leases and three filesystems".
-  No kernel older than 6.12 has been measured.
+  The isolation tests alone were also measured on kernel 6.8 (GitHub ubuntu-22.04), see "Kernel floor".
+  No kernel older than 6.8 has been measured.
 
 ## Running it
 
@@ -226,6 +227,21 @@ The `check` job still takes the refusal branch and reports `OK (skipped=10)` on 
 The `linux-namespaces` job in `.github/workflows/ci.yml` lifts that one sysctl, runs `bench/test_namespaces.py`, and then fails unless all 9 `Isolation` tests report `ok` and the only skip is `test_off_linux_is_unmeasurable`.
 A skipped isolation test therefore cannot read as green in that job (issue #171).
 The moonscape measurements above remain the FUSE-level evidence.
+
+### Kernel floor
+
+The `linux-namespaces` job is a matrix over `ubuntu-latest` and `ubuntu-22.04`, so the isolation tests run on two kernels on every change (issue #171).
+Probe on 2026-10-09 (run 37966740043), same test script, same 17 tests:
+
+| Image | Kernel | `apparmor_restrict_unprivileged_userns` | `unshare -Ur -m true` before any sysctl | Isolation tests |
+|---|---|---|---|---|
+| ubuntu-22.04 (22.04.5) | 6.8.0-1064-azure | key exists, already 0 | works, `--rbind` works | 9 of 9 ok, `OK (skipped=1)` |
+| ubuntu-latest (24.04.5) | 6.17.0-1022-azure | 1 | fails, `write failed /proc/self/uid_map: Operation not permitted` | 9 skipped before the lift, 9 of 9 ok after |
+
+The documented floor for the isolation tests is therefore kernel 6.8, the oldest measured, and not a limit of the feature.
+Nothing in the helper needs a newer kernel than unprivileged user plus mount namespaces, which long predate 6.8.
+Kernels between 6.8 and 6.12, and anything older than 6.8, are still unmeasured.
+The CI step lifts the sysctl only when the key exists, so an image without it does not fail the job.
 `test_both_routes_refused_names_both_in_the_message` puts a refusing `unshare` stub first on `PATH`, so the two-route refusal message is still checked everywhere, including on a host where a namespace does work.
 
 The end-to-end run, on a Linux host with `/dev/fuse` and a Rust toolchain:
@@ -368,7 +384,7 @@ It is not evidence that a warm base was published, because none was, and it is n
 - No leased-slot result on moonscape: it has no `treehouse` binary, so the run uses `--slot`, the same
   `run_build` call site with a different slot provider.
   The cachyos box has one, see the section "Measured with real leases and three filesystems".
-- No `cargo`-level canonical build on moonscape, and no kernel older than 6.12 anywhere.
+- No `cargo`-level canonical build on moonscape, and no kernel older than 6.8 anywhere.
 
 ## A flake in the wiring tests, measured and not fixed
 
