@@ -45,7 +45,7 @@ Plan counts match on all 238 cases in the full run, and only `rename/24.t` diffe
 
 ## Receipts
 
-| run | scope | state | evidence (box, scratch) |
+| run | scope | state | evidence (box scratch; copied without `store/`, `mnt/`, `native/` to `bench/out/ready-g3-linux/run/<stamp>` in the primary checkout, gitignored, `cases.jsonl` hashes re-checked there) |
 | --- | --- | --- | --- |
 | `20261009T113349Z` | sample: `open/17.t`, `unlink/14.t` | harness PASS exit 0, COVERAGE reasons only | `/mnt/docs/Projects/cowfs-g3-linux/run/20261009T113349Z`, `cases.jsonl` sha256 `76ab6f18fdebb680bc289e1173248a759264233478a40178ad9ae98e25649d29` |
 
@@ -85,6 +85,13 @@ Only two cases differ in ok / not ok counts:
 | `rename/24.t` | 9 / 4 | 13 / 0 |
 
 The other 236 cases have identical ok / not ok counts on both arms.
+The full per-case table (238 rows, native and cowfs ok / not ok) is `bench/out/ready-g3-linux/run/20261009T113404Z/per-case.tsv`.
+
+Same-count cases can still hide a different failure, so positions where both arms fail were compared too (heuristic, labelled as such).
+5722 positions fail on both arms; 5644 carry text on both.
+After replacing generated names and numbers of 6 or more digits (inode numbers, which differ between btrfs and cowfs) with placeholders, 2 of the 5644 differ: `mknod/08.t` #18 and #23 (native `got 0`, cowfs `got EPERM`), the root of the finding below.
+Before the number normalisation, 1106 more rows in `rename/09.t` and `rename/10.t` differed only in inode numbers.
+The 78 textless both-fail positions were not compared.
 Established regressions 0, candidates 0, unpairable 5687 (coverage, disclosed).
 Ordinal differential: worse 2, better 4.
 
@@ -99,8 +106,8 @@ The list changes nothing on Linux: neither of its entries fails here.
 
 | position | class | evidence |
 | --- | --- | --- |
-| `mknod/08.t` #19 | NEW (not #108, #109 or #204) | cowfs `tried 'mknod <n0> f 0644 0 0', expected EEXIST, got 0`; native ok |
-| `mknod/08.t` #24 | NEW, same mechanism | identical text in the char-device iteration |
+| `mknod/08.t` #19 | NEW, #243 (not #108, #109, #204 or #211) | cowfs `tried 'mknod <n0> f 0644 0 0', expected EEXIST, got 0`; native ok |
+| `mknod/08.t` #24 | NEW, #243, same mechanism | identical text in the char-device iteration |
 
 Both are downstream of positions #18 and #23, which fail on both arms but differently.
 `mknod/08.t` loops `create_file <type>` then `mknod b`, `mknod c 0 0`, `mknod f`, then unlink, for each type.
@@ -121,7 +128,7 @@ Reproduced by hand on the box, kernel `7.2.8-2-cachyos`, uid 1000, a fresh priva
 Mechanism, read from source, consistent with the reproduction but not traced on the wire: `crates/cowfs-fuse/src/fs.rs` `mknod` refuses every device node when `req.uid() != 0` with EPERM ("The kernel already demands CAP_MKNOD for a device; this is the second line").
 The Linux kernel exempts the 0:0 whiteout char device from the CAP_MKNOD check, so the request reaches the daemon and the second line refuses what the kernel allowed.
 The check came in with `c373387` (slice C of #107).
-Not filed, per the task; listed here for a decision.
+Filed as #243 (reproduced end to end, not speculative).
 The harness marks both rows `root_required` because their text matches `mknod`, but the native arm shows the operation succeeds unprivileged, so it is a real divergence and the verdict correctly counts it.
 
 ## The 4 better positions
@@ -150,8 +157,8 @@ On the Mac, the same 113 tests pass and the live macOS mount table (16 lines) pa
 ## Verdict for g3, Linux arm
 
 Measured, not closed.
-One NEW divergence (`mknod/08.t` #19, #24, unprivileged whiteout mknod refused by the FUSE adapter) fails the gate on Linux.
-Everything else is equal or explained: 236 of 238 cases have identical counts, and the 4 better rows are a btrfs TODO in the native oracle.
+One NEW divergence (#243: `mknod/08.t` #19, #24, unprivileged whiteout mknod refused by the FUSE adapter) fails the gate on Linux.
+Everything else measured is equal or explained: 236 of 238 cases have identical counts, the both-fail text comparison finds no other difference among 5644 textful positions, and the 4 better rows are a btrfs TODO in the native oracle.
 
 ## Limits
 
