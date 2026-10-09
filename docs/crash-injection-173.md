@@ -177,9 +177,39 @@ Issue 276 follow-ups, killed by the same harness (`MUT_ARGS="--test crash --test
 M2 is also killed by the process-crash test `a_crash_at_every_step_of_a_discard_leaves_the_store_clean` now that the unlink is a boundary.
 Not done: `LogOp::Rename`, because the only renames in the store are inside `write_whole`, which the model already treats as one atomic `Whole` write.
 
+## Slice 4: power loss over a whole `Gc::collect`
+
+`crates/cowfs-gc/tests/power_collect.rs`, test-only, behind the dev-dependency `fault-injection` edge; no production code, public API or on-disk format changes.
+One thread-local op log carries three timelines in one order:
+
+- the store, rebuilt by `crashmodel::crash_image` at every op index of a real reclaiming collect;
+- the metadata database, on a recording redb `StorageBackend` passed to `Meta::open_with_backend`; each backend event stamps a marker (`1 << 40 | n`) into the store log, and the image at a cut is the base plus every event up to the last completed `sync_data` (all unsynced redb writes lost);
+- the collector's state directory (`atime.bin`, `mark.bin`), as any mix of old file, new file, torn prefix and no file.
+
+The meta database runs with the mount's `before_sync` hook (store sync before metadata commit), and the recorded cycle contains two commits on purpose: a `late` snapshot whose file is committed by the freeze, and a `mid` snapshot created after the freeze listing and committed by the sweep's fresh listing; a final `meta.sync()` after the collect plays the mount's background commit.
+Both snapshots name blocks that are garbage in the store until they do, so a lost commit-before-unlink ordering shows as a missing block.
+Each image is reopened (store, meta, collector) and must: report no store loss, hold no whole-pack acceptance of a pack still on disk, pass `meta.check`, read back byte for byte every block of every durable snapshot, pass `fsck`, and survive a second collect with no error and the same receipts.
+Fail-closed asserts: some image lost a source pack and some kept all; the `late` and `mid` files are durable in some images and missing in others.
+`C173_SEEDS=n` sets the seeds (default 8; about 1100 images, 15 s on the box).
+
+Collector state is advisory, so it is not routed through the store's fsync model.
+`gc_state_is_advisory` is the evidence: 64 seeds of every old/new/torn/missing mix over the final disk never lose a block or fail a collect, and a snapshot untouched since phase A (`frozen`) makes the next cycle read the persisted mark cache.
+The two fsync mutants of that cache survive, as they must (`GA1` no file fsync, `GA2` no directory fsync): the test already explores every state those fsyncs could change.
+
+Mutants (`MUT_PKG=cowfs-gc MUT_ARGS="--test power_collect" python3 crates/cowfs-store/tests/mutate.py ...`):
+
+- GM1, `collect` discards the new pack instead of the source: killed.
+- M2, unlink before the watermark raise: killed.
+- N1, no new-pack fsync: killed.
+- D1, no packs directory fsync after the unlink: killed (through the whole-pack acceptance check).
+- Survivors, with the reason: W1 and E7 (watermark before data fsync, no leading sync) need a writer with unsynced puts, which a collect does not have; the store sweeps kill them.
+  GF1 and GF2 (no metadata sync at the freeze, none at the fresh listing): each sync is the other's backup and `durable_snapshots` lists a snapshot as soon as `new_snapshot` returns, so neither is observable here; `race.rs` is where that window lives.
+
+Not covered: metadata unsynced writes surviving a cut (only the durable prefix is modelled; redb's own recovery is `cowfs-meta/tests/crash.rs`), the core-level timeline with the flusher thread (slice 5), `fsops.rs` intent files.
+
 ## Out of scope and next slices
 
-- Slice 3: power loss (store part done, see above).
+- Slice 3 and 4: power loss (store and gc parts done, see above).
   Chosen mechanism: a store-boundary write-ordering simulation, extending the existing `oplog_*` crash model (which already drops unsynced writes) to a recorded `Gc::collect`.
   It proves the store's fsync ordering under modelled filesystem rules, not that a real kernel, NFS or disk honours fsync.
   Real power loss needs the VM power-cut harness (`qa4-vm.sh` and `qa5-vm.sh` show the shape); out of scope.
