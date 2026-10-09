@@ -132,6 +132,7 @@ Valid means all of:
 - `problems` is empty and rep counts equal `--reps` for every gate; each arm's `foreign_cpu.p95` is within its `limit`.
 - `native_native` ratios within 1 +/- 0.10.
 - `compare_rc` is `[0, 0]` for a PASS or `[1, 1]` or mixed 0 and 1 for a real FAIL; 2 or 3 is INVALID.
+- On Linux the cowfs arm is `fuse.cowfs` with source `cowfs` (not `nfs`), `daemon.mount_fstype` is `fuse.cowfs`, and `platform` is `linux` with `native_fs` `btrfs` on the cachyos box; the rest of this list applies unchanged.
 - `result` is PASS, FAIL or INVALID, and only PASS or FAIL is a gate statement.
 - A non-sample run is refused up front unless gates include g1, g2 and g3, scale is 100, reps are at least 5 and `--load-cap` is at most 4.0 (a guess: 25 percent of 16 cores).
 - Any recorded problem, including in `--sample`, gives exit 2; a valid FAIL is exit 1.
@@ -141,36 +142,82 @@ Valid means all of:
 The debug-build artefact looks like: the driver refuses the build (opt_level 0 or debug assertions), or in old logs cowfs/native ratios of 17x to 144x on every rep including a no-op rebuild costing 13 to 16 s, load1 above 8, and native-native outside the band.
 A cowfs/native ratio of 10x or more with a release daemon, quiet host and good controls would be a real FAIL, not an artefact, and must be investigated rather than excused.
 
-## Linux native arm: cachyos, btrfs
+## Linux arm: cachyos, btrfs
 
-What exists: nothing.
-There is no Linux driver and no Linux release daemon built for this gate.
-`bench/linux-sample.sh` is native-only and starts no daemon.
+The same driver runs the Linux arm: `python3 bench/g12_run.py --run-id ID` picks the platform from `sys.platform`.
+No second driver: the profile check, digest check, quiet rule, cool-down, minimums, `verdict.json` and exit codes are one code path.
 
-Host facts (checked 2026-10-08): `zeeshan@100.122.64.51`, x86_64, 16 cores, Linux 7.2.8 cachyos, load average 0.01, cargo 1.99.0, git, fusermount3 present.
-The cachyos root and `/home` (nvme0n1p2) and `/mnt/docs` are btrfs.
-So the Linux native number is a BTRFS number and must be reported as such.
+Host facts (checked 2026-10-08): `zeeshan@100.122.64.51`, x86_64, 16 cores, Linux 7.2.8 cachyos, cargo 1.99.0, git, fusermount3, `/dev/fuse` mode 666 (so FUSE mounts need no sudo, verified by the sample below).
+The cachyos root and `/home` (nvme0n1p2) and `/mnt/docs` (nvme0n1p3) are btrfs.
+So the Linux native number is a BTRFS number and must be reported as such: `verdict.json` carries `platform` and `native_fs` (the native root's filesystem, read from `mount`).
+
+What the Linux arm does differently (all in `bench/g12_run.py`):
+- cowfs arm: the same private release `cowfs-daemon`, serving a FUSE mount; the arm must be `fuse.cowfs` with source `cowfs` (the fsname default of `cowfs-fuse`), `st_dev` different from the native root, daemon alive, digest unchanged, checked before and after every cowfs arm.
+  The native root being on a `fuse.cowfs` mount stops the run.
+- Parsing: `mount_entry` reads both `X on Y (type, ...)` (macOS) and `X on Y type T (...)` (Linux).
+- CPU idle: `/proc/stat` deltas (idle + iowait over all ticks) every 5 s instead of `top -l`.
+- Foreign CPU: same derivation as macOS (limit = baseline p95 + 50 points; load1 only for baseline and settle; same plateau cool-down and the same minimums), but a different metric, below.
+  On Linux `ps` pcpu is CPU time over process lifetime, which hides a long-lived process that spikes now, so the Linux driver does not use it: it reads `/proc/[pid]/stat` twice 1 s apart and takes utime+stime tick deltas (a process is identified by pid and starttime, not by name, since kworker and setproctitle processes rename themselves; one born or reused inside the interval counts all its ticks), then feeds the same rows to the same `foreign_cpu` rule.
+  The metric still differs from the macOS one (1 s delta against a decaying average), so the two platforms' baselines and limits are never compared with each other.
+  The induced set (reported, not gated) is kernel threads `kworker`, `ksoftirqd`, `kswapd`, `jbd2`, `btrfs-*`, `fuse*`; chosen, not measured.
+  The cachyos self-hosted CI runners (`Runner.Listener`, `Runner.Worker`) and any login session count as foreign and are gated, deliberately.
+- Paths: everything resolves under `/mnt/docs/Projects/cowfs-g12` (override `COWFS_G12_BASE`): the checkout and `bench/out/g12/ID`, the CPU lock `cpu.lock`, the socket `sock/g12-ID.sock`.
+  The driver refuses a path outside that base, and a socket path over 100 bytes (AF_UNIX).
+  The socket directory is created mode 0700, because `cowfs-daemon` refuses any other mode (found live on the first sample).
+- Stop: SIGTERM after an argv check, then if a `fuse.cowfs` mount is still listed, `fusermount3 -u` on that exact mountpoint, then the table is re-read and a remaining mount is a recorded problem.
+- Cargo and temp: `CARGO_HOME`, `COWFS_BENCH_CARGO_HOME` and `TMPDIR` default to `<base>/cargo-home` and `<base>/tmp`, and the path check refuses an override outside the base.
+  The rustup toolchain stays in `~/.rustup` (read only).
+
+Shipping the tree: a `git bundle` of the branch cloned on the box (the gate corpus clone needs the pinned sha `c1619ec`, which `git archive` has no history for), then the changed files copied over.
+There are no GitHub credentials on the box.
 
 Optional proxy, explicitly labelled loop-on-btrfs: an ext4 loop image under `/mnt/docs`.
-It needs sudo for loop, mkfs and mount only, using the password from the `.env` `CACHY_OS_PASS` piped on stdin, never in argv.
-The recipe is `docs/verification/evidence/namespaces171/fsimg.sh`, in commit `29f6e9a` (not on this branch).
+It needs sudo for loop, mkfs and mount only, using an operator-supplied password piped on stdin, never in argv.
+The recipe is `docs/verification/evidence/namespaces171/fsimg.sh`, in commit `29f6e9a`.
+Not built or run here.
 A loop-on-btrfs ext4 number is never the gate.
 
-`bench/g12_run.py` parts that are macOS-specific and must not be reused as is on Linux:
-- `top -l` CPU parsing (`window`).
-- `mount_entry` parses the macOS form `X on Y (type, opts)`; Linux prints `X on Y type T (opts)`, so the regex would read the type as `rw`.
-- The daemon mount check `fstype == "nfs"` and the `localhost:/cowfs-` NFS export source in `arm_problems`.
-- The shared CPU lock path under `spikes/nfs-loopback/out`.
-- The `~/.cowfs/sock` socket location.
+Validated on cachyos (2026-10-08), NOT GATE RESULTS.
+Driver files sha256 prefixes `0a7d8aac` (g12_run.py) and `2c363734` (test_g12_run.py) are what ran in `lsample4`, run from a bundle of this branch's base plus those two files (the branch head is identical to them for these files).
+- `python3 -m unittest bench.test_g12_run` (32 tests) passes on the box and on the Mac; `python3 -m unittest discover -s bench` passes on the Mac (516 tests, 13 skipped).
+- `lsample4` (final driver): `--sample` (scale 1, g3, 1 rep, 20 s baseline).
+  Release build accepted (`opt_level` 3, `debug_assertions` false), daemon launched from the built binary, `mount_fstype` `fuse.cowfs`, all four arms ran and were quiet, `pre` and `post` arm checks empty, `native_fs` `btrfs`, `induced_max` at most 4 points.
+  Exit 2 with the only recorded problem native-native 0.412 outside 1 +/- 0.10: g3 takes 0.03 to 0.1 s at scale 1 with one rep, so that is noise, and the sample's g3 cowfs/native ratios of 1.62 and 1.27 (`compare_rc` `[1, 0]`) say nothing about cowfs.
+- `lsample3` (earlier driver, same box): `--sample --gates g1,g2,g3`, so a clean cargo build and an edit rebuild ran through the FUSE mount.
+  `lsample3` cowfs/native, all gates, pair1 and pair2, one rep on a non-quiet host, NOT A GATE RESULT either way: harness g1 1.20 and 1.18 (16.2 s native against 19.5 s cowfs); harness g2 2.83 and 2.69 (FAIL at 1.5x); harness g3 2.12 and 3.60 (FAIL at 1.5x); `compare_rc` `[1, 1]`; native-native g1 1.001, g2 0.883, g3 0.336.
+  One rep is not an estimate, and the passing g1 must not be read alone.
+  Its c1, n2 and c2 arms were "not quiet" by the settle check because load1 (1.6 to 2.1) was above the baseline-derived limit of 1.42 right after the previous arm's `-j4` build; foreign CPU was within its limit.
+  That run also exposed the process-identity bug (`induced_max` of 3000 to 18000 points because a renamed kernel thread counted its lifetime ticks), fixed by the starttime rule and a test before `lsample4`.
+- `lsample1` (first driver) died on the daemon's 0700 socket-directory rule; fixed, test added.
+- `lsample2` (lifetime-pcpu driver) got through the plumbing with native-native 0.522 and `compare_rc` `[1, 1]`; superseded by the /proc delta metric.
+- Afterwards each time: no `cowfs` mount, no daemon, no driver process, `cpu.lock` and socket gone.
 
-Requirements for a Linux arm, text only, not built in this PR:
-- A Linux release daemon built on cachyos with the same `--message-format=json` profile and digest checks.
-- A FUSE mount through `cowfs-fuse` inside the daemon, `fusermount3` for unmount, and a mount-table check for `fuse.cowfs` instead of NFS (see how `docs/verification/ready-g4.md` attests the arm).
-- Everything under `/mnt/docs/...` per the `cachyos-gpu` skill (not `/` or `/home`), including the private store, mount, socket, cargo home and native root.
-- A Linux idle baseline from `/proc/loadavg` and `/proc/stat` over the same window rules.
-- A native control on the same btrfs filesystem and the same native-native band.
-- Sudo only for the optional loop image, never for the daemon.
-- Coordination with the cachyos self-hosted CI runner, which shares the box.
+Still unvalidated on Linux:
+- Harness g1 and g2 as a measurement: one sample rep only, no 5-rep run.
+  Harness g2 took 0.11 to 0.36 s in `lsample3` (observed from the artifact mtimes in `lsample3/native/corpus-target/debug/deps` on the box, review of PR 202): g2 appends a comment to `crates/cowfs-vfs-path/src/cookies.rs`, and after that rep only `cowfs_vfs_path` was rewritten, with no downstream crate or binary relinked, so g2 is cargo's freshness scan plus one small incremental rustc run.
+  The FUSE overhead of about 0.2 s on that is the 2.7x ratio.
+  Off macOS there is no added-seconds budget (macOS uses an absolute 1.0 s added budget per issue 18), so Linux harness g2 FAILS BY CONSTRUCTION of this workload.
+  OPEN DECISION for Zee, not decided here: add an absolute added-seconds budget on Linux, or change the g2 edit to one that relinks something realistic.
+  The comment in `bench/gates.py` claiming nothing in the workspace depends on `cowfs-vfs-path` is false: at the pinned sha `c1619ec` the dependent is `cowfs-fuse`, and on current main also `cowfs-ctl`, `cowfs-daemon`, `cowfs-gc` and `cowfs-nfs`. In `lsample3` `cowfs-fuse` was not rebuilt after the g2 edit; nothing was observed for the current-main dependents. Documented here, code comment not changed in this PR.
+- Open, non-blocking, from the PR 202 review:
+  - The induced set matches by name prefix, so a user process named `fuse*` or `btrfs-*` escapes the foreign gate.
+  - An unreadable `/proc` yields 0 foreign CPU and passes silently.
+  - Short-lived processes inside the 1 s window are not counted, and foreign cargo, rustc, cc1 and ld are checked by `ps` only at the baseline and between arms, not during an arm (the same weakness class as macOS `ps`).
+  - `/proc/stat` idle counts iowait as idle (defensible, since the floor is relative to a baseline with the same definition, but it eases the floor under an I/O-heavy foreign process on btrfs).
+  - `native_fs` is recorded, not gated, and `COWFS_G12_BASE` is overridable with the guard checking against the same base (a real run must not override it).
+  - The path guard does not resolve symlinks.
+- The plateau cool-down did not settle in samples (a sample does not wait); it has never run live with a real 300 s baseline.
+- A full gate run (scale 100, 5 reps) has not been attempted.
+- The box has an interactive desktop session (`kitty`, `btop`, `hyprlock` showed in the foreign-CPU top lists) and the self-hosted CI runners: a real run needs a window with neither, and no lock is shared with the runners.
+- The foreign-CPU limit on Linux (baseline p95 + 50 points) is a chosen margin, as on macOS.
+- Each Linux foreign-CPU sample includes a 1 s delta, so the sampling cadence is about 6 s and `--baseline-window 300` spans about 360 s.
+- The `fusermount3 -u` fallback is covered by a unit test only; in every live run the daemon unmounted itself on SIGTERM.
+
+Linux one-command recipe (run it detached; the harness timeout kills foreground jobs):
+
+    export PATH=/home/zeeshan/.cargo/bin:$PATH && cd /mnt/docs/Projects/cowfs-g12/src && mkdir -p ../logs && setsid nohup python3 bench/g12_run.py --run-id g12-$(date +%Y%m%d) > ../logs/g12.log 2>&1 < /dev/null & echo $! > ../logs/g12.pid
+
+Afterwards verify: `mount | grep cowfs` is empty, `pgrep -f '^python3 bench/g12_run'` is empty, `../cpu.lock` is gone.
 
 ## Sample run, NOT A GATE RESULT
 
@@ -185,18 +232,19 @@ Both samples are described here only; their `verdict.json` files are not committ
 - The 23.4x and 12.0x cowfs/native ratios in it are busy-host numbers, not evidence about cowfs.
 
 `sample1` is superseded: it came from the first driver version, which could not fail its release check or detect a dead daemon.
-Neither sample ran cargo builds through the mount, which stay unvalidated (see blockers).
+Neither macOS sample ran cargo builds through the NFS mount, which stays unvalidated (see blockers); the Linux samples are described in the Linux section.
 
 ## Blockers checklist
 
-- [ ] UNVALIDATED: cargo build through the release daemon mount; run `--sample --gates g1,g2 --reps 1` on the quiet host first.
+- [ ] UNVALIDATED: cargo build through the release daemon mount: run once on Linux in `lsample3` (1 rep, scale 1, FUSE), not validated; not run on macOS NFS; run `--sample --gates g1,g2 --reps 1` on the quiet host first.
 - [ ] Quiet Mac: no other agent running cargo or rustc, so the baseline passes (p95 load1 at most 4.0).
 - [x] cargo-home populated in this lease (`bench/out/cargo-home`); a new lease needs network once.
 - [ ] Release binaries present in the lease (rebuild if the lease was returned).
 - [ ] Time budget: 100k-file tree generation through NFS plus 4 arms x 5 reps of clean builds; expect hours, not minutes.
-- [ ] Linux native arm on cachyos (btrfs): Linux driver and Linux release daemon do not exist (requirements above).
-- [ ] The foreign CPU rule, the plateau cool-down and the induced set have never run live in a driver run, only as unit tests and one `ps` parse on this Mac; they are untested against a real build on a quiet host.
-- [ ] Cargo build through the mount is still unvalidated on a quiet host.
+- [ ] OPEN DECISION (Zee): Linux harness g2 fails by construction (0.1 s native workload, no added-seconds budget off macOS); add an absolute added-seconds budget on Linux, or change the g2 edit to one that relinks something realistic.
+- [ ] Linux arm on cachyos (btrfs): driver exists, g3 samples passed their plumbing and a cargo build through FUSE ran once (1 rep, not validated); the full run is not done.
+- [ ] The foreign CPU rule, the plateau cool-down and the induced set have never run live with a real baseline, on either platform: unit tests, a `ps` parse on this Mac, and the 20 s Linux samples only.
+- [ ] Cargo build through the mount is still unvalidated on a quiet host (Linux: one sample rep only, see above).
 - [ ] Real large tracked repo for git status is not covered (synthetic tree only).
 
 ## One-command recipe for the quiet-host Mac run
