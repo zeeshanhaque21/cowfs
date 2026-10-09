@@ -93,15 +93,25 @@ The gate is defined from a baseline taken at the start of each real run, by comm
 
     python3 bench/g12_run.py --run-id ID
 
-- Baseline window: 300 s, load1 sampled every 5 s plus `top -l N -s 5 -n 0` CPU idle (first top sample dropped, it is since boot).
-- Baseline is refused if p95 load1 exceeds 4.0 (25 percent of 16 cores), if any foreign cargo, rustc, cc1 or ld process runs, or if there are no CPU samples.
-- The constants 4.0, +1.0 and -10 points are chosen, not measured.
-- Limit is `min(baseline p95 load1 + 1.0, 4.0)`; idle floor is baseline median CPU idle minus 10 points.
-- Before each of the four arms a 60 s window must satisfy the limit, the idle floor and no foreign processes, retrying for 15 minutes, else INVALID.
-- After the run every rep's `load1_before` and `load1_after` is checked against the limit.
+- After the release build the driver waits for a load1 plateau: 7 polls 10 s apart, all at or below the cap (4.0) and spread under 0.5 (the 0.5 is chosen), at most 600 s, else INVALID with the reason, so the build's decaying load never enters the baseline.
+- Baseline window: 300 s, sampled every 5 s: load1, foreign CPU, plus `top -l N -s 5 -n 0` CPU idle (first top sample dropped, it is since boot).
+- Foreign CPU is the sum of `ps` pcpu of every process outside the driver's own process tree and the daemon's tree (the arm's build, the mount server and the driver itself are own).
+  `ps` pcpu is a decaying average, a heuristic, so it is only ever compared with the same metric from the baseline, never read as absolute usage.
+- Baseline is refused if p95 load1 exceeds 4.0 (25 percent of 16 cores), if p95 foreign CPU exceeds 100 points (one core), if any foreign cargo, rustc, cc1 or ld process runs, or if there are no CPU samples.
+- Derivation: the limits are the measured baseline plus a stated margin, and the margins are chosen, not measured.
+  - load1 limit = baseline p95 load1 + 1.0, capped at 4.0.
+  - Foreign CPU limit = baseline p95 foreign CPU + 50 points (half a core).
+  - Idle floor = baseline median CPU idle - 10 points.
+- CPU of `kernel_task` (the NFS client), `mds`, `mds_stores`, `mdworker_shared` and `fseventsd` is induced by the arm's own file I/O: it is recorded per arm as `induced_max` but not gated.
+  That set is chosen, not measured. Spotlight indexing was reported disabled on this Mac (`mdutil -s`).
+- The top 3 gated contributors at each arm's peak sample are recorded in `verdict.json` (`foreign_cpu.top3_at_peak`) so a breach can be diagnosed.
+- During an arm only gated foreign CPU counts: a sampler takes one reading at the start, every 5 s, and one at the end, and the arm's p95 must be within the foreign CPU limit.
+  A breach stops the run as INVALID, since the remaining arms would be wasted.
+- load1 is used only for the baseline and for the settle window before each arm (60 s, retried up to 15 minutes, with the load1 limit, the idle floor and no foreign build processes).
+  It is not applied per rep, because the arm's own `cargo build -j 4` raises load1 above any idle-derived limit.
 - `compare.py` has its own ceiling of 30 and a 2x arm skew limit; both are far looser than this gate and only a backstop.
 
-Other cowfs daemons, including shared daemon 15263, do not count as foreign; their load shows up in load1 and CPU idle, which carry the gate.
+Other cowfs daemons, including shared daemon 15263, do not count as foreign; their CPU shows up as foreign CPU, load1 and CPU idle, which carry the gate.
 Run it when the other builders are finished.
 
 ## Thermal and cool-down
@@ -119,7 +129,7 @@ Valid means all of:
 
 - `build` shows `opt_level` 3 and `debug_assertions` false for both binaries, and `daemon.launched_from_built_binary` is true with `daemon.mount_fstype` `nfs`.
 - Every cowfs entry in `arms` has `pre` and `post` with `alive` true, `fstype` `nfs`, a `localhost:/cowfs-` source, an `st_dev` different from the native root, and no `problems` (a dead daemon makes `gates.py` recreate the root on local disk, which would be a native run labelled cowfs).
-- `problems` is empty, rep counts equal `--reps` for every gate, and no rep above the load limit.
+- `problems` is empty and rep counts equal `--reps` for every gate; each arm's `foreign_cpu.p95` is within its `limit`.
 - `native_native` ratios within 1 +/- 0.10.
 - `compare_rc` is `[0, 0]` for a PASS or `[1, 1]` or mixed 0 and 1 for a real FAIL; 2 or 3 is INVALID.
 - `result` is PASS, FAIL or INVALID, and only PASS or FAIL is a gate statement.
@@ -166,12 +176,12 @@ Requirements for a Linux arm, text only, not built in this PR:
 
 Both samples are described here only; their `verdict.json` files are not committed.
 
-`sample2` is the run of the committed driver: `python3 bench/g12_run.py --run-id sample2 --sample` (scale 1, gate g3 only, 1 rep, four arms).
+`sample2` ran an earlier (round 2) driver, before the foreign CPU rule, the plateau cool-down and the induced set existed, so its load findings below come from a rule that no longer exists: `python3 bench/g12_run.py --run-id sample2 --sample` (scale 1, gate g3 only, 1 rep, four arms).
 - `build` shows both binaries accepted from cargo's own reported profile.
 - `daemon.launched_from_built_binary` is true.
 - c1 and c2 `pre` and `post` arm checks had empty problem lists.
 - `mount | grep g12/` gave 0 and the CPU lock was gone afterwards.
-- It exited 2 because problems were recorded on the busy host: baseline refused, all reps above the load limit, native-native 0.626 outside the band, `compare.py` rc 2 twice.
+- It exited 2 because problems were recorded on the busy host: baseline refused, all reps above the (since removed) per-rep load limit, native-native 0.626 outside the band, `compare.py` rc 2 twice.
 - The 23.4x and 12.0x cowfs/native ratios in it are busy-host numbers, not evidence about cowfs.
 
 `sample1` is superseded: it came from the first driver version, which could not fail its release check or detect a dead daemon.
@@ -185,7 +195,8 @@ Neither sample ran cargo builds through the mount, which stay unvalidated (see b
 - [ ] Release binaries present in the lease (rebuild if the lease was returned).
 - [ ] Time budget: 100k-file tree generation through NFS plus 4 arms x 5 reps of clean builds; expect hours, not minutes.
 - [ ] Linux native arm on cachyos (btrfs): Linux driver and Linux release daemon do not exist (requirements above).
-- [ ] Unresolved: per-rep load1 is read around a `cargo build -j 4`, so the arm's own load may mark every build rep above the limit; check on the quiet-host `--sample --gates g1,g2 --reps 1`.
+- [ ] The foreign CPU rule, the plateau cool-down and the induced set have never run live in a driver run, only as unit tests and one `ps` parse on this Mac; they are untested against a real build on a quiet host.
+- [ ] Cargo build through the mount is still unvalidated on a quiet host.
 - [ ] Real large tracked repo for git status is not covered (synthetic tree only).
 
 ## One-command recipe for the quiet-host Mac run
