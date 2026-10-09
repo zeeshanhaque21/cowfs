@@ -465,6 +465,78 @@ def tool_identity(src: Path, binary: Path, features: list[str], source: dict) ->
     }
 
 
+# ---------------------------------------------------------------- suite input
+
+# The macOS NFS client answers EINVAL for pathconf(_PC_PATH_MAX) without asking the server (issue
+# 218, docs/verification/evidence/nfs108-pathconf.md), so `dirgen_max` in misc.sh builds an empty
+# path on the cowfs arm and 13 ENAMETOOLONG cases cannot compare anything. The suite reads
+# PATH_MAX in exactly this one place (and never reads _PC_PIPE_BUF), so the run supplies the value
+# the native arm reports, and only where an arm's own answer is not a positive number.
+PATH_MAX_READ = "\tpath_max=`${fstest} pathconf . _PC_PATH_MAX`\n"
+PATH_MAX_SUPPLY = '\t[ "${path_max}" -gt 0 ] 2>/dev/null || path_max=%d\n'
+
+
+def pathconf_answer(path: Path, name: str) -> dict:
+    try:
+        return {"value": os.pathconf(path, name)}
+    except OSError as exc:
+        return {"value": None, "errno": exc.errno, "error": os.strerror(exc.errno or 0)}
+
+
+def build_suite_overlay(tests_root: Path, dest: Path, binary: Path, path_max: int) -> tuple[Path, dict]:
+    """A per-run copy of the pinned suite whose only difference is one line in misc.sh.
+
+    Every file but misc.sh is a symlink to the pinned file, so the bytes that run are the pinned
+    bytes. The pinned checkout itself is never touched, which keeps verify_tool_source meaningful.
+    The returned receipt names what was injected and the sha256 of both misc.sh files.
+    """
+    pinned = (tests_root / "misc.sh").read_text()
+    if pinned.count(PATH_MAX_READ) != 1:
+        raise RuntimeError("misc.sh does not contain the one PATH_MAX read this harness patches")
+    patched = pinned.replace(PATH_MAX_READ, PATH_MAX_READ + PATH_MAX_SUPPLY % path_max)
+    tests = dest / "tests"
+    tests.mkdir(parents=True)
+    for entry in sorted(tests_root.iterdir()):
+        if entry.name == "misc.sh":
+            continue
+        if entry.is_dir():
+            # A real directory of symlinks: sh resolves `<dir>/../misc.sh` physically, so a
+            # symlinked group directory would reach the pinned misc.sh instead of the overlay's.
+            (tests / entry.name).mkdir()
+            for case in sorted(entry.iterdir()):
+                (tests / entry.name / case.name).symlink_to(case.resolve())
+        else:
+            (tests / entry.name).symlink_to(entry.resolve())
+    (tests / "misc.sh").write_text(patched)
+    (dest / "pjdfstest").symlink_to(binary.resolve())
+    return tests, {
+        "mechanism": "one line inserted after the _PC_PATH_MAX read in misc.sh dirgen_max, in a "
+                     "per-run overlay; every other suite file is a symlink to the pinned file",
+        "injected_line": (PATH_MAX_SUPPLY % path_max).strip(),
+        "applies_to": "any arm whose pathconf answer is not a positive number (both arms run the "
+                      "same overlay, so only an arm that cannot answer is changed)",
+        "path_max": path_max,
+        "misc_sh_pinned_sha256": sha256_text(pinned),
+        "misc_sh_overlay_sha256": sha256_text(patched),
+        "overlay": str(tests),
+    }
+
+
+def suite_input_receipt(native_root: Path, cowfs_root: Path, tests_root: Path, run_dir: Path,
+                        binary: Path) -> tuple[Path, dict]:
+    """What each arm's filesystem answers for PATH_MAX, and what the run supplied because of it."""
+    answers = {arm: {name: pathconf_answer(root, name) for name in ("PC_PATH_MAX", "PC_NAME_MAX")}
+               for arm, root in (("native", native_root), ("cowfs", cowfs_root))}
+    native_max = answers["native"]["PC_PATH_MAX"]["value"]
+    receipt = {"pathconf": answers}
+    if not isinstance(native_max, int) or native_max <= 0:
+        receipt["injection"] = None
+        receipt["note"] = "the native arm gave no PATH_MAX, so none was supplied and the pinned suite ran as is"
+        return tests_root, receipt
+    tests, receipt["injection"] = build_suite_overlay(tests_root, run_dir / "suite", binary, native_max)
+    return tests, receipt
+
+
 # ---------------------------------------------------------------- process registry
 
 
@@ -1567,10 +1639,15 @@ def main() -> int:
         # device, is not a measurement. The receipt is written here, while the mount is up, so the
         # identity survives teardown.
         identity_problems = validate_runtime_identity(arm_fs, expected_cowfs_mount=mount)
+        run_tests_root, suite_input = suite_input_receipt(native_root, cowfs_root, tests_root, run_dir,
+                                                          binary)
+        log(f"suite input {json.dumps(suite_input['pathconf'], sort_keys=True)} "
+            f"injection {(suite_input['injection'] or {}).get('injected_line')}")
         (run_dir / "identity.json").write_text(json.dumps({
             "runtime_identity": arm_fs,
             "validated": not identity_problems,
             "problems": identity_problems,
+            "suite_input": suite_input,
             "mount_table_line": identity["mount_table_line"],
             "daemon": {k: identity[k] for k in ("pid", "argv", "registered_at", "store", "socket")},
             "cowfs_build": cowfs_build,
@@ -1582,10 +1659,10 @@ def main() -> int:
             log(f"refusing to score: no case ran. receipt {run_dir / 'identity.json'}")
             return EXIT_STATUS[INVALID]
         log("native arm")
-        run_arm(registry, "native", tests, tests_root, native_root, run_dir / "raw", jsonl,
+        run_arm(registry, "native", tests, run_tests_root, native_root, run_dir / "raw", jsonl,
                 args.case_timeout)
         log("cowfs arm")
-        run_arm(registry, "cowfs", tests, tests_root, cowfs_root, run_dir / "raw", jsonl,
+        run_arm(registry, "cowfs", tests, run_tests_root, cowfs_root, run_dir / "raw", jsonl,
                 args.case_timeout)
     finally:
         if identity is not None:

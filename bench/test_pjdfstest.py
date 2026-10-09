@@ -605,28 +605,39 @@ class AcceptedDivergences(unittest.TestCase):
         self.assertEqual(len(p.ordinal_rows(sample)[0]), 20)
         self.assertEqual(len(divergence_messages(p.accepted_reasons(sample, []))), 1)
         self.assertEqual(len(divergence_messages(p.accepted_reasons(full, []))), 1)
+        # Those pre-fix runs carry 69 pathconf positions (issue 108). Issue 218 supplies PATH_MAX, so
+        # the checked-in list no longer waives them: a pre-fix run fails against today's list.
         listed = p.load_accepted()
-        for arms in (sample, full):
-            self.assertEqual(divergence_messages(p.accepted_reasons(arms, listed)), [])
-        by_issue = {}
-        for e in listed:
-            by_issue.setdefault(e["issue"], []).append((e["test"], e["n"]))
-        self.assertEqual(len(by_issue["#108"]), 69)
-        self.assertEqual(len({t for t, _ in by_issue["#108"]}), 13)
-        self.assertEqual(by_issue["#204"], [("open/17.t", 2)])
-        self.assertEqual(by_issue["#109"], [("unlink/14.t", 4)])
-        self.assertFalse([r for r in p.accepted_reasons(full, listed) if "listed but not worse" in r["message"]])
+        self.assertEqual(len(divergence_messages(p.accepted_reasons(full, listed))), 1)
+        self.assertIn("69 ordinal-worse", divergence_messages(p.accepted_reasons(full, listed))[0])
+
+    def test_2026_10_09_run_with_path_max_supplied(self):
+        fresh = arms_from("g3-20261009T095141Z-slice.jsonl")
+        listed = p.load_accepted()
+        self.assertEqual({(t, n) for t, n in ((r["test"], r["n"]) for r in p.ordinal_rows(fresh)[0])},
+                         {("open/17.t", 2), ("unlink/14.t", 4)})
+        self.assertEqual(divergence_messages(p.accepted_reasons(fresh, listed)), [])
+        self.assertFalse([r for r in p.accepted_reasons(fresh, listed) if "listed but not worse" in r["message"]])
+        by_issue = {e["issue"]: (e["test"], e["n"]) for e in listed}
+        self.assertEqual(by_issue, {"#204": ("open/17.t", 2), "#109": ("unlink/14.t", 4)})
+        # The 13 PATH_MAX cases are real comparisons now: every one matches native ok for ok
+        # (the cowfs stderr still says `pathconf returned -1`, which the supplied value makes harmless).
+        for test in ("chmod/03.t", "chown/03.t", "ftruncate/03.t", "link/03.t", "mkdir/03.t", "mkfifo/03.t",
+                     "mknod/03.t", "open/03.t", "rename/02.t", "rmdir/03.t", "symlink/03.t", "truncate/03.t",
+                     "unlink/03.t"):
+            self.assertEqual((fresh["native"][test]["ok"], fresh["native"][test]["not_ok"]),
+                             (fresh["cowfs"][test]["ok"], fresh["cowfs"][test]["not_ok"]), test)
 
     def test_the_critics_mutation_is_a_divergence(self):
         # Changing the failure text at unlink/14.t #4 to an unrelated error used to stay waived.
-        full = arms_from("g3-20261009T071336Z-slice.jsonl")
+        full = arms_from("g3-20261009T095141Z-slice.jsonl")
         full["cowfs"]["unlink/14.t"]["cases"][3]["detail"] = "tried 'unlink x', expected 0, got EIO"
         out = p.accepted_reasons(full, p.load_accepted())
         self.assertIn("unlink/14.t #4", divergence_messages(out)[0])
 
     def test_the_list_is_exactly_what_the_derivation_script_produces(self):
         import derive_pjdfstest_divergences as d
-        derived = d.derive(arms_from("g3-20261009T071336Z-slice.jsonl"), "x")
+        derived = d.derive(arms_from("g3-20261009T095141Z-slice.jsonl"), "x")
         self.assertEqual(derived["entries"], p.load_accepted())
 
     def test_the_derivation_script_refuses_an_unclassified_worse_position(self):
@@ -634,6 +645,62 @@ class AcceptedDivergences(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             d.derive(self.arms([True], [False]), "x")
         self.assertIn("a/03.t #1", str(ctx.exception))
+
+
+class SuiteInput(unittest.TestCase):
+    """Issue 218: the cowfs arm gets the native PATH_MAX, in a per-run overlay, and the receipt says so."""
+
+    def overlay(self, tmp, binary=None):
+        root = Path(tmp) / "tests"
+        (root / "chmod").mkdir(parents=True)
+        (root / "chmod" / "03.t").write_text("echo 1\n")
+        (root / "conf").write_text("x=1\n")
+        (root / "misc.sh").write_text("a=1\n" + p.PATH_MAX_READ + "b=2\n")
+        binary = Path(tmp) / "pjdfstest"
+        binary.write_text("")
+        return root, p.build_suite_overlay(root, Path(tmp) / "suite", binary, 1024)
+
+    def test_overlay_changes_one_line_and_leaves_the_pinned_suite_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, (tests, receipt) = self.overlay(tmp)
+            self.assertEqual((root / "misc.sh").read_text(), "a=1\n" + p.PATH_MAX_READ + "b=2\n")
+            lines = (tests / "misc.sh").read_text().splitlines()
+            self.assertEqual(len(lines), 4)
+            self.assertEqual(lines[2].strip(), receipt["injected_line"])
+            self.assertTrue((tests / "chmod" / "03.t").is_symlink() and (tests / "conf").is_symlink())
+            self.assertFalse((tests / "chmod").is_symlink())
+            # sh resolves `<group>/../misc.sh` physically, so the case must reach the overlay's file.
+            done = subprocess.run(["sh", "-c", ". " + str(tests / "chmod" / ".." / "misc.sh") + "; echo $a"],
+                                  capture_output=True, text=True)
+            self.assertEqual(done.stdout.strip(), "1")
+            self.assertTrue((tests.parent / "pjdfstest").is_symlink())
+            self.assertNotEqual(receipt["misc_sh_pinned_sha256"], receipt["misc_sh_overlay_sha256"])
+            self.assertEqual(receipt["misc_sh_pinned_sha256"], p.sha256_text((root / "misc.sh").read_text()))
+
+    def test_overlay_refuses_a_misc_sh_it_cannot_patch_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tests"
+            root.mkdir()
+            (root / "misc.sh").write_text("nothing\n")
+            with self.assertRaises(RuntimeError):
+                p.build_suite_overlay(root, Path(tmp) / "suite", Path(tmp) / "b", 1024)
+
+    def test_injected_line_only_changes_an_arm_that_cannot_answer(self):
+        line = (p.PATH_MAX_SUPPLY % 1024).strip()
+        for answer, want in (("-1", "1024"), ("", "1024"), ("0", "1024"), ("1024", "1024"), ("4096", "4096")):
+            done = subprocess.run(["sh", "-c", f'path_max="{answer}"; {line}; echo $path_max'],
+                                  capture_output=True, text=True, check=True)
+            self.assertEqual(done.stdout.strip(), want, answer)
+
+    def test_receipt_records_both_arms_answers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.overlay(tmp)
+            native = Path(tmp) / "native"
+            native.mkdir()
+            tests, receipt = p.suite_input_receipt(native, native, root, Path(tmp) / "run", Path(tmp) / "pjdfstest")
+            self.assertEqual(receipt["pathconf"]["native"]["PC_PATH_MAX"]["value"], os.pathconf(native, "PC_PATH_MAX"))
+            self.assertEqual(receipt["injection"]["path_max"], os.pathconf(native, "PC_PATH_MAX"))
+            self.assertEqual(tests, Path(tmp) / "run" / "suite" / "tests")
 
 
 class TestList(unittest.TestCase):
