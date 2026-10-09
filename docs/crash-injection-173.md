@@ -51,7 +51,9 @@ Constraint from issue 88:
 - `scripts/check-fault-seam-absent.sh`, run as a CI step, builds the library crates in a separate target dir without the feature.
   It fails if `cowfs-daemon`'s feature graph enables the feature, or if the rlib contains the seam's env key `C7D_EXIT_BOUNDARY_N`.
   It then rebuilds with the feature as a positive control and fails if the key is not found, so the check cannot be blind.
-  The release `cowfs-daemon` is also searched for `oplog_start` and `crashmodel`; those two have no positive control of their own, because an unused item is dropped from a release binary.
+  The release `cowfs-daemon` is also searched for `C7D_EXIT` and `oplog_start`; the feature-on hit is the positive control for the pair, and `oplog_start` has none of its own because an unused item is dropped from a release binary.
+  `crashmodel` is not searched: the daemon never links it even with the feature on (0 hits), so a grep would pass whether or not the module were gated.
+  The compiler is that gate: `crashmodel` imports `LogOp`, whose re-export is `cfg(feature)`, so removing the cfg from `pub mod crashmodel` fails a feature-off build with E0432 (issue 276, tried on the box).
   It is a separate cargo invocation because `cargo test --workspace` turns the feature on through the dev-dependency edges.
 - Known pre-existing caveat, unchanged: `cargo build --workspace --all-targets` unifies the feature onto the lib (see `docs/verification/gc-daemon-e2e.md`).
   The CI workflow has no release build step, so the library graph above is the artifact checked.
@@ -163,6 +165,14 @@ Mutants (`crates/cowfs-store/tests/mutate.py`, run with `MUT_ARGS="--test crash 
 - M2, unlink before the watermark raise (mutation 2): killed by the discard sweep.
 - N1, no new-pack fsync in `finish_compaction`: killed by the compaction plus discard sweep.
 - D1, no packs directory fsync after the unlink: killed by the discard sweep.
+
+Issue 276 follow-ups, killed by the same harness (`MUT_ARGS="--test crash --test power_discard"`):
+
+- E7, `discard` skips its leading `sync()`: killed by `discard_makes_earlier_puts_durable`.
+  A cut inside the discard cannot show it, because the base is already durable; the test puts blocks after the last sync and checks the end state (`crash_image` takes `k == ops.len()` for "after the last op returned").
+- E8, `acknowledge_corruption` skips the directory fsync after dropping `index.cix`: killed by `dropping_the_stale_checkpoint_is_followed_by_a_directory_fsync`, a static ordering check.
+  The sweep `power_loss_at_every_op_of_acknowledge_corruption_keeps_live_blocks` now reaches that path, but it cannot kill E8: `open` re-validates a resurrected checkpoint against the packs and ignores one that names a missing pack, so both outcomes of the removal are safe.
+  The removal is defence in depth, and its fsync is pinned by order, not by a loss.
 
 M2 is also killed by the process-crash test `a_crash_at_every_step_of_a_discard_leaves_the_store_clean` now that the unlink is a boundary.
 Not done: `LogOp::Rename`, because the only renames in the store are inside `write_whole`, which the model already treats as one atomic `Whole` write.

@@ -256,7 +256,8 @@ impl Io {
         self.sync_dir(dir)
     }
 
-    /// Log a whole-file write for the crash model, after the real one.
+    /// Log a whole-file write for the crash model. Callers log before the real write, so a cut
+    /// inside it shows the new content; the old content is the image of the cut at the op before.
     pub(crate) fn log_whole(&self, dir: &Path, file_name: &str, data: &[u8]) {
         let _ = dir;
         log_data(|| LogOp::Whole {
@@ -324,6 +325,30 @@ mod alloc_tests {
     }
     #[global_allocator]
     static A: Counting = Counting;
+
+    /// Issue 276: an unlink with no log active builds no name and allocates nothing.
+    #[test]
+    fn remove_file_allocates_nothing_without_a_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..64)
+            .map(|i| {
+                let p = dir.path().join(format!("pack-{i:08}.cpk"));
+                File::create(&p).unwrap();
+                p
+            })
+            .collect();
+        let io = Io::new(None, true);
+        let (b0, a0) = (BYTES.get(), ALLOCS.get());
+        for p in &paths {
+            io.remove_file(p).unwrap();
+        }
+        let (bytes, allocs) = (BYTES.get() - b0, ALLOCS.get() - a0);
+        assert_eq!(
+            (bytes, allocs),
+            (0, 0),
+            "remove_file allocated on the no-log path"
+        );
+    }
 
     /// Issue 247: with no crash-model log active, a write must not copy its buffer or build a name.
     #[test]

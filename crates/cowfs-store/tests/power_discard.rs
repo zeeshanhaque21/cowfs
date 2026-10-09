@@ -43,12 +43,16 @@ struct Run {
     after: Image,
     ops: Vec<LogOp>,
     live: Vec<(BlockId, Vec<u8>)>,
+    /// Blocks put (not synced) before the recording starts, so only the discard's own leading sync
+    /// can make them durable.
+    pending: Vec<(BlockId, Vec<u8>)>,
     old: u32,
 }
 
 /// Seal a pack of 3 live and 4 dead records and make it durable, then record the work. With
 /// `copy_first` the copy is made durable before the recording starts, so only the discard is cut.
-fn record(copy_first: bool) -> Run {
+/// With `pending`, three more blocks are put after the last sync and before the recording.
+fn record(copy_first: bool, pending: bool) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(dir.path(), opts()).unwrap();
     let live: Vec<(BlockId, Vec<u8>)> = (0..3u32)
@@ -89,6 +93,12 @@ fn record(copy_first: bool) -> Run {
     });
     let base = read_image(dir.path());
     oplog_start();
+    let pending: Vec<(BlockId, Vec<u8>)> = (0..if pending { 3u32 } else { 0 })
+        .map(|i| {
+            let d = noisy(4096, 500 + i);
+            (s.put(&d).unwrap(), d)
+        })
+        .collect();
     let rw = early.unwrap_or_else(compact);
     s.discard_pack(old, &rw.condemned).unwrap();
     let ops = oplog_take();
@@ -98,6 +108,7 @@ fn record(copy_first: bool) -> Run {
         after,
         ops,
         live,
+        pending,
         old,
     }
 }
@@ -176,14 +187,17 @@ fn dump(ops: &[LogOp]) -> String {
 }
 
 fn sweep(run: &Run, seeds: u64, t: &mut Tally) {
-    for k in 0..run.ops.len() {
+    // `k == len` is the cut after the discard returned: nothing in flight, the end state.
+    for k in 0..=run.ops.len() {
         for seed in 0..seeds {
             let mut rng = Rng(seed ^ ((k as u64) << 20) ^ 0x51ED);
             let img = crash_image(&run.base, &run.ops, k, &mut rng, seed % 4);
             let tag = format!(
                 "k={k}/{} seed={seed} op={}",
                 run.ops.len(),
-                brief(&run.ops[k])
+                run.ops
+                    .get(k)
+                    .map_or_else(|| "(none, all done)".into(), brief)
             );
             let dir = tempfile::tempdir().unwrap();
             write_image(&img, dir.path());
@@ -194,14 +208,14 @@ fn sweep(run: &Run, seeds: u64, t: &mut Tally) {
             } else {
                 t.source_gone += 1;
             }
-            if let Err(e) = verify(&img, dir.path(), run, &source) {
+            if let Err(e) = verify(&img, dir.path(), run, &source, k) {
                 t.failures.push(format!("{tag}: {e}"));
             }
         }
     }
 }
 
-fn verify(img: &Image, dir: &Path, run: &Run, source: &str) -> Result<(), String> {
+fn verify(img: &Image, dir: &Path, run: &Run, source: &str, k: usize) -> Result<(), String> {
     let s = Store::open(dir, opts()).map_err(|e| format!("open failed: {e:?}"))?;
     let rep = s.recovery();
     if rep.has_corruption() {
@@ -211,6 +225,21 @@ fn verify(img: &Image, dir: &Path, run: &Run, source: &str) -> Result<(), String
         match s.get(*id) {
             Ok(got) if &got == d => {}
             other => return Err(format!("live block {i} lost or wrong: {:?}", other.err())),
+        }
+    }
+    // Once the discard has returned, its leading `sync` has made every earlier put durable. In a cut
+    // before that, such a put may be lost, so it is only required at the end.
+    if k == run.ops.len() {
+        for (i, (id, d)) in run.pending.iter().enumerate() {
+            match s.get(*id) {
+                Ok(got) if &got == d => {}
+                other => {
+                    return Err(format!(
+                        "put {i} lost after discard returned: {:?}",
+                        other.err()
+                    ))
+                }
+            }
         }
     }
     if !s.fsck().map_err(|e| format!("fsck: {e:?}"))?.is_clean() {
@@ -257,7 +286,7 @@ fn report(what: &str, t: &Tally, ops: &[LogOp]) {
 #[test]
 fn the_log_replays_to_the_real_disk() {
     for copy_first in [false, true] {
-        let run = record(copy_first);
+        let run = record(copy_first, false);
         let replayed = replay_lossless(&run.base, &run.ops);
         let diff: Vec<String> = run
             .after
@@ -287,7 +316,7 @@ fn the_log_replays_to_the_real_disk() {
 /// The unlink is in the model: logged once, and followed by a fsync of the packs directory.
 #[test]
 fn the_model_sees_the_unlink_and_its_directory_fsync() {
-    let run = record(false);
+    let run = record(false, false);
     let unlink = run
         .ops
         .iter()
@@ -305,7 +334,7 @@ fn the_model_sees_the_unlink_and_its_directory_fsync() {
 /// Power loss at every op of a real compaction followed by a discard.
 #[test]
 fn power_loss_at_every_op_of_compaction_and_discard_keeps_live_blocks() {
-    let run = record(false);
+    let run = record(false, false);
     let mut t = Tally::default();
     sweep(&run, seeds(), &mut t);
     report("compaction + discard", &t, &run.ops);
@@ -318,9 +347,183 @@ fn power_loss_at_every_op_of_compaction_and_discard_keeps_live_blocks() {
 /// Power loss at every op of a discard alone, with the copy already durable.
 #[test]
 fn power_loss_at_every_op_of_a_discard_keeps_live_blocks() {
-    let run = record(true);
+    let run = record(true, false);
     let mut t = Tally::default();
     sweep(&run, seeds(), &mut t);
     report("discard", &t, &run.ops);
     assert!(t.images > 0, "no images were built");
+}
+
+/// The discard's leading `sync` is what makes puts made before it durable: with it skipped (mutant
+/// E7) the end state loses them, and no cut inside the discard could show that.
+#[test]
+fn discard_makes_earlier_puts_durable() {
+    for copy_first in [false, true] {
+        let run = record(copy_first, true);
+        assert_eq!(run.pending.len(), 3);
+        let mut t = Tally::default();
+        sweep(&run, seeds(), &mut t);
+        report(
+            &format!("discard with pending puts, copy_first={copy_first}"),
+            &t,
+            &run.ops,
+        );
+    }
+}
+
+/// A store that lost a whole sealed pack, reopened, with the loss about to be accepted.
+struct AckRun {
+    base: Image,
+    ops: Vec<LogOp>,
+    /// Blocks that stayed readable after the loss.
+    kept: Vec<(BlockId, Vec<u8>)>,
+    lost: u32,
+}
+
+/// Fill several packs, checkpoint (so `index.cix` exists and names every pack), delete one sealed
+/// pack file, reopen and record `acknowledge_corruption`: the recovery-time path that drops the
+/// stale `index.cix`, which a discard sweep never reaches.
+fn record_ack() -> AckRun {
+    let dir = tempfile::tempdir().unwrap();
+    let mut all = Vec::new();
+    {
+        let s = Store::open(dir.path(), opts()).unwrap();
+        for i in 0..40u32 {
+            let d = noisy(4096, 900 + i);
+            all.push((s.put(&d).unwrap(), d));
+        }
+        s.sync().unwrap();
+        s.checkpoint().unwrap();
+    }
+    assert!(dir.path().join("index.cix").exists(), "a checkpoint exists");
+    let lost = {
+        let s = Store::open(dir.path(), opts()).unwrap();
+        s.packs()
+            .unwrap()
+            .into_iter()
+            .find(|p| !p.active)
+            .expect("a sealed pack")
+            .id
+    };
+    fs::remove_file(dir.path().join("packs").join(format!("pack-{lost:08}.cpk"))).unwrap();
+    let s = Store::open(dir.path(), opts()).unwrap();
+    assert!(
+        s.recovery().missing_synced.contains(&lost),
+        "the pack loss is reported: {:?}",
+        s.recovery()
+    );
+    let kept: Vec<(BlockId, Vec<u8>)> = all
+        .into_iter()
+        .filter(|(id, d)| s.get(*id).is_ok_and(|g| &g == d))
+        .collect();
+    assert!(
+        !kept.is_empty() && kept.len() < 40,
+        "some blocks are lost, some kept"
+    );
+    assert!(
+        dir.path().join("index.cix").exists(),
+        "the stale checkpoint is still there"
+    );
+    s.sync().unwrap();
+    let base = read_image(dir.path());
+    oplog_start();
+    s.acknowledge_corruption().unwrap();
+    let ops = oplog_take();
+    AckRun {
+        base,
+        ops,
+        kept,
+        lost,
+    }
+}
+
+/// Power loss at every op of `acknowledge_corruption`, including its `index.cix` removal and the
+/// directory fsync after it. Whatever survives must open, keep every block that was readable, pass
+/// `fsck`, and once the acceptance is on disk, report no loss again.
+#[test]
+fn power_loss_at_every_op_of_acknowledge_corruption_keeps_live_blocks() {
+    let run = record_ack();
+    assert!(
+        run.ops
+            .iter()
+            .any(|o| matches!(o, LogOp::Unlink { file } if file == "index.cix")),
+        "the index.cix removal is in the log"
+    );
+    let acked = run
+        .ops
+        .iter()
+        .position(|o| matches!(o, LogOp::Whole { file, .. } if file == "ACKED"))
+        .expect("the acceptance is in the log");
+    let (mut images, mut kept_cix, mut dropped_cix) = (0, 0, 0);
+    let mut failures = Vec::new();
+    for k in 0..=run.ops.len() {
+        for seed in 0..seeds() {
+            let mut rng = Rng(seed ^ ((k as u64) << 20) ^ 0xACC);
+            let img = crash_image(&run.base, &run.ops, k, &mut rng, seed % 4);
+            let dir = tempfile::tempdir().unwrap();
+            write_image(&img, dir.path());
+            images += 1;
+            if img.contains_key("index.cix") {
+                kept_cix += 1;
+            } else {
+                dropped_cix += 1;
+            }
+            let tag = format!("k={k}/{} seed={seed}", run.ops.len());
+            let r = (|| -> Result<(), String> {
+                let s = Store::open(dir.path(), opts()).map_err(|e| format!("open: {e:?}"))?;
+                for (i, (id, d)) in run.kept.iter().enumerate() {
+                    if !s.get(*id).is_ok_and(|g| &g == d) {
+                        return Err(format!("kept block {i} lost"));
+                    }
+                }
+                if !s.fsck().map_err(|e| format!("fsck: {e:?}"))?.is_clean() {
+                    return Err("fsck dirty".into());
+                }
+                // Once the acceptance is on disk, a stale `index.cix` that survives the cut must not
+                // bring the accepted loss back: the removal's own durability is what is at stake.
+                if k > acked && s.recovery().missing_synced.contains(&run.lost) {
+                    return Err("accepted loss reported again".into());
+                }
+                Ok(())
+            })();
+            if let Err(e) = r {
+                failures.push(format!("{tag}: {e}"));
+            }
+        }
+    }
+    println!(
+        "acknowledge_corruption: {images} images, index.cix kept in {kept_cix}, dropped in {dropped_cix}, {} failed",
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {images} crash images failed; first: {:#?}\nops:\n{}",
+        failures.len(),
+        &failures[..failures.len().min(5)],
+        dump(&run.ops)
+    );
+    // Fail closed: the sweep must see the removal both land and not land.
+    assert!(
+        kept_cix > 0 && dropped_cix > 0,
+        "the removal is never in doubt"
+    );
+}
+
+/// The stale-checkpoint removal is followed by a fsync of the store directory. The sweep above
+/// cannot see a missing one (mutant E8): `open` re-validates a resurrected checkpoint against the
+/// packs and ignores one that names a missing pack, so both outcomes are safe and this is a static
+/// ordering check, like `the_model_sees_the_unlink_and_its_directory_fsync`.
+#[test]
+fn dropping_the_stale_checkpoint_is_followed_by_a_directory_fsync() {
+    let run = record_ack();
+    let unlink = run
+        .ops
+        .iter()
+        .position(|o| matches!(o, LogOp::Unlink { file } if file == "index.cix"))
+        .expect("the index.cix removal is in the log");
+    assert!(
+        matches!(run.ops.get(unlink + 1), Some(LogOp::DirSync { dir }) if dir != "packs"),
+        "no store directory fsync right after the index.cix removal: {}",
+        dump(&run.ops)
+    );
 }

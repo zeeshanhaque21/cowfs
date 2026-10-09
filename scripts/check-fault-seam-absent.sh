@@ -12,9 +12,11 @@ NEEDLE=C7D_EXIT
 # That needle has no positive control of its own (unused, it is dropped from a release binary), so
 # the C7D_EXIT hit with the feature on is what proves the binary check can see anything.
 NEEDLE2=oplog_start
-# Slice 3: the shared power-loss image builder (`cowfs_store::crashmodel`) is gated by the same feature;
-# its symbols carry the module path, so no feature-off binary may contain it.
-NEEDLE3=crashmodel
+# The shared power-loss image builder (`cowfs_store::crashmodel`) has no needle here, on purpose: a
+# release daemon never links it even with the feature on (0 hits, checked on the box), so a grep
+# could not fail for the right reason. The compiler is the gate: `crashmodel` imports `LogOp`, whose
+# re-export is `cfg(feature = "fault-injection")`, so dropping the cfg from `pub mod crashmodel`
+# fails a feature-off build with E0432 (also checked on the box).
 
 count() { grep -ac "$NEEDLE" "$CARGO_TARGET_DIR"/debug/libcowfs_store.rlib || true; }
 
@@ -44,7 +46,7 @@ cargo tree -q -p cowfs-daemon --features fault-injection -e normal,build,feature
   || { echo "FAIL: the daemon feature does not forward the store feature" >&2; exit 1; }
 
 # A built RELEASE cowfs-daemon without the feature carries no seam string; with it, it does.
-count_bin() { grep -ac -e "$NEEDLE" -e "$NEEDLE2" -e "$NEEDLE3" "$CARGO_TARGET_DIR"/release/cowfs-daemon || true; }
+count_bin() { grep -ac -e "$NEEDLE" -e "$NEEDLE2" "$CARGO_TARGET_DIR"/release/cowfs-daemon || true; }
 cargo build -q --release -p cowfs-daemon
 rel_off=$(count_bin)
 [ "$rel_off" = 0 ] || { echo "FAIL: release cowfs-daemon carries the seam ($rel_off hits)" >&2; exit 1; }
