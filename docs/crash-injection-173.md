@@ -44,7 +44,7 @@ No release profile or `[features] default` enables it.
 Constraint from issue 88:
 
 - Nothing is added to the control protocol, daemon, CLI or any public type.
-- Cost when disabled is zero, because the seam, the oplog (`LOG`, `oplog_start`, `oplog_take`, `oplog_marker`) and the power-loss image builder (`crashmodel`) are compiled out by `cfg(feature)`.
+- Cost when disabled is zero, because the seam, the oplog (`LOG`, `oplog_start`, `oplog_take`, `oplog_marker`), the power-loss image builder (`crashmodel`) and, since slice 5, core's root-op recorder (`fsops::rootlog`) are compiled out by `cfg(feature)`.
   Before PR 261 (issue 247) this was not true: `Io::write_at` copied every pack write into a `LogOp` before checking whether a log was active.
   Ops are now built lazily inside `log_data`, which is a no-op without the feature, and `write_at_allocates_nothing_without_a_log` pins it with a counting allocator.
   The `LogOp` enum is not gated, but it is only a type: nothing constructs it when the feature is off.
@@ -214,7 +214,7 @@ Not covered: metadata unsynced writes surviving a cut (only the durable prefix i
 ## Slice 5: power loss over a whole `Core` workload
 
 `crates/cowfs-core/tests/power_core.rs`.
-New test file; `crash.rs`, `durability.rs`, `ns_durability*.rs`, `kill9.rs` and `swap.rs` are unchanged and stay (they cut the store with a cruder rule or kill a process).
+New test file; `crash.rs`, `durability.rs`, `ns_durability*.rs`, `kill9.rs` and `swap.rs` are unchanged and stay.
 One thread-local op log carries four timelines in one order:
 
 - the store, rebuilt by `crashmodel::crash_image` at every op index;
@@ -222,42 +222,101 @@ One thread-local op log carries four timelines in one order:
 - the mount root's durable writes, which is the swap intent file: create, write, fsync, rename, unlink and root directory fsync, recorded by `cowfs_core::fsops::rootlog` and stamped in the same way;
 - the acknowledgements (`Core::sync`, `fsync`), stamped, so a cut knows which snapshots an acknowledgement had already made durable.
 
-Root model: file data is durable once its file was fsynced, else any prefix of it (including none); a directory entry change (create, rename, unlink) is durable once the root was fsynced after it, and the rest reach the disk as a prefix, in order, as a journalling filesystem writes them.
+Root model: file data is durable once its file was fsynced, else any prefix of it (including none); a directory entry change (create, rename, unlink) is durable once the root was fsynced after it, and each of the rest reaches the disk or not on its own (a rename of a missing source does nothing).
+That is the same subset rule as the store model, and it is more pessimistic than a journalling filesystem, which writes directory changes in order.
 The op stamped at the cut may or may not have run.
 
-Workload (one thread, `background: false` for Core and for meta): create, overwrite, rename and unlink files and fsync one; fork, remove and rename snapshots; a replacing `promote_base` (victim acknowledged, source with unsynced files) and a non-replacing one; a reclaiming `Collector::collect`; syncs.
-About 250 store ops, 150 metadata events, 14 root ops, 5 acknowledgements; 6 seeds per cut, so about 1500 images, 25 s on the box.
-The op count varies a little between runs, because Core flushes by age as well as by count.
+Workload, one thread, `background: false` for Core and for meta:
 
-Each image is reopened with the shipped `Core::open` and must: open, report no store loss, pass `Core::check` and `fsck`, hold no staging snapshot and no intent file after recovery, show every snapshot an acknowledgement made durable with every unchanged file byte for byte, show no snapshot the workload could not have created, show a swap or rename target as exactly its old tree or the new one and a renamed snapshot under at least one name, and accept a second operation (a new snapshot with a file, then a `promote_base` of it) that survives a further reopen.
-Fail-closed asserts: the timeline is long enough, the gc cycle unlinked a pack, the swaps left intent ops, some images hold an intent file, and swap targets come back both as the old and as the new tree.
-`the_recorded_log_replays_to_the_real_disk` checks that the log of a finished workload replays to the real store, metadata file and root directory, so an op that went round the log (for instance on another thread, which a thread-local log cannot see) fails there.
+- scripted: create, overwrite, rename and unlink files and fsync one; fork, remove and rename snapshots; a replacing `promote_base` (victim acknowledged, source with unsynced files) and a non-replacing one; a reclaiming `Collector::collect`; syncs;
+- seeded, in the spirit of `crash.rs`'s `step` (`COWFS_POWER_WORKLOADS` workloads, default 2): create, overwrite at an offset, truncate, rename over an existing name, unlink, fsync, fork and remove a fork, flush, on files of whichever snapshot is not under a swap check.
 
-Negative control: `the_power_test_notices_a_missing_store_sync_before_metadata_commits` runs the same machinery with Core's store-sync hook removed; 752 of 1170 images fail, with `MissingLiveBlock`.
+Size: 280 to 410 store ops, about 190 metadata events, 14 root ops and 5 or 6 acknowledgements per workload, 5 seeds per cut, so about 3600 images and 60 s on the box with 4 threads.
+The op count has two modes, which differ from the very first op: Core iterates a `HashMap` of snapshots with a per-process random seed, so the order in which it flushes two snapshots changes.
+A failing tag (`k=... seed=...`) is therefore not reproducible by number; the failing image itself is kept on disk and its path is in the message, and it opens with `Core::open`.
+The fail-closed asserts hold in both modes: 14 consecutive runs at 2 seeds per cut all passed, with 355 to 412 ops.
+
+Each image is reopened with the shipped `Core::open` and must:
+
+- open, report no store loss, pass `Core::check` and `fsck`;
+- hold no staging snapshot and no intent file after recovery;
+- show every acknowledged snapshot with every unchanged file byte for byte, and no file that an acknowledged unlink or rename removed (the check runs both ways), and no snapshot the workload could not have created;
+- show a swap or rename target as exactly its old tree (less what was changed in it since) or the new one, and a renamed snapshot under at least one name;
+- accept a second operation, a new snapshot with a file and then a `promote_base` of it, that survives a further reopen.
+
+Fail-closed asserts: the timeline is long enough, the gc cycle unlinked a pack, the swaps left the intent ops, some images hold an intent file, and swap targets come back both as the old and as the new tree.
+`the_recorded_log_replays_to_the_real_disk` cuts after the last op of a workload that ends in a sync and checks that the store log replays to the real packs, the metadata log to the real file and the root log to the real directory, so an op that went round the log (for instance on another thread, which a thread-local log cannot see) fails there.
+
+Negative control: `the_power_test_notices_a_missing_store_sync_before_metadata_commits` runs the same machinery with Core's store-sync hook removed and asserts that some image fails with `MissingLiveBlock`; about half of the images do.
 The memo's second falsifier does not apply: the order needs no lock, because the log is one thread's.
 
-Production code: `cowfs-core` gained the feature `fault-injection` (forwards the store's) and `fsops::{create_with, rename, remove_file}`, thin wrappers over the `std::fs` calls that `swap.rs` made, which log only under the feature.
+Production code touched, which the memo's "route the intent writes" requires:
+
+- `cowfs-core/Cargo.toml`: feature `fault-injection` (forwards the store's) and the self dev-dependency that enables it for the crate's tests, as the store does;
+- `src/fsops.rs`: `create_with`, `rename` and `remove_file`, thin wrappers over the `std::fs` calls `swap.rs` made, which log only under the feature, and the feature-gated `rootlog` module;
+- `src/swap.rs`: its intent-file calls use those wrappers.
+
 Behaviour, on-disk format and public API of a normal build are unchanged.
-`scripts/check-fault-seam-absent.sh` now also builds the `cowfs-core` rlib with and without the feature and searches for the recorder's panic message (`cowfs-rootlog`), 0 hits without it and 1 with it, and checks that no normal or build edge enables the core feature.
+`scripts/check-fault-seam-absent.sh` now also builds the `cowfs-core` rlib with and without the feature and searches for the recorder's panic message (`cowfs-rootlog`): 0 hits without it, 1 with it; and it checks that no normal or build edge enables the core feature.
 The needle was tried on the box against a scratch copy where the module and its call sites are ungated: it finds the message (1 hit) in the feature-off rlib, so the check can fail for the right reason.
 It has no release-binary check of its own, because the daemon's feature forwards only the store's.
+"Cost when disabled is zero" above holds for the core recorder too.
 
-Mutants (`python3 crates/cowfs-core/tests/mutate_power.py`; only `power_core` can kill them):
+Mutants (`python3 crates/cowfs-core/tests/mutate_power.py`; the sweep test alone may kill them, `MUT_FILTER`):
 
-RESULTS_PLACEHOLDER
+| tag | mutation | result |
+|---|---|---|
+| E1 | Core's `store_sync_hook` does nothing | killed by the sweep (and the log replay) |
+| E2 | meta runs the store-sync hook after the transaction commits, not before | killed: `MissingLiveBlock` |
+| E3 | the snapshot-add commit (`fork_snapshot` and the swap's staging fork) skips the hook | killed: `MissingLiveBlock`, also inside the swap alone |
+| E4 | the snapshot-rename commit (`rename_snapshot`, the swap's rename) skips the hook | killed: `MissingLiveBlock`, by `rename_snapshot` only (see notes) |
+| E5 | the snapshot-remove commit (`remove_snapshot`, the swap's victim removal) skips the hook | killed: `MissingLiveBlock`, by `remove_snapshot` only (see notes) |
+| I1 | intent file: no root directory fsync after its rename | killed: `durable snapshot "base" is missing` |
+| I2 | intent file: no fsync of its data before the rename | SURVIVED, equivalent by design (see notes): acceptance item not met |
+| I3 | `finish_swap` removes the intent file (and syncs the removal) before the staging rename | killed: `durable snapshot "base" is missing` |
+| I4 | no root directory fsync after the intent removal | SURVIVED, equivalent: a resurrected intent is finished again |
+| W1 | the store raises its watermark before the pack fsync (`sync_capture`) | killed at Core level: store lost durable data on reopen |
 
-Not modelled, on purpose:
+Notes on the results:
+
+- E1 and E2 are the memo's "reorder the store sync before the metadata commit": Core has no separate flush ordering of its own, the order is the `before_sync` hook Core installs and the commit that calls it, so the two mutants are the hook doing nothing and the hook running after the commit.
+- "Drop the store sync before the swap rename" is an equivalent mutant for the swap path.
+  E4 and E5 are killed only by the standalone `rename_snapshot` and `remove_snapshot` steps of the workload: with those two steps removed from a scratch copy, E4 and E5 survive, and E3 (the staging fork, the commit before them) is still killed inside the swap, at its first intent op.
+  The staging fork's commit has just synced the store, so the victim removal and the rename commits have nothing left to sync.
+- I2 (no fsync of the intent file's data) is an ACCEPTANCE ITEM NOT MET: the memo expected it to fail, and it survives.
+  It is equivalent by design.
+  `recover_intent` handles an intent file that is cut short, empty or missing its newline, by taking the staging name from the file name and rolling forward when the target is gone.
+  The evidence that the path runs: with I2 applied, 223 of 1440 images held a torn intent file, and every one recovered.
+  The fsync is defence in depth against a record that is wrong but looks whole, which needs media corruption, as the comment in `swap.rs` says.
+- I4 (no directory fsync after the intent removal) survives for a similar reason: a resurrected intent is finished again, idempotently.
+- A mutant that raises the store's watermark before the pack fsync (W1) is killed at Core level; before this slice only the store crate saw it.
+
+Not modelled, and what covers it instead:
 
 - A background thread.
-  The thread-local log cannot see `cowfs-flusher` or `cowfs-meta-bg`, whose `before_sync` calls `Store::sync`, so the test runs both off and asserts it.
-  The memo's remedy is a per-store log (the `Trace` already carried by `Io`), which sees every thread; it was not built because the single-thread timeline already orders every durable write of these flows, and a second log would need its own replay check.
-  Cutting a workload with the flusher running is what the daemon sweep, or that per-store log, would add.
-- Unsynced writes surviving a cut, outside what the models above do: the store and metadata models let unsynced writes survive in any subset and tear, the root model keeps a prefix of directory changes, and none of them models a write that survives although a later one does not on the same file beyond the store's sector rules.
-  No claim is made for a real device, APFS or a real kernel.
-- The collector's state directory (`<root>/gc`): it is not in any image, which is the legal "missing" state; old and torn states are slice 4's `gc_state_is_advisory`.
-- The daemon: no `--fault-boundary` sweep was re-run, and `base_meta.rs` is out of scope as in the memo.
+  The thread-local log cannot see `cowfs-flusher` or `cowfs-meta-bg`, whose `before_sync` calls `Store::sync`, so the test runs both off and checks the replay.
+  The memo's remedy is a per-store log (the `Trace` that `Io` already carries), which sees every thread; it was not built because the single-thread timeline already orders every durable write of these flows, and a second log would need its own replay check.
+  Cutting a workload with the flusher running is what a per-store log, or the daemon sweep, would add.
+- Unsynced writes surviving a cut.
+  The store model lets unsynced writes survive in any subset and tear.
+  The metadata model keeps the synced part, or everything, or the synced part plus a random subset that may tear.
+  The root model lets each unsynced directory change reach the disk or not, and an unsynced file keeps any prefix.
+  None of them is checked against a real filesystem, APFS or a real device, so no claim is made for one.
+- The collector's state directory (`<root>/gc`): it is in no image, which is the legal "missing" state; old and torn states are slice 4's `gc_state_is_advisory`.
+- The daemon: no `--fault-boundary` sweep was re-run for this slice, and `base_meta.rs` is out of scope as in the memo.
 - `virt.ino`: nothing writes it in production (only a test helper), so it is not recorded.
-- Concurrent operations; the workload is serial.
+- Concurrent operations: the workload is serial.
+- `Vfs::sync_namespace` (names durable, dirty data not): the acknowledgement model has no "names only" ack, so it is not driven here.
+
+What the older Core tests still own, because the new test does not replace them:
+
+- `crash.rs`: a longer random workload over directories and hard links, with the store cut by truncating the last pack past the watermark (no unlink, rename or directory-fsync model) and a recording meta backend that still runs its background thread.
+  It is the only test of hard links and directory trees under a cut.
+  The new test has no directories and no hard links.
+- `durability.rs`: the order and error handling of the intent and store syncs, by the `fsops` trace and injected sync failures.
+  It is not a power cut, and it stays as the cheap per-call check of the same order.
+- `ns_durability*.rs`: namespace durability and its cost, with the elided unlink; no cut at all.
+- `kill9.rs`: SIGKILL of a child with the flusher running; the page cache survives, so it cannot see a missing fsync, but it is the only test that kills with Core's flusher thread running.
 
 ## Out of scope and next slices
 
