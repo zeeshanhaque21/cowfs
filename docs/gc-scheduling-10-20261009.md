@@ -1,54 +1,68 @@
 # Issue #10: scheduled GC and last-accessed hints, status and decision memo
 
 Date: 2026-10-09.
-Basis: origin/main at 1ea38b1.
+Basis: origin/main at 1ea38b1, re-checked against a143e9f.
+Code references cite symbols, not line numbers, so they do not drift.
 Scope: design memo only.
 No code is changed by this memo.
-Labels: (V) means read in the source at the cited line.
+Labels: (V) means read in the source at the cited symbol.
 Labels: (U) means unverified inference.
 
 ## Issue text
 
 Issue #10 has one sentence and no comments.
 "Mark-and-sweep from snapshot roots, incremental marking over unchanged subtrees, batched last-accessed times as a sweep-candidate hint only. See docs/design.md."
-The contract is `docs/design.md:39-46`, which adds "on demand and on a schedule" and "Each block records a last-accessed time, kept in memory and flushed in batches so reads do not become writes".
+The contract is the GC section of `docs/design.md`, which adds "on demand and on a schedule" and "Each block records a last-accessed time, kept in memory and flushed in batches so reads do not become writes".
 
 ## Acceptance rows
 
 | # | Row | Status | Evidence |
 |---|-----|--------|----------|
-| 1 | Mark-and-sweep from snapshot roots | DONE | `crates/cowfs-gc/src/lib.rs` (`Gc::collect` at :306); tests `crates/cowfs-gc/tests/core_end_to_end.rs`, `core_reclaim.rs`, `race.rs`; daemon `handler.rs:836` |
-| 2 | Incremental marking over unchanged subtrees | DONE | `lib.rs:6-9` shared `Marker`, persistent per-root marks `COWMARK3` (`docs/gc-root-mark-retention.md`, issue #82 closed); tests assert `marked_skipped_roots == 1` at `crates/cowfs-gc/tests/mark.rs:210`, `:324` and `control.rs:112` |
-| 3 | Net-space reporting (gross, rewrite, net) | DONE | `docs/gc-space-accounting.md`, `crates/cowfs-gc/src/report.rs`, daemon `handler.rs:415`; test `a_mixed_pack_reports_gross_removed_rewrite_and_signed_net` at `crates/cowfs-gc/tests/core_reclaim.rs:1073` |
-| 4 | Last-access hint store (in memory, batched flush, never a reason to free) | DONE in the crate | `lib.rs:221` `note_access`, `:232` `flush_hints`, `state.rs:133` `coldness`, `lib.rs:446` coldest-first sort; test `crates/cowfs-gc/tests/control.rs:358` |
-| 5 | On demand GC | DONE | `cowfs gc` in `crates/cowfs-cli/src/cli.rs:63`, handler `crates/cowfs-daemon/src/handler.rs:352`, backend `backend.rs:645-677` (single run, cancel, close waits); test `gc_over_the_core_reclaims_dead_packs_and_survivors_still_read` at `handler.rs:836` |
-| 6 | GC "on a schedule" (`design.md:40`) | OPEN | No timer, interval flag or periodic task in `crates/cowfs-daemon/src` (`main.rs` has only `--store --backend --mount --socket --export-root`) (V by absence) |
-| 7 | Hints are fed by real reads | OPEN | `note_access` has no caller outside `crates/cowfs-gc/tests/control.rs`. Searches `note_access`, `atime`, `atime.bin`, `Hints` outside `crates/cowfs-gc` find only POSIX attribute atime in `cowfs-core` (`inner.rs`, `io.rs`, `ns.rs`), which is unrelated. The `v1-gc.md:496` passage is the gc crate's own `control.rs` test (V) |
-| 8 | Hints survive across cycles in production | OPEN, follows from 7 | The daemon builds a fresh `Collector` per request (`backend.rs:265`, `crates/cowfs-core/src/gc.rs:86`). `atime.bin` is loaded from `<root>/gc`, but nothing writes real data, so every pack has coldness 0 and the sort falls back to most dead bytes first (V) |
-| 9 | Doc matches code on hint bonus | OPEN, small | `docs/v1-gc.md` says hints can raise a pack's effective dead ratio via `Options::cold_dead_bonus`. No such option exists in `Options` (`lib.rs:106-125`) (V) |
-| 10 | Sweep candidates "unmarked blocks older than a threshold" (`design.md:42`) | OPEN, decision | The implemented policy is pack level: `dead_ratio` and `min_dead_bytes`. No age threshold exists. Recommendation below is to amend design.md, not to add one |
-| 11 | Free-space or pressure trigger, resource watchdog in the daemon | OPEN, new | No statvfs or low-space logic in `crates/cowfs-daemon/src` or `cowfs-cli/src`. The "watchdog" hits in docs are test deadlock guards only (V) |
+| 1 | Mark-and-sweep from snapshot roots | DONE | `crates/cowfs-gc/src/lib.rs` (`Gc::collect`); tests `crates/cowfs-gc/tests/core_end_to_end.rs`, `core_reclaim.rs`, `race.rs`; daemon test `gc_over_the_core_reclaims_dead_packs_and_survivors_still_read` in `handler.rs` |
+| 2 | Incremental marking over unchanged subtrees | DONE | `lib.rs` module doc, shared `Marker`, persistent per-root marks `COWMARK3` (`docs/gc-root-mark-retention.md`, issue #82 closed); tests assert `marked_skipped_roots == 1` in `crates/cowfs-gc/tests/mark.rs` and `control.rs` |
+| 3 | Net-space reporting (gross, rewrite, net) | DONE | `docs/gc-space-accounting.md`, `crates/cowfs-gc/src/report.rs`, daemon `handler.rs` (`GcReport` fill); test `a_mixed_pack_reports_gross_removed_rewrite_and_signed_net` in `crates/cowfs-gc/tests/core_reclaim.rs` |
+| 4 | Last-access hint store (in memory, batched flush, never a reason to free) | DONE in the crate | `Gc::note_access`, `Gc::flush_hints`, `Hints::coldness` in `state.rs`, coldest-first sort in `Gc::collect`; test in `crates/cowfs-gc/tests/control.rs` |
+| 5 | On demand GC | DONE | `cowfs gc` in `crates/cowfs-cli/src/cli.rs`, handler `Handler::gc` in `crates/cowfs-daemon/src/handler.rs`, backend `collect_garbage` in `backend.rs` (single run, cancel, close waits); same `handler.rs` test as row 1 |
+| 6 | GC "on a schedule" (`design.md:40`) | OPEN | No timer, interval flag or periodic task in `crates/cowfs-daemon/src` (V by absence), see note 6 |
+| 7 | Hints are fed by real reads | OPEN | `note_access` has no caller outside `crates/cowfs-gc/tests/control.rs` (V), see note 7 |
+| 8 | Hints survive across cycles in production | OPEN, follows from 7 | The daemon builds a fresh `Collector` per request (V), see note 8 |
+| 9 | Doc matches code on hint bonus | DONE by Slice 1 (this PR) | `Options` has no `cold_dead_bonus` (V). `docs/v1-gc.md` no longer claims it |
+| 10 | Sweep candidates "unmarked blocks older than a threshold" (`design.md:42`) | design.md amended by Slice 1; whether to ADD an age threshold is OPEN (D3) | The implemented policy is pack level: `dead_ratio` and `min_dead_bytes` (V). No age threshold exists |
+| 11 | Free-space or pressure trigger, resource watchdog in the daemon | OPEN, new | No statvfs or low-space logic in `crates/cowfs-daemon/src` or `cowfs-cli/src` (V), see note 11 |
 
-Rows 6, 7, 8, 9, 10, 11 are the OPEN set.
-Rows 1 to 5 are closed by the triage in `docs/reviews/open-issues-triage-20261009.md:106-111`, which this memo confirms and refines.
+Rows 6, 7, 8, 10, 11 are the OPEN set.
+Row 9 is closed by this PR.
+
+Evidence notes for the table.
+Each note is one sentence per line.
+
+- Note 6: `main.rs` in the daemon has only `--store`, `--backend`, `--mount`, `--socket`, `--export-root`.
+- Note 7: searches for `note_access`, `atime`, `atime.bin`, `Hints` outside `crates/cowfs-gc` find only POSIX attribute atime in `cowfs-core` (`inner.rs`, `io.rs`, `ns.rs`).
+  That atime is unrelated to the hint store.
+  The `v1-gc.md` passage that mentions feeding hints is the gc crate's own `control.rs` test (V).
+- Note 8: the fresh `Collector` is built in `backend.rs` and `crates/cowfs-core/src/gc.rs`.
+  `atime.bin` is loaded from `<root>/gc`, but nothing writes real data.
+  So every pack has coldness 0, and the sort falls back to most dead bytes first (V).
+- Note 11: the "watchdog" hits in docs are test deadlock guards only (V).
+Rows 1 to 5 are closed by the triage in the issue #10 rows of `docs/reviews/open-issues-triage-20261009.md`, which this memo confirms and refines.
 The triage missed rows 7 to 9: the hint store is DONE and tested, but it is a library with no producer, so the "last-accessed hints" half of the title is not delivered end to end.
 
 ## Facts that constrain the design
 
 1. A cycle is safe against concurrent writers by construction.
-   It marks without a barrier, then takes a short reference barrier, re-walks, and only then unlinks (`lib.rs:12-19`, `docs/v1-gc.md`).
+   It marks without a barrier, then takes a short reference barrier, re-walks, and only then unlinks (`lib.rs` module doc, `docs/v1-gc.md`).
 2. If the barrier or the pinned set is unavailable, nothing is freed and the cycle reports `roots_error` (`docs/v1-gc.md` ExtraRoots contract).
-   The handler turns that into `ErrorCode::Busy` only when the run is a dry run or `freed_bytes == 0` (`handler.rs:379-385`).
+   The handler turns that into `ErrorCode::Busy` only when the run is a dry run or `freed_bytes == 0` (`Handler::gc` in `handler.rs`).
    If a later per-pack poll fails after some packs were unlinked, the result is `Ok` with `roots_error` set.
    So a scheduler that runs while a mount is busy degrades to a no-op, not to data loss.
-3. Only one GC runs at a time, and `close` cancels it and waits up to 120 s (`backend.rs:199`, `close` at `:688`).
-4. A cycle copies at most `io_budget_bytes` (2 GiB default), so its duration and I/O rate are bounded (`lib.rs:112`).
+3. Only one GC runs at a time, and `close` cancels it and waits up to 120 s (`GC_STOP_PATIENCE` and `close` in `backend.rs`).
+4. A cycle copies at most `io_budget_bytes` (2 GiB default), so its duration and I/O rate are bounded (`Options::io_budget_bytes`).
 5. Gross removed bytes overstate savings.
    Net is `gross - rewrite` and is signed (`docs/gc-space-accounting.md`).
    A policy that reacts to "freed" must read net.
 6. The marks cache is derived data and is root specific (issue #82).
    A fresh collector per cycle is therefore correct and cheap, and a scheduler need not keep a collector alive.
-7. Hints are a dead-end for liveness by design: reachability decides, the barrier re-checks (`lib.rs:21-24`).
+7. Hints are a dead-end for liveness by design: reachability decides, the barrier re-checks (`lib.rs` module doc).
 
 ## (a) Scheduling policy
 
@@ -74,10 +88,10 @@ Design.md says "on demand and on a schedule" and does not mention space pressure
 - Flag: `--gc-interval <duration>` on `cowfs-daemon`, absent means OFF.
 - Minimum interval floor of 60 s so a typo cannot spin the daemon.
 - First tick happens one full interval after start, never at start, so a restart loop cannot trigger a GC storm.
-- Each tick calls `Handler::gc(GcParams { dry_run: false }, &OpContext::detached())`, as `handler.rs:1036` already does.
+- Each tick calls `Handler::gc(GcParams { dry_run: false }, &OpContext::detached())`, as the existing `Handler::gc` test in `handler.rs` already does.
   It must not call `backend.collect_garbage` directly, because the handler is where `roots_error` becomes `Busy` and where post-rewrite failures become errors.
   No second code path means the barrier, cancel and close behaviour are inherited unchanged.
-- Both "a collection is already running" and "writers did not let the collector hold still" return `ErrorCode::Busy` (`backend.rs:660`, `handler.rs:379`).
+- Both "a collection is already running" and "writers did not let the collector hold still" return `ErrorCode::Busy` (`collect_garbage` in `backend.rs`, `Handler::gc` in `handler.rs`).
   The first slice treats both the same: log at info and back off.
   Telling them apart would need a new error detail and is not worth a protocol change.
 - On `Busy`, back off exponentially (interval x2, capped at 8x) until one cycle completes.
@@ -94,7 +108,7 @@ Design.md says "on demand and on a schedule" and does not mention space pressure
 - Open files: open orphans and uncommitted chunk lists are the `pinned_blocks` set, polled several times per cycle and unioned.
 - Snapshots: every live snapshot is a root, so a snapshot in use by a mount cannot lose a block.
   A `snapshot rm` during a cycle is covered by the re-walk under the barrier, and `crates/cowfs-gc/tests/race.rs` runs snapshot removes against collects (V for the test, U that the tests cover every ordering).
-- Leases: treehouse leases appear to be snapshots created through the control API (`crates/cowfs-treehouse/src/ctl.rs:123`), so they would be roots (U).
+- Leases: treehouse leases appear to be snapshots created through the control API (`snapshot_create` in `crates/cowfs-treehouse/src/ctl.rs`), so they would be roots (U).
   A released lease followed by `snapshot rm` is what creates garbage, which is why D (nudge) is the natural trigger.
 - Pause and resume: the scheduler tick should use the existing cancel flag.
   Pause is "do not start a tick", implemented as a daemon-wide atomic that a control command could set later.
@@ -109,7 +123,7 @@ Design.md says "on demand and on a schedule" and does not mention space pressure
 | Failure | Behaviour | Required test |
 |---------|-----------|---------------|
 | Barrier unavailable | `Busy`, nothing freed, back off | Scheduled tick over a backend that reports `roots_error` doubles the gap |
-| Cycle errors after rewrite | Reported with real gross, rewrite, net (`handler.rs:395-413`) | Reuse `FailingGc` fixture |
+| Cycle errors after rewrite | Reported with real gross, rewrite, net (`Handler::gc` in `handler.rs`) | Reuse `FailingGc` fixture |
 | Daemon stops mid cycle | Cancelled, `close` waits | Reuse existing close test, add timer stop |
 | Disk full during rewrite | Cycle fails, partial pack indexed as data, next cycle retries (`docs/v1-gc.md`) | Existing; assert the timer does not retry faster than the backoff |
 | Timer thread panics | Daemon continues serving, GC stops, logged | Test that a panic in a tick is caught and does not take down the control server |
@@ -129,8 +143,8 @@ Design.md says "on demand and on a schedule" and does not mention space pressure
 
 - A hint is a pair (block id, epoch second) meaning "this block was last returned to a reader at about this time".
 - It is advisory.
-  Absence of a hint means unknown, treated as cold (`state.rs:137-139`).
-- The only consumer is the sweep order: coldest pack first, where pack coldness is the mean hint of its records (`state.rs:133-143`).
+  Absence of a hint means unknown, treated as cold (`Hints::coldness` in `state.rs`).
+- The only consumer is the sweep order: coldest pack first, where pack coldness is the mean hint of its live records (`Hints::coldness` in `state.rs`).
 - Hints never remove a block from the live set and never add one.
   This is already enforced by structure: the live set is built from roots before hints are consulted, and the barrier re-walk runs after the sort.
 
@@ -164,7 +178,7 @@ Target: zero allocation, no lock contention that a reader can feel.
 2. A test that sets every hint to "cold" for a live block and asserts it is not freed.
 3. A test that corrupts or truncates `atime.bin` and asserts the cycle gives the same freed set as with no file (extends `control.rs`).
 4. A test that drops all hints (cap 0) and asserts the same freed set.
-5. A read-path test asserting a read never performs a file or meta write (extends `control.rs:358`).
+5. A read-path test asserting a read never performs a file or meta write (extends the hint test in `control.rs`).
 
 ## (c) Options, recommendation, slices
 
@@ -179,13 +193,14 @@ Target: zero allocation, no lock contention that a reader can feel.
 
 ### Recommendation
 
-Option 3 in three slices, each independently shippable, each default OFF or default no-op, none changing an on-disk format.
+Option 3 in three slices (Slice 1 is done), each independently shippable, each default OFF or default no-op, none changing an on-disk format.
 
-#### Slice 1: docs reconciliation (no code)
+#### Slice 1: docs reconciliation (no code), DONE by this PR
 
-- Edit `docs/design.md` GC section: candidates are packs by dead fraction, ordered coldest first, not "blocks older than a threshold".
-- Edit `docs/v1-gc.md`: remove or implement `cold_dead_bonus` (recommend remove, YAGNI).
-- Acceptance: grep for `cold_dead_bonus` in docs and code returns nothing, or both agree.
+- Done: `docs/design.md` GC section: candidates are packs by dead fraction, ordered coldest first, not "blocks older than a threshold".
+- Done: `docs/v1-gc.md` no longer claims a `cold_dead_bonus` option, and says it does not exist.
+- Acceptance: no doc claims `cold_dead_bonus` exists as an option.
+  The only remaining mentions say it does not exist.
 - Acceptance: design.md and v1-gc.md describe the same ordering rule.
 
 #### Slice 2: scheduled GC in the daemon, default OFF
@@ -209,7 +224,7 @@ Acceptance criteria:
    Assert `freed_bytes > 0` and that every surviving file reads back (reuse the `core_reclaim.rs` fixture shape).
 7. The tick goes through `Handler::gc`.
    Test: a backend whose report has `roots_error` and `freed_bytes == 0` yields `Busy` to the scheduler, not a success.
-   `cowfs_ctl::GcReport` (`crates/cowfs-ctl/src/types.rs:196`) has no `roots_error` field (V), so the scheduler cannot see a partial roots failure.
+   `cowfs_ctl::GcReport` (`crates/cowfs-ctl/src/types.rs`) has no `roots_error` field (V), so the scheduler cannot see a partial roots failure.
    It backs off only on `Busy`, and an `Ok` resets the gap.
 8. Failing-first: tests 2 to 5 fail on origin/main for lack of the feature.
 9. CI and a cachyos run are green, with no cargo on the Mac.
@@ -226,11 +241,11 @@ Acceptance criteria:
 5. Record format of `atime.bin` is byte-identical to today (golden file test).
 6. Hints survive a daemon restart and a fresh `Collector`.
 7. `atime.bin` size is bounded.
-   Today `Hints::flush` only appends (`state.rs:172` `set_len`) and load keeps the maximum per id, with no rewrite step, so a file fed by real reads grows without bound.
-   Slice 3 must add compaction (write whole through a temp file, fsync, rename, as the marks file does at `state.rs:391`) when the file exceeds a multiple of the live entry count.
+   Today `Hints::flush` only appends (`Hints::flush`, `set_len` in `state.rs`) and load keeps the maximum per id, with no rewrite step, so a file fed by real reads grows without bound.
+   Slice 3 must add compaction (write whole through a temp file, fsync, rename, as the marks file save in `state.rs` does) when the file exceeds a multiple of the live entry count.
    Test: after M flushes of the same K ids the file is at most a fixed multiple of K records.
 8. There is exactly one appender.
-   `Collector` creation per request opens a `Gc` that loads and flushes its own `Hints` (`lib.rs:174`, `:841`).
+   `Collector` creation per request opens a `Gc` that loads and flushes its own `Hints` (`Gc::open` and `flush_hints` in `lib.rs`).
    With a shared owner in `Core`, `Gc::open` needs a constructor taking the shared instance, and the end-of-cycle flush goes through that owner.
    Test: two concurrent `Gc` handles never produce interleaved or duplicated appends.
 
@@ -238,7 +253,8 @@ Acceptance criteria:
 
 - D1: approve Option 3 and its slice order, or choose Option 1 (document on demand only).
 - D2: confirm space-pressure triggering (C) is out of scope for #10.
-- D3: confirm removing `cold_dead_bonus` and the "older than a threshold" wording rather than implementing them.
+- D3: Slice 1 removed the `cold_dead_bonus` claim and the "older than a threshold" wording because they described code that does not exist.
+  Decide whether to ADD an age threshold later, or ratify the pack-level policy as final.
 
 ### Why no code in this pass
 
