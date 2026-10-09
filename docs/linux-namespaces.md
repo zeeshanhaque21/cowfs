@@ -137,6 +137,15 @@ With a canonical path alone, a `cargo` debug build is not byte-identical: the in
 The canonical route of `base refresh --build --canonical` therefore runs the build with `CARGO_INCREMENTAL=0`, overriding any value the caller set, and changes nothing else.
 The earlier 92% figure and its proc-macro dylib explanation did not reproduce on Linux, see the evidence file.
 
+The cost is that a base built this way is not incrementally reusable by a build that leaves the variable unset.
+In a critic's test on a small fixture, the first default-environment build on such a base recompiled every crate (`mac`, `app` and `lib`).
+Two default-environment builds in a row, and two `CARGO_INCREMENTAL=0` builds in a row, rebuilt nothing the second time.
+A slot therefore has to keep `CARGO_INCREMENTAL=0` to stay warm, and while it does, edit rebuilds are not incremental.
+This is the accepted price of the byte-identical promise (decision of 2026-10-08).
+No numeric slowdown is claimed: the test used a tiny fixture.
+The macOS measurements are evidence about the variable, not about the shipped route, because the canonical route is Linux only.
+There is no way to opt out of the override.
+
 Promise, for a build run through the canonical route on Linux:
 
 - Every file under `target` is byte-identical across clean rebuilds and across slots at the same canonical path, including binaries, rlibs, proc-macro libraries, build-script outputs, dep-info files and the fingerprint files.
