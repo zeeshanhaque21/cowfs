@@ -33,8 +33,8 @@ pub struct Ctx {
     /// The backend's declared hardlink limit, when it is small enough to reach cheaply
     /// (from `Options::link_limit`).
     pub link_limit: Option<u32>,
-    /// From `Options::devices_need_privilege`.
-    pub devices_need_privilege: bool,
+    /// From `Options::no_device_privilege`.
+    pub no_device_privilege: bool,
     refs: Mutex<HashMap<Ino, u64>>,
 }
 
@@ -66,7 +66,7 @@ impl Ctx {
             fs,
             xattr_names_prefixed: false,
             link_limit: None,
-            devices_need_privilege: false,
+            no_device_privilege: false,
             refs: Mutex::new(HashMap::new()),
         }
     }
@@ -75,7 +75,7 @@ impl Ctx {
         Self {
             xattr_names_prefixed: opts.xattr_names,
             link_limit: opts.link_limit,
-            devices_need_privilege: opts.devices_need_privilege,
+            no_device_privilege: opts.no_device_privilege,
             ..Self::new(fs)
         }
     }

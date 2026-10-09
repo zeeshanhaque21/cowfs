@@ -353,6 +353,7 @@ fn apply_inner(side: &mut Fs, op: &MOp, refs: &mut Vec<Ino>) -> Out {
 struct Entry {
     kind: u8,
     mode: u32,
+    rdev: u64,
     nlink: u32,
     size: u64,
     digest: [u8; 32],
@@ -415,6 +416,7 @@ fn dump(fs: &dyn Vfs) -> BTreeMap<Vec<u8>, Entry> {
                 Entry {
                     kind: a.kind as u8,
                     mode: a.mode,
+                    rdev: a.rdev,
                     nlink: a.nlink,
                     size: if a.kind == FileKind::Directory {
                         0

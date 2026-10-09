@@ -837,7 +837,14 @@ fn fallocate_modes_reach_the_kernel() {
     }
     assert_eq!(v.read(f, 4000, 200).unwrap()[..96], [7u8; 96]);
     assert_eq!(v.read(f, 4096, 8192).unwrap(), vec![0u8; 8192]);
-    let a = v.fallocate(f, FallocMode::ZeroRange, 19_000, 3000).unwrap();
+    let a = match v.fallocate(f, FallocMode::ZeroRange, 19_000, 3000) {
+        // tmpfs punches holes but has no FALLOC_FL_ZERO_RANGE.
+        Err(Error::NotSupported) => {
+            eprintln!("SKIP: the scratch filesystem does not support zero-range fallocate");
+            return;
+        }
+        r => r.unwrap(),
+    };
     assert_eq!(a.size, 22_000);
     assert_eq!(v.read(f, 19_000, 3000).unwrap(), vec![0u8; 3000]);
     let a = v

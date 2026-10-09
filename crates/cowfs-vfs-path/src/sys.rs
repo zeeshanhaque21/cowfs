@@ -233,6 +233,47 @@ pub fn mknodat(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
     Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn mknodat_exact(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<bool> {
+    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+}
+
+/// `mknodat` with the permission bits of `mode` exactly as given: no umask filters them, so no
+/// chmod by name has to follow (one could land on another node renamed over the name in
+/// between). It runs on a short-lived thread that detaches its own umask with
+/// `unshare(CLONE_FS)` and sets it to 0; the process umask is never touched. `Ok(false)` means
+/// that thread could not get its own umask (a seccomp filter may refuse `unshare`) and nothing
+/// was made. A parent directory's default ACL still applies, as it would to a native `mknod`.
+#[cfg(target_os = "linux")]
+pub fn mknodat_exact(dir: BorrowedFd<'_>, name: &[u8], mode: u32, rdev: u64) -> io::Result<bool> {
+    let name = cstr(name)?;
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("cowfs-mknod".into())
+            .spawn_scoped(s, || {
+                // SAFETY: `unshare(CLONE_FS)` gives only this thread a private copy of its cwd,
+                // root and umask; it touches no memory. The thread ends right after.
+                if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
+                    return Ok(false);
+                }
+                // SAFETY: `umask` cannot fail; after the unshare it affects this thread only.
+                unsafe { libc::umask(0) };
+                // SAFETY: see module docs; `dir` is borrowed for the whole scope.
+                cvt(unsafe {
+                    libc::mknodat(
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                        mode as libc::mode_t,
+                        rdev as libc::dev_t,
+                    )
+                })?;
+                Ok(true)
+            })?
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("the mknod thread panicked")))
+    })
+}
+
 /// `fchmodat` by name, for a node that has no descriptor `fchmod` accepts (an `O_PATH` one).
 /// Never follows a final symlink: one planted at the name makes this fail (Linux, `ENOTSUP`)
 /// or change the link itself (macOS), not its target.

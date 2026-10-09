@@ -17,16 +17,11 @@ const ALL_KINDS: [(FileKind, u64); 4] = [
     (FileKind::BlockDevice, makedev(8, 16)),
 ];
 
-/// Whether this process is root, by the owner of `/proc/self` (Linux; `false` elsewhere).
-fn is_root() -> bool {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
-}
-
-/// The kinds this backend can create. A device node needs privilege on a real kernel: a backend
-/// declared `devices_need_privilege` that answers `PermissionDenied` to a device while this
-/// process is not root is checked with the fifo and the socket only, and the device case is left
-/// to the backends that allow it (MemVfs, Core). Any other `PermissionDenied` is a failure.
+/// The kinds this backend can create. A device node needs `CAP_MKNOD` on a real kernel: a
+/// backend run with `no_device_privilege` (the host probe found this process lacks it) that
+/// answers `PermissionDenied` to a device is checked with the fifo and the socket only, and the
+/// device case is left to the backends that allow it (MemVfs, Core, a privileged run). Any other
+/// `PermissionDenied` is a failure.
 fn kinds(c: &Ctx) -> std::result::Result<Vec<(FileKind, u64)>, Failure> {
     match c.mknod(
         ROOT_INO,
@@ -40,9 +35,7 @@ fn kinds(c: &Ctx) -> std::result::Result<Vec<(FileKind, u64)>, Failure> {
             c.forget_all(a.ino);
             Ok(ALL_KINDS.to_vec())
         }
-        Err(Error::PermissionDenied) if c.devices_need_privilege && !is_root() => {
-            Ok(ALL_KINDS[..2].to_vec())
-        }
+        Err(Error::PermissionDenied) if c.no_device_privilege => Ok(ALL_KINDS[..2].to_vec()),
         Err(e) => Err(e.into()),
     }
 }
