@@ -131,6 +131,15 @@ staging snapshot whose name is reserved (the same one a swap stages into, so a c
 nothing a caller can see), the tree is made durable, read back through the `Vfs` and compared with
 the source byte for byte, and only then is the name made visible.
 
+Access and modification times are kept to the nanosecond on every node (a directory's after its
+children are written, so adding them does not move it), and the names of one hard linked file stay
+names of one inode. A build tool judges freshness by those two, so a copy that drops either looks
+changed (issue 290). Only names inside the imported tree count: a second name outside it is not a
+name, so such a file imports with a link count of 1. ctime cannot be set and is the import time.
+The read-back compares the modification time, link identity and link counts as well as the bytes,
+so a source that is only touched while it is imported (same bytes, new mtime) fails as a
+mismatch, where it used to succeed.
+
 The switch is one fork of the staging snapshot into the requested name, so it is a single root
 write. An import of the same content twice therefore costs nothing the second time: the blocks are
 already stored, and the report's `stored_bytes` says so (0 for a repeat of identical content).
@@ -143,9 +152,11 @@ already stored, and the report's `stored_bytes` says so (0 for a repeat of ident
   every path, kind, mode, size, SHA-256, symlink target, and mtime, ctime, inode, link count, uid
   and gid. atime is excluded on purpose, because the import reads the source and atime is expected to
   move.
-- Symlinks are kept as symlinks and never followed. Anything else that is not a regular file or a
-  directory (a fifo, a socket, a device) is refused with `invalid_params`, because the core cannot
-  hold one and dropping it silently would make the imported tree differ from the source.
+- Symlinks are kept as symlinks and never followed. A fifo, a socket and a device node are imported
+  as the same kind of node (`Vfs::mknod`), with their permission bits and, for a device, the device
+  number; nothing is created on the host. Only a kind the core cannot hold at all is refused with
+  `invalid_params`, because dropping it silently would make the imported tree differ from the
+  source.
 - No directory is special-cased, `.git` included: the source is copied as it is found.
 - A name that exists is `already_exists`. An import never replaces a snapshot.
 - A mismatch, a cancellation or an error leaves the store exactly as the call found it: the staging

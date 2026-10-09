@@ -184,17 +184,20 @@ impl Handler {
         ingested: cowfs_core::Ingested,
         ctx: &OpContext<'_>,
     ) -> CtlResult<ImportReport> {
-        // Hashing both trees reads every byte again, which takes as long as the ingest did.
-        let hashed = ingested.files;
+        // Hashing both trees reads every byte again, which takes as long as the ingest did. The
+        // walk has no entry count to hand, so `done` counts the walk's own steps (an entry or a
+        // megabyte) with no total: a liveness pulse that only ever rises.
         let tick = |phase: &'static str| {
             let mut throttle = Throttle::new();
+            let mut steps = 0u64;
             move || {
+                steps += 1;
                 !throttle.due()
                     || ctx
                         .progress(ProgressEvent {
                             phase: phase.into(),
-                            done: 0,
-                            total: Some(hashed),
+                            done: steps,
+                            total: None,
                             unit: Unit::Items,
                             message: None,
                         })
