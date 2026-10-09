@@ -10,7 +10,7 @@ difference between the two runs is the path.
 Gates, in fixed order:
 
   g1  clean `cargo build` of a pinned clone of this repo, CARGO_TARGET_DIR in DIR
-  g2  warm edit-and-rebuild: touch a leaf file, `cargo build` again
+  g2  warm edit-and-rebuild: edit cowfs-ctl, `cargo build` again (3 libs rebuilt, 2 bins relinked)
   g3  `git status` on a generated 100k+ file tree, warm and with 1% touched
   g4  tree walk plus a small-file read pass over 20k files
   g5  large sequential 1 GiB write and read back, fsync, MiB/s
@@ -62,10 +62,17 @@ SMALL_BYTES = 256
 SMALL_PER_DIR = 256
 GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
 
-# g2 edits this file: it is a leaf of the dependency graph (nothing in the
-# workspace depends on cowfs-vfs-path) but everything downstream of the vfs trait
-# rebuilds behind it.
-EDIT_TARGET = "crates/cowfs-vfs-path/src/cookies.rs"
+# g2 edits this file: cowfs-ctl is the one crate at the pinned sha whose
+# dependents (cowfs-cli, cowfs-treehouse) are the workspace's only binaries, so a
+# one-line change here rebuilds three libs and relinks two executables, which is
+# what an edit-rebuild loop does. (The earlier target, cowfs-vfs-path/src/cookies.rs,
+# had no binary downstream at that sha and cost cargo ~0.3 s: see
+# docs/verification/g1-g2-readiness-20261009.md.) EDIT_CRATE is its lib target name.
+EDIT_TARGET = "crates/cowfs-ctl/src/lib.rs"
+EDIT_CRATE = "cowfs_ctl"
+# A g2 rep that rebuilt fewer units than this, or relinked no executable, is refused.
+# Measured at the pinned sha: 5 units (3 libs, 2 bins). compare.py repeats this number.
+G2_MIN_UNITS = 3
 
 
 def load1() -> float:
@@ -128,6 +135,35 @@ def checked(cmd, cwd=None, env=None, timeout=7200):
         sys.stderr.write(f"FAIL {cmd}\n{p.stdout[-4000:]}\n{p.stderr[-4000:]}\n")
         raise SystemExit(70)
     return p
+
+
+def rebuilt_units(stdout: str) -> list:
+    """Units cargo actually rebuilt (not fresh), from `--message-format=json` output."""
+    out = []
+    for line in stdout.splitlines():
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(m, dict) or m.get("reason") != "compiler-artifact" or m.get("fresh"):
+            continue
+        target = m.get("target") or {}
+        if "custom-build" in (target.get("kind") or []):
+            continue
+        out.append({"name": target.get("name"), "exe": bool(m.get("executable"))})
+    return out
+
+
+def g2_rebuild_problem(units: list):
+    """Why this g2 rep measured a trivial workload, or None."""
+    names = [u["name"] for u in units]
+    if EDIT_CRATE not in names:
+        return f"the edited crate {EDIT_CRATE} was not rebuilt (rebuilt: {names})"
+    if len(units) < G2_MIN_UNITS:
+        return f"only {len(units)} unit(s) rebuilt, need at least {G2_MIN_UNITS} (rebuilt: {names})"
+    if not any(u["exe"] for u in units):
+        return f"no executable was relinked (rebuilt: {names})"
+    return None
 
 
 def jobs() -> list:
@@ -264,11 +300,20 @@ class Ctx:
         leaf.write_text(
             leaf.read_text() + f"\n// cowfs bench g2 edit {time.time_ns()}\n"
         )
-        checked(
-            ["cargo", "build", "--offline", "--locked", *jobs()],
+        p = checked(
+            ["cargo", "build", "--offline", "--locked", *jobs(), "--message-format=json"],
             cwd=self.corpus,
             env=self.env,
         )
+        units = rebuilt_units(p.stdout)
+        why = g2_rebuild_problem(units)
+        if why:
+            raise SystemExit(f"g2 invalid, no rep recorded: {why}")
+        return {
+            "rebuilt_count": len(units),
+            "bins_relinked": sum(1 for u in units if u["exe"]),
+            "rebuilt_units": sorted(u["name"] for u in units),
+        }
 
     def g3(self):
         git = [

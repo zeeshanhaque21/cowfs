@@ -232,6 +232,22 @@ def g5_problem(row, meta_bytes):
     return None
 
 
+G2_MIN_UNITS = 3  # same number as gates.py; a test pins them equal
+
+
+def g2_problem(row):
+    """Why a g2 rep did not rebuild and relink enough to be an edit-rebuild, or None."""
+    m = row.get("metrics")
+    if not isinstance(m, dict):
+        return "no metrics"
+    n, b = m.get("rebuilt_count"), m.get("bins_relinked")
+    if not is_int(n) or not is_int(b):
+        return f"rebuilt_count {n!r} or bins_relinked {b!r} is missing or not an integer (a pre-fix g2 file)"
+    if n < G2_MIN_UNITS or b < 1:
+        return f"only {n} unit(s) rebuilt and {b} executable(s) relinked: not an edit-rebuild workload"
+    return None
+
+
 def file_problems(path):
     """Every reason this result file cannot be trusted, plus its g5 rep count."""
     try:
@@ -279,6 +295,10 @@ def file_problems(path):
                 v = row.get(k)
                 if not is_nonneg_load(v):
                     out.append(f"{path}:{n}: rep {k} {v!r} is missing, not a number, or out of range (NaN or finite >= 0)")
+            if row.get("gate") == "g2":
+                why = g2_problem(row)
+                if why:
+                    out.append(f"{path}:{n}: g2 rep {row.get('rep')}: {why}")
             if row.get("gate") == "g5":
                 g5 += 1
                 why = g5_problem(row, meta_bytes) if meta_bytes is not None else "no valid meta to check against"

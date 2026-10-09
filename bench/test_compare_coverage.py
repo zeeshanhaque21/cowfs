@@ -57,7 +57,7 @@ def rep(gate, index, wall, label="arm", load=1.0):
         "wall_s": wall,
         "load1_before": load,
         "load1_after": load,
-        "metrics": {},
+        "metrics": {"rebuilt_count": 5, "bins_relinked": 2} if gate == "g2" else {},
         "ts": 0.0,
     }
 
