@@ -502,31 +502,28 @@ impl Core {
                 // (its parent), already the new tree, and only the staging snapshot goes below.
                 if let Ok(sc) = self.inner.snap_by_name_raw(staged) {
                     if self.parent_of(&old) != Some(sc.id) {
-                        let r = self
-                            .inner
-                            .flush_snapshot(&sc)
-                            .map_err(ControlError::from)
-                            .and_then(|()| {
-                                // the intent file and its directory entry are durable: the old tree
-                                // may go
-                                crate::fsops::note("victim_removed");
-                                self.move_name(&sc, staged, target, Some(&old))
-                            });
-                        match r {
-                            Ok(e) => entry = Some(e),
-                            // Busy and a flush failure happen before the commit and change nothing
-                            Err(e @ (ControlError::Busy | ControlError::Fs(_))) if undo => {
-                                if self
+                        // A flush failure and `Busy` happen before the commit and change nothing; an
+                        // error from the commit itself may have changed anything and stays pending.
+                        let unwind = |e: ControlError| {
+                            if undo
+                                && self
                                     .inner
                                     .snap_by_name(target)
                                     .is_ok_and(|t| t.id == old.id)
-                                {
-                                    self.rollback(staged, target);
-                                }
-                                return Err(e);
+                            {
+                                self.rollback(staged, target);
                             }
-                            Err(e) => return Err(e),
-                        }
+                            e
+                        };
+                        self.inner
+                            .flush_snapshot(&sc)
+                            .map_err(|e| unwind(e.into()))?;
+                        // the intent file and its directory entry are durable: the old tree may go
+                        crate::fsops::note("victim_removed");
+                        entry = Some(match self.move_name(&sc, staged, target, Some(&old)) {
+                            Err(ControlError::Busy) => return Err(unwind(ControlError::Busy)),
+                            r => r?,
+                        });
                     }
                 }
             }
