@@ -91,20 +91,6 @@ fn mount_conformance() {
         "kernel sends FORGET asynchronously, so reclaim is not observable in the same call; a bounded poll makes 100/100 pass"
             .into(),
     ));
-    // This harness drives the mount through `PathVfs`, which has no fallocate until #103 slice D.
-    for name in [
-        "fallocate_punch_reads_zeros_keeps_size",
-        "fallocate_zero_range_modes",
-        "fallocate_allocate_and_keep_size",
-        "fallocate_errors",
-        "fallocate_content_change_bumps_mtime_and_ctime",
-        "fallocate_random_sequence_matches_model",
-    ] {
-        opts.skip.push((
-            name.into(),
-            "PathVfs has no fallocate yet (#103 slice D)".into(),
-        ));
-    }
     // This harness serves MemVfs through the mount and drives it with `PathVfs` as the client view
     // of the mounted directory; `PathVfs` does not implement `mknod`, so the checks cannot run; the
     // FUSE `mknod` path is covered by `special_files_through_mknod` in `mount.rs`, over MemVfs.

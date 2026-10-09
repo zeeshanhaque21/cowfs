@@ -193,7 +193,30 @@ jobs:
           failures = re.findall(r"^FAIL\s+.*$", log, re.MULTILINE)
           known = r"^FAIL\s+cowfs\s+xattrs\s+xattr_on_directory_and_symlink\s+.*unexpected error: permission denied \(PermissionDenied\)$"
           unexpected = [line for line in failures if not re.fullmatch(known, line)]
-          assert re.search(r"^128 run,", log, re.MULTILINE), "Missing full conformance report"
+          # The expected counts come from the check list itself, so adding a check or unskipping one
+          # needs no number edited here: every check is run, skipped by name, heavy or above level.
+          checks = re.findall(
+              r"^\s+\((\w+), (\w+), (?:Posix|Portable|Cowfs)\),\s*$",
+              Path("crates/cowfs-vfs-test/src/conformance/list.rs").read_text(),
+              re.MULTILINE,
+          )
+          reports = re.findall(
+              r"^(\d+) run, (\d+) failed, (\d+) skipped, (\d+) heavy not enabled, (\d+) above the level",
+              log,
+              re.MULTILINE,
+          )
+          report = max(reports, key=lambda r: int(r[0]), default=None)
+          assert report and int(report[0]) + int(report[2]) + int(report[3]) + int(report[4]) == len(checks), (
+              f"Conformance report does not account for all {len(checks)} checks: {report}"
+          )
+          # Skips are an explicit list; the fallocate checks must never be among them.
+          skipped = set(re.findall(r"^SKIP\s+\S+\s+\S+\s+(\w+)", log, re.MULTILINE))
+          expected_skips = {
+              "concurrent_readers_and_writers_of_one_file",
+              "statfs_free_after_unlink",
+              "hardlink_limit_reports_too_many_links",
+          } | {name for module, name in (c[:2] for c in checks) if module == "special"}
+          assert skipped == expected_skips, f"Skipped checks differ: extra {sorted(skipped - expected_skips)}, missing {sorted(expected_skips - skipped)}"
           assert "SKIP: /dev/fuse" not in log, "FUSE tests skipped"
           assert not unexpected, "Unexpected conformance failures:\n" + "\n".join(unexpected)
           if failures:

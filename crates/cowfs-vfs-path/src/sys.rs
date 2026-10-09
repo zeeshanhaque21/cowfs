@@ -279,6 +279,22 @@ pub fn renameat(
     Ok(())
 }
 
+/// `fallocate(2)` with the kernel's mode bits. Not `posix_fallocate`: that is mode 0 only, and
+/// glibc emulates it by writing zeros where the filesystem lacks support, which is the non-atomic,
+/// space-allocating behaviour `Vfs::fallocate` rules out.
+#[cfg(target_os = "linux")]
+pub fn fallocate(fd: BorrowedFd<'_>, mode: i32, offset: i64, len: i64) -> io::Result<()> {
+    // SAFETY: see module docs.
+    cvt(unsafe { libc::fallocate(fd.as_raw_fd(), mode, offset, len) })?;
+    Ok(())
+}
+
+/// Other platforms have no `fallocate(2)` with these modes.
+#[cfg(not(target_os = "linux"))]
+pub fn fallocate(_fd: BorrowedFd<'_>, _mode: i32, _offset: i64, _len: i64) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+}
+
 pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
     // SAFETY: see module docs.
     cvt(unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) })?;
