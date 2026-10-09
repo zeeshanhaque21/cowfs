@@ -3,7 +3,9 @@
 //! What is proven here is the companion's own logic: the create-or-reset choice, the atomic
 //! `expect_no_holders` path, base refresh and staleness, naming, idempotency, exit-code mapping.
 //! What is not proven here is the mount, because the stub has no mount: materialising a snapshot
-//! at a path is the one request the control protocol does not have yet.
+//! at a path is the one request this stub does not serve. The daemon and `cowfs-ctl` have
+//! `mount_snapshot` and `unmount_snapshot`, but the companion does not call them yet
+//! (`docs/v1-treehouse.md`, gap 1).
 
 mod common;
 

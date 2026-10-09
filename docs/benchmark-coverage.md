@@ -61,6 +61,7 @@ The noise-floor table gains one line when the noise-floor file lacks a gate the 
 
 - Matched `g1`-only and `g1,g3`-only comparisons are still valid and still exit 0, with `g5   not run (no input has g5 reps)` unchanged.
 - Exit codes are unchanged: `PASS` 0, a genuine `FAIL` 1, `UNMEASURABLE` 2, `INVALID` 3.
+  Precedence is `INVALID` (3) first, then `FAIL` (1) over `UNMEASURABLE` (2) over `PASS` (0), so a run with a FAIL and an unmeasurable gate exits 1.
 - Malformed inputs are still refused with exit 3 and no verdict, and no coverage block is printed on that path.
 - No gate present in both arms is still refused with exit 3 rather than printed as a zero-gate pass.
 - g5 is still all or nothing across the supplied inputs, refusal included, and a g5-less run still gets no g5 verdict.

@@ -29,7 +29,9 @@ sh /Users/zeeshanhaque/Projects/cowfs/scripts/treehouse-cowfs.sh get --lease --j
 Then work in the path returned by treehouse.
 The launcher explicitly selects the cowfs root, disables APFS sharing, checks the NFS mount, and checks the control daemon before invoking treehouse.
 It refuses an absent mount instead of silently provisioning on the underlying native directory.
-The paths default to `$HOME/.cowfs` and can be overridden with the env vars `COWFS_HOME`, `COWFS_MOUNT`, `COWFS_SOCKET`, `COWFS_BIN` and `TREEHOUSE_BIN`; `-h` prints usage without touching the mount.
+`COWFS_HOME` defaults to `$HOME/.cowfs`; `COWFS_MOUNT` defaults to `$COWFS_HOME/mnt` and `COWFS_SOCKET` to `$COWFS_HOME/sock/daemon.sock`.
+`COWFS_BIN` defaults to the stable `cowfs` copy under `spikes/nfs-loopback/out/live/bin` in the project checkout, and `TREEHOUSE_BIN` to `treehouse` on `PATH` (else `$HOME/.local/bin/treehouse`).
+With no arguments, `-h` or `--help` the launcher prints usage without touching the mount.
 Existing worktrees and runners have not been moved or restarted.
 Main checkouts and their shared Git object databases remain native unless separately cloned or imported onto cowfs.
 The smoke main checkout, including its Git database, is on cowfs at `base/repos/cowfs`.

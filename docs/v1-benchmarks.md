@@ -52,7 +52,8 @@ The lock is an atomic `mkdir`, retried every 10 s for 15 minutes, with an owner 
 
 `bench/compare.py` prints per-gate median, min and max of the per-rep ratios, and both rep counts.
 It refuses to print a ratio at all when the machine was too loaded for a ratio to mean anything: `load1` above 30 on either side, or the two arms more than 2x apart.
-It prints the load numbers and the word `unmeasurable` instead, and exits 2.
+It prints the load numbers and the word `unmeasurable` instead.
+The exit code is 2 only when no other gate failed: precedence is `INVALID` (3) first, then `FAIL` (1) over `UNMEASURABLE` (2) over `PASS` (0), so an unmeasurable gate next to a genuine FAIL still exits 1.
 Two previous reviewers found timings unmeasurable at load 100 to 300, so a ratio there is noise with a decimal point on it, and the harness must not hand one to the next reader as if it were a finding.
 
 Every rep records `load1` before and after its own timed section, so a gate that ran quiet inside a noisy run is still visible as such.
