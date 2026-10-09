@@ -19,6 +19,11 @@ script to prove its iteration order, and why an assertion with no operation text
 A run that cannot be measured is UNMEASURABLE and a run whose records are malformed is INVALID.
 Neither is ever a pass, and neither is ever reported as a filesystem failure.
 
+An ordinal-worse position (native passes, cowfs fails at the same stream position) is a FAIL
+unless bench/pjdfstest-accepted-divergences.json lists it by (test, n) with an issue and a reason.
+Listed entries that are no longer worse are reported, so the list cannot rot.
+Established regressions are scored separately and are never waived by that list.
+
 Exit status: 0 PASS, 1 FAIL, 2 UNMEASURABLE, 3 INVALID.
 """
 
@@ -915,14 +920,8 @@ def first_call(detail: str) -> str:
     return tokens[index] if index < len(tokens) else "(no syscall)"
 
 
-def ordinal_diagnostic(arms: dict, profiles: dict) -> dict:
-    """The old ordinal-position accounting, kept as a labelled diagnostic.
-
-    Every number here is "N positions in the stream where native passed and cowfs failed". That is
-    a differential, not a count of defects: pairing by position cannot tell a real divergence from
-    a case that simply took a different path after an earlier failure. It is reported because it
-    bounds what the historical record can say, not because it counts anything.
-    """
+def ordinal_rows(arms: dict) -> tuple[list[dict], list[dict]]:
+    """Positions where native passes and cowfs fails (worse), and the reverse (better)."""
     regressions, looser = [], []
     for test in sorted(set(arms.get("native", {})) & set(arms.get("cowfs", {}))):
         native = {c["n"]: c for c in arms["native"][test]["cases"]}
@@ -935,6 +934,18 @@ def ordinal_diagnostic(arms: dict, profiles: dict) -> dict:
                 regressions.append(row)
             elif not left["ok"] and right["ok"]:
                 looser.append(row)
+    return regressions, looser
+
+
+def ordinal_diagnostic(arms: dict, profiles: dict) -> dict:
+    """The old ordinal-position accounting, kept as a labelled diagnostic.
+
+    Every number here is "N positions in the stream where native passed and cowfs failed". That is
+    a differential, not a count of defects: pairing by position cannot tell a real divergence from
+    a case that simply took a different path after an earlier failure. It is reported because it
+    bounds what the historical record can say, not because it counts anything.
+    """
+    regressions, looser = ordinal_rows(arms)
     outside_gate = [r for r in regressions if not r["root_required"]]
     same_text = [r for r in outside_gate
                  if normalize_text(r["native_detail"]) == normalize_text(r["cowfs_detail"])]
@@ -980,6 +991,58 @@ def ordinal_diagnostic(arms: dict, profiles: dict) -> dict:
         "looser_non_owner_rows": len(non_owner),
         "looser_non_owner_rows_by_case": dict(collections.Counter(r["test"] for r in non_owner)),
     }
+
+
+ACCEPTED_DIVERGENCES = Path(__file__).resolve().parent / "pjdfstest-accepted-divergences.json"
+
+
+def load_accepted(path: Path = ACCEPTED_DIVERGENCES) -> list[dict]:
+    """The checked-in list of ordinal-worse positions that are documented, accepted divergences.
+
+    Every entry names (test, n, issue) and carries a reason, so an accepted position is a decision
+    on record and not a silent skip. A malformed list raises: a gate must not guess its own waivers.
+    An absent file waives nothing, which can only make the verdict stricter.
+    """
+    if not Path(path).is_file():
+        return []
+    document = json.loads(Path(path).read_text())
+    entries = document["entries"]
+    for entry in entries:
+        missing = [k for k in ("test", "n", "issue", "reason") if not entry.get(k)]
+        if missing:
+            raise ValueError(f"{path}: accepted divergence {entry!r} lacks {missing}")
+    return entries
+
+
+def accepted_reasons(arms: dict, accepted: list[dict]) -> list[dict]:
+    """Ordinal-worse positions not covered by the accepted list FAIL; list entries that rot are named.
+
+    This sits beside the established-regression rule and never relaxes it: an established
+    regression stays a DIVERGENCE whether or not a position is listed here.
+    """
+    worse, _ = ordinal_rows(arms)
+    listed = {(e["test"], e["n"]): e for e in accepted}
+    uncovered = [r for r in worse if (r["test"], r["n"]) not in listed]
+    out = []
+    if uncovered:
+        shown = ", ".join(f"{r['test']} #{r['n']}" for r in uncovered[:20])
+        more = f" (+{len(uncovered) - 20} more)" if len(uncovered) > 20 else ""
+        out.append(reason(DIVERGENCE, f"{len(uncovered)} ordinal-worse position(s) are not covered by "
+                                      f"an accepted divergence: {shown}{more}"))
+    worse_keys = {(r["test"], r["n"]) for r in worse}
+    compared = set(arms.get("native", {})) & set(arms.get("cowfs", {}))
+    stale = [e for e in accepted if e["test"] in compared and (e["test"], e["n"]) not in worse_keys]
+    if stale:
+        shown = ", ".join(f"{e['test']} #{e['n']} ({e['issue']})" for e in stale[:20])
+        out.append(reason(COVERAGE, f"{len(stale)} accepted divergence(s) are listed but not worse in "
+                                    f"this run, remove them if fixed: {shown}"))
+    covered = len(worse) - len(uncovered)
+    if covered:
+        issues = collections.Counter(listed[(r["test"], r["n"])]["issue"] for r in worse
+                                     if (r["test"], r["n"]) in listed)
+        out.append(reason(COVERAGE, f"{covered} ordinal-worse position(s) are accepted divergences: "
+                                    f"{dict(issues)}"))
+    return out
 
 
 def compare(arms: dict, profiles: dict) -> dict:
@@ -1032,7 +1095,7 @@ def arm_totals(records: list[dict]) -> dict:
 
 
 def verdict(run_dir: Path, tool: dict | None = None, tests_root: Path | None = None,
-            identity: dict | None = None) -> dict:
+            identity: dict | None = None, accepted: list[dict] | None = None) -> dict:
     """Re-read the run's own records, re-parse every raw stream, and refuse anything malformed."""
     jsonl = Path(run_dir) / "cases.jsonl"
     if not jsonl.is_file():
@@ -1122,6 +1185,7 @@ def verdict(run_dir: Path, tool: dict | None = None, tests_root: Path | None = N
     if outside_gate:
         reasons.append(reason(DIVERGENCE, f"{len(outside_gate)} established assertion(s) pass "
                                           "natively and fail on the mount"))
+    reasons += accepted_reasons(arms, load_accepted() if accepted is None else accepted)
     # An established divergence is a result and an unpairable scope is a limit on what can be
     # concluded, so coverage never changes the exit on its own.
     state = state_from(reasons)

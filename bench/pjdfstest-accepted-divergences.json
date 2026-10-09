@@ -1,0 +1,432 @@
+{
+ "version": 1,
+ "derived_from": "bench/out/ready-g3/run/20261009T071336Z (docs/reviews/g3-status-20261009b.md)",
+ "entries": [
+  {
+   "test": "chmod/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chmod/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chmod/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chmod/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chmod/03.t",
+   "n": 5,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chown/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chown/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chown/03.t",
+   "n": 5,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chown/03.t",
+   "n": 6,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chown/03.t",
+   "n": 9,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "chown/03.t",
+   "n": 10,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "ftruncate/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "ftruncate/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "ftruncate/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "ftruncate/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "ftruncate/03.t",
+   "n": 5,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 5,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 6,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 7,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 8,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 9,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 10,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 11,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 12,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "link/03.t",
+   "n": 13,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mkdir/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mkdir/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mkdir/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mkfifo/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mkfifo/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mkfifo/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mkfifo/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mknod/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mknod/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mknod/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "mknod/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "open/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "open/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "open/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "open/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "open/17.t",
+   "n": 2,
+   "issue": "#204",
+   "reason": "open O_WRONLY,O_NONBLOCK on a fifo with no reader answers EACCES where native answers ENXIO; a real defect tracked in #204, listed so the ordinal position is on record while the established regression still fails the gate"
+  },
+  {
+   "test": "rename/02.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "rename/02.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "rename/02.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "rename/02.t",
+   "n": 5,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "rename/02.t",
+   "n": 6,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "rmdir/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "rmdir/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "rmdir/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "rmdir/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "rmdir/03.t",
+   "n": 5,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "symlink/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "symlink/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "symlink/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "symlink/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "symlink/03.t",
+   "n": 5,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "symlink/03.t",
+   "n": 6,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "truncate/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "truncate/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "truncate/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "truncate/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "truncate/03.t",
+   "n": 5,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "unlink/03.t",
+   "n": 1,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "unlink/03.t",
+   "n": 2,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "unlink/03.t",
+   "n": 3,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "unlink/03.t",
+   "n": 4,
+   "issue": "#108",
+   "reason": "pathconf(_PC_PATH_MAX) returns -1 on the macOS NFS client, so the suite cannot build its long path; accepted macOS client divergence (Zee decision 2026-10-09)"
+  },
+  {
+   "test": "unlink/14.t",
+   "n": 4,
+   "issue": "#109",
+   "reason": "open O_RDONLY then unlink then fstat reports nlink 1 where native reports 0: macOS NFS silly-rename keeps nlink 1 for an open unlinked file (#109 symptom 2)"
+  }
+ ]
+}
