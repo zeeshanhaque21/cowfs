@@ -602,10 +602,15 @@ fn base_refresh_runs_the_build_in_a_leased_slot_and_refreshes_the_base() {
 
     // The slot the build ran in was returned by the flow, so the pool is clean again.
     let status = s.treehouse_ok(&["status", "--json"]);
-    assert!(
-        !status.contains(slot),
-        "the build slot was returned: {status}"
-    );
+    // A returned slot stays in the pool as `available`; what must not remain is the lease.
+    let entries: serde_json::Value = serde_json::from_str(&status).expect("status --json");
+    let leased: Vec<&serde_json::Value> = entries
+        .as_array()
+        .expect("status --json is an array")
+        .iter()
+        .filter(|e| e["status"] == "leased")
+        .collect();
+    assert!(leased.is_empty(), "the build slot was returned: {status}");
 
     // A second refresh reports the previous commit.
     let mut args: Vec<String> = common_args.iter().map(|a| (*a).to_owned()).collect();
