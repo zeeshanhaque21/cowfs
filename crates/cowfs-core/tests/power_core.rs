@@ -949,8 +949,9 @@ fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() 
     );
 }
 
-/// The model is only as good as the log. Cut after the last op, nothing is in flight, and the image
-/// must be the disk the workload really left: no store, metadata or root write went round the log
+/// The model is only as good as the log. Cut after the last op of a workload that ends in a sync,
+/// nothing is in flight and everything is acknowledged, so the image must be the disk the workload
+/// really left: no store, metadata or root write went round the log
 /// (for instance on another thread, which a thread-local log cannot see).
 #[test]
 fn the_recorded_log_replays_to_the_real_disk() {
@@ -977,10 +978,26 @@ fn the_recorded_log_replays_to_the_real_disk() {
         meta_image(&run, n, 0, &mut rng) == run.final_meta,
         "the metadata log does not replay to its file"
     );
-    let mut root: Vec<String> = root_image(&run, n, &mut rng).into_keys().collect();
-    root.sort();
+    // the root has no acknowledgement of its own, so compare the names every op leaves, not a cut
+    let mut names = std::collections::BTreeSet::new();
+    for op in &run.rops {
+        match op {
+            RootOp::Create(n) => {
+                names.insert(n.clone());
+            }
+            RootOp::Rename(a, b) => {
+                names.remove(a);
+                names.insert(b.clone());
+            }
+            RootOp::Unlink(n) => {
+                names.remove(n);
+            }
+            _ => {}
+        }
+    }
     assert_eq!(
-        root, run.final_root,
+        names.into_iter().collect::<Vec<_>>(),
+        run.final_root,
         "the root log does not replay to its directory"
     );
     // and it is not trivially empty: every kind of op is in it

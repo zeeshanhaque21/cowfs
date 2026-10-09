@@ -4,8 +4,8 @@
 Usage: python3 crates/cowfs-core/tests/mutate_power.py [TAG ...]    (no tag: every mutation)
 
 Same method as crates/cowfs-store/tests/mutate.py: copy the repo to target/mut/work, apply ONE
-textual mutation to a source file under crates/, run `cargo test -p cowfs-core --test power_core`
-with its own CARGO_TARGET_DIR, and record whether any test failed. A mutant that leaves the suite
+textual mutation to a source file under crates/, run `cargo test -p cowfs-core --test power_core -- power_cut_at_every`
+(the sweep only, see MUT_FILTER) with its own CARGO_TARGET_DIR, and record whether it failed. A mutant that leaves the suite
 green is a SURVIVOR: a test gap or an equivalent mutation, and each one is explained in
 docs/crash-injection-173.md. Results go to target/mut/results.txt.
 """
@@ -15,6 +15,9 @@ root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")
 mut = f"{root}/target/mut"
 work = f"{mut}/work"
 test = os.environ.get("MUT_TEST", "power_core")
+# Only the sweep may kill a mutant: the replay test also fails when an op vanishes from the log,
+# which says the recorder broke, not that a power cut loses data.
+filt = ["--", os.environ.get("MUT_FILTER", "power_cut_at_every")]
 
 HOOK = "        self.run_hook()?;\n        if !has_work {\n            return Ok(None);\n        }\n"
 INTENT_RM = (
@@ -108,7 +111,7 @@ for name, f, a, b in M:
     subprocess.run(["cp", "-a", base, tgt], check=True)
     env = dict(os.environ, CARGO_TARGET_DIR=tgt)
     try:
-        r = subprocess.run(["cargo", "test", "-j4", "--no-fail-fast", "-p", "cowfs-core", "--test", test], cwd=work, env=env, capture_output=True, text=True, timeout=1200)
+        r = subprocess.run(["cargo", "test", "-j4", "--no-fail-fast", "-p", "cowfs-core", "--test", test, *filt], cwd=work, env=env, capture_output=True, text=True, timeout=1200)
         txt = r.stdout + r.stderr
         failed = sorted(set(re.findall(r"^test (\S+) \.\.\. FAILED", txt, re.M)))
         if "could not compile" in txt:
