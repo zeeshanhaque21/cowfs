@@ -24,8 +24,71 @@ use cowfs_fuse::{bench, sweep_stale_mounts, Health, Mount, MountError, MountOpti
 use cowfs_vfs::{SetAttr, Vfs, ROOT_INO};
 use cowfs_vfs_test::MemVfs;
 
+/// Whether this process bypasses file permission checks (`CAP_DAC_OVERRIDE` in the initial user
+/// namespace), probed by reading a mode-0 file. Not "uid 0": root in a user namespace or in a
+/// container without the capability owns `/proc/self` yet is still refused (issue #211).
 fn is_root() -> bool {
-    fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
+    static ROOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ROOT.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("scratch dir for the capability probe");
+        let f = dir.path().join("mode0");
+        File::create(&f).unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o0)).unwrap();
+        File::open(&f).is_ok()
+    })
+}
+
+/// Whether this process may make device nodes (`CAP_MKNOD` in the initial user namespace): the
+/// probe `mknod` of `cowfs_vfs_path::host_can_make_devices`, not a uid check.
+fn can_make_devices() -> bool {
+    cowfs_vfs_path::host_can_make_devices(&std::env::temp_dir()).expect("probe mknod of a device")
+}
+
+/// Set on the child that `special_files_through_mknod_as_root` starts under `sudo`.
+const AS_ROOT_ENV: &str = "COWFS_TEST_AS_ROOT";
+
+/// The root branch of `special_files_through_mknod` needs `CAP_MKNOD`, which an unprivileged test
+/// run lacks, and a user namespace (`unshare -r`) cannot supply: `mknod(2)` of a real device is
+/// refused there. So re-run that test under `sudo -n` where passwordless sudo exists (the GitHub
+/// ubuntu runner). On CI, no sudo is a failure, so the branch cannot silently stop running.
+/// Manual recipe elsewhere: `sudo -E cargo test -p cowfs-fuse -- --ignored special_files`.
+#[test]
+#[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
+fn special_files_through_mknod_as_root() {
+    if !fuse_usable() || std::env::var_os(AS_ROOT_ENV).is_some() || can_make_devices() {
+        return; // no FUSE here, or the plain test already takes the root branch in this process
+    }
+    let sudo = Command::new("sudo")
+        .args(["-n", "true"])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !sudo {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "passwordless sudo is missing on CI: the root branch would never run"
+        );
+        eprintln!("SKIP: no CAP_MKNOD and no passwordless sudo");
+        return;
+    }
+    let out = Command::new("sudo")
+        .args(["-n", "env"])
+        .arg(format!("{AS_ROOT_ENV}=1"))
+        .arg(std::env::current_exe().unwrap())
+        .args(["special_files_through_mknod", "--exact", "--ignored"])
+        .args(["--test-threads=1", "--nocapture"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && text.contains("1 passed"),
+        "root run failed:\n{text}"
+    );
+    assert!(!text.contains("SKIP"), "the root run skipped:\n{text}");
 }
 
 /// Special files through the kernel (issue #107): mkfifo and a socket node are created by the
@@ -78,7 +141,10 @@ fn special_files_through_mknod() {
     );
 
     let made = tool(&["mknod", &p("chr"), "c", "1", "3"]);
-    if is_root() {
+    if std::env::var_os(AS_ROOT_ENV).is_some() {
+        assert!(can_make_devices(), "the sudo child must hold CAP_MKNOD");
+    }
+    if can_make_devices() {
         assert!(made, "root can make a device node");
         let m = fs::symlink_metadata(fx.p("chr")).unwrap();
         assert!(m.file_type().is_char_device());
@@ -99,7 +165,7 @@ fn special_files_through_mknod() {
     let m = fs::symlink_metadata(fx.p("wo")).unwrap();
     assert!(m.file_type().is_char_device());
     assert_eq!((m.rdev(), m.mode() & 0o7777, m.len()), (0, 0o644, 0));
-    if !is_root() {
+    if !can_make_devices() {
         assert!(
             !tool(&["mknod", &p("blk0"), "b", "0", "0"]),
             "block 0:0 is a device"
