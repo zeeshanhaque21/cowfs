@@ -59,3 +59,5 @@ pub fn connect(env: &Env) -> Result<Daemon> {
 pub fn treehouse_bin(explicit: Option<PathBuf>) -> PathBuf {
     explicit.unwrap_or_else(default_bin)
 }
+
+// ci-trial trial/th-full (throwaway)
