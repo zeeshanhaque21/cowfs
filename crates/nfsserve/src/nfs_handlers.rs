@@ -131,10 +131,7 @@ async fn handle_nfs_inner(
         NFSPROC3_CREATE => nfsproc3_create(xid, input, output, context).await?,
         NFSPROC3_MKDIR => nfsproc3_mkdir(xid, input, output, context).await?,
         NFSPROC3_SYMLINK => nfsproc3_symlink(xid, input, output, context).await?,
-        NFSPROC3_MKNOD => {
-            begin(xid, output, nfsstat3::NFS3ERR_NOTSUPP)?;
-            wcc_data::default().serialize(output)?
-        }
+        NFSPROC3_MKNOD => nfsproc3_mknod(xid, input, output, context).await?,
         NFSPROC3_REMOVE => nfsproc3_remove(xid, input, output, context, false).await?,
         NFSPROC3_RMDIR => nfsproc3_remove(xid, input, output, context, true).await?,
         NFSPROC3_RENAME => nfsproc3_rename(xid, input, output, context).await?,
@@ -693,6 +690,74 @@ pub async fn nfsproc3_symlink(
             &args.symlink.symlink_data,
             &args.symlink.symlink_attributes,
         ),
+    )
+    .await;
+    created_reply(xid, output, ctx, wcc, res)
+}
+
+/// MKNOD3args: where, then a union on the type of node.
+#[derive(Debug, Default)]
+struct MKNOD3args {
+    dirops: diropargs3,
+    ftype: ftype3,
+    attr: sattr3,
+    rdev: specdata3,
+    /// False for a type MKNOD does not create (regular file, directory, symlink): no body follows.
+    has_body: bool,
+}
+
+impl XDR for MKNOD3args {
+    fn serialize<R: Write>(&self, _: &mut R) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "MKNOD3args is never sent by the server",
+        ))
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        self.dirops.deserialize(src)?;
+        self.ftype.deserialize(src)?;
+        self.has_body = true;
+        match self.ftype {
+            ftype3::NF3CHR | ftype3::NF3BLK => {
+                self.attr.deserialize(src)?;
+                self.rdev.deserialize(src)?;
+            }
+            ftype3::NF3SOCK | ftype3::NF3FIFO => self.attr.deserialize(src)?,
+            _ => self.has_body = false,
+        }
+        Ok(())
+    }
+}
+
+pub async fn nfsproc3_mknod(
+    xid: u32,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    ctx: &RPCContext,
+) -> Handled {
+    rofs_or_fail!(ctx, xid, output, wcc_data::default());
+    let args = args!(MKNOD3args, xid, input, output);
+    let dirid = fh_or_fail!(ctx, &args.dirops.dir, xid, output, wcc_data::default());
+    let device = matches!(args.ftype, ftype3::NF3CHR | ftype3::NF3BLK);
+    let refusal = if !args.has_body {
+        Some(nfsstat3::NFS3ERR_BADTYPE)
+    } else if device && ctx.auth.uid != 0 {
+        // Creating a device needs root natively; the clients refuse first, this is for a client
+        // that does not.
+        Some(nfsstat3::NFS3ERR_PERM)
+    } else {
+        None
+    };
+    if let Some(stat) = refusal {
+        let (wcc, _) = with_wcc(ctx, dirid, async { Err::<(), _>(stat) }).await;
+        begin(xid, output, stat)?;
+        wcc.serialize(output)?;
+        return Ok(());
+    }
+    let (wcc, res) = with_wcc(
+        ctx,
+        dirid,
+        ctx.vfs
+            .mknod(dirid, &args.dirops.name, args.ftype, &args.attr, args.rdev),
     )
     .await;
     created_reply(xid, output, ctx, wcc, res)

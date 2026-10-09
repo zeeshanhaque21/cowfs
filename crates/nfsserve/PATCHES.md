@@ -25,7 +25,7 @@ Everything below is ours.
   `SETATTR` with a ctime guard no longer writes two replies.
   ACCESS reports the owner permission bits instead of everything.
   WRITE honours the requested stability and reports UNSTABLE for unstable writes.
-  MKNOD answers NFS3ERR_NOTSUPP.
+  MKNOD is implemented (`NFSFileSystem::mknod`, default NFS3ERR_NOTSUPP): fifo, socket, character and block device; a device from an AUTH_UNIX caller other than uid 0 is NFS3ERR_PERM, a regular, directory or symlink type is NFS3ERR_BADTYPE, and MKNOD is in the reply cache's non-idempotent set.
 - Replies leave in one write (header and body together) so TCP_NODELAY does not split them.
 - No panics on network data: bounded XDR lengths and RPC message size, `unwrap` and `assert` removed, `accept` errors do not end the server loop.
   Including `EMFILE`: a descriptor-table flood is finite, and treating it as fatal dropped the listening socket, so the server stopped accepting new connections for good instead of recovering once the flood stopped.

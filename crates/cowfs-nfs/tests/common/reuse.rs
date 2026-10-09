@@ -148,6 +148,11 @@ impl Vfs for ReusingVfs {
     fn mkdir(&self, p: Ino, n: &[u8], m: u32) -> Result<Attr> {
         self.inner.mkdir(self.int(p)?, n, m).map(|a| self.out(a))
     }
+    fn mknod(&self, p: Ino, n: &[u8], k: cowfs_vfs::FileKind, m: u32, r: u64) -> Result<Attr> {
+        self.inner
+            .mknod(self.int(p)?, n, k, m, r)
+            .map(|a| self.out(a))
+    }
     fn symlink(&self, p: Ino, n: &[u8], t: &[u8]) -> Result<Attr> {
         self.inner.symlink(self.int(p)?, n, t).map(|a| self.out(a))
     }

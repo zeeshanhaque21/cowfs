@@ -179,6 +179,34 @@ impl Nfs {
         (acc, r)
     }
 
+    /// An NFS call with an AUTH_UNIX credential for `uid`, so the server sees that caller.
+    pub fn call_as(&mut self, uid: u32, proc: u32, args: Args) -> (u32, Rd) {
+        self.xid += 1;
+        let mut m = Vec::new();
+        for w in [self.xid, 0, 2, NFS, 3, proc] {
+            m.extend_from_slice(&w.to_be_bytes());
+        }
+        // cred: AUTH_UNIX, 20 bytes: stamp, empty machine name, uid, gid, no groups
+        for w in [1u32, 20, 0, 0, uid, uid, 0] {
+            m.extend_from_slice(&w.to_be_bytes());
+        }
+        // verifier: AUTH_NULL
+        for w in [0u32, 0] {
+            m.extend_from_slice(&w.to_be_bytes());
+        }
+        m.extend_from_slice(&args.0);
+        self.send(&m);
+        let mut r = Cursor::new(self.recv());
+        assert_eq!(dec::<u32>(&mut r), self.xid);
+        assert_eq!(dec::<u32>(&mut r), 1, "reply");
+        assert_eq!(dec::<u32>(&mut r), 0, "accepted");
+        let _flavor: u32 = dec(&mut r);
+        let _verf: Vec<u8> = dec(&mut r);
+        let acc: u32 = dec(&mut r);
+        assert_eq!(acc, 0, "rpc not accepted");
+        (dec(&mut r), r)
+    }
+
     /// The next call uses this xid, to build retransmissions.
     pub fn set_next_xid(&mut self, xid: u32) {
         self.xid = xid.wrapping_sub(1);

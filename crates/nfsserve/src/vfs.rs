@@ -110,6 +110,20 @@ pub trait NFSFileSystem: Send + Sync {
         attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3>;
 
+    /// MKNOD: a fifo, socket, character device or block device. `ftype` is one of `NF3FIFO`,
+    /// `NF3SOCK`, `NF3CHR`, `NF3BLK`; `rdev` is zero unless it is a device. The default answers
+    /// `NFS3ERR_NOTSUPP`, which is what a file system without special files says.
+    async fn mknod(
+        &self,
+        _dirid: fileid3,
+        _name: &filename3,
+        _ftype: ftype3,
+        _attr: &sattr3,
+        _rdev: specdata3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
+    }
+
     /// Creates a hard link `name` in `dir_id` to `file_id` and returns the file's attributes.
     async fn link(
         &self,

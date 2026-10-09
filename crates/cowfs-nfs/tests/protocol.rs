@@ -21,14 +21,14 @@ fn null_and_unknown_procedures() {
     assert_eq!(acc, 3, "PROC_UNAVAIL");
     let (acc, _) = c.raw(100_999, 3, 0, Args::new());
     assert_eq!(acc, 1, "PROG_UNAVAIL");
-    let (st, _) = c.call(11, Args::new());
-    assert_eq!(st, NOTSUPP, "MKNOD");
 }
 
 #[test]
 fn malformed_arguments_get_garbage_args() {
     let (_s, mut c) = setup();
-    for proc in [1, 2, 3, 6, 7, 8, 9, 10, 12, 14, 15, 16, 17, 18, 19, 20, 21] {
+    for proc in [
+        1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21,
+    ] {
         let (acc, _) = c.raw(100_003, 3, proc, Args::new().put(&1u32));
         assert_eq!(acc, 4, "proc {proc}");
     }
