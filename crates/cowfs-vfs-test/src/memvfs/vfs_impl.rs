@@ -148,8 +148,18 @@ impl Vfs for MemVfs {
         if !kind.is_special() || (rdev != 0 && !kind.is_device()) {
             return Err(Error::InvalidArgument);
         }
-        self.lock()
-            .new_entry(parent, name, Body::Special { kind, rdev }, mode)
+        let mut st = self.lock();
+        let rdev = if st.f(Fault::MknodDropsRdev) { 0 } else { rdev };
+        let skip_times = st.f(Fault::MknodNoParentTimes);
+        let before = st.nodes.get(&parent).map(|n| (n.mtime, n.ctime));
+        let a = st.new_entry(parent, name, Body::Special { kind, rdev }, mode)?;
+        if let (true, Some((m, c))) = (skip_times, before) {
+            if let Some(n) = st.nodes.get_mut(&parent) {
+                n.mtime = m;
+                n.ctime = c;
+            }
+        }
+        Ok(a)
     }
 
     fn symlink(&self, parent: Ino, name: &[u8], target: &[u8]) -> Result<Attr> {
@@ -367,6 +377,7 @@ impl Vfs for MemVfs {
                 Ok(data)
             }
             Body::Dir(_) => Err(Error::IsDir),
+            Body::Special { .. } if st.f(Fault::SpecialReadOk) => Ok(Vec::new()),
             Body::Symlink { .. } | Body::Special { .. } => Err(Error::InvalidArgument),
         }
     }
