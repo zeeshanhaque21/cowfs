@@ -22,9 +22,11 @@
 //! 6. remove the intent file.
 //!
 //! A crash or error from step 3 on leaves the intent file, and the next `Core::open` finishes
-//! steps 4 to 6 before serving anything. A crash before step 3 leaves a hidden staging snapshot with
-//! no intent file. `Core::open` does not remove it (it only recovers intent files); the next swap or
-//! import of the same target does, because the name is deterministic.
+//! steps 4 to 6 before serving anything. A swap or replacing import of a target with a pending
+//! intent finishes that intent first (`Core::recover_target`), so a retry never deletes the only
+//! copy of a tree. A crash before step 3 leaves a hidden staging snapshot with no intent file;
+//! `Core::open` removes every such orphan once the intents are recovered, before anything can
+//! stage a new one, so it cannot take a staging snapshot a live operation owns.
 
 use std::fs;
 use std::io::Write as _;
@@ -106,35 +108,69 @@ fn intents(root: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// Completes every swap a crash or an error left half done when the store is opened.
+/// Completes one swap a crash or an error left half done, from its intent file `p`.
+///
+/// A torn intent file names nothing, so the staging name its target implies is removed with it.
+fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
+    let Some((staged, target)) = read_intent(p) else {
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_start_matches(SWAP_PREFIX).to_string())
+            .unwrap_or_default();
+        let staged = staging_name(&name);
+        if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
+            let _ = core.inner.unregister(&sc);
+        }
+        let _ = fs::remove_file(p);
+        *core.inner.last_error.lk() = Some(format!(
+            "swap recovery: {p:?} is unreadable, removed any staging snapshot named {staged}"
+        ));
+        return Ok(());
+    };
+    match core.finish_swap(&staged, &target) {
+        // `NotFound`: the target already existed, nothing was left to fork
+        Ok(_) | Err(ControlError::NotFound) => {}
+        Err(e) => return Err(e),
+    }
+    if fs::remove_file(p).is_ok() {
+        sync_dir(&core.inner.root);
+    }
+    Ok(())
+}
+
+/// Completes every swap a crash or an error left half done, then removes the staging snapshots no
+/// intent names, when the store is opened.
 ///
 /// A failure is reported through `Core::last_flush_error` and the intent file stays for the next
 /// open, so a swap is never silently dropped.
 pub(crate) fn recover(core: &Core) {
     for p in intents(&core.inner.root) {
-        let Some((staged, target)) = read_intent(&p) else {
-            // a torn intent: the staging name is deterministic, so remove it and say so
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.trim_start_matches(SWAP_PREFIX).to_string())
-                .unwrap_or_default();
-            let staged = staging_name(&name);
-            if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
+        if let Err(e) = recover_intent(core, &p) {
+            *core.inner.last_error.lk() = Some(format!("swap recovery: {e}"));
+        }
+    }
+    sweep_orphans(core);
+}
+
+/// Removes every staging snapshot that no intent file names (issue 176): a crash during the staging
+/// write leaves one, and nothing else would ever remove a name that is not ingested again.
+///
+/// Runs only from `recover`, inside `Core::open`, when no operation can own a staging snapshot yet.
+/// An intent that could not be recovered still protects its staging snapshot.
+fn sweep_orphans(core: &Core) {
+    let named: std::collections::HashSet<String> = intents(&core.inner.root)
+        .iter()
+        .filter_map(|p| read_intent(p).map(|(staged, _)| staged))
+        .collect();
+    let Ok(all) = core.inner.meta.snapshots() else {
+        return;
+    };
+    for info in all {
+        if is_staging(&info.name) && !named.contains(&info.name) {
+            if let Ok(sc) = core.inner.snap_by_name_raw(&info.name) {
                 let _ = core.inner.unregister(&sc);
             }
-            let _ = fs::remove_file(&p);
-            *core.inner.last_error.lk() = Some(format!(
-                "swap recovery: {p:?} is unreadable, removed any staging snapshot named {staged}"
-            ));
-            continue;
-        };
-        if let Err(e) = core.finish_swap(&staged, &target) {
-            *core.inner.last_error.lk() = Some(format!("swap recovery: {e}"));
-            continue;
-        }
-        if fs::remove_file(&p).is_ok() {
-            sync_dir(&core.inner.root);
         }
     }
 }
@@ -158,6 +194,7 @@ impl Core {
                 "source and target are the same snapshot",
             ));
         }
+        self.recover_target(new)?;
         let src_sc = self.inner.snap_by_name(src)?;
         // the snapshot whose name goes away: the existing target, when there is one
         let victim: Option<&str> = if self.inner.snap_by_name(new).is_ok() {
@@ -167,9 +204,8 @@ impl Core {
         };
         self.inner.check_new_name_except(new, victim)?;
         let staged = staging_name(new);
-        // A leftover staging snapshot of this name is removed first. That is garbage after a crash
-        // before the intent, but if a failed swap left an intent naming it, this destroys the only
-        // copy of the new tree (issue 177). `Core::open` does not sweep orphans either (issue 176).
+        // A pending intent for this target was finished above, so a leftover staging snapshot is
+        // garbage from a crash before the intent.
         if let Ok(leftover) = self.inner.snap_by_name_raw(&staged) {
             let _ = self.inner.unregister(&leftover);
         }
@@ -206,6 +242,18 @@ impl Core {
         done
     }
 
+    /// Finishes the swap a failed earlier call left pending for `target`, before a new call of the
+    /// same name removes its staging snapshot: after a failed `finish_swap` that snapshot is the
+    /// only copy of the new tree (issue 177). An error leaves the intent in place and is returned,
+    /// so the caller does not go on to destroy what the intent still needs.
+    pub(crate) fn recover_target(&self, target: &str) -> Result<(), ControlError> {
+        let p = intent_path(&self.inner.root, target);
+        if p.exists() {
+            recover_intent(self, &p)?;
+        }
+        Ok(())
+    }
+
     /// Replaces `target` with the already verified snapshot `staged`, for an import that replaces.
     /// The intent record goes down before the old target is removed, so a crash after that point is
     /// rolled forward by `Core::open`; an error before it leaves the old target in place.
@@ -214,7 +262,14 @@ impl Core {
         staged: &str,
         target: &str,
     ) -> Result<SnapshotEntry, ControlError> {
-        if let Err(e) = write_intent(&self.inner.root, staged, target) {
+        if let Err(e) = self
+            .fault(2)
+            .and_then(|()| write_intent(&self.inner.root, staged, target))
+        {
+            self.rollback(staged, target);
+            return Err(e);
+        }
+        if let Err(e) = self.fault(3) {
             self.rollback(staged, target);
             return Err(e);
         }
@@ -225,7 +280,9 @@ impl Core {
             }
         }
         // Past this point the old target is gone and only `staged` holds the new tree, so an error
-        // is returned as it is and nothing is cleaned up: the intent file makes `Core::open` finish.
+        // is returned as it is and nothing is cleaned up: the intent file makes `Core::open`, or the
+        // next call for this target, finish. Fault 4 is that error without running `finish_swap`.
+        self.fault(4)?;
         self.finish_swap(staged, target)
     }
 

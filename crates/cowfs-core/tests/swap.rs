@@ -180,3 +180,235 @@ fn rename_snapshot_is_failure_safe() {
     assert_eq!(names, ["b".to_string(), "taken".to_string()]);
     c.check().unwrap();
 }
+
+// ---- the replacing ingest (issues 176 and 177) -------------------------------------------------
+
+use cowfs_core::{ingest_replacing, Hooks, ImportError};
+
+/// A source directory holding one file `f`.
+fn source(root: &std::path::Path, tag: &str, body: &str) -> std::path::PathBuf {
+    let d = root.join(format!("src-{tag}"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("f"), body).unwrap();
+    d
+}
+
+fn replace(c: &Core, from: &std::path::Path) -> Result<(), ImportError> {
+    let mut hooks = Hooks {
+        progress: &mut |_, _| true,
+    };
+    ingest_replacing(c, from, "base", &mut hooks).map(|_| ())
+}
+
+/// A retry that fails or is cancelled after its own staging started.
+fn replace_cancelled(c: &Core, from: &std::path::Path) -> Result<(), ImportError> {
+    let mut hooks = Hooks {
+        progress: &mut |_, _| false,
+    };
+    ingest_replacing(c, from, "base", &mut hooks).map(|_| ())
+}
+
+/// Every snapshot name the metadata holds, staging ones included, plus the swap intent files.
+fn raw_leftovers(dir: &std::path::Path, c: &Core) -> Vec<String> {
+    let mut v: Vec<String> = c
+        .meta()
+        .snapshots()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.name)
+        .filter(|n| n.contains("cowfs-swap"))
+        .collect();
+    v.extend(
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("swap-")),
+    );
+    v
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let p = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &p);
+        } else {
+            std::fs::copy(e.path(), &p).unwrap();
+        }
+    }
+}
+
+/// F2 for the replacing ingest: a failure before the old target goes keeps it, one after leaves the
+/// name missing only while the intent file explains it, and the next open finishes the swap.
+#[test]
+fn ingest_replacing_survives_a_failure_at_every_step() {
+    for step in 2..=4u8 {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let v1 = source(scratch.path(), "v1", "old base");
+        let v2 = source(scratch.path(), "v2", "new content");
+        {
+            let c = Core::open(dir.path(), test_opts()).unwrap();
+            replace(&c, &v1).unwrap();
+            c.set_swap_fault(step);
+            let res = replace(&c, &v2);
+            assert!(res.is_err(), "step {step} was not injected: {res:?}");
+            if step <= 3 {
+                assert_eq!(content(&c, "base", "f"), "old base", "step {step}");
+                assert!(raw_leftovers(dir.path(), &c).is_empty(), "step {step}");
+            } else {
+                assert!(c.snapshot_view("base").is_err(), "step {step}");
+            }
+        }
+        let c = Core::open(dir.path(), test_opts()).expect("reopen");
+        let want = if step >= 4 { "new content" } else { "old base" };
+        assert_eq!(content(&c, "base", "f"), want, "step {step} after reopen");
+        assert!(
+            raw_leftovers(dir.path(), &c).is_empty(),
+            "step {step}: {:?}",
+            raw_leftovers(dir.path(), &c)
+        );
+        c.check().unwrap();
+    }
+}
+
+/// Issue 177: `finish_swap` failed after the old target was removed, so the staged tree and the
+/// intent are all that is left of the new content. A retry of the same name that then fails must
+/// not delete them: the pending intent is rolled forward before the retry starts.
+#[test]
+fn a_failed_same_name_retry_does_not_destroy_a_pending_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "second");
+    let v3 = source(scratch.path(), "v3", "third");
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    replace(&c, &v1).unwrap();
+    c.set_swap_fault(4);
+    assert!(replace(&c, &v2).is_err());
+    c.set_swap_fault(0);
+    assert!(replace_cancelled(&c, &v3).is_err());
+    assert_eq!(
+        content(&c, "base", "f"),
+        "second",
+        "the pending swap was lost"
+    );
+    assert!(
+        raw_leftovers(dir.path(), &c).is_empty(),
+        "{:?}",
+        raw_leftovers(dir.path(), &c)
+    );
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "second", "after reopen");
+    c.check().unwrap();
+}
+
+/// Issue 177, the promote side: the same pending intent met by `promote_base` of the same name.
+#[test]
+fn a_failed_promote_does_not_destroy_a_pending_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "second");
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    replace(&c, &v1).unwrap();
+    c.create_snapshot("src").unwrap();
+    let rs = root_entry(&c, "src").ino;
+    mkfile(&c, rs, "f", b"promoted");
+    c.sync().unwrap();
+    c.set_swap_fault(4);
+    assert!(replace(&c, &v2).is_err());
+    c.set_swap_fault(1);
+    assert!(c.promote_base("src", "base").is_err());
+    c.set_swap_fault(0);
+    assert_eq!(
+        content(&c, "base", "f"),
+        "second",
+        "the pending swap was lost"
+    );
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}
+
+/// Issue 177, the success path: a retry that works replaces the rolled-forward tree.
+#[test]
+fn a_same_name_retry_after_a_pending_swap_lands_the_new_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "second");
+    let v3 = source(scratch.path(), "v3", "third");
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    replace(&c, &v1).unwrap();
+    c.set_swap_fault(4);
+    assert!(replace(&c, &v2).is_err());
+    c.set_swap_fault(0);
+    replace(&c, &v3).unwrap();
+    assert_eq!(content(&c, "base", "f"), "third");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}
+
+/// Issue 176: a crash during the long staging write leaves a hidden staging snapshot and no intent.
+/// The crash image is the store directory copied while the ingest is mid-write.
+#[test]
+fn open_removes_a_staging_snapshot_that_has_no_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let image = scratch.path().join("image");
+    let v1 = source(scratch.path(), "v1", "kept");
+    std::fs::write(v1.join("g"), vec![7u8; 100_000]).unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    {
+        let mut taken = false;
+        let mut hooks = Hooks {
+            progress: &mut |done, _| {
+                if done > 0 && !taken {
+                    taken = true;
+                    copy_dir(dir.path(), &image);
+                }
+                true
+            },
+        };
+        ingest_replacing(&c, &v1, "fresh", &mut hooks).unwrap();
+    }
+    drop(c);
+    let c = Core::open(&image, test_opts()).unwrap();
+    assert!(
+        c.meta()
+            .snapshots()
+            .unwrap()
+            .iter()
+            .all(|i| !i.name.contains("cowfs-swap")),
+        "an orphan staging snapshot survived open: {:?}",
+        raw_leftovers(&image, &c)
+    );
+    assert!(c.snapshot_view("fresh").is_err());
+    c.check().unwrap();
+}
+
+/// Issue 176, the other side: the sweep must not take what a pending intent needs, and a second
+/// open is a no-op.
+#[test]
+fn open_recovers_a_pending_swap_and_a_second_open_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let v1 = source(scratch.path(), "v1", "old base");
+    let v2 = source(scratch.path(), "v2", "second");
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        replace(&c, &v1).unwrap();
+        c.set_swap_fault(4);
+        assert!(replace(&c, &v2).is_err());
+    }
+    // open twice: the first finishes the swap, the sweep must not have touched what it needed
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "second");
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "second");
+    assert!(raw_leftovers(dir.path(), &c).is_empty());
+}
