@@ -139,24 +139,38 @@ def check_identity(arm, ident):
     return p
 
 
+LOG_RE = re.compile(r"^op=(\w+) moved=(\d) caller=(.*?) args=")
+CHECK_CALLER_RE = re.compile(r"(^|[\s/])check(\s|$)")
+
+
 def count_cycles(text):
-    """Mount cycles a case forced on the cowfs arm, from the shim's log.
+    """Calls the case itself made on TEST_DEV or TEST_DIR, from the shim's log.
 
-    The suite's own wrap-up unmounts TEST_DEV once after every case; that is not a
-    cycle. A restoring mount is one, and so is any unmount beyond the wrap-up.
+    The shim logs every such call with its caller. The suite's own wrap-up runs in
+    `check`, not in the case script, so it is not a cycle. Anything else is, and a
+    line this cannot parse counts too, so a doubtful log never reads as clean.
     """
-    lines = [ln.split()[0] for ln in (text or "").splitlines() if ln.strip()]
-    umounts, mounts = lines.count("umount"), lines.count("mount")
-    return mounts + max(0, umounts - 1 - mounts)
+    n = 0
+    for ln in (text or "").splitlines():
+        if not ln.strip():
+            continue
+        m = LOG_RE.match(ln)
+        if m and CHECK_CALLER_RE.search(m.group(3)) and "tests/" not in m.group(3):
+            continue
+        n += 1
+    return n
 
 
-def make_record(arm, case, console, rc, identity_text, cycle_text):
+def make_record(arm, case, console, rc, identity_text, cycle_text, residue_text=None):
     parsed = parse_console(console, rc, case)
     ident = parse_identity(identity_text)
     problems = check_identity(arm, ident)
     want = ARM_FSTYP[arm]
     if parsed["fstyp"] != want:
         problems.append(f"header: FSTYP {parsed['fstyp']!r}, the {arm} arm needs {want!r}")
+    if residue_text is not None and residue_text.strip():
+        problems.append("bare mount directory written, the case did not stay on its snapshot: "
+                        + " ".join(residue_text.split())[:120])
     cycles = count_cycles(cycle_text)
     status = parsed["status"]
     if status == "PASS" and cycles and arm != "native":
@@ -283,7 +297,9 @@ def load_arm(run, arm, ids):
         rc_txt = _read(d / "rc").strip()
         rc = int(rc_txt) if rc_txt.lstrip("-").isdigit() else -1
         recs.append(make_record(arm, case, _read(d / "console.txt"), rc,
-                                _read(d / "identity.txt"), _read(d / "mountcycle.log")))
+                                _read(d / "identity.txt"), _read(d / "mountcycle.log"),
+                                (d / "residue.txt").read_text(errors="replace")
+                                if (d / "residue.txt").is_file() else None))
     return recs
 
 

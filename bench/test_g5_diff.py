@@ -175,27 +175,46 @@ class Identity(unittest.TestCase):
         self.assertTrue(self.check("native", backing=""))
 
 
+WRAP = "op=umount moved=1 caller=/bin/bash ./check generic/001  args=cowfs\n"
+CASE_UM = "op=umount moved=1 caller=/bin/bash ./tests/generic/001  args=cowfs\n"
+CASE_MT = "op=mount moved=1 caller=/bin/bash ./tests/generic/001  args=-t fuse cowfs /m\n"
+
+
 class Cycles(unittest.TestCase):
     def test_count(self):
         self.assertEqual(g.count_cycles(""), 0)
-        # check's own wrap-up unmounts TEST_DEV once after the case: not a cycle
-        self.assertEqual(g.count_cycles("umount cowfs\n"), 0)
-        # case cycles the mount, then the wrap-up umount
-        self.assertEqual(g.count_cycles("umount cowfs\nmount -t fuse cowfs /m\numount cowfs\n"), 1)
-        # a case unmounts and never restores it: still flagged
-        self.assertEqual(g.count_cycles("umount cowfs\numount cowfs\n"), 1)
+        # check's own wrap-up unmounts TEST_DEV after the case: not a cycle
+        self.assertEqual(g.count_cycles(WRAP), 0)
+        # the case cycles the mount, then the wrap-up
+        self.assertEqual(g.count_cycles(CASE_UM + CASE_MT + WRAP), 2)
+
+    def test_case_unmount_without_restore_is_counted(self):
+        # the wrap-up then finds nothing mounted and is logged moved=0 by the shim
+        nomove = "op=umount moved=0 caller=/bin/bash ./check generic/001  args=cowfs\n"
+        self.assertEqual(g.count_cycles(CASE_UM + nomove), 1)
+
+    def test_unparseable_line_counts_conservatively(self):
+        self.assertEqual(g.count_cycles("umount cowfs\n"), 1)
 
 
 class Record(unittest.TestCase):
     def test_emulated_cycle_is_not_a_clean_pass(self):
         r = g.make_record("cowfs", "generic/001", passed(HDR_FUSE), 0, ident("cowfs"),
-                          "umount x\nmount x\numount x\n")
+                          CASE_UM + CASE_MT + WRAP)
         self.assertEqual(r["status"], "PASS_EMULATED")
 
     def test_wrapup_umount_alone_is_a_clean_pass(self):
         r = g.make_record("cowfs", "generic/001", passed(HDR_FUSE), 0, ident("cowfs"),
-                          "umount cowfs\n")
+                          WRAP)
         self.assertEqual(r["status"], "PASS")
+
+    def test_residue_in_bare_directory_poisons_the_record(self):
+        for residue in ("tmp.abc\n", "\nfile\n"):
+            r = g.make_record("cowfs", "generic/001", passed(HDR_FUSE), 0, ident("cowfs"), "",
+                              residue)
+            self.assertTrue([p for p in r["problems"] if "bare" in p], residue)
+        ok = g.make_record("cowfs", "generic/001", passed(HDR_FUSE), 0, ident("cowfs"), "", "")
+        self.assertEqual(ok["problems"], [])
 
     def test_native_cycle_is_a_real_pass(self):
         r = g.make_record("native", "generic/001", passed(HDR_EXT4), 0, ident("native"), "")

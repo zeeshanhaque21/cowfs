@@ -74,9 +74,13 @@ On the cowfs arm only, `umount <TEST_DEV or TEST_DIR>` runs `mount --move <TEST_
 Every other invocation is passed to the real tools.
 Each call is appended to a `mountcycle.log` for the case.
 This is an emulated cycle: the data stays in the daemon and the FUSE session stays up.
+The shim logs every call that names `TEST_DEV` or `TEST_DIR`, whether or not anything moved, with the caller read from `/proc/$PPID/cmdline`.
 So a cowfs case with a cycle gets the status `PASS_EMULATED`, never `PASS`, and acceptance does not accept it.
-The suite's own wrap-up unmounts `TEST_DEV` once after every case, so that single `umount` is not a cycle.
-A cycle is a restoring `mount`, or any `umount` beyond the wrap-up.
+The suite's own wrap-up runs in `check` and unmounts `TEST_DEV` once after every case, so a call whose caller is `check` is not a cycle.
+Any other caller counts, and so does a line the report cannot parse.
+This closes a hole: a case that unmounts and never restores leaves the wrap-up with nothing to unmount, and the log then holds one line, so counting lines alone would have read it as clean.
+After each case, outside its namespace, the root script lists the bare `mnt` and `stash` directories.
+Anything in them means the case ran on the host directory, and the record is invalid.
 The six reviewed ids are checked this way and none cycles.
 While the mount is moved to the stash, `findmnt -S cowfs` still finds it, at the stash path.
 A case that checks mounts in that window may fail, and the receipt shows the cycle count next to such a failure.
@@ -136,7 +140,8 @@ A PASS that skips a rule does not exist.
 7. Exactly one mount has the arm's source in the namespace the case ran in.
 8. The two arms have different `TEST_DIR` and different fstype.
 9. No record is `NO_RESULT`.
-10. A negative control ran and was judged `FAIL`: `generic/005` on a read-only remount of a fresh snapshot.
+10. The bare mount and stash directories are empty after every cowfs case.
+11. A negative control ran and was judged `FAIL`: `generic/005` on a read-only remount of a fresh snapshot.
     A report without a failing control cannot tell a pass from a rubber stamp.
 
 On top of validity, the verdict is:
@@ -157,6 +162,17 @@ Exit codes are the same set `bench/compare.py` and the old gate use.
 3. The output directory is read back and `g5_diff.py report` produces `receipt.json` and `receipt.md`.
 4. A leftover check (`mount`, `losetup -a`, anchored `pgrep`) must come back empty.
    The root script also records its own teardown result in the output directory.
+
+## First results, 2026-10-09, cachyos box
+
+The evidence is in `docs/verification/evidence/g5-20261009-redesign/`.
+The cowfs daemon was the release build with the sha256 in `*-meta.txt`; its source revision was not recorded, because the box copy is not a git checkout.
+The sample is the six reviewed ids: acceptance mode, PASS, native 6 of 6 and cowfs 6 of 6, control failed correctly.
+The wide run is the 155 diagnostic ids: valid, verdict FAIL by the rules above, so diagnostic and not acceptance.
+Native took about 14 minutes with a fresh filesystem per case, and cowfs about 21 minutes on the release build.
+generic/247 unmounts `TEST_DIR` and never restores it, and the shim log caught it as `PASS_EMULATED`.
+generic/127 fails on cowfs twice in a row on the release build (one `fsx` line missing from the output), where the hand run recorded a pass.
+Its cause is not diagnosed here.
 
 ## Not done here
 

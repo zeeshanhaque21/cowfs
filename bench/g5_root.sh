@@ -39,14 +39,19 @@ make_shim() { # shimdir mnt dev stash log
   local rm_ ru
   rm_=$(type -P mount); ru=$(type -P umount)
   mkdir -p "$sd"
+  # Every call that names TEST_DEV or TEST_DIR is logged with its caller, whether or not
+  # anything moved, so a missing restore cannot hide a cycle (see the design doc).
   cat > "$sd/umount" <<EOF
 #!/bin/bash
+caller=\$(tr '\\0' ' ' </proc/\$PPID/cmdline)
 for a in "\$@"; do
   if [ "\$a" = "$mnt" ] || [ "\$a" = "$dev" ]; then
     if findmnt -n "$mnt" >/dev/null 2>&1; then
-      echo "umount \$*" >> "$log"
+      echo "op=umount moved=1 caller=\$caller args=\$*" >> "$log"
       exec $rm_ --move "$mnt" "$stash"
     fi
+    echo "op=umount moved=0 caller=\$caller args=\$*" >> "$log"
+    break
   fi
 done
 exec $ru "\$@"
@@ -54,10 +59,13 @@ EOF
   cat > "$sd/mount" <<EOF
 #!/bin/bash
 n=\$#
-if [ \$n -ge 2 ] && [ "\${@: -2:1}" = "$dev" ] && [ "\${@: -1}" = "$mnt" ] \
-   && ! findmnt -n "$mnt" >/dev/null 2>&1 && findmnt -n "$stash" >/dev/null 2>&1; then
-  echo "mount \$*" >> "$log"
-  exec $rm_ --move "$stash" "$mnt"
+if [ \$n -ge 2 ] && [ "\${@: -2:1}" = "$dev" ] && [ "\${@: -1}" = "$mnt" ]; then
+  caller=\$(tr '\\0' ' ' </proc/\$PPID/cmdline)
+  if ! findmnt -n "$mnt" >/dev/null 2>&1 && findmnt -n "$stash" >/dev/null 2>&1; then
+    echo "op=mount moved=1 caller=\$caller args=\$*" >> "$log"
+    exec $rm_ --move "$stash" "$mnt"
+  fi
+  echo "op=mount moved=0 caller=\$caller args=\$*" >> "$log"
 fi
 exec $rm_ "\$@"
 EOF
@@ -92,6 +100,7 @@ teardown() {
     "$BIN/cowfs" --socket "$OUT/cowfs/run/c.sock" shutdown >/dev/null 2>&1
     for _ in $(seq 20); do grep -q " $OUT/cowfs/main " /proc/self/mountinfo || break; sleep 1; done
     kill -0 "$DPID" 2>/dev/null && kill "$DPID" 2>/dev/null
+    for _ in $(seq 20); do kill -0 "$DPID" 2>/dev/null || break; sleep 1; done
   fi
   mountpoint -q "$OUT/native/mnt" && { umount "$OUT/native/mnt" || umount -l "$OUT/native/mnt"; }
   [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
@@ -119,6 +128,7 @@ case "$BIN" in */release|*/release/) profile=release;; */debug|*/debug/) profile
   echo "cowfs_bin=$BIN/cowfs-daemon"
   echo "cowfs_bin_sha256=$(sha256sum "$BIN/cowfs-daemon" | cut -d' ' -f1)"
   echo "cowfs_profile=$profile"
+  echo "cowfs_rev=${COWFS_REV:-unrecorded}"
   echo "kernel=$(uname -r)"
   for id in $(sed 's#.*/##' "$CASES"); do
     echo "case_sha.$id=$(sha256sum "$XFS/tests/generic/$id" | cut -d' ' -f1)"
@@ -156,6 +166,8 @@ case " $ARMS " in *" cowfs "*|*" control "*)
     ARM=$arm CD=$cd_ ID=$c SN=$sn MAIN=$OUT/cowfs/main MNT=$OUT/cowfs/mnt STASH=$OUT/cowfs/stash \
       XFS=$XFS OUT=$OUT TMO=${TMO:-300} \
       unshare -m --propagation private bash "$0" inns
+    # what is left in the bare directories, seen from OUTSIDE the case's namespace
+    { ls -A "$OUT/cowfs/mnt"; ls -A "$OUT/cowfs/stash"; } > "$cd_/residue.txt" 2>&1
     $CLI snapshot rm "$sn" >/dev/null 2>&1
     progress "$arm $id rc=$(cat "$cd_/rc" 2>/dev/null)"
   }
