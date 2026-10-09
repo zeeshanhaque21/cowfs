@@ -96,6 +96,17 @@ impl Ctx {
         self.note(self.fs.mkdir(parent, name, mode))
     }
 
+    pub fn mknod(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        kind: cowfs_vfs::FileKind,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<Attr> {
+        self.note(self.fs.mknod(parent, name, kind, mode, rdev))
+    }
+
     pub fn symlink(&self, parent: Ino, name: &[u8], target: &[u8]) -> Result<Attr> {
         self.note(self.fs.symlink(parent, name, target))
     }

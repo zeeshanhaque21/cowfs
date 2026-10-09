@@ -14,8 +14,9 @@ mod vfs;
 pub use error::{Error, Result};
 pub use types::FallocMode;
 pub use types::{
-    validate_name, Attr, DirEntry, DirEntryPlus, FileHandle, FileKind, Ino, ReadDir, ReadDirPlus,
-    RenameFlags, SetAttr, SetTime, StatFs, Timestamp, XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
+    dev_major, dev_minor, makedev, validate_name, Attr, DirEntry, DirEntryPlus, FileHandle,
+    FileKind, Ino, ReadDir, ReadDirPlus, RenameFlags, SetAttr, SetTime, StatFs, Timestamp,
+    XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
 };
 pub use vfs::Vfs;
 

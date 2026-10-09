@@ -386,6 +386,7 @@ impl State {
             gid: 0,
             size,
             blocks,
+            rdev: 0,
             atime: n.atime,
             mtime: n.mtime,
             ctime: n.ctime,

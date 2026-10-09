@@ -314,6 +314,7 @@ impl Inner {
             gid: self.gid,
             size: a.size,
             blocks: 0,
+            rdev: 0,
             atime: from_meta_ts(a.atime),
             mtime: from_meta_ts(a.mtime),
             ctime: from_meta_ts(a.ctime),

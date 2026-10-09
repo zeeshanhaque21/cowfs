@@ -94,6 +94,7 @@ mod tests {
             gid: 20,
             size: 1234,
             blocks: 3,
+            rdev: 0,
             atime: Timestamp { secs: 10, nanos: 1 },
             mtime: Timestamp {
                 secs: 11,
