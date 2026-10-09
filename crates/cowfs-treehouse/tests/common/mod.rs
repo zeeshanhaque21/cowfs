@@ -131,19 +131,54 @@ pub fn treehouse_available() -> bool {
     find_treehouse().is_ok()
 }
 
-/// Skips the current test with a visible reason, so an absent treehouse never looks like a pass.
+/// True when an absent treehouse must fail the test instead of skipping it: `CI` is set (every CI
+/// provider sets it) or `COWFS_REQUIRE_TREEHOUSE` is set to anything but empty or `0`.
+///
+/// libtest reports a test that printed "skipping" and returned as `ok`, so on a runner that never
+/// installed treehouse the whole sandbox family was a silent pass (issue 259). ci.yml installs a
+/// pinned treehouse, so on CI an absent one is a broken runner, never a host limitation.
+pub fn treehouse_required() -> bool {
+    let set = |name: &str, unset: &[&str]| {
+        std::env::var(name).is_ok_and(|v| !v.is_empty() && !unset.contains(&v.as_str()))
+    };
+    set("CI", &[]) || set("COWFS_REQUIRE_TREEHOUSE", &["0"])
+}
+
+/// The treehouse binary, `None` (skip) when it is absent and not required, and a panic when it is
+/// absent and `required`.
+pub fn treehouse_or_skip(
+    required: bool,
+    found: Result<PathBuf, TreehouseMissing>,
+) -> Option<PathBuf> {
+    match found {
+        Ok(bin) => Some(bin),
+        Err(why) if required => panic!(
+            "treehouse is required here (CI or COWFS_REQUIRE_TREEHOUSE is set) and is missing: \
+             {why}. A skip would report this test as passed (issue 259); install treehouse \
+             (scripts/install-treehouse.sh) or fix PATH."
+        ),
+        Err(why) => {
+            eprintln!(
+                "skipping {}: {why}",
+                std::thread::current().name().unwrap_or("?")
+            );
+            None
+        }
+    }
+}
+
+/// Skips the current test with a visible reason when treehouse is absent and optional, and fails it
+/// when `CI` or `COWFS_REQUIRE_TREEHOUSE` says treehouse is required, so a missing binary can never
+/// look like a pass on a runner.
 #[macro_export]
 macro_rules! require_treehouse {
     () => {
-        match $crate::common::treehouse_bin() {
-            Ok(bin) => bin,
-            Err(why) => {
-                eprintln!(
-                    "skipping {}: {why}",
-                    std::thread::current().name().unwrap_or("?")
-                );
-                return;
-            }
+        match $crate::common::treehouse_or_skip(
+            $crate::common::treehouse_required(),
+            $crate::common::treehouse_bin(),
+        ) {
+            Some(bin) => bin,
+            None => return,
         }
     };
 }

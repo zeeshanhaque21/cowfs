@@ -83,6 +83,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
+      # Issue 259: the cowfs-treehouse sandbox tests drive a real treehouse (v3.1+: `get --lease --json`).
+      # A runner without one used to skip them and report ok. The release is pinned by version and
+      # sha256 in the script, and the Nextest step below sets COWFS_REQUIRE_TREEHOUSE so an absent
+      # treehouse fails those tests instead of skipping them.
+      - name: Install treehouse
+        run: scripts/install-treehouse.sh
       # Only a pull_request run narrows: push to main and workflow_dispatch run everything. A
       # selection error fails this step, so it fails the test job and the check aggregate.
       - name: Select tests
@@ -92,6 +98,7 @@ jobs:
           EVENT: ${{ github.event_name }}
       - name: Nextest
         env:
+          COWFS_REQUIRE_TREEHOUSE: "1"
           MODE: ${{ steps.select.outputs.mode }}
           FILTERSET: ${{ steps.select.outputs.filterset }}
           PKG_ARGS: ${{ steps.select.outputs.pkg_args }}

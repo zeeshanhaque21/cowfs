@@ -254,5 +254,33 @@ class ChangedCrateSelection(unittest.TestCase):
             self.assertNotIn("select-tests", yaml.safe_dump(WORKFLOW_YAML["jobs"][job]))
 
 
+class TreehouseIsInstalledNotSkipped(unittest.TestCase):
+    """Issue 259: the cowfs-treehouse sandbox tests skip without a treehouse, and a skip is reported as ok."""
+
+    def test_the_test_job_installs_treehouse_before_the_tests_and_requires_it(self):
+        names = [s.get("name") for s in WORKFLOW_YAML["jobs"]["test"]["steps"]]
+        self.assertLess(names.index("Install treehouse"), names.index("Nextest"))
+        self.assertIn("install-treehouse.sh", TEST_STEPS["Install treehouse"]["run"])
+        self.assertNotIn("continue-on-error", TEST_STEPS["Install treehouse"])
+        self.assertEqual(TEST_STEPS["Nextest"]["env"]["COWFS_REQUIRE_TREEHOUSE"], "1")
+
+    def test_the_installer_pins_a_version_and_a_hash_for_every_runner_and_never_pipes_to_a_shell(self):
+        text = (ROOT / "scripts/install-treehouse.sh").read_text()
+        self.assertRegex(text, r"(?m)^VERSION=v\d+\.\d+\.\d+$")
+        for key in ["linux-amd64", "darwin-arm64"]:  # ubuntu-latest and macos-latest
+            self.assertRegex(text, rf"(?m)^\s+{key}\) want=[0-9a-f]{{64}} ;;$")
+        self.assertNotRegex(text, r"\|\s*(ba|z)?sh\b")
+
+    def test_the_installer_refuses_an_archive_that_does_not_match_its_pin(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = (ROOT / "scripts/install-treehouse.sh").read_text()
+            bad = re.sub(r"(?m)^(\s+(?:linux-amd64|darwin-arm64)\) want=)[0-9a-f]{64}", r"\g<1>" + "0" * 64, text)
+            script = Path(d) / "install.sh"
+            script.write_text(bad)
+            r = subprocess.run(["bash", str(script), str(Path(d) / "bin")], capture_output=True, text=True, env={**os.environ, "GITHUB_PATH": ""})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertFalse((Path(d) / "bin" / "treehouse").exists(), "an unverified archive must not be extracted")
+
+
 if __name__ == "__main__":
     unittest.main()
