@@ -68,27 +68,53 @@ impl Serve {
     }
 }
 
-impl Drop for Serve {
-    fn drop(&mut self) {
-        // Ask nicely first, so the daemon removes its socket instead of leaving a stale one.
-        let _ = Command::new(companion())
+impl Serve {
+    /// Asks the daemon to shut down with `cowfs shutdown` (the companion has no such command) and
+    /// waits up to `within` for the process to exit. Returns how long the exit took. A failed
+    /// request, or a daemon still running at the deadline, is an `Err` and the child is killed.
+    fn stop(&mut self, within: Duration) -> Result<Duration, String> {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return Ok(Duration::ZERO); // already stopped, e.g. by an earlier call
+        }
+        let started = std::time::Instant::now();
+        let out = Command::new(require_bin("cowfs"))
             .args(["--socket", &self.socket.display().to_string(), "shutdown"])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
+            .output()
+            .map_err(|e| format!("cannot run cowfs shutdown: {e}"))?;
+        let mut failure = (!out.status.success()).then(|| {
+            format!(
+                "cowfs shutdown failed with {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        while failure.is_none() {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
+                Ok(Some(_)) => return Ok(started.elapsed()),
+                Ok(None) if started.elapsed() < within => {
+                    std::thread::sleep(Duration::from_millis(20));
                 }
-                _ => break,
+                Ok(None) => failure = Some(format!("cowfs serve still running after {within:?}")),
+                Err(e) => failure = Some(format!("cannot poll cowfs serve: {e}")),
             }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        Err(failure.unwrap_or_default())
+    }
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        // Ask nicely first, so the daemon removes its socket instead of leaving a stale one. A
+        // failure is loud, so a regression cannot hide as a slow test.
+        if let Err(e) = self.stop(Duration::from_secs(10)) {
+            if !std::thread::panicking() {
+                panic!("stopping the spawned cowfs serve: {e}");
+            }
+            eprintln!("stopping the spawned cowfs serve: {e}");
+        }
     }
 }
 
@@ -292,6 +318,18 @@ fn provision_refuses_a_path_that_is_not_a_slot() {
     ]);
     assert_eq!(out.status.code(), Some(2), "a usage error");
     assert!(String::from_utf8_lossy(&out.stderr).contains("treehouse slot path"));
+}
+
+#[test]
+fn serve_exits_promptly_when_asked_to_shut_down() {
+    let _w = Watchdog::start(60);
+    let mut serve = Serve::start(private_tempdir());
+    let took = serve.stop(Duration::from_secs(10)).expect("shutdown");
+    assert!(took < Duration::from_secs(2), "serve took {took:?} to exit");
+    assert!(
+        !serve.socket.exists(),
+        "the socket is removed on a clean exit"
+    );
 }
 
 /// Negative control for issue 244: a missing sibling binary must panic, never skip.
