@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""One-command, validated quiet-host run of gates g1/g2 (cargo) and g3 (git status), macOS arm.
+"""One-command, validated quiet-host run of gates g1/g2 (cargo) and g3 (git status), macOS (NFS) and Linux (FUSE) arms.
+
+The platform is sys.platform. On Linux the cowfs arm is the FUSE mount (`fuse.cowfs`, fsname `cowfs`) served by the same
+cowfs-daemon, the native arm is a plain directory on the host filesystem (btrfs on the cachyos box: record and report it
+as btrfs, `verdict.native_fs`), CPU idle comes from /proc/stat, and the CPU lock, socket and output all live under
+/mnt/docs/Projects/cowfs-g12 (COWFS_G12_BASE), never / or /home. Everything else (profile check, digest, quiet rule,
+cool-down, minimums, verdict.json, exit codes) is the same code path.
 
 Tracker g1 = harness gates g1 (clean build) + g2 (edit rebuild); tracker g2 = harness gate g3 (git status).
 
@@ -12,7 +18,7 @@ artifact whose reported profile is unoptimised, has debug assertions, or is not 
 baseline of this host, start a PRIVATE release daemon (own store, socket, mount), run bench/gates.py in the order
 native1, cowfs1, native2, cowfs2 (the run-pair.sh interleave) with a quiet-host check before each arm,
 validate provenance, load and the native-native noise floor, run bench/compare.py for both pairs,
-write OUT/verdict.json, stop the daemon. Per-arm quiet check is foreign CPU (ps pcpu outside the driver's and daemon's process trees) against baseline p95 + a chosen margin;
+write OUT/verdict.json, stop the daemon. Per-arm quiet check is foreign CPU (ps pcpu on macOS, a 1 s /proc tick delta on Linux, outside the driver's and daemon's process trees) against baseline p95 + a chosen margin;
 load1 only gates the baseline and the settle between arms, since the arm's own build raises it.
 Exit 0 valid PASS, 1 valid FAIL, 2 INVALID, unmeasurable, or any recorded problem (also in --sample).
 A non-sample run must use gates g1,g2,g3, scale 100, reps >= 5, --baseline-window >= 300 and --load-cap <= 4.0, else it is refused up front.
@@ -39,13 +45,17 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 BENCH = REPO / "bench"
-LOCK = Path(os.environ.get("COWFS_BENCH_CPU_LOCK", "/Users/zeeshanhaque/Projects/cowfs/spikes/nfs-loopback/out/cpu.lock"))
+LINUX = sys.platform.startswith("linux")
+LINUX_BASE = os.environ.get("COWFS_G12_BASE", "/mnt/docs/Projects/cowfs-g12")
+LOCK = Path(os.environ.get("COWFS_BENCH_CPU_LOCK", f"{LINUX_BASE}/cpu.lock" if LINUX else "/Users/zeeshanhaque/Projects/cowfs/spikes/nfs-loopback/out/cpu.lock"))
 NOISE_BAND = 0.10  # native-vs-native median ratio, same band as scripts/measure-live-trial.py
 FOREIGN = re.compile(r"\b(cargo|rustc|cc1|ld)\b")
 LOAD_CAP_MAX = 4.0  # guess: 25 percent of 16 logical cores, not measured
 FOREIGN_MARGIN = 50.0  # chosen, not measured: half a core of extra foreign CPU (ps pcpu points) over the baseline p95
 FOREIGN_BASE_CAP = 100.0  # chosen: a baseline with more than one core of foreign CPU is not idle
 INDUCED = {"kernel_task", "mds", "mds_stores", "mdworker_shared", "fseventsd"}  # chosen, not measured: CPU the arm's own file I/O induces
+INDUCED_LINUX = ("kworker", "ksoftirqd", "kswapd", "btrfs-", "jbd2", "fuse")  # chosen, not measured: kernel threads the arm's own file I/O wakes
+SOCK_MAX = 100  # AF_UNIX sun_path is 108 bytes on Linux, 104 on macOS; stay under both with room
 PLATEAU = 0.5  # chosen: max load1 spread over 60 s that counts as settled
 COOL_TIMEOUT = 600  # chosen: seconds to let load1 decay after the release build
 MIN_GATES, MIN_SCALE, MIN_REPS, MIN_BASELINE = {"g1", "g2", "g3"}, 100, 5, 300
@@ -94,22 +104,34 @@ def digest_problems(path, want):
     return [] if got == want else [f"digest of {path} is {got}, recorded at build {want}"]
 
 
-def arm_problems(alive, kind, source, dev, native_dev, digest_bad):
+def cowfs_kind(linux=None):
+    return "fuse.cowfs" if (LINUX if linux is None else linux) else "nfs"
+
+
+def is_cowfs_mount(kind, source, linux=None):
+    if LINUX if linux is None else linux:
+        return kind == "fuse.cowfs" and source == "cowfs"  # fsname is cowfs-fuse's default
+    return kind == "nfs" and str(source).startswith("localhost:/cowfs-")
+
+
+def arm_problems(alive, kind, source, dev, native_dev, digest_bad, linux=None):
     out = []
     if not alive:
         out.append("daemon not running")
-    if kind != "nfs" or not str(source).startswith("localhost:/cowfs-"):
-        out.append(f"arm is not the cowfs NFS export (type {kind}, source {source})")
+    if not is_cowfs_mount(kind, source, linux):
+        out.append(f"arm is not the cowfs {'FUSE mount' if (LINUX if linux is None else linux) else 'NFS export'} (type {kind}, source {source})")
     if dev == native_dev:
         out.append("arm shares st_dev with the native root")
     return out + digest_bad
 
 
 def mount_entry(path, table):
-    """(source, type, mountpoint) of the longest mount point containing path, from `mount` output."""
+    """(source, type, mountpoint) of the longest mount point containing path, from `mount` output.
+
+    Two forms: macOS `X on Y (type, opts)` and Linux `X on Y type T (opts)`."""
     best, p = None, str(Path(path).resolve())
     for line in table.splitlines():
-        m = re.match(r"(.+?) on (.+) \(([^,)]+)", line)
+        m = re.match(r"(.+?) on (.+) type (\S+) \(", line) or re.match(r"(.+?) on (.+) \(([^,)]+)", line)
         if m and (p == m[2] or p.startswith(m[2].rstrip("/") + "/")) and (best is None or len(m[2]) > len(best[2])):
             best = (m[1], m[3], m[2])
     return best or (None, None, None)
@@ -145,7 +167,7 @@ def parse_ps(text):
     return rows
 
 
-def foreign_cpu(rows, roots):
+def foreign_cpu(rows, roots, linux=None):
     """pcpu outside the process trees rooted at `roots` (the driver, the daemon), split into
     (foreign, induced, top3): `induced` is the INDUCED set (kernel NFS client, Spotlight, fseventsd), which the arm's own
     I/O provokes and which is reported but not gated; top3 are the largest gated contributors.
@@ -161,9 +183,11 @@ def foreign_cpu(rows, roots):
         if pid not in own:
             own.add(pid)
             todo += kids.get(pid, [])
-    other = [(c, os.path.basename(comm)) for pid, _, c, comm in rows if pid not in own]
-    gated = sorted((x for x in other if x[1] not in INDUCED), reverse=True)
-    return sum(c for c, _ in gated), sum(c for c, n in other if n in INDUCED), [(n, c) for c, n in gated[:3]]
+    lin = LINUX if linux is None else linux
+    other = [(c, comm if lin else os.path.basename(comm)) for pid, _, c, comm in rows if pid not in own]  # Linux comm is a bare name; kworker/0:1 has a slash
+    induced = (lambda n: n.startswith(INDUCED_LINUX)) if lin else (lambda n: n in INDUCED)
+    gated = sorted((x for x in other if not induced(x[1])), reverse=True)
+    return sum(c for c, _ in gated), sum(c for c, n in other if induced(n)), [(n, c) for c, n in gated[:3]]
 
 
 def foreign_problems(samples, limit):
@@ -175,8 +199,42 @@ def foreign_problems(samples, limit):
     return []
 
 
+def parse_pid_stat(text):
+    """One /proc/PID/stat -> (ppid, utime + stime ticks, comm, starttime). comm is whatever sits between the first ( and the last )."""
+    rest = text[text.rindex(")") + 2:].split()
+    return int(rest[1]), int(rest[11]) + int(rest[12]), text[text.index("(") + 1:text.rindex(")")], int(rest[19])
+
+
+def proc_snapshot():
+    snap = {}
+    for d in Path("/proc").glob("[0-9]*"):
+        try:
+            snap[int(d.name)] = parse_pid_stat((d / "stat").read_text())
+        except (OSError, ValueError, IndexError):
+            pass  # exited while being read
+    return snap
+
+
+def delta_rows(a, b, dt, hz):
+    """Two {pid: (ppid, ticks, comm, starttime)} snapshots dt seconds apart -> ps-style rows with the CPU of that interval.
+
+    Linux `ps` pcpu is CPU time over process lifetime, which hides a long-lived process that spikes now; this is current CPU."""
+    rows = []
+    for pid, (ppid, ticks, comm, start) in b.items():
+        before = a.get(pid)  # a process is the same one when pid and starttime match; comm can change (kworker, setproctitle)
+        d = ticks - before[1] if before and before[3] == start and ticks >= before[1] else ticks  # born or reused inside the interval: all of it
+        rows.append((pid, ppid, 100.0 * d / hz / dt, comm))
+    return rows
+
+
 def sample_foreign(roots):
-    return foreign_cpu(parse_ps(sh(["ps", "-A", "-o", "pid=,ppid=,pcpu=,comm="]).stdout), roots)  # (foreign, induced, top3)
+    """(foreign, induced, top3). Linux: CPU over a 1 s /proc delta; macOS: ps pcpu (a decaying average)."""
+    if LINUX:
+        a, t0 = proc_snapshot(), time.monotonic()
+        time.sleep(1)
+        b = proc_snapshot()
+        return foreign_cpu(delta_rows(a, b, time.monotonic() - t0, os.sysconf("SC_CLK_TCK")), roots)
+    return foreign_cpu(parse_ps(sh(["ps", "-A", "-o", "pid=,ppid=,pcpu=,comm="]).stdout), roots)
 
 
 def ratio_table(nat, cow, gates):
@@ -192,16 +250,32 @@ def ratio_table(nat, cow, gates):
 # ---- host quiet gate ----------------------------------------------------------------------
 
 
+def parse_proc_stat(text):
+    """First line of /proc/stat -> (idle + iowait ticks, total ticks)."""
+    f = [int(x) for x in text.splitlines()[0].split()[1:]]
+    return f[3] + f[4], sum(f[:8])  # user nice system idle iowait irq softirq steal; guest is already in user
+
+
+def idle_pcts(snaps):
+    """CPU idle percent between consecutive (idle, total) snapshots; an interval with no ticks yields no sample."""
+    return [100.0 * (b[0] - a[0]) / (b[1] - a[1]) for a, b in zip(snaps, snaps[1:]) if b[1] > a[1]]
+
+
 def window(secs, roots=None):
-    """Sample load1 (and foreign CPU when `roots` is given) every 5 s and CPU idle via top; returns (loads, idles, foreign)."""
+    """Sample load1 (and foreign CPU when `roots` is given) every 5 s and CPU idle (macOS top, Linux /proc/stat); returns (loads, idles, foreign)."""
     n = max(2, secs // 5)
-    top = subprocess.Popen(["top", "-l", str(n + 1), "-s", "5", "-n", "0"], stdout=subprocess.PIPE, text=True)
-    loads, foreign = [], []
+    top = None if LINUX else subprocess.Popen(["top", "-l", str(n + 1), "-s", "5", "-n", "0"], stdout=subprocess.PIPE, text=True)
+    loads, foreign, snaps = [], [], []
     for _ in range(n):
+        if LINUX:
+            snaps.append(parse_proc_stat(Path("/proc/stat").read_text()))
         time.sleep(5)
         loads.append(os.getloadavg()[0])
         if roots:
             foreign.append(sample_foreign(roots))
+    if LINUX:
+        snaps.append(parse_proc_stat(Path("/proc/stat").read_text()))
+        return loads, idle_pcts(snaps), foreign
     out = top.communicate()[0]
     idles = [float(m) for m in re.findall(r"CPU usage:.*?([\d.]+)% idle", out)][1:]  # first top sample is since boot
     return loads, idles, foreign
@@ -227,6 +301,30 @@ def mount_table():
 
 def fstype(path):
     return mount_entry(path, mount_table())[1]
+
+
+def cowfs_mounted(path):
+    src, kind, _ = mount_entry(path, mount_table())
+    return is_cowfs_mount(kind, src)
+
+
+def linux_env(env, base):
+    """Default the cargo and temp locations under `base` (not ~/.cargo on /home); returns the paths to vet."""
+    for k, v in (("CARGO_HOME", "cargo-home"), ("COWFS_BENCH_CARGO_HOME", "cargo-home"), ("TMPDIR", "tmp")):
+        env.setdefault(k, f"{base}/{v}")
+    return [env["CARGO_HOME"], env["COWFS_BENCH_CARGO_HOME"], env["TMPDIR"]]
+
+
+def linux_path_problems(paths, base):
+    """Every Linux work path must resolve inside `base` (under /mnt/docs, never / or /home) and a socket must fit AF_UNIX."""
+    root, out = Path(base).resolve(), []
+    for q in map(str, paths):
+        r = Path(os.path.abspath(q))  # not resolve(): a path that does not exist yet must still be judged
+        if r != root and root not in r.parents:
+            out.append(f"{q} is not under {base}")
+        if len(q) > SOCK_MAX and q.endswith(".sock"):
+            out.append(f"socket path {q} is {len(q)} bytes, limit {SOCK_MAX}")
+    return out
 
 
 def cool_down(cap, timeout, getload=lambda: os.getloadavg()[0], sleep=time.sleep, clock=time.monotonic):
@@ -311,6 +409,17 @@ class ArmSampler(threading.Thread):
 # ---- build and daemon ---------------------------------------------------------------------
 
 
+def private_dir(path):
+    """cowfs-daemon refuses a socket directory that is not owned by the user with mode 0700."""
+    Path(path).mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def sock_path(run_id):
+    """AF_UNIX path limit is 104 bytes, so the socket is short: ~/.cowfs/sock on macOS, <base>/sock on Linux (not /home)."""
+    return (Path(LINUX_BASE) / "sock" if LINUX else Path.home() / ".cowfs" / "sock") / f"g12-{run_id}.sock"
+
+
 def build_release():
     """Build with --release and return {name: artifact message}; refuse anything profile_problems rejects."""
     p = sh(["cargo", "build", "--release", "--locked", "-p", "cowfs-daemon", "-p", "cowfs-cli", "-j", "4",
@@ -338,7 +447,7 @@ class Daemon:
     def __init__(self, out, args, arts):
         self.dir = out / "daemon"
         self.store, self.mnt, self.log = self.dir / "store", self.dir / "mnt", self.dir / "daemon.log"
-        self.sock = Path.home() / ".cowfs" / "sock" / f"g12-{args.run_id}.sock"  # AF_UNIX path limit is 104 bytes
+        self.sock = sock_path(args.run_id)
         self.bin, self.cli = Path(arts["cowfs-daemon"]["executable"]), Path(arts["cowfs"]["executable"])
         self.sha = hashlib.sha256(self.bin.read_bytes()).hexdigest()
         self.proc = None
@@ -346,7 +455,7 @@ class Daemon:
     def start(self):
         self.store.mkdir(parents=True)
         self.mnt.mkdir()
-        self.sock.parent.mkdir(parents=True, exist_ok=True)
+        private_dir(self.sock.parent)
         self.mnt = self.mnt.resolve()
         self.proc = subprocess.Popen(
             [str(self.bin), "--store", str(self.store), "--mount", str(self.mnt), "--socket", str(self.sock), "--backend", "core"],
@@ -354,7 +463,7 @@ class Daemon:
         for _ in range(120):
             if self.proc.poll() is not None:
                 raise SystemExit(f"daemon died: {self.log.read_text()[-1500:]}")
-            if fstype(self.mnt) == "nfs" and self.sock.exists():
+            if fstype(self.mnt) == cowfs_kind() and self.sock.exists():
                 break
             time.sleep(1)
         else:
@@ -389,7 +498,9 @@ class Daemon:
                     self.proc.wait(60)
                 except subprocess.TimeoutExpired:
                     return [f"daemon {self.proc.pid} ignored SIGTERM for 60 s, left running for the operator"]
-        if self.proc and fstype(self.mnt) == "nfs" and "cowfs-" in str(mount_entry(self.mnt, mount_table())[0]):
+        if self.proc and LINUX and cowfs_mounted(self.mnt):
+            sh(["fusermount3", "-u", str(self.mnt)])  # a mount the daemon left behind; the table is re-read below
+        if self.proc and cowfs_mounted(self.mnt):
             out.append(f"mount still present after stop: {self.mnt}")
         self.sock.unlink(missing_ok=True)
         Path(str(self.sock) + ".lock").unlink(missing_ok=True)
@@ -457,6 +568,7 @@ def newest(label):
 def run(args, out, verdict):
     env = dict(os.environ, COWFS_BENCH_SCALE=str(args.scale))
     gl = args.gates.split(",")
+    verdict["platform"], verdict["native_fs"] = "linux" if LINUX else "macos", fstype(out)  # the Linux number is a btrfs number: say so
     acquire_lock(900)
     d = None
     labels = []
@@ -480,8 +592,8 @@ def run(args, out, verdict):
                 return "INVALID"
         croot = d.start()
         verdict["daemon"] = d.prov()
-        if not verdict["daemon"]["launched_from_built_binary"] or verdict["daemon"]["mount_fstype"] != "nfs":
-            verdict["problems"].append("daemon was not launched from the built release binary on an NFS mount")
+        if not verdict["daemon"]["launched_from_built_binary"] or verdict["daemon"]["mount_fstype"] != cowfs_kind():
+            verdict["problems"].append(f"daemon was not launched from the built release binary on a {cowfs_kind()} mount")
             return "INVALID"
         native_dev = os.stat(out).st_dev
         verdict["arms"] = []
@@ -498,7 +610,7 @@ def run(args, out, verdict):
                 if rec["pre"]["problems"]:
                     verdict["problems"].append(f"{label}: cowfs arm unsound before run: {rec['pre']['problems']}")
                     break
-            elif fstype(out) == "nfs":
+            elif fstype(out) == cowfs_kind():
                 verdict["problems"].append(f"{label}: native root is on the cowfs mount")
                 break
             sampler = ArmSampler([os.getpid(), d.proc.pid])
@@ -585,7 +697,11 @@ def main():
     verdict = {"run_id": args.run_id, "sample": s, "NOT_A_GATE_RESULT": s, "gates": args.gates, "reps": args.reps,
                "scale": args.scale, "load_cap": args.load_cap, "baseline_window": args.baseline_window, "wait": args.wait, "problems": [], "result": "INVALID"}
     try:
+        if LINUX:
+            verdict["problems"] += linux_path_problems([out, LOCK, sock_path(args.run_id), *linux_env(os.environ, LINUX_BASE)], LINUX_BASE)
         verdict["problems"] += param_problems(args.gates.split(","), args.scale, args.reps, args.load_cap, s, args.baseline_window)
+        if LINUX and not verdict["problems"]:
+            Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
         verdict["result"] = "INVALID" if verdict["problems"] else run(args, out, verdict)
     except BaseException as e:  # noqa: BLE001  verdict.json is always written; exit 2 never collides with a valid FAIL (1)
         verdict["problems"].append(f"{type(e).__name__}: {e}")

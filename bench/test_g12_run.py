@@ -19,6 +19,11 @@ localhost:/cowfs-abc on /a/mnt (nfs, nodev, nosuid, mounted by u)
 
 
 class G12(unittest.TestCase):
+    def setUp(self):  # the macOS arm's tests: same result on the Linux CI job
+        p = mock.patch.object(g, "LINUX", False)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_release_accepted_debug_rejected(self):
         self.assertEqual(g.profile_problems(REL), [])
         self.assertEqual(len(g.profile_problems(DBG)), 3)
@@ -85,6 +90,11 @@ def fake_sh(lines, rc=0):
 
 
 class Foreign(unittest.TestCase):
+    def setUp(self):  # the macOS arm's tests: same result on the Linux CI job
+        p = mock.patch.object(g, "LINUX", False)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_own_tree_high_foreign_low_is_valid(self):
         rows = g.parse_ps(PS.replace("400.0 someone-elses-build", "3.0 someone-elses-build"))
         f, ind, top = g.foreign_cpu(rows, [100])
@@ -173,7 +183,7 @@ class FakeDaemon:
         return Path(self.mnt) / "cowfs-root"
 
     def prov(self):
-        return {"launched_from_built_binary": self.launched, "mount_fstype": "nfs"}
+        return {"launched_from_built_binary": self.launched, "mount_fstype": g.cowfs_kind()}
 
     def arm_state(self, dev):
         return {"problems": list(self.pre)}
@@ -212,7 +222,7 @@ class FakeSampler:
 
 
 class RunPaths(unittest.TestCase):
-    def go(self, **over):
+    def go(self, linux=False, native_fs="apfs", **over):
         FakeDaemon.launched, FakeDaemon.pre, FakeQuiet.ok, FakeQuiet.good, FakeSampler.value = True, [], True, True, 0.0
         for k, v in over.items():
             for cls in (FakeDaemon, FakeQuiet, FakeSampler):
@@ -225,7 +235,7 @@ class RunPaths(unittest.TestCase):
                 mock.patch.object(g, "release_lock", lambda: None), mock.patch.object(g, "build_release", lambda: {}), \
                 mock.patch.object(g, "Daemon", FakeDaemon), mock.patch.object(g, "Quiet", FakeQuiet), \
                 mock.patch.object(g, "ArmSampler", FakeSampler), mock.patch.object(g, "cool_down", lambda *a, **k: (True, 0.5)), \
-                mock.patch.object(g, "fstype", lambda p: "apfs"), mock.patch.object(g, "LOCK", Path(t) / "lock"), \
+                mock.patch.object(g, "fstype", lambda p: native_fs), mock.patch.object(g, "LINUX", linux), mock.patch.object(g, "LOCK", Path(t) / "lock"), \
                 mock.patch.object(g.subprocess, "run", lambda cmd, **k: calls.append(cmd) or types.SimpleNamespace(returncode=0)):
             (Path(t) / "lock").mkdir()
             res = g.run(args, Path(t), verdict)
@@ -248,10 +258,134 @@ class RunPaths(unittest.TestCase):
         res, v, calls = self.go(pre=["daemon not running"])
         self.assertEqual((res, len(calls)), ("INVALID", 1))  # only n1 ran
 
+    def test_verdict_records_platform_and_native_fs(self):
+        res, v, calls = self.go(linux=True, native_fs="btrfs", good=False)
+        self.assertEqual((v["platform"], v["native_fs"]), ("linux", "btrfs"))
+
+    def test_linux_native_root_on_cowfs_mount_stops(self):
+        res, v, calls = self.go(linux=True, native_fs="fuse.cowfs")
+        self.assertEqual((res, calls), ("INVALID", []))
+        self.assertTrue(any("native root" in p for p in v["problems"]))
+
     def test_foreign_cpu_high_stops_the_arm(self):
         res, v, calls = self.go(value=500.0)
         self.assertEqual((res, len(calls)), ("INVALID", 1))
         self.assertTrue(any("foreign CPU" in p for p in v["problems"]))
+
+
+LINUX_TABLE = """/dev/nvme0n1p3 on /mnt/docs type btrfs (rw,relatime,ssd,subvolid=5)
+cowfs on /mnt/docs/Projects/cowfs-g12/src/bench/out/g12/r/daemon/mnt type fuse.cowfs (rw,nosuid,nodev,relatime,user_id=1000)
+tmpfs on /run type tmpfs (rw,nosuid,nodev)"""
+BASE = "/mnt/docs/Projects/cowfs-g12"
+
+
+class Linux(unittest.TestCase):
+    def test_mount_entry_parses_linux_form(self):
+        p = "/mnt/docs/Projects/cowfs-g12/src/bench/out/g12/r/daemon/mnt/base/g12"
+        self.assertEqual(g.mount_entry(p, LINUX_TABLE), ("cowfs", "fuse.cowfs", p.rsplit("/base", 1)[0]))
+        self.assertEqual(g.mount_entry("/mnt/docs/x/native", LINUX_TABLE)[1], "btrfs")
+
+    def test_arm_problems_fuse(self):
+        ok = dict(alive=True, kind="fuse.cowfs", source="cowfs", dev=5, native_dev=1, digest_bad=[], linux=True)
+        self.assertEqual(g.arm_problems(**ok), [])
+        self.assertTrue(g.arm_problems(**{**ok, "kind": "btrfs", "source": "/dev/nvme0n1p3"}))  # native dir labelled cowfs
+        self.assertTrue(g.arm_problems(**{**ok, "kind": "fuse.sshfs"}))
+        self.assertTrue(g.arm_problems(**{**ok, "source": "other"}))
+        self.assertTrue(g.arm_problems(**{**ok, "kind": "nfs", "source": "localhost:/cowfs-abc"}))  # the macOS arm is not a Linux arm
+        self.assertTrue(g.arm_problems(**{**ok, "dev": 1}))
+        self.assertTrue(g.arm_problems(**{**ok, "alive": False}))
+        self.assertTrue(g.arm_problems(**{**ok, "digest_bad": ["x"]}))
+        self.assertTrue(g.arm_problems(alive=True, kind="fuse.cowfs", source="cowfs", dev=5, native_dev=1, digest_bad=[], linux=False))
+
+    def test_socket_dir_is_private_0700(self):
+        # found live on cachyos: cowfs-daemon refuses a socket directory that is not owned by the user with mode 0700
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t) / "a" / "sock"
+            d.parent.mkdir()
+            d.mkdir(mode=0o755)
+            g.private_dir(d)
+            self.assertEqual(d.stat().st_mode & 0o777, 0o700)
+            g.private_dir(Path(t) / "b" / "sock")  # created with parents
+            self.assertEqual((Path(t) / "b" / "sock").stat().st_mode & 0o777, 0o700)
+
+    def test_pid_stat_parse_survives_odd_comm(self):
+        line = "123 (tmux: server (x)) S 7 1 1 0 -1 4194560 1 0 0 0 40 2 0 0 20 0 1 0 5 0 0 0 0\n"
+        self.assertEqual(g.parse_pid_stat(line), (7, 42, "tmux: server (x)", 5))  # ppid, utime + stime, comm, starttime
+
+    def test_delta_rows_measure_current_cpu_not_lifetime(self):
+        # a process that ran for days (huge tick count) and spikes now; a pid born mid-interval; a pid that vanished
+        a = {1: (0, 10_000_000, "browser", 1), 2: (1, 500, "gone", 2), 4: (1, 100, "old", 4)}
+        b = {1: (0, 10_000_400, "browser", 1), 3: (1, 100, "newborn", 3), 4: (1, 100, "old", 4)}
+        rows = {r[0]: r for r in g.delta_rows(a, b, dt=1.0, hz=100)}
+        self.assertAlmostEqual(rows[1][2], 400.0)  # 4 cores' worth, visible despite a lifetime average near 0
+        self.assertAlmostEqual(rows[3][2], 100.0)  # born inside the interval: its whole tick count
+        self.assertAlmostEqual(rows[4][2], 0.0)
+        self.assertNotIn(2, rows)
+        self.assertEqual(rows[1][1], 0)  # ppid kept for the own-tree walk
+        reused = g.delta_rows({5: (0, 9000, "a", 7)}, {5: (0, 50, "a", 8)}, 1.0, 100)  # pid reuse: new starttime, same name
+        self.assertAlmostEqual(reused[0][2], 50.0)
+        renamed = g.delta_rows({6: (0, 9000, "kworker/0:1", 7)}, {6: (0, 9010, "kworker/0:2", 7)}, 1.0, 100)  # comm changes, same process
+        self.assertAlmostEqual(renamed[0][2], 10.0)
+
+    def test_linux_env_defaults_stay_under_base(self):
+        env = {}
+        paths = g.linux_env(env, BASE)
+        self.assertEqual(env["CARGO_HOME"], BASE + "/cargo-home")
+        self.assertEqual(g.linux_path_problems(paths, BASE), [])
+        env = {"CARGO_HOME": "/home/zeeshan/.cargo"}  # an operator override outside the base is refused, not honoured
+        self.assertTrue(g.linux_path_problems(g.linux_env(env, BASE), BASE))
+
+    def test_proc_stat_idle(self):
+        a = "cpu  100 0 100 700 100 0 0 0 0 0\ncpu0 1 1 1 1 1 0 0 0 0 0\n"
+        b = "cpu  150 0 150 1300 100 0 0 0 0 0\ncpu0 1 1 1 1 1 0 0 0 0 0\n"
+        self.assertEqual(g.parse_proc_stat(a), (800, 1000))  # idle + iowait, all fields
+        self.assertEqual(g.idle_pcts([g.parse_proc_stat(a), g.parse_proc_stat(b)]), [600 / 700 * 100])
+        self.assertEqual(g.idle_pcts([g.parse_proc_stat(a)]), [])
+        self.assertEqual(g.idle_pcts([(1, 1), (1, 1)]), [])  # no ticks elapsed: no sample, not a division by zero
+
+    def test_foreign_cpu_linux_names(self):
+        rows = g.parse_ps("  1 0 0.0 systemd\n 50 2 7.0 kworker/u32:1\n 60 1 30.0 Runner.Worker\n 70 1 2.0 btrfs-transaction\n")
+        f, ind, top = g.foreign_cpu(rows, [999], linux=True)
+        self.assertAlmostEqual(f, 30.0)  # a CI runner worker is foreign and gated
+        self.assertAlmostEqual(ind, 9.0)  # kernel worker threads and btrfs are induced, reported not gated
+        self.assertEqual(top[0], ("Runner.Worker", 30.0))
+
+    def test_work_paths_must_be_under_the_base(self):
+        ok = [BASE + "/src/bench/out/g12/r", BASE + "/cpu.lock", BASE + "/sock/g12-r.sock"]
+        self.assertEqual(g.linux_path_problems(ok, BASE), [])
+        self.assertTrue(g.linux_path_problems(["/home/zeeshan/x"] + ok, BASE))
+        self.assertTrue(g.linux_path_problems([BASE + "-evil/x"], BASE))  # prefix is not containment
+        self.assertTrue(g.linux_path_problems([BASE + "/../../../home/z"], BASE))
+        self.assertTrue(g.linux_path_problems([BASE + "/sock/" + "x" * 120 + ".sock"], BASE))  # AF_UNIX 108-byte limit
+
+    def test_stop_falls_back_to_fusermount_and_verifies(self):
+        d = g.Daemon.__new__(g.Daemon)
+        d.proc, d.bin, d.mnt = types.SimpleNamespace(poll=lambda: 0, pid=1), Path("/b/cowfs-daemon"), Path("/m/mnt")
+        d.sock = Path("/nonexistent/s.sock")
+        cmds, mounted = [], [True]
+
+        def fake_sh(cmd, **k):
+            cmds.append(cmd)
+            if cmd[0] == "fusermount3":
+                mounted[0] = False
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def table():
+            return "cowfs on /m/mnt type fuse.cowfs (rw)\n" if mounted[0] else ""
+
+        with mock.patch.object(g, "LINUX", True), mock.patch.object(g, "sh", fake_sh), mock.patch.object(g, "mount_table", table), \
+                mock.patch.object(g, "fstype", lambda p: g.mount_entry(p, table())[1]):
+            self.assertEqual(d.stop(), [])
+        self.assertIn(["fusermount3", "-u", "/m/mnt"], cmds)
+        mounted[0], cmds[:] = True, []
+
+        def stuck(cmd, **k):
+            cmds.append(cmd)
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="busy")
+
+        with mock.patch.object(g, "LINUX", True), mock.patch.object(g, "sh", stuck), mock.patch.object(g, "mount_table", table), \
+                mock.patch.object(g, "fstype", lambda p: g.mount_entry(p, table())[1]):
+            self.assertTrue(any("mount still present" in p for p in d.stop()))
 
 
 if __name__ == "__main__":
