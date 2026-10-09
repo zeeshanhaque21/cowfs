@@ -251,6 +251,9 @@ impl Vfs for Probe {
     fn removexattr(&self, i: Ino, n: &[u8]) -> Result<()> {
         self.inner.removexattr(i, n)
     }
+    fn fallocate(&self, i: Ino, m: FallocMode, o: u64, l: u64) -> Result<Attr> {
+        self.inner.fallocate(i, m, o, l)
+    }
 }
 
 pub fn fuse_usable() -> bool {

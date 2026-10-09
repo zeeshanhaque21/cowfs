@@ -160,6 +160,82 @@ fn read_only_mount_refuses_writes() {
     assert_eq!(fs::read(fx.p("f")).unwrap(), b"kept");
 }
 
+/// `fallocate(2)` on an open file; 0 on success, else the errno.
+#[allow(unsafe_code)]
+fn falloc(f: &File, mode: i32, off: i64, len: i64) -> i32 {
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain syscall on a valid open descriptor
+    if unsafe { libc::fallocate(f.as_raw_fd(), mode, off, len) } == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap()
+    }
+}
+
+const KEEP: i32 = libc::FALLOC_FL_KEEP_SIZE;
+const PUNCH: i32 = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+const ZERO: i32 = libc::FALLOC_FL_ZERO_RANGE;
+
+#[test]
+#[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
+fn fallocate_modes_through_a_mount() {
+    let Some(fx) = Fixture::new("") else { return };
+    let data: Vec<u8> = (0..65_536u32).map(|i| (i % 251) as u8 + 1).collect();
+    fs::write(fx.p("f"), &data).unwrap();
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fx.p("f"))
+        .unwrap();
+    let st = || fs::metadata(fx.p("f")).unwrap();
+    let blocks = st().blocks();
+    let mut model = data;
+
+    // punch: bytes read as zeros, size kept, whole pages freed
+    assert_eq!(falloc(&f, PUNCH, 4096, 8192), 0);
+    model[4096..12_288].fill(0);
+    assert_eq!(st().len(), 65_536);
+    assert_eq!(fs::read(fx.p("f")).unwrap(), model);
+    assert!(st().blocks() < blocks, "blocks did not drop after a punch");
+
+    // zero-range inside the file, with and without keep-size, unaligned
+    assert_eq!(falloc(&f, ZERO | KEEP, 20_001, 3000), 0);
+    model[20_001..23_001].fill(0);
+    assert_eq!(falloc(&f, ZERO, 30_000, 100), 0);
+    model[30_000..30_100].fill(0);
+    assert_eq!(st().len(), 65_536);
+    assert_eq!(fs::read(fx.p("f")).unwrap(), model);
+
+    // keep-size past the end changes nothing; zero-range and allocate past the end grow the file
+    assert_eq!(falloc(&f, KEEP, 65_536, 4096), 0);
+    assert_eq!(st().len(), 65_536);
+    assert_eq!(falloc(&f, ZERO | KEEP, 65_000, 5000), 0);
+    model[65_000..].fill(0);
+    assert_eq!(st().len(), 65_536);
+    assert_eq!(falloc(&f, ZERO, 66_000, 1000), 0);
+    model.resize(67_000, 0);
+    assert_eq!(st().len(), 67_000);
+    assert_eq!(falloc(&f, 0, 70_000, 1), 0);
+    model.resize(70_001, 0);
+    assert_eq!(falloc(&f, 0, 0, 10), 0);
+    assert_eq!(st().len(), 70_001);
+    assert_eq!(fs::read(fx.p("f")).unwrap(), model);
+
+    // refusals: collapse, insert and unshare are unsupported, length 0 is invalid, a range past
+    // the largest file is EFBIG, and nothing above changed the file
+    for mode in [0x08, 0x20, 0x40, 0x04] {
+        assert_eq!(
+            falloc(&f, mode, 0, 4096),
+            libc::EOPNOTSUPP,
+            "mode {mode:#x}"
+        );
+    }
+    assert_eq!(falloc(&f, 0, 0, 0), libc::EINVAL);
+    assert_eq!(falloc(&f, 0, 1 << 42, 1), libc::EFBIG);
+    assert_eq!(st().len(), 70_001);
+    assert_eq!(fs::read(fx.p("f")).unwrap(), model);
+}
+
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
 fn unsupported_operations_report_enotsup() {
@@ -169,14 +245,10 @@ fn unsupported_operations_report_enotsup() {
     assert!(
         !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("not supported")
     );
-    let out = Command::new("fallocate")
-        .args(["-l", "4096"])
-        .arg(fx.p("a"))
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("not supported")
-    );
+    // collapse and insert range are not supported; the other modes are (see the next test)
+    let f = OpenOptions::new().write(true).open(fx.p("a")).unwrap();
+    assert_eq!(falloc(&f, 0x08, 0, 4096), libc::EOPNOTSUPP);
+    assert_eq!(falloc(&f, 0x20, 0, 4096), libc::EOPNOTSUPP);
     assert!(Command::new("cp")
         .arg(fx.p("a"))
         .arg(fx.p("b"))

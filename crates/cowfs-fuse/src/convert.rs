@@ -2,6 +2,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cowfs_vfs::FallocMode;
 use cowfs_vfs::{Attr, FileKind, RenameFlags, Timestamp, XattrFlags, MODE_MASK};
 
 const S_IFMT: u32 = 0o170_000;
@@ -63,6 +64,24 @@ pub fn rename_flags(flags: u32) -> Result<RenameFlags, i32> {
     Ok(RenameFlags {
         no_replace: flags & RENAME_NOREPLACE != 0,
     })
+}
+
+const FALLOC_KEEP_SIZE: i32 = 0x01;
+const FALLOC_PUNCH_HOLE: i32 = 0x02;
+const FALLOC_ZERO_RANGE: i32 = 0x10;
+
+/// Maps `fallocate` mode bits. Collapse, insert and unshare (and any unknown bit, and the pairs
+/// the kernel itself refuses: `PUNCH_HOLE` without `KEEP_SIZE`, `PUNCH_HOLE` with `ZERO_RANGE`)
+/// are `EOPNOTSUPP`, which is `ENOTSUP` on Linux.
+pub fn falloc_mode(mode: i32) -> Result<FallocMode, i32> {
+    match mode {
+        0 => Ok(FallocMode::Allocate),
+        FALLOC_KEEP_SIZE => Ok(FallocMode::KeepSize),
+        m if m == FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE => Ok(FallocMode::PunchHole),
+        FALLOC_ZERO_RANGE => Ok(FallocMode::ZeroRange),
+        m if m == FALLOC_ZERO_RANGE | FALLOC_KEEP_SIZE => Ok(FallocMode::ZeroRangeKeepSize),
+        _ => Err(libc::ENOTSUP),
+    }
 }
 
 /// Maps `setxattr` flags. Unknown bits are `EINVAL`.
@@ -196,6 +215,31 @@ pub fn access_allowed(mode: u32, owner: u32, group: u32, uid: u32, gid: u32, mas
 mod tests {
     use super::*;
     use cowfs_vfs::Error;
+
+    #[test]
+    fn fallocate_modes_map_and_the_rest_are_enotsup() {
+        assert_eq!(falloc_mode(0), Ok(FallocMode::Allocate));
+        assert_eq!(falloc_mode(1), Ok(FallocMode::KeepSize));
+        assert_eq!(falloc_mode(3), Ok(FallocMode::PunchHole));
+        assert_eq!(falloc_mode(0x10), Ok(FallocMode::ZeroRange));
+        assert_eq!(falloc_mode(0x11), Ok(FallocMode::ZeroRangeKeepSize));
+        // punch without keep-size, punch with zero-range, no-hide-stale, collapse, insert,
+        // unshare, and an unknown bit
+        for m in [
+            0x02,
+            0x13,
+            0x04,
+            0x08,
+            0x09,
+            0x20,
+            0x21,
+            0x40,
+            0x80,
+            0x11 | 0x08,
+        ] {
+            assert_eq!(falloc_mode(m), Err(libc::ENOTSUP), "mode {m:#x}");
+        }
+    }
 
     fn ts(secs: i64, nanos: u32) -> Timestamp {
         Timestamp { secs, nanos }

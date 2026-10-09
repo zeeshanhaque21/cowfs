@@ -615,6 +615,15 @@ impl Vfs for GuardedView {
     fn removexattr(&self, i: Ino, n: &[u8]) -> cowfs_vfs::Result<()> {
         self.inner.removexattr(i, n)
     }
+    fn fallocate(
+        &self,
+        i: Ino,
+        m: cowfs_vfs::FallocMode,
+        o: u64,
+        l: u64,
+    ) -> cowfs_vfs::Result<Attr> {
+        self.inner.fallocate(i, m, o, l)
+    }
 }
 
 fn translated() -> MountOptions {

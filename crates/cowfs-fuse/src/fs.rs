@@ -445,6 +445,14 @@ impl Core {
         Ok((n.min(max), stale))
     }
 
+    /// The kernel updates its own size and drops the page-cache range after a success, so there is
+    /// no attribute to hand back.
+    fn fallocate(&self, ino: Ino, mode: i32, off: i64, len: i64) -> R<()> {
+        let mode = convert::falloc_mode(mode)?;
+        let (off, len) = (offset(off)?, offset(len)?);
+        self.call(|v| v.fallocate(ino, mode, off, len)).map(|_| ())
+    }
+
     fn invalidate_attr(&self, ino: Ino) {
         if let Some(n) = self.sh.notifier.get() {
             if let Err(e) = n.inval_inode(ino, -1, 0) {
@@ -992,14 +1000,16 @@ impl Filesystem for Fs {
     fn fallocate(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
-        _offset: i64,
-        _length: i64,
-        _mode: i32,
+        offset: i64,
+        length: i64,
+        mode: i32,
         reply: ReplyEmpty,
     ) {
-        reply.error(libc::ENOTSUP);
+        self.lane(Class::Write, ino, move |c| {
+            empty(c.fallocate(ino, mode, offset, length), reply)
+        });
     }
 
     fn copy_file_range(

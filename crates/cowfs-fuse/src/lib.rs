@@ -89,8 +89,9 @@
 //! # Not supported
 //!
 //! Device nodes, fifos and sockets (`mknod` of anything but a regular file is `ENOTSUP`),
-//! `RENAME_EXCHANGE` (`ENOTSUP`), `fallocate` and `copy_file_range` (`ENOTSUP`, so
-//! `rsync --preallocate` prints a warning per file and `cp --reflink=always` fails),
+//! `RENAME_EXCHANGE` (`ENOTSUP`), `fallocate` collapse, insert and unshare range (`ENOTSUP`;
+//! allocate, keep-size, punch-hole and zero-range work) and `copy_file_range` (`ENOTSUP`, so
+//! `cp --reflink=always` fails),
 //! extended attribute namespaces other than `user.*`, `security.*` and `trusted.*` (POSIX ACLs
 //! are `ENOTSUP`), holes (`SEEK_DATA` and `SEEK_HOLE` treat the whole file as data), and FUSE
 //! locks: the kernel handles `flock` and POSIX locks locally. `syncfs(2)` takes the kernel
