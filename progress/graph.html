@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cowfs dependency graph</title>
+<style>
+  body { font: 15px/1.4 -apple-system, system-ui, sans-serif; margin: 0; padding: 12px; background: #111; color: #eee; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .meta { color: #999; font-size: 12px; margin-bottom: 10px; }
+  .ctl button, .ctl a { background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 8px; margin-right: 6px; font-size: 12px; text-decoration: none; }
+  .legend { font-size: 12px; margin: 8px 0; }
+  .legend span { display: inline-block; padding: 1px 8px; border-radius: 8px; margin-right: 6px; }
+  #graph { background: #181818; border-radius: 6px; padding: 8px; overflow: auto; }
+  #graph svg { max-width: none; }
+  .list { margin-top: 14px; font-size: 13px; }
+  .list h2 { font-size: 14px; margin: 14px 0 4px; }
+  .row { background: #1c1c1c; border-radius: 6px; padding: 6px 8px; margin-bottom: 6px; }
+  .row b { font-weight: 600; }
+  .st { font-size: 11px; padding: 0 6px; border-radius: 8px; margin-left: 6px; }
+  .st.done { background: #2a6a3a; } .st.active { background: #2a4a7a; } .st.blocked { background: #5a2a2a; } .st.pending { background: #444; }
+  .note { color: #aaa; font-size: 12px; margin-top: 2px; }
+  .after { color: #8bf; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>cowfs dependency graph</h1>
+<div class="meta" id="meta">loading…</div>
+<div class="ctl"><a href="/">Tracker</a><button id="doneBtn" onclick="toggleDone()"></button><button onclick="load()">Refresh</button></div>
+<div class="legend">An arrow A &rarr; B means <b>B waits for A</b>.
+  <span style="background:#2a6a3a">done</span><span style="background:#2a4a7a">active</span>
+  <span style="background:#5a2a2a">blocked</span><span style="background:#444">pending</span></div>
+<div id="graph">drawing…</div>
+<div class="list" id="list"></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.3/dist/mermaid.min.js"></script>
+<script>
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+function q(s) { return String(s).replace(/"/g, "'").replace(/[\[\]{}()<>]/g, " ").slice(0, 60); }
+let showDone = false;
+try { showDone = localStorage.getItem("cowfsGraphDone") === "1"; } catch (e) {}
+function toggleDone() {
+  showDone = !showDone;
+  try { localStorage.setItem("cowfsGraphDone", showDone ? "1" : "0"); } catch (e) {}
+  load();
+}
+function groupOf(i) {
+  const st = String(i.state ?? "").toLowerCase();
+  if (i.done || st === "done") return "done";
+  if (st === "blocked" || st === "failed") return "blocked";
+  if (st === "pending" || st === "ready") return "pending";
+  return "active";
+}
+mermaid.initialize({ startOnLoad: false, theme: "dark", flowchart: { htmlLabels: true, curve: "basis" }, securityLevel: "strict" });
+async function load() {
+  document.getElementById("doneBtn").textContent = showDone ? "Hide done" : "Show done";
+  const s = await (await fetch("status.json?t=" + Date.now(), { cache: "no-store" })).json();
+  const items = {};
+  s.phases.forEach(p => p.items.forEach(i => { items[String(i.id)] = i; }));
+  const deps = s.dependencies || {};
+  const visible = id => items[id] && (showDone || groupOf(items[id]) !== "done");
+  const edges = [];
+  Object.entries(deps).forEach(([a, bs]) => bs.forEach(b => { if (visible(a) && visible(b)) edges.push([b, a]); }));
+  const inGraph = new Set(edges.flat());
+  const nid = id => "n_" + id.replace(/[^A-Za-z0-9]/g, "_");
+  const lines = ["flowchart LR"];
+  inGraph.forEach(id => lines.push(`  ${nid(id)}["${q(items[id].title)}"]:::${groupOf(items[id])}`));
+  edges.forEach(([b, a]) => lines.push(`  ${nid(b)} --> ${nid(a)}`));
+  lines.push("  classDef done fill:#2a6a3a,stroke:#3a8a4a,color:#fff;");
+  lines.push("  classDef active fill:#2a4a7a,stroke:#3b82f6,color:#fff;");
+  lines.push("  classDef blocked fill:#5a2a2a,stroke:#a33,color:#fff;");
+  lines.push("  classDef pending fill:#444,stroke:#777,color:#fff;");
+  const open = Object.values(items).filter(i => groupOf(i) !== "done");
+  document.getElementById("meta").textContent =
+    `${open.length} open of ${Object.keys(items).length} items · ${edges.length} dependencies drawn · plan ${s.updated} · refreshed ${new Date().toLocaleTimeString()}`;
+  try {
+    const { svg } = await mermaid.render("g" + Date.now(), lines.join("\n"));
+    document.getElementById("graph").innerHTML = svg;
+  } catch (e) {
+    document.getElementById("graph").textContent = "graph failed to draw: " + e;
+  }
+  const order = { blocked: 0, active: 1, pending: 2, done: 3 };
+  const rows = Object.values(items).filter(i => showDone || groupOf(i) !== "done")
+    .sort((x, y) => order[groupOf(x)] - order[groupOf(y)]);
+  document.getElementById("list").innerHTML = "<h2>Items</h2>" + rows.map(i => {
+    const g = groupOf(i), d = (deps[String(i.id)] || []).filter(x => items[x]);
+    const wait = d.length ? `<div class="after">waits for: ${d.map(x => esc(items[x].title.slice(0, 40)) + " (" + groupOf(items[x]) + ")").join(" · ")}</div>` : "";
+    const note = (i.status_note || i.note || "").slice(0, 260);
+    return `<div class="row"><b>${esc(i.title)}</b><span class="st ${g}">${esc(i.state)}</span>${wait}${note ? `<div class="note">${esc(note)}</div>` : ""}</div>`;
+  }).join("");
+}
+load().catch(e => { document.getElementById("meta").textContent = "failed: " + e; });
+setInterval(() => load().catch(() => {}), 30000);
+</script>
+</body>
+</html>

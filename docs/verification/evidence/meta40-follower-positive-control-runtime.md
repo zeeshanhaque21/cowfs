@@ -1,0 +1,11 @@
+# #40 follower-durable-ack positive control: runtime evidence (wbuddy, READONLY)
+
+Scope: PR #146 head only; not whole-#40. Source fix accepted on review SHA256 `1a643100500696b55c1d70a3c73ecfc0caeae8f0efb6ef3200f085f203232fad` (`docs/reviews/pr146-hook-setup-final-wbuddy-review.md`); no new broad source audit.
+Checkout pinned: PR146 head `efb125c8a129df69c9333de4c15d7096500eaa8f`, tree `811f1bc36239df2a845a529cb30e1a3a8fb5b20f`, parent `e91533077baca6f8963d93594f94dbcb87a8a184`; branch `test/meta-follower-durability-40` == remote. main `9874afae` (primary) unchanged; origin/main `01fa855f`, tree `ab4aa816`, NOT ancestor of head.
+CI run `37543390611` @ `efb125c`: completed/success; jobs ubuntu-latest, macos-latest, linux-fuse all success.
+Named unit test, real PASS both platforms: `db::tests::follower_wait_does_not_ack_before_the_leader_publishes_durable_seq ... ok` (ubuntu 22:59:20Z, macos 23:01:58Z).
+Integration `tests/follower_durability.rs`, 2 passed both platforms: `single_durable_ack_follows_the_hook ... ok`, `every_durable_ack_is_durable_on_return_including_followers ... ok` (ubuntu 2 passed/0 failed, macos 2 passed/0 failed).
+Reopen/crash-adjacent surface seen green: `the_flags_survive_a_close_and_a_reopen`, `opening_a_healthy_file_reports_no_recovery`, `a_failed_recovery_is_reported_and_restores_the_file_byte_for_byte`; cowfs-meta lib 135 tests 133 passed 2 ignored, integration blocks 7/14/20 pass 0 fail (both platforms).
+fmt/clippy: `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` succeeded in-job (ubuntu Finished 6.80s, macos 12.37s), zero warnings.
+REMAINING / NOT PROVEN: canonical early-follower mutant at `wait_durable` (`if *led { return Ok(()); }`) NOT EXECUTED - green CI is NOT that kill; 150ms probe branch can false-green an unscheduled follower and requires a real control. Mutation gate + all 5 whole-#40 controls, crash store, Core health stay open. No merge recommendation until mutant-executed-red proof.
+CONSTRAINTS: this run was read-only. No local cargo/build/test/mutation/probe; no checkout/main commit/push; no workflow dispatch/rerun/poll; no leases/worktrees/cleanup/offload/waiver. Prior READY5 19Gi > 8Gi cap; no execution authorization, no bypass proposed.
