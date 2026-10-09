@@ -282,5 +282,49 @@ class TreehouseIsInstalledNotSkipped(unittest.TestCase):
             self.assertFalse((Path(d) / "bin" / "treehouse").exists(), "an unverified archive must not be extracted")
 
 
+NS_JOB = WORKFLOW_YAML["jobs"]["linux-namespaces"]
+NS_STEPS = {s["name"]: s for s in NS_JOB["steps"] if "name" in s}
+
+
+class NamespaceKernelMatrix(unittest.TestCase):
+    """Issue 171: the isolation tests run on every hosted image listed, not only ubuntu-latest."""
+
+    IMAGES = ["ubuntu-latest", "ubuntu-22.04"]  # 24.04 / kernel 6.17 and 22.04 / kernel 6.8
+
+    def test_the_job_is_a_matrix_over_every_image_and_none_is_dropped_on_failure(self):
+        self.assertEqual(NS_JOB["strategy"]["matrix"]["os"], self.IMAGES)
+        self.assertEqual(NS_JOB["runs-on"], "${{ matrix.os }}")
+        self.assertIs(NS_JOB["strategy"]["fail-fast"], False, "one image failing must not hide the other's result")
+
+    def test_the_check_aggregate_requires_the_matrix_job(self):
+        self.assertIn("linux-namespaces", WORKFLOW_YAML["jobs"]["check"]["needs"])
+
+    def test_the_gate_steps_keep_their_names(self):
+        self.assertEqual(
+            list(NS_STEPS), ["Allow unprivileged user namespaces", "Namespace tests", "Enforce that isolation ran, not skipped"]
+        )
+
+    def run_allow_step(self, key_exists):
+        """Run the sysctl step with stub sysctl/sudo/unshare; return (rc, recorded sysctl writes)."""
+        with tempfile.TemporaryDirectory() as d:
+            for name, body in {
+                "sysctl": f'#!/bin/sh\n[ "$1" = -w ] && {{ echo "$@" >> "{d}/writes"; exit 0; }}\n' + ("exit 0\n" if key_exists else "exit 255\n"),
+                "sudo": '#!/bin/sh\nexec "$@"\n',
+                "unshare": "#!/bin/sh\nexit 0\n",
+            }.items():
+                (Path(d) / name).write_text(body)
+                (Path(d) / name).chmod(0o755)
+            env = {**os.environ, "PATH": f"{d}:{os.environ['PATH']}"}
+            r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", NS_STEPS["Allow unprivileged user namespaces"]["run"]], env=env, capture_output=True, text=True)
+            w = Path(d, "writes")
+            return r.returncode, w.read_text().splitlines() if w.exists() else []
+
+    def test_the_sysctl_is_lifted_only_where_the_key_exists(self):
+        rc, writes = self.run_allow_step(key_exists=True)
+        self.assertEqual((rc, writes), (0, ["-w kernel.apparmor_restrict_unprivileged_userns=0"]))
+        rc, writes = self.run_allow_step(key_exists=False)
+        self.assertEqual((rc, writes), (0, []), "a kernel without the key must not fail the step")
+
+
 if __name__ == "__main__":
     unittest.main()
