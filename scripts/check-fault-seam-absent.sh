@@ -7,10 +7,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/seam-check}"
 NEEDLE=C7D_EXIT
-# The crash-model log (issue 247) is gated by the same feature, so its entry point is a second needle.
+# The crash-model log (issue 247) is gated by the same feature. Only the release binary is searched
+# for its entry point: an rlib lists cfg-gated item names in its metadata even when they are off.
+# That needle has no positive control of its own (unused, it is dropped from a release binary), so
+# the C7D_EXIT hit with the feature on is what proves the binary check can see anything.
 NEEDLE2=oplog_start
 
-count() { grep -ac -e "$NEEDLE" -e "$NEEDLE2" "$CARGO_TARGET_DIR"/debug/libcowfs_store.rlib || true; }
+count() { grep -ac "$NEEDLE" "$CARGO_TARGET_DIR"/debug/libcowfs_store.rlib || true; }
 
 cargo build -q -p cowfs-store -p cowfs-gc --lib
 if cargo tree -q -p cowfs-daemon -e features -i cowfs-store | grep -q fault-injection; then
