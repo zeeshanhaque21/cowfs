@@ -400,6 +400,7 @@ Client defaults, `ClientOptions`, and the CLI `--timeout`:
   (exit 3) instead of a connection nobody serves.
 - Every close after an error reply follows the same discipline: write the frame, half-close, read
   away what the peer already sent, then close.
+  Once the shutdown deadline has passed the read-away is skipped, so the close does not outlive `wait()`.
 - In-flight requests are cancelled.
   Handlers that stop send their final frame, which is `shutting_down` (a `cancelled` result is rewritten to it).
 - The server waits up to the shutdown deadline (5 s by default).
