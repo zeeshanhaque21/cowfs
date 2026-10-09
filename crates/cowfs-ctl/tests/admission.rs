@@ -402,27 +402,38 @@ fn a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace() 
     // actually resumed, from before `shutdown()`, which is never later than the server's own start.
     // An attempt that resumed late is discarded and rerun; only an on-time resume is asserted on.
     let window = Duration::from_millis(450);
-    let mut late = Vec::new();
-    for _ in 0..5 {
-        let (e, resumed) = a4_resume_after_400ms();
-        eprintln!("A4 within-grace ending={e:?} resumed_at={resumed:?}");
-        if resumed >= window {
-            late.push(resumed);
-            continue;
+    // 250 ms is 50 ms past the 200 ms shutdown deadline (the abandon path has begun) and leaves 200 ms
+    // of scheduler slack before the 450 ms close; it must be asserted. 400 ms probes the far edge of
+    // the window, where 50 ms of slack is below the starvation seen on shared macOS runners (resumes
+    // measured at 453..547 ms for a nominal 400 ms), so it is asserted only when it lands in time.
+    for (delay_ms, required) in [(250u64, true), (400, false)] {
+        let mut late = Vec::new();
+        let mut asserted = false;
+        for _ in 0..5 {
+            let (e, resumed) = a4_resume_after(delay_ms);
+            eprintln!("A4 within-grace delay={delay_ms}ms ending={e:?} resumed_at={resumed:?}");
+            if resumed >= window {
+                late.push(resumed);
+                continue;
+            }
+            assert_eq!(
+                e,
+                Ending::Response,
+                "a client that resumed at {resumed:?}, inside the {window:?} window, must get its whole terminal frame: {e:?}"
+            );
+            asserted = true;
+            break;
         }
-        assert_eq!(
-            e,
-            Ending::Response,
-            "a client that resumed at {resumed:?}, inside the {window:?} window, must get its whole terminal frame: {e:?}"
+        assert!(
+            asserted || !required,
+            "no {delay_ms} ms attempt resumed inside the {window:?} window, so the runner was too starved to test it: {late:?}"
         );
-        return;
     }
-    panic!("no attempt resumed inside the {window:?} window, so the runner was too starved to test it: {late:?}");
 }
 
 /// One run of the scenario: returns the ending and how long after just before `shutdown()` the
 /// client began reading.
-fn a4_resume_after_400ms() -> (Ending, Duration) {
+fn a4_resume_after(delay_ms: u64) -> (Ending, Duration) {
     let fx = start_with(
         Streamer {
             steps: 20_000,
@@ -448,9 +459,7 @@ fn a4_resume_after_400ms() -> (Ending, Duration) {
     thread::sleep(Duration::from_millis(300));
     let t0 = Instant::now();
     fx.server().handle().shutdown();
-    // Aim to resume at 400 ms, inside the promised window: `shutdown_deadline` 200 ms plus the
-    // 250 ms grace closes at 450 ms.
-    thread::sleep(Duration::from_millis(400));
+    thread::sleep(Duration::from_millis(delay_ms));
     drop(w);
     let resumed = t0.elapsed();
     (classify(&s, Duration::from_millis(2500)), resumed)
