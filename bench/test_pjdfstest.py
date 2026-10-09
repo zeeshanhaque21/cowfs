@@ -519,15 +519,12 @@ class VerdictStates(unittest.TestCase):
             self.assertTrue(any("mixes cases" in problem for problem in report["guard_problems"]))
 
 
-EVIDENCE = Path("/Users/zeeshanhaque/Projects/cowfs/bench/out/ready-g3/run")
+TESTDATA = Path(__file__).resolve().parent / "pjdfstest-testdata"
 
 
-def arms_from(run: Path) -> dict:
-    arms: dict = {}
-    for line in (run / "cases.jsonl").read_text().splitlines():
-        rec = json.loads(line)
-        arms.setdefault(rec["arm"], {})[rec["test"]] = rec
-    return arms
+def arms_from(name: str) -> dict:
+    import derive_pjdfstest_divergences as d
+    return d.load_arms(TESTDATA / name)
 
 
 def divergence_messages(reasons):
@@ -542,7 +539,7 @@ class AcceptedDivergences(unittest.TestCase):
                 "cowfs": {test: record("cowfs", test, [case(ok, n=i + 1) for i, ok in enumerate(cowfs_ok)])}}
 
     def entry(self, n, issue="#1", test="a/03.t"):
-        return {"test": test, "n": n, "issue": issue, "reason": "r"}
+        return {"test": test, "n": n, "issue": issue, "reason": "r", "match": "(?s)."}
 
     def test_uncovered_worse_position_is_divergence(self):
         out = p.accepted_reasons(self.arms([True, True], [True, False]), [])
@@ -576,21 +573,38 @@ class AcceptedDivergences(unittest.TestCase):
     def test_entry_without_a_reason_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "a.json"
-            path.write_text(json.dumps({"entries": [{"test": "a", "n": 1, "issue": "#1"}]}))
+            path.write_text(json.dumps({"entries": [{"test": "a", "n": 1, "issue": "#1", "match": "."}]}))
             with self.assertRaises(ValueError):
                 p.load_accepted(path)
 
-    @unittest.skipUnless((EVIDENCE / "20261009T070408Z").is_dir() and (EVIDENCE / "20261009T071336Z").is_dir(),
-                         "2026-10-09 g3 evidence (gitignored) is not present")
-    def test_2026_10_09_evidence(self):
-        sample = arms_from(EVIDENCE / "20261009T070408Z")
-        full = arms_from(EVIDENCE / "20261009T071336Z")
+    def test_a_different_failure_at_a_listed_position_is_not_waived(self):
+        arms = self.arms([True, True], [True, False])
+        arms["cowfs"]["a/03.t"]["cases"][1]["detail"] = "tried 'x', expected ENXIO, got EACCES"
+        entry = dict(self.entry(2), match="expected EPERM")
+        out = p.accepted_reasons(arms, [entry])
+        self.assertIn("signature", divergence_messages(out)[0])
+        self.assertEqual(divergence_messages(p.accepted_reasons(arms, [dict(entry, match="EACCES")])), [])
+
+    def test_stderr_signature_matches_case_scoped_entries(self):
+        arms = self.arms([True, True], [True, False])
+        arms["cowfs"]["a/03.t"]["stderr_tail"] = "pathconf returned -1"
+        self.assertEqual(divergence_messages(p.accepted_reasons(arms, [dict(self.entry(2), match="pathconf")])), [])
+
+    def test_entry_without_a_match_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.json"
+            path.write_text(json.dumps({"entries": [{"test": "a", "n": 1, "issue": "#1", "reason": "r"}]}))
+            with self.assertRaises(ValueError):
+                p.load_accepted(path)
+
+    def test_2026_10_09_evidence_slice(self):
+        sample = arms_from("g3-20261009T070408Z-slice.jsonl")
+        full = arms_from("g3-20261009T071336Z-slice.jsonl")
         # Before this change the sample had no DIVERGENCE reason (the harness said PASS on
         # coverage alone) although 20 positions were worse. Now it FAILs without the list.
         self.assertEqual(len(p.ordinal_rows(sample)[0]), 20)
         self.assertEqual(len(divergence_messages(p.accepted_reasons(sample, []))), 1)
         self.assertEqual(len(divergence_messages(p.accepted_reasons(full, []))), 1)
-        # With the checked-in list every one of the 71 worse positions is covered.
         listed = p.load_accepted()
         for arms in (sample, full):
             self.assertEqual(divergence_messages(p.accepted_reasons(arms, listed)), [])
@@ -601,8 +615,25 @@ class AcceptedDivergences(unittest.TestCase):
         self.assertEqual(len({t for t, _ in by_issue["#108"]}), 13)
         self.assertEqual(by_issue["#204"], [("open/17.t", 2)])
         self.assertEqual(by_issue["#109"], [("unlink/14.t", 4)])
-        # The list is exact for the full run: nothing in it has rotted.
         self.assertFalse([r for r in p.accepted_reasons(full, listed) if "listed but not worse" in r["message"]])
+
+    def test_the_critics_mutation_is_a_divergence(self):
+        # Changing the failure text at unlink/14.t #4 to an unrelated error used to stay waived.
+        full = arms_from("g3-20261009T071336Z-slice.jsonl")
+        full["cowfs"]["unlink/14.t"]["cases"][3]["detail"] = "tried 'unlink x', expected 0, got EIO"
+        out = p.accepted_reasons(full, p.load_accepted())
+        self.assertIn("unlink/14.t #4", divergence_messages(out)[0])
+
+    def test_the_list_is_exactly_what_the_derivation_script_produces(self):
+        import derive_pjdfstest_divergences as d
+        derived = d.derive(arms_from("g3-20261009T071336Z-slice.jsonl"), "x")
+        self.assertEqual(derived["entries"], p.load_accepted())
+
+    def test_the_derivation_script_refuses_an_unclassified_worse_position(self):
+        import derive_pjdfstest_divergences as d
+        with self.assertRaises(SystemExit) as ctx:
+            d.derive(self.arms([True], [False]), "x")
+        self.assertIn("a/03.t #1", str(ctx.exception))
 
 
 class TestList(unittest.TestCase):
@@ -767,8 +798,8 @@ class ReconcileNeverOverwrites(unittest.TestCase):
         self.assertEqual(payload["state"], p.FAIL)
         self.assertEqual(len(payload["comparison"]["established_regressions"]), self.ESTABLISHED)
         self.assertEqual(len(payload["comparison"]["unpairable"]), self.UNPAIRABLE)
-        # The established regression, plus the fixture's 25 pre-fix mkfifo/00.t worse positions,
-        # which no accepted divergence covers.
+        # The established regression, plus the fixture's 25 uncovered worse positions (22 mkfifo/00.t,
+        # 2 open/17.t, 1 rmdir/12.t) that no accepted divergence covers.
         self.assertEqual(sorted(r["message"].split(" ", 1)[1][:30] for r in payload["reasons"]
                                 if r["kind"] == "DIVERGENCE"),
                          ["established assertion(s) pass ", "ordinal-worse position(s) are "])

@@ -929,7 +929,9 @@ def ordinal_rows(arms: dict) -> tuple[list[dict], list[dict]]:
         for index in sorted(set(native) & set(cowfs)):
             left, right = native[index], cowfs[index]
             row = {"test": test, "n": index, "native_detail": left["detail"],
-                   "cowfs_detail": right["detail"], "root_required": bool(right["root_required"])}
+                   "cowfs_detail": right["detail"], "root_required": bool(right["root_required"]),
+                   "cowfs_stderr": arms["cowfs"][test].get("stderr")
+                   or arms["cowfs"][test].get("stderr_tail") or ""}
             if left["ok"] and not right["ok"]:
                 regressions.append(row)
             elif not left["ok"] and right["ok"]:
@@ -1000,7 +1002,9 @@ def load_accepted(path: Path = ACCEPTED_DIVERGENCES) -> list[dict]:
     """The checked-in list of ordinal-worse positions that are documented, accepted divergences.
 
     Every entry names (test, n, issue) and carries a reason, so an accepted position is a decision
-    on record and not a silent skip. A malformed list raises: a gate must not guess its own waivers.
+    on record and not a silent skip. `match` is a regex searched in the failing assertion's cowfs
+    detail followed by the case's stderr, so a waiver only covers the failure it was written for:
+    a different failure at a listed position is not waived. A malformed list raises: a gate must not guess its own waivers.
     An absent file waives nothing, which can only make the verdict stricter.
     """
     if not Path(path).is_file():
@@ -1008,9 +1012,10 @@ def load_accepted(path: Path = ACCEPTED_DIVERGENCES) -> list[dict]:
     document = json.loads(Path(path).read_text())
     entries = document["entries"]
     for entry in entries:
-        missing = [k for k in ("test", "n", "issue", "reason") if not entry.get(k)]
+        missing = [k for k in ("test", "n", "issue", "reason", "match") if not entry.get(k)]
         if missing:
             raise ValueError(f"{path}: accepted divergence {entry!r} lacks {missing}")
+        re.compile(entry["match"])
     return entries
 
 
@@ -1022,13 +1027,20 @@ def accepted_reasons(arms: dict, accepted: list[dict]) -> list[dict]:
     """
     worse, _ = ordinal_rows(arms)
     listed = {(e["test"], e["n"]): e for e in accepted}
-    uncovered = [r for r in worse if (r["test"], r["n"]) not in listed]
+    def waived(row: dict) -> bool:
+        entry = listed.get((row["test"], row["n"]))
+        return bool(entry) and bool(re.search(entry["match"], row["cowfs_detail"] + "\n" + row["cowfs_stderr"]))
+
+    uncovered = [r for r in worse if not waived(r)]
+    unmatched = [r for r in uncovered if (r["test"], r["n"]) in listed]
     out = []
     if uncovered:
         shown = ", ".join(f"{r['test']} #{r['n']}" for r in uncovered[:20])
         more = f" (+{len(uncovered) - 20} more)" if len(uncovered) > 20 else ""
         out.append(reason(DIVERGENCE, f"{len(uncovered)} ordinal-worse position(s) are not covered by "
-                                      f"an accepted divergence: {shown}{more}"))
+                                      f"an accepted divergence: {shown}{more}"
+                                      + (f"; {len(unmatched)} of them are listed but the failure no "
+                                         "longer matches the entry's signature" if unmatched else "")))
     worse_keys = {(r["test"], r["n"]) for r in worse}
     compared = set(arms.get("native", {})) & set(arms.get("cowfs", {}))
     stale = [e for e in accepted if e["test"] in compared and (e["test"], e["n"]) not in worse_keys]
@@ -1038,8 +1050,7 @@ def accepted_reasons(arms: dict, accepted: list[dict]) -> list[dict]:
                                     f"this run, remove them if fixed: {shown}"))
     covered = len(worse) - len(uncovered)
     if covered:
-        issues = collections.Counter(listed[(r["test"], r["n"])]["issue"] for r in worse
-                                     if (r["test"], r["n"]) in listed)
+        issues = collections.Counter(listed[(r["test"], r["n"])]["issue"] for r in worse if waived(r))
         out.append(reason(COVERAGE, f"{covered} ordinal-worse position(s) are accepted divergences: "
                                     f"{dict(issues)}"))
     return out
