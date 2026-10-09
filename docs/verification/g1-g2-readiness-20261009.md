@@ -111,6 +111,42 @@ Harness dry run, native only, no mount, `-j 4`, load1 8 to 11 (busy host), NOT A
 It shows the machinery works end to end at the new pin (clone, fetch of the pinned sha, reset-and-edit, json parse, validity rule, JSONL rows with the new `corpus_sha`).
 The times are inflated by the busy host and mean nothing about cowfs; no quiet-host run exists, so no gate result is produced.
 
+### g2 UNMEASURABLE rule and the heavier edit (issue 221, NOT A GATE RESULT)
+
+Source: `docs/reviews/216-critic-20261009.md`.
+The same edit varied 1.4 to 12.8 s (`cowfs-ctl`) and 1.3 to 7.0 s (`cowfs-core`) across reps on one host at load 11 to 17, against a bar that tests a 0.5 to 1.0 s margin.
+On macOS the g2 bar is an added-seconds budget (`--budget-add`, default 1.0 s), not 1.5x; only Linux uses the 1.5x ratio.
+
+Changes:
+- The per-rep `git checkout --` reset and the file edit moved out of the timed region: `Ctx.g2_prep()` runs before the timer, `Ctx.g2()` is only the `cargo build`.
+- `compare.py` never prints PASS or FAIL for g2 unless all three hold, and otherwise prints `UNMEASURABLE: <reason>` (exit 2, like the load ceiling):
+
+| Parameter | Value | Why |
+| --- | --- | --- |
+| `G2_NATIVE_FLOOR_S` | 3.0 s native median | At 1.4 s native, the 1.0 s budget is a 70 percent margin that one rep's noise (1.3 to 12.8 s) exceeds. At 3 s the budget is at most 33 percent. 3 s is the critic's figure. |
+| `G2_SPREAD_MAX` | 2.0 (max/min of the reps), each arm | Critic's quiet `cowfs-daemon` reps spanned 1.28x and `cowfs-vfs` 1.72x; the load 11 to 17 `cowfs-ctl` and `cowfs-core` edits spanned 9.3x and 5.4x. 2.0 admits the first two and refuses the last two. Chosen, not derived. |
+| `G2_MIN_REPS` | 3 per arm | A spread of fewer than 3 reps says nothing. |
+
+The verdict text says what to do: run it on a quiet host, or use a heavier edit target so native work is several seconds.
+The rule needs to be re-tuned from a quiet-host run; the numbers above are a refusal threshold from noisy-host data, not a calibrated bar.
+
+Heavier edit, measured in a scratch clone of `3f4fba2` (edit `cowfs-vfs/src/lib.rs`, one comment line, separate `CARGO_TARGET_DIR` per variant, `cargo build ... --offline --locked -j 4 --message-format=json`, 1 discarded rep then 10 reps each, NOT A GATE RESULT).
+Host load1 was 175 to 212 for the first two variants and 50 to 136 for the third (a very busy shared Mac with 25 sessions), so these are worst-case-noise numbers:
+
+| Command | Units rebuilt | Executables relinked | Median | Min to max | Spread |
+| --- | --- | --- | --- | --- | --- |
+| `cargo build` (previous g2) | 13 | 3 | 2.59 s | 2.27 to 2.84 s | 1.25x |
+| `cargo build --tests` | 127 | 117 | 22.97 s | 17.37 to 29.34 s | 1.69x |
+| `cargo build --all-targets` | 133 | 123 | 23.51 s | 16.90 to 30.57 s | 1.81x |
+
+Decision: ADOPTED `cargo build --tests` for g2 (about 23 s of native work, well above the 4 s bar and the 3 s floor; spread 1.69x is inside the 2.0 bound even at load 175 to 212).
+`--all-targets` costs the same and adds examples and benches the edit does not matter for.
+A new untimed `warm_tests` step builds the test targets once before rep 0, so rep 0 is an edit and not a cold test build.
+Unit and relink counts are now about 127 and 117, so the `G2_MIN_UNITS` shape floor (3 units, 1 relink) is loose; it is kept as a floor on shape, not an expected count.
+Harness dry run of the new g2, native only, no mount, load1 26 to 34, NOT A GATE RESULT: `python3 bench/gates.py --gates g2 --reps 3` gave 15.44 s, 16.65 s, 17.93 s, each with `rebuilt_count` 127 and `bins_relinked` 117.
+Not yet measured: the cowfs arm (through the mount) on this workload, any Linux number, and any quiet-host number.
+The previous "Edit at the new pin" table above is the plain-build record and still holds for it.
+
 ### Why the earlier edit, history at the retired pin `c1619ec` (superseded by the section above)
 
 The previous edit appended a comment to `crates/cowfs-vfs-path/src/cookies.rs`.

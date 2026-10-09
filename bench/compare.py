@@ -77,6 +77,17 @@ RATIO_BAR = 1.5
 LOAD_CEILING = 30.0
 LOAD_SKEW = 2.0
 GATES = ["g1", "g2", "g3", "g4", "g5", "g6"]
+# g2 is UNMEASURABLE, never a PASS or FAIL, unless it is long and steady enough to test its bar (issue #221).
+# Chosen from the PR 216 critic data (docs/reviews/216-critic-20261009.md), not derived:
+#   floor: macOS budget is 1.0 s added and Linux is 1.5x, so a 1.4 s native median leaves a 0.7 to 1.0 s margin that a
+#   single rep's noise (1.3 to 12.8 s same edit, same host, load 11 to 17) exceeds. 3 s is the critic's figure and makes
+#   the 1.0 s budget at most a 33 percent margin.
+#   spread: a quiet cowfs-daemon edit varied 4.40 to 5.64 s (1.28x), cowfs-vfs 2.50 to 4.30 s (1.72x), and the load-11-to-17
+#   ctl and core edits 9.3x and 5.4x. 2.0x admits the first two and refuses the last two.
+#   reps: a spread of fewer than 3 reps says nothing.
+G2_NATIVE_FLOOR_S = 3.0
+G2_SPREAD_MAX = 2.0
+G2_MIN_REPS = 3
 
 
 def rows_of(path):
@@ -354,6 +365,22 @@ def ratios(a, b):
     return [r for r in pairs if not math.isnan(r)]
 
 
+def g2_unmeasurable(native, cowfs):
+    """Why g2 cannot be ruled on, or None. Both arms are checked: a noisy cowfs arm is as unusable as a noisy native one."""
+    fix = "run it on a quiet host, or use a heavier edit target so native work is several seconds"
+    for arm, rows in (("native", native), ("cowfs", cowfs)):
+        if len(rows) < G2_MIN_REPS:
+            return f"{arm} arm has {len(rows)} g2 reps, need {G2_MIN_REPS}; {fix}"
+    med = median(native)
+    if med < G2_NATIVE_FLOOR_S:
+        return f"native median {med:.2f}s is under the {G2_NATIVE_FLOOR_S:.1f}s floor, too short for the bar; {fix}"
+    for arm, rows in (("native", native), ("cowfs", cowfs)):
+        lo, hi = spread(rows)
+        if lo <= 0 or hi / lo > G2_SPREAD_MAX:
+            return f"{arm} reps span {lo:.2f}s to {hi:.2f}s, over the {G2_SPREAD_MAX:.1f}x spread bound; {fix}"
+    return None
+
+
 def verdict(gate, med_a, med_b, mn, mx, on_macos, budget):
     if gate in ("g1", "g3"):
         ok = med_b <= RATIO_BAR * med_a
@@ -443,6 +470,12 @@ def main() -> int:
                   f"skew limit {LOAD_SKEW}x)")
             unmeasurable += 1
             continue
+        if gate == "g2":
+            why = g2_unmeasurable(a, b)
+            if why:
+                print(f"UNMEASURABLE: {why}")
+                unmeasurable += 1
+                continue
         status, why = verdict(gate, ma, mb, mn, mx, on_macos, args.budget_add)
         print(f"{status} ({why})")
         if status == "FAIL":
