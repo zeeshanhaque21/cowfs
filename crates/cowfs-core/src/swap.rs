@@ -17,8 +17,8 @@
 //! 1. fork the source into a staging name (a failure here changes nothing),
 //! 2. write and sync the intent file `<root>/swap-<target>`, naming the staging and target snapshots,
 //! 3. remove the old target if there is one,          <- rollback is no longer possible
-//! 4. fork the staging snapshot into the target name,
-//! 5. remove the staging snapshot,
+//! 4. rename the staging snapshot to the target name (one metadata transaction, the id is kept),
+//! 5. (nothing: the staging name left with the rename; an older release forked and removed here),
 //! 6. remove the intent file.
 //!
 //! A crash or error from step 3 on leaves the intent file, and the next `Core::open` finishes
@@ -294,8 +294,8 @@ impl Core {
     /// staging, so `Core::rename_snapshot` commits the name directly.
     /// Returns `Ok` only when the new name is in place. Returns `Err` with the mount unchanged,
     /// except after the old target was removed, where the swap is rolled forward instead.
-    /// The two forks change the snapshot id, so every inode number in the new snapshot differs
-    /// from the old one's.
+    /// The one fork gives the new snapshot a new id, which it keeps under the target name, so every
+    /// inode number in it differs from the old target's.
     pub(crate) fn swap_snapshot(
         &self,
         src: &str,
@@ -426,8 +426,7 @@ impl Core {
         sync_dir(&self.inner.root);
     }
 
-    /// Steps 4 to 6: fork the staging snapshot into the target name, remove the staging snapshot,
-    /// remove the intent file.
+    /// Steps 4 to 6: rename the staging snapshot to the target name, remove the intent file.
     pub(crate) fn finish_swap(
         &self,
         staged: &str,
@@ -441,9 +440,10 @@ impl Core {
         if self.inner.snap_by_name(target).is_err() {
             let sc = self.inner.snap_by_name_raw(staged)?;
             self.inner.flush_snapshot(&sc)?;
-            let fork = sc.snap.fork(target).map_err(control_meta)?;
-            entry = Some(self.inner.register(fork)?);
+            entry = Some(self.move_name(&sc, staged, target)?);
         }
+        // Only an old target that already existed (a crash left both names) leaves a staging
+        // snapshot here; after the rename above there is none.
         if let Ok(st) = self.inner.snap_by_name_raw(staged) {
             let _ = self.inner.unregister(&st);
         }
