@@ -357,7 +357,10 @@ fn delivery_evidence(
 ) -> String {
     let tail_from = raw.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     let mut kinds = std::collections::BTreeMap::<String, usize>::new();
-    for l in raw[..tail_from].split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+    for l in raw[..tail_from]
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+    {
         let k = serde_json::from_slice::<serde_json::Value>(l)
             .ok()
             .and_then(|v| v["type"].as_str().map(str::to_owned))

@@ -92,7 +92,10 @@ fn layout() -> Layout {
             }
             versions.push(v);
         }
-        assert!(seed < 5000, "could not build {VERSIONS} boundary-preserving versions");
+        assert!(
+            seed < 5000,
+            "could not build {VERSIONS} boundary-preserving versions"
+        );
     }
     Layout {
         image,
@@ -113,7 +116,11 @@ fn run(opts: Options, arm: &str) {
 
     let off = l.block as u64;
     let stop = AtomicBool::new(false);
-    let (reads, torn, seen) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let (reads, torn, seen) = (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    );
     let first_tear = std::sync::Mutex::new(None::<String>);
     let start = Instant::now();
     let mut last = 0;
@@ -134,10 +141,10 @@ fn run(opts: Options, arm: &str) {
                                     u64::from_le_bytes(got[BLOCK - 8..].try_into().unwrap()),
                                 )
                             });
-                            first_tear
-                                .lock()
-                                .unwrap()
-                                .get_or_insert(format!("len={} head/tail tags={tags:?}", got.len()));
+                            first_tear.lock().unwrap().get_or_insert(format!(
+                                "len={} head/tail tags={tags:?}",
+                                got.len()
+                            ));
                         }
                     }
                 }
