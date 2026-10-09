@@ -161,6 +161,7 @@ fn read_only_mount_refuses_writes() {
 }
 
 /// `fallocate(2)` on an open file; 0 on success, else the errno.
+#[allow(unsafe_code)]
 fn falloc(f: &File, mode: i32, off: i64, len: i64) -> i32 {
     use std::os::fd::AsRawFd;
     // SAFETY: plain syscall on a valid open descriptor
