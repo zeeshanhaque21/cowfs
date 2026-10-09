@@ -266,6 +266,8 @@ fn fault_boundary(kind: &str) {
 }
 
 #[cfg(test)]
+// A counting allocator cannot be written without `unsafe`; this test module is the one place.
+#[allow(unsafe_code)]
 mod alloc_tests {
     use super::*;
     use std::alloc::{GlobalAlloc, Layout, System};
