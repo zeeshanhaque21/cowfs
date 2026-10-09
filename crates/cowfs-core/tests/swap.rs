@@ -592,3 +592,59 @@ fn a_torn_intent_with_the_target_still_present_keeps_the_target() {
     assert_eq!(content(&c, "abc", "f"), "old");
     assert!(raw_leftovers(dir.path(), &c).is_empty());
 }
+
+fn max_id(c: &Core) -> u64 {
+    c.list_snapshots().unwrap().iter().map(|e| e.id).max().unwrap()
+}
+
+/// Issue 42 (a): a promotion forks once. The staged snapshot is renamed into the target name and
+/// keeps its id, so the call consumes exactly one snapshot id, with or without a victim.
+#[test]
+fn promote_base_forks_once_and_keeps_the_staged_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    c.create_snapshot("base").unwrap();
+    let rb = root_entry(&c, "base").ino;
+    mkfile(&c, rb, "f", b"old base");
+    c.create_snapshot("src").unwrap();
+    let rs = root_entry(&c, "src").ino;
+    mkfile(&c, rs, "f", b"new content");
+    c.sync().unwrap();
+    for (target, tag) in [("base", "replacing"), ("fresh", "no victim")] {
+        let before = max_id(&c);
+        let e = c.promote_base("src", target).unwrap();
+        assert_eq!(e.id, before + 1, "{tag}: one fork, one id");
+        assert_eq!(max_id(&c), before + 1, "{tag}: no second id was spent");
+        assert_eq!(content(&c, target, "f"), "new content", "{tag}");
+    }
+    c.check().unwrap();
+    drop(c);
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "new content");
+    assert!(leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}
+
+/// A crash between the rename into the target name and the removal of the intent file leaves the
+/// target in place, no staging snapshot and a stale intent; the next open drops the intent and
+/// keeps the target.
+#[test]
+fn a_stale_intent_after_the_rename_is_dropped_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = Core::open(dir.path(), test_opts()).unwrap();
+        c.create_snapshot("base").unwrap();
+        c.create_snapshot("src").unwrap();
+        let rs = root_entry(&c, "src").ino;
+        mkfile(&c, rs, "f", b"new content");
+        c.sync().unwrap();
+        c.promote_base("src", "base").unwrap();
+    }
+    // the intent the finished swap removed, put back as a crash before that removal would leave it
+    let staged = format!("base~0000000000000000{}0", cowfs_snapname::RESERVED);
+    std::fs::write(dir.path().join("swap-base"), format!("{staged}\nbase\n")).unwrap();
+    let c = Core::open(dir.path(), test_opts()).unwrap();
+    assert_eq!(content(&c, "base", "f"), "new content");
+    assert!(leftovers(dir.path(), &c).is_empty());
+    c.check().unwrap();
+}

@@ -168,7 +168,7 @@ A rename cannot do that, because it refuses a name another snapshot holds, so `p
 Any failure before step 3 leaves the old target untouched.
 Any failure or crash from step 3 on leaves the intent file, and the next `Core::open` finishes steps 4 to 6 before it serves anything.
 So a snapshot name never disappears without a record that explains it, and a failed swap never costs the old base.
-The two forks change the snapshot id, so every inode number in the new snapshot differs from the old one's.
+The one fork gives the new snapshot a new id, which it keeps under the target name, so every inode number in it differs from the old target's.
 Import uses the same finish step.
 A swap or replacing import of a name with a pending intent finishes that intent first (`Core::recover_target`), so a retry never deletes the only copy of the new tree.
 After the intents, `Core::open` removes every staging snapshot no intent names (a crash during staging leaves one); it holds the store's flock, so no live operation owns a staging snapshot then.
@@ -567,7 +567,7 @@ Moving to `chunk_range` and `splice_content` is the next step for multi-GiB file
 Requests recorded in #42, and where each stands on main:
 
 1. `Meta::rename_snapshot(id, new_name)`: landed (#137) and used by `Core::rename_snapshot` (#141).
-   `promote_base` replaces an existing name, so it still uses the staged swap and its two forks.
+   `promote_base` replaces an existing name, so it still uses the staged swap; the swap forks once and renames the staged snapshot into place.
 2. `Tx::set_now`: landed (#136).
    `Core` stamps each deferred operation with the ctime its cached node holds.
    `Snapshot::batch_at` was not added, because `set_now` covers the need.
