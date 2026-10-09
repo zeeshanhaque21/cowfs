@@ -1,14 +1,29 @@
 name: ci
 
+# A change that touches only review reports, verification evidence, spike notes or the progress
+# tracker does not start CI. A search of the code, tests and bench harness found exactly one test that
+# reads a doc: crates/cowfs-core/tests/critic2b.rs asserts on docs/v1-core.md, so docs/v1-core.md and
+# the rest of docs/ are deliberately NOT ignored. A change that touches any other file as well still
+# runs everything, and so does an edit of this workflow file. A pull request that only touches the
+# paths below gets no CI run at all, not a skipped one.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/reviews/**'
+      - 'docs/verification/**'
+      - 'docs/spikes/**'
+      - 'progress/**'
+      - 'LICENSE'
+      - 'NOTICE'
   pull_request:
-
-# A new push to a PR cancels that PR's running checks. Other runs (main) get a unique group, so none is cancelled.
-concurrency:
-  group: ci-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+    paths-ignore:
+      - 'docs/reviews/**'
+      - 'docs/verification/**'
+      - 'docs/spikes/**'
+      - 'progress/**'
+      - 'LICENSE'
+      - 'NOTICE'
 
 jobs:
   check:
