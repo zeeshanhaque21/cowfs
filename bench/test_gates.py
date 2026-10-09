@@ -586,6 +586,17 @@ class CompareRefuses(unittest.TestCase):
             self.assertIn("FAIL", out)
             self.assertNotIn("PASS", out)
 
+
+    def test_g2_pre_fix_file_is_invalid_and_post_fix_file_is_not(self):
+        g2 = {"kind": "rep", "gate": "g2", "rep": 0, "wall_s": 1.0, "load1_before": 1.0, "load1_after": 1.0}
+        with tempfile.TemporaryDirectory() as d:
+            old = self.write(d, "old.jsonl", [meta(), {**g2, "metrics": {}}])
+            rc, err, out = self.run_compare([old], old)
+            self.assertEqual(rc, 3, out)
+            self.assertIn("g2 rep", err)
+            new = self.write(d, "new.jsonl", [meta(), {**g2, "metrics": {"rebuilt_count": 5, "bins_relinked": 2}}])
+            self.assertEqual(self.run_compare([new], new)[0], 0)
+
     def test_gates_writes_scale_into_meta_that_compare_accepts(self):
         with tempfile.TemporaryDirectory() as d:
             root, out = Path(d) / "root", Path(d) / "out"
@@ -600,6 +611,85 @@ class CompareRefuses(unittest.TestCase):
             first = json.loads(Path(f).read_text().splitlines()[0])
             self.assertEqual((first["scale"], first["counts"]["big_bytes"]), (0.3, 3 * MIB))
             self.assertEqual(self.run_compare([f], f, f)[0], 0)
+
+
+def artifact(name, kind="lib", fresh=False, exe=None):
+    return json.dumps({"reason": "compiler-artifact", "fresh": fresh, "executable": exe,
+                       "target": {"name": name, "kind": [kind]}})
+
+
+# What cargo reported after the old g2 edit (cowfs-vfs-path/src/cookies.rs, measured on the
+# pinned corpus) and after the new one (cowfs-ctl/src/lib.rs); both measured with
+# `cargo build --message-format=json` on a scratch clone of c1619ec.
+OLD_EDIT_OUT = "\n".join([artifact("cowfs_vfs", fresh=True), artifact("cowfs_vfs_path")])
+NEW_EDIT_OUT = "\n".join([
+    artifact("cowfs_vfs", fresh=True),
+    artifact("cowfs_ctl"), artifact("cowfs_treehouse"), artifact("cowfs_cli"),
+    artifact("cowfs-treehouse", "bin", exe="/t/debug/cowfs-treehouse"),
+    artifact("cowfs", "bin", exe="/t/debug/cowfs"),
+    json.dumps({"reason": "build-finished", "success": True}),
+])
+
+
+class G2RebuildValidity(unittest.TestCase):
+    """g2 must rebuild and relink something real, or the rep is refused (review of PR 202)."""
+
+    def test_old_edit_shape_is_refused(self):
+        units = gates.rebuilt_units(OLD_EDIT_OUT)
+        self.assertEqual([u["name"] for u in units], ["cowfs_vfs_path"])
+        self.assertIn("rebuilt", gates.g2_rebuild_problem(units))
+
+    def test_new_edit_shape_is_accepted(self):
+        units = gates.rebuilt_units(NEW_EDIT_OUT)
+        self.assertEqual(len(units), 5)
+        self.assertIsNone(gates.g2_rebuild_problem(units))
+
+    def test_noop_and_missing_edited_crate_and_no_relink_are_each_refused(self):
+        self.assertTrue(gates.g2_rebuild_problem(gates.rebuilt_units("")))
+        no_edit = "\n".join([artifact("a"), artifact("b"), artifact("c", "bin", exe="/x")])
+        self.assertIn(gates.EDIT_CRATE, gates.g2_rebuild_problem(gates.rebuilt_units(no_edit)))
+        no_bin = "\n".join([artifact(gates.EDIT_CRATE), artifact("b"), artifact("c")])
+        self.assertIn("relink", gates.g2_rebuild_problem(gates.rebuilt_units(no_bin)))
+
+    def test_build_scripts_and_garbage_lines_do_not_count(self):
+        out = "\n".join(["not json", artifact("x", "custom-build"), artifact("y", "custom-build"), artifact(gates.EDIT_CRATE)])
+        self.assertEqual([u["name"] for u in gates.rebuilt_units(out)], [gates.EDIT_CRATE])
+
+    def test_edit_target_lives_in_the_checked_crate(self):
+        self.assertEqual(gates.EDIT_TARGET.split("/")[1].replace("-", "_"), gates.EDIT_CRATE)
+
+    def run_g2(self, stdout):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            ctx = gates.Ctx(root, {})
+            target = ctx.corpus / gates.EDIT_TARGET
+            target.parent.mkdir(parents=True)
+            target.write_text("// lib\n")
+            done = mock.Mock(stdout=stdout, stderr="", returncode=0)
+            with mock.patch.object(gates, "checked", return_value=done) as ck:
+                try:
+                    return ctx.g2(), ck
+                finally:
+                    self.assertIn("--message-format=json", ck.call_args[0][0])
+                    self.assertIn("// cowfs bench g2 edit", target.read_text())
+
+    def test_g2_records_the_rebuilt_units(self):
+        m, _ = self.run_g2(NEW_EDIT_OUT)
+        self.assertEqual((m["rebuilt_count"], m["bins_relinked"]), (5, 2))
+        self.assertIn(gates.EDIT_CRATE, m["rebuilt_units"])
+
+    def test_g2_refuses_the_trivial_workload_and_records_no_rep(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_g2(OLD_EDIT_OUT)
+        self.assertIn("g2", str(cm.exception))
+
+    def test_compare_refuses_a_g2_rep_without_the_rebuild_evidence(self):
+        row = {"gate": "g2", "rep": 0, "metrics": {}}
+        self.assertTrue(compare.g2_problem(row))
+        self.assertTrue(compare.g2_problem({**row, "metrics": {"rebuilt_count": 1, "bins_relinked": 0}}))
+        self.assertIsNone(compare.g2_problem({**row, "metrics": {"rebuilt_count": 5, "bins_relinked": 2}}))
+        self.assertTrue(compare.g2_problem({**row, "metrics": {"rebuilt_count": True, "bins_relinked": 1}}))
+        self.assertEqual(compare.G2_MIN_UNITS, gates.G2_MIN_UNITS)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,17 @@ Tracker g2 is harness gate `g3` (git status).
 Harness g2 is at most 1.5x off macOS, and on macOS the added seconds must stay under 1.0 s (issue #18 amendment, not the tracker's 1.5x).
 The driver prints both, so the tracker wording and the macOS budget are both visible.
 
+Exact mapping (checked against `bench/gates.py`, `bench/compare.py` and `bench/g12_run.py`):
+
+| Tracker gate | Bar | Harness gates |
+| --- | --- | --- |
+| g1: cargo build within 1.5x | 1.5x | `g1` (clean build) and `g2` (edit rebuild) |
+| g2: git status on a large tree within 1.5x | 1.5x | `g3` |
+| none | report only | `g4`, `g5`, `g6` |
+
+The harness numbering is therefore shifted by one from the tracker's for the git status gate.
+In this document `g1`, `g2`, `g3` mean harness gates unless written "tracker".
+
 ## Why the earlier live trial proves nothing
 
 `docs/live-trial-metrics.md` and its review recorded 17x to 144x slower than native in every repetition.
@@ -40,9 +51,52 @@ Warm no-op rebuild is the same command again with nothing changed.
 `bench/gates.py` does not time it.
 Only `scripts/measure-live-trial.py` does, and its cowfs arm path is tied to where the repo lives, so it is not used here.
 
-Edit rebuild (harness g2): append `// cowfs bench g2 edit <ns>` to `crates/cowfs-vfs-path/src/cookies.rs`, then:
+Edit rebuild (harness g2): append `// cowfs bench g2 edit <ns>` to `crates/cowfs-ctl/src/lib.rs`, then:
 
-    cargo build --offline --locked -j 4
+    cargo build --offline --locked -j 4 --message-format=json
+
+The `--message-format=json` output is parsed for `compiler-artifact` records with `fresh` false.
+A rep is refused (no row recorded) unless `cowfs_ctl` itself was rebuilt, at least 3 units were rebuilt, and at least one executable was relinked.
+Each recorded g2 rep carries `rebuilt_count`, `bins_relinked` and `rebuilt_units`, and `compare.py` marks a g2 rep without them (any pre-fix file) INVALID.
+The two checks use the same minimum (`G2_MIN_UNITS`, pinned equal by a test).
+
+### Why this edit (decision of 2026-10-09)
+
+The previous edit appended a comment to `crates/cowfs-vfs-path/src/cookies.rs`.
+At the pinned sha `c1619ec` (the corpus the harness builds, not current main) the workspace has two binaries, `cowfs` (cowfs-cli) and `cowfs-treehouse`, and both depend only on `cowfs-ctl`.
+So that edit rebuilt one lib and relinked nothing.
+Cargo reported `cowfs_vfs_path` as the only non-fresh unit; the build took 0.26 s.
+The review of PR 202 correctly called this a trivial workload (freshness scan plus one small rustc run), not an edit-rebuild loop.
+
+Candidate edits, each a one-line comment appended, measured on a scratch clone of `c1619ec` (`cargo build -j 2 --message-format=json`, debug profile, incremental on as the harness leaves it, NOT A GATE RESULT: busy Mac, load1 about 12, single observations):
+
+| Edit | Units rebuilt | Executables relinked | Wall |
+| --- | --- | --- | --- |
+| `cowfs-vfs-path/src/cookies.rs` (old) | `cowfs_vfs_path` (1) | 0 | 0.26 s |
+| `cowfs-vfs/src/lib.rs` | `cowfs_vfs`, `cowfs_fuse`, `cowfs_vfs_path`, `cowfs_nfs`, `cowfs_vfs_test` (5) | 0 | 0.72 s |
+| `cowfs-ctl/src/lib.rs` (new) | `cowfs_ctl`, `cowfs_treehouse`, `cowfs_cli` libs plus bins `cowfs-treehouse`, `cowfs` (5) | 2 | 1.49 s, then 1.04 to 1.17 s over 3 more reps |
+| `cowfs-ctl/src/server.rs` | same 5 | 2 | 0.93 s |
+
+A comment-only edit is enough: cargo's mtime-based freshness rebuilds the crate, the dependents see a newer dependency artifact, and the binaries relink.
+A `pub const` added instead of a comment took 1.2 to 1.9 s; the comment is kept because it is behaviour-neutral.
+`cowfs-vfs` edits rebuild four dependents but no binary exists downstream of them at this sha, so they are not a build-and-relink loop.
+`cowfs-ctl` is the one crate whose dependents include the binaries, so it is the realistic choice at this pin.
+
+Harness dry run, native only, no mount, `-j 2`, load1 about 11.4, NOT A GATE RESULT: `python3 bench/gates.py --gates g2 --reps 2` recorded two reps of 2.42 s and 2.36 s, each with `rebuilt_count` 5, `bins_relinked` 2 and units `cowfs`, `cowfs-treehouse`, `cowfs_cli`, `cowfs_ctl`, `cowfs_treehouse`.
+It shows the machinery works end to end (edit, json parse, validity rule, JSONL row); the times are inflated by the busy host and mean nothing about cowfs.
+
+Bar decision:
+- macOS keeps its absolute 1.0 s added-seconds budget, unchanged (issue #18).
+- Linux keeps the 1.5x ratio and gets no new absolute budget in this change.
+  The premise that native time would be several seconds is NOT met at this pin: the pinned corpus has no `cowfs-core` or `cowfs-daemon`, and the best edit available gives about 1 s on a busy Mac at `-j 2` (probably less on a quiet `-j 4` host).
+  At 1 s a 1.5x ratio leaves a few hundred ms of allowed added time, and the old FUSE cost was about 0.2 s, so Linux g2 may now be borderline rather than failing by construction.
+  Unmeasured, stated as expectation only: that the FUSE cost grows with the real work (three rlibs and two debug executables written through the mount), and that a budget would only hide a slowdown.
+  No Linux native number exists for the new edit.
+  Zee's call after the first quiet cachyos run, if g2 is borderline: (a) add a Linux added-seconds budget, or (b) re-pin `DEFAULT_SHA` to a commit that has `cowfs-core` and `cowfs-daemon` so the edit is several seconds long.
+  Option (b) also changes g1 and invalidates the existing Linux samples.
+  On current main the binaries are `cowfs`, `cowfs-daemon` and `cowfs-treehouse`; `cowfs-daemon` depends on `cowfs-core`, `cowfs-ctl`, `cowfs-vfs` and `cowfs-vfs-path`, so an edit there would relink the daemon.
+
+The refusal rule above guarantees the workload is not the trivial one, whatever the time.
 
 Git status (harness g3), warm then after touching 1 percent of `d000`:
 
@@ -194,11 +248,14 @@ Driver files sha256 prefixes `0a7d8aac` (g12_run.py) and `2c363734` (test_g12_ru
 
 Still unvalidated on Linux:
 - Harness g1 and g2 as a measurement: one sample rep only, no 5-rep run.
+  Superseded by the new g2 edit (see "Why this edit"): the findings below are about the old edit.
   Harness g2 took 0.11 to 0.36 s in `lsample3` (observed from the artifact mtimes in `lsample3/native/corpus-target/debug/deps` on the box, review of PR 202): g2 appends a comment to `crates/cowfs-vfs-path/src/cookies.rs`, and after that rep only `cowfs_vfs_path` was rewritten, with no downstream crate or binary relinked, so g2 is cargo's freshness scan plus one small incremental rustc run.
   The FUSE overhead of about 0.2 s on that is the 2.7x ratio.
   Off macOS there is no added-seconds budget (macOS uses an absolute 1.0 s added budget per issue 18), so Linux harness g2 FAILS BY CONSTRUCTION of this workload.
-  OPEN DECISION for Zee, not decided here: add an absolute added-seconds budget on Linux, or change the g2 edit to one that relinks something realistic.
-  The comment in `bench/gates.py` claiming nothing in the workspace depends on `cowfs-vfs-path` is false: at the pinned sha `c1619ec` the dependent is `cowfs-fuse`, and on current main also `cowfs-ctl`, `cowfs-daemon`, `cowfs-gc` and `cowfs-nfs`. In `lsample3` `cowfs-fuse` was not rebuilt after the g2 edit; nothing was observed for the current-main dependents. Documented here, code comment not changed in this PR.
+  DECIDED by Zee on 2026-10-09: change the g2 edit to one that relinks something realistic (done, see "Why this edit"); no Linux budget added.
+  The old `bench/gates.py` comment was half right: at `c1619ec` nothing built by a plain `cargo build` depends on `cowfs-vfs-path` (`cowfs-fuse` lists it only under `[dev-dependencies]`, which is why `cowfs-fuse` was not rebuilt in `lsample3`).
+  The false part was "everything downstream of the vfs trait rebuilds behind it", and the comment is stale on current main, where `cowfs-ctl`, `cowfs-daemon`, `cowfs-fuse`, `cowfs-gc` and `cowfs-nfs` depend on it.
+  The comment is replaced.
 - Open, non-blocking, from the PR 202 review:
   - The induced set matches by name prefix, so a user process named `fuse*` or `btrfs-*` escapes the foreign gate.
   - An unreadable `/proc` yields 0 foreign CPU and passes silently.
@@ -241,7 +298,7 @@ Neither macOS sample ran cargo builds through the NFS mount, which stays unvalid
 - [x] cargo-home populated in this lease (`bench/out/cargo-home`); a new lease needs network once.
 - [ ] Release binaries present in the lease (rebuild if the lease was returned).
 - [ ] Time budget: 100k-file tree generation through NFS plus 4 arms x 5 reps of clean builds; expect hours, not minutes.
-- [ ] OPEN DECISION (Zee): Linux harness g2 fails by construction (0.1 s native workload, no added-seconds budget off macOS); add an absolute added-seconds budget on Linux, or change the g2 edit to one that relinks something realistic.
+- [x] Linux harness g2 trivial-workload problem: g2 now edits `cowfs-ctl` (5 units, 2 relinks, refused if fewer); decision recorded in "Why this edit". UNVALIDATED on Linux: no cachyos run with the new edit yet.
 - [ ] Linux arm on cachyos (btrfs): driver exists, g3 samples passed their plumbing and a cargo build through FUSE ran once (1 rep, not validated); the full run is not done.
 - [ ] The foreign CPU rule, the plateau cool-down and the induced set have never run live with a real baseline, on either platform: unit tests, a `ps` parse on this Mac, and the 20 s Linux samples only.
 - [ ] Cargo build through the mount is still unvalidated on a quiet host (Linux: one sample rep only, see above).
