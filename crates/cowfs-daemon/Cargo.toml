@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 publish = true
 
+[features]
+# Issue 173: only forwards the store's process-exit seam (C7D_EXIT_BOUNDARY_N). It adds no code,
+# no control-protocol surface and is never enabled by a default or release build; the harness
+# builds a daemon with it into a private target dir. scripts/check-fault-seam-absent.sh guards it.
+fault-injection = ["cowfs-store/fault-injection"]
+
 [lib]
 name = "cowfs_daemon"
 
