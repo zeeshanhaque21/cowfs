@@ -68,6 +68,8 @@ fn mount_conformance() {
     };
     eprintln!("suite base directory: {}", base.display());
     let mut opts = Options::from_env();
+    // A real kernel: a device node needs root, so non-root runs check the fifo and the socket.
+    opts.devices_need_privilege = true;
     if opts.timeout.is_none() {
         opts.timeout = std::time::Duration::from_secs(300).into();
     }

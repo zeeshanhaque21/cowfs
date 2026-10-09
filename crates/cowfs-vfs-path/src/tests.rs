@@ -861,3 +861,49 @@ fn fallocate_modes_reach_the_kernel() {
         Error::IsDir
     );
 }
+
+/// The race behind `mknod`'s chmod and `setattr` on a special node: the name is looked up
+/// again, so a symlink planted there must never redirect the chmod to its target.
+#[test]
+fn fchmodat_by_name_never_follows_a_symlink() {
+    let (scratch, _v) = fs();
+    std::fs::write(scratch.0.join("outside"), b"sentinel").expect("write outside");
+    std::os::unix::fs::symlink("outside", scratch.0.join("l")).expect("plant a symlink");
+    let dir = std::fs::File::open(&scratch.0).expect("open dir");
+    // Linux refuses (ENOTSUP) where macOS changes the link itself; neither may touch the target.
+    let _ = sys::fchmodat(dir.as_fd(), b"l", 0o777);
+    let md = std::fs::metadata(scratch.0.join("outside")).expect("stat outside");
+    assert_eq!(
+        md.mode() & 0o777,
+        0o644,
+        "the symlink target's mode changed"
+    );
+}
+
+#[test]
+fn setattr_mode_on_a_special_node_never_lands_on_a_swapped_in_symlink_target() {
+    let (scratch, v) = fs();
+    let fifo = scratch.0.join("p");
+    let ok = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(ok.success(), "mkfifo");
+    let ino = v.lookup(ROOT_INO, b"p").expect("lookup fifo").ino;
+    std::fs::write(scratch.0.join("outside"), b"sentinel").expect("write outside");
+    std::fs::remove_file(&fifo).expect("remove fifo");
+    std::os::unix::fs::symlink("outside", &fifo).expect("swap a symlink in");
+    let _ = v.setattr(
+        ino,
+        SetAttr {
+            mode: Some(0o777),
+            ..Default::default()
+        },
+    );
+    let md = std::fs::metadata(scratch.0.join("outside")).expect("stat outside");
+    assert_eq!(
+        md.mode() & 0o777,
+        0o644,
+        "the symlink target's mode changed"
+    );
+}

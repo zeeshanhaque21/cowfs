@@ -276,7 +276,7 @@ Conformance consumers found: `MemVfs` (`cowfs-vfs-test/tests/memvfs.rs`), Core (
 Slice D implements `PathVfs::mknod` on Linux (`mknodat`; macOS has none, so the native macOS PathVfs run skips the checks with that reason) and the FUSE conformance run no longer skips the 16 checks: the mounted MemVfs is driven through `PathVfs`, so the checks now reach FUSE `mknod` through a real kernel.
 PathVfs opens a special node with `O_PATH|O_NOFOLLOW|O_NONBLOCK` (attributes, times and unlinked-while-open survival), changes its mode by name or through `/proc/self/fd`, and answers `read`, `write` and a size change with `InvalidArgument`.
 A device node needs privilege on a real kernel, so the checks first probe with one device `mknod`; a backend that answers `PermissionDenied` is checked with the fifo and the socket only, and the device cases stay with MemVfs and Core.
-The expected linux-fuse run count goes from 128 to 144.
+The expected linux-fuse run count goes from 134 to 150.
 `special_files_through_mknod` in `cowfs-fuse/tests/mount.rs` has a root branch for the device case, but CI runs as a normal user, so that branch has not run anywhere yet; the device cases are only exercised by MemVfs and Core.
 The ctime-equality assertion of `mknod_fifo_attrs` was dropped for every backend, because PathVfs applies the mode after creating the node.
 `PathVfs::mknod` works on Linux only.

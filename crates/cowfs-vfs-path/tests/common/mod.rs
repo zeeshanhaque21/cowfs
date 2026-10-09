@@ -53,6 +53,8 @@ pub fn run_suite(base: &Path) {
     };
     println!("suite base directory: {}", base.display());
     let mut opts = Options::from_env();
+    // A real kernel: a device node needs root, so non-root runs check the fifo and the socket.
+    opts.devices_need_privilege = true;
     if opts.timeout.is_none() {
         // One Posix check creates 8,000 hardlink pairs in one directory and lists them six times
         // at page sizes from 1 up. On this machine a single `linkat` costs about 0.9 ms, so the
