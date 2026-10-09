@@ -233,56 +233,105 @@ pub fn mknodat(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
     Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
-/// Whether a thread may detach its own umask (`unshare(CLONE_FS)`), which `mknodat_exact` needs.
+/// What is known of `unshare(CLONE_FS)` here: `true` once it worked, `false` once refused for good.
+/// Unset while unknown, including after a transient failure, which the next call retries.
 #[cfg(target_os = "linux")]
-pub fn private_umask_available() -> bool {
-    std::thread::spawn(|| {
-        // SAFETY: as in `mknodat_exact`; this short-lived thread does nothing else.
-        unsafe { libc::unshare(libc::CLONE_FS) == 0 }
+static PRIVATE_UMASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether an `unshare` errno is a standing refusal, worth remembering (each retry costs a
+/// thread): a seccomp filter answers `EPERM`, `EACCES` or `ENOSYS`, and `EINVAL` means the
+/// kernel or sandbox does not support the flag. Anything else (`ENOMEM`, `EAGAIN`, ...) is
+/// transient: it must not downgrade every later call to the racy chmod path.
+#[cfg(target_os = "linux")]
+fn refusal_is_permanent(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::EPERM | libc::EACCES | libc::EINVAL | libc::ENOSYS
+    )
+}
+
+/// Runs `f` on a short-lived thread that detaches its own umask with `unshare(CLONE_FS)` and
+/// sets it to 0, so a creation call there gets exactly the mode it names (a parent's default ACL
+/// still applies, as it would to a native call). The process umask is never touched. `Ok(None)`
+/// means no private umask is available (a seccomp filter may refuse `unshare`, and macOS has no
+/// per thread umask) and `f` did not run.
+#[cfg(target_os = "linux")]
+pub fn with_private_umask<R: Send>(
+    f: impl FnOnce() -> io::Result<R> + Send,
+) -> io::Result<Option<R>> {
+    run_with_private_umask(&PRIVATE_UMASK, detach_umask, f)
+}
+
+#[cfg(target_os = "linux")]
+fn detach_umask() -> Result<(), i32> {
+    // SAFETY: `unshare(CLONE_FS)` gives only this thread a private copy of its cwd, root and
+    // umask; it touches no memory. The thread ends right after.
+    if unsafe { libc::unshare(libc::CLONE_FS) } == 0 {
+        // SAFETY: `umask` cannot fail; after the unshare it affects this thread only.
+        unsafe { libc::umask(0) };
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EPERM))
+    }
+}
+
+/// `with_private_umask` with the cache and the unshare-then-umask(0) step passed in, so a test can
+/// inject one (a test must never call `umask`: it would change the whole test process).
+#[cfg(target_os = "linux")]
+fn run_with_private_umask<R: Send>(
+    known: &std::sync::OnceLock<bool>,
+    unshare: impl FnOnce() -> Result<(), i32> + Send,
+    f: impl FnOnce() -> io::Result<R> + Send,
+) -> io::Result<Option<R>> {
+    if known.get() == Some(&false) {
+        return Ok(None);
+    }
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("cowfs-umask0".into())
+            .spawn_scoped(s, || {
+                if let Err(errno) = unshare() {
+                    if refusal_is_permanent(errno) {
+                        let _ = known.set(false);
+                    }
+                    return Ok(None);
+                }
+                let _ = known.set(true);
+                f().map(Some)
+            })?
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("the umask-0 thread panicked")))
     })
-    .join()
-    .unwrap_or(false)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn mknodat_exact(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<bool> {
-    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+pub fn with_private_umask<R: Send>(
+    _: impl FnOnce() -> io::Result<R> + Send,
+) -> io::Result<Option<R>> {
+    Ok(None)
 }
 
-/// `mknodat` with the permission bits of `mode` exactly as given: no umask filters them, so no
-/// chmod by name has to follow (one could land on another node renamed over the name in
-/// between). It runs on a short-lived thread that detaches its own umask with
-/// `unshare(CLONE_FS)` and sets it to 0; the process umask is never touched. `Ok(false)` means
-/// that thread could not get its own umask (a seccomp filter may refuse `unshare`) and nothing
-/// was made. A parent directory's default ACL still applies, as it would to a native `mknod`.
+/// Whether a thread may detach its own umask, which `mknodat_exact` and `mkdirat_exact` need.
 #[cfg(target_os = "linux")]
+pub fn private_umask_available() -> bool {
+    if PRIVATE_UMASK.get().is_none() {
+        let _ = with_private_umask(|| Ok(()));
+    }
+    PRIVATE_UMASK.get() == Some(&true)
+}
+
+/// `mknodat` with the permission bits of `mode` exactly as given, no umask filtering them, so no
+/// chmod by name has to follow (one could land on another node renamed over the name in
+/// between). `Ok(false)` means no private umask: nothing was made.
 pub fn mknodat_exact(dir: BorrowedFd<'_>, name: &[u8], mode: u32, rdev: u64) -> io::Result<bool> {
-    let name = cstr(name)?;
-    std::thread::scope(|s| {
-        std::thread::Builder::new()
-            .name("cowfs-mknod".into())
-            .spawn_scoped(s, || {
-                // SAFETY: `unshare(CLONE_FS)` gives only this thread a private copy of its cwd,
-                // root and umask; it touches no memory. The thread ends right after.
-                if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
-                    return Ok(false);
-                }
-                // SAFETY: `umask` cannot fail; after the unshare it affects this thread only.
-                unsafe { libc::umask(0) };
-                // SAFETY: see module docs; `dir` is borrowed for the whole scope.
-                cvt(unsafe {
-                    libc::mknodat(
-                        dir.as_raw_fd(),
-                        name.as_ptr(),
-                        mode as libc::mode_t,
-                        rdev as libc::dev_t,
-                    )
-                })?;
-                Ok(true)
-            })?
-            .join()
-            .unwrap_or_else(|_| Err(io::Error::other("the mknod thread panicked")))
-    })
+    Ok(with_private_umask(|| mknodat(dir, name, mode, rdev))?.is_some())
+}
+
+/// `mkdirat` with `mode` unfiltered by the umask; `Ok(false)` as for `mknodat_exact`.
+pub fn mkdirat_exact(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<bool> {
+    Ok(with_private_umask(|| mkdirat(dir, name, mode))?.is_some())
 }
 
 /// `fchmodat` by name, for a node that has no descriptor `fchmod` accepts (an `O_PATH` one).
@@ -807,5 +856,46 @@ mod rdev_tests {
             (8 << 24) | 16,
             "macOS makedev(8, 16)"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod umask_cache_tests {
+    use super::run_with_private_umask;
+    use std::sync::OnceLock;
+
+    fn try_once(known: &OnceLock<bool>, errno: Option<i32>) -> Option<u8> {
+        let unshare = move || errno.map_or(Ok(()), Err);
+        run_with_private_umask(known, unshare, || Ok(7u8)).unwrap()
+    }
+
+    #[test]
+    fn a_transient_unshare_failure_is_retried_not_cached() {
+        for errno in [libc::ENOMEM, libc::EAGAIN] {
+            let known = OnceLock::new();
+            assert_eq!(
+                try_once(&known, Some(errno)),
+                None,
+                "the failing call falls back"
+            );
+            assert_eq!(known.get(), None, "errno {errno} is not remembered");
+            assert_eq!(
+                try_once(&known, None),
+                Some(7),
+                "the next call gets a private umask"
+            );
+            assert_eq!(known.get(), Some(&true));
+        }
+    }
+
+    #[test]
+    fn a_permanent_refusal_is_cached_and_not_retried() {
+        for errno in [libc::EPERM, libc::EACCES, libc::EINVAL, libc::ENOSYS] {
+            let known = OnceLock::new();
+            assert_eq!(try_once(&known, Some(errno)), None);
+            assert_eq!(known.get(), Some(&false), "errno {errno} is remembered");
+            // Even a call whose unshare would now succeed does not try again.
+            assert_eq!(try_once(&known, None), None, "errno {errno}: no retry");
+        }
     }
 }
