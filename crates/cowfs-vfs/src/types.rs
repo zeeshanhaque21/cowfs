@@ -187,3 +187,22 @@ pub fn validate_name(name: &[u8]) -> Result<()> {
     }
     Ok(())
 }
+
+/// What `Vfs::fallocate` does to the range `[offset, offset + len)`. The kernel's `fallocate`
+/// mode bits map to these: `0`, `KEEP_SIZE`, `PUNCH_HOLE|KEEP_SIZE`, `ZERO_RANGE`,
+/// `ZERO_RANGE|KEEP_SIZE`. A punch never changes the size, so there is no variant that does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FallocMode {
+    /// The size becomes `max(size, offset + len)`. Existing bytes are untouched and new bytes
+    /// read as zeros. A backend without preallocation reserves nothing.
+    Allocate,
+    /// Checks the inode and range and changes no data and no size.
+    KeepSize,
+    /// The part of the range inside the file reads as zeros. The size is unchanged.
+    PunchHole,
+    /// Like `PunchHole`, and the size becomes `max(size, offset + len)`.
+    ZeroRange,
+    /// Like `PunchHole`, with the kernel's `ZERO_RANGE|KEEP_SIZE` spelling.
+    ZeroRangeKeepSize,
+}

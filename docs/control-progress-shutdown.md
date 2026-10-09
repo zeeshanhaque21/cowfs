@@ -67,8 +67,9 @@ write (`best_effort_abandon`, which skips a held write lock) and then `kill`s th
 readable peer still gets `shutting_down` and no connection is left open behind a spawn failure.
 
 The change is confined to the deadline branch.
-The graceful path (before the deadline) and the connection thread's own `abandon_inflight` are
-unchanged, which is why `a4_a_terminal_frame_being_written_is_not_cut_by_shutdown` still holds.
+The graceful path (before the deadline) is unchanged, which is why `a4_a_terminal_frame_being_written_is_not_cut_by_shutdown` still holds.
+Separately, the connection thread's own teardown now calls `abandon_inflight_until`, which waits for
+a terminal write already in progress, bounded by the grace end, before it kills (#127).
 
 ## Why the frame is not cut
 

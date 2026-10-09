@@ -391,6 +391,55 @@ impl Vfs for MemVfs {
         })
     }
 
+    fn fallocate(&self, ino: Ino, mode: FallocMode, offset: u64, len: u64) -> Result<Attr> {
+        let mut st = self.lock();
+        let no_extend = st.f(Fault::ZeroRangeNoExtend);
+        let (noop, shrinks, punch_grows) = (
+            st.f(Fault::PunchNoop),
+            st.f(Fault::AllocateShrinks),
+            st.f(Fault::PunchChangesSize),
+        );
+        let n = st.node_mut(ino)?;
+        let kind = n.kind();
+        let Body::File(p) = &mut n.body else {
+            return Err(if kind == FileKind::Directory {
+                Error::IsDir
+            } else {
+                Error::InvalidArgument
+            });
+        };
+        if len == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let end = offset
+            .checked_add(len)
+            .filter(|&e| e <= MAX_FILE)
+            .ok_or(Error::NoSpace)?;
+        let (zero, extend) = match mode {
+            FallocMode::Allocate => (false, true),
+            FallocMode::KeepSize => (false, false),
+            FallocMode::PunchHole => (true, punch_grows),
+            FallocMode::ZeroRangeKeepSize => (true, false),
+            FallocMode::ZeroRange => (true, !no_extend),
+            _ => return Err(Error::NotSupported),
+        };
+        let old = p.size;
+        if zero && !noop {
+            p.punch(offset, end.min(old));
+        }
+        if extend && (end > old || shrinks && mode == FallocMode::Allocate) {
+            p.size = end;
+        }
+        let grew = p.size > old;
+        let t = st.now();
+        if zero || grew {
+            st.touch_data(ino, t);
+        } else {
+            st.bump_ctime(ino, t);
+        }
+        st.attr(ino)
+    }
+
     fn flush(&self, ino: Ino) -> Result<()> {
         self.lock().node(ino).map(|_| ())
     }
