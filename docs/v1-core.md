@@ -530,6 +530,7 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `swap::recover` | last_error | leaf |
 | `swap::swap_snapshot` | last_error | leaf |
 | `swap::stage_and_intent` | snap. | 3 |
+| `swap::drop_intent` | last_error | leaf |
 | `util::lk` | leaf | 1 |
 | `util::try_lk` | leaf | 1 |
 | `util::shard` | leaf | 1 |
