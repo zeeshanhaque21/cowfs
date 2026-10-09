@@ -23,11 +23,11 @@ The contract is the GC section of `docs/design.md`, which adds "on demand and on
 | 3 | Net-space reporting (gross, rewrite, net) | DONE | `docs/gc-space-accounting.md`, `crates/cowfs-gc/src/report.rs`, daemon `handler.rs` (`GcReport` fill); test `a_mixed_pack_reports_gross_removed_rewrite_and_signed_net` in `crates/cowfs-gc/tests/core_reclaim.rs` |
 | 4 | Last-access hint store (in memory, batched flush, never a reason to free) | DONE in the crate | `Gc::note_access`, `Gc::flush_hints`, `Hints::coldness` in `state.rs`, coldest-first sort in `Gc::collect`; test in `crates/cowfs-gc/tests/control.rs` |
 | 5 | On demand GC | DONE | `cowfs gc` in `crates/cowfs-cli/src/cli.rs`, handler `Handler::gc` in `crates/cowfs-daemon/src/handler.rs`, backend `collect_garbage` in `backend.rs` (single run, cancel, close waits); same `handler.rs` test as row 1 |
-| 6 | GC "on a schedule" (`design.md:40`) | OPEN | No timer, interval flag or periodic task in `crates/cowfs-daemon/src` (V by absence), see note 6 |
+| 6 | GC "on a schedule" (GC section of `design.md`) | OPEN | No timer, interval flag or periodic task in `crates/cowfs-daemon/src` (V by absence), see note 6 |
 | 7 | Hints are fed by real reads | OPEN | `note_access` has no caller outside `crates/cowfs-gc/tests/control.rs` (V), see note 7 |
 | 8 | Hints survive across cycles in production | OPEN, follows from 7 | The daemon builds a fresh `Collector` per request (V), see note 8 |
 | 9 | Doc matches code on hint bonus | DONE by Slice 1 (this PR) | `Options` has no `cold_dead_bonus` (V). `docs/v1-gc.md` no longer claims it |
-| 10 | Sweep candidates "unmarked blocks older than a threshold" (`design.md:42`) | design.md amended by Slice 1; whether to ADD an age threshold is OPEN (D3) | The implemented policy is pack level: `dead_ratio` and `min_dead_bytes` (V). No age threshold exists |
+| 10 | Sweep candidates "unmarked blocks older than a threshold" (GC section of `design.md`) | design.md amended by Slice 1; whether to ADD an age threshold is OPEN (D3) | The implemented policy is pack level: `dead_ratio` and `min_dead_bytes` (V). No age threshold exists |
 | 11 | Free-space or pressure trigger, resource watchdog in the daemon | OPEN, new | No statvfs or low-space logic in `crates/cowfs-daemon/src` or `cowfs-cli/src` (V), see note 11 |
 
 Rows 6, 7, 8, 10, 11 are the OPEN set.
