@@ -257,10 +257,17 @@ fn a_same_name_promote_racing_a_refresh_never_leaves_a_record_that_disagrees_wit
             let got = report.snapshot.base.and_then(|m| m.commit);
             assert_eq!(got.as_deref(), Some(commits[i].as_str()), "{which} {round}");
             let tag = read(b.as_ref(), "warm", "tag").expect("a tree");
-            assert_eq!(tag, if i == 0 { "tree-A" } else { "tree-C" }, "{which} {round}");
+            assert_eq!(
+                tag,
+                if i == 0 { "tree-A" } else { "tree-C" },
+                "{which} {round}"
+            );
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(promoter.join().unwrap() > 0, "{which}: the promoter never ran");
+        assert!(
+            promoter.join().unwrap() > 0,
+            "{which}: the promoter never ran"
+        );
     }
 }
 
