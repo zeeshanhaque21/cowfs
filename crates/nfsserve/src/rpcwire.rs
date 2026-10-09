@@ -55,6 +55,7 @@ async fn handle_rpc(
         return Ok(true);
     }
 
+    let (prog, vers, proc) = (call.prog, call.vers, call.proc);
     let cache_key = (call.prog == nfs::PROGRAM
         && call.vers == nfs::VERSION
         && NON_IDEMPOTENT.contains(&call.proc))
@@ -68,20 +69,47 @@ async fn handle_rpc(
         context.reply_cache.note_xid(context.conn, xid);
         match context.reply_cache.begin(key) {
             Begin::Replay(reply) => {
-                debug!("replaying the reply to retransmitted xid {xid}");
+                debug!(
+                    "replaying the reply to retransmitted xid {xid} (proc {})",
+                    nfs_handlers::proc_name(proc)
+                );
                 output.extend_from_slice(&reply);
                 return Ok(true);
             }
             Begin::InProgress => {
-                debug!("dropping retransmission of running xid {xid}");
+                debug!(
+                    "dropping retransmission of running xid {xid} (prog {prog} vers {vers} proc {} {})",
+                    proc,
+                    nfs_handlers::proc_name(proc)
+                );
                 return Ok(false);
             }
             Begin::New => {}
         }
     }
 
+    let mut cancelled = false;
     let res = if call.prog == nfs::PROGRAM {
-        nfs_handlers::handle_nfs(xid, call, input, output, &context).await
+        // The watchdog: a handler that never resolves (a blocked call, a lock nobody releases)
+        // would leave its xid unanswered for good. Cancel it and tell the client to retry.
+        match timeout(
+            context.handler_timeout,
+            nfs_handlers::handle_nfs(xid, call, input, output, &context),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                error!(
+                    "NFS handler {} (xid {xid}) ran over {:?} and was cancelled, answering JUKEBOX",
+                    nfs_handlers::proc_name(proc),
+                    context.handler_timeout
+                );
+                cancelled = true;
+                output.truncate(4);
+                nfs_handlers::jukebox_reply(xid, proc, output)
+            }
+        }
     } else if call.prog == portmap::PROGRAM {
         portmap_handlers::handle_portmap(xid, call, input, output, &context)
     } else if call.prog == mount::PROGRAM {
@@ -105,8 +133,8 @@ async fn handle_rpc(
             .map_err(Into::into)
     };
     if let Some(key) = cache_key {
-        let reply = res
-            .is_ok()
+        // A cancelled call gets no cached reply: the client's retry must run again.
+        let reply = (res.is_ok() && !cancelled)
             .then(|| output.get(4..).map(<[u8]>::to_vec))
             .flatten();
         context.reply_cache.finish(key, reply);

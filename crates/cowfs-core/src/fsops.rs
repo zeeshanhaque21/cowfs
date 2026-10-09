@@ -4,7 +4,7 @@
 //! trace of the calls in the order they happened.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -111,6 +111,8 @@ fn take_fault(what: Fault, path: &Path) -> io::Result<()> {
 pub(crate) fn sync_file(f: &File, path: &Path) -> io::Result<()> {
     note(&format!("sync_file:{}", file_name(path)));
     take_fault(Fault::FileSync, path)?;
+    #[cfg(feature = "fault-injection")]
+    rootlog::push(|| rootlog::RootOp::Sync(file_name(path)));
     f.sync_all()
 }
 
@@ -118,7 +120,93 @@ pub(crate) fn sync_file(f: &File, path: &Path) -> io::Result<()> {
 pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     note(&format!("sync_dir:{}", path.display()));
     take_fault(Fault::DirSync, path)?;
+    #[cfg(feature = "fault-injection")]
+    rootlog::push(|| rootlog::RootOp::DirSync);
     File::open(path)?.sync_all()
+}
+
+/// Creates `path` and writes `data` to it, not yet durable. The caller syncs it.
+pub(crate) fn create_with(path: &Path, data: &[u8]) -> io::Result<File> {
+    let mut f = File::create(path)?;
+    #[cfg(feature = "fault-injection")]
+    {
+        rootlog::push(|| rootlog::RootOp::Create(file_name(path)));
+        rootlog::push(|| rootlog::RootOp::Write(file_name(path), data.to_vec()));
+    }
+    f.write_all(data)?;
+    Ok(f)
+}
+
+/// `std::fs::rename`, in the order the power-loss model records.
+pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(feature = "fault-injection")]
+    rootlog::push(|| rootlog::RootOp::Rename(file_name(from), file_name(to)));
+    std::fs::rename(from, to)
+}
+
+/// `std::fs::remove_file`, in the order the power-loss model records.
+pub(crate) fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    #[cfg(feature = "fault-injection")]
+    rootlog::push(|| rootlog::RootOp::Unlink(file_name(path)));
+    std::fs::remove_file(path)
+}
+
+/// The mount root's durable writes (the swap intent file), recorded for the power-loss model of
+/// issue 173. Only with `fault-injection`; nothing is compiled into a normal build.
+///
+/// Per thread, like the store's op log, and stamped into that log as markers so the two share one
+/// order. An op is stamped before it runs, so a cut at its stamp may or may not have applied it.
+#[cfg(feature = "fault-injection")]
+#[doc(hidden)]
+pub mod rootlog {
+    use std::cell::RefCell;
+
+    /// Marks a store-log marker as a root op; the op's index is in the low bits.
+    pub const ROOT_MARK: u64 = 1 << 41;
+
+    /// One durable-relevant call on a file in the mount root. Names are relative to the root.
+    #[derive(Clone, Debug)]
+    pub enum RootOp {
+        /// A file was created (empty).
+        Create(String),
+        /// Bytes written at offset 0 of a freshly created file.
+        Write(String, Vec<u8>),
+        /// A file was fsynced.
+        Sync(String),
+        /// A file was renamed over `to`.
+        Rename(String, String),
+        /// A file was unlinked.
+        Unlink(String),
+        /// The root directory was fsynced.
+        DirSync,
+    }
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<RootOp>>> = const { RefCell::new(None) };
+    }
+
+    /// Start recording this thread's root ops.
+    pub fn start() {
+        LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stop recording and take the log.
+    pub fn take() -> Vec<RootOp> {
+        LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(crate) fn push(op: impl FnOnce() -> RootOp) {
+        let idx = LOG.with(|l| {
+            l.borrow_mut().as_mut().map(|v| {
+                v.push(op());
+                u32::try_from(v.len() - 1).expect("cowfs-rootlog: more than 2^32 recorded ops")
+            })
+        });
+        if let Some(i) = idx {
+            cowfs_store::oplog_marker(ROOT_MARK | u64::from(i));
+        }
+    }
 }
 
 fn file_name(path: &Path) -> String {

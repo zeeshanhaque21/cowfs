@@ -24,8 +24,14 @@ const ENTRY: usize = 36;
 /// different, newly committed root's blocks.
 /// Neither older layout carries the per-root association, so neither can be reconstructed into one
 /// and both are rejected: every root is walked in full, which is always correct.
+/// `COWMARK4` is `COWMARK3`'s layout plus a trailing BLAKE3 hash of every byte before it. Without
+/// it a same-length corruption (bit rot, a zeroed span) parsed as a valid but different set, and a
+/// later cycle skipped a root's walk and freed live blocks. `COWMARK3` has no hash, so it is
+/// rejected like the older layouts: its roots are walked in full once.
 /// The cache is derived data: discarding it costs a walk and nothing else.
-const MAGIC_MARKS: &[u8] = b"COWMARK3";
+const MAGIC_MARKS: &[u8] = b"COWMARK4";
+/// Length of the trailing BLAKE3 hash.
+const HASH_LEN: usize = 32;
 const ROOT_ENTRY: usize = 32;
 /// A root key and its block count, ahead of that root's own block list.
 const GROUP_ENTRY: usize = ROOT_ENTRY + 8;
@@ -235,7 +241,15 @@ impl Marks {
     /// would leave a root credited with only some of its blocks, and a later cycle would skip that
     /// root's walk and free the rest.
     fn parse(&mut self, bytes: &[u8]) {
-        let Some(body) = bytes.strip_prefix(MAGIC_MARKS) else {
+        // The hash covers the magic too, and is checked before any byte of the body is believed.
+        let Some((covered, hash)) = bytes.split_at_checked(bytes.len().saturating_sub(HASH_LEN))
+        else {
+            return;
+        };
+        if hash.len() != HASH_LEN || blake3::hash(covered).as_bytes() != hash {
+            return;
+        }
+        let Some(body) = covered.strip_prefix(MAGIC_MARKS) else {
             return;
         };
         let Some((n_roots, mut rest)) = split_u64(body) else {
@@ -369,7 +383,7 @@ impl Marks {
             return Ok(());
         }
         let mut buf = Vec::with_capacity(
-            MAGIC_MARKS.len() + 8 + self.roots.len() * GROUP_ENTRY + self.assoc * 32,
+            MAGIC_MARKS.len() + 8 + self.roots.len() * GROUP_ENTRY + self.assoc * 32 + HASH_LEN,
         );
         buf.extend_from_slice(MAGIC_MARKS);
         buf.extend_from_slice(&(self.roots.len() as u64).to_le_bytes());
@@ -382,6 +396,8 @@ impl Marks {
                 buf.extend_from_slice(b.as_bytes());
             }
         }
+        let hash = blake3::hash(&buf);
+        buf.extend_from_slice(hash.as_bytes());
         let tmp = self.path.with_extension("tmp");
         {
             let mut f = File::create(&tmp)?;
@@ -493,7 +509,17 @@ mod tests {
                 buf.extend_from_slice(b.as_bytes());
             }
         }
+        if magic == MAGIC_MARKS {
+            seal(&mut buf);
+        }
         buf
+    }
+
+    /// Append the trailing hash, so a test can build a structurally wrong body that is still sealed
+    /// and reaches the parser, instead of being stopped at the hash.
+    fn seal(buf: &mut Vec<u8>) {
+        let h = blake3::hash(buf);
+        buf.extend_from_slice(h.as_bytes());
     }
 
     /// B2: an old-format marks file (a collector before the walked-root fix) may pair a listed root
@@ -591,16 +617,17 @@ mod tests {
         let (k1, k2) = (root(1), root(2));
         let (a, b) = (BlockId::of(b"a"), BlockId::of(b"b"));
         let good = file(&[(&k1, &[&a]), (&k2, &[&b])], MAGIC_MARKS);
+        let raw = good[..good.len() - HASH_LEN].to_vec();
 
         // A count that runs past the end of the file, which is what a torn write looks like.
-        let mut over = good.clone();
+        let mut over = raw.clone();
         let n_at = MAGIC_MARKS.len();
         over[n_at..n_at + 8].copy_from_slice(&9u64.to_le_bytes());
         // Trailing bytes the root count does not account for.
-        let mut extra = good.clone();
+        let mut extra = raw.clone();
         extra.extend_from_slice(b"tail");
         // The same root twice, where the second group would silently overwrite the first.
-        let mut twice = good.clone();
+        let mut twice = raw.clone();
         let mut second = Vec::new();
         second.extend_from_slice(&k1);
         second.extend_from_slice(&1u64.to_le_bytes());
@@ -608,16 +635,17 @@ mod tests {
         twice.extend_from_slice(&second);
         // A root with no blocks, which no writer emits and which would seed a skipped walk with
         // nothing.
-        let mut empty_group = good.clone();
+        let mut empty_group = raw.clone();
         empty_group.extend_from_slice(&k1);
         empty_group.extend_from_slice(&0u64.to_le_bytes());
 
-        for (what, bytes) in [
+        for (what, mut bytes) in [
             ("a count past the end", over),
             ("trailing bytes", extra),
             ("a repeated root", twice),
             ("a root with no blocks", empty_group),
         ] {
+            seal(&mut bytes);
             fs::write(d.path().join("mark.bin"), &bytes).unwrap();
             let m = Marks::load(d.path(), 16);
             assert_eq!(m.n_blocks(), 0, "{what} must not yield a partial set");
@@ -646,6 +674,58 @@ mod tests {
         let m = Marks::load(d.path(), 16);
         assert_eq!(m.n_blocks(), 0);
         assert!(!m.has_root(&root(3)), "a torn tail leaves no trusted root");
+    }
+
+    /// Issue 288: a same-length corruption must be rebuilt, never trusted. Each case starts from a
+    /// good file and damages it without changing the length where it can.
+    #[test]
+    fn a_damaged_file_is_never_trusted() {
+        let d = tempfile::tempdir().unwrap();
+        let mut m = Marks::load(d.path(), 64);
+        let k = root(5);
+        for i in 0..8u8 {
+            m.add_root(&k);
+            m.add_block(&k, BlockId::of(&[i]));
+        }
+        m.save(&HashSet::new()).unwrap();
+        let path = d.path().join("mark.bin");
+        let good = fs::read(&path).unwrap();
+        assert!(
+            Marks::load(d.path(), 64).has_root(&k),
+            "control: intact file is reused"
+        );
+
+        let mut flip = good.clone();
+        flip[good.len() / 2] ^= 1;
+        let mut zeroed = good.clone();
+        let at = MAGIC_MARKS.len() + 8 + GROUP_ENTRY;
+        zeroed[at..at + 64].fill(0);
+        let mut bad_hash = good.clone();
+        *bad_hash.last_mut().unwrap() ^= 0xff;
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(b"garbage");
+        let mut prefix_junk = b"x".to_vec();
+        prefix_junk.extend_from_slice(&good);
+        // A COWMARK3 file (no hash) with a valid layout: the previous format, never trusted.
+        let mut v3 = good[..good.len() - HASH_LEN].to_vec();
+        v3[..MAGIC_MARKS.len()].copy_from_slice(b"COWMARK3");
+
+        for (what, bytes) in [
+            ("a bit flip", flip),
+            ("a zeroed 64-byte span", zeroed),
+            ("a corrupt hash", bad_hash),
+            ("trailing garbage", trailing),
+            ("a leading byte", prefix_junk),
+            ("a truncated tail", good[..good.len() - 1].to_vec()),
+            ("an empty file", Vec::new()),
+            ("the old unhashed format", v3),
+        ] {
+            fs::write(&path, &bytes).unwrap();
+            let m = Marks::load(d.path(), 64);
+            assert!(!m.has_root(&k), "{what} must not leave a trusted root");
+            assert_eq!(m.n_blocks(), 0, "{what} must not yield a partial set");
+            assert!(!m.dropped);
+        }
     }
 
     #[test]
