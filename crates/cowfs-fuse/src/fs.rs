@@ -563,7 +563,7 @@ impl Filesystem for Fs {
         _req: &Request<'_>,
         ino: u64,
         mode: Option<u32>,
-        _uid: Option<u32>,
+        uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
         atime: Option<TimeOrNow>,
@@ -576,6 +576,9 @@ impl Filesystem for Fs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        if let Err(e) = convert::owner_unchanged(uid, self.core.uid) {
+            return reply.error(e);
+        }
         let changes = SetAttr {
             mode: mode.map(|m| m & MODE_MASK),
             size,

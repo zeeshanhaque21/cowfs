@@ -147,10 +147,9 @@ So this run used `rustc` directly, and a canonical path says nothing about a car
 - The treehouse wiring uses `--slot`, not a treehouse lease.
   moonscape has no `treehouse` binary, so the integration run builds in the snapshot itself.
   That is the same `run_build` call site a leased slot takes; only the slot provider differs.
-- The integration run uses the path backend, not the core backend, because `base_refresh` copies a
-  directory into the store and the core backend refuses that by design.
-  It is the backend that supports the operation under test, serving the same store over the same
-  FUSE mount.
+- The integration run used the path backend, not the core backend, because at the time `base_refresh` copied a
+  directory into the store and the core backend refused that.
+  The core backend now publishes `base_refresh` tree-natively (issue 123), but this run predates that.
   Block-level verification is the core backend's, and belongs to the helper run.
 - `base_refresh` no longer depends on what git prints: the checkout path is passed as an argument and
   nothing is read from stdout. That removes the version question entirely rather than answering it, and
@@ -176,11 +175,13 @@ two-route check passes.
 The full `bench/` suite reports 53 tests on macOS, 10 of them skipped, and the rest of them belong to
 `bench/test_gates.py`.
 
-The GitHub `ubuntu-latest` runner denies namespaces, so CI takes the macOS branch and reports
-`OK (skipped=10)` there.
-That is the honest outcome and not a CI gap in the tests: a refusal pass is not an isolation pass, and
-the run's first line says which branch it took.
-The isolation matrix was run on `moonscape` instead, and the measurements above are from there.
+The GitHub `ubuntu-latest` runner (ubuntu-24.04, kernel 6.17) denies unprivileged user namespaces by default.
+Probe on the runner (2026-10-08, image ubuntu24/20261004.327): `kernel.apparmor_restrict_unprivileged_userns=1`, `kernel.unprivileged_userns_clone=1`, and `unshare -Ur -m true` fails with `write failed /proc/self/uid_map: Operation not permitted`.
+After `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` the same call succeeds and a `--rbind` inside the new mount namespace works.
+The `check` job still takes the refusal branch and reports `OK (skipped=10)` on its ubuntu leg.
+The `linux-namespaces` job in `.github/workflows/ci.yml` lifts that one sysctl, runs `bench/test_namespaces.py`, and then fails unless all 9 `Isolation` tests report `ok` and the only skip is `test_off_linux_is_unmeasurable`.
+A skipped isolation test therefore cannot read as green in that job (issue #171).
+The moonscape measurements above remain the FUSE-level evidence.
 `test_both_routes_refused_names_both_in_the_message` puts a refusing `unshare` stub first on `PATH`, so the two-route refusal message is still checked everywhere, including on a host where a namespace does work.
 
 The end-to-end run, on a Linux host with `/dev/fuse` and a Rust toolchain:
@@ -317,8 +318,7 @@ It is not evidence that a warm base was published, because none was, and it is n
 
 - No warm base is published, so no dedup or warm-base benefit is measured.
   The path backend stored 20.9 MiB for 20.9 MiB logical in the earlier run.
-- No Core backend result, because the core backend refuses `base_refresh` by design: it ingests trees, not
-  directories.
+- No Core backend result in this run. The core backend now publishes `base_refresh` tree-natively (issue 123), but this measurement predates that.
 - No `fsck` result: the path backend has no block store and says so.
 - No crash safety and no no-data-loss claim. The readback is a daemon restart, not crash injection.
 - No leased-slot result: moonscape has no `treehouse` binary, so the run uses `--slot`, the same
