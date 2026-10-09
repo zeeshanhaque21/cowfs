@@ -381,12 +381,103 @@ fn a4_shutdown_abandons_a_handler_that_never_returns() {
     );
 }
 
+/// The `shutting_down` terminal frame must reach a client that stops reading and resumes within
+/// the shutdown grace.
+///
+/// The client stops reading at 300 ms so the flood fills the socket buffer and the next progress
+/// write really blocks; shutdown then starts and the client resumes reading 400 ms later, inside
+/// the delivery grace (`shutdown_deadline` 200 ms plus `drain_deadline` 250 ms, so the connection is
+/// closed at about 450 ms). The blocked write unwinds, the abandon worker writes the terminal, and
+/// the client must get one whole frame.
+///
+/// Before #77 the server returned without joining that worker, so a blocked client could hold the
+/// connection, socket and handler for a further `write_timeout`. That half is now asserted by
+/// `a4_a_terminal_frame_is_not_guaranteed_past_the_grace`.
 #[test]
-fn a4_a_terminal_frame_being_written_is_not_cut_by_shutdown() {
+fn a4_a_terminal_frame_is_delivered_to_a_client_that_resumes_within_the_grace() {
     let _w = Watchdog::start(180);
-    // The client stops reading, so the terminal frame write is still in flight when the server
-    // gives up on the connection.
+    // The promise only covers a client that resumes inside `shutdown_deadline` plus the grace. A
+    // `thread::sleep` is a lower bound, so on a starved runner the resume can land past that window
+    // and the case then says nothing about the guarantee. Each attempt therefore measures when it
+    // actually resumed, from before `shutdown()`, which is never later than the server's own start.
+    // An attempt that resumed late is discarded and rerun; only an on-time resume is asserted on.
+    let window = Duration::from_millis(450);
+    // 250 ms is 50 ms past the 200 ms shutdown deadline (the abandon path has begun) and leaves 200 ms
+    // of scheduler slack before the 450 ms close; it must be asserted. 400 ms probes the far edge of
+    // the window, where 50 ms of slack is below the starvation seen on shared macOS runners (resumes
+    // measured at 453..547 ms for a nominal 400 ms), so it is asserted only when it lands in time.
+    for (delay_ms, required) in [(250u64, true), (400, false)] {
+        let mut late = Vec::new();
+        let mut asserted = false;
+        for _ in 0..5 {
+            let (e, resumed) = a4_resume_after(delay_ms);
+            eprintln!("A4 within-grace delay={delay_ms}ms ending={e:?} resumed_at={resumed:?}");
+            if resumed >= window {
+                late.push(resumed);
+                continue;
+            }
+            assert_eq!(
+                e,
+                Ending::Response,
+                "a client that resumed at {resumed:?}, inside the {window:?} window, must get its whole terminal frame: {e:?}"
+            );
+            asserted = true;
+            break;
+        }
+        assert!(
+            asserted || !required,
+            "no {delay_ms} ms attempt resumed inside the {window:?} window, so the runner was too starved to test it: {late:?}"
+        );
+    }
+}
+
+/// One run of the scenario: returns the ending and how long after just before `shutdown()` the
+/// client began reading.
+fn a4_resume_after(delay_ms: u64) -> (Ending, Duration) {
     let fx = start_with(
+        Streamer {
+            steps: 20_000,
+            padding: 2000,
+        },
+        ServerOptions {
+            shutdown_deadline: Duration::from_millis(200),
+            // The original geometry: the 250 ms default grace. It is deliberately left at the default
+            // rather than widened. An earlier revision cut the delivery window in half and had to
+            // widen this to 500 ms to keep passing; that silently removed the guarantee for clients
+            // resuming between 325 ms and 450 ms, which is the range a maintainer reads in the docs.
+            // With the whole grace as the delivery window the default is correct again.
+            write_timeout: Duration::from_secs(5),
+            ..ServerOptions::default()
+        },
+    );
+    let s = UnixStream::connect(&fx.path).unwrap();
+    let mut w = s.try_clone().unwrap();
+    w.write_all(HELLO.as_bytes()).unwrap();
+    w.write_all(b"\n").unwrap();
+    w.write_all(REQUEST.as_bytes()).unwrap();
+    w.write_all(b"\n").unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let t0 = Instant::now();
+    fx.server().handle().shutdown();
+    thread::sleep(Duration::from_millis(delay_ms));
+    drop(w);
+    let resumed = t0.elapsed();
+    (classify(&s, Duration::from_millis(2500)), resumed)
+}
+
+/// Past the grace the server closes the connection before `wait()` returns, so a client that is
+/// still not reading gets no promise: it may see a partial frame, then EOF.
+///
+/// The contract (`docs/v1-control-api.md:397-399`) says abandoned handlers have "their connections
+/// closed and the server returns". #77 makes that real: the connection, socket and handler are
+/// released by `shutdown_deadline` plus the grace, not left to unwind against `write_timeout`.
+/// A complete terminal frame cannot be guaranteed to a peer that resumes reading only after that
+/// close, so this asserts the close is bounded and that whatever the peer does see is never a
+/// duplicated terminal.
+#[test]
+fn a4_a_terminal_frame_is_not_guaranteed_past_the_grace() {
+    let _w = Watchdog::start(180);
+    let mut fx = start_with(
         Streamer {
             steps: 20_000,
             padding: 2000,
@@ -399,17 +490,36 @@ fn a4_a_terminal_frame_being_written_is_not_cut_by_shutdown() {
     );
     let s = UnixStream::connect(&fx.path).unwrap();
     let mut w = s.try_clone().unwrap();
-    w.write_all(format!("{HELLO}\n").as_bytes()).unwrap();
-    w.write_all(format!("{REQUEST}\n").as_bytes()).unwrap();
+    w.write_all(HELLO.as_bytes()).unwrap();
+    w.write_all(b"\n").unwrap();
+    w.write_all(REQUEST.as_bytes()).unwrap();
+    w.write_all(b"\n").unwrap();
     thread::sleep(Duration::from_millis(300));
-    fx.server().handle().shutdown();
+
+    let t0 = Instant::now();
+    let server = fx.server.take().unwrap();
+    server.handle().shutdown();
+    server.wait();
+    let wait_ms = t0.elapsed().as_millis();
+    eprintln!("A4 beyond-grace wait_ms={wait_ms}");
+
+    // The peer never read, so the terminal cannot land in its buffer. It resumes long after the
+    // close and must see the connection go away, not a frame the server never finished writing.
     thread::sleep(Duration::from_millis(600));
     drop(w);
     let e = classify(&s, Duration::from_millis(2500));
-    eprintln!("A4 finishing ending={e:?}");
+    eprintln!("A4 beyond-grace ending={e:?}");
+    // `classify` only counts a terminal it parsed out of a complete line, so a terminal it reports
+    // really arrived whole.
     assert!(
-        !matches!(e, Ending::NoFrame | Ending::NoHello | Ending::TwoTerminals),
-        "the terminal frame must be whole: {e:?}"
+        !matches!(e, Ending::NoHello | Ending::TwoTerminals),
+        "the abandoned connection must not answer twice or lose the handshake: {e:?}"
+    );
+    // Bounded: the deadline plus one grace with tolerance for a loaded machine. `write_timeout` is
+    // 5 s, so a bound well below it still fails an implementation that waits the write out.
+    assert!(
+        wait_ms < 3000,
+        "wait() took {wait_ms} ms; the connection must be closed by deadline plus grace"
     );
 }
 

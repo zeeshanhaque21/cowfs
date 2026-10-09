@@ -351,6 +351,22 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// The last 200 lines of stdout then stderr, for assertion messages.
+///
+/// `cargo test` prints the panic message and the failing test name on stdout and only the
+/// summary on stderr, so a message built from stderr alone hides the real failure (issue 165).
+fn output_tail(out: &Output) -> String {
+    let tail = |text: String| {
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(200)..].join("\n")
+    };
+    format!(
+        "--- stdout (tail) ---\n{}\n--- stderr (tail) ---\n{}",
+        tail(stdout(out)),
+        tail(stderr(out))
+    )
+}
+
 /// One receipt field, typed.
 ///
 /// `record` used to take `&str` for every value and serialise it as a JSON string, so a row
@@ -1311,8 +1327,13 @@ fn native_control_builds_and_tests_the_sample_project() {
         .collect();
     record("native-control", &refs);
 
-    assert_eq!(code(&build), 0, "native build failed: {}", stderr(&build));
-    assert_eq!(code(&test), 0, "native test failed: {}", stderr(&test));
+    assert_eq!(
+        code(&build),
+        0,
+        "native build failed: {}",
+        output_tail(&build)
+    );
+    assert_eq!(code(&test), 0, "native test failed: {}", output_tail(&test));
     assert!(built.is_file(), "the native control produced no rlib");
 }
 
@@ -2023,13 +2044,13 @@ fn a_real_project_builds_and_tests_inside_an_exported_slot_snapshot() {
         code(&build),
         0,
         "cargo build inside the verified export failed:\n{}",
-        stderr(&build)
+        output_tail(&build)
     );
     assert_eq!(
         code(&test),
         0,
         "cargo test inside the verified export failed:\n{}",
-        stderr(&test)
+        output_tail(&test)
     );
     assert!(rlib.is_file(), "the in-slot build produced no rlib");
 }
@@ -3000,13 +3021,13 @@ fn warm_base_acceptance_over_a_real_core() {
             code(&build),
             0,
             "slot {slot_no} build failed:\n{}",
-            stderr(&build)
+            output_tail(&build)
         );
         assert_eq!(
             code(&test),
             0,
             "slot {slot_no} test failed:\n{}",
-            stderr(&test)
+            output_tail(&test)
         );
 
         // Reset the slot and prove it is the untouched base again, on a fresh export.

@@ -110,12 +110,19 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ShutdownDeadlines {
+    abandon: Instant,
+    grace_end: Instant,
+}
+
 #[derive(Debug)]
 struct Shared {
     epoch: Instant,
     stopping: AtomicBool,
-    abandon_at: OnceLock<Instant>,
+    deadlines: OnceLock<ShutdownDeadlines>,
     shutdown_after: Duration,
+    drain_after: Duration,
     next_conn: AtomicU64,
     requests: AtomicUsize,
     conns: Mutex<HashMap<u64, Arc<Conn>>>,
@@ -124,7 +131,11 @@ struct Shared {
 
 impl Shared {
     fn begin_shutdown(&self) {
-        let _ = self.abandon_at.set(Instant::now() + self.shutdown_after);
+        let abandon = Instant::now() + self.shutdown_after;
+        let _ = self.deadlines.set(ShutdownDeadlines {
+            abandon,
+            grace_end: abandon + self.drain_after,
+        });
         self.stopping.store(true, Ordering::SeqCst);
     }
 
@@ -142,8 +153,16 @@ impl Shared {
         self.stopping.load(Ordering::SeqCst)
     }
 
+    /// The single end instant of the shutdown grace, once the shutdown deadline has passed.
+    fn abandoned_grace_end(&self) -> Option<Instant> {
+        self.deadlines
+            .get()
+            .filter(|d| Instant::now() >= d.abandon)
+            .map(|d| d.grace_end)
+    }
+
     fn abandoned(&self) -> bool {
-        self.abandon_at.get().is_some_and(|d| Instant::now() >= *d)
+        self.abandoned_grace_end().is_some()
     }
 }
 
@@ -186,8 +205,9 @@ impl Server {
         let shared = Arc::new(Shared {
             epoch: Instant::now(),
             stopping: AtomicBool::new(false),
-            abandon_at: OnceLock::new(),
+            deadlines: OnceLock::new(),
             shutdown_after: opts.shutdown_deadline,
+            drain_after: opts.drain_deadline,
             next_conn: AtomicU64::new(0),
             requests: AtomicUsize::new(0),
             conns: Mutex::new(HashMap::new()),
@@ -270,11 +290,101 @@ fn accept_loop(
         if lock(&shared.conns).is_empty() {
             break;
         }
-        if shared.abandoned() {
+        if let Some(grace_end) = shared.abandoned_grace_end() {
+            // The end instant was fixed when shutdown began, not when this loop noticed the deadline.
+            // Everything from here to the return spends ONE grace: the budget is
+            // `shutdown_deadline + drain_deadline`, and no wait restarts it.
+            // The whole grace is the delivery window. `kill` runs at `grace_end`, so a client that
+            // resumes reading at any point inside `shutdown_deadline + drain_deadline` still gets its
+            // frame; the unwind after the resume plus the terminal write still fits in that window.
+            //
+            // Reserving a slice of the grace for the close does not buy a close-at-return property:
+            // the unsplit source already closed at the return in every shape an independent review
+            // measured. What a reserve actually buys is letting a killed parked handler unwind before
+            // the return, which is a weaker claim than the contract makes. `v1-control-api.md` detaches
+            // handler threads and lets them die with the process, so this hands that case back rather
+            // than pretending it is joined.
+            let release_start = grace_end;
+            let left = |now: Instant, end: Instant| {
+                end.saturating_duration_since(now)
+                    .max(Duration::from_millis(1))
+            };
+            // Deliver each straggler's `shutting_down` frame from its own worker, then wait for those
+            // workers within the grace. A readable client's frame is written before `wait()` returns,
+            // so `cowfs serve` can exit right after it without dropping the frame. A worker for a
+            // client that stopped reading blocks on the write lock a progress write holds for the
+            // whole `write_timeout`; the grace expires and `wait()` returns without joining it, so a
+            // blocked write cannot stretch the budget. The worker count is bounded by
+            // `max_connections`.
             let stragglers: Vec<Arc<Conn>> = lock(&shared.conns).values().cloned().collect();
-            for conn in stragglers {
-                conn.abandon_inflight();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let mut workers = Vec::with_capacity(stragglers.len());
+            for conn in &stragglers {
+                let owned = Arc::clone(conn);
+                let done_tx = done_tx.clone();
+                match thread::Builder::new()
+                    .name("cowfs-ctl-abandon".into())
+                    .spawn(move || {
+                        owned.abandon_inflight();
+                        owned.kill();
+                        let _ = done_tx.send(());
+                    }) {
+                    Ok(worker) => workers.push(worker),
+                    // No worker: deliver the frame best-effort without blocking on a held write
+                    // lock, then close, so a readable peer still gets `shutting_down` and no
+                    // connection is left open past the return. The write gets only what is left of the
+                    // one grace, so a peer whose receive queue is completely full cannot park the
+                    // accept thread for a whole `write_timeout` here.
+                    Err(_) => {
+                        conn.best_effort_abandon(left(Instant::now(), release_start));
+                        conn.kill();
+                    }
+                }
+            }
+            drop(done_tx);
+            for _ in 0..workers.len() {
+                let remaining = left(Instant::now(), release_start);
+                if done_rx.recv_timeout(remaining).is_err() {
+                    break;
+                }
+            }
+            // A worker that has not finished is parked behind a progress write that a non-reading
+            // peer is holding open. `abandon_inflight` cannot observe the cancel token until that
+            // write returns, so without this the connection, socket and handler would outlive
+            // `wait()` by up to `write_timeout`, which the Shutdown contract forbids ("their
+            // connections are closed"). `kill` takes no lock, so it cannot block: half-closing the
+            // write side aborts the parked `write_all`, so the worker returns. This truncates any
+            // frame still being written to a very slow but reading peer, which is the "abandoned"
+            // semantics.
+            for conn in &stragglers {
                 conn.kill();
+            }
+            // The workers own the only writes this server still makes to a control client, so join
+            // them before returning: no control-client buffer writer outlives `wait()`. `kill`
+            // already aborted their blocked writes, so this normally completes at once. Bounded by the
+            // same `grace_end`, so a worker descheduled past the grace cannot stretch the budget; such
+            // a worker only has to finish a write that can no longer reach a peer, and the process
+            // exit in `cowfs serve` ends it.
+            for worker in workers {
+                while !worker.is_finished() && Instant::now() < grace_end {
+                    // Yield rather than sleep: a one-millisecond sleep is a floor, not a ceiling, and
+                    // on a loaded runner it can stretch far enough to miss a worker that is already
+                    // runnable. The wait is bounded by `grace_end` either way.
+                    std::thread::yield_now();
+                }
+            }
+            // The connection threads own the sockets, and each request worker owns a handler. A worker
+            // parked behind a blocked write cannot observe its cancel token, so both the socket and
+            // the handler would outlive `wait()` by up to `write_timeout` without this wait, which the
+            // Shutdown contract forbids ("their connections are closed"). The workers were already
+            // killed above, so a parked writer is released at once. Still bounded by the same
+            // `grace_end`: a handler that is stuck on the CPU instead of a socket cannot be forced
+            // out by half-closing, so it is detached and dies with the process, exactly as the
+            // contract says of handler threads. It never costs a second grace.
+            while Instant::now() < grace_end
+                && (!lock(&shared.conns).is_empty() || stragglers.iter().any(|c| !c.released()))
+            {
+                std::thread::yield_now();
             }
             break;
         }
@@ -524,6 +634,11 @@ struct Conn {
     /// Terminal frames whose write is in progress. Counted outside the inflight map so a slow
     /// write never holds the map lock, yet teardown still sees the request as unfinished.
     finishing: AtomicU64,
+    /// Request worker threads this connection still owns. A worker parks in whatever the handler
+    /// is doing, which a blocked progress write makes up to a whole `write_timeout`, so the
+    /// connection thread dropping out of `conns` does not mean the handler is gone. Shutdown waits on
+    /// this count so `wait()` returns with no handler of an abandoned connection still running.
+    workers: AtomicU64,
 }
 
 impl Conn {
@@ -536,7 +651,13 @@ impl Conn {
             last_active: AtomicU64::new(0),
             inflight: Mutex::new(HashMap::new()),
             finishing: AtomicU64::new(0),
+            workers: AtomicU64::new(0),
         })
+    }
+
+    /// True once this connection owns no request worker, no terminal write and no live request.
+    fn released(&self) -> bool {
+        self.workers.load(Ordering::SeqCst) == 0 && self.inflight_empty()
     }
 
     fn send(&self, frame: &ServerFrame) -> bool {
@@ -609,6 +730,40 @@ impl Conn {
         }
     }
 
+    /// Same as `abandon_inflight`, but the terminal write is skipped when the write lock is held.
+    /// Used on the shutdown deadline when no helper thread could be spawned, so the deadline path
+    /// never blocks behind a peer that stopped reading, while a readable peer still gets its frame.
+    ///
+    /// `budget` bounds the write itself. A peer whose receive queue is completely full would
+    /// otherwise park this `write_all` for the whole `write_timeout` on the accept thread, which is
+    /// the same deadline this path exists to protect. On timeout the connection is marked dead and
+    /// closed by `kill`, which is the abandoned outcome.
+    fn best_effort_abandon(&self, budget: Duration) {
+        let ids: Vec<u64> = lock(&self.inflight).keys().copied().collect();
+        for id in ids {
+            let frame = ServerFrame::Error {
+                id: Some(id),
+                error: CtlError::new(ErrorCode::ShuttingDown, "server is shutting down"),
+            };
+            if let Ok(mut inflight) = self.inflight.try_lock() {
+                if inflight.remove(&id).is_none() {
+                    continue;
+                }
+                drop(inflight);
+                if let Ok(_write) = self.write_lock.try_lock() {
+                    if self.dead.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let _ = self.stream.set_write_timeout(Some(budget));
+                    if (&self.stream).write_all(&frame.encode()).is_err() {
+                        self.dead.store(true, Ordering::SeqCst);
+                    }
+                    let _ = self.stream.set_write_timeout(None);
+                }
+            }
+        }
+    }
+
     /// Milliseconds since the server started at which this connection last had traffic.
     fn last_active(&self) -> Duration {
         Duration::from_millis(self.last_active.load(Ordering::SeqCst))
@@ -632,9 +787,14 @@ impl Conn {
         let _ = reader
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(50)));
+        // A connection that was already killed has had its delivery grace: the write side is closed
+        // and the peer either got its terminal frame or never will. Reading away what the peer sent
+        // is politeness for a peer that is still there, and it is what would otherwise hold this
+        // socket, and the handler behind it, open for the whole drain deadline after `wait()`
+        // returned. Close now instead; the contract only promises the close.
         let until = Instant::now() + deadline;
         let mut sink = [0u8; 8192];
-        while Instant::now() < until {
+        while !self.dead.load(Ordering::SeqCst) && Instant::now() < until {
             match reader.read(&mut sink) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
@@ -866,6 +1026,7 @@ fn start_request(
         return;
     }
     let slot = RequestSlot(Arc::clone(shared));
+    conn.workers.fetch_add(1, Ordering::SeqCst);
     let spawned = thread::Builder::new().name("cowfs-ctl-req".into()).spawn({
         let (conn, handler, opts, shared) = (
             Arc::clone(conn),
@@ -883,10 +1044,12 @@ fn start_request(
                 request,
                 token,
                 slot,
-            )
+            );
+            conn.workers.fetch_sub(1, Ordering::SeqCst);
         }
     });
     if spawned.is_err() {
+        conn.workers.fetch_sub(1, Ordering::SeqCst);
         conn.finish(
             id,
             &ServerFrame::Error {
