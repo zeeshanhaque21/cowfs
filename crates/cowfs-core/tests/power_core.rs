@@ -192,7 +192,6 @@ struct Expect {
 
 struct World {
     core: Core,
-    backend: Backend,
     live: BTreeMap<String, Tree>,
     cur: Expect,
     /// `acks[j]` is the expectation for cuts after acknowledgement `j` (0 is the setup).
@@ -381,7 +380,6 @@ fn record(hook: bool) -> Run {
     .unwrap();
     let mut w = World {
         core,
-        backend: backend.clone(),
         live: BTreeMap::new(),
         cur: Expect::default(),
         acks: Vec::new(),
@@ -469,7 +467,7 @@ fn record(hook: bool) -> Run {
         ack_at,
         acks: w.acks,
         gc_unlinked,
-        swaps: 3,
+        swaps: 2,
     }
 }
 

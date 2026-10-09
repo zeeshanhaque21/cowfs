@@ -145,7 +145,8 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// `std::fs::remove_file`, in the order the power-loss model records.
-pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
     #[cfg(feature = "fault-injection")]
     rootlog::push(|| rootlog::RootOp::Unlink(file_name(path)));
     std::fs::remove_file(path)
