@@ -3,6 +3,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use cowfs_vfs::FallocMode;
 use cowfs_vfs::{
     Attr, Error, FileHandle, FileKind, Ino, Result, SetAttr, SetTime, StatFs, Timestamp,
     XattrFlags, MODE_MASK, NAME_MAX, ROOT_INO,
@@ -204,6 +205,73 @@ impl Inner {
             st.attr.mtime = pick(t);
         }
         st.attr.ctime = now;
+        {
+            let mut q = sc.q.lk();
+            if node.seq.load(Ordering::Acquire) <= sc.drained() {
+                q.touch(&node);
+            }
+        }
+        Ok(st.report())
+    }
+
+    /// `Vfs::fallocate`. The size decision and the chunk rewrite happen under the node write lock,
+    /// so a concurrent write, truncate or fallocate cannot be lost or shrunk.
+    pub(crate) fn op_fallocate(
+        &self,
+        ino: Ino,
+        mode: FallocMode,
+        off: u64,
+        len: u64,
+    ) -> Result<Attr> {
+        let (zero, extend) = match mode {
+            FallocMode::Allocate => (false, true),
+            FallocMode::KeepSize => (false, false),
+            FallocMode::PunchHole | FallocMode::ZeroRangeKeepSize => (true, false),
+            FallocMode::ZeroRange => (true, true),
+            _ => return Err(Error::NotSupported),
+        };
+        let (sc, node) = self.file_node(ino)?;
+        if len == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let end = off
+            .checked_add(len)
+            .filter(|&e| e <= MAX_FILE)
+            .ok_or(Error::FileTooBig)?;
+        self.ensure_file(&sc, &node)?;
+        if let Some(e) = node.poisoned() {
+            return Err(e);
+        }
+        // a punch stores chunks, so the gate is entered before the node lock is taken
+        let entry = zero.then(|| self.gate.enter());
+        let mut st = node.st.wr();
+        let now = Timestamp::now();
+        let old = st.attr.size;
+        if let Some(entry) = &entry {
+            if off < end.min(old) {
+                let f = st.file.as_mut().ok_or(Error::Stale)?;
+                let n0 = f.dirty_bytes();
+                f.flush(&self.blocks, entry)?;
+                self.dirty_bytes.fetch_sub(n0, Ordering::AcqRel);
+                if let Err(e) = f.punch(&self.blocks, entry, off, end.min(old)) {
+                    // the flush above already moved dirty bytes into the chunk list: queue it, or
+                    // a later sync would commit the list from before that flush
+                    self.queue_content(&sc, &node, &st);
+                    return Err(e);
+                }
+            }
+        }
+        let grew = extend && end > old;
+        if grew {
+            st.attr.size = end;
+        }
+        if zero || grew {
+            st.attr.mtime = now;
+        }
+        st.attr.ctime = now;
+        if zero || grew {
+            self.queue_content(&sc, &node, &st);
+        }
         {
             let mut q = sc.q.lk();
             if node.seq.load(Ordering::Acquire) <= sc.drained() {

@@ -1,5 +1,6 @@
 //! `Vfs` for `Core`.
 
+use cowfs_vfs::FallocMode;
 use cowfs_vfs::{
     Attr, Error, FileHandle, FileKind, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, Vfs,
     XattrFlags,
@@ -130,5 +131,9 @@ impl Vfs for Core {
 
     fn removexattr(&self, ino: Ino, name: &[u8]) -> Result<()> {
         self.inner.op_removexattr(ino, name)
+    }
+
+    fn fallocate(&self, ino: Ino, mode: FallocMode, offset: u64, len: u64) -> Result<Attr> {
+        self.inner.op_fallocate(ino, mode, offset, len)
     }
 }

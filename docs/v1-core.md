@@ -428,6 +428,7 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `dcache::purge_snapshot` | leaf | 1 |
 | `dcache::shrink_all` | leaf | 1 |
 | `file::truncate` | blocks | ? |
+| `file::punch` | blocks | ? |
 | `file::put_piece` | blocks | ? |
 | `file::flush_extent` | blocks | ? |
 | `file::verify_partial` | blocks | ? |
@@ -474,6 +475,7 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `io::op_read` | st.rd | 2 |
 | `io::op_write` | sc.q, st.wr, st.rd, last_error | 1 then 2 then leaf |
 | `io::op_setattr` | sc.q, st.wr, st.rd | 1 then 2 |
+| `io::op_fallocate` | sc.q, st.wr | 1 then 2 |
 | `io::op_readlink` | st.rd | 2 |
 | `io::op_open` | handles | leaf |
 | `io::op_release` | nodes, handles | 2 then leaf |

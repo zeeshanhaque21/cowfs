@@ -39,7 +39,7 @@ All ranges are `[offset, offset + len)` in bytes.
 
 cowfs has no preallocation.
 Allocate is therefore sparse-aware: it only promises that the file is at least that long and that a later write inside the range cannot fail for lack of space that this call could have reserved, which is no promise at all here.
-It never consumes space, so `st_blocks` does not grow, and it never returns `NoSpace` except for a range past the maximum file size.
+It never consumes space, so `st_blocks` does not grow, and it never reserves space; a range past the maximum file size is `FileTooBig`.
 This is the documented deviation from ext4, where mode 0 reserves blocks.
 Zero-range and punch are the same operation on cowfs, because both mean "reads as zeros" and a hole is the cheapest way to say it.
 This is a second deviation from ext4, where ZERO_RANGE preallocates blocks for the range.
@@ -78,12 +78,13 @@ Extension (Allocate, ZeroRange past EOF) only raises `size`; the new bytes are t
 Chunk lists are values and blocks are immutable and content addressed.
 A punch builds a new chunk list for the live file and never rewrites a block, so a snapshot or clone that shares the old list still reads the old bytes.
 The test is explicit: write, snapshot, punch the live file, read both, and require the snapshot unchanged.
-A snapshot view that is read-only answers `ReadOnly`, by the same check the other mutating operations use.
+A snapshot view is a writable session over a copy-on-write tree, so fallocate on it works like write; only the synthetic root is read-only, and it is a directory (`IsDir`).
 
 ### GC and fsck
 
 A hole ref carries the all-zero id, which GC already filters (`cowfs-gc` drops `HOLE` when marking) and which `is_hole` recognises in core.
-Punching leaves blocks unreferenced by the live file; they are freed by the next GC cycle, exactly as after truncate or unlink.
+Punching leaves blocks unreferenced by the live file; the next GC cycle frees them, exactly as after truncate or unlink.
+The tests check the collector's input (the fork's live blocks are unchanged and the punched file names fewer), not a GC cycle itself.
 The slice B test runs fsck-style reference checks over a file with punched holes: every non-hole ref resolves, and no hole ref has length zero or above `HOLE_MAX`.
 
 ### Space and quota
@@ -97,18 +98,16 @@ If the store or a limit refuses those puts, the call returns `NoSpace` (`ENOSPC`
 | Condition | Vfs error | errno |
 |---|---|---|
 | `len == 0` | InvalidArgument | EINVAL |
-| range beyond the maximum file size, or `offset + len` overflows | NoSpace today | ENOSPC |
+| range beyond the maximum file size, or `offset + len` overflows | FileTooBig | EFBIG |
 | unknown inode | Stale | ESTALE |
 | directory | IsDir | EISDIR |
 | symlink | InvalidArgument | EINVAL |
-| read-only snapshot | ReadOnly | EROFS |
 | damaged block at an edge | Corrupt | EIO |
 | no store room for the edge re-chunk | NoSpace | ENOSPC |
 | backend without support (default) | NotSupported | ENOTSUP (= EOPNOTSUPP on Linux) |
 
-Linux returns `EFBIG` for a range past the maximum size.
-`write` and `setattr` already return `NoSpace` for it, and another builder is adding a `FileTooBig` error.
-Until it lands, fallocate matches `write`; when it lands, all three move together.
+Linux returns `EFBIG` for a range past the maximum size, and so do `write`, `setattr` and fallocate, through `Error::FileTooBig`.
+A range whose `offset + len` overflows `u64` is the same error.
 The FUSE adapter rejects negative offset or length with `EINVAL` before calling the Vfs.
 The FUSE adapter answers `EOPNOTSUPP` for collapse-range, insert-range, unshare-range, any unknown bit, and the invalid pairs the kernel itself refuses (`PUNCH_HOLE` without `KEEP_SIZE`, `PUNCH_HOLE` with `ZERO_RANGE`).
 
@@ -121,12 +120,12 @@ The NFS adapter keeps the default: NFS v3 has no fallocate.
 
 ## Tests
 
-Slice A (cowfs-vfs and cowfs-vfs-test): conformance checks, run on MemVfs, with four MemVfs faults so a wrong backend fails: `PunchNoop` and `PunchChangesSize` (caught by the punch check), `AllocateShrinks` (allocate check), `ZeroRangeNoExtend` (zero-range check).
+Slice A (cowfs-vfs and cowfs-vfs-test): conformance checks, run on MemVfs, with six MemVfs faults so a wrong backend fails: `PunchNoop` and `PunchChangesSize` (punch check), `AllocateShrinks` (allocate check), `ZeroRangeNoExtend` (zero-range check), `FallocZeroLenOk` (errors check) and `FallocNoTimes` (times check).
 Checks: punch reads zeros and keeps size, zero-range with and without keep, allocate extends and never shrinks (sequentially: allocate inside a longer file leaves the size alone), keep-size past EOF keeps the size, errors, times (`Level::Cowfs`), and a seeded random sequence against a byte model.
 MemVfs has one coarse lock, so a two-thread check there could not fail for the right reason; the real interleaving of allocate against growing writes is tested on Core in slice B, where the atomicity lives.
 The checks are `Level::Portable`, not `Posix`, because PathVfs answers `NotSupported` until slice D.
 The only runs of the whole suite on a backend without fallocate are `crates/cowfs-core/tests/conformance.rs` (the `conformance_tests!` skip list and the `SuiteOptions::skip` in `run_all_prints_a_table`); the PathVfs native and mount runs are manual, ignored and non-strict.
-Core skips the new checks by name with the reason "fallocate not implemented yet (#103 slice B)", so the skip is visible and slice B removes it.
+Core skipped the new checks by name, with the reason "fallocate not implemented in Core yet (#103 slice B)", until slice B, which deleted both skip lists and made `run_all_prints_a_table` assert that the six ran and passed.
 Slice B: the same checks on Core, plus the snapshot-unchanged test, hole-ref integrity after a punch, `st_blocks` drop, and edge cases at chunk boundaries.
 Slice C: first read the kernel's `fuse_file_fallocate` for the CI and cachyos kernel versions to learn which mode masks reach userspace, because a filtered `ZERO_RANGE` would keep those matrix rows `EOPNOTSUPP` whatever cowfs does.
 Slice C: a Linux-only mount test in `crates/cowfs-fuse/tests/mount.rs` that calls `fallocate(1)` or `libc::fallocate` for every mode and reads back, and the matrix re-run.

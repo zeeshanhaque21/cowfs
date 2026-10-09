@@ -196,7 +196,7 @@ pub trait Vfs: Send + Sync {
     /// Allocates, punches or zeroes `[offset, offset + len)` of a regular file atomically and
     /// returns the new attributes. See `FallocMode` for each mode.
     ///
-    /// `len == 0` is `Error::InvalidArgument`. A range past the largest file size is an error
+    /// `len == 0` is `Error::InvalidArgument`. A range past the largest file size is `Error::FileTooBig`
     /// and changes nothing. A directory is `Error::IsDir` and a symlink `Error::InvalidArgument`.
     /// `PunchHole` and both `ZeroRange` modes are content changes, so they set mtime and ctime.
     /// There is no preallocation: no mode consumes space, and `blocks` never grows.

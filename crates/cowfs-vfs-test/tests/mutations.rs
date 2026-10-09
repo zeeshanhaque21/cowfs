@@ -48,6 +48,12 @@ const FAST: &[(Fault, &[&str])] = &[
         Fault::PunchChangesSize,
         &["fallocate_punch_reads_zeros_keeps_size"],
     ),
+    (Fault::ZeroRangeNoExtend, &["fallocate_zero_range_modes"]),
+    (Fault::FallocZeroLenOk, &["fallocate_errors"]),
+    (
+        Fault::FallocNoTimes,
+        &["fallocate_content_change_bumps_mtime_and_ctime"],
+    ),
 ];
 
 #[test]

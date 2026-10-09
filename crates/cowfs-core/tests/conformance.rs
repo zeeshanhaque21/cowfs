@@ -44,6 +44,7 @@ macro_rules! forward {
     };
 }
 
+use cowfs_vfs::FallocMode;
 use cowfs_vfs::{
     Attr, FileHandle, FileKind, Ino, ReadDir, RenameFlags, Result, SetAttr, StatFs, XattrFlags,
 };
@@ -74,41 +75,44 @@ forward! {
     setxattr(ino: Ino, name: &[u8], value: &[u8], flags: XattrFlags) -> Result<()>;
     listxattr(ino: Ino) -> Result<Vec<Vec<u8>>>;
     removexattr(ino: Ino, name: &[u8]) -> Result<()>;
+    fallocate(ino: Ino, mode: FallocMode, offset: u64, len: u64) -> Result<Attr>;
 }
 
-/// Checks Core cannot pass until #103 slice B; each is an ignored test with this reason.
-const NO_FALLOCATE: &[&str] = &[
-    "fallocate_punch_reads_zeros_keeps_size",
-    "fallocate_zero_range_modes",
-    "fallocate_allocate_and_keep_size",
-    "fallocate_errors",
-    "fallocate_content_change_bumps_mtime_and_ctime",
-    "fallocate_random_sequence_matches_model",
-];
-
-conformance_tests!(
-    || -> Arc<dyn Vfs> { factory() },
-    skip = {
-        fallocate_punch_reads_zeros_keeps_size => "fallocate not implemented in Core yet (#103 slice B)",
-        fallocate_zero_range_modes => "fallocate not implemented in Core yet (#103 slice B)",
-        fallocate_allocate_and_keep_size => "fallocate not implemented in Core yet (#103 slice B)",
-        fallocate_errors => "fallocate not implemented in Core yet (#103 slice B)",
-        fallocate_content_change_bumps_mtime_and_ctime => "fallocate not implemented in Core yet (#103 slice B)",
-        fallocate_random_sequence_matches_model => "fallocate not implemented in Core yet (#103 slice B)"
-    }
-);
+conformance_tests!(|| -> Arc<dyn Vfs> { factory() });
 
 #[test]
 fn run_all_prints_a_table() {
     let f = || factory();
-    let opts = SuiteOptions {
-        skip: NO_FALLOCATE
-            .iter()
-            .map(|n| (n.to_string(), "#103 slice B".to_string()))
-            .collect(),
-        ..SuiteOptions::default()
-    };
-    let report = run_all(&f, &opts);
+    let report = run_all(&f, &SuiteOptions::default());
     println!("{}", report.table());
     assert!(report.passed(), "{}", report.table());
+    // Core implements fallocate: the six checks must run and pass, never be skipped or missing.
+    assert!(
+        report
+            .skipped
+            .iter()
+            .all(|k| !k.check.name.starts_with("fallocate")),
+        "{}",
+        report.table()
+    );
+    let ran = |n: &str| {
+        report
+            .results
+            .iter()
+            .any(|r| r.check.name == n && r.outcome.is_ok())
+    };
+    for n in [
+        "fallocate_punch_reads_zeros_keeps_size",
+        "fallocate_zero_range_modes",
+        "fallocate_allocate_and_keep_size",
+        "fallocate_errors",
+        "fallocate_content_change_bumps_mtime_and_ctime",
+        "fallocate_random_sequence_matches_model",
+    ] {
+        assert!(
+            ran(n),
+            "{n} did not run and pass on Core\n{}",
+            report.table()
+        );
+    }
 }

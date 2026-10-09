@@ -86,6 +86,10 @@ pub enum Fault {
     PunchChangesSize,
     /// `fallocate` `ZeroRange` past the end zeroes but leaves the size alone.
     ZeroRangeNoExtend,
+    /// `fallocate` with length 0 succeeds instead of `InvalidArgument`.
+    FallocZeroLenOk,
+    /// `fallocate` punch and zero-range leave mtime and ctime alone.
+    FallocNoTimes,
     /// `mknod` forgets the device number.
     MknodDropsRdev,
     /// `read` of a special file succeeds with no bytes instead of `InvalidArgument`.
@@ -160,6 +164,8 @@ impl Fault {
         Fault::AllocateShrinks,
         Fault::PunchChangesSize,
         Fault::ZeroRangeNoExtend,
+        Fault::FallocZeroLenOk,
+        Fault::FallocNoTimes,
         Fault::MknodDropsRdev,
         Fault::SpecialReadOk,
         Fault::MknodNoParentTimes,

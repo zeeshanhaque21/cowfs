@@ -613,9 +613,10 @@ pub fn fallocate_errors(c: &Ctx) -> Outcome {
             "{mode:?} on a never existing inode"
         );
         for (off, len) in [(1u64 << 42, 1u64), (u64::MAX, 2), (1, u64::MAX)] {
-            ensure!(
-                c.fs.fallocate(f, mode, off, len).is_err(),
-                "{mode:?} {off}+{len} past the largest file succeeded"
+            ensure_err!(
+                c.fs.fallocate(f, mode, off, len),
+                Error::FileTooBig,
+                "{mode:?} {off}+{len} past the largest file"
             );
         }
     }
@@ -623,6 +624,18 @@ pub fn fallocate_errors(c: &Ctx) -> Outcome {
         c.fs.getattr(f)?.size,
         5,
         "a failed fallocate changed the size"
+    );
+    // the largest file size is the boundary: ending exactly on it works, one byte more does not
+    let max = 1u64 << 42;
+    ensure_eq!(
+        c.fs.fallocate(f, FallocMode::KeepSize, max - 1, 1)?.size,
+        5,
+        "KeepSize ending exactly at the largest file size"
+    );
+    ensure_err!(
+        c.fs.fallocate(f, FallocMode::KeepSize, max - 1, 2),
+        Error::FileTooBig,
+        "KeepSize ending one byte past the largest file size"
     );
     ensure!(
         c.content(f)? == b"hello",
