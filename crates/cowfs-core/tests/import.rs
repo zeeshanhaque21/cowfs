@@ -118,7 +118,7 @@ fn nothing_is_special_cased_so_git_comes_across_like_any_other_directory() {
 }
 
 #[test]
-fn refuses_a_source_that_is_not_a_directory_and_an_entry_the_core_cannot_hold() {
+fn refuses_a_source_that_is_not_a_directory_or_is_missing() {
     let f = common::fixture();
     let file = f.dir.path().join("plain");
     fs::write(&file, b"x").unwrap();
@@ -128,29 +128,53 @@ fn refuses_a_source_that_is_not_a_directory_and_an_entry_the_core_cannot_hold() 
     ));
     assert!(run(&f.core, &f.dir.path().join("gone"), "s").is_err());
     assert!(f.core.list_snapshots().unwrap().is_empty());
+}
 
-    // A fifo: nothing in a cowfs snapshot can be one, so the import refuses rather than skip it.
+/// A source with a fifo, a unix socket and (as root) a device node is imported as the same kinds of
+/// node, with their modes and device number, and the read-back verification accepts them.
+#[test]
+fn imports_fifo_socket_and_device_nodes_as_the_same_kind() {
+    use std::os::unix::net::UnixListener;
+    let f = common::fixture();
     let src = f.dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("ok"), b"x").unwrap();
-    let fifo = src.join("pipe");
-    assert!(
-        std::process::Command::new("mkfifo")
-            .arg(&fifo)
+    let tool = |args: &[&str]| {
+        std::process::Command::new(args[0])
+            .args(&args[1..])
             .status()
-            .expect("mkfifo")
-            .success(),
+            .expect("tool")
+            .success()
+    };
+    let path = |n: &str| src.join(n).to_str().unwrap().to_string();
+    assert!(
+        tool(&["mkfifo", "-m", "640", &path("pipe")]),
         "the test needs a fifo"
     );
-    let e = run(&f.core, &src, "withfifo").unwrap_err();
-    let ImportError::Invalid(msg) = e else {
-        panic!("{e:?}");
-    };
-    assert!(msg.contains("pipe"), "{msg}");
-    assert!(
-        f.core.list_snapshots().unwrap().is_empty(),
-        "a refused import leaves no snapshot"
+    let _sock = UnixListener::bind(src.join("sock")).unwrap();
+    let dev = tool(&["mknod", &path("chr"), "c", "1", "3"]);
+    let ingested = run(&f.core, &src, "withnodes").unwrap();
+    assert_eq!(ingested.files, 1, "only the regular file counts as a file");
+
+    let view = f.core.snapshot_view("withnodes").unwrap();
+    let pipe = view.lookup(ROOT_INO, b"pipe").unwrap();
+    assert_eq!(
+        (pipe.kind, pipe.mode, pipe.nlink, pipe.size),
+        (FileKind::Fifo, 0o640, 1, 0)
     );
+    assert_eq!(
+        view.lookup(ROOT_INO, b"sock").unwrap().kind,
+        FileKind::Socket
+    );
+    if dev {
+        let chr = view.lookup(ROOT_INO, b"chr").unwrap();
+        assert_eq!(chr.kind, FileKind::CharDevice);
+        assert_eq!(chr.rdev, cowfs_vfs::makedev(1, 3));
+    } else {
+        eprintln!("not root: the device node case did not run");
+        assert!(view.lookup(ROOT_INO, b"chr").is_err());
+    }
+    f.core.check().unwrap();
 }
 
 #[test]

@@ -39,6 +39,8 @@ pub struct Stat {
     pub gid: u32,
     pub size: u64,
     pub blocks: u64,
+    /// The host's `st_rdev`.
+    pub rdev: u64,
     pub atime: (i64, u32),
     pub mtime: (i64, u32),
     pub ctime: (i64, u32),
@@ -51,8 +53,12 @@ mod modes {
     pub const S_IFREG: u32 = libc::S_IFREG as u32;
     pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
     pub const S_IFLNK: u32 = libc::S_IFLNK as u32;
+    pub const S_IFIFO: u32 = libc::S_IFIFO as u32;
+    pub const S_IFSOCK: u32 = libc::S_IFSOCK as u32;
+    pub const S_IFCHR: u32 = libc::S_IFCHR as u32;
+    pub const S_IFBLK: u32 = libc::S_IFBLK as u32;
 }
-pub use modes::{S_IFDIR, S_IFLNK, S_IFREG};
+pub use modes::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK};
 
 impl Stat {
     pub fn file_type(&self) -> u32 {
@@ -112,6 +118,7 @@ fn widen(st: &libc::stat) -> Stat {
         gid: st.st_gid,
         size: st.st_size as u64,
         blocks: st.st_blocks as u64,
+        rdev: st.st_rdev as u64,
         atime: ts(st.st_atime as i64, st.st_atime_nsec as i64),
         mtime: ts(st.st_mtime as i64, st.st_mtime_nsec as i64),
         ctime: ts(st.st_ctime as i64, st.st_ctime_nsec as i64),
@@ -174,6 +181,74 @@ pub const OPEN_SYMLINK: libc::c_int = libc::O_PATH | libc::O_NOFOLLOW;
 /// Flags that open a symlink itself (not its target) for `fstat` and friends.
 #[cfg(target_os = "macos")]
 pub const OPEN_SYMLINK: libc::c_int = libc::O_SYMLINK | libc::O_RDONLY;
+
+/// Flags that open a fifo, socket or device node itself without blocking or touching the device.
+#[cfg(target_os = "linux")]
+pub const OPEN_SPECIAL: libc::c_int = OPEN_SYMLINK | libc::O_NONBLOCK;
+
+/// The cowfs device number `(major << 32) | minor` of a host `st_rdev`.
+#[cfg(target_os = "linux")]
+pub fn host_to_cowfs(rdev: u64) -> u64 {
+    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+    (major << 32) | (minor & 0xffff_ffff)
+}
+
+#[cfg(target_os = "macos")]
+pub fn host_to_cowfs(rdev: u64) -> u64 {
+    let rdev = rdev & 0xffff_ffff;
+    (((rdev >> 24) & 0xff) << 32) | (rdev & 0xff_ffff)
+}
+
+/// The host `st_rdev` of a cowfs device number; bits the host cannot carry are dropped.
+#[cfg(target_os = "linux")]
+pub fn cowfs_to_host(rdev: u64) -> u64 {
+    let (major, minor) = (rdev >> 32, rdev & 0xffff_ffff);
+    ((major & 0xfff) << 8) | ((major & !0xfff) << 32) | (minor & 0xff) | ((minor & !0xff) << 12)
+}
+
+#[cfg(target_os = "macos")]
+pub fn cowfs_to_host(rdev: u64) -> u64 {
+    (((rdev >> 32) & 0xff) << 24) | (rdev & 0xff_ffff)
+}
+
+/// `mknodat` of a fifo, socket or device. macOS has no `mknodat`, so it is unsupported there.
+#[cfg(target_os = "linux")]
+pub fn mknodat(dir: BorrowedFd<'_>, name: &[u8], mode: u32, rdev: u64) -> io::Result<()> {
+    let name = cstr(name)?;
+    // SAFETY: see module docs.
+    cvt(unsafe {
+        libc::mknodat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            mode as libc::mode_t,
+            rdev as libc::dev_t,
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn mknodat(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+}
+
+/// `fchmodat` by name, for a node that has no descriptor `fchmod` accepts (an `O_PATH` one).
+pub fn fchmodat(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<()> {
+    let name = cstr(name)?;
+    // SAFETY: see module docs.
+    cvt(unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) })?;
+    Ok(())
+}
+
+/// `chmod` through an `O_PATH` descriptor, via its `/proc/self/fd` name.
+#[cfg(target_os = "linux")]
+pub fn chmod_fd(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
+    let path = cstr(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
+    // SAFETY: see module docs.
+    cvt(unsafe { libc::chmod(path.as_ptr(), mode as libc::mode_t) })?;
+    Ok(())
+}
 
 pub fn mkdirat(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<()> {
     let name = cstr(name)?;
@@ -646,4 +721,30 @@ pub fn removexattr(t: &XTarget<'_>, name: &[u8]) -> io::Result<()> {
         }
     };
     cvt(r).map(|_| ())
+}
+
+#[cfg(test)]
+mod rdev_tests {
+    use super::{cowfs_to_host, host_to_cowfs};
+
+    #[test]
+    fn device_numbers_round_trip_through_the_host_encoding() {
+        // (major, minor) pairs every host can carry
+        for (major, minor) in [(0u64, 0u64), (1, 3), (8, 16), (4, 255), (200, 70_000)] {
+            let cowfs = (major << 32) | minor;
+            assert_eq!(
+                host_to_cowfs(cowfs_to_host(cowfs)),
+                cowfs,
+                "{major}:{minor}"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(cowfs_to_host((8 << 32) | 16), 0x810, "glibc makedev(8, 16)");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            cowfs_to_host((8 << 32) | 16),
+            (8 << 24) | 16,
+            "macOS makedev(8, 16)"
+        );
+    }
 }

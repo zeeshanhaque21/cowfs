@@ -71,6 +71,10 @@ pub(crate) fn kind_of(st: &Stat) -> Result<FileKind> {
         t if t == sys::S_IFREG => Ok(FileKind::Regular),
         t if t == sys::S_IFDIR => Ok(FileKind::Directory),
         t if t == sys::S_IFLNK => Ok(FileKind::Symlink),
+        t if t == sys::S_IFIFO => Ok(FileKind::Fifo),
+        t if t == sys::S_IFSOCK => Ok(FileKind::Socket),
+        t if t == sys::S_IFCHR => Ok(FileKind::CharDevice),
+        t if t == sys::S_IFBLK => Ok(FileKind::BlockDevice),
         _ => Err(Error::NotSupported),
     }
 }
@@ -423,16 +427,21 @@ impl State {
     }
 
     pub(crate) fn attr_of(&self, ino: Ino, st: &Stat) -> Result<Attr> {
+        let kind = kind_of(st)?;
         Ok(Attr {
             ino,
-            kind: kind_of(st)?,
+            kind,
             mode: st.mode & MODE_MASK,
             nlink: u32::try_from(st.nlink).unwrap_or(u32::MAX),
             uid: st.uid,
             gid: st.gid,
             size: st.size,
             blocks: st.blocks,
-            rdev: 0,
+            rdev: if kind.is_device() {
+                sys::host_to_cowfs(st.rdev)
+            } else {
+                0
+            },
             atime: ts(st.atime),
             mtime: ts(st.mtime),
             ctime: ts(st.ctime),
@@ -702,6 +711,9 @@ fn open_named(dir: &File, name: &[u8], kind: FileKind, write: bool) -> io::Resul
             false,
         ),
         FileKind::Symlink => (sys::openat(d, name, sys::OPEN_SYMLINK, 0)?, false),
+        // Linux only: macOS has no O_PATH, and its O_SYMLINK open would open a real device.
+        #[cfg(target_os = "linux")]
+        k if k.is_special() => (sys::openat(d, name, sys::OPEN_SPECIAL, 0)?, false),
         // A non-exhaustive enum: refusing a kind we do not know is the only safe answer.
         _ => return Err(io::Error::from_raw_os_error(libc::ENOTSUP)),
     };

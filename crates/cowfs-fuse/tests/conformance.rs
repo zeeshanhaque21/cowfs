@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use cowfs_vfs::Vfs;
 use cowfs_vfs_path::{force_remove_dir_all, PathVfs};
-use cowfs_vfs_test::conformance::{all_checks, run_all, Options};
+use cowfs_vfs_test::conformance::{run_all, Options};
 
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
@@ -91,15 +91,6 @@ fn mount_conformance() {
         "kernel sends FORGET asynchronously, so reclaim is not observable in the same call; a bounded poll makes 100/100 pass"
             .into(),
     ));
-    // This harness serves MemVfs through the mount and drives it with `PathVfs` as the client view
-    // of the mounted directory; `PathVfs` does not implement `mknod`, so the checks cannot run; the
-    // FUSE `mknod` path is covered by `special_files_through_mknod` in `mount.rs`, over MemVfs.
-    for c in all_checks().iter().filter(|c| c.category == "special") {
-        opts.skip.push((
-            c.name.into(),
-            "PathVfs (the client view) does not implement mknod; see special_files_through_mknod in mount.rs".into(),
-        ));
-    }
     let report = run_all(&factory, &opts);
     eprintln!("{}", report.table());
     wait_for_cleanup();

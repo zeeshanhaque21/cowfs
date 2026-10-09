@@ -38,6 +38,8 @@ pub enum Op {
     Read(Vec<u8>, u16, u16),
     /// Sets or removes an attribute named by the index. Symlink targets and directories too.
     Xattr(Vec<u8>, u8, Option<u8>),
+    /// A fifo, socket or device node: path, mode, kind index (taken modulo 4) and device byte.
+    Mknod(Vec<u8>, u16, u8, u8),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,6 +52,8 @@ struct Leaf {
     data: RefCell<Vec<u8>>,
     mode: Cell<u32>,
     target: Option<Vec<u8>>,
+    /// A fifo, socket or device: its kind and device number. No data, `read` and `write` fail.
+    special: Option<(FileKind, u64)>,
     xattrs: RefCell<BTreeMap<u8, u8>>,
 }
 
@@ -79,8 +83,27 @@ fn new_leaf(mode: u32, target: Option<Vec<u8>>) -> Rc<Leaf> {
         data: RefCell::default(),
         mode: Cell::new(mode),
         target,
+        special: None,
         xattrs: RefCell::default(),
     })
+}
+
+fn special_kind(idx: u8) -> FileKind {
+    [
+        FileKind::Fifo,
+        FileKind::Socket,
+        FileKind::CharDevice,
+        FileKind::BlockDevice,
+    ][usize::from(idx % 4)]
+}
+
+/// The device number a `Mknod` op gives its node: zero unless the kind is a device.
+fn special_rdev(kind: FileKind, dev: u8) -> u64 {
+    if kind.is_device() {
+        cowfs_vfs::makedev(u32::from(dev), u32::from(dev) * 3 + 1)
+    } else {
+        0
+    }
 }
 
 fn split(p: &[u8]) -> (&[u8], u8) {
@@ -153,6 +176,17 @@ impl Oracle {
             Op::Symlink(p, t) => {
                 self.insert(p, Node::Leaf(new_leaf(0o777, Some(name(*t).to_vec()))))
             }
+            Op::Mknod(p, m, k, dev) => {
+                let kind = special_kind(*k);
+                let leaf = Leaf {
+                    data: RefCell::default(),
+                    mode: Cell::new(u32::from(*m) & MODE_MASK),
+                    target: None,
+                    special: Some((kind, special_rdev(kind, *dev))),
+                    xattrs: RefCell::default(),
+                };
+                self.insert(p, Node::Leaf(Rc::new(leaf)))
+            }
             Op::Link(s, d) => {
                 let leaf = match self.get(s)? {
                     Node::Leaf(l) => Some(Rc::clone(l)),
@@ -210,7 +244,9 @@ impl Oracle {
             Op::Rename(a, b, no_replace) => self.rename(a, b, *no_replace),
             Op::Write(p, off, len, seed) => match self.get(p)? {
                 Node::Dir(_) => Err(vec![Error::IsDir]),
-                Node::Leaf(l) if l.target.is_some() => Err(vec![Error::InvalidArgument]),
+                Node::Leaf(l) if l.target.is_some() || l.special.is_some() => {
+                    Err(vec![Error::InvalidArgument])
+                }
                 Node::Leaf(l) => {
                     let (off, len) = (usize::from(*off), usize::from(*len));
                     if len > 0 {
@@ -225,7 +261,9 @@ impl Oracle {
             },
             Op::Truncate(p, size) => match self.get(p)? {
                 Node::Dir(_) => Err(vec![Error::IsDir]),
-                Node::Leaf(l) if l.target.is_some() => Err(vec![Error::InvalidArgument]),
+                Node::Leaf(l) if l.target.is_some() || l.special.is_some() => {
+                    Err(vec![Error::InvalidArgument])
+                }
                 Node::Leaf(l) => {
                     l.data.borrow_mut().resize(usize::from(*size), 0);
                     Ok(Obs::Unit)
@@ -242,7 +280,9 @@ impl Oracle {
             }
             Op::Read(p, off, len) => match self.get(p)? {
                 Node::Dir(_) => Err(vec![Error::IsDir]),
-                Node::Leaf(l) if l.target.is_some() => Err(vec![Error::InvalidArgument]),
+                Node::Leaf(l) if l.target.is_some() || l.special.is_some() => {
+                    Err(vec![Error::InvalidArgument])
+                }
                 Node::Leaf(l) => {
                     let data = l.data.borrow();
                     let start = usize::from(*off).min(data.len());
@@ -340,6 +380,17 @@ fn exec(fs: &dyn Vfs, op: &Op) -> Result<Obs, Error> {
         Op::Symlink(p, t) => {
             let (pp, n) = split(p);
             unit(fs.symlink(resolve(fs, pp)?, &name(n), &name(*t)))
+        }
+        Op::Mknod(p, m, k, dev) => {
+            let (pp, n) = split(p);
+            let kind = special_kind(*k);
+            unit(fs.mknod(
+                resolve(fs, pp)?,
+                &name(n),
+                kind,
+                u32::from(*m),
+                special_rdev(kind, *dev),
+            ))
         }
         Op::Link(s, d) => {
             let src = resolve(fs, s)?;
@@ -537,6 +588,19 @@ fn compare_leaf(
                 ));
             }
         }
+        None if l.special.is_some() => {
+            let (kind, rdev) = l.special.unwrap_or((FileKind::Fifo, 0));
+            if (a.kind, a.rdev, a.size, a.mode) != (kind, rdev, 0, l.mode.get()) {
+                return Err(format!(
+                    "{at}: {:?} rdev {:x} size {} mode {:o}, want {kind:?} rdev {rdev:x} size 0 mode {:o}",
+                    a.kind,
+                    a.rdev,
+                    a.size,
+                    a.mode,
+                    l.mode.get()
+                ));
+            }
+        }
         None => {
             let data = l.data.borrow();
             if a.kind != FileKind::Regular || a.size != data.len() as u64 || a.mode != l.mode.get()
@@ -623,7 +687,7 @@ pub fn random_ops(seed: u64, len: usize) -> Vec<Op> {
         }
     }
     let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let table = [5u64, 6, 2, 3, 3, 2, 5, 4, 2, 1, 2, 2];
+    let table = [5u64, 6, 2, 3, 3, 2, 5, 4, 2, 1, 2, 2, 2];
     (0..len)
         .map(|_| {
             let mut x = r.below(table.iter().sum());
@@ -652,6 +716,12 @@ pub fn random_ops(seed: u64, len: usize) -> Vec<Op> {
                 8 => Op::Truncate(path(&mut r), r.below(12_000) as u16),
                 9 => Op::SetMode(path(&mut r), r.next() as u16),
                 10 => Op::Read(path(&mut r), r.below(12_000) as u16, r.below(8000) as u16),
+                11 => Op::Mknod(
+                    path(&mut r),
+                    mode(&mut r),
+                    r.below(4) as u8,
+                    r.below(5) as u8,
+                ),
                 _ => Op::Xattr(
                     path(&mut r),
                     r.below(3) as u8,
