@@ -8,11 +8,12 @@
 //! | fault at | before reopen | after reopen |
 //! |---|---|---|
 //! | none | base is the new content | same |
-//! | 1 (staging fork) | base is the old content | same |
+//! | 1, promote only (staging fork) | base is the old content | same |
 //! | 2 (intent file) | base is the old content | same |
 //! | 3 (remove old) | base is the old content | same |
-//! | 4 (after the old target went) | `base` is absent, intent file present | base is the new content |
-//! | 5 (after the swap completed) | base is the new content | same |
+//! | 4, import (after the old target went) | `base` is absent, intent file present, the call returns `Err` | base is the new content |
+//! | 4, promote (after the old target went) | base is the new content, error logged, the swap rolls forward and returns `Ok` | same |
+//! | 5, promote only (after the swap completed) | base is the new content, error logged | same |
 //! | 6 (rename done, intent kept: a crash) | base is the new content, intent file present | base is the new content, intent dropped |
 //! | 7 (intent removal fails) | base is the new content, error logged, intent file present | same as 6 |
 //!

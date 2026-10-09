@@ -174,21 +174,29 @@ fn recover_intent(core: &Core, p: &Path) -> Result<(), ControlError> {
         } else if let Ok(sc) = core.inner.snap_by_name_raw(&staged) {
             let _ = core.inner.unregister(&sc);
         }
-        let _ = fs::remove_file(p);
+        let gone = fs::remove_file(p);
         sync_dir(&core.inner.root);
         *core.inner.last_error.lk() = Some(format!(
-            "swap recovery: {p:?} is unreadable, {} staging snapshot {staged}",
+            "swap recovery: {p:?} is unreadable, {} staging snapshot {staged}{}",
             if kept {
                 "rolled forward"
             } else {
                 "removed any"
+            },
+            match gone {
+                Ok(()) => String::new(),
+                Err(e) => format!("; could not remove it: {e}, the next open retries"),
             }
         ));
         return Ok(());
     };
     if p.file_name().and_then(|n| n.to_str()) == Some(&format!("{SWAP_PREFIX}{target}.tmp")) {
         // an older release's temp file (`swap-<target>.tmp`): its swap had not started
-        let _ = fs::remove_file(p);
+        if let Err(e) = fs::remove_file(p) {
+            *core.inner.last_error.lk() = Some(format!(
+                "swap recovery: could not remove {p:?}: {e}; the next open retries"
+            ));
+        }
         return Ok(());
     }
     match core.finish_swap(&staged, &target) {
@@ -229,6 +237,7 @@ pub(crate) fn recover(core: &Core) {
         .flatten()
     {
         if e.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
+            // best-effort on purpose: the file is inert, and the next open retries
             let _ = fs::remove_file(e.path());
         }
     }
@@ -424,6 +433,10 @@ impl Core {
     }
 
     /// Undo steps 1 and 2: no target was removed, so the mount goes back to exactly what it was.
+    ///
+    /// Removal errors are ignored on purpose: the caller is already returning the error that got
+    /// us here, and a leftover intent or temp file is handled by the next call for this target or
+    /// the next open (`recover_target`, `recover`).
     fn rollback(&self, staged: &str, target: &str) {
         if let Ok(sc) = self.inner.snap_by_name_raw(staged) {
             let _ = self.inner.unregister(&sc);
