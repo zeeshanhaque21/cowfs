@@ -90,6 +90,7 @@ fn client_frames() -> Vec<(&'static str, ClientFrame)> {
                 repo: "/srv/repo".into(),
                 git_ref: "main".into(),
                 name: None,
+                replace: false,
             })),
         ),
         (

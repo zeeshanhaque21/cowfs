@@ -6,8 +6,8 @@ use crate::frame::{
 use crate::handler::{CancelToken, ControlHandler, HolderGuard, OpContext};
 use crate::types::*;
 use crate::validate::{
-    validate_abs_path, validate_git_ref, validate_mount_relative, validate_repo,
-    validate_snapshot_name,
+    validate_abs_path, validate_base_name, validate_git_ref, validate_mount_relative,
+    validate_repo, validate_snapshot_name,
 };
 use crate::{socket, sys};
 use serde_json::json;
@@ -1196,7 +1196,7 @@ fn dispatch(
             Response::Snapshot(h.snapshot_rename(&p.from, &p.to)?)
         }
         Request::SnapshotPromote(p) => {
-            validate_snapshot_name(&p.name)?;
+            validate_base_name(&p.name)?;
             Response::Snapshot(h.snapshot_promote(&p.name)?)
         }
         Request::Gc(p) => Response::Gc(h.gc(p, ctx)?),
@@ -1210,7 +1210,7 @@ fn dispatch(
             validate_repo(&p.repo)?;
             validate_git_ref(&p.git_ref)?;
             if let Some(n) = &p.name {
-                validate_snapshot_name(n)?;
+                validate_base_name(n)?;
             }
             Response::BaseRefresh(h.base_refresh(p, ctx)?)
         }

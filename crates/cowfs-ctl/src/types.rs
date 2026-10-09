@@ -83,6 +83,10 @@ pub struct BaseRefreshParams {
     pub git_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Allow the refresh to replace an existing snapshot that has no base record, which is
+    /// otherwise refused because it may be a snapshot a user owns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace: bool,
 }
 
 /// Parameters of `ps`.

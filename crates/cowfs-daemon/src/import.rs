@@ -228,8 +228,41 @@ pub fn run(
     })
 }
 
-/// `base_refresh {repo, git_ref, name?}`. The name defaults to a derived one that two
+/// The base names a refresh is publishing right now, keyed by store and collision key.
+static REFRESHING: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Holds one base name for the length of a refresh; released on drop, on every path out.
+struct Refreshing(PathBuf, String);
+
+impl Refreshing {
+    /// `None` when another refresh of the same name is in flight.
+    ///
+    /// A refresh is replace, promote, record, read back: four steps that are only a publication
+    /// together. Two interleaved on one name can leave one tree under the other's commit, and on the
+    /// Core they share one hidden staging name, so the second is refused instead of waited for.
+    fn take(store: &Path, name: &str) -> Option<Refreshing> {
+        let key = (store.to_owned(), cowfs_ctl::name_key(name));
+        let mut held = REFRESHING.lock().unwrap_or_else(|p| p.into_inner());
+        if held.contains(&key) {
+            return None;
+        }
+        held.push(key.clone());
+        Some(Refreshing(key.0, key.1))
+    }
+}
+
+impl Drop for Refreshing {
+    fn drop(&mut self) {
+        let mut held = REFRESHING.lock().unwrap_or_else(|p| p.into_inner());
+        held.retain(|(s, n)| *s != self.0 || *n != self.1);
+    }
+}
+
+/// `base_refresh {repo, git_ref, name?, replace}`. The name defaults to a derived one that two
 /// repositories cannot collide on.
+///
+/// An existing snapshot of that name which is not a base is refused unless `replace` is set,
+/// because it may be a snapshot a user owns. A base is refreshed without the flag.
 pub fn base_refresh(
     backend: &dyn Backend,
     snaps: &dyn Snapshots,
@@ -240,6 +273,14 @@ pub fn base_refresh(
         .name
         .clone()
         .unwrap_or_else(|| base_name(&params.repo));
+    // Here as well as at the control API: the derived default name never passes through the API.
+    cowfs_ctl::validate_base_name(&name)?;
+    let _publishing = Refreshing::take(backend.store_path(), &name).ok_or_else(|| {
+        CtlError::new(
+            ErrorCode::Busy,
+            format!("another refresh of {name:?} is in progress"),
+        )
+    })?;
     let repo = PathBuf::from(&params.repo);
     let meta = std::fs::symlink_metadata(&repo)
         .map_err(|e| CtlError::new(ErrorCode::NotFound, format!("{}: {e}", params.repo)))?;
@@ -249,14 +290,24 @@ pub fn base_refresh(
             params.repo
         )));
     }
-    let previous = snaps
-        .list()
-        .unwrap_or_default()
-        .contains(&name)
-        .then(|| snaps.create_meta(&name).ok())
-        .flatten()
-        .and_then(|i| i.base)
-        .and_then(|b| b.commit);
+    let existing =
+        if snaps.list().unwrap_or_default().contains(&name) {
+            Some(snaps.create_meta(&name).map_err(|e| {
+                CtlError::new(ErrorCode::IoError, format!("cannot read {name:?}: {e}"))
+            })?)
+        } else {
+            None
+        };
+    if !params.replace && existing.as_ref().is_some_and(|i| i.base.is_none()) {
+        return Err(CtlError::new(
+            ErrorCode::AlreadyExists,
+            format!(
+                "{name:?} is a snapshot, not a base, and a refresh would replace it; \
+                 pass --replace (replace: true) to do that"
+            ),
+        ));
+    }
+    let previous = existing.and_then(|i| i.base).and_then(|b| b.commit);
     let commit = git_commit(&params.repo, &params.git_ref).ok_or_else(|| {
         CtlError::not_found(format!(
             "{} has no commit at {:?}",
@@ -618,6 +669,7 @@ mod tests {
                 repo: repo.display().to_string(),
                 git_ref: "main".into(),
                 name: Some(name.into()),
+                replace: false,
             },
             &OpContext::detached(),
         )
@@ -857,6 +909,7 @@ mod tests {
                 repo: repo.display().to_string(),
                 git_ref: "main".into(),
                 name: Some("warm".into()),
+                replace: false,
             },
             &cancelled,
         )
@@ -887,34 +940,27 @@ mod tests {
         core.close().unwrap();
     }
 
-    /// The staging name is the core's own hidden one, so a legal name at the length limit publishes.
+    /// Issue 170: the Core's swap intent file is `swap-<name>` on the host filesystem, so a name the
+    /// Core can hold is not always one it can refresh. The base limit is checked at the first call,
+    /// and a name at that limit refreshes again.
     #[test]
-    fn a_base_name_at_the_length_limit_publishes_and_never_leaves_partial_state_on_the_core() {
+    fn a_base_name_is_refused_at_the_first_call_when_it_could_not_be_refreshed_on_the_core() {
         use crate::backend::CoreBackend;
         let store = tempfile::tempdir().unwrap();
         let (_rd, repo) = repo("the base");
         let core = CoreBackend::open(store.path(), cowfs_core::Options::default()).unwrap();
-        let long = "a".repeat(cowfs_core::NAME_MAX);
-        refresh(&core, &repo, &long).expect("a name at the limit publishes");
-        // The swap's intent file is `swap-<name>` on the host filesystem, so replacing a name this
-        // long is the core's own limit (it hits `promote_base` too). It must fail cleanly: an
-        // error, the old base still there, and nothing left under another name.
-        let second = refresh(&core, &repo, &long);
-        assert!(
-            second.is_err(),
-            "replacing a 255-byte name hits the Core intent-file limit (issue 170); when that is fixed, flip this to expect success"
-        );
+        let too_long = "a".repeat(cowfs_core::NAME_MAX);
+        let e = refresh(&core, &repo, &too_long).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidParams, "{e}");
+        assert!(core.snapshots().list().unwrap().is_empty());
+
+        let long = "a".repeat(cowfs_ctl::BASE_NAME_MAX);
+        refresh(&core, &repo, &long).expect("a name at the base limit publishes");
+        refresh(&core, &repo, &long).expect("and refreshes again");
         assert_eq!(
             core.snapshots().list().unwrap(),
             std::slice::from_ref(&long)
         );
-        let view = core.snapshot(&long).unwrap();
-        let files = cowfs_ctl::hash_view(view.as_ref(), cowfs_vfs::ROOT_INO)
-            .unwrap()
-            .files;
-        assert!(files >= 1, "a failed replacement left the old base intact");
-        drop(view);
-        core.snapshots().create_meta(&long).unwrap();
         core.close().unwrap();
     }
 
@@ -931,6 +977,7 @@ mod tests {
                 repo: repo.display().to_string(),
                 git_ref: "no-such-ref".into(),
                 name: Some("warm".into()),
+                replace: false,
             },
             &OpContext::detached(),
         )

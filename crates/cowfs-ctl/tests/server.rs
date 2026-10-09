@@ -196,6 +196,7 @@ fn end_to_end_every_method_with_the_real_client() {
                 repo: "/srv/myrepo".into(),
                 git_ref: "main".into(),
                 name: None,
+                replace: false,
             }))
             .unwrap()
         else {
