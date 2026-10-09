@@ -1,0 +1,12 @@
+xfstests_commit=3e1ee800e52a0f53d7d9a7809be1ffc80ec1788f
+xfstests_tree=3683cb11c7dde850a567042e89b4e35e5d082b8e
+xfstests_path=/mnt/docs/Projects/cowfs-g5-build/final/xfstests
+make_rc=2
+make_failed_targets=default locktest src
+compiler=cc (GCC) 16.2.1 20260810
+kernel=7.2.8-2-cachyos
+fsstress_sha256=37b4976f33f9f95e96a72045e5ff568de9a82008b3b713e08fdb49c8324370e7
+fsx_sha256=a3c50f07fd7297dabf9c9b4dca9ab4621a80d820c15902068bdf55119cc1fbae
+group_list_sha256=66cf56d81f41f7a485edbc3a57cd7d793384f6b9c365391cfe8853af313a96b4
+smoke_fsx=200 ops A-OK
+smoke_fsstress_ops=45

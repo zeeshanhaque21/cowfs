@@ -1,0 +1,14 @@
+Seed set to 1
+main: filesystem does not support fallocate mode FALLOC_FL_UNSHARE_RANGE, disabling!
+main: filesystem does not support fallocate mode FALLOC_FL_WRITE_ZEROES, disabling!
+main: filesystem does not support fallocate mode FALLOC_FL_COLLAPSE_RANGE, disabling!
+main: filesystem does not support fallocate mode FALLOC_FL_INSERT_RANGE, disabling!
+main: filesystem does not support exchange range, disabling!
+main: filesystem does not support dontcache IO, disabling!
+main: atomic writes need O_DIRECT (-Z), disabling!
+zero_range to largest ever: 0x31720
+copying to largest ever: 0x383c7
+fallocating to largest ever: 0x3892a
+cloning to largest ever: 0x3f000
+copying to largest ever: 0x3f893
+All 200 operations completed A-OK!
