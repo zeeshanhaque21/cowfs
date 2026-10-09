@@ -1418,10 +1418,18 @@ impl Store {
 
     /// Re-hash every block and re-check every record checksum, without changing anything.
     pub fn fsck(&self) -> Result<FsckReport> {
+        self.fsck_with(&mut |_, _| true)
+    }
+
+    /// [`Store::fsck`] that reports `(bytes scanned, bytes to scan)` after every record, so a
+    /// caller can show progress and a peer that gave up can stop it: returning false makes this
+    /// fail with an `Interrupted` I/O error. It is called often, so a caller throttles.
+    pub fn fsck_with(&self, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<FsckReport> {
         let lens = self.writer().pack_lens();
         let mut report = FsckReport::default();
         let mut verified: HashMap<(u32, u32), BlockId> = HashMap::new();
         let mut seen = HashSet::new();
+        let total: u64 = lens.values().sum();
         for (&pack_id, &len) in &lens {
             let file = self.reads.get(pack_id).map_err(|e| match e.kind() {
                 io::ErrorKind::NotFound => Error::Corrupt {
@@ -1439,6 +1447,12 @@ impl Store {
                         payload,
                     } => {
                         report.records += 1;
+                        if !progress(report.bytes_scanned + offset, total) {
+                            return Err(Error::Io(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "fsck was cancelled",
+                            )));
+                        }
                         match record::decode(header, payload) {
                             Ok(data) if BlockId::of(&data) == header.id => {
                                 verified.insert((pack_id, offset as u32), header.id);

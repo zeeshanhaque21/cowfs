@@ -85,7 +85,13 @@ pub trait Backend: Send + Sync + fmt::Debug {
     }
 
     /// Re-hashes every block, or `None` when the backend has no block store to check.
-    fn fsck(&self) -> io::Result<Option<cowfs_store::FsckReport>> {
+    ///
+    /// `progress(done, total)` is called often while it works and returns false to stop the check,
+    /// which then fails; a caller throttles.
+    fn fsck(
+        &self,
+        _progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> io::Result<Option<cowfs_store::FsckReport>> {
         Ok(None)
     }
 
@@ -677,9 +683,12 @@ impl Backend for CoreBackend {
             .map(Some)
     }
 
-    fn fsck(&self) -> io::Result<Option<cowfs_store::FsckReport>> {
+    fn fsck(
+        &self,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> io::Result<Option<cowfs_store::FsckReport>> {
         with_core(&self.core, |c| {
-            c.fsck()
+            c.fsck_with(progress)
                 .map(Some)
                 .map_err(|e| io::Error::other(e.to_string()))
         })
