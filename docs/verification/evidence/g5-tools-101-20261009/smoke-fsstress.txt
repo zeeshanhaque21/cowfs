@@ -1,0 +1,53 @@
+0/0: do_mmap - no filename
+0/1: writev - no filename
+0/2: clonerange read - no filename
+0/3: read - no filename
+0/4: dread - no filename
+0/5: do_fallocate - no filename
+0/6: do_mmap - no filename
+0/7: write - no filename
+0/8: getattr . 0 -1
+0/9: unlink - no file
+0/10: dread - no filename
+0/11: mkdir d0 0
+0/11: mkdir add id=0,parent=-1
+0/12: writev - no filename
+0/13: clonerange read - no filename
+0/14: creat d0/f1 x:0 0 0
+0/14: creat add id=1,parent=0
+0/15: fallocate(ZERO_RANGE) d0/f1[86141964 1 1000 1000 0 0] [469211,4815] 0
+0/16: read dontcache d0/f1[86141964 1 1000 1000 16 474026] [439642,116683] 0
+0/17: read d0/f1[86141964 1 1000 1000 16 474026] [259338,68313] 0
+0/18: do_aio_rw - xfsctl(XFS_IOC_DIOINFO) d0/f1[86141964 1 1000 1000 16 474026] return 25, fallback to stat()
+0/18: awrite d0/f1[86141964 1 1000 1000 16 474026] [1032192,8192] 0
+0/19: getfattr file d0/f1 name user.x0 failed 61
+0/21: fallocate(KEEP_SIZE|PUNCH_HOLE) d0/f1[86141964 1 1000 1000 32 1040384] [564677,479619] 0
+0/22: xfsctl(XFS_IOC_RESVSP64) d0/f1[86141964 1 1000 1000 16 1040384] [1396091,395199] 0
+0/23: fallocate(ZERO_RANGE) d0/f1[86141964 1 1000 1000 800 1040384] [1520880,327173] 0
+0/24: dread - xfsctl(XFS_IOC_DIOINFO) d0/f1[86141964 1 1000 1000 912 1848053] return 25, fallback to stat()
+0/24: dread d0/f1[86141964 1 1000 1000 912 1848053] [180224,28672] 0
+0/25: rename() d0 to d0/d2 22
+0/26: dwrite - xfsctl(XFS_IOC_DIOINFO) d0/f1[86141964 1 1000 1000 912 1848053] return 25, fallback to stat()
+0/26: dwrite d0/f1[86141964 1 1000 1000 912 1848053] [712704,16384] 0
+0:27: subvol_delete - no subvolume
+0/28: exchangerange d0/f1[86141964 1 1000 1000 944 1848053] [503808,81920] -> d0/f1[86141964 1 1000 1000 944 1848053] [274432,81920] error 25
+0/29: fsync d0/f1 0
+0/30: writev d0/f1[86141964 1 1000 1000 944 1848053] [1505823,23,931] 0
+0/31: rmdir d0 39
+0/32: mwrite d0/f1[86141964 1 1000 1000 944 1848053] [1331200,94917,SHARED] 0
+0/33: writev d0/f1[86141964 1 1000 1000 1064 1848053] [2021031,146,657] 0
+0/34: readlink - no filename
+0/35: fsync d0/f1 0
+0/39: read dontcache d0/f1[86141964 1 1000 1000 1256 2116953] [1269509,77970] 0
+0/40: getattr d0 0 -1
+0/41: mknod d0/c3 0
+0/41: mknod add id=3,parent=0
+0/42: clonerange d0/f1[86141964 1 1000 1000 1256 2116953] [1101824,69632] -> d0/f1[86141964 1 1000 1000 1256 2116953] [6230016,69632]
+0/43: rename() d0 to d0/d4 22
+0/44: clonerange d0/f1[86141964 1 1000 1000 1256 6299648] [4669440,53248] -> d0/f1[86141964 1 1000 1000 1256 6299648] [5943296,53248]
+0/45: xfsctl(XFS_IOC_RESVSP64) d0/f1[86141964 1 1000 1000 1256 6299648] [4878031,1046976] 0
+0/46: dwrite - xfsctl(XFS_IOC_DIOINFO) d0/f1[86141964 1 1000 1000 3312 6299648] return 25, fallback to stat()
+0/46: dwrite d0/f1[86141964 1 1000 1000 3312 6299648] [4108288,126976] 0
+0/47: truncate d0/f1[86141964 1 1000 1000 3560 6299648] 6824612 0
+0/48: chown d0/c3 7/3 1
+0/49: bulkstat nent 252 total 0

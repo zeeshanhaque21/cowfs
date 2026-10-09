@@ -1,0 +1,13 @@
+locktest.c:1065:16: error: variable 'deleg' has initializer but incomplete type
+locktest.c:1065:38: error: 'struct delegation' has no member named 'd_type'
+locktest.c:1065:27: error: storage size of 'deleg' isn't known
+locktest.c:1365:12: error: variable 'deleg' has initializer but incomplete type
+locktest.c:1365:34: error: 'struct delegation' has no member named 'd_type'
+locktest.c:1365:23: error: storage size of 'deleg' isn't known
+locktest.c:1615:16: error: variable 'deleg' has initializer but incomplete type
+locktest.c:1615:38: error: 'struct delegation' has no member named 'd_type'
+locktest.c:1615:27: error: storage size of 'deleg' isn't known
+make[3]: *** [Makefile:139: locktest] Error 1
+make[2]: *** [include/buildrules:30: src] Error 2
+make[1]: *** [Makefile:65: default] Error 2
+make: *** [Makefile:63: default] Error 2
