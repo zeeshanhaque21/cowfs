@@ -17,7 +17,10 @@ fn umasks() -> Vec<String> {
     let mut out = Vec::new();
     let mut paths = vec!["/proc/self/status".to_string()];
     if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
-        paths.extend(rd.flatten().map(|e| format!("{}/status", e.path().display())));
+        paths.extend(
+            rd.flatten()
+                .map(|e| format!("{}/status", e.path().display())),
+        );
     }
     for p in paths {
         if let Ok(text) = std::fs::read_to_string(p) {

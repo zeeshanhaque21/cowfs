@@ -33,7 +33,7 @@ fn is_root() -> bool {
         let dir = tempfile::tempdir().expect("scratch dir for the capability probe");
         let f = dir.path().join("mode0");
         File::create(&f).unwrap();
-        fs::set_permissions(&f, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o0)).unwrap();
         File::open(&f).is_ok()
     })
 }
@@ -55,8 +55,8 @@ const AS_ROOT_ENV: &str = "COWFS_TEST_AS_ROOT";
 #[test]
 #[ignore = "needs FUSE: cargo test -p cowfs-fuse -- --ignored --test-threads=1"]
 fn special_files_through_mknod_as_root() {
-    if std::env::var_os(AS_ROOT_ENV).is_some() || can_make_devices() {
-        return; // the plain test already takes the root branch in this process
+    if !fuse_usable() || std::env::var_os(AS_ROOT_ENV).is_some() || can_make_devices() {
+        return; // no FUSE here, or the plain test already takes the root branch in this process
     }
     let sudo = Command::new("sudo")
         .args(["-n", "true"])
@@ -79,11 +79,14 @@ fn special_files_through_mknod_as_root() {
         .args(["--test-threads=1", "--nocapture"])
         .output()
         .unwrap();
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         out.status.success() && text.contains("1 passed"),
-        "root run failed:\n{text}\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        "root run failed:\n{text}"
     );
     assert!(!text.contains("SKIP"), "the root run skipped:\n{text}");
 }

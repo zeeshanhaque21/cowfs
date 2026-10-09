@@ -269,7 +269,10 @@ impl Vfs for PathVfs {
         // when the owner could not open the directory afterwards. Without a thread-private
         // umask it always does.
         let first = mode | 0o700;
-        let exact = sys::mkdirat_exact(dir.file.as_fd(), name, first).map_err(io_err)?;
+        let exact = s
+            .umask
+            .mkdirat_exact(dir.file.as_fd(), name, first)
+            .map_err(io_err)?;
         if !exact {
             sys::mkdirat(dir.file.as_fd(), name, 0o700).map_err(io_err)?;
         }
@@ -319,7 +322,10 @@ impl Vfs for PathVfs {
         // go by name, and lands on whatever another process renamed over the name in between.
         // That chmod is left for when the kernel may change the mode (a default ACL on the
         // parent) or no thread-private umask exists.
-        let exact = sys::mknodat_exact(dir.file.as_fd(), name, ty | mode, host).map_err(io_err)?;
+        let exact = s
+            .umask
+            .mknodat_exact(dir.file.as_fd(), name, ty | mode, host)
+            .map_err(io_err)?;
         if !exact {
             sys::mknodat(dir.file.as_fd(), name, ty | 0o600, host).map_err(io_err)?;
         }

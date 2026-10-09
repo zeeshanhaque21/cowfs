@@ -134,6 +134,8 @@ pub(crate) struct State {
     open_handles: HashMap<u64, Ino>,
     next_ino: Ino,
     next_handle: u64,
+    /// Makes nodes with an exact mode (see `sys::UmaskWorker`); started on first use.
+    pub(crate) umask: sys::UmaskWorker,
 }
 
 impl State {
@@ -169,6 +171,7 @@ impl State {
             open_handles: HashMap::new(),
             next_ino: ROOT_INO + 1,
             next_handle: 1,
+            umask: sys::UmaskWorker::default(),
         })
     }
 
