@@ -322,16 +322,61 @@ fn blocked_progress_write_does_not_stall_admission() {
 /// (N=20 idle and N=20 under CPU load), this one 300 to 314 ms. Parse after the drain.
 /// See docs/reviews/pr79-spike-20261008.md.
 fn drain_raw<R: Read>(from: &mut R, until: Instant) -> Vec<u8> {
+    drain_raw_eof(from, until).0
+}
+
+/// `drain_raw` that also reports whether the drain ended on EOF (the server closed) rather than on
+/// the window running out. Diagnostics only (#121): it changes nothing about what is read.
+fn drain_raw_eof<R: Read>(from: &mut R, until: Instant) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut buf = vec![0u8; 256 * 1024];
+    let mut eof = false;
     while Instant::now() < until {
         match from.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                eof = true;
+                break;
+            }
             Ok(n) => out.extend_from_slice(&buf[..n]),
             Err(_) => {}
         }
     }
-    out
+    (out, eof)
+}
+
+/// One line of evidence for a failed delivery assertion (#121): bytes received, elapsed ms, frames
+/// seen by type, terminal ids, the bytes after the last newline (a cut frame), whether the drain
+/// ended on EOF, and the server's shutdown state. A CI failure used to carry none of this, so an
+/// early close by the server could not be told from a frame that never came.
+fn delivery_evidence(
+    raw: &[u8],
+    elapsed: Duration,
+    eof: bool,
+    handle: &ShutdownHandle,
+    steps: Option<&AtomicU64>,
+) -> String {
+    let tail_from = raw.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let mut kinds = std::collections::BTreeMap::<String, usize>::new();
+    for l in raw[..tail_from]
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+    {
+        let k = serde_json::from_slice::<serde_json::Value>(l)
+            .ok()
+            .and_then(|v| v["type"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unparsed".into());
+        *kinds.entry(k).or_default() += 1;
+    }
+    format!(
+        "evidence: bytes={} elapsed_ms={} frames={kinds:?} terminal_ids={:?} partial_tail_bytes={} \
+         ended_on_eof={eof} server_shutting_down={} handler_steps={:?}",
+        raw.len(),
+        elapsed.as_millis(),
+        terminal_ids(raw),
+        raw.len() - tail_from,
+        handle.is_shutting_down(),
+        steps.map(|s| s.load(Ordering::SeqCst)),
+    )
 }
 
 /// Ids of the terminal frames in `raw`. Only a complete line counts, so a truncated tail can never
@@ -384,24 +429,29 @@ fn an_unblocked_client_still_receives_a_terminal_frame_at_shutdown() {
     assert!(steps.load(Ordering::SeqCst) >= 2, "handler never streamed");
 
     let t0 = Instant::now();
-    fx.server().handle().shutdown();
+    let handle = fx.server().handle();
+    handle.shutdown();
     // Keep reading so the abandoned request's terminal frame is not lost to a full buffer. The
     // frame now lands at the deadline plus grace, well under 2 s; a 5 s window would mask a
     // regression back to the write timeout.
     let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
-    let raw = drain_raw(&mut &s, Instant::now() + Duration::from_secs(2));
+    let (raw, eof) = drain_raw_eof(&mut &s, Instant::now() + Duration::from_secs(2));
     let elapsed = t0.elapsed();
+    let evidence = delivery_evidence(&raw, elapsed, eof, &handle, Some(&*steps));
     let ids = terminal_ids(&raw);
     assert!(
         ids.iter().all(|&i| i == 1),
-        "terminal frame carries the request id: {ids:?}"
+        "terminal frame carries the request id: {ids:?}; {evidence}"
     );
     let terminal = !ids.is_empty();
     eprintln!(
-        "PROGRESS77 terminal_present={terminal} elapsed_ms={}",
+        "PROGRESS77 terminal_present={terminal} elapsed_ms={} {evidence}",
         elapsed.as_millis()
     );
-    assert!(terminal, "a reading client must receive its terminal frame");
+    assert!(
+        terminal,
+        "a reading client must receive its terminal frame; {evidence}"
+    );
 }
 
 /// Reads `chunk` bytes, then pauses `pause`, until EOF or `until`; parses nothing. A client that
@@ -1409,17 +1459,19 @@ fn a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame() {
 
             let t0 = Instant::now();
             let server = fx.server.take().unwrap();
-            server.handle().shutdown();
+            let handle = server.handle();
+            handle.shutdown();
             // Resume while the server is still inside its delivery window: that is the whole claim.
             // The frame is read before `wait()` returns, which is exactly what the window promises.
             thread::sleep(Duration::from_millis(case.resume_ms));
             let _ = client
                 .stream
                 .set_read_timeout(Some(Duration::from_millis(50)));
-            let raw = drain_raw(
+            let (raw, eof) = drain_raw_eof(
                 &mut client.reader,
                 Instant::now() + Duration::from_millis(2500),
             );
+            let evidence = delivery_evidence(&raw, t0.elapsed(), eof, &handle, Some(&*attempted));
             let whole = terminal_ids(&raw).contains(&1);
             // The server finishes its own grace and returns; only after that is the close claim
             // meaningful. `wait()` returns inside the budget, so this cannot stretch anything.
@@ -1436,7 +1488,7 @@ fn a_client_resuming_late_inside_the_full_grace_gets_a_whole_frame() {
             assert!(
                 whole,
                 "{} rep {rep}: a client that resumed {} ms inside a {window:?} grace got no whole \
-                 terminal frame",
+                 terminal frame; {evidence}",
                 case.label, case.resume_ms
             );
             assert!(
