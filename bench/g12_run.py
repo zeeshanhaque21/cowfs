@@ -565,6 +565,11 @@ def newest(label):
     return sorted((p for p in (BENCH / "out").glob(f"{label}-*.jsonl") if pat.fullmatch(p.name)), key=lambda p: p.stat().st_mtime)[-1]
 
 
+def unmeasurable_gates(outs):
+    """Per compare.py run, the gates whose result line is UNMEASURABLE (rc 1 can carry them next to a FAIL)."""
+    return [sorted({m.group(1) for m in re.finditer(r"^(g\d)\s.*UNMEASURABLE:", o, re.M)}) for o in outs]
+
+
 def run(args, out, verdict):
     env = dict(os.environ, COWFS_BENCH_SCALE=str(args.scale))
     gl = args.gates.split(",")
@@ -655,13 +660,15 @@ def run(args, out, verdict):
         if ratio is None or abs(ratio - 1) > NOISE_BAND:
             verdict["problems"].append(f"{g}: native-native ratio {ratio} outside 1 +/- {NOISE_BAND}")
     verdict["cowfs_over_native"] = {"pair1": ratio_table(rows["n1"], rows["c1"], gl), "pair2": ratio_table(rows["n2"], rows["c2"], gl)}
-    codes = []
+    codes, outs = [], []
     for i, (nat, cow, nf) in enumerate((("n1", "c1", "n2"), ("n2", "c2", "n1"))):
         p = sh([sys.executable, str(BENCH / "compare.py"), "--native", str(files[nat]), "--cowfs", str(files[cow]),
                 "--noise-floor", str(files[nf])])
         (out / f"compare-{i + 1}.txt").write_text(p.stdout + p.stderr)
         codes.append(p.returncode)
+        outs.append(p.stdout)
     verdict["compare_rc"] = codes
+    verdict["unmeasurable_gates"] = unmeasurable_gates(outs)  # a FAIL receipt must still say which gates compare.py could not rule on
     if any(c in (2, 3) for c in codes):
         verdict["problems"].append(f"compare.py rc {codes}")
     if args.sample:
@@ -695,7 +702,7 @@ def main():
     out = BENCH / "out" / "g12" / args.run_id
     out.mkdir(parents=True)  # exclusive: a repeated run id is refused
     verdict = {"run_id": args.run_id, "sample": s, "NOT_A_GATE_RESULT": s, "gates": args.gates, "reps": args.reps,
-               "scale": args.scale, "load_cap": args.load_cap, "baseline_window": args.baseline_window, "wait": args.wait, "problems": [], "result": "INVALID"}
+               "scale": args.scale, "load_cap": args.load_cap, "baseline_window": args.baseline_window, "wait": args.wait, "problems": [], "unmeasurable_gates": [], "result": "INVALID"}
     try:
         if LINUX:
             verdict["problems"] += linux_path_problems([out, LOCK, sock_path(args.run_id), *linux_env(os.environ, LINUX_BASE)], LINUX_BASE)
@@ -707,7 +714,7 @@ def main():
         verdict["problems"].append(f"{type(e).__name__}: {e}")
         verdict["result"] = "INVALID"
     (out / "verdict.json").write_text(json.dumps(verdict, indent=1, default=str) + "\n")
-    print(json.dumps({k: verdict[k] for k in ("run_id", "sample", "NOT_A_GATE_RESULT", "result", "problems")}, default=str))
+    print(json.dumps({k: verdict[k] for k in ("run_id", "sample", "NOT_A_GATE_RESULT", "result", "unmeasurable_gates", "problems")}, default=str))
     if verdict["problems"] or verdict["result"] == "INVALID":
         return 2
     return 0 if verdict["result"] in ("PASS", "SAMPLE, NOT A GATE RESULT") else 1
