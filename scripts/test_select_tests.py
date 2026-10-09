@@ -5,6 +5,7 @@ only ever err towards running MORE: any file it cannot place forces the full run
 """
 import importlib.util
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -51,7 +52,7 @@ class Selection(unittest.TestCase):
         r = select(["crates/cowfs-nfs/src/lib.rs"])
         self.assertFalse(r.full)
         self.assertEqual(r.crates, ["cowfs-nfs"])
-        self.assertEqual(r.filterset, "rdeps(=cowfs-nfs)")
+        self.assertEqual(r.filterset, "package(=cowfs-nfs)")
 
     def test_core_crate_selects_every_dependent_including_dev_edges(self):
         r = select(["crates/cowfs-core/src/lib.rs"])
@@ -68,7 +69,7 @@ class Selection(unittest.TestCase):
     def test_two_crates_or_their_filtersets(self):
         r = select(["crates/cowfs-nfs/a.rs", "crates/cowfs-cli/b.rs", "crates/cowfs-nfs/c.rs"])
         self.assertEqual(r.crates, ["cowfs-cli", "cowfs-nfs"])
-        self.assertEqual(r.filterset, "rdeps(=cowfs-cli) | rdeps(=cowfs-nfs)")
+        self.assertEqual(r.filterset, "package(=cowfs-cli) | package(=cowfs-nfs)")
 
     def test_doc_packages_are_lib_crates_of_the_tested_set_only(self):
         r = select(["crates/cowfs-core/src/lib.rs"])
@@ -155,13 +156,13 @@ class Outputs(unittest.TestCase):
         self.assertIn("filterset=", full)
         part = sel.github_output(select(["crates/cowfs-nfs/a.rs"]))
         self.assertIn("mode=filtered", part)
-        self.assertIn("filterset=rdeps(=cowfs-nfs)", part)
+        self.assertIn("filterset=package(=cowfs-nfs)", part)
         self.assertIn("doc_args=-p cowfs-nfs", part)
         self.assertIn("pkg_args=-p cowfs-nfs", part)
 
     def test_summary_names_crates_filterset_and_reason(self):
         text = sel.summary(select(["crates/cowfs-core/a.rs"]))
-        for needle in ["cowfs-core", "rdeps(=cowfs-core)", "cowfs-fuse"]:
+        for needle in ["cowfs-core", "package(=cowfs-core)", "cowfs-fuse"]:
             self.assertIn(needle, text)
         self.assertIn("Cargo.lock", sel.summary(select(["Cargo.lock"])))
 
@@ -185,10 +186,11 @@ class Cli(unittest.TestCase):
                 self.assertIn("mode=full", out)
                 self.assertIn(event, summ)
 
-    def test_unresolvable_base_is_an_error_not_a_silent_full(self):
-        r, out, _ = self.run_cli("--event", "pull_request", "--base", "no-such-ref", "--head", "HEAD")
-        self.assertNotEqual(r.returncode, 0)
-        self.assertEqual(out, "")
+    def test_unresolvable_base_runs_full(self):
+        r, out, summ = self.run_cli("--event", "pull_request", "--base", "no-such-ref", "--head", "HEAD")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("mode=full", out)
+        self.assertIn("cannot diff", summ)
 
     def test_real_workspace_places_every_crate_directory(self):
         meta = sel.cargo_metadata()
@@ -196,6 +198,130 @@ class Cli(unittest.TestCase):
             d = sel.crate_dir(p, meta["workspace_root"])
             with self.subTest(crate=p["name"]):
                 self.assertEqual(sel.select([d + "/src/lib.rs"], meta["packages"], meta["workspace_root"]).crates, [p["name"]])
+
+
+REAL = sel.cargo_metadata()
+
+
+def real_select(files):
+    return sel.select(files, REAL["packages"], REAL["workspace_root"])
+
+
+class RuntimeEdges(unittest.TestCase):
+    """cowfs-treehouse tests run the cowfs and cowfs-daemon binaries; cargo has no edge for that."""
+
+    def test_cli_change_selects_treehouse_tests(self):
+        r = real_select(["crates/cowfs-cli/src/cli.rs"])
+        self.assertIn("cowfs-treehouse", r.tested)
+        self.assertIn("package(=cowfs-treehouse)", r.filterset)
+
+    def test_core_change_reaches_treehouse_through_daemon(self):
+        self.assertIn("cowfs-treehouse", real_select(["crates/cowfs-core/src/lib.rs"]).tested)
+
+    def test_treehouse_change_builds_the_binaries_its_tests_run(self):
+        r = real_select(["crates/cowfs-treehouse/src/lib.rs"])
+        self.assertEqual(r.crates, ["cowfs-treehouse"])
+        self.assertTrue({"cowfs-cli", "cowfs-daemon", "cowfs-treehouse"} <= set(r.build), r.build)
+        self.assertIn("-p cowfs-daemon", sel.github_output(r))
+        # built, not necessarily tested: a treehouse change does not rerun the cli tests
+        self.assertNotIn("cowfs-cli", r.tested)
+
+    def test_every_declared_edge_is_a_workspace_crate(self):
+        names = {p["name"] for p in REAL["packages"]}
+        for crate, needed in sel.RUNTIME_EDGES.items():
+            self.assertIn(crate, names)
+            self.assertLessEqual(set(needed), names)
+
+    def test_no_test_crate_runs_an_undeclared_workspace_binary(self):
+        """Scan crates/*/tests for the binaries tests execute; each must be a cargo edge or declared."""
+        owners = {t["name"]: p["name"] for p in REAL["packages"] for t in p["targets"] if "bin" in t["kind"]}
+        cargo_deps = {p["name"]: {d["name"] for d in p["dependencies"]} for p in REAL["packages"]}
+        root = Path(REAL["workspace_root"])
+        missing = []
+        for p in REAL["packages"]:
+            tests = Path(p["manifest_path"]).parent / "tests"
+            text = "\n".join(f.read_text() for f in tests.rglob("*.rs")) if tests.is_dir() else ""
+            for binary, owner in owners.items():
+                if owner == p["name"]:
+                    continue
+                pat = rf'CARGO_BIN_EXE_{re.escape(binary)}|(?:join|_bin|bin_path|binary)\(\s*"{re.escape(binary)}"'
+                if re.search(pat, text) and owner not in sel.RUNTIME_EDGES.get(p["name"], ()):
+                    missing.append(f"{p['name']} tests run the {binary} binary of {owner}: add it to RUNTIME_EDGES")
+        self.assertEqual(missing, [], "\n".join(missing))
+        self.assertTrue(root.is_dir())
+
+    def test_the_scan_finds_the_known_edges(self):
+        # a guard that matches nothing would pass forever: pin that the pattern sees treehouse and daemon
+        text = (Path(REAL["workspace_root"]) / "crates/cowfs-treehouse/tests/real_project_acceptance.rs").read_text()
+        self.assertRegex(text, r'sibling_bin\(\s*"cowfs-daemon"')
+        text = (Path(REAL["workspace_root"]) / "crates/cowfs-daemon/tests/namespace_durability.rs").read_text()
+        self.assertRegex(text, r'join\(\s*"cowfs"')
+
+
+class FeatureUnification(unittest.TestCase):
+    """-p builds do not unify cowfs-store/fault-injection the way --workspace does; that is safe only
+    while nothing outside store and gc is gated on it."""
+
+    def test_fault_injection_cfg_is_confined_to_store_and_gc(self):
+        root = Path(REAL["workspace_root"])
+        users = set()
+        for f in (root / "crates").rglob("*.rs"):
+            if re.search(r'feature\s*=\s*"fault-injection"|fault-injection', f.read_text()):
+                users.add(f.relative_to(root).parts[1])
+        self.assertLessEqual(users, {"cowfs-store", "cowfs-gc"}, users)
+
+    def test_only_gc_enables_fault_injection_on_store_from_a_dependency_edge(self):
+        root = Path(REAL["workspace_root"])
+        enabling = {
+            d.name
+            for d in (root / "crates").iterdir()
+            if (d / "Cargo.toml").is_file()
+            and re.search(r'cowfs-store\s*=\s*\{[^}]*features\s*=\s*\[[^\]]*fault-injection', (d / "Cargo.toml").read_text())
+        }
+        self.assertLessEqual(enabling, {"cowfs-gc", "cowfs-store"}, enabling)
+
+
+class ChangedFiles(unittest.TestCase):
+    def repo(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.cwd = os.getcwd()
+        os.chdir(t.name)
+        self.addCleanup(os.chdir, self.cwd)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "a@b")
+        self.git("config", "user.name", "n")
+        return t.name
+
+    def git(self, *a):
+        return subprocess.run(["git", *a], capture_output=True, text=True, check=True).stdout.strip()
+
+    def commit(self, name):
+        Path(name).write_text(name)
+        self.git("add", name)
+        self.git("commit", "-qm", name)
+
+    def test_merge_commit_diffs_against_its_first_parent(self):
+        self.repo()
+        self.commit("base")
+        self.git("switch", "-qc", "pr")
+        self.commit("one")
+        self.commit("two")
+        self.git("switch", "-q", "main")
+        self.commit("other")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "pr")
+        self.assertEqual(sorted(sel.changed_files("HEAD^1", "HEAD")), ["one", "two"])
+
+    def test_head_that_is_not_a_merge_is_refused(self):
+        self.repo()
+        self.commit("base")
+        self.commit("one")
+        self.assertIsNone(sel.changed_files("HEAD^1", "HEAD"))
+
+    def test_unresolvable_base_is_refused(self):
+        self.repo()
+        self.commit("base")
+        self.assertIsNone(sel.changed_files("no-such-ref", "HEAD"))
 
 
 if __name__ == "__main__":

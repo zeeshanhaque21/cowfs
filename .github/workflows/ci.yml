@@ -96,15 +96,30 @@ jobs:
           FILTERSET: ${{ steps.select.outputs.filterset }}
           PKG_ARGS: ${{ steps.select.outputs.pkg_args }}
         run: |
-          if [ "$MODE" = full ]; then
-            cargo nextest run --workspace --profile ci --partition hash:${{ matrix.shard }}/${{ matrix.of }}
-          elif [ -n "$PKG_ARGS" ]; then
-            # -p builds only the crates that can be affected; -E is the filterset shown in the summary.
-            # A shard can be left with no test at all, which is not a failure.
-            cargo nextest run $PKG_ARGS --profile ci --partition hash:${{ matrix.shard }}/${{ matrix.of }} --no-tests=pass -E "$FILTERSET"
-          else
-            echo "no crate selected: no tests"
-          fi
+          case "$MODE" in
+            full)
+              cargo nextest run --workspace --profile ci --partition hash:${{ matrix.shard }}/${{ matrix.of }}
+              ;;
+            filtered)
+              if [ -z "$PKG_ARGS" ]; then
+                # Only an explicitly empty selection (docs or bench only) may skip the tests.
+                [ "$FILTERSET" = "none()" ] || { echo "::error::filtered mode with no crates but filterset '$FILTERSET'"; exit 1; }
+                echo "no crate selected: no tests"
+                exit 0
+              fi
+              # -p compiles the tested crates and the crates whose binaries they run. A non-empty
+              # selection must contain tests, or the filterset is wrong: that is an error, not a pass.
+              selected=$(cargo nextest list $PKG_ARGS --profile ci -E "$FILTERSET" --message-format oneline | wc -l)
+              [ "$selected" -gt 0 ] || { echo "::error::the filterset '$FILTERSET' selects no test"; exit 1; }
+              echo "selected $selected tests before sharding"
+              # --no-tests=pass is for a shard that hashing leaves empty; the check above covers the rest.
+              cargo nextest run $PKG_ARGS --profile ci --partition hash:${{ matrix.shard }}/${{ matrix.of }} --no-tests=pass -E "$FILTERSET"
+              ;;
+            *)
+              echo "::error::unknown test selection mode '$MODE': the Select tests step produced no usable output"
+              exit 1
+              ;;
+          esac
       # nextest does not run doctests.
       - name: Doctests
         if: ${{ matrix.shard == 1 }}
@@ -112,13 +127,13 @@ jobs:
           MODE: ${{ steps.select.outputs.mode }}
           DOC_ARGS: ${{ steps.select.outputs.doc_args }}
         run: |
-          if [ "$MODE" = full ]; then
-            cargo test --doc --workspace
-          elif [ -n "$DOC_ARGS" ]; then
-            cargo test --doc $DOC_ARGS
-          else
-            echo "no selected crate has a lib target: no doctests"
-          fi
+          case "$MODE" in
+            full) cargo test --doc --workspace ;;
+            filtered)
+              if [ -n "$DOC_ARGS" ]; then cargo test --doc $DOC_ARGS; else echo "no selected crate has a lib target: no doctests"; fi
+              ;;
+            *) echo "::error::unknown test selection mode '$MODE'"; exit 1 ;;
+          esac
       - name: Bench harness unit tests (macos)
         if: ${{ matrix.os == 'macos-latest' }}
         run: python3 -m unittest discover -s bench -v

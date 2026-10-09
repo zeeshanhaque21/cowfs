@@ -153,7 +153,10 @@ def run_test_step(name, cwd, env_extra, shard=1, of=2):
     script = step["run"].replace("${{ matrix.shard }}", str(shard)).replace("${{ matrix.of }}", str(of))
     bin_dir = Path(cwd) / "bin"
     bin_dir.mkdir(exist_ok=True)
-    (bin_dir / "cargo").write_text(f'#!/bin/sh\necho "$@" >> "{cwd}/cargo.calls"\n')
+    (bin_dir / "cargo").write_text(
+        f'#!/bin/sh\necho "$@" >> "{cwd}/cargo.calls"\n'
+        'case "$1 $2" in "nextest list") printf "%s" "$STUB_LIST";; esac\n'
+    )
     (bin_dir / "cargo").chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", **{k: v for k, v in step.get("env", {}).items() if "${{" not in v}, **env_extra}
     r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], cwd=cwd, env=env, capture_output=True, text=True)
@@ -199,16 +202,36 @@ class ChangedCrateSelection(unittest.TestCase):
         self.assertEqual(calls, ["nextest run --workspace --profile ci --partition hash:2/2"])
 
     def test_filtered_mode_builds_only_selected_crates_keeps_sharding_and_passes_the_filterset_as_one_argument(self):
-        filterset = "rdeps(=cowfs-core) | rdeps(=cowfs-nfs)"
-        env = {"MODE": "filtered", "FILTERSET": filterset, "PKG_ARGS": "-p cowfs-core -p cowfs-nfs"}
+        filterset = "package(=cowfs-core) | package(=cowfs-nfs)"
+        env = {"MODE": "filtered", "FILTERSET": filterset, "PKG_ARGS": "-p cowfs-core -p cowfs-nfs", "STUB_LIST": "a b\nc d\n"}
         r, calls = run_test_step("Nextest", self.tmp(), env, shard=1)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("--workspace", calls[0], "--workspace would compile every test binary")
-        self.assertIn("-p cowfs-core -p cowfs-nfs", calls[0])
-        self.assertIn("--partition hash:1/2", calls[0])
-        self.assertIn("--no-tests=pass", calls[0], "a shard left with no test is not a failure")
-        self.assertTrue(calls[0].endswith(f"-E {filterset}"), calls[0])
+        self.assertEqual(len(calls), 2, calls)
+        self.assertTrue(calls[0].startswith("nextest list -p cowfs-core -p cowfs-nfs"), calls[0])
+        run = calls[1]
+        self.assertNotIn("--workspace", run, "--workspace would compile every test binary")
+        self.assertIn("-p cowfs-core -p cowfs-nfs", run)
+        self.assertIn("--partition hash:1/2", run)
+        self.assertIn("--no-tests=pass", run, "a shard left with no test is not a failure")
+        self.assertTrue(run.endswith(f"-E {filterset}"), run)
+
+    def test_non_empty_selection_that_selects_no_test_fails(self):
+        env = {"MODE": "filtered", "FILTERSET": "package(=cowfs-core)", "PKG_ARGS": "-p cowfs-core", "STUB_LIST": ""}
+        r, calls = run_test_step("Nextest", self.tmp(), env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(len(calls), 1, "must not go on to run with --no-tests=pass")
+
+    def test_unknown_or_empty_mode_fails_closed(self):
+        for mode in ["", "partial", "FULL"]:
+            for step in ["Nextest", "Doctests"]:
+                with self.subTest(mode=mode, step=step):
+                    r, calls = run_test_step(step, self.tmp(), {"MODE": mode, "FILTERSET": "", "PKG_ARGS": "", "DOC_ARGS": ""})
+                    self.assertNotEqual(r.returncode, 0)
+                    self.assertEqual(calls, [])
+
+    def test_filtered_without_crates_needs_the_explicit_empty_filterset(self):
+        r, calls = run_test_step("Nextest", self.tmp(), {"MODE": "filtered", "FILTERSET": "", "PKG_ARGS": ""})
+        self.assertNotEqual(r.returncode, 0)
 
     def test_empty_selection_runs_no_cargo_at_all(self):
         r, calls = run_test_step("Nextest", self.tmp(), {"MODE": "filtered", "FILTERSET": "none()", "PKG_ARGS": ""})
