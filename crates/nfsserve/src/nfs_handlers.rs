@@ -76,7 +76,10 @@ pub async fn handle_nfs(
 
 /// The procedure's name for logs.
 pub fn proc_name(proc: u32) -> String {
-    format!("{:?}", NFSProgram::from_u32(proc).unwrap_or(NFSProgram::INVALID))
+    format!(
+        "{:?}",
+        NFSProgram::from_u32(proc).unwrap_or(NFSProgram::INVALID)
+    )
 }
 
 /// A NFS3ERR_JUKEBOX reply to `proc`: the status plus the empty failure body that procedure
@@ -1022,7 +1025,10 @@ mod tests {
         };
         // GETATTR: status only; LOOKUP: post_op_attr; SETATTR: wcc_data; LINK: attr + wcc;
         // RENAME: two wcc_data.
-        assert_eq!([tail(1), tail(3), tail(2), tail(15), tail(14)], [0, 4, 8, 12, 16]);
+        assert_eq!(
+            [tail(1), tail(3), tail(2), tail(15), tail(14)],
+            [0, 4, 8, 12, 16]
+        );
     }
 
     #[test]

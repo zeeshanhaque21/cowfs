@@ -198,7 +198,9 @@ impl Nfs {
         self.s.set_read_timeout(Some(d)).unwrap();
         let mut h = [0u8; 4];
         let got = self.s.read_exact(&mut h);
-        self.s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        self.s
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
         got.ok()?;
         let mut b = vec![0u8; (u32::from_be_bytes(h) & 0x7fff_ffff) as usize];
         self.s.read_exact(&mut b).unwrap();
