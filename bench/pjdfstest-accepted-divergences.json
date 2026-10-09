@@ -7,14 +7,16 @@
    "n": 2,
    "issue": "#204",
    "reason": "open O_WRONLY,O_NONBLOCK on a fifo with no reader answers EACCES where native answers ENXIO; a real defect tracked in #204, listed so the ordinal position is on record while the established regression still fails the gate",
-   "match": "expected ENXIO, got EACCES"
+   "match": "expected ENXIO, got EACCES",
+   "platform": "macos"
   },
   {
    "test": "unlink/14.t",
    "n": 4,
    "issue": "#109",
    "reason": "open O_RDONLY then unlink then fstat reports nlink 1 where native reports 0: macOS NFS silly-rename keeps nlink 1 for an open unlinked file (#109 symptom 2)",
-   "match": "fstat 0 nlink', expected 0, got 1"
+   "match": "fstat 0 nlink', expected 0, got 1",
+   "platform": "macos"
   }
  ]
 }

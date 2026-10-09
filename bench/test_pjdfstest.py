@@ -359,6 +359,16 @@ class LinuxMountTable(unittest.TestCase):
                 fs = p.fs_identity(Path("/mnt/docs/x/mnt/pjd"))
         self.assertEqual((fs["mountpoint"], fs["fstype"], fs["problem"]),
                          ("/mnt/docs/x/mnt", "fuse.cowfs", None))
+    def test_a_real_box_capture_parses(self):
+        """`mount` run on cachyos (util-linux 2.42.4) 2026-10-09, one line made by a user-namespace
+        tmpfs at a path containing a space and a literal ' type '. Linux `mount` does not escape."""
+        table = (Path(__file__).resolve().parent / "pjdfstest-testdata" / "cachyos-mount-20261009.txt").read_text()
+        entries = p.mount_entries(table)
+        self.assertEqual([(e[1], e[2].split(",")[0]) for e in entries],
+                         [("/", "btrfs"), ("/home", "btrfs"), ("/sys/fs/fuse/connections", "fusectl"),
+                          ("/run/user/1000/psd/zeeshan-chromium", "fuse.fuse-overlayfs"),
+                          ("/tmp/pjd1FdUr6/a type b", "tmpfs")])
+
     def test_macos_lines_are_unchanged(self):
         self.assertEqual(p.mount_entries(MountState.TABLE),
                          [("localhost:/cowfs-abc", "/private/tmp/m", "nfs, nodev, nosuid"),
@@ -369,7 +379,18 @@ class MountState(unittest.TestCase):
 
     def test_exact_decoded_match_is_mounted(self):
         self.assertEqual(p.mount_entries(self.TABLE)[0][1], "/private/tmp/m")
-        self.assertEqual(p._unescape("/private/tmp/a\\040b"), "/private/tmp/a b")
+
+    def test_a_macos_mount_point_with_spaces_and_a_literal_type_is_whole(self):
+        """Real macOS `mount` (hdiutil image at '.../a type b', 2026-10-09) prints the path raw:
+        `/dev/disk8s1 on /x/a type b (hfs, local, nodev)`. Neither OS escapes a space."""
+        entries = p.mount_entries("/dev/disk8s1 on /Volumes/a type b (hfs, local, nodev)\n"
+                                  "/dev/disk9s1 on /Volumes/my disk (apfs, local)\n")
+        self.assertEqual([(e[1], e[2].split(",")[0]) for e in entries],
+                         [("/Volumes/a type b", "hfs"), ("/Volumes/my disk", "apfs")])
+
+    def test_a_literal_backslash_escape_is_not_decoded(self):
+        entries = p.mount_entries("/dev/x on /Volumes/a\\040b (apfs, local)\n")
+        self.assertEqual(entries[0][1], "/Volumes/a\\040b")
 
     def test_a_prefix_is_not_a_match(self):
         state = p.mount_state.__wrapped__(Path("/private/tmp/m")) if hasattr(p.mount_state, "__wrapped__") else None
@@ -560,8 +581,44 @@ class AcceptedDivergences(unittest.TestCase):
         return {"native": {test: record("native", test, [case(ok, n=i + 1) for i, ok in enumerate(native_ok)])},
                 "cowfs": {test: record("cowfs", test, [case(ok, n=i + 1) for i, ok in enumerate(cowfs_ok)])}}
 
-    def entry(self, n, issue="#1", test="a/03.t"):
-        return {"test": test, "n": n, "issue": issue, "reason": "r", "match": "(?s)."}
+    def entry(self, n, issue="#1", test="a/03.t", platform="any"):
+        return {"test": test, "n": n, "issue": issue, "reason": "r", "match": "(?s).", "platform": platform}
+
+    def test_an_entry_for_the_other_platform_is_neither_stale_nor_a_waiver(self):
+        mac = self.entry(2, "#109", platform="macos")
+        clean = self.arms([True, True], [True, True])
+        self.assertEqual(p.accepted_reasons(clean, [mac], platform="linux"), [])
+        self.assertIn("listed but not worse", p.accepted_reasons(clean, [mac], platform="macos")[0]["message"])
+        worse = self.arms([True, True], [True, False])
+        self.assertEqual(len(divergence_messages(p.accepted_reasons(worse, [mac], platform="linux"))), 1)
+        self.assertEqual(divergence_messages(p.accepted_reasons(worse, [mac], platform="macos")), [])
+
+    def test_an_any_entry_and_an_unknown_platform_apply_everywhere(self):
+        clean = self.arms([True, True], [True, True])
+        for platform in ("linux", "macos", None):
+            self.assertIn("listed but not worse", p.accepted_reasons(clean, [self.entry(2)], platform=platform)[0]["message"])
+        self.assertIn("listed but not worse",
+                      p.accepted_reasons(clean, [self.entry(2, platform="linux")], platform=None)[0]["message"])
+
+    def test_the_run_platform_comes_from_the_receipt_or_its_cowfs_fstype(self):
+        self.assertEqual(p.identity_platform({"platform": "linux"}), "linux")
+        self.assertEqual(p.identity_platform({"cowfs": {"fstype": "nfs"}}), "macos")
+        self.assertEqual(p.identity_platform({"cowfs": {"fstype": "fuse.cowfs"}}), "linux")
+        self.assertIsNone(p.identity_platform({"cowfs": {"fstype": "btrfs"}}))
+        self.assertIsNone(p.identity_platform(None))
+
+    def test_entry_with_a_bad_platform_is_refused(self):
+        for bad in ({}, {"platform": "windows"}):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "a.json"
+                path.write_text(json.dumps({"entries": [{"test": "a", "n": 1, "issue": "#1", "reason": "r",
+                                                         "match": ".", **bad}]}))
+                with self.assertRaises(ValueError):
+                    p.load_accepted(path)
+
+    def test_the_checked_in_list_names_a_platform_per_entry(self):
+        self.assertEqual({e["test"]: e["platform"] for e in p.load_accepted()},
+                         {"open/17.t": "macos", "unlink/14.t": "macos"})
 
     def test_uncovered_worse_position_is_divergence(self):
         out = p.accepted_reasons(self.arms([True, True], [True, False]), [])
@@ -661,6 +718,17 @@ class AcceptedDivergences(unittest.TestCase):
         import derive_pjdfstest_divergences as d
         derived = d.derive(arms_from("g3-20261009T095141Z-slice.jsonl"), "x")
         self.assertEqual(derived["entries"], p.load_accepted())
+
+    def test_a_linux_derivation_keeps_the_macos_entries_and_does_not_apply_their_rules(self):
+        import derive_pjdfstest_divergences as d
+        existing = p.load_accepted()
+        clean = arms_from("g3-20261009T095141Z-slice.jsonl")
+        clean["cowfs"] = clean["native"]
+        derived = d.derive(clean, "x", "linux", existing)
+        self.assertEqual(derived["entries"], existing)
+        with self.assertRaises(SystemExit):
+            d.derive(arms_from("g3-20261009T095141Z-slice.jsonl"), "x", "linux", existing)
+        self.assertEqual(d.derive(clean, "x", "macos", existing)["entries"], [])
 
     def test_the_derivation_script_refuses_an_unclassified_worse_position(self):
         import derive_pjdfstest_divergences as d
@@ -927,6 +995,27 @@ class RuntimeIdentityIsFailClosed(unittest.TestCase):
         self.assertEqual(self.check(identity, expected_cowfs_mount="/tmp/mnt"), p.INVALID)
         # The same identity is fine when nothing says where the mount should have been.
         self.assertEqual(p.validate_runtime_identity(identity), [])
+
+    def test_a_cowfs_arm_of_the_wrong_type_is_invalid(self):
+        """Separate devices are not enough: the cowfs arm must be fuse.cowfs (Linux) or nfs (macOS)."""
+        bad = (("linux", "btrfs"), ("linux", "fuse"), ("linux", "fuseblk"), ("linux", "nfs"),
+               ("linux", "nfs4"), ("linux", "smbfs"), ("macos", "btrfs"), ("macos", "fuse.cowfs"),
+               ("macos", "nfs4"), (None, "btrfs"), (None, "apfs"), (None, "fuseblk"))
+        for platform, fstype in bad:
+            identity = {"platform": platform, "native": GOOD_IDENTITY["native"],
+                        "cowfs": {**GOOD_IDISTRY, "fstype": fstype}}
+            self.assertEqual(self.check(identity), p.INVALID, f"{platform} {fstype} was accepted")
+            self.assertTrue(any("filesystem type" in m["message"] for m in p.validate_runtime_identity(identity)))
+
+    def test_the_required_cowfs_fstype_is_per_platform(self):
+        for platform, fstype in (("linux", "fuse.cowfs"), ("macos", "nfs"), (None, "nfs"), (None, "fuse.cowfs")):
+            identity = {"platform": platform, "native": GOOD_IDENTITY["native"],
+                        "cowfs": {**GOOD_IDISTRY, "fstype": fstype}}
+            self.assertEqual(p.validate_runtime_identity(identity), [], f"{platform} {fstype}")
+        self.assertEqual(p.COWFS_FSTYPE, {"linux": "fuse.cowfs", "macos": "nfs"})
+        self.assertEqual(p.host_platform("darwin"), "macos")
+        self.assertEqual(p.host_platform("linux"), "linux")
+        self.assertIsNone(p.host_platform("win32"))
 
     def test_equal_devices_are_invalid(self):
         identity = {"native": GOOD_IDENTITY["native"],
