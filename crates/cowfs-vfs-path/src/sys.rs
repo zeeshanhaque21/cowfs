@@ -267,6 +267,8 @@ fn detach_umask() -> Result<(), i32> {
     // SAFETY: `unshare(CLONE_FS)` gives only this thread a private copy of its cwd, root and
     // umask; it touches no memory. The thread ends right after.
     if unsafe { libc::unshare(libc::CLONE_FS) } == 0 {
+        // SAFETY: `umask` cannot fail; after the unshare it affects this thread only.
+        unsafe { libc::umask(0) };
         Ok(())
     } else {
         Err(io::Error::last_os_error()
@@ -275,7 +277,8 @@ fn detach_umask() -> Result<(), i32> {
     }
 }
 
-/// `with_private_umask` with the cache and the `unshare` call passed in, so a test can inject one.
+/// `with_private_umask` with the cache and the unshare-then-umask(0) step passed in, so a test can
+/// inject one (a test must never call `umask`: it would change the whole test process).
 #[cfg(target_os = "linux")]
 fn run_with_private_umask<R: Send>(
     known: &std::sync::OnceLock<bool>,
@@ -296,8 +299,6 @@ fn run_with_private_umask<R: Send>(
                     return Ok(None);
                 }
                 let _ = known.set(true);
-                // SAFETY: `umask` cannot fail; after the unshare it affects this thread only.
-                unsafe { libc::umask(0) };
                 f().map(Some)
             })?
             .join()
