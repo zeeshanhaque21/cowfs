@@ -300,16 +300,29 @@ exec '{real}' "$@"
 
     /// Runs treehouse against this sandbox through the shim, and guards the output.
     pub fn treehouse_at(&self, root: &Path, args: &[&str]) -> Output {
-        let out = Command::new(self.shim())
-            .args(args)
-            .arg("--root")
-            .arg(root)
-            .env_remove("TREEHOUSE_ROOT")
-            .env_remove("TREEHOUSE_LEASE_HOLDER")
-            .current_dir(self.repo())
-            .stdin(Stdio::null())
-            .output()
-            .unwrap_or_else(|e| panic!("cannot run treehouse: {e}"));
+        let shim = self.shim();
+        // ETXTBSY: a sibling test thread that forks while the shim is still open for writing holds a
+        // write descriptor until its own exec, and Linux refuses to execute the file meanwhile. The
+        // script is complete; the spawn is retried (seen as a flake on the cachyos box, issue 259).
+        let mut attempt = 0;
+        let out = loop {
+            let spawned = Command::new(&shim)
+                .args(args)
+                .arg("--root")
+                .arg(root)
+                .env_remove("TREEHOUSE_ROOT")
+                .env_remove("TREEHOUSE_LEASE_HOLDER")
+                .current_dir(self.repo())
+                .stdin(Stdio::null())
+                .output();
+            match spawned {
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 20 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                other => break other.unwrap_or_else(|e| panic!("cannot run treehouse: {e}")),
+            }
+        };
         assert_sandboxed(args, &out);
         out
     }
