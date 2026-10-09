@@ -1137,6 +1137,11 @@ impl NFSFileSystem for CowNfs {
         self.run(move |a| a.mkdir(dirid, &name, &attr)).await
     }
 
+    fn mknod_needs_root(&self, ftype: ftype3, rdev: specdata3) -> bool {
+        convert::mknod_kind(ftype)
+            .is_some_and(|k| cowfs_vfs::mknod_needs_root(k, convert::rdev(rdev)))
+    }
+
     async fn mknod(
         &self,
         dirid: fileid3,

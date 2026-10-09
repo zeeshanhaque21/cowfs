@@ -110,6 +110,12 @@ pub trait NFSFileSystem: Send + Sync {
         attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3>;
 
+    /// Whether `MKNOD` of `ftype` with device number `rdev` needs a root (uid 0) caller. The
+    /// default is every device node; a file system with a finer rule overrides it.
+    fn mknod_needs_root(&self, ftype: ftype3, _rdev: specdata3) -> bool {
+        matches!(ftype, ftype3::NF3CHR | ftype3::NF3BLK)
+    }
+
     /// MKNOD: a fifo, socket, character device or block device. `ftype` is one of `NF3FIFO`,
     /// `NF3SOCK`, `NF3CHR`, `NF3BLK`; `rdev` is zero unless it is a device. The default answers
     /// `NFS3ERR_NOTSUPP`, which is what a file system without special files says.

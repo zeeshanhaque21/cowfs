@@ -639,8 +639,7 @@ impl Filesystem for Fs {
         // exception is Linux's whiteout, the character device 0:0, which anyone may make
         // (`vfs_mknod`), so the kernel forwards it from a normal user and so must we. It has no
         // data and no device behind it.
-        let whiteout = special == Some(FileKind::CharDevice) && rdev == 0;
-        if device && !whiteout && req.uid() != 0 {
+        if special.is_some_and(|k| cowfs_vfs::mknod_needs_root(k, rdev)) && req.uid() != 0 {
             return reply.error(libc::EPERM);
         }
         let n = n.to_owned();

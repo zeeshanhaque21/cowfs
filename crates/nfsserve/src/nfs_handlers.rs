@@ -743,12 +743,11 @@ pub async fn nfsproc3_mknod(
     rofs_or_fail!(ctx, xid, output, wcc_data::default());
     let args = args!(MKNOD3args, xid, input, output);
     let dirid = fh_or_fail!(ctx, &args.dirops.dir, xid, output, wcc_data::default());
-    let device = matches!(args.ftype, ftype3::NF3CHR | ftype3::NF3BLK);
     let refusal = if !args.has_body {
         Some(nfsstat3::NFS3ERR_BADTYPE)
-    } else if device && ctx.auth.uid != 0 {
-        // Creating a device needs root natively; the clients refuse first, this is for a client
-        // that does not.
+    } else if ctx.auth.uid != 0 && ctx.vfs.mknod_needs_root(args.ftype, args.rdev) {
+        // Creating a device needs root natively (bar the whiteout, which the file system
+        // exempts); the clients refuse first, this is for a client that does not.
         Some(nfsstat3::NFS3ERR_PERM)
     } else {
         None
