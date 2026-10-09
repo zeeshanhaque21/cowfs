@@ -304,6 +304,18 @@ class NamespaceKernelMatrix(unittest.TestCase):
             list(NS_STEPS), ["Allow unprivileged user namespaces", "Namespace tests", "Enforce that isolation ran, not skipped"]
         )
 
+    def test_the_gate_counts_isolation_tests_in_both_unittest_log_formats(self):
+        # python 3.10 (ubuntu-22.04) logs "(mod.Class)", 3.12 (ubuntu-latest) logs "(mod.Class.method)"
+        gate = NS_STEPS["Enforce that isolation ran, not skipped"]["run"]
+        names = [f"test_t{i}" for i in range(9)]
+        for fmt in ["{n} (test_namespaces.Isolation) ... ok", "{n} (test_namespaces.Isolation.{n}) ... ok"]:
+            with self.subTest(fmt=fmt), tempfile.TemporaryDirectory() as d:
+                lines = [fmt.format(n=n) for n in names] + ["test_off_linux_is_unmeasurable (test_namespaces.Refusals) ... skipped 'x'"]
+                log = "a mount namespace was available\n" + "\n".join(lines) + "\n\nRan 17 tests in 0.3s\n\nOK (skipped=1)\n"
+                (Path(d) / "namespaces.log").write_text(log)
+                r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", gate], cwd=d, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
     def run_allow_step(self, key_exists):
         """Run the sysctl step with stub sysctl/sudo/unshare; return (rc, recorded sysctl writes)."""
         with tempfile.TemporaryDirectory() as d:
