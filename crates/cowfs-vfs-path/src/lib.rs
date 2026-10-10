@@ -59,9 +59,10 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use cowfs_vfs::FallocMode;
 use cowfs_vfs::{
@@ -698,7 +699,9 @@ fn mode_may_change(dir: std::os::fd::BorrowedFd<'_>, new_dir: bool) -> bool {
 /// Linux only. The descriptor chmod goes through `/proc/self/fd`: without `/proc` it fails with
 /// that call's own errno (`ENOENT`), not `ENOTSUP`. A filesystem or kernel without
 /// `RENAME_NOREPLACE` (`EINVAL`/`ENOSYS` from the rename) gives `ENOTSUP`; nothing falls back to
-/// a chmod by name. A crash mid-call leaves a stray `.cowfs-mknod-<hex>` directory (see #307).
+/// a chmod by name. A crash mid-call can still leave a stray `.cowfs-mknod-<hex>` directory
+/// behind (#307); each call sweeps `dir` first and removes any such directory old enough that
+/// no concurrent call could still own it (see `sweep_stale_mknod_scratch`).
 #[cfg(target_os = "linux")]
 fn mknod_private(
     dir: std::os::fd::BorrowedFd<'_>,
@@ -707,6 +710,7 @@ fn mknod_private(
     rdev: u64,
 ) -> io::Result<()> {
     const NODE: &[u8] = b"n";
+    sweep_stale_mknod_scratch(dir);
     let scratch: String = sys::random16()?
         .iter()
         .fold(".cowfs-mknod-".into(), |s, b| s + &format!("{b:02x}"));
@@ -742,7 +746,63 @@ fn mknod_private(
         result
     })();
     let removed = sys::unlinkat(dir, scratch, true);
+    keep_make_despite_failed_cleanup(made, removed)
+}
+
+/// Combines the outcome of making the node (`made`) with the outcome of removing the now-empty
+/// scratch directory (`removed`). On success the node already made it out via `rename`, so a
+/// failed `rmdir` only leaves a stray scratch directory behind (cleared by
+/// `sweep_stale_mknod_scratch` on a later call, #307) -- never a reason to fail an otherwise-
+/// successful mknod. On failure, `made`'s error is the real one; `removed`'s is incidental.
+fn keep_make_despite_failed_cleanup(
+    made: io::Result<()>,
+    removed: io::Result<()>,
+) -> io::Result<()> {
+    if made.is_ok() {
+        return made;
+    }
     made.and(removed)
+}
+
+/// How long a `.cowfs-mknod-*` scratch directory may sit in `dir` before the next `mknod` there
+/// treats it as abandoned (by a crash, or a `rmdir` ignored after a successful rename, #307)
+/// rather than owned by a call still in flight. `mknod_private` does a handful of syscalls
+/// between making the scratch directory and removing it; a minute is generous.
+const STALE_MKNOD_SCRATCH_AGE: Duration = Duration::from_secs(60);
+
+/// Best-effort sweep of `dir` for abandoned `.cowfs-mknod-*` scratch directories, run lazily at
+/// the top of `mknod_private` instead of walking the whole tree at mount time: it only costs an
+/// extra `readdir` of a directory `mknod` is about to write into anyway, and it cleans up
+/// exactly the directories where the leak in #307 can recur. A directory that never sees
+/// another `mknod` call keeps any stray entry; that is an accepted trade (see #307), not
+/// something this function tries to fix. Every error here is swallowed: a sweep failure must
+/// never turn into a `mknod` failure.
+#[cfg(target_os = "linux")]
+fn sweep_stale_mknod_scratch(dir: std::os::fd::BorrowedFd<'_>) {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(".cowfs-mknod-") {
+            continue;
+        }
+        // `DirEntry::metadata` is an `lstat`, not a `stat`: it will not follow a symlink planted
+        // under this name, and `is_dir()` below then rejects it instead of recursing into it.
+        let Ok(meta) = entry.metadata() else { continue };
+        let age_ok = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > STALE_MKNOD_SCRATCH_AGE);
+        if !age_ok || !meta.is_dir() || meta.uid() != sys::geteuid() {
+            continue;
+        }
+        force_remove_dir_all(&entry.path());
+    }
 }
 
 /// Whether `got` (the opened descriptor) is the node `mknodat` just made (`want`): the same
