@@ -708,23 +708,40 @@ fn a_null_flood_does_not_evict_the_nfs_socket_while_the_mount_starts() {
     );
 }
 
-#[test]
-fn the_pinged_nfs_socket_outlasts_the_cap_minus_one_later_connections() {
-    // Eviction is by connection age among sockets that served nothing, so an attacker has to
-    // open max_connections - 1 = 3 newer connections before the kernel's socket is the oldest
-    // (recency alone needed one). The residual window is stated in the PR for #262.
+/// Opens `n` more connections (one NULL each, like the kernel's ping) at a full cap after the
+/// kernel-style NFS socket has pinged, and says whether that socket is still served.
+fn pinged_socket_survives(n: usize) -> bool {
     let (s, _flood) = flooded_server();
     let mut nfs_socket = Nfs::attach(s.port(), nfs_fh3::default());
     assert_eq!(nfs_socket.raw(100_003, 3, 0, Args::new()).0, 0);
     let mut later = vec![];
-    // The first three are the flood's own connections being evicted, oldest first.
-    for _ in 0..3 {
+    for _ in 0..n {
         later.push(connect_raw(s.port()));
         later.last_mut().unwrap().write_all(&null_frame()).unwrap();
         assert!(answered_fully(later.last_mut().unwrap()));
     }
-    assert!(
-        nfs_socket.try_getattr(&nfs_fh3::default()).is_some(),
-        "the socket was evicted by fewer than cap-1 newer connections"
-    );
+    nfs_socket.try_getattr(&nfs_fh3::default()).is_some()
+}
+
+#[test]
+fn the_pinged_nfs_socket_outlasts_the_cap_minus_one_later_connections() {
+    // Eviction is by connection age among sockets that served nothing, so an attacker has to
+    // open max_connections - 1 = 3 newer connections before the kernel's socket is the oldest
+    // (recency alone needed one).
+    assert!(pinged_socket_survives(3));
+}
+
+#[test]
+fn the_pinged_nfs_socket_falls_to_cap_newer_connections() {
+    // KNOWN LIMIT (#262), reproduced: before its first handle-bearing call the kernel's socket
+    // looks exactly like a port-only attacker's NULL-pinged connection, so max_connections newer
+    // ones evict it. Unauthenticated sockets give nothing to protect it by. This pins the limit;
+    // if a real discriminator is ever added, flip this test and un-ignore the one below.
+    assert!(!pinged_socket_survives(4));
+}
+
+#[test]
+#[ignore = "known limit #262: a port-only attacker can evict the kernel's pre-MNT socket"]
+fn the_pinged_nfs_socket_survives_any_number_of_later_connections() {
+    assert!(pinged_socket_survives(64));
 }
