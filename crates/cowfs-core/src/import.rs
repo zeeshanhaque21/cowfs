@@ -149,8 +149,12 @@ fn ingest_with(
         )));
     }
     crate::validate_snapshot_name(name)?;
-    // held to the end: the staging snapshot of this name is this call's alone (issue 300)
-    let _target = c.lock_target(name);
+    // held to the end: the staging snapshot of this name is this call's alone (issue 300).
+    // Bounded, not the unbounded internal lock_target: a daemon import request queued behind a
+    // long ingest or swap of the same name times out instead of hanging (issue 316).
+    let _target = c
+        .lock_target_timeout(name, swap::DEFAULT_LOCK_WAIT)
+        .map_err(|_| ControlError::Timeout)?;
     // A swap a failed earlier call left pending for this name is finished before anything below
     // removes its staging snapshot, the only copy of that call's tree (issue 177).
     c.recover_target(name)?;

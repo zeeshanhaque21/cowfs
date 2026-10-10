@@ -81,6 +81,10 @@ pub enum ControlError {
     /// A handle is open in the snapshot.
     #[error("snapshot is busy: a file is open in it")]
     Busy,
+    /// A bounded wait for the target's per-target lock (issue 316) gave up: another swap or
+    /// ingest is still holding it.
+    #[error("timed out waiting for another swap or ingest of that name to finish")]
+    Timeout,
     /// A filesystem or storage error.
     #[error(transparent)]
     Fs(#[from] Error),
@@ -334,7 +338,9 @@ impl Core {
         validate_snapshot_name(name)?;
         // Outermost: the same per-target lock swap_snapshot/ingest_with take, so a fork cannot
         // land on a name an in-flight swap or import is about to claim (issue 315).
-        let _target = self.lock_target(name);
+        let _target = self
+            .lock_target_timeout(name, swap::DEFAULT_LOCK_WAIT)
+            .map_err(|_| ControlError::Timeout)?;
         let sc = self.inner.snap_by_name(src)?;
         self.inner.check_new_name(name)?;
         self.inner.flush_snapshot(&sc)?;
@@ -345,7 +351,9 @@ impl Core {
     /// Removes a snapshot, discarding uncommitted work in it. Refused while a handle is open.
     pub fn remove_snapshot(&self, name: &str) -> Result<(), ControlError> {
         // Outermost: see `fork_snapshot` above (issue 315).
-        let _target = self.lock_target(name);
+        let _target = self
+            .lock_target_timeout(name, swap::DEFAULT_LOCK_WAIT)
+            .map_err(|_| ControlError::Timeout)?;
         let sc = self.inner.snap_by_name(name)?;
         self.inner.unregister(&sc)
     }
@@ -362,8 +370,17 @@ impl Core {
         // other way cannot invert the order into a deadlock; a self-rename (old == new) locks the
         // single name once, never twice.
         let (lo, hi) = if old <= new { (old, new) } else { (new, old) };
-        let _g_lo = self.lock_target(lo);
-        let _g_hi = (hi != lo).then(|| self.lock_target(hi));
+        let _g_lo = self
+            .lock_target_timeout(lo, swap::DEFAULT_LOCK_WAIT)
+            .map_err(|_| ControlError::Timeout)?;
+        let _g_hi = if hi != lo {
+            Some(
+                self.lock_target_timeout(hi, swap::DEFAULT_LOCK_WAIT)
+                    .map_err(|_| ControlError::Timeout)?,
+            )
+        } else {
+            None
+        };
 
         let sc = self.inner.snap_by_name(old)?;
         validate_snapshot_name(new)?;

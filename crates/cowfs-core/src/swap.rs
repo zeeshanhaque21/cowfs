@@ -34,6 +34,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cowfs_vfs::Error;
 
@@ -306,14 +307,32 @@ impl Drop for TargetGuard<'_> {
     }
 }
 
+/// Default bound for [`Core::lock_target_timeout`] on daemon-reachable paths (issue 316): long
+/// enough to sit behind a real ingest or swap of the same target, short enough that a stuck
+/// daemon request surfaces as a clear timeout instead of a silent hang. See docs/v1-daemon.md.
+pub(crate) const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Returned by [`Core::lock_target_timeout`] when the deadline elapses before the target is
+/// free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockTimeout;
+
+impl std::fmt::Display for LockTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("timed out waiting for another swap or ingest to release this target")
+    }
+}
+
+impl std::error::Error for LockTimeout {}
+
 impl Core {
     /// Serialises `swap_snapshot` (so `promote_base`), `ingest_with` (so `ingest` and
     /// `ingest_replacing`), `rename_snapshot`, `remove_snapshot` and `fork_snapshot` on one target
     /// name: they share its staging name and intent file, and each one's `clear_leftover`,
     /// `recover_target` and `drop_intent` would otherwise act on the other's staging snapshot or
     /// intent, or rename/remove/fork a name out from under an in-flight swap or import (issue 300,
-    /// issue 315). Blocks until the other call is done, with no cancel hook, timeout or fairness
-    /// (issue 316). The key is the target name, so two targets whose staging hashes collide are not
+    /// issue 315). Blocks until the other call is done, with no cancel hook or fairness. For a bounded wait
+    /// instead, see `lock_target_timeout` (issue 316). The key is the target name, so two targets whose staging hashes collide are not
     /// serialised either.
     ///
     /// Lock order: the outermost lock, taken before the gate, `snaps`, any `SnapCtx` lock and
@@ -335,6 +354,31 @@ impl Core {
             inner: &self.inner,
             target: target.to_owned(),
         }
+    }
+
+    /// Bounded-wait sibling of [`Core::lock_target`] (issue 316): gives up with `Err(LockTimeout)`
+    /// instead of blocking forever when another swap or ingest is still holding `target` at the
+    /// deadline. For callers that must not give up (recovery, internal cleanup), use
+    /// `lock_target`; this one is for request handling where an unbounded wait would hang a
+    /// caller the daemon cannot otherwise cancel (see docs/v1-daemon.md).
+    pub(crate) fn lock_target_timeout(
+        &self,
+        target: &str,
+        timeout: Duration,
+    ) -> Result<TargetGuard<'_>, LockTimeout> {
+        let (set, cv) = &self.inner.swap_targets;
+        let held = set.lk();
+        let (mut held, result) = cv
+            .wait_timeout_while(held, timeout, |held| held.contains(target))
+            .unwrap_or_else(|e| e.into_inner());
+        if result.timed_out() {
+            return Err(LockTimeout);
+        }
+        held.insert(target.to_owned());
+        Ok(TargetGuard {
+            inner: &self.inner,
+            target: target.to_owned(),
+        })
     }
 
     /// Removes the leftover staging snapshot `staged` of `target`, unless an intent for another
@@ -378,6 +422,9 @@ impl Core {
                 "source and target are the same snapshot",
             ));
         }
+        // Unbounded (issue 316): promote_base's caller already serializes behind the daemon's
+        // own locks (HolderGuard, bases.exclusive), and giving up partway through an atomic base
+        // swap is worse than waiting, so this stays on the must-not-give-up lock_target.
         let _target = self.lock_target(new);
         self.recover_target(new)?;
         let src_sc = self.inner.snap_by_name(src)?;
@@ -1231,5 +1278,31 @@ mod tests {
         }
         h1.join().unwrap();
         h2.join().unwrap();
+    }
+
+    /// issue 316: a second caller must get a timeout error, not hang forever, when the first
+    /// still holds the per-target lock past the deadline.
+    #[test]
+    fn lock_target_timeout_gives_up_while_the_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_core(dir.path());
+
+        let held = c.lock_target("busy");
+        let start = std::time::Instant::now();
+        assert!(
+            c.lock_target_timeout("busy", Duration::from_millis(50))
+                .is_err(),
+            "must time out, not block, while the first guard is held"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must give up at the deadline, not hang"
+        );
+
+        // once the first guard drops, the same target is free again
+        drop(held);
+        assert!(c
+            .lock_target_timeout("busy", Duration::from_millis(50))
+            .is_ok());
     }
 }

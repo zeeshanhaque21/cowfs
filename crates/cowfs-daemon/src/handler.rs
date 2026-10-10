@@ -50,6 +50,7 @@ fn io(e: std::io::Error, what: &str) -> CtlError {
         std::io::ErrorKind::Unsupported => ErrorCode::Unsupported,
         std::io::ErrorKind::InvalidInput => ErrorCode::InvalidParams,
         std::io::ErrorKind::WouldBlock => ErrorCode::Busy,
+        std::io::ErrorKind::TimedOut => ErrorCode::Timeout,
         _ => ErrorCode::IoError,
     };
     CtlError::new(code, format!("{what}: {e}"))
