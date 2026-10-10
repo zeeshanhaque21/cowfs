@@ -667,7 +667,7 @@ fn owner_override_applies_to_every_reply() {
         Some((501, 20)),
     )
     .unwrap();
-    let mut c = Nfs::connect(server.port(), server.export_name());
+    let mut c = Nfs::connect(server.port(), &server.export_name());
     let root = c.root.clone();
     assert_eq!((c.attrs(&root).uid, c.attrs(&root).gid), (501, 20));
     let f = c.create_file(&root, "f");

@@ -112,7 +112,7 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     mount_signal: Option<mpsc::Sender<bool>>,
     mount_gate: Option<Arc<MountGate>>,
     peer_check: Option<PeerCheck>,
-    export_name: Arc<String>,
+    export_name: Arc<Mutex<String>>,
     limits: Limits,
     reply_cache: Arc<ReplyCache>,
     live: Arc<Mutex<Vec<Live>>>,
@@ -178,7 +178,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             mount_gate: None,
             peer_check: None,
-            export_name: Arc::from("/".to_string()),
+            export_name: Arc::new(Mutex::new("/".to_string())),
             reply_cache: reply_cache(&limits),
             live: Arc::new(Mutex::new(Vec::new())),
             next_conn: AtomicU64::new(1),
@@ -209,13 +209,23 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
     /// Example: Name `foo` results in the export path `/foo`.
     /// Default path is `/` if not set.
     pub fn with_export_name<S: AsRef<str>>(&mut self, export_name: S) {
-        self.export_name = Arc::new(format!(
+        *self
+            .export_name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = format!(
             "/{}",
             export_name
                 .as_ref()
                 .trim_end_matches('/')
                 .trim_start_matches('/')
-        ))
+        )
+    }
+
+    /// A clone of the shared export-name cell, so a caller that stashed one before
+    /// `handle_forever` took ownership of this listener can still rotate the export path
+    /// (e.g. after re-arming a one-shot mount gate for a deliberate remount).
+    pub fn export_name_handle(&self) -> Arc<Mutex<String>> {
+        self.export_name.clone()
     }
 }
 

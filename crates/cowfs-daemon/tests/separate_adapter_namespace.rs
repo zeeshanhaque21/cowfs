@@ -731,8 +731,8 @@ fn observe(mkdir_first: bool, race: bool) -> Observation {
     let server_a = Server::start(a.clone() as Arc<dyn Vfs>, &translated(), None).expect("server a");
     let server_b = Server::start(b.clone() as Arc<dyn Vfs>, &translated(), None).expect("server b");
 
-    let mut ca = Client::connect(server_a.port(), server_a.export_name());
-    let mut cb = Client::connect(server_b.port(), server_b.export_name());
+    let mut ca = Client::connect(server_a.port(), &server_a.export_name());
+    let mut cb = Client::connect(server_b.port(), &server_b.export_name());
     let root_a = ca.fh();
     let root_b = cb.fh();
 
@@ -996,8 +996,8 @@ fn the_two_adapters_share_one_snapshot_namespace() {
     let view_b = core.snapshot_view("s").unwrap();
     let server_a = Server::start(Arc::new(view_a) as Arc<dyn Vfs>, &translated(), None).unwrap();
     let server_b = Server::start(Arc::new(view_b) as Arc<dyn Vfs>, &translated(), None).unwrap();
-    let mut ca = Client::connect(server_a.port(), server_a.export_name());
-    let mut cb = Client::connect(server_b.port(), server_b.export_name());
+    let mut ca = Client::connect(server_a.port(), &server_a.export_name());
+    let mut cb = Client::connect(server_b.port(), &server_b.export_name());
 
     let (probe_st, _probe_fh, _probe_kind) = ca.lookup("nonexistent");
     assert_ne!(
@@ -1060,7 +1060,7 @@ fn the_sidecar_channel_round_trips_valid_bytes_and_refuses_junk() {
     core.create_snapshot("s").unwrap();
     let vfs = core.snapshot_view("s").unwrap();
     let server = Server::start(Arc::new(vfs) as Arc<dyn Vfs>, &translated(), None).unwrap();
-    let mut c = Client::connect(server.port(), server.export_name());
+    let mut c = Client::connect(server.port(), &server.export_name());
 
     let (doc_st, _doc_fh) = c.create("doc", 0o644);
     assert_eq!(doc_st, OK, "create(doc)");

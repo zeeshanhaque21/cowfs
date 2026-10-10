@@ -1,6 +1,6 @@
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
@@ -28,7 +28,7 @@ pub struct RPCContext {
     pub mount_gate: Option<Arc<MountGate>>,
     pub peer_check: Option<PeerCheck>,
     pub local: SocketAddr,
-    pub export_name: Arc<String>,
+    pub export_name: Arc<Mutex<String>>,
     pub reply_cache: Arc<ReplyCache>,
     /// See `Limits::handler_timeout`.
     pub handler_timeout: std::time::Duration,
