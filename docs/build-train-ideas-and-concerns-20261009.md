@@ -159,10 +159,12 @@ No scope was added to any builder because of this list.
 
 - The live daemon runs a build older than this session's merges.
   None of the NFS fixes (#287 watchdog, #279 flood eviction) are running, and the vendored `nfsserve` copy under `spikes/nfs-loopback/vendor` is not re-vendored.
-- `treehouse return` hung inside the cowfs mount and left a lease detached but still leased.
-  Leases 1 to 6 are held by finished agents.
-  The cause is not diagnosed; #289 (macOS Quarantine hook) is a hypothesis.
-  The treehouse pool could run out.
+- `treehouse return` looked like it hung and left leases detached but still leased.
+  Corrected 2026-10-10: it did not hang on the mount.
+  It terminates lingering processes in the worktree, and the caller's own shell was one of them because the caller's working directory was inside the lease (exit 143 or 144).
+  Running `treehouse return <path>` from outside the lease worked for all seven leases once the stale processes holding them were killed.
+  The #289 Quarantine-hook hypothesis does not explain this symptom.
+  A dirty worktree also needs a confirmation that cannot be answered without stdin, so restore noise such as Cargo.lock first.
 - The `cowfs` CLI default socket (`/var/folders/.../cowfs-501/control.sock`) is not where the live daemon listens (`~/.cowfs/sock/daemon.sock`).
   A bare `cowfs status` reports "not running" against a healthy daemon.
 - The disk that holds the store is 99% full, the store is about 33 GB, and GC has no scheduler.
@@ -198,7 +200,7 @@ No scope was added to any builder because of this list.
 - Watch the Bazel remote-apis big-blob proposals (Split and Splice RPCs, issue 326 there) as an outside reference for chunked large blobs.
 - Key the per-target lock by snapshot id instead of name, so renames cannot slip past it.
 - Make the `cowfs` CLI find the live socket from the daemon pid file or a config entry.
-- Add the lease-audit script from the morning list; the hang above makes it more useful.
+- Add the lease-audit script from the morning list; stale processes holding leases make it more useful.
 
 ### Where the PRs stand
 
@@ -214,3 +216,12 @@ No scope was added to any builder because of this list.
 - Local workspace clippy fails in `cowfs-vfs-path` (`UmaskWorker`, `sys.rs`) on macOS in several builders' reports while CI lint passes.
   It was not checked against main.
 - #315 (rename, remove and fork do not take the per-target lock) and #316 (waiters cannot be cancelled and have no timeout) are open.
+
+### Update, 2026-10-10: daemon recreate attempt
+
+- The live mount point `~/.cowfs/mnt` cannot be mounted again.
+  A `umount -f /Users/zeeshanhaque/.cowfs/mnt` (pid 59553, started 2026-10-09) is stuck inside the unmount syscall in uninterruptible state, so `mount_nfs` returns Resource busy.
+  No signal can end it; a reboot is the expected way out, or serving the old export again so the kernel call can finish.
+- The old store is moved aside as `~/.cowfs/store.old-20261010` (33 GB) and the new daemon binaries are in `spikes/nfs-loopback/out/live/bin`; the previous ones are in `bin.old-20261010`.
+- Five leaked `cowfs serve` test servers (from `cowfs-263/r` and `cowfs-259` on the scratch box) were still running after about 15 hours.
+- The destructive-command hook blocked deleting the local `pr303` branch ref twice after the facts were stated; the ref is harmless and was left.
