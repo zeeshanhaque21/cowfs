@@ -1,7 +1,152 @@
-# Clone vs cowfs workspaces on macOS (WIP)
+# Clone vs cowfs workspaces on macOS (2026-10-10)
 
-Work in progress.
-Raw CSV so far:
+Question: can plain OS copy-on-write clones replace the cowfs mount for many cheap workspaces of a Rust project?
+Judged on real disk used, build time, and whether built files survive a different folder path.
+A sibling agent ran the same experiment on Linux; this report covers the Mac only.
+
+## Setup
+
+- Project: fresh `git clone https://github.com/zeeshanhaque21/cowfs.git`, pinned at `65a551957134c361c70fd7c843ef265a2327dc7c`.
+- Base: that tree after one `cargo test --no-run --workspace` (dev profile, target inside the tree).
+- Base build: 18.8 s wall, 113 `Compiling` lines, `target/` 3.9 GiB (du), 4.85 GB of file bytes per `cowfs import`.
+- Machine: Apple M3 Max, 16 cores, 128 GiB RAM, macOS 26.6.2 (25G83), APFS Data volume.
+- Toolchain: rustc 1.99.0 (b940084d7 2026-09-28), cargo 1.99.0 (5f94df478 2026-08-27), no sccache, no RUSTFLAGS.
+- Free disk at start: 251 GB (df -k, Data volume); at end 139 GB (other agents also wrote to this volume).
+- Arm A: `cp -R base slot-N`.
+- Arm B: `cp -cR base slot-N` (APFS clone).
+- Arm C: a private cowfs daemon (`spikes/nfs-loopback/out/live/bin`, cowfs sha1 d0b87f05, cowfs-daemon sha1 9ce9aa36) copied to scratch, `--backend core`, NFS loopback adapter.
+- The private daemon lived under `/private/tmp/claude-501/cfx`, not the session scratchpad, because the scratchpad path pushes the socket past the macOS 104-byte Unix socket limit.
+- The daemon also refuses a socket directory that is not mode 0700.
+- The live daemon (pid 10824, `~/.cowfs`) was never touched.
+- Arm C base: `cowfs import base --name exp-base`, 27.1 s, verified by hash, stored_bytes 1.23 GB, df delta 1.21 GiB.
+- Slots: A and B under the scratch dir, C at `<mnt>/slot-N` from `cowfs snapshot create slot-N --from exp-base`.
+- All slots sit at a path different from the base, so every first build in a slot is a different-path build.
+- Driver: one Python script, steps strictly sequential, one build at a time, CSV appended and fsynced per step.
+- Disk: `sync; sleep 10; df -k /System/Volumes/Data` after every step; cowfs `stored_bytes`/`logical_bytes` after every arm C step; no `du` on clone arms.
+- Idle noise: two df reads 60 s apart differed by 1.8 MB.
+- APFS clone check: a 1 GiB random file cloned with `cp -c` moved df by -0.5 MB, a plain copy by 1.00 GiB.
+- No local Time Machine snapshots existed (`tmutil listlocalsnapshots /` empty).
+- The machine was not quiet: other agents and apps ran throughout, idle load average 2.2 to 4.
+
+## Leaf crates for R2
+
+Chosen by transitive reverse dependents in the workspace (`cargo metadata --no-deps`, self-edges dropped), lowest first, ties alphabetical.
+
+| slot | crate | transitive dependents |
+| --- | --- | --- |
+| 1 | cowfs-cli | 0 |
+| 2 | cowfs-treehouse | 0 |
+| 3 | cowfs-daemon | 1 |
+| 4 | cowfs-fuse | 2 |
+| 5 | cowfs-nfs | 2 |
+| 6 | cowfs-ctl | 3 |
+| 7 | nfsserve | 3 |
+| 8 | cowfs-core | 5 |
+
+R3 appended `// exp slot K` to `crates/cowfs-store/src/lib.rs` in every slot (6 transitive dependents), on top of the R2 edit.
+
+## Scope changes by lead decision
+
+- Arm C R3 ran slots 1 to 3 only, not 8, by lead decision, because each slot took 21 to 26 minutes.
+- Arm C R4 was not run at all, by lead decision.
+- Lead's reason: a metadata-write micro-benchmark on the mount (run by the lead, not by me) measured about 100 ms per create/mkdir/rename and 21 ms per unlink, so a clean plus full rebuild would take hours per slot.
+- My arm C R4 `cargo clean` in slot 1 had run about 9.5 minutes when I stopped it on that decision; it exited within 5 s of SIGTERM, and slot 1's target is now partially cleaned.
+- Rule 2 is therefore UNEVALUATED for cowfs.
+- Arm C R6 ran on slots 2 and 3 (slot 1 was partially cleaned).
+- Arms A and B ran every round in full.
+
+## Per-arm per-round summary
+
+Disk is the sum of per-step settled df deltas inside each contiguous run, in GiB (positive means space used).
+Arm C also shows the change in cowfs `stored_bytes` (decimal GB).
+Seconds are the mean wall time per slot.
+
+| round | A s/slot | A disk GiB | B s/slot | B disk GiB | C s/slot | C disk GiB | C stored GB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| R1 create 8 slots | 12.0 (upper bound) | 36.80 | 8.0 (upper bound) | 0.10 | 2.0 (upper bound) | 0.03 | 0.000 |
+| R2 leaf edit, 8 slots | 17.6 | 11.43 | 4.6 | 4.71 | 276.3 (+184.7 rerun) | 1.00 | 0.922 |
+| R3 store edit | 9.5 (8 slots) | -3.95 | 10.9 (8 slots) | 16.39 | 1346.5 (3 slots) | 1.18 | 1.261 |
+| R4 clean (4 slots) | 7.8 | -22.01 | 5.9 | -9.65 | not run | | |
+| R4 full build (4 slots) | 16.9 | 15.04 | 16.7 | 15.03 | not run | | |
+| R4 net | | -6.97 | | 5.38 | not run | | |
+| R6 snapname tests | 2.2 PASS 3/3 | | 2.1 PASS 3/3 | | 23.3 PASS 2/2 | | |
+
+Compiling lines per slot in R2: A 74 in every slot; B 1,1,2,1,3,4,4,5; C 1,1,2,1,3,4,4,5 (same as B).
+Compiling lines per slot in R3: 7 in every slot of every arm.
+Compiling lines in R4: 113 in every slot (A and B), equal to the base build.
+Arm C R2 per slot (s): 63.5, 115.8, 170.1, 42.2, 396.2, 408.0, 449.9, 564.6 (failed, see anomalies) plus a 184.7 s rerun.
+Arm C R3 per slot (s): 1238 (reconstructed, see anomalies), 1264.7, 1536.8.
+1-minute load during arm C builds was 3.3 to 6.1, about the idle baseline, while A and B builds drove it to 12 to 29.
+So the CPU sat mostly idle during cowfs builds and the mount was the bottleneck; I did not profile it.
+
+Cumulative footprint over the 8 working slots (A and B), measured after each round, in GiB:
+
+| after | A | B | C |
+| --- | --- | --- | --- |
+| R1 | 36.80 | 0.10 | 1.24 (1.21 import + 0.03) |
+| R2 | 48.23 | 4.81 | 2.24 |
+| R3 | 44.28 | 21.20 | 3.42 measured with 3 slots; about 5.39 if 8 slots scale linearly (assumption, not measured) |
+| R4 | 37.31 | 26.58 | not run |
+
+Final cowfs state: logical_bytes 9.62 GB, stored_bytes 3.42 GB, store directory 3.36 GiB (du, plain directory), 9 snapshots.
+
+## Rule evaluation
+
+Rule 1 (clones reach at least 70% of cowfs's space saving across R2 to R4, and builds are not slower than cowfs): NOT MET on space; met on speed.
+- R4 is missing for cowfs, so I compare at the end of R3, with saving defined as footprint below arm A.
+- Saving after R3: B 44.28 - 21.20 = 23.08 GiB; C 44.28 - 5.39 = 38.89 GiB (C's 8-slot figure is the linear estimate from 3 slots).
+- B reaches 59% of cowfs's saving, under the 70% bar.
+- Using only the measured 3-slot C R3 growth per slot (0.39 GiB) against B's (2.05 GiB per slot) gives the same picture: B grows about 5x faster in R3.
+- On R2 alone (all 8 slots measured), B grew 4.71 GiB against C's 1.00 GiB.
+- Speed: clones are far faster, R2 4.6 s vs 276 s per slot, R3 10.9 s vs 1347 s per slot (60x to 120x).
+- Taken together, the rule as written is not met because of the space clause.
+
+Rule 2 (cowfs saves at least 2x more disk than clones in R4): UNEVALUATED, cowfs R4 was not run by lead decision.
+- For reference, B's R4 on 4 slots: clean freed 9.65 GiB, full build wrote 15.03 GiB, net +5.38 GiB (about 3.76 GiB written per full rebuild).
+- A's R4 on 4 slots: clean freed 22.01 GiB, build wrote 15.04 GiB, net -6.97 GiB.
+
+Rule 3 (a clone at a new path rebuilds more than 50% of units): NOT TRIGGERED for clones.
+- B (APFS clone, new path): at most 5 of 113 units (4.4%) in R2, the edited crate and its dependents only.
+- C (cowfs, new path): the same counts as B.
+- A (plain `cp -R`, not a clone) rebuilt 74 of 113 (65%) in every slot, and the cause is mtimes, not the path.
+- A no-edit build in a fresh `cp -R` slot also compiled 74 units; `cargo -v` gave 74 `Dirty ... the dependency X was rebuilt` reasons.
+- `cp -R` sets every mtime to copy time, while `cp -cR` and `cowfs import` keep source mtimes (checked with `stat -f %m`).
+- The remap repeat changed nothing: with the base rebuilt under one identical RUSTFLAGS string `--remap-path-prefix=<base>=/ws --remap-path-prefix=<slot-10>=/ws --remap-path-prefix=<slot-11>=/ws`, two fresh `cp -R` slots still compiled 76 of 113.
+- A per-slot remap string would change RUSTFLAGS and force a full rebuild by itself, which is why one identical string was used.
+
+## Anomalies
+
+- cowfs ld EEXIST: in arm C R2 slot 8, `ld` failed with `open() failed, errno=17 (File exists)` for `target/debug/deps/swap_provenance_124-2afb039026b4edb5`, although that bare file was absent from a directory listing right after.
+- One diagnostic rerun passed (184.7 s, 4 crates recompiled); it happened once in 14 arm C builds; slot 8's R2 cost is both runs.
+- Stall-rule false positive: the "no log growth for 10 min" rule fired on arm C R3 slot 1 at 18:00 elapsed.
+- ps then showed 15 to 16 rustc processes in U state with new pids still being spawned, so the build was progressing; cargo prints nothing while test targets compile and link.
+- The driver did not kill it; the build completed on its own at about 20.6 minutes with no errors and 168 `Executable` lines.
+- Its row is reconstructed: seconds from ps etime start (plus or minus 1 s) to the log mtime.
+- From then on every cargo call used `--message-format=json-render-diagnostics`, so each finished unit writes a line; the rule did not fire again.
+- R1 times for slots 1 to 8 are upper bounds quantized to 2 s (driver polling bug, fixed before R2); later precise `cp -R` creates took 22 to 35 s with the page cache colder.
+- In the pre-run smoke test, a fresh snapshot was not listed and the first write got ENOENT, then worked seconds later (likely a cached negative lookup from an earlier `ls`); R1 saw 0 s visibility wait.
+- Arm A R3 freed 3.95 GiB and arm A R4 clean freed more than the rebuild wrote, because incremental-compilation session dirs accumulated in R2 were pruned or deleted.
+- `cowfs status` logical and stored bytes did not change during the 9.5-minute partial `cargo clean`; I did not run gc and did not verify why.
+- Free space fell from 251 GB to 139 GB over the run, partly from other agents on the same volume, so long arm C windows carry more df noise than the short A and B steps; stored_bytes is the cleaner arm C number.
+
+## What I could not verify
+
+- Arm C R4 and rule 2, not run by lead decision.
+- Arm C R3 for slots 4 to 8; the 8-slot C footprint after R3 is a linear estimate.
+- The root cause of the ld EEXIST, and whether it reproduces.
+- Why cowfs builds are 60x to 120x slower; the lead's metadata micro-benchmark is the leading explanation, and I did not profile.
+- Whether `cp -pR` (mtime-preserving plain copy) would make arm A incremental; not tested.
+
+## Teardown
+
+- Before shutdown: `cowfs ps` showed no processes for all 9 snapshots, and `lsof -n <mnt>` completed with no matches.
+- `cowfs shutdown` returned `{}`, the daemon exited within 5 s, and the private mount was gone; the live mount was still present.
+- No `umount -f` was used.
+
+## Raw CSV
+
+Columns: arm, round, slot, seconds, compiling_count, df_free_kb, notes.
+Extra rounds: R2rerun (diagnostic rerun), R5diag (no-edit build in a fresh `cp -R` slot), R5remap-base and R2remap (remap repeat), R4clean (the clean step of R4).
 
 ```csv
 arm,round,slot,seconds,compiling_count,df_free_kb,notes
@@ -142,4 +287,14 @@ A,R2remap,start,0.00,,140069500,load1=3.19
 A,R2remap,10,20.90,76,140200360,rc=0 load1=12.71 edit=cowfs-treehouse
 A,R2remap,11,20.18,76,140338252,rc=0 load1=17.06 edit=cowfs-daemon
 A,R2remap,end,0.00,,140320676,load1=12.75
+C,R3,start,0.00,,140314892,load1=10.72 logical=7529983450 stored=2602099876
+C,R3,2,1264.73,7,139954848,rc=0 load1=3.26 edit=cowfs-store logical=8587374922 stored=3012636201
+C,R3,3,1536.82,7,139513248,rc=0 load1=3.97 edit=cowfs-store logical=9591754684 stored=3411713664
+C,R3,end,0.00,,,driver stopped before slot 4 by lead decision (trim to 3 slots); slot 4 not edited
+C,R4,start,0.00,,139513388,load1=3.94 logical=9591754684 stored=3411713664
+C,R4clean,1,~575,,,ABORTED by lead decision: cargo clean in slot-1 SIGTERMed after ~9.5 min (exited within 5s); slot-1 target now partially cleaned; C R4 not run
+C,R6,start,0.00,,139083248,load1=4.32 logical=9591754684 stored=3411713664
+C,R6,2,23.71,3,139082788,"rc=0 PASS results=[('ok', '7', '0'), ('ok', '0', '0')]"
+C,R6,3,22.94,3,139081880,"rc=0 PASS results=[('ok', '7', '0'), ('ok', '0', '0')]"
+C,R6,end,0.00,,139081728,load1=3.59 logical=9615589253 stored=3420746473
 ```
