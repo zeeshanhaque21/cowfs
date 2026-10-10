@@ -1,8 +1,9 @@
 # Crash injection seam for gate g6 (issue 173)
 
-Status: slice 1 (crate-level process-exit evidence) merged in PR 183.
-Slice 2 (daemon-level reach) is on branch `feat/crash-injection-173-daemon`.
-Refs: issue 173, issue 88, `docs/reviews/issue88-status-20261008.md`, `docs/verification/daemon-crash-acceptance.md`.
+Status: slices 1-5 merged (PR183, slice 2, PR274, PR285, PR299/PR310; #276 follow-ups in PR284).
+The daemon crash-injection sweep was re-run against the current code on 2026-10-10 (see "Re-run after slices 3-5" below) and passed.
+Issues 173 and 276 are closed; this doc stays as the evidence record.
+Refs: issue 173, issue 276, issue 88, `docs/reviews/issue88-status-20261008.md`, `docs/verification/daemon-crash-acceptance.md`.
 
 ## Problem
 
@@ -136,6 +137,19 @@ Absence checks, `scripts/check-fault-seam-absent.sh` (CI step, same name):
 Cost: about 5 minutes of wall time for the full sweep on a busy host (load average 40), one daemon and mount at a time.
 The template is built once per invocation, in roughly 1 minute.
 
+### Re-run after slices 3-5, closing #173 and #276
+
+Evidence, this Mac, 2026-10-10, run id `fault-boundary-173-276` under `bench/out/crash88/` (gitignored), on `cowfs` HEAD `4cf031e` (merge of #318; includes slices 3-5, PR274/285/299/310, and the #276 follow-ups, PR284).
+Treehouse worktree slot 6, branch `verify/issue-173-276-crash-sweep-2`.
+Invocation: `scripts/verify-daemon-crash.py --fault-boundary 1-60`, wrapped in a hard 45-minute `perl -e 'alarm N; exec @ARGV'` ceiling plus a separate stall-detection watchdog (6-minute no-log-growth trigger, dumps `ps` state/wchan on fire); neither fired.
+
+- Sweep n=1..29: n=1..28 each die with status 77 during the gc and pass every check, and n=29 finishes the gc, so the cycle now has 28 store `Io` boundaries (up from 18), matching the growth the crate-level sweep already showed (73 to 88 after slice 3).
+- Raw pack directory at death: the source pack is still present for n=1..22 and missing for n=23..28 (and 29, the completed run).
+- `pass_fail_by_phase`: `{"gc": [28, 0], "completed": [1, 0]}`; `closed: []`; `reached_completion: true`. Exit 0, overall PASS.
+- Wall time roughly 10-11 minutes on a lightly loaded host (load average ~3, vs. the earlier busy-host run); no hang, no stall-watchdog trigger, no retries.
+- Live mount (`~/.cowfs/mnt`, independent of this sweep's private per-point mounts) stayed responsive throughout: a 10-second-alarm `ls`/`stat` probe immediately after the sweep returned instantly.
+- This re-run resolves the staleness this doc flagged below: the daemon sweep is no longer predating slice 3, and both #173's and #276's last open item (this sweep) is now closed out.
+
 ## Remaining
 
 - Power loss (slice 3): process exit keeps the page cache, so a missing fsync is invisible here.
@@ -144,10 +158,8 @@ The template is built once per invocation, in roughly 1 minute.
   Sweeping a writing daemon would need the fixture build to run under the env var, and the counter starts at process start.
 - Mutation 2 (the unlink moved ahead of the durable watermark raise) was not caught by slice 2; slice 3 closes it, see "Slice 3" below.
 - The sweep is a manual stage (`--fault-boundary 1-60`), not a CI job, because it needs a real NFS mount and a 300 MiB fixture.
-- No stability check (n-1 still dies, n+1 still completes) beyond the sweep stopping at n=19.
-- These counts predate slice 3.
-  Slice 3 added the unlink boundary and routed the compaction copy through `Io`, so a store cycle now has more boundaries (the crate-level sweep `crash_inject` went from 73 to 88).
-  The daemon sweep needs an NFS mount and was not re-run in slice 3, so n=18, n=14 and "startup contributes none" above are stale until it is.
+- No stability check (n-1 still dies, n+1 still completes) beyond the sweep stopping at n=29.
+- The original counts (n=18, n=14, "startup contributes none") predated slice 3 and are superseded by the 2026-10-10 re-run above (n=28, n=22).
 
 ## Slice 3: power loss over compaction and discard
 
