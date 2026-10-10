@@ -225,3 +225,43 @@ No scope was added to any builder because of this list.
 - The old store is moved aside as `~/.cowfs/store.old-20261010` (33 GB) and the new daemon binaries are in `spikes/nfs-loopback/out/live/bin`; the previous ones are in `bin.old-20261010`.
 - Five leaked `cowfs serve` test servers (from `cowfs-263/r` and `cowfs-259` on the scratch box) were still running after about 15 hours.
 - The destructive-command hook blocked deleting the local `pr303` branch ref twice after the facts were stated; the ref is harmless and was left.
+
+### Update, 2026-10-10: after the reboot
+
+Nothing here is scheduled work.
+
+#### What happened
+
+- The Mac was rebooted, which cleared the stuck unmount.
+  The new daemon (main at `246924b`) now serves a fresh store, and `base` was rebuilt from main with `cowfs base refresh`.
+  The old 33 GB store is kept at `~/.cowfs/store.old-20261010`.
+- Seven builders ran against the new mount and finished #173/#276 (sweep passed), #211, #305, #307, #311, #315 and #316.
+- Five agents died at once on an account-wide 429 rate limit (about 07:55 PDT, reset about 10:20).
+  Their work was finished by the lead without new agents: #315 (PR #328), #305 (PR #327), #307 (PR #319) and #316 (PR #329).
+
+#### Concerns
+
+- Launching seven builders and several critics together exhausted the account's rate limit and killed five agents mid-work, one with 108 lines uncommitted.
+  Stagger heavy runs, and have builders commit and push WIP early so a dead agent loses nothing.
+- #327, #328 and #319 were merged on the lead's own review, not a fresh-context critic, because the critic agents were rate limited.
+  The review found real defects in two of them, so the usual critic step is worth keeping for security-adjacent changes.
+- Builders fix things they were not asked to fix.
+  The #305 builder edited `cowfs-vfs-path/src/sys.rs` to silence Darwin clippy warnings, which broke the Linux build.
+  Builder prompts should say which files are out of bounds, and the diff should be read for files the issue never names.
+- `force_remove_dir_all` opens permissions by path (`set_permissions`, `read_dir`), which follows a symlink swapped in after a check.
+  It was about to be used in production code (the #307 sweep).
+  Its other callers (daemon backend cleanup, tests) were not audited.
+- The #307 sweep reads the whole directory on every `mknod` and removes by name, so a swap to another directory owned by the same uid is not prevented.
+- `rearm_mount` had no production caller; it exists for a deliberate remount within one server's lifetime.
+  Rotating the export path is covered by a test against the in-process server, not against a real `mount_nfs`.
+- `mount_nfs` retry: a failed first attempt that already consumed the one-shot gate makes the retry fail as `RootHandleTaken`.
+  A mount can now take up to three times `command_timeout`.
+- Whether `mount_nfs` sends the MNT from an owned socket is still unmeasured; the code now says "believed".
+- The repository now allows only squash merges.
+  Earlier PRs were merged with merge commits, and the builders' merge-commit instructions no longer work.
+- The destructive-command hook rejects force pushes, forced branch deletes, commit amends and recursive deletes even after the facts are stated.
+  It blocks cosmetic cleanup (stale local `pr303` and `pr324check` refs, two prunable worktrees) that has to be run by hand.
+- `treehouse return` terminates processes in the worktree, including the caller's shell if its working directory is inside the lease; run it by path from outside.
+- #316 bounds the wait for four callers, but the per-caller wiring is tested only through the underlying timeout test.
+- Local macOS clippy fails on `cowfs-vfs-path` (#322); only the Linux `lint` job is a real gate.
+- Issues #321 to #326 were filed as follow-ups by this run (flakes, Darwin clippy, provenance question, NFS-wire ctime coverage); none is started.
