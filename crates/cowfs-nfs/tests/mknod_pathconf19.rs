@@ -55,9 +55,14 @@ fn mknod_creates_fifo_socket_and_devices_with_type_mode_and_rdev() {
         assert_eq!((a.rdev.specdata1, a.rdev.specdata2), dev, "{n} rdev");
         // Issue 326: the ctime of a fresh special node survives the wire as wall-clock time
         // (not zero, not the epoch default), within 5 s either side of the call like the
-        // Portable conformance check `mknod_ctime_is_wall_clock`.
+        // Portable conformance check `mknod_ctime_is_wall_clock`. `MemVfs` stamps atime, mtime
+        // and ctime with the same value, so this does not pin that the wire reads the *ctime*
+        // field; `convert.rs`'s unit test with distinct times does. Saturating adds: a
+        // far-future ctime is clamped to `u32::MAX` and must fail the assert, not overflow.
         assert!(
-            a.ctime.seconds != 0 && a.ctime.seconds + 5 >= before && a.ctime.seconds <= after + 5,
+            a.ctime.seconds != 0
+                && a.ctime.seconds.saturating_add(5) >= before
+                && a.ctime.seconds <= after.saturating_add(5),
             "{n} ctime {} outside [{before}, {after}] +-5 s",
             a.ctime.seconds
         );
