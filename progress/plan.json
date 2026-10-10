@@ -1702,7 +1702,7 @@
           "title": "#289 live mount hang in the macOS Quarantine hook on NFS",
           "state": "blocked",
           "owner": "lead",
-          "status_note": "Open. Hypothesis from a spindump (git and treehouse stuck in the kernel Quarantine hook, AppleDouble xattr emulation, daemon idle). Not verified. Related symptom: treehouse return hangs inside the mount and leaves a lease detached but leased (seen 2026-10-09, not diagnosed).",
+          "status_note": "Open. Hypothesis from a spindump (git and treehouse stuck in the kernel Quarantine hook, AppleDouble xattr emulation, daemon idle). Not verified. The earlier note linking it to treehouse return was wrong (see the ideas file). Separate finding 2026-10-10: a `umount -f` of ~/.cowfs/mnt has been stuck in the unmount syscall (state U) since 2026-10-09, which makes mount_nfs report Resource busy.",
           "issue": 289
         },
         {
@@ -2031,5 +2031,5 @@
   "bar_history": [
     "2026-10-09 (Zee): gate changed from 'native APFS and ext4 (moonscape)' to 'native APFS plus a Linux native filesystem on cachyos'. The cachyos root is btrfs, so the Linux number is a btrfs number; an ext4 loop image under /mnt/docs may be added as a labelled proxy, not as the gate."
   ],
-  "update_20261009_evening": "Merged since the morning update: #273 #274 #275 #277 #278 #279 #280 #281 #282 #284 #285 #291 #292 #293 #294 #295 #296 #297 #298 #299 #303 #304 #306 #308 #309 #310 #312 #313 #314 (#222 #271 #272 earlier). No PR open and no builder running at the time of writing. Process: every code PR gets a fresh-context critic before merge; MERGE-AFTER-FIXES goes back to the builder; security-sensitive PRs get a fresh critic per round (#298 and #303 took three). Known tooling problem: treehouse return hangs inside the cowfs mount (#289 hypothesis), so leases 1 to 7 are left held. Ideas and concerns: docs/build-train-ideas-and-concerns-20261009.md."
+  "update_20261009_evening": "Merged since the morning update: #273 #274 #275 #277 #278 #279 #280 #281 #282 #284 #285 #291 #292 #293 #294 #295 #296 #297 #298 #299 #303 #304 #306 #308 #309 #310 #312 #313 #314 (#222 #271 #272 earlier). No PR open and no builder running at the time of writing. Process: every code PR gets a fresh-context critic before merge; MERGE-AFTER-FIXES goes back to the builder; security-sensitive PRs get a fresh critic per round (#298 and #303 took three). Tooling note (corrected 2026-10-10): treehouse return terminates lingering processes in the lease, including a caller whose cwd is inside it; run it by path from outside. All seven leases were returned after stale processes were killed. Ideas and concerns: docs/build-train-ideas-and-concerns-20261009.md."
 }
