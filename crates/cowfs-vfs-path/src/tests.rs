@@ -985,6 +985,7 @@ fn keep_make_despite_failed_cleanup_prefers_a_successful_make() {
 }
 
 /// #307 fix B: `random16` keeps retrying past a simulated `EINTR` instead of surfacing it.
+#[cfg(target_os = "linux")]
 #[test]
 fn random16_returns_sixteen_bytes() {
     let a = crate::sys::random16().unwrap();
