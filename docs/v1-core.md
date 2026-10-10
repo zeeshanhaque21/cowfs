@@ -408,10 +408,12 @@ A second call on the same target name waits; calls on other targets do not.
 It is taken only by those two entry points, never while holding another lock of ours, and never twice in one call, so it cannot be part of a cycle.
 Its set mutex (`swap_targets`) is a leaf held only to insert or remove a name.
 Daemon locks (`HolderGuard`, `bases.exclusive`) are taken above it and are never taken by the core.
+A waiter on `lock_target` itself still has no cancel hook, no timeout and no fairness; `promote_base` stays on it because the daemon has already serialized around it (`HolderGuard`, `bases.exclusive`) and giving up partway through an atomic base swap is worse than waiting.
+`Core::lock_target_timeout(target, timeout)` is the bounded sibling (issue 316): `ingest_with` uses it with `DEFAULT_LOCK_WAIT` (30s) because it is reached directly from a daemon import request (`cowfs-daemon/src/backend.rs`'s `ingest`/`ingest_replacing`) with nothing above it to bound or cancel the wait; a second import of the same target now gets `ControlError::Timeout` (wire `ErrorCode::Timeout`, see `docs/v1-daemon.md`) instead of hanging past the deadline.
 Not covered: `rename_snapshot`, `remove_snapshot` and `fork_snapshot` do not take it, so renaming or removing the target while a promote or import of it runs still races (issue 315).
 Not covered: the lock is keyed by target name, while two targets whose staging hashes collide share one staging snapshot (a 64-bit FNV collision; `clear_leftover` only guards the intent-file case).
-A waiter has no cancel hook, no timeout and no fairness (issue 316).
 Tests (`tests/swap_concurrent.rs`): `a_promote_during_a_replacing_import_of_the_same_target_does_not_break_the_import`, `two_replacing_imports_of_the_same_target_run_one_after_the_other`, `racing_promotes_of_one_target_leave_one_clean_result`.
+Test (`src/swap.rs`): `lock_target_timeout_gives_up_while_the_lock_is_held` holds the lock on one caller and asserts a second, bounded caller gets `Err` well before the deadline, not a hang.
 
 0. **The reference gate** (`src/gate.rs`) is outermost of the rules below.
    A thread enters it before it takes `SnapCtx::ns`, `SnapCtx::flush`, a node lock or meta's lock, and only while it may store a chunk or commit a chunk list: `flush_snapshot`, `barrier`, and `setattr` with a size.
@@ -458,7 +460,6 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `gate::waiting` | leaf | 1 |
 | `gate::drop` | leaf | 1 |
 | `gate::a_nested_enter_is_admitted_while_a_barrier_drains` | leaf | 1 |
-| `import::ingest_with` | target | 0 |
 | `inner::snapctx_id` | leaf | 1 |
 | `inner::all_snaps` | leaf | 1 |
 | `inner::take_reserved` | leaf | 1 |
@@ -546,11 +547,13 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `swap::recover` | last_error | leaf |
 | `swap::drop` | target | 0 |
 | `swap::lock_target` | target | 0 |
+| `swap::lock_target_timeout` | target | 0 |
 | `swap::swap_snapshot` | target, last_error | 0 then leaf |
 | `swap::stage_and_intent` | snap. | 3 |
 | `swap::parent_of` | snap. | 3 |
 | `swap::drop_intent` | last_error | leaf |
 | `swap::a_target_forked_from_the_staging_snapshot_is_kept_and_the_staging_snapshot_dropped` | snap. | 3 |
+| `swap::lock_target_timeout_gives_up_while_the_lock_is_held` | target | 0 |
 | `util::lk` | leaf | 1 |
 | `util::try_lk` | leaf | 1 |
 | `util::shard` | leaf | 1 |

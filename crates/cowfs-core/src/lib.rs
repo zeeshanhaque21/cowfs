@@ -81,6 +81,10 @@ pub enum ControlError {
     /// A handle is open in the snapshot.
     #[error("snapshot is busy: a file is open in it")]
     Busy,
+    /// A bounded wait for the target's per-target lock (issue 316) gave up: another swap or
+    /// ingest is still holding it.
+    #[error("timed out waiting for another swap or ingest of that name to finish")]
+    Timeout,
     /// A filesystem or storage error.
     #[error(transparent)]
     Fs(#[from] Error),

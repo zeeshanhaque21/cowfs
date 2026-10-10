@@ -486,6 +486,10 @@ fn ingest_error(e: cowfs_core::ImportError) -> CtlError {
             "that snapshot name is already taken".to_owned(),
         ),
         I::Core(E::InvalidName(why)) => CtlError::invalid(format!("invalid snapshot name: {why}")),
+        I::Core(E::Timeout) => CtlError::new(
+            ErrorCode::Timeout,
+            "timed out waiting for another swap or ingest of that name to finish".to_owned(),
+        ),
         I::Core(e) => CtlError::new(ErrorCode::IoError, e.to_string()),
     }
 }
@@ -496,6 +500,7 @@ fn control_io(e: cowfs_core::ControlError) -> io::Error {
         cowfs_core::ControlError::Exists => io::ErrorKind::AlreadyExists,
         cowfs_core::ControlError::NotFound => io::ErrorKind::NotFound,
         cowfs_core::ControlError::Busy => io::ErrorKind::WouldBlock,
+        cowfs_core::ControlError::Timeout => io::ErrorKind::TimedOut,
         cowfs_core::ControlError::Fs(e) => match e {
             cowfs_vfs::Error::NotFound => io::ErrorKind::NotFound,
             cowfs_vfs::Error::Exists => io::ErrorKind::AlreadyExists,

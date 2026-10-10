@@ -169,6 +169,18 @@ already stored, and the report's `stored_bytes` says so (0 for a repeat of ident
   staging snapshot, it runs afterwards and gets `already_exists` from `check_new_name`. Across
   processes it is stronger still: the store holds an exclusive `flock` on its `LOCK` file, so a
   second daemon on the same store refuses to open it.
+  Inside that call, `ingest_with` (`crates/cowfs-core/src/import.rs`) also takes the core's own
+  per-target lock (`Core::lock_target_timeout`, `issue 316`) before writing, bounded to
+  `DEFAULT_LOCK_WAIT` (30s): a second request for the same target that is still waiting when the
+  deadline passes gets `ControlError::Timeout` (wire `ErrorCode::Timeout`) rather than blocking
+  forever. In this backend the `CoreSlot` mutex above it already fully serializes `import`
+  requests end to end (same name or not), so that mutex's own wait is the one actually queuing a
+  second request today, and it has no timeout or cancel of its own; the per-target bound exists so
+  the core's own entry point is never the uncancellable one, and so a caller of `cowfs-core`
+  outside this daemon (or a future backend that releases `CoreSlot` earlier) is already covered.
+  `promote_base` keeps the unbounded `Core::lock_target`: it only runs under the daemon's own
+  `HolderGuard`/`bases.exclusive` locks, so giving up partway through an atomic base swap would be
+  worse than the wait.
 - `base_refresh` publishes tree-natively (issue 123).
   The daemon checks the ref out into a staging worktree it chose, ingests that through `Core::ingest` (or `ingest_replacing` when the name is taken), then promotes the base and persists its provenance.
   The new tree is staged under the core's reserved hidden name and verified first, so a failed refresh leaves the old tree alone and no user-visible residue.
