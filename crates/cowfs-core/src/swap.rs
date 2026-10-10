@@ -307,20 +307,23 @@ impl Drop for TargetGuard<'_> {
 }
 
 impl Core {
-    /// Serialises `swap_snapshot` (so `promote_base`) and `ingest_with` (so `ingest` and
-    /// `ingest_replacing`) on one target name: they share its staging name and intent file, and
-    /// each one's `clear_leftover`, `recover_target` and `drop_intent` would otherwise act on the
-    /// other's staging snapshot or intent (issue 300). Blocks until the other call is done, with
-    /// no cancel hook, timeout or fairness (issue 316).
-    ///
-    /// Not covered: `rename_snapshot`, `remove_snapshot` and `fork_snapshot` do not take it, so a
-    /// rename or remove of the target during a swap still races (issue 315). The key is the target
-    /// name, so two targets whose staging hashes collide are not serialised either.
+    /// Serialises `swap_snapshot` (so `promote_base`), `ingest_with` (so `ingest` and
+    /// `ingest_replacing`), `rename_snapshot`, `remove_snapshot` and `fork_snapshot` on one target
+    /// name: they share its staging name and intent file, and each one's `clear_leftover`,
+    /// `recover_target` and `drop_intent` would otherwise act on the other's staging snapshot or
+    /// intent, or rename/remove/fork a name out from under an in-flight swap or import (issue 300,
+    /// issue 315). Blocks until the other call is done, with no cancel hook, timeout or fairness
+    /// (issue 316). The key is the target name, so two targets whose staging hashes collide are not
+    /// serialised either.
     ///
     /// Lock order: the outermost lock, taken before the gate, `snaps`, any `SnapCtx` lock and
     /// meta's, and held across all of them (an import holds it for the whole ingest). Nothing in
-    /// this crate takes it while holding another lock of ours, and no call takes it twice, so it
-    /// cannot be part of a cycle. The set mutex is a leaf held only to insert or remove a name.
+    /// this crate takes it while holding another lock of ours. `rename_snapshot` is the only call
+    /// that takes it twice in one call, once for each of its two names (never the same name twice);
+    /// it always locks them in a fixed, value-sorted order, so a concurrent rename the other way
+    /// locks in the same order and cannot invert it into a deadlock. No other call takes it more
+    /// than once, so it cannot otherwise be part of a cycle. The set mutex is a leaf held only to
+    /// insert or remove a name.
     pub(crate) fn lock_target(&self, target: &str) -> TargetGuard<'_> {
         let (set, cv) = &self.inner.swap_targets;
         let mut held = set.lk();
@@ -1089,5 +1092,144 @@ mod tests {
         }
         let c = open_core(dir.path());
         assert!(has_f(&c, b"abc"), "the new tree is installed");
+    }
+
+    /// Holds the target lock on `name` for a while on a background thread, as `swap_snapshot` and
+    /// `ingest_with` do mid-swap, and signals `holding` once it is held. The caller must wait for
+    /// `holding` before racing another call against the same name, and join the returned handle.
+    fn hold_target_lock(
+        c: Core,
+        name: &'static str,
+        hold_for: std::time::Duration,
+        holding: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let _target = c.lock_target(name);
+            holding.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(hold_for);
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    }
+
+    fn wait_until(flag: &std::sync::atomic::AtomicBool) {
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Issue 315: before the fix, `rename_snapshot` took no lock at all, so it could rename a
+    /// target out from under an in-flight `swap_snapshot`/`ingest_with` on that same name. This
+    /// pins a holder on the per-target lock (the same one those two take) and asserts the rename
+    /// only proceeds once the holder has released it.
+    #[test]
+    fn a_concurrent_rename_of_an_in_flight_target_is_blocked_by_the_per_target_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_core(dir.path());
+        c.create_snapshot("base").unwrap();
+        let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = hold_target_lock(
+            c.clone(),
+            "base",
+            std::time::Duration::from_millis(200),
+            holding.clone(),
+            released.clone(),
+        );
+        wait_until(&holding);
+        c.rename_snapshot("base", "renamed").unwrap();
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "rename_snapshot raced the in-flight holder of the target lock on \"base\""
+        );
+        holder.join().unwrap();
+    }
+
+    /// Issue 315: same gap as the rename test above, for `remove_snapshot`.
+    #[test]
+    fn a_concurrent_remove_of_an_in_flight_target_is_blocked_by_the_per_target_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_core(dir.path());
+        c.create_snapshot("base").unwrap();
+        let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = hold_target_lock(
+            c.clone(),
+            "base",
+            std::time::Duration::from_millis(200),
+            holding.clone(),
+            released.clone(),
+        );
+        wait_until(&holding);
+        c.remove_snapshot("base").unwrap();
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "remove_snapshot raced the in-flight holder of the target lock on \"base\""
+        );
+        holder.join().unwrap();
+    }
+
+    /// Issue 315: same gap as the rename test above, for `fork_snapshot`'s destination name.
+    #[test]
+    fn a_concurrent_fork_into_an_in_flight_target_is_blocked_by_the_per_target_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_core(dir.path());
+        c.create_snapshot("src").unwrap();
+        c.create_snapshot("base").unwrap();
+        let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The target lock is keyed by name only, so forking into an unrelated but still-locked
+        // name ("base") is enough to exercise the gap without needing "base" to already exist as
+        // the destination.
+        c.remove_snapshot("base").unwrap();
+        let holder = hold_target_lock(
+            c.clone(),
+            "base",
+            std::time::Duration::from_millis(200),
+            holding.clone(),
+            released.clone(),
+        );
+        wait_until(&holding);
+        c.fork_snapshot("src", "base").unwrap();
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "fork_snapshot raced the in-flight holder of the target lock on \"base\""
+        );
+        holder.join().unwrap();
+    }
+
+    /// Issue 315: `rename_snapshot` locks both of its names, so two renames crossing in opposite
+    /// directions ("x" -> "y" and "y" -> "x") must lock them in the same fixed order or they can
+    /// deadlock (classic lock-order inversion). Bounded with a watchdog so a regression hangs this
+    /// test instead of the whole suite.
+    #[test]
+    fn a_two_name_rename_locks_in_a_fixed_order_and_never_deadlocks_with_the_reverse_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_core(dir.path());
+        c.create_snapshot("x").unwrap();
+        c.create_snapshot("y").unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (c1, c2, d1) = (c.clone(), c.clone(), done.clone());
+        let h1 = std::thread::spawn(move || {
+            // one direction may legitimately fail (whichever loses the race to rename "x" away
+            // first), only a hang is a bug
+            let _ = c1.rename_snapshot("x", "y_tmp");
+            d1.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let d2 = done.clone();
+        let h2 = std::thread::spawn(move || {
+            let _ = c2.rename_snapshot("y", "x_tmp");
+            d2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(h1.is_finished() && h2.is_finished()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "crossed renames deadlocked: lock order on the two target names was not consistent"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h1.join().unwrap();
+        h2.join().unwrap();
     }
 }

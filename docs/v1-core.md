@@ -403,15 +403,17 @@ One table, `error::from_meta` and `error::from_store`, tested case by case.
 There is ONE global order, and it is enforced by construction rather than by inspection:
 
 **Above rule 0: the per-target swap lock** (`Core::lock_target`, `src/swap.rs`) is the outermost lock of all.
-`swap_snapshot` (so `promote_base`) and `ingest_with` (so `ingest` and `ingest_replacing`) take it first and hold it to the end of the call, because they share one staging name and one intent file per target (issue 300).
+`swap_snapshot` (so `promote_base`), `ingest_with` (so `ingest` and `ingest_replacing`), `rename_snapshot`, `remove_snapshot` and `fork_snapshot` take it first and hold it to the end of the call, because they share one staging name and one intent file per target, or can otherwise claim, rename or remove the same name from under one another (issue 300, issue 315).
 A second call on the same target name waits; calls on other targets do not.
-It is taken only by those two entry points, never while holding another lock of ours, and never twice in one call, so it cannot be part of a cycle.
+It is taken only by those five entry points, never while holding another lock of ours.
+`rename_snapshot` is the only call that takes it twice in one call, once for each of its two names (never the same name twice); it always locks them in a fixed, value-sorted order, so a concurrent rename the other way locks in the same order and cannot invert it into a deadlock.
+No other call takes it more than once, so it cannot otherwise be part of a cycle.
 Its set mutex (`swap_targets`) is a leaf held only to insert or remove a name.
 Daemon locks (`HolderGuard`, `bases.exclusive`) are taken above it and are never taken by the core.
-Not covered: `rename_snapshot`, `remove_snapshot` and `fork_snapshot` do not take it, so renaming or removing the target while a promote or import of it runs still races (issue 315).
 Not covered: the lock is keyed by target name, while two targets whose staging hashes collide share one staging snapshot (a 64-bit FNV collision; `clear_leftover` only guards the intent-file case).
 A waiter has no cancel hook, no timeout and no fairness (issue 316).
 Tests (`tests/swap_concurrent.rs`): `a_promote_during_a_replacing_import_of_the_same_target_does_not_break_the_import`, `two_replacing_imports_of_the_same_target_run_one_after_the_other`, `racing_promotes_of_one_target_leave_one_clean_result`.
+Tests (`src/swap.rs`, issue 315): `a_concurrent_rename_of_an_in_flight_target_is_blocked_by_the_per_target_lock`, `a_concurrent_remove_of_an_in_flight_target_is_blocked_by_the_per_target_lock`, `a_concurrent_fork_into_an_in_flight_target_is_blocked_by_the_per_target_lock`, `a_two_name_rename_locks_in_a_fixed_order_and_never_deadlocks_with_the_reverse_rename`.
 
 0. **The reference gate** (`src/gate.rs`) is outermost of the rules below.
    A thread enters it before it takes `SnapCtx::ns`, `SnapCtx::flush`, a node lock or meta's lock, and only while it may store a chunk or commit a chunk list: `flush_snapshot`, `barrier`, and `setattr` with a size.
@@ -505,7 +507,9 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `io::op_removexattr` | sc.ns, st.wr | 1 then 2 |
 | `lib::shutdown` | leaf | 1 |
 | `lib::from_parts` | target, nodes, dents, aliases, handles, root_time, pressure, unsynced, last_error | 0 then 2 then leaf |
-| `lib::fork_snapshot` | snap. | 3 |
+| `lib::fork_snapshot` | target, snap. | 0 then 3 |
+| `lib::remove_snapshot` | target | 0 |
+| `lib::rename_snapshot` | target | 0 |
 | `lib::move_name` | root_time | leaf |
 | `lib::list_snapshots` | leaf | 1 |
 | `lib::merkle_root` | snap. | 3 |
@@ -551,6 +555,7 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `swap::parent_of` | snap. | 3 |
 | `swap::drop_intent` | last_error | leaf |
 | `swap::a_target_forked_from_the_staging_snapshot_is_kept_and_the_staging_snapshot_dropped` | snap. | 3 |
+| `swap::hold_target_lock` | target | 0 |
 | `util::lk` | leaf | 1 |
 | `util::try_lk` | leaf | 1 |
 | `util::shard` | leaf | 1 |
