@@ -20,10 +20,7 @@ test = os.environ.get("MUT_TEST", "power_core")
 filt = ["--", os.environ.get("MUT_FILTER", "power_cut_at_every")]
 
 HOOK = "        self.run_hook()?;\n        if !has_work {\n            return Ok(None);\n        }\n"
-INTENT_RM = (
-    "        if crate::fsops::remove_file(intent_path(&self.inner.root, target)).is_ok() {\n"
-    "            sync_dir(&self.inner.root);\n        }\n        entry.ok_or(ControlError::NotFound)"
-)
+DROP = "        self.drop_intent(target);\n        entry.ok_or(ControlError::NotFound)"
 
 
 def hook_after_commit(t):
@@ -38,15 +35,11 @@ def hook_after_commit(t):
 
 
 def intent_removed_before_rename(t):
-    """finish_swap removes (and syncs the removal of) the intent file before the rename."""
-    if INTENT_RM not in t or "        let mut entry = None;\n" not in t:
+    """finish_swap drops (and syncs the removal of) the intent file before the staging rename."""
+    if DROP not in t or "        let mut entry = None;\n" not in t:
         raise ValueError
-    t = t.replace(INTENT_RM, "        entry.ok_or(ControlError::NotFound)", 1)
-    early = (
-        "        if crate::fsops::remove_file(intent_path(&self.inner.root, target)).is_ok() {\n"
-        "            sync_dir(&self.inner.root);\n        }\n"
-    )
-    return t.replace("        let mut entry = None;\n", "        let mut entry = None;\n" + early, 1)
+    t = t.replace(DROP, "        entry.ok_or(ControlError::NotFound)", 1)
+    return t.replace("        let mut entry = None;\n", "        self.drop_intent(target);\n        let mut entry = None;\n", 1)
 
 
 def hook_skipped_for(kind):
@@ -73,8 +66,8 @@ M = [
      "    crate::fsops::sync_file(&f, &tmp).map_err(|e| io(&e.to_string()))?;\n", ""),
     ("I3 intent removed before the staging rename", "cowfs-core/src/swap.rs", intent_removed_before_rename, None),
     ("I4 intent removal not followed by a directory fsync", "cowfs-core/src/swap.rs",
-     "        if crate::fsops::remove_file(intent_path(&self.inner.root, target)).is_ok() {\n            sync_dir(&self.inner.root);\n        }\n        entry.ok_or",
-     "        let _ = crate::fsops::remove_file(intent_path(&self.inner.root, target));\n        entry.ok_or"),
+     "            Ok(()) => sync_dir(&self.inner.root),\n            // nothing to remove: a recovery that already dropped it",
+     "            Ok(()) => {}\n            // nothing to remove: a recovery that already dropped it"),
     # the store's own mutation 'W1 watermark before pack fsync' (tests/mutate.py), seen from Core
     ("W1 watermark raised before the pack fsync", "cowfs-store/src/store.rs",
      "            self.io.sync_file(&file, &pack::pack_path(&self.dir, id))?;\n            self.wm\n                .lock()\n                .unwrap_or_else(PoisonError::into_inner)\n                .advance(Mark { pack: id, len })?;",
@@ -89,6 +82,7 @@ if not os.path.exists(base):
     env = dict(os.environ, CARGO_TARGET_DIR=base)
     subprocess.run(["cargo", "test", "-j4", "--no-run", "-p", "cowfs-core", "--test", test], cwd=work, env=env, check=True, capture_output=True)
 out = open(f"{mut}/results.txt", "a")
+bad = []  # mutants that did not apply or compile: a stale pattern must not pass for a result
 for name, f, a, b in M:
     tag = name.split()[0]
     if only and tag not in only:
@@ -100,9 +94,9 @@ for name, f, a, b in M:
         try:
             mutated = a(t)
         except ValueError:
-            out.write(f"{name}: PATTERN NOT FOUND\n"); out.flush(); continue
+            out.write(f"{name}: FAILED-TO-APPLY (pattern not found)\n"); out.flush(); bad.append(tag); continue
     elif a not in t:
-        out.write(f"{name}: PATTERN NOT FOUND\n"); out.flush(); continue
+        out.write(f"{name}: FAILED-TO-APPLY (pattern not found)\n"); out.flush(); bad.append(tag); continue
     else:
         mutated = t.replace(a, b, 1)
     open(target, "w").write(mutated)
@@ -116,8 +110,9 @@ for name, f, a, b in M:
         failed = sorted(set(re.findall(r"^test (\S+) \.\.\. FAILED", txt, re.M)))
         if "could not compile" in txt:
             v = "COMPILE ERROR"
+            bad.append(tag)
         elif failed:
-            first = re.findall(r"FAIL (k=\S+ seed=\d+ op=[^:]*: .{0,160})", txt)
+            first = re.findall(r"FAIL (w=\d+ k=\S+ seed=\d+ op=[^:]*: .{0,160})", txt)
             v = "KILLED by " + ", ".join(failed[:4]) + (f"; first image: {first[0]}" if first else "")
         else:
             v = "SURVIVED"
@@ -127,3 +122,5 @@ for name, f, a, b in M:
     shutil.rmtree(tgt, ignore_errors=True)
     shutil.copy(f"{root}/crates/{f}", target)
 out.write("DONE\n"); out.close()
+if bad:
+    sys.exit(f"mutants not applied or not compiling: {bad} (see {mut}/results.txt)")

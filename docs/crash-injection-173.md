@@ -232,9 +232,16 @@ Workload, one thread, `background: false` for Core and for meta:
 - scripted: create, overwrite, rename and unlink files and fsync one; fork, remove and rename snapshots; a replacing `promote_base` (victim acknowledged, source with unsynced files) and a non-replacing one; a reclaiming `Collector::collect`; syncs;
 - seeded, in the spirit of `crash.rs`'s `step` (`COWFS_POWER_WORKLOADS` workloads, default 2): create, overwrite at an offset, truncate, rename over an existing name, unlink, fsync, fork and remove a fork, flush, on files of whichever snapshot is not under a swap check.
 
-Size: 280 to 410 store ops, about 190 metadata events, 14 root ops and 5 or 6 acknowledgements per workload, 5 seeds per cut, so about 3600 images and 60 s on the box with 4 threads.
+Size: 280 to 410 store ops, about 190 metadata events, 14 root ops and 5 or 6 acknowledgements per workload, 5 seeds per cut, so about 3600 to 4200 images.
+Timings of the sweep test (4 threads, 5 seeds per cut, 2 workloads), measured in the CI run of PR 310: 198 s on the macOS runner (negative control 89 s) and 90 s on ubuntu (negative control 41 s on the other shard); the cachyos box takes about 70 s.
+PR 299 saw 74 s on ubuntu and 212 s on macOS, so ubuntu runners vary by about 20 percent between runs.
+On a slow runner turn the knobs down: `COWFS_POWER_SEEDS` (images per cut, default 5), `COWFS_POWER_WORKLOADS` (default 2) and `COWFS_POWER_THREADS` (default 4).
+The fail-closed assert needs more than 1000 images, and a workload gives about (ops + 1) x seeds of them with 280 to 410 ops, so keep at least 1 workload with 5 seeds or 2 workloads with 3 seeds; fewer can fail the assert without any bug.
+Only workload seeds 0 and 1 run in CI.
 The op count has two modes, which differ from the very first op: Core iterates a `HashMap` of snapshots with a per-process random seed, so the order in which it flushes two snapshots changes.
-A failing tag (`k=... seed=...`) is therefore not reproducible by number; the first failing images are kept on disk and their paths are in the message, and it opens with `Core::open`.
+A failing tag (`w=<workload> k=... seed=...`) is therefore not reproducible by number.
+What a failure keeps instead: the first four failing images, under `target/tmp/power_core` (`CARGO_TARGET_TMPDIR`), their paths in the `FAIL` lines, and `trace-w<workload>-<pid>.txt` next to them, the whole recorded timeline (every store op by the `k` of the tag, the root ops with their position, the acknowledgements), which is also printed to stderr after the `FAIL` lines so the CI log carries it (nothing uploads the directory).
+An image opens with `Core::open`; the `k` of a tag names a line of the trace.
 The fail-closed asserts hold in both modes: 14 consecutive runs at 2 seeds per cut all passed, with 355 to 412 ops.
 
 Each image is reopened with the shipped `Core::open` and must:
@@ -275,7 +282,7 @@ Mutants (`python3 crates/cowfs-core/tests/mutate_power.py`; the sweep test alone
 | I1 | intent file: no root directory fsync after its rename | killed: `durable snapshot "base" is missing` |
 | I2 | intent file: no fsync of its data before the rename | SURVIVED, equivalent by design (see notes): acceptance item not met |
 | I3 | `finish_swap` removes the intent file (and syncs the removal) before the staging rename | killed: `durable snapshot "base" is missing` |
-| I4 | no root directory fsync after the intent removal | SURVIVED, equivalent: a resurrected intent is finished again |
+| I4 | no root directory fsync after the intent removal | SURVIVED, equivalent: a resurrected intent is finished again, also after user operations on the target (see notes) |
 | W1 | the store raises its watermark before the pack fsync (`sync_capture`) | killed at Core level: store lost durable data on reopen |
 
 Notes on the results:
@@ -289,7 +296,9 @@ Notes on the results:
   `recover_intent` handles an intent file that is cut short, empty or missing its newline, by taking the staging name from the file name and rolling forward when the target is gone.
   The evidence that the path runs: with I2 applied, 223 of 1440 images held a torn intent file, and every one recovered.
   The fsync is defence in depth against a record that is wrong but looks whole, which needs media corruption, as the comment in `swap.rs` says.
-- I4 (no directory fsync after the intent removal) survives for a similar reason: a resurrected intent is finished again, idempotently.
+- I4 (no directory fsync after the intent removal) survives, and is equivalent: a resurrected intent is finished again, idempotently.
+  The workload uses a swap target after its swap (a write and a rename in `base`; a write, an unlink and then the removal of `fresh`, all before anything syncs the root directory again), so an intent that comes back meets those user operations.
+  With I4 applied, 513 of 2400 and 386 of 1860 images (workloads 0 and 1) opened with an intent file whose unlink had completed before the cut (the test counts these as `resurrected`; it only prints the count, and the structural guard `post_swap_guard` is what fails if the post-swap operations are removed from the workload), against 5 and 6 without the mutant, and every one recovered: the target exists, the staging snapshot does not, so `finish_swap` only drops the intent; where the user removed the target, neither tree exists and recovery reports it and drops the intent.
 - A mutant that raises the store's watermark before the pack fsync (W1) is killed at Core level; before this slice only the store crate saw it.
 
 Not modelled, and what covers it instead:

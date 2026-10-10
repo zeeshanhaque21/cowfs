@@ -26,8 +26,9 @@
 //! What this does not model, on purpose: see `docs/crash-injection-173.md` (slice 5).
 //!
 //! `COWFS_POWER_SEEDS` sets the images per cut (default 5), `COWFS_POWER_WORKLOADS` the seeded
-//! workloads (default 2), `COWFS_POWER_THREADS` the workers. A failing image is kept on disk and
-//! its path is in the message; the op count of a run varies (see `docs/crash-injection-173.md`).
+//! workloads (default 2), `COWFS_POWER_THREADS` the workers. A failing image is kept under
+//! `target/tmp/power_core` and its path is in the message, next to `trace-w<seed>-<pid>.txt` (the
+//! timeline, also printed); the op count of a run varies (see `docs/crash-injection-173.md`).
 //! The older `crash.rs`, `durability.rs`, `ns_durability*.rs` and `kill9.rs` stay: they cut the
 //! store with a cruder rule or by killing a process, and see what a process crash can see.
 
@@ -553,8 +554,16 @@ fn record(hook: bool, wseed: u64) -> Run {
     w.sync();
 
     // non-replacing swap, then a rename of a snapshot, neither acknowledged until the end
+    // the swap targets are used after their swap: a resurrected intent (its removal not yet on
+    // disk) meets these user ops before anything syncs the root directory again (mutant I4)
+    w.put("base", "post", &data(7000, 11));
+    w.rename_file("base", "g", "g2");
     w.promote("s3", "fresh");
     w.sync();
+    w.put("fresh", "p1", &data(4000, 12));
+    w.unlink("fresh", "e");
+    w.core.flush().unwrap();
+    w.remove_snapshot("fresh");
     w.put("s3", "h", &data(9000, 10));
     w.core.flush().unwrap();
     w.rename_snapshot("s1", "s1r");
@@ -774,6 +783,8 @@ struct Tally {
     with_intent: u32,
     /// images whose intent file was not a whole record (an unsynced one cut short)
     torn_intent: u32,
+    /// images whose intent file is on disk although its unlink completed before the cut
+    resurrected: u32,
     /// swap targets that came back as the old tree, and as the new one
     old_tree: u32,
     new_tree: u32,
@@ -785,6 +796,7 @@ impl Tally {
         self.images += o.images;
         self.with_intent += o.with_intent;
         self.torn_intent += o.torn_intent;
+        self.resurrected += o.resurrected;
         self.old_tree += o.old_tree;
         self.new_tree += o.new_tree;
         self.failures.extend(o.failures);
@@ -798,6 +810,54 @@ fn same_tree(want: &Tree, got: &Tree, loose: &HashSet<String>) -> bool {
         && got
             .keys()
             .all(|p| want.contains_key(p) || loose.contains(p))
+}
+
+/// An intent file is on disk at open although its name was last unlinked at the root before the
+/// cut (not created or renamed to again since): the directory entry change never reached the disk,
+/// the case the swap's final directory fsync exists for.
+fn resurrected(run: &Run, k: usize, dir: &Path) -> bool {
+    let mut unlinked: BTreeSet<&str> = BTreeSet::new();
+    for (i, op) in run.rops.iter().enumerate() {
+        if run.root_at[i] >= k {
+            break;
+        }
+        match op {
+            RootOp::Create(n) => {
+                unlinked.remove(n.as_str());
+            }
+            RootOp::Rename(a, b) => {
+                unlinked.remove(a.as_str());
+                unlinked.remove(b.as_str());
+            }
+            RootOp::Unlink(n) => {
+                unlinked.insert(n);
+            }
+            _ => {}
+        }
+    }
+    unlinked.iter().any(|n| dir.join(n).exists())
+}
+
+/// The post-swap user operations are part of the recorded workload: some acknowledgement interval
+/// holds a swap together with writes and a rename in its target `base`, and the last interval holds
+/// writes, an unlink and the removal of the second target `fresh`. Without them the resurrected
+/// intent never meets a user operation and mutant I4 is untested; deleting them fails here.
+fn post_swap_guard(run: &Run) {
+    let touched = |s: &str, ps: &[&str]| {
+        run.acks.iter().any(|e| {
+            e.touched
+                .get(s)
+                .is_some_and(|t| ps.iter().all(|p| t.contains(*p)))
+        })
+    };
+    assert!(
+        touched("base", &["post", "g2"]),
+        "the workload no longer uses `base` after its swap"
+    );
+    assert!(
+        touched("fresh", &["p1", "e"]) && run.acks.iter().any(|e| e.may_vanish.contains("fresh")),
+        "the workload no longer uses and removes `fresh` after its swap"
+    );
 }
 
 fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
@@ -969,6 +1029,39 @@ fn brief(op: &LogOp) -> String {
 const KEEP_MAX: usize = 4;
 static KEPT: AtomicUsize = AtomicUsize::new(0);
 
+/// Where failure evidence goes: under the target dir, where a human can find it.
+fn scratch() -> std::path::PathBuf {
+    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join("power_core");
+    fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// The whole recorded timeline as text: every store op by index (the `k=` of a failing tag), the
+/// root ops with their position, the acknowledgements. A recorded run is not reproducible by seed
+/// (Core iterates a `HashMap`), so a failure keeps this next to the kept images; the cut `k` of a
+/// tag names a line here.
+fn trace(run: &Run) -> String {
+    let mut s = String::new();
+    for (k, op) in run.ops.iter().enumerate() {
+        s += &format!("{k}\t{}\n", brief(op));
+    }
+    for (i, op) in run.rops.iter().enumerate() {
+        s += &format!("root op {i} at store op {}: {op:?}\n", run.root_at[i]);
+    }
+    for (p, j) in &run.ack_at {
+        s += &format!("ack {j} at store op {p}\n");
+    }
+    s
+}
+
+/// Writes the trace of a failing workload; returns the text to print after the FAIL lines.
+fn dump_trace(run: &Run, wseed: u64) -> String {
+    let p = scratch().join(format!("trace-w{wseed}-{}.txt", std::process::id()));
+    let tr = trace(run);
+    fs::write(&p, &tr).unwrap();
+    format!("TRACE w={wseed} saved to {}\n{tr}", p.display())
+}
+
 fn build_image(run: &Run, k: usize, seed: u64, dir: &Path) {
     let mut rng = Rng(seed ^ ((k as u64) << 20) ^ 0x57A1);
     let img = crash_image(&run.store_base, &run.ops, k, &mut rng, seed % 4);
@@ -985,7 +1078,7 @@ fn build_image(run: &Run, k: usize, seed: u64, dir: &Path) {
 
 /// `keep` leaves the first failing images on disk (at most `KEEP_MAX`), for the sweep that must pass;
 /// the negative control fails by design and keeps nothing.
-fn sweep(run: &Run, seeds: u64, threads: usize, keep: bool) -> Tally {
+fn sweep(run: &Run, wseed: u64, seeds: u64, threads: usize, keep: bool) -> Tally {
     let total = Mutex::new(Tally::default());
     std::thread::scope(|sc| {
         for th in 0..threads {
@@ -1003,17 +1096,18 @@ fn sweep(run: &Run, seeds: u64, threads: usize, keep: bool) -> Tally {
                     let ex = &run.acks[j.min(run.acks.len() - 1)];
                     for seed in 0..seeds {
                         let tag = format!(
-                            "k={k}/{} seed={seed} op={}",
+                            "w={wseed} k={k}/{} seed={seed} op={}",
                             run.ops.len(),
                             run.ops.get(k).map_or_else(|| "(all done)".into(), brief)
                         );
                         let dir = tempfile::tempdir().unwrap();
                         build_image(run, k, seed, dir.path());
                         t.images += 1;
+                        t.resurrected += u32::from(resurrected(run, k, dir.path()));
                         if let Err(e) = verify(dir.path(), ex, &mut t) {
                             let kept = if keep && KEPT.fetch_add(1, Ordering::Relaxed) < KEEP_MAX {
                                 // `verify` writes into the image, so rebuild the cut image
-                                let d = tempfile::tempdir().unwrap().keep();
+                                let d = tempfile::tempdir_in(scratch()).unwrap().keep();
                                 build_image(run, k, seed, &d);
                                 format!(" image {}", d.display())
                             } else {
@@ -1032,7 +1126,7 @@ fn sweep(run: &Run, seeds: u64, threads: usize, keep: bool) -> Tally {
 
 fn report(run: &Run, t: &Tally) {
     println!(
-        "{} power-cut images over {} ops ({} root ops, {} metadata events, {} acks), {} with an intent file on disk ({} torn), swap targets old/new = {}/{}, gc unlinked {} packs",
+        "{} power-cut images over {} ops ({} root ops, {} metadata events, {} acks), {} with an intent file on disk ({} torn, {} resurrected after its unlink), swap targets old/new = {}/{}, gc unlinked {} packs",
         t.images,
         run.ops.len(),
         run.rops.len(),
@@ -1040,6 +1134,7 @@ fn report(run: &Run, t: &Tally) {
         run.ack_at.len() - 1,
         t.with_intent,
         t.torn_intent,
+        t.resurrected,
         t.old_tree,
         t.new_tree,
         run.gc_unlinked,
@@ -1049,6 +1144,7 @@ fn report(run: &Run, t: &Tally) {
 #[test]
 fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() {
     let mut all = Tally::default();
+    let mut traces = Vec::new();
     for wseed in 0..env("COWFS_POWER_WORKLOADS", 2) as u64 {
         let run = record(true, wseed);
         assert!(
@@ -1070,11 +1166,16 @@ fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() 
         );
         let t = sweep(
             &run,
+            wseed,
             env("COWFS_POWER_SEEDS", 5) as u64,
             env("COWFS_POWER_THREADS", 4),
             true,
         );
         report(&run, &t);
+        if !t.failures.is_empty() {
+            traces.push(dump_trace(&run, wseed));
+        }
+        post_swap_guard(&run);
         all.merge(t);
     }
     assert!(all.images > 1000);
@@ -1088,6 +1189,9 @@ fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() 
     );
     for f in all.failures.iter().take(8) {
         eprintln!("FAIL {f}");
+    }
+    for tr in &traces {
+        eprintln!("{tr}");
     }
     assert!(
         all.failures.is_empty(),
@@ -1187,6 +1291,7 @@ fn the_power_test_notices_a_missing_store_sync_before_metadata_commits() {
     let run = record(false, 0);
     let t = sweep(
         &run,
+        0,
         env("COWFS_POWER_SEEDS", 5) as u64,
         env("COWFS_POWER_THREADS", 4),
         false,
