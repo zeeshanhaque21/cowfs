@@ -1535,7 +1535,9 @@
           "title": "#211 PathVfs::mknod chmod follows symlinks + coverage gaps",
           "state": "active",
           "owner": "lead",
-          "status_note": "PR214 (chmod nofollow), PR250 (CAP_MKNOD probe, rdev model, exact-umask mknodat) and PR282 (persistent umask worker, sudo re-run of the root mknod test, capability probes) merged. PR303 open: the by-name fallback chmod (ACL parent or no private umask) now creates under a private temp name and chmods through an O_PATH fd; its critic found a predictable temp name (hard-link swap) and the builder is hardening it (random name, fstat identity check). Stray temp nodes after a crash: #307. Still unchecked: Core rdev model, ctime of fresh special nodes. Issue stays open."
+          "status_note": "PR214, PR250, PR282 and PR303 merged. PR303: the by-name fallback chmod (ACL parent or no private umask) now builds the node in a random 0700 scratch directory in the target directory, checks dev/ino and type through an O_PATH fd, chmods through the fd and renames out with RENAME_NOREPLACE; three critic rounds, no second-uid test (needs root). Linux only: mknodat is unsupported on macOS. Open: #307 (stray scratch directories after a crash, plus low findings A/B), Core rdev model and ctime of fresh special nodes unchecked. Issue stays open.",
+          "pr": "#303",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/303"
         },
         {
           "id": "254",
@@ -1640,10 +1642,12 @@
         {
           "id": "302",
           "title": "#302 power_core follow-ups from PR299 critic",
-          "state": "ready",
+          "state": "done",
           "owner": "lead",
-          "status_note": "Builder running: op trace on failure, post-swap target use (mutant I4), CI timings in docs/crash-injection-173.md.",
-          "issue": 302
+          "status_note": "PR310 merged: failing sweep writes and prints an op trace, workload uses base and fresh after their swaps with a structural guard, mutate_power.py exits non-zero on a stale pattern, I3/I4 patterns re-anchored to drop_intent, CI timings measured (sweep 198 s macOS, 90 s ubuntu). Mutant I4 still survives and is documented as equivalent (finish_swap just drops the intent). Issue closed.",
+          "issue": 302,
+          "pr": "#310",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/310"
         },
         {
           "id": "265",
@@ -1666,9 +1670,9 @@
         {
           "id": "286",
           "title": "#286 promote_base single-fork follow-ups",
-          "state": "active",
+          "state": "done",
           "owner": "lead",
-          "status_note": "PR296 merged (fault 6/7 seams, intent-removal errors reported, per-path fault table). PR298 open (replace-by-name closes the last promote window, D13): critic rounds 1 and 2 done, builder added commit-fault tests through move_name and a re-read rollback; CI red at head cf02145, being diagnosed. Related race: #300.",
+          "status_note": "PR280, PR296 (A) and PR298 (B, replace-by-name in one Meta commit, with rollback when a re-read proves the replace did not land) merged after three critic rounds. A commit that landed but returned Err keeps the intent and rolls forward on reopen. Missing: a daemon-level test of the original #124 case (#311). Race with import-replace: #300. Issue left open for Zee to close.",
           "issue": 286,
           "pr": "#298",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/298"
@@ -1714,17 +1718,17 @@
         {
           "id": "300",
           "title": "#300 swap: no per-target lock in core; import-replace can race swap",
-          "state": "pending",
+          "state": "active",
           "owner": "lead",
-          "status_note": "Open, found by the PR296 builder by code reading, not reproduced. Daemon swap vs swap is serialised; the replacing import holds neither lock across ingest.",
+          "status_note": "Builder running: reproduce first with a concurrent swap and replace on one target; fix with a per-target lock only if it reproduces.",
           "issue": 300
         },
         {
           "id": "301",
           "title": "#301 flaky read_atomic_across_chunk_boundary read-count floor",
-          "state": "active",
+          "state": "done",
           "owner": "lead",
-          "status_note": "PR306 open, CI green: the writer runs until the readers did MIN_READS, torn-read assertions unchanged; reproduced once under load, 72 loaded runs pass, a torn-read mutant dies in 0.46 s. Critic running.",
+          "status_note": "PR306 merged: the writer runs until the readers did MIN_READS, a drop guard ends the test if any thread panics, torn-read assertions unchanged. Reproduced once under load; 72 loaded runs passed; a torn-read mutant dies in 0.46 s; panic mutants end in about 1 to 2 s. Idle runtime about 23 s (the old test was cut at 8 s). Issue closed.",
           "issue": 301,
           "pr": "#306",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/306"
@@ -1734,7 +1738,7 @@
           "title": "#305 nfs: mount-time retry, rotate export path on rearm",
           "state": "pending",
           "owner": "lead",
-          "status_note": "Follow-ups from the PR304 critic (refs #262). PR279 (NULL-flood eviction) and PR304 (test-only pin of the residual, server fixes declined) merged. #262 stays open.",
+          "status_note": "Follow-ups from the PR304 critic (refs #262): bounded mount-time retry, rotate the export path on rearm, soften the 'ownerless socket' wording. PR279 (NULL-flood eviction) and PR304 (test-only pin of the residual; server fixes declined) merged. #262 stays open.",
           "issue": 305,
           "pr": "#304",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/304"
@@ -1744,8 +1748,26 @@
           "title": "#307 PathVfs::mknod stray temp nodes after a crash",
           "state": "pending",
           "owner": "lead",
-          "status_note": "Open, found by the PR303 critic.",
+          "status_note": "Open. Found by the PR303 critic: stray scratch directories/nodes after a crash. Low findings from the third critic: rmdir error can override a successful rename-out, getrandom has no EINTR retry, race test does not check leftovers.",
           "issue": 307
+        },
+        {
+          "id": "262",
+          "title": "#262 NFS hardening follow-ups (PR245 critic)",
+          "state": "active",
+          "owner": "lead",
+          "status_note": "PR279 merged (NULL-flood eviction keeps the served socket). PR304 merged: reproduced the residual with a real socket test (the kernel's pre-MNT socket looks like an attacker's pinged one, evicted at the cap), pinned it, and declined server fixes for the NULL flood and the first-MNT theft window with reasons. Follow-ups in #305. macOS real-mount suite not run (it hung for 10 minutes with no mount_nfs spawned). Issue stays open.",
+          "issue": 262,
+          "pr": "#304",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/304"
+        },
+        {
+          "id": "311",
+          "title": "#311 daemon test for a swap that returns Err while the tree ends up new",
+          "state": "pending",
+          "owner": "lead",
+          "status_note": "Open, from the PR298 critic: the original #124 case has no daemon-level test; needs a seam reachable from the daemon crate.",
+          "issue": 311
         }
       ]
     },
@@ -1991,5 +2013,5 @@
   "bar_history": [
     "2026-10-09 (Zee): gate changed from 'native APFS and ext4 (moonscape)' to 'native APFS plus a Linux native filesystem on cachyos'. The cachyos root is btrfs, so the Linux number is a btrfs number; an ext4 loop image under /mnt/docs may be added as a labelled proxy, not as the gate."
   ],
-  "update_20261009_evening": "Merged since the morning update: #273 #274 #275 #277 #278 #279 #280 #281 #282 #284 #285 #291 #292 #293 #294 #295 #296 #297 #299 #304 (#222 #271 #272 earlier). Open: #298 (CI red, being fixed), #303 (hardening after critic), #306 (critic running). Builders running: #302. Process: every PR gets a fresh-context critic before merge; MERGE-AFTER-FIXES goes back to the builder. Known tooling problem: treehouse return hangs inside the cowfs mount (#289 hypothesis), so leases 1 to 4 are left held."
+  "update_20261009_evening": "Merged since the morning update: #273 #274 #275 #277 #278 #279 #280 #281 #282 #284 #285 #291 #292 #293 #294 #295 #296 #297 #298 #299 #303 #304 #306 #308 #309 #310 (#222 #271 #272 earlier). No PR open at the time of writing. Builders running: #300. Process: every PR gets a fresh-context critic before merge; MERGE-AFTER-FIXES goes back to the builder, security-sensitive PRs get a fresh critic per round (#298 and #303 took three). Known tooling problem: treehouse return hangs inside the cowfs mount (#289 hypothesis), so leases 1 to 6 are left held."
 }
