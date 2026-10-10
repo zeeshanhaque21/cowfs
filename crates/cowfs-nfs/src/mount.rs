@@ -175,11 +175,11 @@ impl Server {
         // is in `mount_nfs`'s argv (visible to `ps` for the few ms to the first MNT) because
         // that is the only way to hand a source to it. A second token in the mount options
         // would sit in the same argv. Binding MNT to the child's pid or uid would not add
-        // much either: `mount_nfs` sends MNT from its own ordinary, owned socket (visible to
-        // `lsof`), so a uid check at MNT time only rules out another user, not a same-user
-        // racer. It is the *kernel's* NFS client socket, opened after the mount succeeds for
-        // the actual file traffic, that no process owns and `lsof` cannot see (`peer.rs`) -
-        // that socket is never involved in the MNT call itself. A racer who wins the first
+        // much either. The MNT is believed to come from `mount_nfs` itself, an ordinary
+        // process (this was not measured on a real mount here), so a uid check at MNT time
+        // would only rule out another user, not a same-user racer. What `peer.rs` documents as
+        // owned by no process and invisible to `lsof` is the kernel's NFS client socket used
+        // for the file traffic after the mount. A racer who wins the first
         // MNT can use the filesystem until `Mount::new` tears the server down after mount_nfs
         // fails. That is bounded by `command_timeout` (20 s by default); an observed value
         // was not measured.
