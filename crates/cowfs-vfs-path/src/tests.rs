@@ -914,3 +914,19 @@ fn setattr_mode_on_a_special_node_never_lands_on_a_swapped_in_symlink_target() {
         "the symlink target's mode changed"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_node_that_is_not_the_one_just_made_is_refused() {
+    let st = |mode, nlink| crate::sys::Stat {
+        mode,
+        nlink,
+        ..Default::default()
+    };
+    let fifo = libc::S_IFIFO;
+    assert!(crate::made_node(&st(fifo | 0o600, 1), fifo).is_ok());
+    // Another type swapped in at the temporary name, or a hard link onto a victim.
+    assert!(crate::made_node(&st(libc::S_IFREG | 0o600, 1), fifo).is_err());
+    assert!(crate::made_node(&st(libc::S_IFSOCK | 0o600, 1), fifo).is_err());
+    assert!(crate::made_node(&st(fifo | 0o600, 2), fifo).is_err());
+}

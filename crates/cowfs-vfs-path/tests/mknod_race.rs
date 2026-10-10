@@ -73,16 +73,28 @@ fn mknod_mode_never_lands_on_a_node_swapped_in() {
 /// anything created in it and `mknod` must chmod after `mknodat`. False when `setfacl` is missing
 /// or the filesystem has no ACL support.
 fn set_default_acl(dir: &std::path::Path) -> bool {
-    std::process::Command::new("setfacl")
+    let set = std::process::Command::new("setfacl")
         .args(["-d", "-m", "u::rwx,g::r-x,o::r-x"])
         .arg(dir)
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|s| s.success());
+    // In CI a missing setfacl must fail the run, not skip the one test that needs it.
+    assert!(
+        set || std::env::var_os("CI").is_none(),
+        "CI: setfacl is missing or the default ACL was refused"
+    );
+    // The ACL took effect only if getfacl lists it back.
+    set && std::process::Command::new("getfacl")
+        .arg(dir)
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("default:user::rwx"))
 }
 
 /// Runs `mknod` in a loop while a helper swaps `node` for a symlink to `victim` (mode 0o644) and
 /// for decoy sockets (mode 0o644). Returns the paths whose mode `mknod` changed.
 fn race(acl: bool) -> Option<Vec<std::path::PathBuf>> {
+    // The helper must have swapped plenty of nodes, or a green run proves nothing.
+    const MIN_SWAPS: u32 = 500;
     let root = std::env::temp_dir().join(format!(
         "cowfs-mknod-race-{}-{}",
         acl as u8,
@@ -122,6 +134,7 @@ fn race(acl: bool) -> Option<Vec<std::path::PathBuf>> {
                 std::fs::rename(&tmp, dir.join("node")).unwrap();
                 n += 1;
             }
+            n
         })
     };
     for _ in 0..20_000 {
@@ -131,7 +144,8 @@ fn race(acl: bool) -> Option<Vec<std::path::PathBuf>> {
         }
     }
     stop.store(true, Ordering::Relaxed);
-    helper.join().expect("helper");
+    let swaps = helper.join().expect("helper");
+    assert!(swaps >= MIN_SWAPS, "the helper swapped only {swaps} nodes");
     let hit = std::fs::read_dir(&side)
         .unwrap()
         .map(|e| e.unwrap().path())

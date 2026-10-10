@@ -688,8 +688,14 @@ fn mode_may_change(dir: std::os::fd::BorrowedFd<'_>, new_dir: bool) -> bool {
 }
 
 /// `mknodat` of `name` with exactly `mode`, for when the creation mode cannot be trusted. The node
-/// is made under a name nobody else knows, chmod'ed through a descriptor opened without following
-/// symlinks, then renamed to `name` without replacing anything (`EEXIST` if it exists).
+/// is made under a random 128-bit name, opened without following symlinks and checked to be the
+/// node just made (the requested type, one link), chmod'ed through that descriptor, then renamed
+/// to `name` without replacing anything (`EEXIST` if it exists).
+///
+/// Linux only, and it needs `/proc` (the descriptor chmod goes through `/proc/self/fd`) and a
+/// filesystem with `RENAME_NOREPLACE`; without those it fails with `ENOTSUP`, it does not fall
+/// back to a chmod by name. A crash between the `mknodat` and the rename leaves a stray
+/// `.cowfs-mknod-<hex>` node behind; nothing sweeps it (tracked in a follow-up issue).
 #[cfg(target_os = "linux")]
 fn mknod_private(
     dir: std::os::fd::BorrowedFd<'_>,
@@ -697,32 +703,47 @@ fn mknod_private(
     ty_mode: u32,
     rdev: u64,
 ) -> io::Result<()> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp = format!(
-        ".cowfs-mknod-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
+    use std::io::Read;
+    let mut rnd = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut rnd)?;
+    let tmp: String = rnd
+        .iter()
+        .fold(".cowfs-mknod-".into(), |s, b| s + &format!("{b:02x}"));
     let tmp = tmp.as_bytes();
-    sys::mknodat(dir, tmp, (ty_mode & !MODE_MASK) | 0o600, rdev)?;
+    let ty = ty_mode & !MODE_MASK;
+    sys::mknodat(dir, tmp, ty | 0o600, rdev)?;
     let done = sys::openat(dir, tmp, sys::OPEN_SPECIAL, 0)
-        .and_then(|fd| sys::chmod_fd(fd.as_fd(), ty_mode & MODE_MASK))
-        .and_then(|()| sys::renameat(dir, tmp, dir, name, true));
+        .and_then(|fd| {
+            let st = sys::fstat(fd.as_fd())?;
+            made_node(&st, ty)?;
+            sys::chmod_fd(fd.as_fd(), ty_mode & MODE_MASK)
+        })
+        .and_then(|()| sys::renameat(dir, tmp, dir, name, true))
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::EINVAL | libc::ENOSYS) => io::Error::from_raw_os_error(libc::ENOTSUP),
+            _ => e,
+        });
     if done.is_err() {
         let _ = sys::unlinkat(dir, tmp, false);
     }
     done
 }
 
+/// Whether `st` can be the node `mknod_private` just made: the requested file type and one link.
+/// Anything else was put at the temporary name by someone else.
+#[cfg(target_os = "linux")]
+fn made_node(st: &sys::Stat, ty: u32) -> io::Result<()> {
+    if st.mode & libc::S_IFMT == ty && st.nlink == 1 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    }
+}
+
+/// `mknodat` exists only on Linux, so `mknod` is unsupported elsewhere.
 #[cfg(not(target_os = "linux"))]
-fn mknod_private(
-    dir: std::os::fd::BorrowedFd<'_>,
-    name: &[u8],
-    ty_mode: u32,
-    rdev: u64,
-) -> io::Result<()> {
-    // Where `mknodat` exists but the descriptor chmod does not, nothing can be made exactly.
-    sys::mknodat(dir, name, ty_mode, rdev)
+fn mknod_private(_: std::os::fd::BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
 /// Whether this process may make device nodes under `dir`: a probe `mknod` of a character

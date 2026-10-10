@@ -28,7 +28,7 @@ fn cvt_size(r: isize) -> io::Result<usize> {
 }
 
 /// The fields of `struct stat` the crate uses, widened to fixed types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stat {
     pub dev: u64,
     pub ino: u64,
@@ -226,11 +226,6 @@ pub fn mknodat(dir: BorrowedFd<'_>, name: &[u8], mode: u32, rdev: u64) -> io::Re
         )
     })?;
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn mknodat(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
-    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
 /// What is known of `unshare(CLONE_FS)` here: `true` once it worked, `false` once refused for good.
