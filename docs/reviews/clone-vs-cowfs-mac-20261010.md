@@ -69,4 +69,77 @@ C,R2,8,564.63,5,187438648,rc=101 load1=3.86 edit=cowfs-core logical=6067796280 s
 C,R2rerun,start,0.00,,187437352,load1=3.40 logical=6067796280 stored=2073995138
 C,R2rerun,8,184.72,4,187361108,rc=0 load1=3.32 diagnostic rerun after failure logical=6300965305 stored=2150533480
 C,R2rerun,end,0.00,,187361468,load1=3.08 logical=6300965305 stored=2150533480
+A,R3,start,0.00,,187361192,load1=3.89
+A,R3,1,9.48,7,187879060,rc=0 load1=7.44 edit=cowfs-store
+A,R3,2,9.44,7,188398780,rc=0 load1=7.72 edit=cowfs-store
+A,R3,3,9.40,7,188914612,rc=0 load1=13.47 edit=cowfs-store
+A,R3,4,9.49,7,189431488,rc=0 load1=14.61 edit=cowfs-store
+A,R3,5,9.62,7,189954380,rc=0 load1=17.77 edit=cowfs-store
+A,R3,6,9.85,7,190472720,rc=0 load1=20.39 edit=cowfs-store
+A,R3,7,9.66,7,190988944,rc=0 load1=18.11 edit=cowfs-store
+A,R3,8,9.43,7,191507548,rc=0 load1=16.21 edit=cowfs-store
+A,R3,end,0.00,,191507404,load1=12.40
+B,R3,start,0.00,,191507420,load1=10.88
+B,R3,1,11.15,7,189135116,rc=0 load1=12.21 edit=cowfs-store
+B,R3,2,11.12,7,186695060,rc=0 load1=21.38 edit=cowfs-store
+B,R3,3,10.42,7,184498920,rc=0 load1=22.15 edit=cowfs-store
+B,R3,4,10.98,7,182055644,rc=0 load1=22.68 edit=cowfs-store
+B,R3,5,11.28,7,179878416,rc=0 load1=25.15 edit=cowfs-store
+B,R3,6,10.84,7,177717564,rc=0 load1=23.77 edit=cowfs-store
+B,R3,7,11.29,7,175565456,rc=0 load1=20.55 edit=cowfs-store
+B,R3,8,10.46,7,174326372,rc=0 load1=20.65 edit=cowfs-store
+B,R3,end,0.00,,174324432,load1=15.20
+C,R3,start,0.00,,174334608,load1=13.17 logical=6300965305 stored=2150533480
+C,R3,1,1238.00,7,173894720,rc=? (no error lines; Executable lines present) stall-rule false positive: driver exited at 18:00 while rustc still progressing; build completed on its own; seconds from ps etime start (+-1s) to log mtime; df/status taken after completion logical=7529983450 stored=2602099876
+A,R4,start,0.00,,173879112,load1=3.29
+A,R4clean,1,7.78,,179648300,rc=0 load1=4.15
+A,R4,1,18.00,113,175701980,rc=0 load1=20.82
+A,R4clean,2,7.81,,181472104,rc=0 load1=14.69
+A,R4,2,16.69,113,177531152,rc=0 load1=21.80
+A,R4clean,3,7.71,,183299900,rc=0 load1=15.66
+A,R4,3,16.29,113,179354760,rc=0 load1=23.21
+A,R4clean,4,7.88,,185125448,rc=0 load1=15.32
+A,R4,4,16.50,113,181189480,rc=0 load1=20.61
+A,R4,end,0.00,,181189444,load1=15.33
+B,R4,start,0.00,,181189292,load1=13.36
+B,R4clean,1,6.30,,183664024,rc=0 load1=11.07
+B,R4,1,16.57,113,179728084,rc=0 load1=19.92
+B,R4clean,2,5.94,,182333988,rc=0 load1=13.99
+B,R4,2,16.39,113,178386520,rc=0 load1=22.94
+B,R4clean,3,5.95,,180949412,rc=0 load1=14.80
+B,R4,3,16.24,113,177003568,rc=0 load1=24.35
+B,R4clean,4,5.57,,179478652,rc=0 load1=17.39
+B,R4,4,17.63,113,175542904,rc=0 load1=21.11
+B,R4,end,0.00,,175542856,load1=15.97
+A,R6,start,0.00,,175542708,load1=13.91
+A,R6,1,2.32,3,175525500,"rc=0 PASS results=[('ok', '7', '0'), ('ok', '0', '0')]"
+A,R6,2,2.14,3,175511116,"rc=0 PASS results=[('ok', '7', '0'), ('ok', '0', '0')]"
+A,R6,3,2.14,3,175493972,"rc=0 PASS results=[('ok', '7', '0'), ('ok', '0', '0')]"
+A,R6,end,0.00,,175493932,load1=7.61
+B,R6,start,0.00,,175492976,load1=6.60
+B,R6,1,2.14,3,175475816,"rc=0 PASS results=[('ok', '7', '0'), ('ok', '0', '0')]"
+B,R6,2,2.00,3,175461316,"rc=0 PASS results=[('ok', '7', '0'), ('ok', '0', '0')]"
+B,R6,3,2.01,3,175444272,"rc=0 PASS results=[('ok', '7', '0'), ('ok', '0', '0')]"
+B,R6,end,0.00,,175438608,load1=4.34
+A,R1,start,0.00,,175435504,load1=4.12
+A,R1,9,22.09,,170676872,rc=0 load1=3.40
+A,R1,end,0.00,,170677812,load1=3.27
+A,R5diag,start,0.00,,170677528,load1=2.92
+A,R5diag,9,17.59,74,169149964,rc=0 load1=9.86 no-edit fingerprint diag
+A,R5diag,end,0.00,,169162524,load1=7.90
+A,R1,start,0.00,,169145232,load1=5.83
+A,R1,12,22.33,,164356500,rc=0 load1=4.92
+A,R1,end,0.00,,164356440,load1=5.29
+A,R5diag,start,0.00,,164354976,load1=5.18
+A,R5diag,12,17.88,74,162813060,rc=0 load1=8.32 no-edit diag -v
+A,R5diag,end,0.00,,162813344,load1=6.53
+base,R5remap-base,base,20.07,113,158899572,rc=0 base rebuilt with identical REMAP_FLAGS
+A,R1,start,0.00,,158900640,load1=6.92
+A,R1,10,33.61,,149451140,rc=0 load1=4.52
+A,R1,11,35.14,,140070416,rc=0 load1=3.75
+A,R1,end,0.00,,140070448,load1=3.40
+A,R2remap,start,0.00,,140069500,load1=3.19
+A,R2remap,10,20.90,76,140200360,rc=0 load1=12.71 edit=cowfs-treehouse
+A,R2remap,11,20.18,76,140338252,rc=0 load1=17.06 edit=cowfs-daemon
+A,R2remap,end,0.00,,140320676,load1=12.75
 ```
