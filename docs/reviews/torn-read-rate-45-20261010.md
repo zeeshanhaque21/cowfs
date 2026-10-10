@@ -3,11 +3,11 @@
 Date: 2026-10-10.
 Machine: cachyos box, Linux 7.2.8-2-cachyos, 16 CPUs, native arm on the btrfs volume at /mnt/docs (nvme0n1p3).
 Repo head measured: 65a5519.
-Scratch directory /mnt/docs/Projects/cowfs-torn-measure, deleted after the run; no mount or process left behind (checked with `mount` and `pgrep`).
+Scratch directory /mnt/docs/Projects/cowfs-torn-measure, deleted after each session (main series, then the staggered rerun); no mount or process left behind (checked with `mount` and `pgrep`).
 
 ## Question
 
-Earlier work (PR 249, PR 281) showed cached reads tear on tmpfs, btrfs and ext4, and that O_DIRECT readers of a cowfs mount saw 0 tears in about 78M reads.
+Earlier work (PR 249, PR 281) showed cached reads tear on tmpfs, btrfs and ext4, and that O_DIRECT readers of a cowfs mount saw 0 tears in about 78M reads (the tracker figure; the PR 249 mount in coherence.rs uses `file_flush_bytes` of 4096, not this run's mount).
 It never measured whether the tear rate with ordinary cached reads is higher on a cowfs FUSE mount than on the native disk.
 This note measures that, and decides whether to force direct I/O.
 
@@ -17,14 +17,15 @@ Workload: the shape of `crates/cowfs-fuse/tests/coherence.rs`, rewritten as a sm
 3 writers `pwrite` 4096-byte uniform buffers, 3 readers `pread` the same ranges with ordinary buffered reads (no O_DIRECT), 10 s per run, 1 MiB file prefilled with byte 1.
 Slot for iteration i of thread t is `(i*7+t) % nslots`, value `t*60 + i%50 + 2`, as in coherence.rs.
 A read is torn when its 4096 bytes are not all equal.
-After the writers stop, every slot is read again at rest; all 45 runs had 0 torn slots at rest.
+After the writers stop, every slot is read again at rest; all 60 runs had 0 torn slots at rest.
 
 Three write patterns:
 
 - `aligned`: 16 slots at `s*4096` (the coherence.rs pattern).
 - `cross4k`: 16 slots at `s*4096 + 2048`, so every write and read crosses a 4 KiB page boundary.
 - `crosschunk`: 3 slots at `c*256KiB - 2048` for c = 1..3, so every write crosses a cowfs chunk boundary.
-  The real chunker (`cowfs_store::chunks`) cuts this file at exactly 256, 512, 768 and 1024 KiB, prefilled and with each tested write value in the straddling slots (checked with a scratch program, text below).
+  The real chunker (`cowfs_store::chunks`) cuts the prefilled file at exactly 256, 512, 768 and 1024 KiB, and still does with each of 5 sample values (2, 62, 122, 51, 200) written into all 3 straddling slots (scratch program, text below).
+  The workload writes up to 150 distinct values and different slots hold different values at once; those images were not checked.
 
 Arms, alternated by rotating the order every rep:
 
@@ -33,8 +34,10 @@ Arms, alternated by rotating the order every rep:
    Fresh store and mount per run.
 3. `paced` (supplementary control): native btrfs with each writer paced by `clock_nanosleep` absolute deadlines to the cowfs arm's per-writer write rate from a pilot (9400, 8800 and 8000 writes/s for the three patterns).
    Added because the cowfs arm writes about 15x slower than native, so tears per read on its own mostly measures write speed.
+   In this series all three paced writers shared one deadline clock, so they fired in phase.
+4. `paced_staggered` (rerun after the main series, not interleaved with it): the same paced arm with writer t's first deadline offset by t/3 of a period, to rule out the in-phase confound.
 
-5 reps per arm per pattern, 45 runs, every run reported below, none dropped.
+5 reps per arm per pattern: 45 runs in the main series plus 15 staggered runs, every run reported below, none dropped.
 Machine quiet: CPU idle 91 to 97 percent over 2 s before each run (37 of 45 samples at 96).
 About six unrelated `cowfs` daemons from other work were running at 5 to 10 percent of one CPU each; they were left alone.
 
@@ -56,23 +59,33 @@ Cells are tears / reads = tears per million reads.
 
 Reading the table:
 
-- Same workload, cowfs against native btrfs: the cowfs mount tears about 10x less often per million reads in every pattern (87.9 against 948.3, 128.5 against 1841.3, 900.2 against 126810.8 at the median).
+Staggered paced rerun (writers offset by t/3 of a period), same cell format:
+
+| Pattern | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Median | Min to max | Median reads | Writes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| aligned | 709 / 84.9M = 8.4 | 805 / 84.4M = 9.5 | 963 / 76.8M = 12.5 | 1034 / 75.8M = 13.6 | 804 / 76.1M = 10.6 | 10.6 | 8.4 to 13.6 | 76.8M | 282K |
+| cross4k | 558 / 79.0M = 7.1 | 898 / 79.1M = 11.4 | 554 / 71.0M = 7.8 | 561 / 70.6M = 7.9 | 583 / 71.1M = 8.2 | 7.9 | 7.1 to 11.4 | 71.1M | 264K |
+| crosschunk | 716101 / 68.1M = 10522.1 | 755340 / 67.7M = 11149.2 | 699285 / 61.7M = 11331.9 | 738332 / 62.0M = 11916.9 | 703650 / 61.0M = 11534.5 | 11331.9 | 10522.1 to 11916.9 | 62.0M | 240K |
+
+- Same workload, cowfs against native btrfs: the cowfs mount tears less often per million reads in every pattern, by about 11x for `aligned` (87.9 against 948.3), 14x for `cross4k` (128.5 against 1841.3) and 141x for `crosschunk` (900.2 against 126810.8), at the median.
   The spreads do not overlap in any pattern.
   The main reason is that cowfs writes are about 15x slower, so there are far fewer write windows for a reader to land in.
-- Matched write rate (paced control): for `aligned` and `cross4k` the cowfs mount tears about 7x and 10x more per million reads than paced btrfs (87.9 against 12.2, 128.5 against 13.4), with non-overlapping spreads and similar read counts (83.6M and 66.2M against 80.0M and 75.2M).
-  So each FUSE write leaves a wider tear window in the page cache than a btrfs write does.
+- Matched write rate (paced control): for `aligned` and `cross4k` the cowfs mount tears about 7x and 10x more per million reads than in-phase paced btrfs (87.9 against 12.2, 128.5 against 13.4), and about 8x and 16x more than staggered paced btrfs (against 10.6 and 7.9), with non-overlapping spreads and similar read counts.
+  Staggering the writers did not raise the paced rate, so the in-phase deadlines do not explain the gap.
+  Inference, not instrumented: each FUSE write leaves a wider tear window in the page cache than a btrfs write does.
   The paced arm did about 8 percent more writes than cowfs for `aligned`, which would push its rate up, not down.
-- For `crosschunk` the order flips: paced btrfs tears about 12x more than cowfs (11215.0 against 900.2).
-  Only 3 slots and writers on identical deadlines make this pattern far more contended than the others, so compare it only within the pattern, not against `cross4k`.
+- For `crosschunk` the order flips: paced btrfs tears about 12x more than cowfs (11215.0 in phase, 11331.9 staggered, against 900.2), so phase is not the cause there either.
+  Only 3 slots make this pattern far more contended than the others, so compare it only within the pattern, not against `cross4k`.
+  Hypothesis, not checked: the 256 KiB offsets are also likely large-folio boundaries in the btrfs page cache, so a native write there updates two folios in separate steps, while a 4 KiB-crossing write inside one large folio does not; native btrfs shows about 3 tears per write in this pattern.
 - Crossing a cowfs chunk boundary does not raise the cowfs rate relative to native in any arm.
-- At rest, 0 torn slots in all 45 runs, on both filesystems.
+- At rest, 0 torn slots in all 60 runs, on both filesystems.
 
 ## Verdict
 
-With the same unthrottled workload, cached reads tear about 10x less often per million reads on a cowfs FUSE mount than on native btrfs, in all three patterns; but at a matched write rate, which is closer to an application whose write rate is set by itself and not by the filesystem, cowfs tears 7x to 10x more for page-aligned and page-crossing writes (about 90 to 130 per million reads against about 12 to 13).
-Do not force direct I/O (FOPEN_DIRECT_IO): the tear exists on the native disk too, so no application can rely on buffered-read atomicity on Linux either way, and forcing direct I/O would make cowfs stricter than the native filesystems at the cost of the page cache, shared mmap and throughput, to shrink a rate from tens to zero per million reads rather than to fix a cowfs fault.
+With the same unthrottled workload, cached reads tear less often per million reads on a cowfs FUSE mount than on native btrfs (11x, 14x and 141x less for the three patterns); but at a matched write rate, which is closer to an application whose write rate is set by itself and not by the filesystem, cowfs tears about 7x to 16x more for page-aligned and page-crossing writes (about 90 to 130 per million reads against about 8 to 13), and still about 12x less for the chunk-crossing pattern.
+Do not force direct I/O (FOPEN_DIRECT_IO): the tear exists on the native disk too, so no application can rely on buffered-read atomicity on Linux either way, and forcing direct I/O would make cowfs stricter than the native filesystems at the cost of the page cache, shared mmap and throughput, to bring a rate of roughly 90 to 900 per million reads to zero rather than to fix a cowfs fault.
 
-The higher per-write rate is still a page-cache tear: O_DIRECT readers through the same mount saw 0 tears in earlier work, and the daemon serves each READ atomically.
+The higher per-write rate is still a page-cache tear: O_DIRECT readers saw 0 tears through the PR 249 coherence.rs mount (a `Core` with `file_flush_bytes` 4096), which shows the daemon serves each READ atomically; O_DIRECT was not rerun against this run's default-options mount.
 Its mechanism in the kernel FUSE write path was not investigated here; if it matters, that is the next measurement, not a direct I/O switch.
 
 ## Not verified
@@ -80,15 +93,17 @@ Its mechanism in the kernel FUSE write path was not investigated here; if it mat
 - Whether the straddling block was actually split across two stored chunks during a run.
   With a 1 MiB file and the default 4 MiB `file_flush_bytes`, writes may sit in the dirty overlay until the background flusher runs; buffered reads are served from the page cache either way.
 - The kernel mechanism behind the wider per-write window on FUSE (for example page locking across the WRITE round trip, or uptodate clearing); not instrumented.
-- The crosschunk inversion in the paced arm is reported, not explained.
+- The crosschunk inversion in the paced arms is reported, not explained; the large-folio explanation above is a hypothesis.
+- The staggered paced rerun ran after the main series, not interleaved with the other arms.
 - One machine, one kernel (7.2.8), btrfs only for the native arm; ext4, tmpfs and XFS were not rerun.
 - The cowfs arm mounts a `Core` snapshot view through `cowfs_fuse::Mount` with the daemon's default options, not through the full `cowfs serve` daemon.
 - The paced rates come from the pilot, so the paced arm matches the cowfs arm's write rate to within about 8 percent, not exactly.
 
 ## Driver text
 
-All four files lived only in the scratch directory and were deleted with it.
+All files lived only in the scratch directory and were deleted with it.
 `coremount.rs` and `cuts.rs` were dropped into `crates/cowfs-fuse/examples/` and `crates/cowfs-store/examples/` of a scratch clone and built with `cargo build --release`; no production crate changed.
+`tear.c` below is the final version; the main series ran without the `stagger` block (the first `if (rate)` in `writer`), which was added for the staggered rerun only.
 
 ### `tear.c`
 
@@ -115,7 +130,8 @@ static long slots[16];
 static int nslots;
 static atomic_int stop;
 static atomic_long reads, writes, tears;
-static long rate;  // writes per second per writer, 0 = unpaced
+static long rate;
+static int nwriters;  // writes per second per writer, 0 = unpaced
 
 static int xopen(int fl) {
   int fd = open(path, fl);
@@ -129,6 +145,10 @@ static void *writer(void *a) {
   char buf[LEN];
   struct timespec next;
   clock_gettime(CLOCK_MONOTONIC, &next);
+  if (rate) {  // stagger writers by t/W of a period so paced writers do not fire in phase
+    next.tv_nsec += (1000000000L / rate) * t / nwriters;
+    if (next.tv_nsec >= 1000000000L) { next.tv_sec++; next.tv_nsec -= 1000000000L; }
+  }
   for (long i = 0; !atomic_load_explicit(&stop, memory_order_relaxed); i++) {
     if (rate) {  // absolute deadlines, so a late write does not push every later one back
       next.tv_nsec += 1000000000L / rate;
@@ -165,6 +185,7 @@ int main(int argc, char **argv) {
   const char *pat = argv[2];
   int secs = atoi(argv[3]), W = argc > 4 ? atoi(argv[4]) : 3, R = argc > 5 ? atoi(argv[5]) : 3;
   rate = argc > 6 ? atol(argv[6]) : 0;
+  nwriters = W;
   prctl(PR_SET_TIMERSLACK, 1UL);
   if (!strcmp(pat, "aligned")) { nslots = 16; for (int s = 0; s < 16; s++) slots[s] = s * 4096L; }
   else if (!strcmp(pat, "cross4k")) { nslots = 16; for (int s = 0; s < 16; s++) slots[s] = s * 4096L + 2048; }
@@ -254,6 +275,19 @@ for rep in $REPS; do
       $a $rep $p
     done
   done
+done
+```
+
+### `paced2.sh`
+
+```bash
+#!/bin/bash
+# Scratch only: paced native arm rerun with writers staggered by t/3 of a period. usage: paced2.sh <rep>
+D=/mnt/docs/Projects/cowfs-torn-measure
+for p in aligned cross4k crosschunk; do
+  case $p in aligned) r=9400;; cross4k) r=8800;; crosschunk) r=8000;; esac
+  sleep 3
+  echo "ARM=paced_staggered rep=$1 $(timeout 70 $D/tear $D/native/f $p 10 3 3 $r)"
 done
 ```
 
