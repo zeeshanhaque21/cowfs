@@ -402,6 +402,12 @@ One table, `error::from_meta` and `error::from_store`, tested case by case.
 
 There is ONE global order, and it is enforced by construction rather than by inspection:
 
+0. **The per-target swap lock** (`Core::lock_target`, `src/swap.rs`) is above the gate.
+   `swap_snapshot` and every ingest (`ingest`, `ingest_replacing`) take it first and hold it to the end of the call, because they share one staging name and one intent file per target (issue 300).
+   A second call on the same target waits; calls on other targets do not.
+   Only those two entry points take it, never while holding another lock of ours, and never twice in one call, so it cannot be part of a cycle.
+   Daemon locks (`HolderGuard`, `bases.exclusive`) are taken above it and are never taken by the core.
+   Tests: `a_promote_during_a_replacing_import_of_the_same_target_does_not_break_the_import`, `two_replacing_imports_of_the_same_target_run_one_after_the_other`, `racing_promotes_of_one_target_leave_one_clean_result` (`tests/swap_concurrent.rs`).
 0. **The reference gate** (`src/gate.rs`) is outermost.
    A thread enters it before it takes `SnapCtx::ns`, `SnapCtx::flush`, a node lock or meta's lock, and only while it may store a chunk or commit a chunk list: `flush_snapshot`, `barrier`, and `setattr` with a size.
    `Blocks::put` takes the gate's `Entry`, so a store write outside the gate does not compile.
@@ -532,6 +538,8 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `ns::refresh_dir_attr` | st.wr, snap. | 2 then 3 |
 | `swap::recover_intent` | last_error | leaf |
 | `swap::recover` | last_error | leaf |
+| `swap::drop` | leaf | 1 |
+| `swap::lock_target` | leaf | 1 |
 | `swap::swap_snapshot` | last_error | leaf |
 | `swap::stage_and_intent` | snap. | 3 |
 | `swap::parent_of` | snap. | 3 |

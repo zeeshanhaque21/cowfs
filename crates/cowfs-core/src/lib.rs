@@ -252,6 +252,7 @@ impl Core {
             bg: (Mutex::new(false), Condvar::new()),
             unsynced: Mutex::new(None),
             last_error: Mutex::new(mark_warning),
+            swap_targets: (Mutex::new(Default::default()), Condvar::new()),
             capacity_blocks: (avail / 4096).max(1 << 20).min(total / 4096 + 1),
             base_pack_bytes,
             root: dir.to_path_buf(),

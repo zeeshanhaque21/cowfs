@@ -149,8 +149,7 @@ fn two_replacing_imports_of_the_same_target_run_one_after_the_other() {
     no_leftovers(dir.path(), &c);
 }
 
-/// Two promotes of one target, one parked between its steps by the fault-free path cannot be
-/// parked, so run them hard against each other and check the end state.
+/// Four promotes of one target at once, repeatedly: every one succeeds and the end state is clean.
 #[test]
 fn racing_promotes_of_one_target_leave_one_clean_result() {
     let dir = tempfile::tempdir().unwrap();

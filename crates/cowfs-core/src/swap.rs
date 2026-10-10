@@ -293,7 +293,43 @@ pub(crate) fn check_target_len(target: &str) -> Result<(), ControlError> {
     Ok(())
 }
 
+/// Held for the whole of one swap or replacing import of one target; see [`Core::lock_target`].
+pub(crate) struct TargetGuard<'a> {
+    inner: &'a crate::inner::Inner,
+    target: String,
+}
+
+impl Drop for TargetGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.swap_targets.0.lk().remove(&self.target);
+        self.inner.swap_targets.1.notify_all();
+    }
+}
+
 impl Core {
+    /// Serialises every call that stages, replaces or recovers `target`: a promote, a replacing
+    /// import and a plain import share the staging name and the intent file of the target, and
+    /// each one's `clear_leftover`, `recover_target` and `drop_intent` would otherwise act on the
+    /// other's staging snapshot or intent (issue 300). Blocks until the other call is done.
+    ///
+    /// Lock order: taken first, before the gate, `snaps`, any `SnapCtx` lock and meta's, and held
+    /// across all of them (an import holds it for the whole ingest). Nothing in this crate takes
+    /// it while holding another lock of ours, and it is never taken twice by one call (only the
+    /// public entry points take it: `swap_snapshot`, `ingest_with`), so it cannot be part of a
+    /// cycle. The set mutex is a leaf held only to insert or remove a name.
+    pub(crate) fn lock_target(&self, target: &str) -> TargetGuard<'_> {
+        let (set, cv) = &self.inner.swap_targets;
+        let mut held = set.lk();
+        while held.contains(target) {
+            held = cv.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.insert(target.to_owned());
+        TargetGuard {
+            inner: &self.inner,
+            target: target.to_owned(),
+        }
+    }
+
     /// Removes the leftover staging snapshot `staged` of `target`, unless an intent for another
     /// target names it (a staging-hash collision): that snapshot is the only copy of that swap's
     /// new tree, so the call is refused before it changes anything.
@@ -335,6 +371,7 @@ impl Core {
                 "source and target are the same snapshot",
             ));
         }
+        let _target = self.lock_target(new);
         self.recover_target(new)?;
         let src_sc = self.inner.snap_by_name(src)?;
         // the snapshot whose name goes away: the existing target, when there is one

@@ -196,6 +196,8 @@ pub(crate) struct Inner {
     pub(crate) bg: (Mutex<bool>, Condvar),
     pub(crate) unsynced: Mutex<Option<Instant>>,
     pub(crate) last_error: Mutex<Option<String>>,
+    /// Targets with a swap or replacing import in flight; see `Core::lock_target`.
+    pub(crate) swap_targets: (Mutex<std::collections::HashSet<String>>, Condvar),
     pub(crate) capacity_blocks: u64,
     pub(crate) base_pack_bytes: u64,
     /// The mount root directory, which holds the intent files of an interrupted snapshot swap.
