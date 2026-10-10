@@ -1718,10 +1718,12 @@
         {
           "id": "300",
           "title": "#300 swap: no per-target lock in core; import-replace can race swap",
-          "state": "active",
+          "state": "done",
           "owner": "lead",
-          "status_note": "Builder running: reproduce first with a concurrent swap and replace on one target; fix with a per-target lock only if it reproduces.",
-          "issue": 300
+          "status_note": "PR314 merged after one critic round. Reproduced first: three tests failed on main (promote during a parked replacing import returned Exists, two imports returned snapshot exists, four concurrent promotes returned NotFound). Fix: a blocking per-target-name lock taken first by swap_snapshot, promote_base and ingest_with, outermost, never nested. Not covered: rename_snapshot, remove_snapshot, fork_snapshot (#315), and waiters have no cancel, timeout or fairness (#316). Issue closed.",
+          "issue": 300,
+          "pr": "#314",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/314"
         },
         {
           "id": "301",
@@ -1768,6 +1770,22 @@
           "owner": "lead",
           "status_note": "Open, from the PR298 critic: the original #124 case has no daemon-level test; needs a seam reachable from the daemon crate.",
           "issue": 311
+        },
+        {
+          "id": "315",
+          "title": "#315 swap: rename, remove and fork do not take the per-target lock",
+          "state": "pending",
+          "owner": "lead",
+          "status_note": "Open, from the PR314 critic: a rename of the target during a promote or import still races. The lock is keyed by name, not id.",
+          "issue": 315
+        },
+        {
+          "id": "316",
+          "title": "#316 swap: per-target lock waiters have no cancel or timeout",
+          "state": "pending",
+          "owner": "lead",
+          "status_note": "Open, from the PR314 critic: a daemon import queued behind a long ingest of the same name cannot be cancelled; no fairness among waiters.",
+          "issue": 316
         }
       ]
     },
@@ -2013,5 +2031,5 @@
   "bar_history": [
     "2026-10-09 (Zee): gate changed from 'native APFS and ext4 (moonscape)' to 'native APFS plus a Linux native filesystem on cachyos'. The cachyos root is btrfs, so the Linux number is a btrfs number; an ext4 loop image under /mnt/docs may be added as a labelled proxy, not as the gate."
   ],
-  "update_20261009_evening": "Merged since the morning update: #273 #274 #275 #277 #278 #279 #280 #281 #282 #284 #285 #291 #292 #293 #294 #295 #296 #297 #298 #299 #303 #304 #306 #308 #309 #310 (#222 #271 #272 earlier). No PR open at the time of writing. Builders running: #300. Process: every PR gets a fresh-context critic before merge; MERGE-AFTER-FIXES goes back to the builder, security-sensitive PRs get a fresh critic per round (#298 and #303 took three). Known tooling problem: treehouse return hangs inside the cowfs mount (#289 hypothesis), so leases 1 to 6 are left held."
+  "update_20261009_evening": "Merged since the morning update: #273 #274 #275 #277 #278 #279 #280 #281 #282 #284 #285 #291 #292 #293 #294 #295 #296 #297 #298 #299 #303 #304 #306 #308 #309 #310 #312 #313 #314 (#222 #271 #272 earlier). No PR open and no builder running at the time of writing. Process: every code PR gets a fresh-context critic before merge; MERGE-AFTER-FIXES goes back to the builder; security-sensitive PRs get a fresh critic per round (#298 and #303 took three). Known tooling problem: treehouse return hangs inside the cowfs mount (#289 hypothesis), so leases 1 to 7 are left held. Ideas and concerns: docs/build-train-ideas-and-concerns-20261009.md."
 }
