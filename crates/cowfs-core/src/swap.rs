@@ -1014,17 +1014,15 @@ mod tests {
             let c = open_core(dir.path());
             c.create_snapshot("src").unwrap();
             c.create_snapshot("abc").unwrap();
+            let old_id = c.inner.snap_by_name("abc").unwrap().id;
             assert!(finish_with(&c, Fault::After, false).is_err());
             assert!(intent_path(&c.inner.root, "abc").exists(), "intent kept");
-            assert!(
-                c.inner
-                    .meta
-                    .durable_snapshots()
-                    .unwrap()
-                    .iter()
-                    .any(|r| r.name == staging_name("abc") || r.name == "abc"),
-                "the new tree is still named in the file"
-            );
+            // the replace is in the file: the old target's row is gone, and the staged snapshot
+            // (a different id) answers to the target name with no staging name left
+            let rows = c.inner.meta.durable_snapshots().unwrap();
+            assert!(rows.iter().all(|r| r.id.0 != old_id), "old target removed");
+            assert_eq!(rows.iter().filter(|r| r.name == "abc").count(), 1);
+            assert!(rows.iter().all(|r| r.name != staging_name("abc")));
         }
         let c = open_core(dir.path());
         assert!(has_f(&c, b"abc"), "the new tree is installed");

@@ -1344,8 +1344,9 @@ mod tests {
     /// forward; the core's `swap` unit tests cover that.) Either way the swap reports the failure
     /// and the record must read unknown, because the error alone cannot tell the two apart.
     ///
-    /// On the unsafe code this fails with `commit-AAA` over `BBBB-from-srcB`, which is the defect
-    /// this issue was filed for.
+    /// On the unsafe code (the old record restored after an `Err`) this fails on the record still
+    /// naming `commit-AAA`. The original #124 case, where the tree ends up NEW while the swap
+    /// returns `Err`, needs a seam reachable from this crate and has no test here yet.
     #[test]
     fn a_core_swap_whose_replace_commit_fails_never_restores_the_old_commit() {
         let dir = tempfile::tempdir().unwrap();
