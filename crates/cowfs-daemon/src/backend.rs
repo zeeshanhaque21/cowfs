@@ -1395,6 +1395,75 @@ mod tests {
         );
     }
 
+    fn core_snaps_with_swap_fault(dir: &Path, step: u8) -> CoreSnapshots {
+        // `set_swap_fault` is a `#[doc(hidden)]` production seam on `Core` (see swap.rs), not
+        // gated behind cfg(test), so it is reachable from this crate without any change to
+        // cowfs-core. Step 6 fires after the replace commit has already landed (the rename is
+        // done) but before the intent file is dropped.
+        let core = cowfs_core::Core::open(
+            dir,
+            cowfs_core::Options {
+                background: false,
+                ..Default::default()
+            },
+        )
+        .expect("a core to inject the swap fault into");
+        core.set_swap_fault(step);
+        CoreSnapshots {
+            core: Arc::new(Mutex::new(Some(core))),
+            bases: crate::base_meta::BaseMetaStore::open(dir).expect("the base records"),
+        }
+    }
+
+    /// #124's other half: a replace commit that **lands** (the rename is durable, the tree under
+    /// "base" is already `srcB`'s) must still surface as `Err` from `swap()` when a later step
+    /// fails, and the record must still read unknown rather than describe either tree.
+    ///
+    /// This is the daemon-reachable seam the sibling test above says had none: fault 6 on
+    /// `Core::set_swap_fault` fires after the rename but before `drop_intent`, which is exactly
+    /// the window the core's own `swap` unit tests cover via the cfg(test)-only
+    /// `FAIL_AFTER_COMMIT` hook that `move_name` checks, a hook this crate cannot reach.
+    #[test]
+    fn a_core_swap_whose_replace_commit_lands_still_reports_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().to_owned();
+        {
+            let seed = CoreBackend::open(&store, cowfs_core::Options::default()).unwrap();
+            seeded_pair(&seed);
+        }
+
+        let s = core_snaps_with_swap_fault(&store, 6);
+        let res = s.swap("base", "srcB");
+        assert!(
+            res.is_err(),
+            "fault 6 fires after the rename lands, so the swap must still report the failure"
+        );
+        drop(s);
+
+        // Reopen through the production backend: `Core::open` starts a fresh, unfaulted core, so
+        // this drives the same recovery a real crash-and-restart would and lets us see the tree
+        // the fault left behind.
+        let reopened = CoreBackend::open(&store, cowfs_core::Options::default()).unwrap();
+        let info = reopened.snapshots().create_meta("base").unwrap();
+        let v = reopened.snapshot("base").unwrap();
+        let a = v.lookup(cowfs_vfs::ROOT_INO, b"only").unwrap();
+        let content = String::from_utf8_lossy(&v.read(a.ino, 0, 4096).unwrap()).into_owned();
+        assert_eq!(
+            content, "BBBB-from-srcB",
+            "the rename already landed before the fault fired: the tree under \"base\" is the \
+             new one even though swap() returned Err"
+        );
+        assert!(
+            !store.join("swap-base").exists(),
+            "recovery drops the intent file the fault left behind"
+        );
+        assert_eq!(
+            commit_of(&info),
+            None,
+            "an error from swap() invalidates the record even though the tree landed: {info:?}"
+        );
+    }
+
     /// The refusal order is the one the core used, so the two backends answer a name-with-itself
     /// swap of a snapshot that does not exist the same way.
     #[test]
