@@ -82,6 +82,7 @@ if not os.path.exists(base):
     env = dict(os.environ, CARGO_TARGET_DIR=base)
     subprocess.run(["cargo", "test", "-j4", "--no-run", "-p", "cowfs-core", "--test", test], cwd=work, env=env, check=True, capture_output=True)
 out = open(f"{mut}/results.txt", "a")
+bad = []  # mutants that did not apply or compile: a stale pattern must not pass for a result
 for name, f, a, b in M:
     tag = name.split()[0]
     if only and tag not in only:
@@ -93,9 +94,9 @@ for name, f, a, b in M:
         try:
             mutated = a(t)
         except ValueError:
-            out.write(f"{name}: PATTERN NOT FOUND\n"); out.flush(); continue
+            out.write(f"{name}: FAILED-TO-APPLY (pattern not found)\n"); out.flush(); bad.append(tag); continue
     elif a not in t:
-        out.write(f"{name}: PATTERN NOT FOUND\n"); out.flush(); continue
+        out.write(f"{name}: FAILED-TO-APPLY (pattern not found)\n"); out.flush(); bad.append(tag); continue
     else:
         mutated = t.replace(a, b, 1)
     open(target, "w").write(mutated)
@@ -109,8 +110,9 @@ for name, f, a, b in M:
         failed = sorted(set(re.findall(r"^test (\S+) \.\.\. FAILED", txt, re.M)))
         if "could not compile" in txt:
             v = "COMPILE ERROR"
+            bad.append(tag)
         elif failed:
-            first = re.findall(r"FAIL (k=\S+ seed=\d+ op=[^:]*: .{0,160})", txt)
+            first = re.findall(r"FAIL (w=\d+ k=\S+ seed=\d+ op=[^:]*: .{0,160})", txt)
             v = "KILLED by " + ", ".join(failed[:4]) + (f"; first image: {first[0]}" if first else "")
         else:
             v = "SURVIVED"
@@ -120,3 +122,5 @@ for name, f, a, b in M:
     shutil.rmtree(tgt, ignore_errors=True)
     shutil.copy(f"{root}/crates/{f}", target)
 out.write("DONE\n"); out.close()
+if bad:
+    sys.exit(f"mutants not applied or not compiling: {bad} (see {mut}/results.txt)")

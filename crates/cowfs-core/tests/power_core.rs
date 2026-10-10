@@ -812,14 +812,52 @@ fn same_tree(want: &Tree, got: &Tree, loose: &HashSet<String>) -> bool {
             .all(|p| want.contains_key(p) || loose.contains(p))
 }
 
-/// An intent file is on disk at open although the unlink of that very name had completed before
-/// the cut: the directory entry change never reached the disk, the case the swap's final
-/// directory fsync exists for.
+/// An intent file is on disk at open although its name was last unlinked at the root before the
+/// cut (not created or renamed to again since): the directory entry change never reached the disk,
+/// the case the swap's final directory fsync exists for.
 fn resurrected(run: &Run, k: usize, dir: &Path) -> bool {
-    run.rops.iter().enumerate().any(|(i, op)| match op {
-        RootOp::Unlink(n) => run.root_at[i] < k && dir.join(n).exists(),
-        _ => false,
-    })
+    let mut unlinked: BTreeSet<&str> = BTreeSet::new();
+    for (i, op) in run.rops.iter().enumerate() {
+        if run.root_at[i] >= k {
+            break;
+        }
+        match op {
+            RootOp::Create(n) => {
+                unlinked.remove(n.as_str());
+            }
+            RootOp::Rename(a, b) => {
+                unlinked.remove(a.as_str());
+                unlinked.remove(b.as_str());
+            }
+            RootOp::Unlink(n) => {
+                unlinked.insert(n);
+            }
+            _ => {}
+        }
+    }
+    unlinked.iter().any(|n| dir.join(n).exists())
+}
+
+/// The post-swap user operations are part of the recorded workload: some acknowledgement interval
+/// holds a swap together with writes and a rename in its target `base`, and the last interval holds
+/// writes, an unlink and the removal of the second target `fresh`. Without them the resurrected
+/// intent never meets a user operation and mutant I4 is untested; deleting them fails here.
+fn post_swap_guard(run: &Run) {
+    let touched = |s: &str, ps: &[&str]| {
+        run.acks.iter().any(|e| {
+            e.touched
+                .get(s)
+                .is_some_and(|t| ps.iter().all(|p| t.contains(*p)))
+        })
+    };
+    assert!(
+        touched("base", &["post", "g2"]),
+        "the workload no longer uses `base` after its swap"
+    );
+    assert!(
+        touched("fresh", &["p1", "e"]) && run.acks.iter().any(|e| e.may_vanish.contains("fresh")),
+        "the workload no longer uses and removes `fresh` after its swap"
+    );
 }
 
 fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
@@ -991,7 +1029,7 @@ fn brief(op: &LogOp) -> String {
 const KEEP_MAX: usize = 4;
 static KEPT: AtomicUsize = AtomicUsize::new(0);
 
-/// Where failure evidence goes: under the target dir, a path CI can upload and a human can find.
+/// Where failure evidence goes: under the target dir, where a human can find it.
 fn scratch() -> std::path::PathBuf {
     let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join("power_core");
     fs::create_dir_all(&d).unwrap();
@@ -1016,13 +1054,12 @@ fn trace(run: &Run) -> String {
     s
 }
 
-/// Writes the trace of a failing workload and prints it, so the CI log has it too.
-fn dump_trace(run: &Run, wseed: u64) -> std::path::PathBuf {
+/// Writes the trace of a failing workload; returns the text to print after the FAIL lines.
+fn dump_trace(run: &Run, wseed: u64) -> String {
     let p = scratch().join(format!("trace-w{wseed}-{}.txt", std::process::id()));
     let tr = trace(run);
     fs::write(&p, &tr).unwrap();
-    eprintln!("TRACE w={wseed} saved to {}\n{tr}", p.display());
-    p
+    format!("TRACE w={wseed} saved to {}\n{tr}", p.display())
 }
 
 fn build_image(run: &Run, k: usize, seed: u64, dir: &Path) {
@@ -1107,6 +1144,7 @@ fn report(run: &Run, t: &Tally) {
 #[test]
 fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() {
     let mut all = Tally::default();
+    let mut traces = Vec::new();
     for wseed in 0..env("COWFS_POWER_WORKLOADS", 2) as u64 {
         let run = record(true, wseed);
         assert!(
@@ -1135,8 +1173,9 @@ fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() 
         );
         report(&run, &t);
         if !t.failures.is_empty() {
-            dump_trace(&run, wseed);
+            traces.push(dump_trace(&run, wseed));
         }
+        post_swap_guard(&run);
         all.merge(t);
     }
     assert!(all.images > 1000);
@@ -1150,6 +1189,9 @@ fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() 
     );
     for f in all.failures.iter().take(8) {
         eprintln!("FAIL {f}");
+    }
+    for tr in &traces {
+        eprintln!("{tr}");
     }
     assert!(
         all.failures.is_empty(),
