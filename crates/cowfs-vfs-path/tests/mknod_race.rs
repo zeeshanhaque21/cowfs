@@ -4,7 +4,8 @@
 
 #![cfg(target_os = "linux")]
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -67,4 +68,96 @@ fn mknod_mode_never_lands_on_a_node_swapped_in() {
         hit.len(),
         &hit[..hit.len().min(5)]
     );
+}
+
+/// Gives `dir` a default POSIX ACL (`u::rwx,g::r-x,o::r-x`), so the kernel may change the mode of
+/// anything created in it and `mknod` must chmod after `mknodat`. False when the filesystem has
+/// no ACL support.
+fn set_default_acl(dir: &std::path::Path) -> bool {
+    // posix_acl_xattr: version 2, then (tag, perm, id) entries: USER_OBJ, GROUP_OBJ, OTHER.
+    let mut v = 2u32.to_le_bytes().to_vec();
+    for (tag, perm) in [(1u16, 7u16), (4, 5), (0x20, 5)] {
+        v.extend_from_slice(&tag.to_le_bytes());
+        v.extend_from_slice(&perm.to_le_bytes());
+        v.extend_from_slice(&u32::MAX.to_le_bytes());
+    }
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+    let name = c"system.posix_acl_default";
+    // SAFETY: valid NUL terminated strings and a buffer of the stated length.
+    unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), v.as_ptr().cast(), v.len(), 0) == 0 }
+}
+
+/// Runs `mknod` in a loop while a helper swaps `node` for a symlink to `victim` (mode 0o644) and
+/// for decoy sockets (mode 0o644). Returns the paths whose mode `mknod` changed.
+fn race(acl: bool) -> Option<Vec<std::path::PathBuf>> {
+    let root = std::env::temp_dir().join(format!(
+        "cowfs-mknod-race-{}-{}",
+        acl as u8,
+        std::process::id()
+    ));
+    let (dir, side) = (root.join("fs"), root.join("side"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&side).unwrap();
+    if acl && !set_default_acl(&dir) {
+        eprintln!("SKIP: no default ACL support under {}", root.display());
+        cowfs_vfs_path::force_remove_dir_all(&root);
+        return None;
+    }
+    let victim = side.join("victim");
+    std::fs::write(&victim, b"v").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let fs = PathVfs::new(&dir).expect("open the directory");
+    let stop = Arc::new(AtomicBool::new(false));
+    let helper = {
+        let (dir, side, victim, stop) = (dir.clone(), side.clone(), victim.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(Ordering::Relaxed) && n < 200_000 {
+                let tmp = dir.join(".decoy");
+                if n % 2 == 0 {
+                    symlink(&victim, &tmp).unwrap();
+                } else {
+                    let keep = side.join(n.to_string());
+                    drop(UnixListener::bind(&keep).expect("bind a decoy"));
+                    std::fs::set_permissions(&keep, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                    std::fs::hard_link(&keep, &tmp).unwrap();
+                }
+                std::fs::rename(&tmp, dir.join("node")).unwrap();
+                n += 1;
+            }
+        })
+    };
+    for _ in 0..20_000 {
+        let _ = fs.unlink(ROOT_INO, b"node");
+        if let Ok(a) = fs.mknod(ROOT_INO, b"node", FileKind::Fifo, 0o600, 0) {
+            fs.forget(a.ino, 1);
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    helper.join().expect("helper");
+    let hit = std::fs::read_dir(&side)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| std::fs::metadata(p).unwrap().mode() & 0o7777 != 0o644)
+        .collect();
+    drop(fs);
+    cowfs_vfs_path::force_remove_dir_all(&root);
+    Some(hit)
+}
+
+/// The symlink swap of #211: a chmod by name after `mknodat` follows a link planted at the name.
+#[test]
+fn mknod_never_chmods_a_symlink_target() {
+    let hit = race(false).unwrap();
+    assert!(hit.is_empty(), "mknod changed the mode of {hit:?}");
+}
+
+/// The same race where the kernel may change the mode (default ACL), so `mknod` cannot rely on
+/// the creation mode and has to chmod the node it made, not whatever sits at the name.
+#[test]
+fn mknod_with_default_acl_never_chmods_a_node_swapped_in() {
+    if let Some(hit) = race(true) {
+        assert!(hit.is_empty(), "mknod changed the mode of {hit:?}");
+    }
 }
