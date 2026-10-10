@@ -318,19 +318,16 @@ impl Vfs for PathVfs {
         let dir = s.dir_fd(parent)?;
         s.invalidate(parent);
         let mode = mode & MODE_MASK;
-        // The mode goes in at creation, unfiltered by the umask: a chmod after `mknodat` can only
-        // go by name, and lands on whatever another process renamed over the name in between.
-        // That chmod is left for when the kernel may change the mode (a default ACL on the
-        // parent) or no thread-private umask exists.
-        let exact = s
-            .umask
-            .mknodat_exact(dir.file.as_fd(), name, ty | mode, host)
-            .map_err(io_err)?;
+        // The mode goes in at creation, unfiltered by the umask: a chmod by name after `mknodat`
+        // lands on whatever another process renamed over the name in between. When the kernel
+        // may change the mode (a default ACL on the parent) or no thread-private umask exists,
+        // the node is made under a private name, chmod'ed through a descriptor, then renamed in.
+        let exact = !mode_may_change(dir.file.as_fd(), false)
+            && s.umask
+                .mknodat_exact(dir.file.as_fd(), name, ty | mode, host)
+                .map_err(io_err)?;
         if !exact {
-            sys::mknodat(dir.file.as_fd(), name, ty | 0o600, host).map_err(io_err)?;
-        }
-        if !exact || mode_may_change(dir.file.as_fd(), false) {
-            sys::fchmodat(dir.file.as_fd(), name, mode).map_err(io_err)?;
+            mknod_private(dir.file.as_fd(), name, ty | mode, host).map_err(io_err)?;
         }
         let st = sys::fstatat(dir.file.as_fd(), name).map_err(io_err)?;
         let ino = s.register(parent, &dir.file, name, &st)?;
@@ -688,6 +685,44 @@ fn mode_may_change(dir: std::os::fd::BorrowedFd<'_>, new_dir: bool) -> bool {
         }
     }
     new_dir && sys::fstat(dir).map_or(true, |st| st.mode & 0o2000 != 0)
+}
+
+/// `mknodat` of `name` with exactly `mode`, for when the creation mode cannot be trusted. The node
+/// is made under a name nobody else knows, chmod'ed through a descriptor opened without following
+/// symlinks, then renamed to `name` without replacing anything (`EEXIST` if it exists).
+#[cfg(target_os = "linux")]
+fn mknod_private(
+    dir: std::os::fd::BorrowedFd<'_>,
+    name: &[u8],
+    ty_mode: u32,
+    rdev: u64,
+) -> io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = format!(
+        ".cowfs-mknod-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let tmp = tmp.as_bytes();
+    sys::mknodat(dir, tmp, (ty_mode & !MODE_MASK) | 0o600, rdev)?;
+    let done = sys::openat(dir, tmp, sys::OPEN_SPECIAL, 0)
+        .and_then(|fd| sys::chmod_fd(fd.as_fd(), ty_mode & MODE_MASK))
+        .and_then(|()| sys::renameat(dir, tmp, dir, name, true));
+    if done.is_err() {
+        let _ = sys::unlinkat(dir, tmp, false);
+    }
+    done
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mknod_private(
+    dir: std::os::fd::BorrowedFd<'_>,
+    name: &[u8],
+    ty_mode: u32,
+    rdev: u64,
+) -> io::Result<()> {
+    // Where `mknodat` exists but the descriptor chmod does not, nothing can be made exactly.
+    sys::mknodat(dir, name, ty_mode, rdev)
 }
 
 /// Whether this process may make device nodes under `dir`: a probe `mknod` of a character

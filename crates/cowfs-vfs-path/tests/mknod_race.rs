@@ -4,7 +4,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,20 +70,14 @@ fn mknod_mode_never_lands_on_a_node_swapped_in() {
 }
 
 /// Gives `dir` a default POSIX ACL (`u::rwx,g::r-x,o::r-x`), so the kernel may change the mode of
-/// anything created in it and `mknod` must chmod after `mknodat`. False when the filesystem has
-/// no ACL support.
+/// anything created in it and `mknod` must chmod after `mknodat`. False when `setfacl` is missing
+/// or the filesystem has no ACL support.
 fn set_default_acl(dir: &std::path::Path) -> bool {
-    // posix_acl_xattr: version 2, then (tag, perm, id) entries: USER_OBJ, GROUP_OBJ, OTHER.
-    let mut v = 2u32.to_le_bytes().to_vec();
-    for (tag, perm) in [(1u16, 7u16), (4, 5), (0x20, 5)] {
-        v.extend_from_slice(&tag.to_le_bytes());
-        v.extend_from_slice(&perm.to_le_bytes());
-        v.extend_from_slice(&u32::MAX.to_le_bytes());
-    }
-    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
-    let name = c"system.posix_acl_default";
-    // SAFETY: valid NUL terminated strings and a buffer of the stated length.
-    unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), v.as_ptr().cast(), v.len(), 0) == 0 }
+    std::process::Command::new("setfacl")
+        .args(["-d", "-m", "u::rwx,g::r-x,o::r-x"])
+        .arg(dir)
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Runs `mknod` in a loop while a helper swaps `node` for a symlink to `victim` (mode 0o644) and
@@ -99,7 +92,10 @@ fn race(acl: bool) -> Option<Vec<std::path::PathBuf>> {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::create_dir_all(&side).unwrap();
     if acl && !set_default_acl(&dir) {
-        eprintln!("SKIP: no default ACL support under {}", root.display());
+        eprintln!(
+            "SKIP: no setfacl or no default ACL support under {}",
+            root.display()
+        );
         cowfs_vfs_path::force_remove_dir_all(&root);
         return None;
     }
@@ -114,7 +110,7 @@ fn race(acl: bool) -> Option<Vec<std::path::PathBuf>> {
             let mut n = 0u32;
             while !stop.load(Ordering::Relaxed) && n < 200_000 {
                 let tmp = dir.join(".decoy");
-                if n % 2 == 0 {
+                if n & 1 == 0 {
                     symlink(&victim, &tmp).unwrap();
                 } else {
                     let keep = side.join(n.to_string());
@@ -150,7 +146,12 @@ fn race(acl: bool) -> Option<Vec<std::path::PathBuf>> {
 #[test]
 fn mknod_never_chmods_a_symlink_target() {
     let hit = race(false).unwrap();
-    assert!(hit.is_empty(), "mknod changed the mode of {hit:?}");
+    assert!(
+        hit.is_empty(),
+        "mknod changed the mode of {} nodes it did not make: {:?}",
+        hit.len(),
+        &hit[..hit.len().min(3)]
+    );
 }
 
 /// The same race where the kernel may change the mode (default ACL), so `mknod` cannot rely on
@@ -158,6 +159,11 @@ fn mknod_never_chmods_a_symlink_target() {
 #[test]
 fn mknod_with_default_acl_never_chmods_a_node_swapped_in() {
     if let Some(hit) = race(true) {
-        assert!(hit.is_empty(), "mknod changed the mode of {hit:?}");
+        assert!(
+            hit.is_empty(),
+            "mknod changed the mode of {} nodes it did not make: {:?}",
+            hit.len(),
+            &hit[..hit.len().min(3)]
+        );
     }
 }
