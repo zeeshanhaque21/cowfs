@@ -914,3 +914,46 @@ fn setattr_mode_on_a_special_node_never_lands_on_a_swapped_in_symlink_target() {
         "the symlink target's mode changed"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_node_that_is_not_the_one_just_made_is_refused() {
+    let st = |dev, ino, mode| crate::sys::Stat {
+        dev,
+        ino,
+        mode,
+        ..Default::default()
+    };
+    let fifo = libc::S_IFIFO;
+    let want = st(1, 7, fifo | 0o600);
+    assert!(crate::made_node(&want, &want, fifo).is_ok());
+    // Another inode, another device, or another type at the same name.
+    assert!(crate::made_node(&st(1, 8, fifo | 0o600), &want, fifo).is_err());
+    assert!(crate::made_node(&st(2, 7, fifo | 0o600), &want, fifo).is_err());
+    assert!(crate::made_node(&st(1, 7, libc::S_IFSOCK | 0o600), &want, fifo).is_err());
+}
+
+/// The private node is made with the exact mode and leaves nothing behind, on success and on
+/// failure (`EEXIST`), and the scratch directory is private while it exists.
+#[cfg(target_os = "linux")]
+#[test]
+fn mknod_private_sets_the_mode_and_removes_its_scratch_directory() {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let root = std::env::temp_dir().join(format!("cowfs-mknod-private-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let d = std::fs::File::open(&root).unwrap();
+    crate::mknod_private(d.as_fd(), b"node", libc::S_IFIFO | 0o4751, 0).unwrap();
+    let m = std::fs::symlink_metadata(root.join("node")).unwrap();
+    assert!(m.file_type().is_fifo());
+    assert_eq!(m.permissions().mode() & 0o7777, 0o4751);
+    // Exists: refused, and the scratch directory and node are gone.
+    let e = crate::mknod_private(d.as_fd(), b"node", libc::S_IFIFO | 0o600, 0).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+    let names: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["node"], "scratch directory left behind");
+    crate::force_remove_dir_all(&root);
+}

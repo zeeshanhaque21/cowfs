@@ -28,7 +28,7 @@ fn cvt_size(r: isize) -> io::Result<usize> {
 }
 
 /// The fields of `struct stat` the crate uses, widened to fixed types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stat {
     pub dev: u64,
     pub ino: u64,
@@ -226,11 +226,6 @@ pub fn mknodat(dir: BorrowedFd<'_>, name: &[u8], mode: u32, rdev: u64) -> io::Re
         )
     })?;
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn mknodat(_: BorrowedFd<'_>, _: &[u8], _: u32, _: u64) -> io::Result<()> {
-    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
 /// What is known of `unshare(CLONE_FS)` here: `true` once it worked, `false` once refused for good.
@@ -533,6 +528,30 @@ pub fn chmod_fd(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
     // SAFETY: see module docs.
     cvt(unsafe { libc::chmod(path.as_ptr(), mode as libc::mode_t) })?;
     Ok(())
+}
+
+/// The effective user id.
+#[cfg(target_os = "linux")]
+pub fn geteuid() -> u32 {
+    // SAFETY: no arguments, cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// 16 bytes from the kernel's random source (`getrandom(2)`, no descriptor, never short).
+#[cfg(target_os = "linux")]
+pub fn random16() -> io::Result<[u8; 16]> {
+    let mut b = [0u8; 16];
+    // SAFETY: a valid buffer of the stated length.
+    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+    if n == 16 {
+        Ok(b)
+    } else {
+        Err(if n < 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::from_raw_os_error(libc::EIO)
+        })
+    }
 }
 
 pub fn mkdirat(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<()> {
