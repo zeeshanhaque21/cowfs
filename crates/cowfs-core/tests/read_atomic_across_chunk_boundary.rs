@@ -46,6 +46,17 @@ const CAP: Duration = Duration::from_secs(120);
 const WRITES: usize = 4000;
 const MIN_READS: usize = 1000;
 
+/// Sets the shared flag when its thread unwinds, so a panic anywhere ends every loop at once
+/// instead of leaving the others spinning until `CAP`.
+struct OnPanic<'a>(&'a AtomicBool);
+impl Drop for OnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Relaxed);
+        }
+    }
+}
+
 fn cuts(image: &[u8]) -> Vec<usize> {
     let mut at = 0;
     cowfs_store::chunks(image)
@@ -120,6 +131,7 @@ fn run(opts: Options, arm: &str) {
 
     let off = l.block as u64;
     let stop = AtomicBool::new(false);
+    let failed = AtomicBool::new(false);
     let (reads, torn, seen) = (
         AtomicUsize::new(0),
         AtomicUsize::new(0),
@@ -131,8 +143,9 @@ fn run(opts: Options, arm: &str) {
     std::thread::scope(|s| {
         for _ in 0..READERS {
             s.spawn(|| {
+                let _guard = OnPanic(&failed);
                 let mut kinds = [false; VERSIONS];
-                while !stop.load(Relaxed) && start.elapsed() < CAP {
+                while !stop.load(Relaxed) && !failed.load(Relaxed) && start.elapsed() < CAP {
                     let got = fs.read(ino, off, BLOCK as u32).unwrap();
                     reads.fetch_add(1, Relaxed);
                     match l.versions.iter().position(|v| *v == got) {
@@ -155,9 +168,11 @@ fn run(opts: Options, arm: &str) {
                 seen.fetch_max(kinds.iter().filter(|k| **k).count(), Relaxed);
             });
         }
+        let _guard = OnPanic(&failed);
         let mut i = 0;
         while (i < WRITES || reads.load(Relaxed) < MIN_READS)
             && torn.load(Relaxed) == 0
+            && !failed.load(Relaxed)
             && start.elapsed() < CAP
         {
             last = (i + 1) % VERSIONS;
