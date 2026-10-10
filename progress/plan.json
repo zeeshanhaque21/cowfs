@@ -115,7 +115,7 @@
       "self_check": "The user would reasonably reject any full-completion claim while existing acceptance tasks remain open."
     }
   },
-  "reconciled_at": "2026-10-08",
+  "reconciled_at": "2026-10-09",
   "status_policy": "Done means the scoped implementation or report merged, not production acceptance. GitHub issues may remain open for acceptance and historical follow-ups. status_note supersedes historical detail, owner and ci entries where present. Building requires an active worker; ready means queued; blocked names an unmet prerequisite. Native comparison and crash gates remain separate.",
   "capacity_update": {
     "verified_free_gib": 261.22,
@@ -237,7 +237,7 @@
           "pr": "#104",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/104",
           "review_session": "ses_ef6789392ffef3M7SeLALESmXz",
-          "status_note": "PR104 harness merged as8255706f295227be54c014699d2a1c4c3ff58cd1 pinned016769e7f4076a5c0fc712a65932c546048052f7 after independentF2-F5PASS, own30-op CoreNFS matched readback and exact-head3green. Primary safelyfast-forwarded with dirty work preserved; merged-main42unit tests exit0, graph detect_changes refreshed. Independentreport docs/reviews/git-integrity21-repair-final.mdsha47455eeb. Parser lineage resolved: brokenvariant uncommittedrepair state, originalmatcher14/14 live matches; historical42 remainshistorical notinvalidated bynewparser. Prior model failure passesonexacthead, no waiver. Historicalcommit eedb24f negated closure wording unexpectedlyauto-closed21 despite emptyPRrefs; coordinator verifiedtimeline, reopened21 and postedcorrection. OriginalcorruptionNOTREPRODUCED/unfixed, larger805MiBsoak outstanding; acceptanceissue remainsOPEN. Shared15263LOCALMAC/all32leases/otherfixtures preserved, no deployment.",
+          "status_note": "PR104 harness merged as8255706f295227be54c014699d2a1c4c3ff58cd1 pinned016769e7f4076a5c0fc712a65932c546048052f7 after independentF2-F5PASS, own30-op CoreNFS matched readback and exact-head3green. Primary safelyfast-forwarded with dirty work preserved; merged-main42unit tests exit0, graph detect_changes refreshed. Independentreport docs/reviews/git-integrity21-repair-final.mdsha47455eeb. Parser lineage resolved: brokenvariant uncommittedrepair state, originalmatcher14/14 live matches; historical42 remainshistorical notinvalidated bynewparser. Prior model failure passesonexacthead, no waiver. Historicalcommit eedb24f negated closure wording unexpectedlyauto-closed21 despite emptyPRrefs; coordinator verifiedtimeline, reopened21 and postedcorrection. OriginalcorruptionNOTREPRODUCED/unfixed, larger805MiBsoak outstanding; acceptanceissue remainsOPEN. Shared15263LOCALMAC/all32leases/otherfixtures preserved, no deployment. 2026-10-09: PR291 merged, Linux FUSE soak results recorded.",
           "detail": "Write race fixed and regression-checked. Corrupt idx not reproduced, needs a soak on the fixed server. Readdir cookie still position-based.",
           "merge_note_20261008": "2026-10-08: PR158 MERGED 8f83ee024ca94be4a0d04b10d3eb0684e80f9719 pinned 3a1a17325605088bbf17abbde8bd22269970d950. CI failure was a test bug (page size 120 left a 0-byte READDIR budget, NFS3ERR_TOOSMALL); PAGE 300, no assertion changed, both cookie tests ok on ubuntu and macos. Critic blocked only the stale PR body, rewritten. Review: docs/reviews/158-critic-20261008.md. Test checks the listing, not cookie values."
         },
@@ -277,7 +277,7 @@
           "id": "8",
           "title": "#8 Merkle tree and O(1) writable snapshots",
           "state": "done",
-          "status_note": "PR #25 merged 2026-09-30. Metadata/snapshot implementation landed; old review text below is historical. Real-daemon durability acceptance remains #88/g6, not satisfied by this implementation merge.",
+          "status_note": "PR #25 merged 2026-09-30. Metadata/snapshot implementation landed; old review text below is historical. Real-daemon durability acceptance remains #88/g6, not satisfied by this implementation merge. 2026-10-09: PR291 merged, #8 seeding and O(1) snapshot measurements recorded (docs/verification/measure-8-21-20261009.md).",
           "issue": 8,
           "owner": "critic round 2 (subagent)",
           "pr": "#25",
@@ -301,7 +301,7 @@
           "id": "10",
           "title": "#10 garbage collection",
           "state": "done",
-          "status_note": "GC implementation and repairs #76/#78/#85/#86/#87 merged. Root-specific cache repair #82 is complete, not active. Real private CLI reclaim, error accounting and survivor reopen passed independent review. Full-stack crash, Linux private acceptance and real cancellation gates are not implied complete.",
+          "status_note": "GC implementation and repairs #76/#78/#85/#86/#87 merged. Root-specific cache repair #82 is complete, not active. Real private CLI reclaim, error accounting and survivor reopen passed independent review. Full-stack crash, Linux private acceptance and real cancellation gates are not implied complete. 2026-10-09 evening: PR292 merged (GC docs reconciled with code: no cold_dead_bonus, per-pack policy, hint store never fed, no scheduler; scheduling memo docs/gc-scheduling-10-20261009.md). PR295 merged (mark.bin checksum, #288). Scheduling and feeding the hint store remain undecided.",
           "issue": 10,
           "owner": "Core/daemon builder / Sonnet safety review / DeepSeek e2e proof",
           "pr": "#76",
@@ -657,7 +657,7 @@
           "issue": 121,
           "worker_session": "ses_eff8a48ecffeLDy1vy5IJotMHy",
           "latest_outcome": "Canonicalfixture-finalreview confirmsoriginalfailurecaptureNOTPRESERVED onlyprose;73reps0failnotresolution. 332mswouldindicateearlyEOF/cutframe ratherthantwo-secondtimeout; alternativeunproven dead-onlydrain+competingfinish/killordering. Original79builderassignedboundedREADONLYpublictopologyfive-step spike literalcontract/sourcehash+rawbyteEOF/PID/directrc/per-itemflush preserveevidence; no newhooks/retries/assertrelax/fullstress/theory-onlyfix. Canonicalprimaryevidence/control-terminal121-spike.md ownedruntimeartifacts only/head4bunchanged/shareddaemonprotected. MERGEBLOCKremainsuntilactualdiagnosis/regression.",
-          "status_note": "Does not reproduce (200 loaded runs; original test passes 100/100 on current and pre-PR194 servers). PR230 merged: wait-bound measurement test only. One CI sample wait_ms=1687 with no frame, bytes received not logged: an early kill is not excluded. Kept open until a CI failure with bytes logged appears.",
+          "status_note": "Does not reproduce (200 loaded runs; original test passes 100/100 on current and pre-PR194 servers). PR230 merged: wait-bound measurement test only. One CI sample wait_ms=1687 with no frame, bytes received not logged: an early kill is not excluded. Kept open until a CI failure with bytes logged appears. 2026-10-09: PR281 merged, evidence-rich shutdown assertions.",
           "log_20261008": [
             "Refs from PR79 (merged): check whether the terminal-frame flake still reproduces after the a4/progress_shutdown measurement fixes; close with evidence or keep.",
             "Launched 2026-10-09: status audit with loop reproduction (N reported), the progress-after-terminal ordering race, drain_and_close doc-vs-code; output docs/reviews/ctl-issues-status-20261009.md.",
@@ -920,7 +920,7 @@
           "pr": "#142",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/142",
           "review_session": "ses_ef61671feffeI79sablUmGp8uv",
-          "status_note": "2026-10-09 audit: request 2 (shared name crate), 3 (hole flag), 5 (deferred-op ctime via Tx::set_now) met; request 1: rename_snapshot met, promote_base still forks twice (replacing an existing name is not a rename, by design); request 4: reservation done, alias table and virt.ino remain; reap met (PR151), modeled crash images met (PR152). Not closable. Latent, unverified: Inner::commit stamp skips set_now when a node is gone (looks unreachable by source reading).",
+          "status_note": "2026-10-09 audit: request 2 (shared name crate), 3 (hole flag), 5 (deferred-op ctime via Tx::set_now) met; request 1: rename_snapshot met, promote_base still forks twice (replacing an existing name is not a rename, by design); request 4: reservation done, alias table and virt.ino remain; reap met (PR151), modeled crash images met (PR152). Not closable. Latent, unverified: Inner::commit stamp skips set_now when a node is gone (looks unreachable by source reading). 2026-10-09 evening: PR280 merged (promote forks once and renames the staged snapshot into place). Follow-ups #286: PR296 merged; PR298 (replace-by-name, one Meta commit) open, CI red at last check and under repair.",
           "issue": 42,
           "owner": "open: alias table + virt.ino removal needs a legacy-store compatibility decision; promote_base double fork; timed session-load and git-status cost blocked on g1/g2",
           "reserved_core_integrated_ubuntu_runtime": "PR142c8398a8 run37552521968 Ubuntu job112571103245 SUCCESS: Core durability7/elide8/names4/reservedidentity4/conformance132/critic2b27 executedPASS, privatelegacy2PASS, Metaunit36 including foreign/refusedclose/postpersist/fixedcostlargePASS, recovery40four/inode_reservation11PASS. Counts separatedbycrate reusedfilenames. Ubuntu+FUSE pass/macOS pending; no merge/whole42claim. Canonical meta42-directory-elision-physical-identity-repair.md.",
@@ -970,7 +970,7 @@
           "pr": "#105",
           "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/105",
           "review_session": "ses_ef697f682ffeREdVREp51FvrVS",
-          "status_note": "2026-10-09: root cause = Linux kernel page cache (POSIX XSH 2.9.7 requires read/write atomicity; cached reads tear on tmpfs, btrfs, ext4 too), not cowfs. With O_DIRECT readers the cowfs mount showed 0 tears in ~78M reads. PR249 merged: O_DIRECT test only, no production change. Design choice left to Zee: FOPEN_DIRECT_IO (atomic cached reads, costs page cache, shared mmap, throughput); recommended: leave. Open: Core test pinning a 4 KiB block across a chunk boundary.",
+          "status_note": "2026-10-09: root cause = Linux kernel page cache (POSIX XSH 2.9.7 requires read/write atomicity; cached reads tear on tmpfs, btrfs, ext4 too), not cowfs. With O_DIRECT readers the cowfs mount showed 0 tears in ~78M reads. PR249 merged: O_DIRECT test only, no production change. Design choice left to Zee: FOPEN_DIRECT_IO (atomic cached reads, costs page cache, shared mmap, throughput); recommended: leave. Open: Core test pinning a 4 KiB block across a chunk boundary. 2026-10-09: PR281 merged an atomic-read test; its read-count floor was flaky under load, fixed by PR306 (#301).",
           "issue": 45,
           "owner": "Space Bunny repair delivered / independent ready-wave13 final-delta review active",
           "detail": "Issue remains open despite FUSE implementation merge. Requires bounded real Linux concurrent reader/writer reproduction with native control; no claim it is resolved by unrelated NFS/resource fixes. Do not alter or dispatch hosted runners to reproduce it.",
@@ -1241,7 +1241,7 @@
           "state": "active",
           "owner": "critics reviewing PR172 and PR180; rows 3-4 queued (cachyos, sudo via .env)",
           "issue": 171,
-          "status_note": "4 of 5 acceptance rows met on main (CI job, cargo canonical build, core-backend base_refresh re-run on cachyos, real lease). Unmet: older kernels; needs a floor decision (cheapest: a second hosted-runner image such as ubuntu-22.04 in linux-namespaces). docs/reviews/namespaces-171-remaining-20261009.md.",
+          "status_note": "4 of 5 acceptance rows met on main (CI job, cargo canonical build, core-backend base_refresh re-run on cachyos, real lease). Unmet: older kernels; needs a floor decision (cheapest: a second hosted-runner image such as ubuntu-22.04 in linux-namespaces). docs/reviews/namespaces-171-remaining-20261009.md. 2026-10-09 evening: PR277 merged, isolation tests also run on ubuntu-22.04 (kernel 6.8); the check roll-up needs every matrix leg.",
           "log_20261008": [
             "Builder launched 2026-10-08 on rows 1 and 2 (branch ci/userns-and-cargo-canonical-171). Rows 3 (real Linux treehouse lease run, needs a Linux host with treehouse) and 4 (btrfs/XFS/older-kernel) not started.",
             "2026-10-08: builder on rows 1-2 running. Rows 3-4 (real Linux treehouse lease run; btrfs/XFS/older-kernel matrix) approved to run on the cachyos box (Zee said yes) but the box is OFFLINE: tailscale shows cachyos-x8664 offline, last seen 44 min before 2026-10-08 evening check, ssh times out. Not started. Prereqs from the cachyos-gpu skill: check disk first, work under /mnt/docs, no passwordless sudo (so no mkfs/loop mounts for btrfs/XFS unless existing partitions are available), no GitHub creds on the box (ship a git archive), launch long jobs with nohup. Box may need to be woken.",
@@ -1535,7 +1535,7 @@
           "title": "#211 PathVfs::mknod chmod follows symlinks + coverage gaps",
           "state": "active",
           "owner": "lead",
-          "status_note": "PR214 (chmod nofollow) and PR250 (CAP_MKNOD probe, model rdev, mknodat_exact with CLONE_FS umask(0)) merged. Open: mount.rs:27 /proc/self root check, root branch never runs in CI, attrs read by name after mknod. Follow-up #254."
+          "status_note": "PR214 (chmod nofollow), PR250 (CAP_MKNOD probe, rdev model, exact-umask mknodat) and PR282 (persistent umask worker, sudo re-run of the root mknod test, capability probes) merged. PR303 open: the by-name fallback chmod (ACL parent or no private umask) now creates under a private temp name and chmods through an O_PATH fd; its critic found a predictable temp name (hard-link swap) and the builder is hardening it (random name, fstat identity check). Stray temp nodes after a crash: #307. Still unchecked: Core rdev model, ctime of fresh special nodes. Issue stays open."
         },
         {
           "id": "254",
@@ -1547,9 +1547,9 @@
         {
           "id": "258",
           "title": "#258 NFS vs FUSE mknod privilege rule",
-          "state": "active",
+          "state": "done",
           "owner": "lead",
-          "status_note": "PR271 open: premise was stale (nfsserve already refused devices for non-root); real gap was two disagreeing rules (NFS refused the 0:0 whiteout). Shared cowfs_vfs::mknod_needs_root used by FUSE and NFS. Critic running."
+          "status_note": "PR271 merged: one mknod privilege rule for FUSE and NFS. Issue closed."
         },
         {
           "id": "252",
@@ -1568,9 +1568,9 @@
         {
           "id": "259",
           "title": "#259 require_treehouse! silent skip in CI",
-          "state": "pending",
+          "state": "done",
           "owner": "lead",
-          "status_note": "CI installs no treehouse and require_treehouse! skips silently: the whole sandbox/treehouse family is a silent pass in CI. Needs ci.yml (owned by PR222 decision)."
+          "status_note": "PR273 merged: CI installs a pinned treehouse and an absent treehouse now fails the run instead of skipping. Issue closed."
         },
         {
           "id": "263",
@@ -1620,6 +1620,132 @@
           "state": "done",
           "owner": "lead",
           "status_note": "PR261 merged: Io::write_at no longer allocates/copies when no crash log is active; oplog compiled only with fault-injection. Measured on cachyos: -2056 allocs, -268 MB over 256 MiB of puts."
+        },
+        {
+          "id": "173",
+          "title": "#173 crash-injection seam: mid-GC, pack-fsync, watermark, metadata-commit orderings (g6)",
+          "state": "active",
+          "owner": "lead",
+          "status_note": "Slice 3 PR274 (power-loss model over compaction and discard) and PR284 (mutants E7/E8 killed, honest crashmodel gate) merged. Slice 4 PR285 (gc under power loss) merged. Slice 5 PR299 (power loss over a whole Core workload, about 3600 images) merged with a MERGE verdict; survivors I2/I4 justified as equivalent. Open: daemon --fault-boundary sweep (needs an NFS mount and the 300 MiB fixture) and follow-ups #302 (repro trace, post-swap target use, CI timings). Issue stays open.",
+          "issue": 173
+        },
+        {
+          "id": "276",
+          "title": "#276 crash-injection slice 3 follow-ups",
+          "state": "active",
+          "owner": "lead",
+          "status_note": "Every code item was already fixed by PR284 (checked 2026-10-09 against main). Only the daemon --fault-boundary 1-60 sweep is open. Candidate to close once that runs.",
+          "issue": 276
+        },
+        {
+          "id": "302",
+          "title": "#302 power_core follow-ups from PR299 critic",
+          "state": "ready",
+          "owner": "lead",
+          "status_note": "Builder running: op trace on failure, post-swap target use (mutant I4), CI timings in docs/crash-injection-173.md.",
+          "issue": 302
+        },
+        {
+          "id": "265",
+          "title": "#265 g2 PR257 critic notes",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR278 merged. Issue closed.",
+          "issue": 265
+        },
+        {
+          "id": "283",
+          "title": "#283 macOS CI flake: nested cargo test progress_shutdown",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR293 merged: the nested cargo test in real_project_acceptance runs only deterministic cowfs-ctl tests (--lib --test wire). Cause is a hypothesis from the CI log; a loaded reproduction was not done. Coverage lost: admission, progress_shutdown, regress, server and flood binaries no longer run nested (they still run in the main nextest run).",
+          "issue": 283,
+          "pr": "#293",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/293"
+        },
+        {
+          "id": "286",
+          "title": "#286 promote_base single-fork follow-ups",
+          "state": "active",
+          "owner": "lead",
+          "status_note": "PR296 merged (fault 6/7 seams, intent-removal errors reported, per-path fault table). PR298 open (replace-by-name closes the last promote window, D13): critic rounds 1 and 2 done, builder added commit-fault tests through move_name and a re-read rollback; CI red at head cf02145, being diagnosed. Related race: #300.",
+          "issue": 286,
+          "pr": "#298",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/298"
+        },
+        {
+          "id": "287",
+          "title": "#287 nfsserve retransmit and failed reply-write handling",
+          "state": "active",
+          "owner": "lead",
+          "status_note": "PR294 merged: handler watchdog answers a never-completing call with JUKEBOX, cache slot freed. Known hazard, documented at Limits::handler_timeout: a cancelled non-idempotent call can still complete, so the retry may see NOENT/EXIST. Items 2, 3 and 5 stay open. The live daemon uses the vendored nfsserve copy in spikes/nfs-loopback/vendor, which PR294 does not touch, so the live mount is not fixed until it is re-vendored.",
+          "issue": 287,
+          "pr": "#294",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/294"
+        },
+        {
+          "id": "288",
+          "title": "#288 cowfs-gc mark.bin checksum",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR295 merged: BLAKE3 over the whole file (COWMARK4), a bad or old-format file triggers a full walk. Cosmetic: a stale COWMARK3 doc comment in state.rs line 20.",
+          "issue": 288,
+          "pr": "#295",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/295"
+        },
+        {
+          "id": "289",
+          "title": "#289 live mount hang in the macOS Quarantine hook on NFS",
+          "state": "blocked",
+          "owner": "lead",
+          "status_note": "Open. Hypothesis from a spindump (git and treehouse stuck in the kernel Quarantine hook, AppleDouble xattr emulation, daemon idle). Not verified. Related symptom: treehouse return hangs inside the mount and leaves a lease detached but leased (seen 2026-10-09, not diagnosed).",
+          "issue": 289
+        },
+        {
+          "id": "290",
+          "title": "#290 import drops mtimes and hardlinks",
+          "state": "done",
+          "owner": "lead",
+          "status_note": "PR297 merged: mtimes and in-tree hardlinks kept, verify compares mtime and link identity, progress through hash and fsck (total None for the hash phase). Before/after numbers in the PR body are author-run and unverified.",
+          "issue": 290,
+          "pr": "#297",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/297"
+        },
+        {
+          "id": "300",
+          "title": "#300 swap: no per-target lock in core; import-replace can race swap",
+          "state": "pending",
+          "owner": "lead",
+          "status_note": "Open, found by the PR296 builder by code reading, not reproduced. Daemon swap vs swap is serialised; the replacing import holds neither lock across ingest.",
+          "issue": 300
+        },
+        {
+          "id": "301",
+          "title": "#301 flaky read_atomic_across_chunk_boundary read-count floor",
+          "state": "active",
+          "owner": "lead",
+          "status_note": "PR306 open, CI green: the writer runs until the readers did MIN_READS, torn-read assertions unchanged; reproduced once under load, 72 loaded runs pass, a torn-read mutant dies in 0.46 s. Critic running.",
+          "issue": 301,
+          "pr": "#306",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/306"
+        },
+        {
+          "id": "305",
+          "title": "#305 nfs: mount-time retry, rotate export path on rearm",
+          "state": "pending",
+          "owner": "lead",
+          "status_note": "Follow-ups from the PR304 critic (refs #262). PR279 (NULL-flood eviction) and PR304 (test-only pin of the residual, server fixes declined) merged. #262 stays open.",
+          "issue": 305,
+          "pr": "#304",
+          "pr_url": "https://github.com/zeeshanhaque21/cowfs/pull/304"
+        },
+        {
+          "id": "307",
+          "title": "#307 PathVfs::mknod stray temp nodes after a crash",
+          "state": "pending",
+          "owner": "lead",
+          "status_note": "Open, found by the PR303 critic.",
+          "issue": 307
         }
       ]
     },
@@ -1648,7 +1774,7 @@
           "detail": "Requires a matched large tracked real-core tree and private release daemon under quiet load. Earlier passthrough figures are scoped spike evidence, not a current acceptance PASS. Performance trials must not run concurrently with the active build/test lanes.",
           "gate_change_20261009": "Bar changed by Zee: native APFS (this Mac) plus a Linux native filesystem on the cachyos box (btrfs root); ext4 on moonscape dropped.",
           "owner": "DECISION for Zee: Linux g2 bar (absolute added-seconds budget like macOS, or a different edit)",
-          "status_note": "Merged doc records the OPEN DECISION: Linux g2 fails by construction (no absolute added-seconds budget off macOS). Also: gates.py comment 'nothing depends on cowfs-vfs-path' is false (documented, code untouched).",
+          "status_note": "Merged doc records the OPEN DECISION: Linux g2 fails by construction (no absolute added-seconds budget off macOS). Also: gates.py comment 'nothing depends on cowfs-vfs-path' is false (documented, code untouched). 2026-10-09: PR278 merged (g2 measuring platform, g12 mixed-run receipt, g2_decision pin; fixes #265).",
           "log_20261008": [
             "2026-10-09 PR202 critic (BLOCK, doc-only, docs/reviews/202-critic-20261009.md): code sound, CI 4/4 on 5d563f4, 32 test_g12_run tests ok in the ubuntu log, no Linux branch loosens a refusal. FINDING: harness g2 (git status/edit) appends a comment to cowfs-vfs-path/src/cookies.rs; after that rep only cowfs_vfs_path is rewritten, nothing downstream relinks, so g2 = cargo freshness scan + one small incremental rustc; FUSE overhead ~0.2 s = 2.7x ratio. macOS has an absolute added-seconds budget (1.0 s, issue 18); Linux has none, so LINUX g2 FAILS BY CONSTRUCTION. lsample3 (one rep, NOT a gate result) also: g2 2.83/2.69 FAIL, g3 2.12/3.60 FAIL, g1 1.20/1.18. The gates.py comment 'nothing depends on cowfs-vfs-path' is false (ctl, daemon, fuse, gc, nfs depend on it). Builder fixing the doc (all ratios quoted; explanation; open decision).",
             "Merged doc records the OPEN DECISION: Linux g2 fails by construction (no absolute added-seconds budget off macOS). Also: gates.py comment 'nothing depends on cowfs-vfs-path' is false (documented, code untouched)."
@@ -1864,5 +1990,6 @@
   "dependencies_note": "A depends on B means B must finish before A. Hand-curated 2026-10-09 from the tracker notes; edit this map when the plan changes. Read by progress/graph.html.",
   "bar_history": [
     "2026-10-09 (Zee): gate changed from 'native APFS and ext4 (moonscape)' to 'native APFS plus a Linux native filesystem on cachyos'. The cachyos root is btrfs, so the Linux number is a btrfs number; an ext4 loop image under /mnt/docs may be added as a labelled proxy, not as the gate."
-  ]
+  ],
+  "update_20261009_evening": "Merged since the morning update: #273 #274 #275 #277 #278 #279 #280 #281 #282 #284 #285 #291 #292 #293 #294 #295 #296 #297 #299 #304 (#222 #271 #272 earlier). Open: #298 (CI red, being fixed), #303 (hardening after critic), #306 (critic running). Builders running: #302. Process: every PR gets a fresh-context critic before merge; MERGE-AFTER-FIXES goes back to the builder. Known tooling problem: treehouse return hangs inside the cowfs mount (#289 hypothesis), so leases 1 to 4 are left held."
 }
