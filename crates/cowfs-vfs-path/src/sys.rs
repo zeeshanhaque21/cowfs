@@ -6,7 +6,9 @@
 
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("cowfs-vfs-path supports Linux and macOS only");
@@ -301,13 +303,6 @@ fn run_with_private_umask<R: Send>(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn with_private_umask<R: Send>(
-    _: impl FnOnce() -> io::Result<R> + Send,
-) -> io::Result<Option<R>> {
-    Ok(None)
-}
-
 /// Whether a thread may detach its own umask, which `mknodat_exact` and `mkdirat_exact` need.
 #[cfg(target_os = "linux")]
 pub fn private_umask_available() -> bool {
@@ -339,6 +334,7 @@ struct Worker {
 /// and a panic inside a job comes back as an error without killing the worker. After a `fork`
 /// only the forking thread exists in the child, so a worker started by the parent is abandoned
 /// (leaked, never joined) and a fresh one is started on the next call, rather than hanging.
+#[cfg_attr(not(target_os = "linux"), derive(Default))]
 pub struct UmaskWorker {
     #[cfg(target_os = "linux")]
     live: Option<Worker>,
@@ -350,6 +346,7 @@ pub struct UmaskWorker {
     unshare: fn() -> Result<(), i32>,
 }
 
+#[cfg(target_os = "linux")]
 impl Default for UmaskWorker {
     fn default() -> Self {
         Self {

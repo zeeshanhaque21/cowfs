@@ -59,9 +59,12 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, SystemTime};
 
 use cowfs_vfs::FallocMode;
@@ -754,6 +757,7 @@ fn mknod_private(
 /// failed `rmdir` only leaves a stray scratch directory behind (cleared by
 /// `sweep_stale_mknod_scratch` on a later call, #307) -- never a reason to fail an otherwise-
 /// successful mknod. On failure, `made`'s error is the real one; `removed`'s is incidental.
+#[cfg(target_os = "linux")]
 fn keep_make_despite_failed_cleanup(
     made: io::Result<()>,
     removed: io::Result<()>,
@@ -768,6 +772,7 @@ fn keep_make_despite_failed_cleanup(
 /// treats it as abandoned (by a crash, or a `rmdir` ignored after a successful rename, #307)
 /// rather than owned by a call still in flight. `mknod_private` does a handful of syscalls
 /// between making the scratch directory and removing it; a minute is generous.
+#[cfg(target_os = "linux")]
 const STALE_MKNOD_SCRATCH_AGE: Duration = Duration::from_secs(60);
 
 /// Best-effort sweep of `dir` for abandoned `.cowfs-mknod-*` scratch directories, run lazily at
