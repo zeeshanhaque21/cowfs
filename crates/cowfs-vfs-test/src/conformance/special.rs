@@ -8,6 +8,7 @@
 
 use cowfs_vfs::{makedev, Error, FileKind, RenameFlags, SetAttr, SetTime, Timestamp, ROOT_INO};
 
+use super::basic::near;
 use super::{Ctx, Failure, Outcome};
 
 const ALL_KINDS: [(FileKind, u64); 4] = [
@@ -126,6 +127,27 @@ pub fn mknod_device_attrs_keep_rdev(c: &Ctx) -> Outcome {
             e.map(|e| (e.entry.kind, e.attr.rdev)),
             Some((kind, rdev)),
             "readdir_attrs for {kind:?}"
+        );
+    }
+    Ok(())
+}
+
+/// `ctime` on a freshly made special node must sit at the wall clock of creation: not zero,
+/// not drifted from "now", for every kind `mknod` can produce (mirrors
+/// `timestamps_track_wall_clock`, which only covers regular files).
+pub fn mknod_ctime_is_wall_clock(c: &Ctx) -> Outcome {
+    for (kind, rdev) in kinds(c)? {
+        let before = Timestamp::now();
+        let a = c.mknod(ROOT_INO, &name(kind), kind, 0o600, rdev)?;
+        let after = Timestamp::now();
+        ensure!(
+            a.ctime.secs != 0,
+            "ctime is zero for a freshly made {kind:?}"
+        );
+        ensure!(
+            near(a.ctime, before, after),
+            "ctime {:?} not within [{before:?}, {after:?}] for {kind:?}",
+            a.ctime
         );
     }
     Ok(())

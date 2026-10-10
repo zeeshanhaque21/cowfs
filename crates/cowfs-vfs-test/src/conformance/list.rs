@@ -132,6 +132,7 @@ macro_rules! __conformance_checks {
                 (special, mknod_socket_attrs, Cowfs),
                 (special, mknod_masks_mode, Cowfs),
                 (special, mknod_device_attrs_keep_rdev, Cowfs),
+                (special, mknod_ctime_is_wall_clock, Portable),
                 (special, mknod_whiteout_char_device, Cowfs),
                 (special, mknod_existing_is_exists, Cowfs),
                 (special, mknod_in_file_is_not_dir, Cowfs),
