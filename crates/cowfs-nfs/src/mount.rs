@@ -252,11 +252,14 @@ impl Server {
     /// same path would let anyone who read that table race the next legitimate remount for
     /// the root handle. A fresh path closes that window without needing a fresh server.
     pub fn rearm_mount(&self) {
+        // Rotate first, then open the gate: the other order leaves a window where the gate is
+        // open on the old path a mount-table reader already knows. If no fresh path can be
+        // made the gate stays shut (the remount then fails as `RootHandleTaken`), never open on
+        // the old path.
+        let Ok(next) = secret_path() else { return };
+        *self.export.lock().unwrap_or_else(PoisonError::into_inner) = format!("/{next}");
         if let Some(g) = &self.gate {
             g.rearm();
-        }
-        if let Ok(next) = secret_path() {
-            *self.export.lock().unwrap_or_else(PoisonError::into_inner) = format!("/{next}");
         }
     }
 }
