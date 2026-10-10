@@ -38,9 +38,13 @@ const BLOCK: usize = 4096;
 const IMAGE: usize = 1 << 20;
 const VERSIONS: usize = 8;
 const READERS: usize = 3;
-/// The run stops at this, so a slow machine does fewer iterations instead of hanging.
-const CAP: Duration = Duration::from_secs(8);
+/// Hang guard only. A healthy run ends on progress (below), never on this, so load cannot starve
+/// the assertions: the writer keeps writing until the readers have done their share of reads.
+const CAP: Duration = Duration::from_secs(120);
+/// The writer does at least this many writes, and keeps writing until the readers have done at
+/// least `MIN_READS` reads while it ran. Both are progress targets, not wall-clock ones (#301).
 const WRITES: usize = 4000;
+const MIN_READS: usize = 1000;
 
 fn cuts(image: &[u8]) -> Vec<usize> {
     let mut at = 0;
@@ -151,11 +155,13 @@ fn run(opts: Options, arm: &str) {
                 seen.fetch_max(kinds.iter().filter(|k| **k).count(), Relaxed);
             });
         }
-        for i in 0..WRITES {
-            if start.elapsed() > CAP {
-                break;
-            }
+        let mut i = 0;
+        while (i < WRITES || reads.load(Relaxed) < MIN_READS)
+            && torn.load(Relaxed) == 0
+            && start.elapsed() < CAP
+        {
             last = (i + 1) % VERSIONS;
+            i += 1;
             let n = fs.write(ino, off, &l.versions[last]).unwrap();
             assert_eq!(n as usize, BLOCK, "short write");
         }
@@ -177,7 +183,10 @@ fn run(opts: Options, arm: &str) {
         first_tear.lock().unwrap()
     );
     // Not vacuous: readers ran, and at least one of them saw the block change under it.
-    assert!(reads >= 1000, "only {reads} reads ran");
+    assert!(
+        reads >= MIN_READS,
+        "only {reads} reads ran in {CAP:?}: the readers were starved, not the atomicity broken"
+    );
     assert!(
         seen.load(Relaxed) >= 2,
         "no reader saw more than one version, so the race never happened"
