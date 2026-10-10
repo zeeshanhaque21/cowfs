@@ -402,7 +402,18 @@ One table, `error::from_meta` and `error::from_store`, tested case by case.
 
 There is ONE global order, and it is enforced by construction rather than by inspection:
 
-0. **The reference gate** (`src/gate.rs`) is outermost.
+**Above rule 0: the per-target swap lock** (`Core::lock_target`, `src/swap.rs`) is the outermost lock of all.
+`swap_snapshot` (so `promote_base`) and `ingest_with` (so `ingest` and `ingest_replacing`) take it first and hold it to the end of the call, because they share one staging name and one intent file per target (issue 300).
+A second call on the same target name waits; calls on other targets do not.
+It is taken only by those two entry points, never while holding another lock of ours, and never twice in one call, so it cannot be part of a cycle.
+Its set mutex (`swap_targets`) is a leaf held only to insert or remove a name.
+Daemon locks (`HolderGuard`, `bases.exclusive`) are taken above it and are never taken by the core.
+Not covered: `rename_snapshot`, `remove_snapshot` and `fork_snapshot` do not take it, so renaming or removing the target while a promote or import of it runs still races (issue 315).
+Not covered: the lock is keyed by target name, while two targets whose staging hashes collide share one staging snapshot (a 64-bit FNV collision; `clear_leftover` only guards the intent-file case).
+A waiter has no cancel hook, no timeout and no fairness (issue 316).
+Tests (`tests/swap_concurrent.rs`): `a_promote_during_a_replacing_import_of_the_same_target_does_not_break_the_import`, `two_replacing_imports_of_the_same_target_run_one_after_the_other`, `racing_promotes_of_one_target_leave_one_clean_result`.
+
+0. **The reference gate** (`src/gate.rs`) is outermost of the rules below.
    A thread enters it before it takes `SnapCtx::ns`, `SnapCtx::flush`, a node lock or meta's lock, and only while it may store a chunk or commit a chunk list: `flush_snapshot`, `barrier`, and `setattr` with a size.
    `Blocks::put` takes the gate's `Entry`, so a store write outside the gate does not compile.
    A caller that already holds a node write lock (`op_write`'s threshold flush, `relieve`) uses `try_enter` and leaves its bytes dirty when the gate is closed, so nothing parks at the gate while holding a node lock.
@@ -447,6 +458,7 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `gate::waiting` | leaf | 1 |
 | `gate::drop` | leaf | 1 |
 | `gate::a_nested_enter_is_admitted_while_a_barrier_drains` | leaf | 1 |
+| `import::ingest_with` | target | 0 |
 | `inner::snapctx_id` | leaf | 1 |
 | `inner::all_snaps` | leaf | 1 |
 | `inner::take_reserved` | leaf | 1 |
@@ -492,7 +504,7 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `io::op_setxattr` | sc.ns, st.wr, snap. | 1 then 2 then 3 |
 | `io::op_removexattr` | sc.ns, st.wr | 1 then 2 |
 | `lib::shutdown` | leaf | 1 |
-| `lib::from_parts` | nodes, dents, aliases, handles, root_time, pressure, unsynced, last_error | 2 then leaf |
+| `lib::from_parts` | target, nodes, dents, aliases, handles, root_time, pressure, unsynced, last_error | 0 then 2 then leaf |
 | `lib::fork_snapshot` | snap. | 3 |
 | `lib::move_name` | root_time | leaf |
 | `lib::list_snapshots` | leaf | 1 |
@@ -532,7 +544,9 @@ exactly what the generator produces from `crates/cowfs-core/src`.
 | `ns::refresh_dir_attr` | st.wr, snap. | 2 then 3 |
 | `swap::recover_intent` | last_error | leaf |
 | `swap::recover` | last_error | leaf |
-| `swap::swap_snapshot` | last_error | leaf |
+| `swap::drop` | target | 0 |
+| `swap::lock_target` | target | 0 |
+| `swap::swap_snapshot` | target, last_error | 0 then leaf |
 | `swap::stage_and_intent` | snap. | 3 |
 | `swap::parent_of` | snap. | 3 |
 | `swap::drop_intent` | last_error | leaf |
