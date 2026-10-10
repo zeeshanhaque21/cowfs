@@ -13,6 +13,11 @@ blake3.workspace = true
 redb = "4.3"
 thiserror.workspace = true
 
+[features]
+# Test seam for cowfs-core: `Meta::set_commit_fault`. No production caller enables it
+# (scripts/check-fault-seam-absent.sh guards it through cowfs-core).
+fault-injection = []
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true

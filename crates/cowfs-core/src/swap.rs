@@ -21,9 +21,8 @@
 //!    target is removed, in one metadata transaction,   <- rollback is no longer possible
 //! 4. remove the intent file; a failure is reported and a leftover file is dropped on open.
 //!
-//! A crash, or a step 3 commit error that a re-read cannot show did not land, leaves the intent
-//! file, and the next `Core::open` finishes the
-//! swap before serving anything. A swap or replacing import of a target with a pending intent
+//! A crash, or a step 3 commit error whose outcome a re-read cannot establish, leaves the intent
+//! file, and the next `Core::open` finishes the swap before serving anything. A swap or replacing import of a target with a pending intent
 //! finishes that intent first (`Core::recover_target`), so a retry never deletes the only copy of a
 //! tree. A crash before step 3 leaves a hidden staging snapshot with no intent file; `Core::open`
 //! removes every such orphan once the intents are recovered, before anything can stage a new one,
@@ -67,8 +66,8 @@ fn intent_path(root: &Path, target: &str) -> PathBuf {
 thread_local! {
     /// Test seam: makes `finish_swap` fail, the one step `set_swap_fault` cannot reach at open.
     static FAIL_FINISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Test seam: the replace commit returns an error without writing anything.
-    static FAIL_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: the re-read after a failed replace commit cannot be read.
+    static FAIL_REREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test seam: forces every staging name's hash, to build the collision a real name pair needs
     /// a 2^32 search for.
     static HASH_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -448,7 +447,9 @@ impl Core {
     ///
     /// Removal errors are ignored on purpose: the caller is already returning the error that got
     /// us here, and a leftover intent or temp file is handled by the next call for this target or
-    /// the next open (`recover_target`, `recover`).
+    /// the next open (`recover_target`, `recover`). That includes a failed `unregister` of the
+    /// staging snapshot (a poisoned database): with the intent gone, the orphan sweep in
+    /// `Core::open` removes the leftover staging row.
     fn rollback(&self, staged: &str, target: &str) {
         if let Ok(sc) = self.inner.snap_by_name_raw(staged) {
             let _ = self.inner.unregister(&sc);
@@ -525,15 +526,7 @@ impl Core {
                             .map_err(|e| unwind(e.into()))?;
                         // the intent file and its directory entry are durable: the old tree may go
                         crate::fsops::note("victim_removed");
-                        #[cfg(test)]
-                        let injected = FAIL_COMMIT.with(std::cell::Cell::get);
-                        #[cfg(not(test))]
-                        let injected = false;
-                        let moved = if injected {
-                            Err(io("injected commit failure"))
-                        } else {
-                            self.move_name(&sc, staged, target, Some(&old))
-                        };
+                        let moved = self.move_name(&sc, staged, target, Some(&old));
                         entry = Some(match moved {
                             Err(ControlError::Busy) => return Err(unwind(ControlError::Busy)),
                             // A commit error: roll back only when the file provably still has the
@@ -566,6 +559,10 @@ impl Core {
     /// True when the metadata file, re-read now, still has snapshot `old` under `target` and
     /// snapshot `new` under `staged`: a failed replace commit changed nothing.
     fn replace_did_not_land(&self, old: u64, new: u64, staged: &str, target: &str) -> bool {
+        #[cfg(test)]
+        if FAIL_REREAD.with(std::cell::Cell::get) {
+            return false;
+        }
         self.inner.meta.durable_snapshots().is_ok_and(|rows| {
             let name_of = |id: u64| rows.iter().find(|r| r.id.0 == id).map(|r| r.name.as_str());
             name_of(old) == Some(target) && name_of(new) == Some(staged)
@@ -890,28 +887,50 @@ mod tests {
         c.release(h).unwrap();
     }
 
-    /// A replace commit that fails and provably changed nothing is rolled back like a failure
-    /// before it: the old target stays live and writable and no intent is left for a restart.
-    #[test]
-    fn a_commit_error_that_did_not_land_is_rolled_back_not_left_pending() {
-        let dir = tempfile::tempdir().unwrap();
-        let c = Core::open(
-            dir.path(),
+    fn open_core(dir: &Path) -> Core {
+        Core::open(
+            dir,
             crate::Options {
                 background: false,
                 ..Default::default()
             },
         )
-        .unwrap();
-        c.create_snapshot("src").unwrap();
-        c.create_snapshot("abc").unwrap();
+        .unwrap()
+    }
+
+    /// Stages `src` (holding file `f`) over `abc` and runs the live finish with the meta commit
+    /// fault `fault` and, optionally, an unreadable re-read. Returns the call's result.
+    fn finish_with(c: &Core, fault: u8, reread_fails: bool) -> Result<SnapshotEntry, ControlError> {
+        let root = c.lookup(ROOT_INO, b"src").unwrap().ino;
+        c.create(root, b"f", 0o644).unwrap();
         let staged = staging_name("abc");
         let src = c.inner.snap_by_name("src").unwrap();
+        c.inner.flush_snapshot(&src).unwrap();
         c.stage_and_intent(&src, &staged, "abc").unwrap();
-        FAIL_COMMIT.with(|f| f.set(true));
+        FAIL_REREAD.with(|f| f.set(reread_fails));
+        c.inner.meta.set_commit_fault(fault);
         let r = c.finish_live(&staged, "abc");
-        FAIL_COMMIT.with(|f| f.set(false));
-        assert!(r.is_err());
+        c.inner.meta.set_commit_fault(0);
+        FAIL_REREAD.with(|f| f.set(false));
+        r
+    }
+
+    fn has_f(c: &Core, snap: &[u8]) -> bool {
+        let root = c.lookup(ROOT_INO, snap).unwrap().ino;
+        c.lookup(root, b"f").is_ok()
+    }
+
+    /// A replace commit that fails before anything is written (through `move_name`, so the
+    /// victim's `removed` flag is set and undone) provably changed nothing: rolled back like a
+    /// failure before it, the old target live and writable, no intent for a restart.
+    #[test]
+    fn a_commit_error_that_did_not_land_is_rolled_back_not_left_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_core(dir.path());
+        c.create_snapshot("src").unwrap();
+        c.create_snapshot("abc").unwrap();
+        assert!(finish_with(&c, 1, false).is_err());
+        let staged = staging_name("abc");
         assert!(
             !intent_path(&c.inner.root, "abc").exists(),
             "no intent left"
@@ -920,6 +939,59 @@ mod tests {
             c.inner.snap_by_name_raw(&staged).is_err(),
             "staging dropped"
         );
-        assert!(c.inner.snap_by_name("abc").is_ok());
+        assert!(
+            !has_f(&c, b"abc"),
+            "the old target is still the one answering"
+        );
+        let root = c.lookup(ROOT_INO, b"abc").unwrap().ino;
+        c.create(root, b"g", 0o644).unwrap();
+    }
+
+    /// The data-loss direction: a commit that landed but returned `Err` must keep the intent and
+    /// the staging snapshot (a rollback would delete the only copy of the new tree's name), and
+    /// the next open installs the new tree.
+    #[test]
+    fn a_commit_that_landed_but_returned_an_error_keeps_the_intent_and_rolls_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let c = open_core(dir.path());
+            c.create_snapshot("src").unwrap();
+            c.create_snapshot("abc").unwrap();
+            assert!(finish_with(&c, 2, false).is_err());
+            assert!(intent_path(&c.inner.root, "abc").exists(), "intent kept");
+            assert!(
+                c.inner
+                    .meta
+                    .durable_snapshots()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.name == staging_name("abc") || r.name == "abc"),
+                "the new tree is still named in the file"
+            );
+        }
+        let c = open_core(dir.path());
+        assert!(has_f(&c, b"abc"), "the new tree is installed");
+        assert!(!intent_path(&c.inner.root, "abc").exists());
+        assert!(c.inner.snap_by_name_raw(&staging_name("abc")).is_err());
+    }
+
+    /// An unreadable re-read is an unknown outcome: the intent stays even though nothing landed,
+    /// and the next open rolls forward.
+    #[test]
+    fn an_unreadable_reread_after_a_commit_error_keeps_the_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let c = open_core(dir.path());
+            c.create_snapshot("src").unwrap();
+            c.create_snapshot("abc").unwrap();
+            assert!(finish_with(&c, 1, true).is_err());
+            assert!(intent_path(&c.inner.root, "abc").exists(), "intent kept");
+            assert!(
+                c.inner.snap_by_name_raw(&staging_name("abc")).is_ok(),
+                "staging kept"
+            );
+        }
+        let c = open_core(dir.path());
+        assert!(has_f(&c, b"abc"), "the new tree is installed");
     }
 }
