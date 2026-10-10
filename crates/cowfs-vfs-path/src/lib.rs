@@ -688,14 +688,17 @@ fn mode_may_change(dir: std::os::fd::BorrowedFd<'_>, new_dir: bool) -> bool {
 }
 
 /// `mknodat` of `name` with exactly `mode`, for when the creation mode cannot be trusted. The node
-/// is made under a random 128-bit name, opened without following symlinks and checked to be the
-/// node just made (the requested type, one link), chmod'ed through that descriptor, then renamed
-/// to `name` without replacing anything (`EEXIST` if it exists).
+/// is made inside a private scratch directory (random 128-bit name, mode 0700, owned by this
+/// process), which no other uid can enter, so nobody else can put anything at the node's name
+/// there. It is opened without following symlinks, checked against the `fstatat` taken right
+/// after `mknodat` (same device and inode), chmod'ed through that descriptor, renamed out to
+/// `name` without replacing anything (`EEXIST` if it exists) and the scratch directory removed.
+/// Every error path removes both.
 ///
-/// Linux only, and it needs `/proc` (the descriptor chmod goes through `/proc/self/fd`) and a
-/// filesystem with `RENAME_NOREPLACE`; without those it fails with `ENOTSUP`, it does not fall
-/// back to a chmod by name. A crash between the `mknodat` and the rename leaves a stray
-/// `.cowfs-mknod-<hex>` node behind; nothing sweeps it (tracked in a follow-up issue).
+/// Linux only. The descriptor chmod goes through `/proc/self/fd`: without `/proc` it fails with
+/// that call's own errno (`ENOENT`), not `ENOTSUP`. A filesystem or kernel without
+/// `RENAME_NOREPLACE` (`EINVAL`/`ENOSYS` from the rename) gives `ENOTSUP`; nothing falls back to
+/// a chmod by name. A crash mid-call leaves a stray `.cowfs-mknod-<hex>` directory (see #307).
 #[cfg(target_os = "linux")]
 fn mknod_private(
     dir: std::os::fd::BorrowedFd<'_>,
@@ -703,37 +706,50 @@ fn mknod_private(
     ty_mode: u32,
     rdev: u64,
 ) -> io::Result<()> {
-    use std::io::Read;
-    let mut rnd = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut rnd)?;
-    let tmp: String = rnd
+    const NODE: &[u8] = b"n";
+    let scratch: String = sys::random16()?
         .iter()
         .fold(".cowfs-mknod-".into(), |s, b| s + &format!("{b:02x}"));
-    let tmp = tmp.as_bytes();
-    let ty = ty_mode & !MODE_MASK;
-    sys::mknodat(dir, tmp, ty | 0o600, rdev)?;
-    let done = sys::openat(dir, tmp, sys::OPEN_SPECIAL, 0)
-        .and_then(|fd| {
-            let st = sys::fstat(fd.as_fd())?;
-            made_node(&st, ty)?;
-            sys::chmod_fd(fd.as_fd(), ty_mode & MODE_MASK)
-        })
-        .and_then(|()| sys::renameat(dir, tmp, dir, name, true))
-        .map_err(|e| match e.raw_os_error() {
-            Some(libc::EINVAL | libc::ENOSYS) => io::Error::from_raw_os_error(libc::ENOTSUP),
-            _ => e,
-        });
-    if done.is_err() {
-        let _ = sys::unlinkat(dir, tmp, false);
-    }
-    done
+    let scratch = scratch.as_bytes();
+    sys::mkdirat(dir, scratch, 0o700)?;
+    let made = (|| {
+        let sd = sys::openat(
+            dir,
+            scratch,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )?;
+        // The name could have been swapped for someone else's directory before the open.
+        let st = sys::fstat(sd.as_fd())?;
+        if st.uid != sys::geteuid() || st.mode & 0o077 != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        let ty = ty_mode & !MODE_MASK;
+        let result = (|| {
+            sys::mknodat(sd.as_fd(), NODE, ty | 0o600, rdev)?;
+            let want = sys::fstatat(sd.as_fd(), NODE)?;
+            let fd = sys::openat(sd.as_fd(), NODE, sys::OPEN_SPECIAL, 0)?;
+            made_node(&sys::fstat(fd.as_fd())?, &want, ty)?;
+            sys::chmod_fd(fd.as_fd(), ty_mode & MODE_MASK)?;
+            sys::renameat(sd.as_fd(), NODE, dir, name, true).map_err(|e| match e.raw_os_error() {
+                Some(libc::EINVAL | libc::ENOSYS) => io::Error::from_raw_os_error(libc::ENOTSUP),
+                _ => e,
+            })
+        })();
+        if result.is_err() {
+            let _ = sys::unlinkat(sd.as_fd(), NODE, false);
+        }
+        result
+    })();
+    let removed = sys::unlinkat(dir, scratch, true);
+    made.and(removed)
 }
 
-/// Whether `st` can be the node `mknod_private` just made: the requested file type and one link.
-/// Anything else was put at the temporary name by someone else.
+/// Whether `got` (the opened descriptor) is the node `mknodat` just made (`want`): the same
+/// device and inode, of the requested type `ty`.
 #[cfg(target_os = "linux")]
-fn made_node(st: &sys::Stat, ty: u32) -> io::Result<()> {
-    if st.mode & libc::S_IFMT == ty && st.nlink == 1 {
+fn made_node(got: &sys::Stat, want: &sys::Stat, ty: u32) -> io::Result<()> {
+    if got.dev == want.dev && got.ino == want.ino && got.mode & libc::S_IFMT == ty {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(libc::EIO))

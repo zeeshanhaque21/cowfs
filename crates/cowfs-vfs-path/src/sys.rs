@@ -530,6 +530,30 @@ pub fn chmod_fd(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// The effective user id.
+#[cfg(target_os = "linux")]
+pub fn geteuid() -> u32 {
+    // SAFETY: no arguments, cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// 16 bytes from the kernel's random source (`getrandom(2)`, no descriptor, never short).
+#[cfg(target_os = "linux")]
+pub fn random16() -> io::Result<[u8; 16]> {
+    let mut b = [0u8; 16];
+    // SAFETY: a valid buffer of the stated length.
+    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+    if n == 16 {
+        Ok(b)
+    } else {
+        Err(if n < 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::from_raw_os_error(libc::EIO)
+        })
+    }
+}
+
 pub fn mkdirat(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<()> {
     let name = cstr(name)?;
     // SAFETY: see module docs.
