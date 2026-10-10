@@ -234,7 +234,7 @@ fn start_hidden(vfs: Arc<Watched>) -> (cowfs_nfs::Server, Nfs) {
     };
     opts.check_peer_uid = false;
     let server = cowfs_nfs::Server::start(vfs.clone(), &opts, None).unwrap();
-    let c = Nfs::connect(server.port(), server.export_name());
+    let c = Nfs::connect(server.port(), &server.export_name());
     (server, c)
 }
 

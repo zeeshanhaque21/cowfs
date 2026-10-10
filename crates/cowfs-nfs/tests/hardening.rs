@@ -39,14 +39,24 @@ fn only_the_first_mnt_gets_the_root_handle() {
     );
 
     s.rearm_mount();
+    let rotated = format!("/{}", s.export_name());
+    assert_ne!(
+        rotated, own,
+        "rearm rotates the export path so the old, now-public one cannot be replayed (#305)"
+    );
     let mut again = Nfs::attach(s.port(), nfs_fh3::default());
     assert_eq!(
         again.mount_path(&own).0,
-        0,
-        "a deliberate remount is possible after rearm"
+        MNT_NOENT,
+        "the old path is dead, even for a deliberate remount"
     );
     assert_eq!(
-        other.mount_path(&own).0,
+        again.mount_path(&rotated).0,
+        0,
+        "a deliberate remount is possible on the rotated path after rearm"
+    );
+    assert_eq!(
+        other.mount_path(&rotated).0,
         MNT_ACCES,
         "and closes the gate behind it"
     );
@@ -744,4 +754,35 @@ fn the_pinged_nfs_socket_falls_to_cap_newer_connections() {
 #[ignore = "known limit #262: a port-only attacker can evict the kernel's pre-MNT socket"]
 fn the_pinged_nfs_socket_survives_any_number_of_later_connections() {
     assert!(pinged_socket_survives(64));
+}
+
+#[test]
+fn a_bounded_retry_gets_in_after_the_flood_evicts_the_mnt_attempt() {
+    // Same eviction rule as `pinged_socket_falls_to_cap_newer_connections`, but this time it
+    // is the connection meant to carry the real client's MNT that is still zero-served and
+    // oldest when it is sacrificed, not the NFS data socket - the startup window #305 added a
+    // bounded `Mount::new` retry for.
+    let (s, _flood) = flooded_server();
+    let mut attempt1 = Nfs::attach(s.port(), nfs_fh3::default());
+    let mut later = Vec::new();
+    for _ in 0..4 {
+        let mut c = connect_raw(s.port());
+        c.write_all(&null_frame()).unwrap();
+        assert!(answered_fully(&mut c));
+        later.push(c);
+    }
+    assert!(
+        attempt1.try_getattr(&nfs_fh3::default()).is_none(),
+        "the flood should have evicted the would-be MNT connection before it sent anything"
+    );
+
+    // The gate was never claimed, since attempt1 never got to send MNT: a retry on a fresh
+    // connection still gets the root handle.
+    let own = format!("/{}", s.export_name());
+    let mut retry = Nfs::attach(s.port(), nfs_fh3::default());
+    assert_eq!(
+        retry.mount_path(&own).0,
+        0,
+        "a retry should succeed where the flood only beat the first attempt to MNT"
+    );
 }

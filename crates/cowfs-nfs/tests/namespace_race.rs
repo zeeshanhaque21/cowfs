@@ -299,7 +299,7 @@ fn a_sidecar_name_never_becomes_a_real_object_under_raw_nfs() {
     watch.arm(MAIN);
 
     let mk = {
-        let mut c = common::Nfs::connect(server.port(), server.export_name());
+        let mut c = common::Nfs::connect(server.port(), &server.export_name());
         let root = root.clone();
         std::thread::spawn(move || c.mkdir(&root, "._doc"))
     };
@@ -313,7 +313,7 @@ fn a_sidecar_name_never_becomes_a_real_object_under_raw_nfs() {
     // window. On an adapter whose read and write are one step this blocks on the directory lock
     // until the first request finishes; on one without the step it runs straight through.
     let created = {
-        let mut c = common::Nfs::connect(server.port(), server.export_name());
+        let mut c = common::Nfs::connect(server.port(), &server.export_name());
         let root = root.clone();
         std::thread::spawn(move || c.create(&root, "doc", 1, common::sattr_mode(0o644), [0; 8]))
     };

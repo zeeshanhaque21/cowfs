@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::sync::PoisonError;
 
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
@@ -88,7 +89,12 @@ pub async fn mountproc3_mnt(
     path.deserialize(input)?;
     let utf8path = std::str::from_utf8(&path).unwrap_or_default();
     debug!("mountproc3_mnt({:?},{:?}) ", xid, utf8path);
-    let path = if let Some(path) = utf8path.strip_prefix(context.export_name.as_str()) {
+    let export_name = context
+        .export_name
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let path = if let Some(path) = utf8path.strip_prefix(export_name.as_str()) {
         let path = path
             .trim_start_matches('/')
             .trim_end_matches('/')

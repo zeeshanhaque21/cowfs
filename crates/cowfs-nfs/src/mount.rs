@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -151,7 +151,7 @@ pub struct Server {
     runtime: Option<tokio::runtime::Runtime>,
     port: u16,
     gate: Option<Arc<MountGate>>,
-    export: String,
+    export: Arc<Mutex<String>>,
 }
 
 impl Server {
@@ -174,13 +174,18 @@ impl Server {
         // Residual (#262), no better mechanism exists: the path is the per-mount token, and it
         // is in `mount_nfs`'s argv (visible to `ps` for the few ms to the first MNT) because
         // that is the only way to hand a source to it. A second token in the mount options
-        // would sit in the same argv. Binding MNT to the child's pid or uid is not possible:
-        // the kernel NFS client sends MNT from a socket no process owns (`peer.rs`), and the
-        // uid check only helps against another user. A racer who wins the first MNT can use the
-        // filesystem until `Mount::new` tears the server down after mount_nfs fails. That is
-        // bounded by `command_timeout` (20 s by default); an observed value was not measured.
+        // would sit in the same argv. Binding MNT to the child's pid or uid would not add
+        // much either. The MNT is believed to come from `mount_nfs` itself, an ordinary
+        // process (this was not measured on a real mount here), so a uid check at MNT time
+        // would only rule out another user, not a same-user racer. What `peer.rs` documents as
+        // owned by no process and invisible to `lsof` is the kernel's NFS client socket used
+        // for the file traffic after the mount. A racer who wins the first
+        // MNT can use the filesystem until `Mount::new` tears the server down after mount_nfs
+        // fails. That is bounded by `command_timeout` (20 s by default); an observed value
+        // was not measured.
         let export = secret_path()?;
         listener.with_export_name(export.clone());
+        let export = listener.export_name_handle();
         listener.set_limits(opts.limits.clone());
         let gate = opts.one_shot_mount.then(|| Arc::new(MountGate::new()));
         if let Some(gate) = &gate {
@@ -217,8 +222,15 @@ impl Server {
     }
 
     /// The path that answers MNT. `mount_nfs` is the only thing that is told this.
-    pub fn export_name(&self) -> &str {
-        &self.export
+    pub fn export_name(&self) -> String {
+        // The shared cell holds the leading-slash form `with_export_name` normalizes to
+        // (nfsserve compares MNT paths against it as-is); strip it back off so callers keep
+        // seeing the bare token this always returned.
+        self.export
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .trim_start_matches('/')
+            .to_string()
     }
 
     pub fn port(&self) -> u16 {
@@ -234,7 +246,18 @@ impl Server {
     /// Lets the next MNT take the root handle again, for a deliberate remount. UMNT never does
     /// this: a daemon restart makes a new server, export path and gate, so [`Mount`] never
     /// needs it.
+    ///
+    /// Also rotates the export path. The old one stays readable from the mount table
+    /// (`sweep_stale_mounts`) for as long as this process runs, so re-arming the gate on the
+    /// same path would let anyone who read that table race the next legitimate remount for
+    /// the root handle. A fresh path closes that window without needing a fresh server.
     pub fn rearm_mount(&self) {
+        // Rotate first, then open the gate: the other order leaves a window where the gate is
+        // open on the old path a mount-table reader already knows. If no fresh path can be
+        // made the gate stays shut (the remount then fails as `RootHandleTaken`), never open on
+        // the old path.
+        let Ok(next) = secret_path() else { return };
+        *self.export.lock().unwrap_or_else(PoisonError::into_inner) = format!("/{next}");
         if let Some(g) = &self.gate {
             g.rearm();
         }
@@ -372,15 +395,32 @@ impl Mount {
         let md = std::fs::metadata(&mountpoint)?;
         let server = Server::start(vfs, &opts, Some((md.uid(), md.gid())))?;
         let source = format!("localhost:/{}", server.export_name());
-        let mounted = checked(
-            Command::new(MOUNT_NFS)
-                .arg("-o")
-                .arg(opts.nfs_option_string(server.port()))
-                .arg(&source)
-                .arg(&mountpoint),
-            timeout,
-        );
-        let refused = server.mnt_was_refused();
+        let try_mount = || {
+            checked(
+                Command::new(MOUNT_NFS)
+                    .arg("-o")
+                    .arg(opts.nfs_option_string(server.port()))
+                    .arg(&source)
+                    .arg(&mountpoint),
+                timeout,
+            )
+        };
+        let mut mounted = try_mount();
+        let mut refused = server.mnt_was_refused();
+        // A NULL flood that fills the connection table can evict this mount's own
+        // connection before it reaches MNT (#262), failing `mount_nfs` for a reason that has
+        // nothing to do with the mount itself. Retry a bounded number of times: a flood that
+        // wins every single attempt is not something a retry count can fix anyway, and
+        // retrying after the gate was already refused would only replace a clear
+        // `RootHandleTaken` with a confusing timeout.
+        const MOUNT_ATTEMPTS: u32 = 3;
+        for _ in 1..MOUNT_ATTEMPTS {
+            if mounted.is_ok() || refused {
+                break;
+            }
+            mounted = try_mount();
+            refused = server.mnt_was_refused();
+        }
         let mut mount = Mount {
             server: Some(server),
             mountpoint,

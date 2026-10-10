@@ -31,7 +31,7 @@ fn nonowner_write() -> u32 {
         Some((501, 20)),
     )
     .unwrap();
-    let mut nfs = common::Nfs::connect(server.port(), server.export_name());
+    let mut nfs = common::Nfs::connect(server.port(), &server.export_name());
     let root = nfs.root.clone();
     let (status, handle, _) = nfs.create(
         &root,

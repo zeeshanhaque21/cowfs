@@ -158,7 +158,7 @@ fn setup() -> (Arc<Watched>, Server, Nfs) {
     let mut opts = translated();
     opts.check_peer_uid = false;
     let server = cowfs_nfs::Server::start(vfs.clone(), &opts, None).unwrap();
-    let c = Nfs::connect(server.port(), server.export_name());
+    let c = Nfs::connect(server.port(), &server.export_name());
     (vfs, server, c)
 }
 

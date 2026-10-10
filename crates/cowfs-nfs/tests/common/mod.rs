@@ -123,7 +123,7 @@ pub struct Nfs {
 pub fn serve(vfs: Arc<dyn Vfs>, mut opts: MountOptions) -> (Server, Nfs) {
     opts.check_peer_uid = false;
     let server = Server::start(vfs, &opts, None).unwrap();
-    let nfs = Nfs::connect(server.port(), server.export_name());
+    let nfs = Nfs::connect(server.port(), &server.export_name());
     (server, nfs)
 }
 
