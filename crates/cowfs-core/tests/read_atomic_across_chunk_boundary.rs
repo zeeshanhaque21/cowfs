@@ -38,9 +38,24 @@ const BLOCK: usize = 4096;
 const IMAGE: usize = 1 << 20;
 const VERSIONS: usize = 8;
 const READERS: usize = 3;
-/// The run stops at this, so a slow machine does fewer iterations instead of hanging.
-const CAP: Duration = Duration::from_secs(8);
+/// Hang guard only. A healthy run ends on progress (below), never on this, so load cannot starve
+/// the assertions: the writer keeps writing until the readers have done their share of reads.
+const CAP: Duration = Duration::from_secs(120);
+/// The writer does at least this many writes, and keeps writing until the readers have done at
+/// least `MIN_READS` reads while it ran. Both are progress targets, not wall-clock ones (#301).
 const WRITES: usize = 4000;
+const MIN_READS: usize = 1000;
+
+/// Sets the shared flag when its thread unwinds, so a panic anywhere ends every loop at once
+/// instead of leaving the others spinning until `CAP`.
+struct OnPanic<'a>(&'a AtomicBool);
+impl Drop for OnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Relaxed);
+        }
+    }
+}
 
 fn cuts(image: &[u8]) -> Vec<usize> {
     let mut at = 0;
@@ -116,6 +131,7 @@ fn run(opts: Options, arm: &str) {
 
     let off = l.block as u64;
     let stop = AtomicBool::new(false);
+    let failed = AtomicBool::new(false);
     let (reads, torn, seen) = (
         AtomicUsize::new(0),
         AtomicUsize::new(0),
@@ -127,8 +143,9 @@ fn run(opts: Options, arm: &str) {
     std::thread::scope(|s| {
         for _ in 0..READERS {
             s.spawn(|| {
+                let _guard = OnPanic(&failed);
                 let mut kinds = [false; VERSIONS];
-                while !stop.load(Relaxed) && start.elapsed() < CAP {
+                while !stop.load(Relaxed) && !failed.load(Relaxed) && start.elapsed() < CAP {
                     let got = fs.read(ino, off, BLOCK as u32).unwrap();
                     reads.fetch_add(1, Relaxed);
                     match l.versions.iter().position(|v| *v == got) {
@@ -151,11 +168,15 @@ fn run(opts: Options, arm: &str) {
                 seen.fetch_max(kinds.iter().filter(|k| **k).count(), Relaxed);
             });
         }
-        for i in 0..WRITES {
-            if start.elapsed() > CAP {
-                break;
-            }
+        let _guard = OnPanic(&failed);
+        let mut i = 0;
+        while (i < WRITES || reads.load(Relaxed) < MIN_READS)
+            && torn.load(Relaxed) == 0
+            && !failed.load(Relaxed)
+            && start.elapsed() < CAP
+        {
             last = (i + 1) % VERSIONS;
+            i += 1;
             let n = fs.write(ino, off, &l.versions[last]).unwrap();
             assert_eq!(n as usize, BLOCK, "short write");
         }
@@ -177,7 +198,10 @@ fn run(opts: Options, arm: &str) {
         first_tear.lock().unwrap()
     );
     // Not vacuous: readers ran, and at least one of them saw the block change under it.
-    assert!(reads >= 1000, "only {reads} reads ran");
+    assert!(
+        reads >= MIN_READS,
+        "only {reads} reads ran in {CAP:?}: the readers were starved, not the atomicity broken"
+    );
     assert!(
         seen.load(Relaxed) >= 2,
         "no reader saw more than one version, so the race never happened"
