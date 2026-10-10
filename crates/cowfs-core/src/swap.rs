@@ -68,6 +68,10 @@ thread_local! {
     static FAIL_FINISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test seam: the re-read after a failed replace commit cannot be read.
     static FAIL_REREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: `move_name` fails right after the metadata commit succeeded.
+    static FAIL_AFTER_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: the meta sync hook (run just before a commit is written) fails.
+    static FAIL_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test seam: forces every staging name's hash, to build the collision a real name pair needs
     /// a 2^32 search for.
     static HASH_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -569,6 +573,16 @@ impl Core {
         })
     }
 
+    /// Test seam for `move_name`: an error right after the metadata commit succeeded.
+    #[cfg(test)]
+    pub(crate) fn after_commit_fault() -> Result<(), ControlError> {
+        if FAIL_AFTER_COMMIT.with(std::cell::Cell::get) {
+            Err(io("injected failure after the commit"))
+        } else {
+            Ok(())
+        }
+    }
+
     /// The recorded parent id of `sc`.
     fn parent_of(&self, sc: &crate::queue::SnapCtx) -> Option<u64> {
         let snap = self
@@ -898,9 +912,48 @@ mod tests {
         .unwrap()
     }
 
-    /// Stages `src` (holding file `f`) over `abc` and runs the live finish with the meta commit
-    /// fault `fault` and, optionally, an unreadable re-read. Returns the call's result.
-    fn finish_with(c: &Core, fault: u8, reread_fails: bool) -> Result<SnapshotEntry, ControlError> {
+    /// A core whose meta sync hook fails while `FAIL_BEFORE_COMMIT` is set: the commit never
+    /// writes, the way a `before_sync` hook failure does in production.
+    fn open_core_failing_commits(dir: &Path) -> Core {
+        Core::open_with_meta(
+            dir,
+            crate::Options {
+                background: false,
+                ..Default::default()
+            },
+            |d, mut o| {
+                let inner = o.before_sync.take();
+                o.before_sync = Some(std::sync::Arc::new(move || {
+                    if let Some(h) = inner.clone() {
+                        h()?;
+                    }
+                    if FAIL_BEFORE_COMMIT.with(std::cell::Cell::get) {
+                        return Err(std::io::Error::other("injected meta sync failure"));
+                    }
+                    Ok(())
+                }) as cowfs_meta::SyncHook);
+                cowfs_meta::Meta::open(d.join("meta.redb"), o)
+            },
+        )
+        .unwrap()
+    }
+
+    /// How the replace commit is made to fail in [`finish_with`].
+    #[derive(Clone, Copy)]
+    enum Fault {
+        /// the commit never writes
+        Before,
+        /// the commit is durable and `move_name` still returns `Err`
+        After,
+    }
+
+    /// Stages `src` (holding file `f`) over `abc` and runs the live finish with the commit fault
+    /// `fault` and, optionally, an unreadable re-read. Returns the call's result.
+    fn finish_with(
+        c: &Core,
+        fault: Fault,
+        reread_fails: bool,
+    ) -> Result<SnapshotEntry, ControlError> {
         let root = c.lookup(ROOT_INO, b"src").unwrap().ino;
         c.create(root, b"f", 0o644).unwrap();
         let staged = staging_name("abc");
@@ -908,9 +961,13 @@ mod tests {
         c.inner.flush_snapshot(&src).unwrap();
         c.stage_and_intent(&src, &staged, "abc").unwrap();
         FAIL_REREAD.with(|f| f.set(reread_fails));
-        c.inner.meta.set_commit_fault(fault);
+        match fault {
+            Fault::Before => FAIL_BEFORE_COMMIT.with(|f| f.set(true)),
+            Fault::After => FAIL_AFTER_COMMIT.with(|f| f.set(true)),
+        }
         let r = c.finish_live(&staged, "abc");
-        c.inner.meta.set_commit_fault(0);
+        FAIL_BEFORE_COMMIT.with(|f| f.set(false));
+        FAIL_AFTER_COMMIT.with(|f| f.set(false));
         FAIL_REREAD.with(|f| f.set(false));
         r
     }
@@ -926,10 +983,10 @@ mod tests {
     #[test]
     fn a_commit_error_that_did_not_land_is_rolled_back_not_left_pending() {
         let dir = tempfile::tempdir().unwrap();
-        let c = open_core(dir.path());
+        let c = open_core_failing_commits(dir.path());
         c.create_snapshot("src").unwrap();
         c.create_snapshot("abc").unwrap();
-        assert!(finish_with(&c, 1, false).is_err());
+        assert!(finish_with(&c, Fault::Before, false).is_err());
         let staged = staging_name("abc");
         assert!(
             !intent_path(&c.inner.root, "abc").exists(),
@@ -957,7 +1014,7 @@ mod tests {
             let c = open_core(dir.path());
             c.create_snapshot("src").unwrap();
             c.create_snapshot("abc").unwrap();
-            assert!(finish_with(&c, 2, false).is_err());
+            assert!(finish_with(&c, Fault::After, false).is_err());
             assert!(intent_path(&c.inner.root, "abc").exists(), "intent kept");
             assert!(
                 c.inner
@@ -981,10 +1038,10 @@ mod tests {
     fn an_unreadable_reread_after_a_commit_error_keeps_the_intent() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let c = open_core(dir.path());
+            let c = open_core_failing_commits(dir.path());
             c.create_snapshot("src").unwrap();
             c.create_snapshot("abc").unwrap();
-            assert!(finish_with(&c, 1, true).is_err());
+            assert!(finish_with(&c, Fault::Before, true).is_err());
             assert!(intent_path(&c.inner.root, "abc").exists(), "intent kept");
             assert!(
                 c.inner.snap_by_name_raw(&staging_name("abc")).is_ok(),

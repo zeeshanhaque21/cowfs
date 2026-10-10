@@ -197,12 +197,12 @@ thread_local! {
 // it, so the edit is durable while the caller still sees an error. That second one is how a test
 // proves the retry path does not treat a persisted create as a failed one. Thread-local for the
 // same reason as `RESERVE_FAULT`.
-#[cfg(any(test, feature = "fault-injection"))]
+#[cfg(test)]
 thread_local! {
     static COMMIT_FAULT: Cell<u8> = const { Cell::new(0) };
 }
 
-#[cfg(any(test, feature = "fault-injection"))]
+#[cfg(test)]
 fn commit_fault() -> u8 {
     COMMIT_FAULT.with(Cell::get)
 }
@@ -229,7 +229,7 @@ fn reset_reserve_probe() {
     COMMIT_FAULT.with(|c| c.set(0));
 }
 
-#[cfg(any(test, feature = "fault-injection"))]
+#[cfg(test)]
 fn set_commit_fault(v: u8) {
     COMMIT_FAULT.with(|c| c.set(v));
 }
@@ -800,12 +800,12 @@ impl Inner {
                     meta.insert("version", SPECIAL_VERSION)?;
                 }
             }
-            #[cfg(any(test, feature = "fault-injection"))]
+            #[cfg(test)]
             if commit_fault() == 1 {
                 return Err(Error::Storage("injected before the batch commit".into()));
             }
             wtx.commit()?;
-            #[cfg(any(test, feature = "fault-injection"))]
+            #[cfg(test)]
             if commit_fault() == 2 {
                 return Err(Error::Storage("injected after the batch commit".into()));
             }
@@ -1838,15 +1838,6 @@ impl Meta {
     /// Creates a snapshot holding an empty tree (just the root directory). Durable on return.
     pub fn new_snapshot(&self, name: &str) -> Result<Snapshot> {
         Ok(self.snap(self.h.inner.add_snapshot(name, None)?))
-    }
-
-    /// Test seam for `cowfs-core`'s swap tests: `1` fails the next ordinary commit just before it,
-    /// `2` just after it (durable, but the caller sees `Err`), `0` is off. Per thread. Absent
-    /// without the `fault-injection` feature.
-    #[cfg(feature = "fault-injection")]
-    #[doc(hidden)]
-    pub fn set_commit_fault(&self, v: u8) {
-        set_commit_fault(v);
     }
 
     /// Opens a snapshot by name.

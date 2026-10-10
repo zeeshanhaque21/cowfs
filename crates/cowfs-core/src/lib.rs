@@ -397,6 +397,10 @@ impl Core {
             }
             return Err(control_meta(e));
         }
+        #[cfg(test)]
+        if victim.is_some() {
+            Core::after_commit_fault()?;
+        }
         let info = self
             .inner
             .meta

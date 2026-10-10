@@ -12,7 +12,7 @@ publish.workspace = true
 # of tests/power_core.rs, and turns on the store's op log. No production caller enables it; the
 # self dev-dependency below does it for this crate's tests. scripts/check-fault-seam-absent.sh
 # guards it.
-fault-injection = ["cowfs-store/fault-injection", "cowfs-meta/fault-injection"]
+fault-injection = ["cowfs-store/fault-injection"]
 
 [dependencies]
 cowfs-store = { path = "../cowfs-store" }
