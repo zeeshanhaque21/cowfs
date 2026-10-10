@@ -6,7 +6,7 @@
 
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("cowfs-vfs-path supports Linux and macOS only");
@@ -302,6 +302,8 @@ fn run_with_private_umask<R: Send>(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code, reason = "public stub kept for cross-platform symmetry; macOS call sites \
+    that would use it are themselves Linux-only, so it has no caller on this platform")]
 pub fn with_private_umask<R: Send>(
     _: impl FnOnce() -> io::Result<R> + Send,
 ) -> io::Result<Option<R>> {
@@ -351,6 +353,10 @@ pub struct UmaskWorker {
 }
 
 impl Default for UmaskWorker {
+    // Not derivable: on Linux, `known: &'static OnceLock<bool>` has no `Default` (it is a
+    // reference to a specific static, not an empty value). clippy only sees the
+    // non-Linux, no-field shape and suggests derive; that would break the Linux build.
+    #[allow(clippy::derivable_impls)]
     fn default() -> Self {
         Self {
             #[cfg(target_os = "linux")]
