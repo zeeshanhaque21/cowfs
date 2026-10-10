@@ -541,16 +541,23 @@ pub fn geteuid() -> u32 {
 #[cfg(target_os = "linux")]
 pub fn random16() -> io::Result<[u8; 16]> {
     let mut b = [0u8; 16];
-    // SAFETY: a valid buffer of the stated length.
-    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
-    if n == 16 {
-        Ok(b)
-    } else {
-        Err(if n < 0 {
-            io::Error::last_os_error()
-        } else {
-            io::Error::from_raw_os_error(libc::EIO)
-        })
+    loop {
+        // SAFETY: a valid buffer of the stated length.
+        let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+        if n == 16 {
+            return Ok(b);
+        }
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            // A 16-byte request is all-or-nothing: the only partial outcome is a signal landing
+            // before any byte is produced, which getrandom(2) reports as EINTR. Retry rather than
+            // surface a transient signal as a hard mknod failure (#307).
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        return Err(io::Error::from_raw_os_error(libc::EIO));
     }
 }
 

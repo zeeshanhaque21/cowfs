@@ -170,8 +170,21 @@ fn race(acl: bool) -> Option<Vec<std::path::PathBuf>> {
         .map(|e| e.unwrap().path())
         .filter(|p| std::fs::metadata(p).unwrap().mode() & 0o7777 != 0o644)
         .collect();
+    // #307: tens of thousands of racing mknod/unlink rounds is exactly where a leaked
+    // `.cowfs-mknod-*` scratch directory would show up, so check for one before `dir` gets wiped
+    // out from under us by the cleanup below.
+    let stray: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter(|n| n.to_string_lossy().starts_with(".cowfs-mknod-"))
+        .collect();
     drop(fs);
     cowfs_vfs_path::force_remove_dir_all(&root);
+    assert!(
+        stray.is_empty(),
+        "mknod left stray scratch directories behind: {stray:?}"
+    );
     Some(hit)
 }
 

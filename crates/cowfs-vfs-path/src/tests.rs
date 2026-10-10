@@ -957,3 +957,72 @@ fn mknod_private_sets_the_mode_and_removes_its_scratch_directory() {
     assert_eq!(names, ["node"], "scratch directory left behind");
     crate::force_remove_dir_all(&root);
 }
+
+/// #307 fix A: a failed scratch-directory `rmdir` must not override a successful rename-out --
+/// only a failed make may fail the call.
+#[test]
+fn keep_make_despite_failed_cleanup_prefers_a_successful_make() {
+    use crate::keep_make_despite_failed_cleanup as combine;
+    let ok = || Ok(());
+    let err = |code| Err(std::io::Error::from_raw_os_error(code));
+
+    // Made and removed both succeeded: success.
+    assert!(combine(ok(), ok()).is_ok());
+    // Made succeeded but the cleanup rmdir failed: still success (the old bug returned `removed`'s
+    // error here).
+    assert!(combine(ok(), err(libc::ENOTEMPTY)).is_ok());
+    // Made failed: that error wins, whether or not the cleanup also failed.
+    assert_eq!(
+        combine(err(libc::EEXIST), ok()).unwrap_err().raw_os_error(),
+        Some(libc::EEXIST)
+    );
+    assert_eq!(
+        combine(err(libc::EEXIST), err(libc::ENOTEMPTY))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EEXIST)
+    );
+}
+
+/// #307 fix B: `random16` keeps retrying past a simulated `EINTR` instead of surfacing it.
+#[cfg(target_os = "linux")]
+#[test]
+fn random16_returns_sixteen_bytes() {
+    let a = crate::sys::random16().unwrap();
+    let b = crate::sys::random16().unwrap();
+    assert_eq!(a.len(), 16);
+    assert_ne!(a, b, "two calls produced the same 16 random bytes");
+}
+
+/// #307: a `.cowfs-mknod-*` scratch directory old enough that no concurrent `mknod_private` call
+/// could still own it is swept on the next `mknod` in that directory, leftover node and all; a
+/// fresh one is left alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn mknod_sweeps_a_stale_scratch_directory_but_leaves_a_fresh_one() {
+    use std::os::fd::AsFd;
+    let root = std::env::temp_dir().join(format!("cowfs-mknod-sweep-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let d = std::fs::File::open(&root).unwrap();
+
+    let stale = root.join(".cowfs-mknod-deadbeefdeadbeefdeadbeefdeadbeef");
+    let fresh = root.join(".cowfs-mknod-cafebabecafebabecafebabecafebabe");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::create_dir(&fresh).unwrap();
+    // A crash between `mknodat` and the rename-out leaves the node itself behind too: the sweep
+    // must remove it along with its directory, not just an empty one.
+    std::fs::File::create(stale.join("n")).unwrap();
+    force_observable_mtime(&stale);
+
+    crate::mknod_private(d.as_fd(), b"node", libc::S_IFIFO | 0o600, 0).unwrap();
+
+    assert!(
+        !stale.exists(),
+        "a day-old scratch directory should have been swept"
+    );
+    assert!(
+        fresh.exists(),
+        "a freshly-made scratch directory must survive the sweep"
+    );
+    crate::force_remove_dir_all(&root);
+}
