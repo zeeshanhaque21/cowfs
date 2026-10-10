@@ -19,6 +19,14 @@ fn mknod_args(dir: &nfs_fh3, n: &str, kind: ftype3, mode: u32, dev: (u32, u32)) 
     a
 }
 
+/// Seconds since the epoch, as an NFS `nfstime3` carries them.
+fn wall_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32
+}
+
 /// MKNOD as root (AUTH_NULL counts as root).
 fn mknod(c: &mut Nfs, dir: &nfs_fh3, n: &str, kind: ftype3, dev: (u32, u32)) -> u32 {
     c.call(11, mknod_args(dir, n, kind, 0o640, dev)).0
@@ -34,7 +42,9 @@ fn mknod_creates_fifo_socket_and_devices_with_type_mode_and_rdev() {
         (ftype3::NF3CHR, "chr", (1, 3)),
         (ftype3::NF3BLK, "blk", (8, 16)),
     ] {
+        let before = wall_secs();
         assert_eq!(mknod(&mut c, &root, n, kind, dev), OK, "MKNOD {n}");
+        let after = wall_secs();
         let fh = c.must_lookup(&root, n);
         let (st, a) = c.getattr(&fh);
         let a = a.expect("attributes");
@@ -43,6 +53,19 @@ fn mknod_creates_fifo_socket_and_devices_with_type_mode_and_rdev() {
         assert_eq!(a.mode, 0o640, "{n} mode");
         assert_eq!((a.nlink, a.size), (1, 0), "{n} nlink and size");
         assert_eq!((a.rdev.specdata1, a.rdev.specdata2), dev, "{n} rdev");
+        // Issue 326: the ctime of a fresh special node survives the wire as wall-clock time
+        // (not zero, not the epoch default), within 5 s either side of the call like the
+        // Portable conformance check `mknod_ctime_is_wall_clock`. `MemVfs` stamps atime, mtime
+        // and ctime with the same value, so this does not pin that the wire reads the *ctime*
+        // field; `convert.rs`'s unit test with distinct times does. Saturating adds: a
+        // far-future ctime is clamped to `u32::MAX` and must fail the assert, not overflow.
+        assert!(
+            a.ctime.seconds != 0
+                && a.ctime.seconds.saturating_add(5) >= before
+                && a.ctime.seconds <= after.saturating_add(5),
+            "{n} ctime {} outside [{before}, {after}] +-5 s",
+            a.ctime.seconds
+        );
         assert_eq!(
             mknod(&mut c, &root, n, kind, dev),
             EXIST,
