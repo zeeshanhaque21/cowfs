@@ -131,3 +131,86 @@ No scope was added to any running builder because of this list.
 - Merged with only a green CI, test-only: 230.
 - Waiting on a re-critic or on fixes: 220, 222, 233.
 - Still building: the NFS mount-gate hardening (issue 43) and the FUSE torn-read investigation (issue 45).
+
+## Evening update, 2026-10-09: ideas and concerns from #273 to #314
+
+Nothing here is scheduled work.
+No scope was added to any builder because of this list.
+
+### Concerns: process
+
+- Builders pushed without running the whole set of tests their change reaches.
+  PR 298 passed local `cowfs-core` tests and then failed CI because a `cowfs-daemon` test still assumed the old behaviour.
+  The same push added a `fault-injection` feature to `cowfs-meta`, which a lint rule in `scripts/test_select_tests.py` forbids.
+  A builder should run every crate that depends on the crate it changed, plus the `scripts/` unit tests, before reporting.
+- A first critic round is not enough for security-adjacent or recovery code.
+  PR 298 and PR 303 each took three rounds, and the second round of PR 303 found a predictable temp name that a hard-link swap could exploit.
+  Rounds two and three should be assumed for any change that touches chmod, rename, intents or locks.
+- Builders reported "CI green" or "waiting for CI" about heads that later changed.
+  The lead has to read CI on the exact head sha before every merge.
+- Files written to the primary checkout and then committed through a clone collided with the next fast-forward three times.
+  Each time the identical untracked copy had to be moved aside by hand.
+  Commit documents from a clone first, then fast-forward the primary checkout.
+- Docs-only PRs have no CI.
+  A stale unit-test count survived in `docs/v1-core.md` until a critic caught it.
+  Counts in prose go stale quickly.
+
+### Concerns: runtime and tooling
+
+- The live daemon runs a build older than this session's merges.
+  None of the NFS fixes (#287 watchdog, #279 flood eviction) are running, and the vendored `nfsserve` copy under `spikes/nfs-loopback/vendor` is not re-vendored.
+- `treehouse return` hung inside the cowfs mount and left a lease detached but still leased.
+  Leases 1 to 6 are held by finished agents.
+  The cause is not diagnosed; #289 (macOS Quarantine hook) is a hypothesis.
+  The treehouse pool could run out.
+- The `cowfs` CLI default socket (`/var/folders/.../cowfs-501/control.sock`) is not where the live daemon listens (`~/.cowfs/sock/daemon.sock`).
+  A bare `cowfs status` reports "not running" against a healthy daemon.
+- The disk that holds the store is 99% full, the store is about 33 GB, and GC has no scheduler.
+  The access-hint store is never fed (#10).
+- The measured saving (86.0 GB logical, 34.1 GB stored, 2.5x) comes from one snapshot.
+  The definition of `logical_bytes` was not verified, and no native comparison was run.
+  Treehouse slots are plain directories inside that snapshot, so there is no clone sharing yet.
+- macOS CI shards take 10 to 19 minutes.
+  Load-sensitive tests fail first there (#301, #283).
+
+### Concerns: correctness left open
+
+- #262: the NULL-flood eviction window and the first-MNT window remain.
+  The critic judged a server fix infeasible; a bounded mount retry and rotating the export path on rearm are filed as #305.
+  The claim that macOS sends MNT from an ownerless socket is unverified.
+- #314 locks swap, promote and ingest per target name.
+  `rename_snapshot`, `remove_snapshot` and `fork_snapshot` do not take that lock, and waiters have no timeout or cancel.
+- #211: the chmod fallback in `mknod` is Linux only, has no second-uid test, and can leave stray scratch directories after a crash (#307).
+  The Core rdev model and the ctime of fresh special nodes are still unchecked.
+- #311: the original #124 case (tree ends up new but `swap` returns an error) has no daemon-level test.
+- #173 and #276: the daemon `--fault-boundary` sweep needs an NFS mount and the 300 MiB fixture and has not run.
+- Mutants I2 and I4 in `power_core` survive and are argued to be equivalent.
+  The argument rests on reading `finish_swap`.
+- PR 293 removed several test binaries from the nested cargo run.
+  Their coverage now exists only in the main nextest run.
+
+### Ideas, not scheduled
+
+- Validate `progress/plan.json` in CI: JSON parse, state vocabulary, every `pr` and `issue` resolvable.
+  It is edited by hand, and one wrong state would not be noticed.
+- Run `scripts/mutate_power.py` in CI or nightly, now that it exits non-zero on a stale pattern.
+- Compare the 2.5x dedup against restic, Kopia or the desync chunker on a copy of one `target/` directory, on the scratch box.
+- Watch the Bazel remote-apis big-blob proposals (Split and Splice RPCs, issue 326 there) as an outside reference for chunked large blobs.
+- Key the per-target lock by snapshot id instead of name, so renames cannot slip past it.
+- Make the `cowfs` CLI find the live socket from the daemon pid file or a config entry.
+- Add the lease-audit script from the morning list; the hang above makes it more useful.
+
+### Where the PRs stand
+
+- Every code PR in this stretch got a fresh-context critic report under docs/reviews before it merged: 273 to 280, 282, 284, 285, 292 to 299, 303, 304, 306, 310 and 314.
+- Docs-only PRs merged without a critic: 291, 308, 309, 312 and 313.
+- 314 (per-target lock, #300) merged after one MERGE-AFTER-FIXES round; #300 is closed.
+- No PR is open.
+
+### Concerns added at the end
+
+- A builder saw `a_synced_namespace_survives_a_killed_daemon_in_ci` fail in a local `cowfs-daemon` run and did not investigate; CI passed.
+  It is a possible flake and has no issue.
+- Local workspace clippy fails in `cowfs-vfs-path` (`UmaskWorker`, `sys.rs`) on macOS in several builders' reports while CI lint passes.
+  It was not checked against main.
+- #315 (rename, remove and fork do not take the per-target lock) and #316 (waiters cannot be cancelled and have no timeout) are open.
