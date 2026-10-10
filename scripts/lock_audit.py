@@ -21,6 +21,7 @@ HEADER_MARK = "| Site | Locks held together | Order |"
 
 # What each lock means, for the "order" column.
 ORDER = {
+    "target": "0",
     "sc.ns": "1",
     "sc.flush": "1",
     "sc.q": "1",
@@ -42,6 +43,7 @@ ORDER = {
     "blocks.put": "3",
 }
 GROUPS = [
+    (re.compile(r"\block_target\b|\bswap_targets\b"), "target"),
     (re.compile(r"\bsc\.ns\b"), "sc.ns"),
     (re.compile(r"\bsc\.flush\b"), "sc.flush"),
     (re.compile(r"\bsc\.q\b|\bq\.lk\(\)|\.q\.lk\(\)"), "sc.q"),
@@ -61,7 +63,7 @@ GROUPS = [
     (re.compile(r"\bsnap\."), "snap."),
     (re.compile(r"\bblocks\.get\b|\bblocks\.put\b"), "blocks"),
 ]
-TAKES = re.compile(r"\.rd\(\)|\.wr\(\)|\.lk\(\)|\.try_read\(\)|\.try_write\(\)|\.try_lock\(\)|snap\.|blocks\.get|blocks\.put")
+TAKES = re.compile(r"\block_target\(|\.rd\(\)|\.wr\(\)|\.lk\(\)|\.try_read\(\)|\.try_write\(\)|\.try_lock\(\)|snap\.|blocks\.get|blocks\.put")
 
 
 def fns(src: str):

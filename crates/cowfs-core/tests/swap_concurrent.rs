@@ -54,6 +54,17 @@ fn parked_import(
         .map_err(|e| e.to_string())
 }
 
+/// The second call must not finish while the first is parked inside its ingest: it is waiting on
+/// the target lock. Completion is observed on `done`, so the only timing is the bounded wait for
+/// a call that should NOT happen; a late (slow) second call can make the test pass wrongly but
+/// never fail it wrongly, and without the lock it finishes within milliseconds.
+fn assert_blocked(done: &mpsc::Receiver<()>) {
+    assert!(
+        done.recv_timeout(Duration::from_millis(500)).is_err(),
+        "the second call finished while the first was still parked: no per-target lock"
+    );
+}
+
 fn no_leftovers(dir: &Path, c: &Core) {
     let names: Vec<String> = c
         .list_snapshots()
@@ -97,11 +108,16 @@ fn a_promote_during_a_replacing_import_of_the_same_target_does_not_break_the_imp
         std::thread::spawn(move || parked_import(&c, &v1, "target", parked_tx, go_rx))
     };
     parked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
     let prom = {
         let c = c.clone();
-        std::thread::spawn(move || c.promote_base("src", "target").map(|_| ()))
+        std::thread::spawn(move || {
+            let r = c.promote_base("src", "target").map(|_| ());
+            done_tx.send(()).unwrap();
+            r
+        })
     };
-    std::thread::sleep(Duration::from_millis(300));
+    assert_blocked(&done_rx);
     go_tx.send(()).unwrap();
     let (imp, prom) = (imp.join().unwrap(), prom.join().unwrap());
     assert!(imp.is_ok(), "import: {imp:?}, promote: {prom:?}");
@@ -123,6 +139,7 @@ fn two_replacing_imports_of_the_same_target_run_one_after_the_other() {
     );
     let (parked_tx, parked_rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
     let one = {
         let c = c.clone();
         std::thread::spawn(move || parked_import(&c, &v1, "target", parked_tx, go_rx))
@@ -134,12 +151,14 @@ fn two_replacing_imports_of_the_same_target_run_one_after_the_other() {
             let mut hooks = Hooks {
                 progress: &mut |_, _| true,
             };
-            ingest_replacing(&c, &v2, "target", &mut hooks)
+            let r = ingest_replacing(&c, &v2, "target", &mut hooks)
                 .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+            done_tx.send(()).unwrap();
+            r
         })
     };
-    std::thread::sleep(Duration::from_millis(300));
+    assert_blocked(&done_rx);
     go_tx.send(()).unwrap();
     let (one, two) = (one.join().unwrap(), two.join().unwrap());
     assert!(one.is_ok(), "first: {one:?}, second: {two:?}");

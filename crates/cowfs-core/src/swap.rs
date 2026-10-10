@@ -307,16 +307,20 @@ impl Drop for TargetGuard<'_> {
 }
 
 impl Core {
-    /// Serialises every call that stages, replaces or recovers `target`: a promote, a replacing
-    /// import and a plain import share the staging name and the intent file of the target, and
+    /// Serialises `swap_snapshot` (so `promote_base`) and `ingest_with` (so `ingest` and
+    /// `ingest_replacing`) on one target name: they share its staging name and intent file, and
     /// each one's `clear_leftover`, `recover_target` and `drop_intent` would otherwise act on the
-    /// other's staging snapshot or intent (issue 300). Blocks until the other call is done.
+    /// other's staging snapshot or intent (issue 300). Blocks until the other call is done, with
+    /// no cancel hook, timeout or fairness (issue 316).
     ///
-    /// Lock order: taken first, before the gate, `snaps`, any `SnapCtx` lock and meta's, and held
-    /// across all of them (an import holds it for the whole ingest). Nothing in this crate takes
-    /// it while holding another lock of ours, and it is never taken twice by one call (only the
-    /// public entry points take it: `swap_snapshot`, `ingest_with`), so it cannot be part of a
-    /// cycle. The set mutex is a leaf held only to insert or remove a name.
+    /// Not covered: `rename_snapshot`, `remove_snapshot` and `fork_snapshot` do not take it, so a
+    /// rename or remove of the target during a swap still races (issue 315). The key is the target
+    /// name, so two targets whose staging hashes collide are not serialised either.
+    ///
+    /// Lock order: the outermost lock, taken before the gate, `snaps`, any `SnapCtx` lock and
+    /// meta's, and held across all of them (an import holds it for the whole ingest). Nothing in
+    /// this crate takes it while holding another lock of ours, and no call takes it twice, so it
+    /// cannot be part of a cycle. The set mutex is a leaf held only to insert or remove a name.
     pub(crate) fn lock_target(&self, target: &str) -> TargetGuard<'_> {
         let (set, cv) = &self.inner.swap_targets;
         let mut held = set.lk();
