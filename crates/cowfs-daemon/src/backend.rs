@@ -1334,18 +1334,21 @@ mod tests {
         );
     }
 
-    /// #124: a swap that fails past the staged swap's point of no return must not leave the old
-    /// commit describing the tree that ends up under the name.
+    /// #124: a swap whose replace commit fails must not leave the old commit describing a tree
+    /// that is not under the name.
     ///
-    /// The fault is the third durable commit, which is the fork of the staging snapshot into the
-    /// target. Past that point the core rolls forward, so the swap returns `Err` with the intent
-    /// file pending and the next open installs the new tree. The record must read unknown, because
-    /// the error alone cannot tell that rollback from a failed roll-forward.
+    /// The fault is the second durable commit, which replaces the target by the staging snapshot
+    /// (the first is the staging fork). The hook fails before that commit writes, so the core
+    /// re-reads the file, sees the replace did not land and rolls back: the old tree stays and no
+    /// intent file is left. (A commit that landed but returned `Err` keeps the intent and rolls
+    /// forward; the core's `swap` unit tests cover that.) Either way the swap reports the failure
+    /// and the record must read unknown, because the error alone cannot tell the two apart.
     ///
-    /// On the unsafe code this fails with `commit-AAA` over `BBBB-from-srcB`, which is the defect
-    /// this issue was filed for.
+    /// On the unsafe code (the old record restored after an `Err`) this fails on the record still
+    /// naming `commit-AAA`. The original #124 case, where the tree ends up NEW while the swap
+    /// returns `Err`, needs a seam reachable from this crate and has no test here yet.
     #[test]
-    fn a_core_swap_that_fails_past_the_point_of_no_return_never_restores_the_old_commit() {
+    fn a_core_swap_whose_replace_commit_fails_never_restores_the_old_commit() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().to_owned();
         {
@@ -1353,18 +1356,13 @@ mod tests {
             seeded_pair(&seed);
         }
 
-        let s = core_snaps_with_failing_commit(&store, 3);
+        let s = core_snaps_with_failing_commit(&store, 2);
         let res = s.swap("base", "srcB");
         assert!(
             res.is_err(),
-            "the third commit must fail, so the swap reports the failure"
+            "the second commit must fail, so the swap reports the failure"
         );
-        let intent_pending = store.join("swap-base").exists();
         drop(s);
-        assert!(
-            intent_pending,
-            "the failure has to have landed past the point of no return, or this proves nothing"
-        );
 
         // Reopen through the production backend, so `swap::recover` runs as it would for a caller.
         let reopened = CoreBackend::open(&store, cowfs_core::Options::default()).unwrap();
@@ -1373,12 +1371,12 @@ mod tests {
         let a = v.lookup(cowfs_vfs::ROOT_INO, b"only").unwrap();
         let content = String::from_utf8_lossy(&v.read(a.ino, 0, 4096).unwrap()).into_owned();
         assert_eq!(
-            content, "BBBB-from-srcB",
-            "the roll-forward installed the new tree, so the old commit cannot describe it"
+            content, "AAAA-from-srcA",
+            "the replace commit never wrote, so the swap rolled back and the old tree is still there"
         );
         assert!(
             !store.join("swap-base").exists(),
-            "the reopen finished the swap, so the intent file is gone"
+            "a rolled back swap leaves no intent file"
         );
         assert_eq!(
             commit_of(&info),

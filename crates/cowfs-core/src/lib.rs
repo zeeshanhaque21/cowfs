@@ -359,23 +359,48 @@ impl Core {
         }
         // the name this snapshot is giving up cannot collide with itself
         self.inner.check_new_name_except(new, Some(old))?;
-        self.move_name(&sc, old, new)
+        self.move_name(&sc, old, new, None)
     }
 
     /// Moves the name of `sc`, currently `old`, to `new` in one metadata transaction, then brings
     /// the live registry in line. Staging names are allowed: the swap moves its staged tree into the
     /// target name this way. The caller has checked `new`.
+    ///
+    /// With `victim`, the snapshot that holds `new` is removed in that same transaction
+    /// (`Meta::replace_snapshot`), so the name is never absent, in metadata or in the live
+    /// registry. A victim with an open handle is `Busy` and nothing changes.
     pub(crate) fn move_name(
         &self,
         sc: &Arc<SnapCtx>,
         old: &str,
         new: &str,
+        victim: Option<&Arc<SnapCtx>>,
     ) -> Result<SnapshotEntry, ControlError> {
         let id = SnapshotId(sc.id);
-        self.inner
-            .meta
-            .rename_snapshot(id, new)
-            .map_err(control_meta)?;
+        if let Some(v) = victim {
+            if v.open_handles.load(Ordering::Acquire) > 0 {
+                return Err(ControlError::Busy);
+            }
+            // Blocks new operations on the victim while the commit runs; undone if it fails. Set
+            // under its locks, as `unregister` does, so no flush of it is in flight past this point.
+            let _ns = v.ns.lk();
+            let _fl = v.flush.lk();
+            v.removed.store(true, Ordering::Release);
+        }
+        let r = match victim {
+            Some(_) => self.inner.meta.replace_snapshot(id, new),
+            None => self.inner.meta.rename_snapshot(id, new),
+        };
+        if let Err(e) = r {
+            if let Some(v) = victim {
+                v.removed.store(false, Ordering::Release);
+            }
+            return Err(control_meta(e));
+        }
+        #[cfg(test)]
+        if victim.is_some() {
+            Core::after_commit_fault()?;
+        }
         let info = self
             .inner
             .meta
@@ -387,8 +412,15 @@ impl Core {
         // metadata now says rather than being left to describe a name that has moved
         let mut s = self.inner.snaps.wr();
         s.by_name.remove(old);
+        // one critical section: the name points at the victim, then at `sc`, never at nothing
         s.by_name.insert(new.to_string(), sc.id);
+        if let Some(v) = victim {
+            s.by_id.remove(&v.id);
+        }
         drop(s);
+        if let Some(v) = victim {
+            self.inner.purge_live(v);
+        }
         *self.inner.root_time.lk() = Timestamp::now();
         Ok(entry(&info)?)
     }
@@ -396,7 +428,9 @@ impl Core {
     /// Makes `base` a clone of `src`, replacing an existing `base`.
     ///
     /// Crash-safe and error-safe (see `src/swap.rs`): if anything fails before the point of no
-    /// return the old `base` is still there, and past it the swap is rolled forward instead.
+    /// return the old `base` is still there, and past it the swap is rolled forward instead. The
+    /// old `base` is replaced by the staged clone in one metadata transaction, so the name is never
+    /// missing.
     pub fn promote_base(&self, src: &str, base: &str) -> Result<SnapshotEntry, ControlError> {
         self.inner.snap_by_name(src)?;
         self.swap_snapshot(src, base)
@@ -774,6 +808,18 @@ impl Inner {
         if sc.open_handles.load(Ordering::Acquire) > 0 {
             return Err(ControlError::Busy);
         }
+        self.purge_live(sc);
+        // `removed` blocks every new operation on this snapshot and its caches are empty, so the
+        // meta commit can run without the namespace and flush locks: it can wait for another
+        // snapshot's store fsync, and holding those locks across that wait is what wedges a mount.
+        self.meta
+            .remove_snapshot(SnapshotId(sc.id))
+            .map_err(control_meta)
+    }
+
+    /// Drops everything the live mount holds for `sc`: its registry entries, queue, nodes and
+    /// caches, and marks it removed. The metadata row is the caller's.
+    fn purge_live(&self, sc: &Arc<SnapCtx>) {
         {
             let _ns = sc.ns.lk();
             let _fl = sc.flush.lk();
@@ -807,12 +853,6 @@ impl Inner {
             self.aliases.wr().purge_snapshot(sc.id);
             *self.root_time.lk() = Timestamp::now();
         }
-        // `removed` blocks every new operation on this snapshot and its caches are empty, so the
-        // meta commit can run without the namespace and flush locks: it can wait for another
-        // snapshot's store fsync, and holding those locks across that wait is what wedges a mount.
-        self.meta
-            .remove_snapshot(SnapshotId(sc.id))
-            .map_err(control_meta)
     }
 
     fn stats(&self) -> Stats {

@@ -440,6 +440,12 @@ enum Extra<'a> {
         id: SnapshotId,
         name: &'a str,
     },
+    /// [`Extra::Rename`] that also takes the name from the snapshot holding it, which is removed in
+    /// the same transaction.
+    Replace {
+        id: SnapshotId,
+        name: &'a str,
+    },
 }
 
 fn corrupt(what: &str) -> Error {
@@ -598,8 +604,10 @@ impl Inner {
         force_hook: bool,
     ) -> Result<Option<SnapshotId>> {
         self.check_writable(s)?;
+        // the snapshot this commit deletes: the one removed, or the one whose name a replace takes
         let removed = match &extra {
             Extra::Remove(id) => Some(*id),
+            Extra::Replace { id, name } => s.names.get(*name).copied().filter(|v| v != id),
             _ => None,
         };
         let dirty = s
@@ -647,6 +655,15 @@ impl Inner {
                 // Renaming to the name the snapshot already has changes nothing, so there is
                 // nothing to write. It is not an error either: the caller asked for the name it
                 // can already see.
+                if e.info.name == *name {
+                    return Ok(None);
+                }
+            }
+            Extra::Replace { id, name } => {
+                let Some(e) = s.snaps.get(id) else {
+                    return Err(Error::NoSuchSnapshot);
+                };
+                // The name it already has: nothing to retarget, nothing to remove.
                 if e.info.name == *name {
                     return Ok(None);
                 }
@@ -743,7 +760,7 @@ impl Inner {
                         reap.insert(next, *e.info.root.as_bytes())?;
                         meta.insert("next_reap", next + 1)?;
                     }
-                    Extra::Rename { id, name } => {
+                    Extra::Rename { id, name } | Extra::Replace { id, name } => {
                         // One transaction moves the name in both tables: the row keeps its id, so
                         // the snapshot's tree, its inode numbers and any handle already open on it
                         // are untouched, and a name held by another snapshot is refused above.
@@ -759,6 +776,16 @@ impl Inner {
                         info.name = (*name).to_string();
                         snaps.insert(id.0, encode_snap(&info).as_slice())?;
                         names.remove(e.info.name.as_str())?;
+                        // A replace deletes the holder of the name in this same transaction: its
+                        // row goes, its root joins the reap queue (as in `Extra::Remove`), and the
+                        // insert below points the name at `id`, so the name is never absent.
+                        if let Some(v) = removed {
+                            let ve = s.snaps.get(&v).ok_or(Error::NoSuchSnapshot)?;
+                            snaps.remove(v.0)?;
+                            let next = meta_get(&meta, "next_reap")?;
+                            reap.insert(next, *ve.info.root.as_bytes())?;
+                            meta.insert("next_reap", next + 1)?;
+                        }
                         names.insert(*name, id.0)?;
                     }
                 }
@@ -821,7 +848,12 @@ impl Inner {
                 self.reap_len.fetch_add(1, SeqCst);
                 self.wake_reaper();
             }
-            Extra::Rename { id, name } => {
+            Extra::Rename { id, name } | Extra::Replace { id, name } => {
+                if let Some(v) = removed {
+                    s.snaps.remove(&v);
+                    self.reap_len.fetch_add(1, SeqCst);
+                    self.wake_reaper();
+                }
                 // The session mirrors the two tables, so it moves here too, and only after the
                 // transaction committed: a handle already open on this snapshot keeps working and
                 // reports the new name, because its id did not change.
@@ -1254,6 +1286,18 @@ impl Inner {
         }
         let mut s = self.wlock()?;
         self.commit(&mut s, Extra::Rename { id, name }, false, true)
+            .map(|_| ())
+    }
+
+    /// [`Self::rename_snapshot`] that may take a name another snapshot holds: that snapshot is
+    /// removed and `id` is given its name in ONE transaction, so the name is never absent and a
+    /// crash leaves either the old holder or `id` under it, never neither.
+    fn replace_snapshot(&self, id: SnapshotId, name: &str) -> Result<()> {
+        if name.is_empty() || name.len() > usize::from(u16::MAX) {
+            return Err(Error::Invalid("bad snapshot name"));
+        }
+        let mut s = self.wlock()?;
+        self.commit(&mut s, Extra::Replace { id, name }, false, true)
             .map(|_| ())
     }
 
@@ -1861,9 +1905,28 @@ impl Meta {
     /// writes nothing.
     ///
     /// `cowfs-core` uses this for `Core::rename_snapshot`. Replacing an existing name is not
-    /// something this does, so `Core::promote_base` still stages that through `src/swap.rs`.
+    /// something this does: that is [`Self::replace_snapshot`], which `Core::promote_base` uses.
     pub fn rename_snapshot(&self, id: SnapshotId, new_name: &str) -> Result<()> {
         self.h.inner.rename_snapshot(id, new_name)
+    }
+
+    /// Gives snapshot `id` the name `name`, removing the snapshot that holds it, in ONE
+    /// transaction.
+    ///
+    /// This is [`Self::rename_snapshot`] for a name that is taken: the other snapshot is deleted
+    /// exactly as [`Self::remove_snapshot`] deletes it (its row goes and its root is queued for the
+    /// reaper), `id` keeps its id, tree and inode numbers and answers to the name, and a crash
+    /// leaves either the old holder or `id` under the name, never neither. A name nobody holds is a
+    /// plain rename; the name `id` already has is a no-op that writes nothing. A
+    /// [`SnapshotId`] that is not present is [`Error::NoSuchSnapshot`] and changes nothing, and an
+    /// empty or oversized name is [`Error::Invalid`]. No on-disk format changes: the transaction
+    /// writes the same rows a remove followed by a rename would.
+    ///
+    /// A [`Snapshot`] handle on the removed holder keeps reading its tree until the reaper frees it,
+    /// as after [`Self::remove_snapshot`]; the caller refuses the replace while one is open if that
+    /// matters.
+    pub fn replace_snapshot(&self, id: SnapshotId, name: &str) -> Result<()> {
+        self.h.inner.replace_snapshot(id, name)
     }
 
     /// Frees a bounded number of nodes of removed snapshots. Returns true when more remain.
