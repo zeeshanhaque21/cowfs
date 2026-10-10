@@ -332,6 +332,9 @@ impl Core {
     /// Clones snapshot `src` into a new writable snapshot `name` in O(1).
     pub fn fork_snapshot(&self, src: &str, name: &str) -> Result<SnapshotEntry, ControlError> {
         validate_snapshot_name(name)?;
+        // Outermost: the same per-target lock swap_snapshot/ingest_with take, so a fork cannot
+        // land on a name an in-flight swap or import is about to claim (issue 315).
+        let _target = self.lock_target(name);
         let sc = self.inner.snap_by_name(src)?;
         self.inner.check_new_name(name)?;
         self.inner.flush_snapshot(&sc)?;
@@ -341,6 +344,8 @@ impl Core {
 
     /// Removes a snapshot, discarding uncommitted work in it. Refused while a handle is open.
     pub fn remove_snapshot(&self, name: &str) -> Result<(), ControlError> {
+        // Outermost: see `fork_snapshot` above (issue 315).
+        let _target = self.lock_target(name);
         let sc = self.inner.snap_by_name(name)?;
         self.inner.unregister(&sc)
     }
@@ -351,6 +356,15 @@ impl Core {
     /// added, removed or half-moved. Replacing a name that another snapshot holds is not a rename:
     /// that is [`Core::promote_base`], which keeps the staging swap in `src/swap.rs`.
     pub fn rename_snapshot(&self, old: &str, new: &str) -> Result<SnapshotEntry, ControlError> {
+        // Outermost: lock both names a rename touches, same lock swap_snapshot/ingest_with take,
+        // so neither can be claimed by an in-flight swap or import while the rename is deciding
+        // (issue 315). Always locked in a fixed, value-sorted order so a concurrent rename the
+        // other way cannot invert the order into a deadlock; a self-rename (old == new) locks the
+        // single name once, never twice.
+        let (lo, hi) = if old <= new { (old, new) } else { (new, old) };
+        let _g_lo = self.lock_target(lo);
+        let _g_hi = (hi != lo).then(|| self.lock_target(hi));
+
         let sc = self.inner.snap_by_name(old)?;
         validate_snapshot_name(new)?;
         if old == new {
