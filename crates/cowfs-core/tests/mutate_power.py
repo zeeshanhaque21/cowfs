@@ -20,10 +20,7 @@ test = os.environ.get("MUT_TEST", "power_core")
 filt = ["--", os.environ.get("MUT_FILTER", "power_cut_at_every")]
 
 HOOK = "        self.run_hook()?;\n        if !has_work {\n            return Ok(None);\n        }\n"
-INTENT_RM = (
-    "        if crate::fsops::remove_file(intent_path(&self.inner.root, target)).is_ok() {\n"
-    "            sync_dir(&self.inner.root);\n        }\n        entry.ok_or(ControlError::NotFound)"
-)
+DROP = "        self.drop_intent(target);\n        entry.ok_or(ControlError::NotFound)"
 
 
 def hook_after_commit(t):
@@ -38,15 +35,11 @@ def hook_after_commit(t):
 
 
 def intent_removed_before_rename(t):
-    """finish_swap removes (and syncs the removal of) the intent file before the rename."""
-    if INTENT_RM not in t or "        let mut entry = None;\n" not in t:
+    """finish_swap drops (and syncs the removal of) the intent file before the staging rename."""
+    if DROP not in t or "        let mut entry = None;\n" not in t:
         raise ValueError
-    t = t.replace(INTENT_RM, "        entry.ok_or(ControlError::NotFound)", 1)
-    early = (
-        "        if crate::fsops::remove_file(intent_path(&self.inner.root, target)).is_ok() {\n"
-        "            sync_dir(&self.inner.root);\n        }\n"
-    )
-    return t.replace("        let mut entry = None;\n", "        let mut entry = None;\n" + early, 1)
+    t = t.replace(DROP, "        entry.ok_or(ControlError::NotFound)", 1)
+    return t.replace("        let mut entry = None;\n", "        self.drop_intent(target);\n        let mut entry = None;\n", 1)
 
 
 def hook_skipped_for(kind):
@@ -73,8 +66,8 @@ M = [
      "    crate::fsops::sync_file(&f, &tmp).map_err(|e| io(&e.to_string()))?;\n", ""),
     ("I3 intent removed before the staging rename", "cowfs-core/src/swap.rs", intent_removed_before_rename, None),
     ("I4 intent removal not followed by a directory fsync", "cowfs-core/src/swap.rs",
-     "        if crate::fsops::remove_file(intent_path(&self.inner.root, target)).is_ok() {\n            sync_dir(&self.inner.root);\n        }\n        entry.ok_or",
-     "        let _ = crate::fsops::remove_file(intent_path(&self.inner.root, target));\n        entry.ok_or"),
+     "            Ok(()) => sync_dir(&self.inner.root),\n            // nothing to remove: a recovery that already dropped it",
+     "            Ok(()) => {}\n            // nothing to remove: a recovery that already dropped it"),
     # the store's own mutation 'W1 watermark before pack fsync' (tests/mutate.py), seen from Core
     ("W1 watermark raised before the pack fsync", "cowfs-store/src/store.rs",
      "            self.io.sync_file(&file, &pack::pack_path(&self.dir, id))?;\n            self.wm\n                .lock()\n                .unwrap_or_else(PoisonError::into_inner)\n                .advance(Mark { pack: id, len })?;",

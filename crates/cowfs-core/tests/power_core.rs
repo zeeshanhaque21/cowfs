@@ -783,6 +783,8 @@ struct Tally {
     with_intent: u32,
     /// images whose intent file was not a whole record (an unsynced one cut short)
     torn_intent: u32,
+    /// images whose intent file is on disk although its unlink completed before the cut
+    resurrected: u32,
     /// swap targets that came back as the old tree, and as the new one
     old_tree: u32,
     new_tree: u32,
@@ -794,6 +796,7 @@ impl Tally {
         self.images += o.images;
         self.with_intent += o.with_intent;
         self.torn_intent += o.torn_intent;
+        self.resurrected += o.resurrected;
         self.old_tree += o.old_tree;
         self.new_tree += o.new_tree;
         self.failures.extend(o.failures);
@@ -807,6 +810,16 @@ fn same_tree(want: &Tree, got: &Tree, loose: &HashSet<String>) -> bool {
         && got
             .keys()
             .all(|p| want.contains_key(p) || loose.contains(p))
+}
+
+/// An intent file is on disk at open although the unlink of that very name had completed before
+/// the cut: the directory entry change never reached the disk, the case the swap's final
+/// directory fsync exists for.
+fn resurrected(run: &Run, k: usize, dir: &Path) -> bool {
+    run.rops.iter().enumerate().any(|(i, op)| match op {
+        RootOp::Unlink(n) => run.root_at[i] < k && dir.join(n).exists(),
+        _ => false,
+    })
 }
 
 fn verify(dir: &Path, ex: &Expect, t: &mut Tally) -> Result<(), String> {
@@ -1053,6 +1066,7 @@ fn sweep(run: &Run, wseed: u64, seeds: u64, threads: usize, keep: bool) -> Tally
                         let dir = tempfile::tempdir().unwrap();
                         build_image(run, k, seed, dir.path());
                         t.images += 1;
+                        t.resurrected += u32::from(resurrected(run, k, dir.path()));
                         if let Err(e) = verify(dir.path(), ex, &mut t) {
                             let kept = if keep && KEPT.fetch_add(1, Ordering::Relaxed) < KEEP_MAX {
                                 // `verify` writes into the image, so rebuild the cut image
@@ -1075,7 +1089,7 @@ fn sweep(run: &Run, wseed: u64, seeds: u64, threads: usize, keep: bool) -> Tally
 
 fn report(run: &Run, t: &Tally) {
     println!(
-        "{} power-cut images over {} ops ({} root ops, {} metadata events, {} acks), {} with an intent file on disk ({} torn), swap targets old/new = {}/{}, gc unlinked {} packs",
+        "{} power-cut images over {} ops ({} root ops, {} metadata events, {} acks), {} with an intent file on disk ({} torn, {} resurrected after its unlink), swap targets old/new = {}/{}, gc unlinked {} packs",
         t.images,
         run.ops.len(),
         run.rops.len(),
@@ -1083,6 +1097,7 @@ fn report(run: &Run, t: &Tally) {
         run.ack_at.len() - 1,
         t.with_intent,
         t.torn_intent,
+        t.resurrected,
         t.old_tree,
         t.new_tree,
         run.gc_unlinked,
