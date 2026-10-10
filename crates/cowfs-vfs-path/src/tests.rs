@@ -960,6 +960,7 @@ fn mknod_private_sets_the_mode_and_removes_its_scratch_directory() {
 
 /// #307 fix A: a failed scratch-directory `rmdir` must not override a successful rename-out --
 /// only a failed make may fail the call.
+#[cfg(target_os = "linux")]
 #[test]
 fn keep_make_despite_failed_cleanup_prefers_a_successful_make() {
     use crate::keep_make_despite_failed_cleanup as combine;
