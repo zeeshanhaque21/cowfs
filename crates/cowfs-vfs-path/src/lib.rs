@@ -771,8 +771,10 @@ fn keep_make_despite_failed_cleanup(
 const STALE_MKNOD_SCRATCH_AGE: Duration = Duration::from_secs(60);
 
 /// Best-effort sweep of `dir` for abandoned `.cowfs-mknod-*` scratch directories, run lazily at
-/// the top of `mknod_private` instead of walking the whole tree at mount time: it only costs an
-/// extra `readdir` of a directory `mknod` is about to write into anyway, and it cleans up
+/// the top of `mknod_private` instead of walking the whole tree at mount time: it costs one
+/// `readdir` of the directory `mknod` is about to write into, which is linear in that directory's
+/// size on every call (acceptable because `mknod` is rare: device nodes, fifos, sockets; a
+/// per-process throttle is the upgrade if a hot path ever appears), and it cleans up
 /// exactly the directories where the leak in #307 can recur. A directory that never sees
 /// another `mknod` call keeps any stray entry; that is an accepted trade (see #307), not
 /// something this function tries to fix. Every error here is swallowed: a sweep failure must
@@ -792,6 +794,8 @@ fn sweep_stale_mknod_scratch(dir: std::os::fd::BorrowedFd<'_>) {
         }
         // `DirEntry::metadata` is an `lstat`, not a `stat`: it will not follow a symlink planted
         // under this name, and `is_dir()` below then rejects it instead of recursing into it.
+        // That check is only a filter: the entry can still be swapped between it and the removal
+        // below, so the removal must itself never follow a symlink.
         let Ok(meta) = entry.metadata() else { continue };
         let age_ok = meta
             .modified()
@@ -801,7 +805,12 @@ fn sweep_stale_mknod_scratch(dir: std::os::fd::BorrowedFd<'_>) {
         if !age_ok || !meta.is_dir() || meta.uid() != sys::geteuid() {
             continue;
         }
-        force_remove_dir_all(&entry.path());
+        // Not `force_remove_dir_all`: its permission-opening pass uses `set_permissions` and
+        // `read_dir` by path, which follow a symlink swapped in after the `lstat` above and would
+        // chmod whatever it points at. A scratch directory is created `0700` and owned by us
+        // (the uid check above), so nothing in it needs opening up, and `remove_dir_all` does not
+        // follow symlinks.
+        let _ = std::fs::remove_dir_all(entry.path());
     }
 }
 
