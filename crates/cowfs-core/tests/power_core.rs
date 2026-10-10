@@ -26,8 +26,9 @@
 //! What this does not model, on purpose: see `docs/crash-injection-173.md` (slice 5).
 //!
 //! `COWFS_POWER_SEEDS` sets the images per cut (default 5), `COWFS_POWER_WORKLOADS` the seeded
-//! workloads (default 2), `COWFS_POWER_THREADS` the workers. A failing image is kept on disk and
-//! its path is in the message; the op count of a run varies (see `docs/crash-injection-173.md`).
+//! workloads (default 2), `COWFS_POWER_THREADS` the workers. A failing image is kept under
+//! `target/tmp/power_core` and its path is in the message, next to `trace-w<seed>-<pid>.txt` (the
+//! timeline, also printed); the op count of a run varies (see `docs/crash-injection-173.md`).
 //! The older `crash.rs`, `durability.rs`, `ns_durability*.rs` and `kill9.rs` stay: they cut the
 //! store with a cruder rule or by killing a process, and see what a process crash can see.
 
@@ -553,8 +554,16 @@ fn record(hook: bool, wseed: u64) -> Run {
     w.sync();
 
     // non-replacing swap, then a rename of a snapshot, neither acknowledged until the end
+    // the swap targets are used after their swap: a resurrected intent (its removal not yet on
+    // disk) meets these user ops before anything syncs the root directory again (mutant I4)
+    w.put("base", "post", &data(7000, 11));
+    w.rename_file("base", "g", "g2");
     w.promote("s3", "fresh");
     w.sync();
+    w.put("fresh", "p1", &data(4000, 12));
+    w.unlink("fresh", "e");
+    w.core.flush().unwrap();
+    w.remove_snapshot("fresh");
     w.put("s3", "h", &data(9000, 10));
     w.core.flush().unwrap();
     w.rename_snapshot("s1", "s1r");
@@ -969,6 +978,40 @@ fn brief(op: &LogOp) -> String {
 const KEEP_MAX: usize = 4;
 static KEPT: AtomicUsize = AtomicUsize::new(0);
 
+/// Where failure evidence goes: under the target dir, a path CI can upload and a human can find.
+fn scratch() -> std::path::PathBuf {
+    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join("power_core");
+    fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// The whole recorded timeline as text: every store op by index (the `k=` of a failing tag), the
+/// root ops with their position, the acknowledgements. A recorded run is not reproducible by seed
+/// (Core iterates a `HashMap`), so a failure keeps this next to the kept images; the cut `k` of a
+/// tag names a line here.
+fn trace(run: &Run) -> String {
+    let mut s = String::new();
+    for (k, op) in run.ops.iter().enumerate() {
+        s += &format!("{k}\t{}\n", brief(op));
+    }
+    for (i, op) in run.rops.iter().enumerate() {
+        s += &format!("root op {i} at store op {}: {op:?}\n", run.root_at[i]);
+    }
+    for (p, j) in &run.ack_at {
+        s += &format!("ack {j} at store op {p}\n");
+    }
+    s
+}
+
+/// Writes the trace of a failing workload and prints it, so the CI log has it too.
+fn dump_trace(run: &Run, wseed: u64) -> std::path::PathBuf {
+    let p = scratch().join(format!("trace-w{wseed}-{}.txt", std::process::id()));
+    let tr = trace(run);
+    fs::write(&p, &tr).unwrap();
+    eprintln!("TRACE w={wseed} saved to {}\n{tr}", p.display());
+    p
+}
+
 fn build_image(run: &Run, k: usize, seed: u64, dir: &Path) {
     let mut rng = Rng(seed ^ ((k as u64) << 20) ^ 0x57A1);
     let img = crash_image(&run.store_base, &run.ops, k, &mut rng, seed % 4);
@@ -985,7 +1028,7 @@ fn build_image(run: &Run, k: usize, seed: u64, dir: &Path) {
 
 /// `keep` leaves the first failing images on disk (at most `KEEP_MAX`), for the sweep that must pass;
 /// the negative control fails by design and keeps nothing.
-fn sweep(run: &Run, seeds: u64, threads: usize, keep: bool) -> Tally {
+fn sweep(run: &Run, wseed: u64, seeds: u64, threads: usize, keep: bool) -> Tally {
     let total = Mutex::new(Tally::default());
     std::thread::scope(|sc| {
         for th in 0..threads {
@@ -1003,7 +1046,7 @@ fn sweep(run: &Run, seeds: u64, threads: usize, keep: bool) -> Tally {
                     let ex = &run.acks[j.min(run.acks.len() - 1)];
                     for seed in 0..seeds {
                         let tag = format!(
-                            "k={k}/{} seed={seed} op={}",
+                            "w={wseed} k={k}/{} seed={seed} op={}",
                             run.ops.len(),
                             run.ops.get(k).map_or_else(|| "(all done)".into(), brief)
                         );
@@ -1013,7 +1056,7 @@ fn sweep(run: &Run, seeds: u64, threads: usize, keep: bool) -> Tally {
                         if let Err(e) = verify(dir.path(), ex, &mut t) {
                             let kept = if keep && KEPT.fetch_add(1, Ordering::Relaxed) < KEEP_MAX {
                                 // `verify` writes into the image, so rebuild the cut image
-                                let d = tempfile::tempdir().unwrap().keep();
+                                let d = tempfile::tempdir_in(scratch()).unwrap().keep();
                                 build_image(run, k, seed, &d);
                                 format!(" image {}", d.display())
                             } else {
@@ -1070,11 +1113,15 @@ fn power_cut_at_every_op_of_a_core_workload_keeps_every_acknowledged_snapshot() 
         );
         let t = sweep(
             &run,
+            wseed,
             env("COWFS_POWER_SEEDS", 5) as u64,
             env("COWFS_POWER_THREADS", 4),
             true,
         );
         report(&run, &t);
+        if !t.failures.is_empty() {
+            dump_trace(&run, wseed);
+        }
         all.merge(t);
     }
     assert!(all.images > 1000);
@@ -1187,6 +1234,7 @@ fn the_power_test_notices_a_missing_store_sync_before_metadata_commits() {
     let run = record(false, 0);
     let t = sweep(
         &run,
+        0,
         env("COWFS_POWER_SEEDS", 5) as u64,
         env("COWFS_POWER_THREADS", 4),
         false,
