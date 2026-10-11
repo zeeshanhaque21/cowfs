@@ -101,10 +101,34 @@ Work that follows.
 - Keep the Ubuntu 22.04 check in the automatic tests, and plan for the day that runner image is retired.
 - Versions between 6.8 and 6.12 are covered by the promise but are not tested individually.
 
+## 7. Do we keep the mount (cowfs FUSE/NFS) as the way to make cheap workspaces?
+
+Answer: **No. Stop the mount direction.**
+
+Rule set by Zee: if a build in a cowfs workspace takes more than 2x the native build, it is not worth it.
+
+Evidence (merged reports, PR 336, 337, 338).
+- Native incremental rebuild in the base checkout: 8.4 s.
+- cowfs mount, durability sync on: 391 to 450 s for the same rebuild, about 50x native.
+- Edit and rebuild per slot: macOS 276 s (core edit 1347 s) against 4.6 s (10.9 s) for an APFS clone. Linux 41 to 1452 s against 2 to 18 s for a btrfs reflink.
+- Disk: cowfs only beats clones if it is garbage collected after every build. Before gc the Linux store reached 121 GB, worse than plain copies.
+- A clone at a new path keeps the warm build cache (at most 5 of 113 or 121 units rebuilt), so clones do not lose the speed benefit.
+- The slowdown is the deliberate durability fix for issue 90 (about 100 ms per metadata op). The run that would turn that sync off was stopped before it finished, because even a large gain could not reach 2x native.
+
+Not measured, so not claimed.
+- cowfs with the sync off.
+- cowfs clean rebuild (round R4) and the "cowfs saves 2x more disk" rule.
+- Whether a mount with batched durability could ever get within 2x.
+
+Work that follows.
+- Replacement under test: OS clone (APFS clone, btrfs reflink) plus sccache. Report to come in docs/reviews/clone-sccache-mac-20261010.md.
+- Do not delete the cowfs code yet. Decide that after the replacement benchmark.
+- Note: the treehouse worktrees for this repo currently live inside the cowfs mount, so they pay this slowdown. Moving them is part of the follow-up.
+
 ## Still undecided
 
 These were listed as needing a decision but were not part of the six.
 - Whether the simulated power-cut testing is enough for release (gate g6).
 - Whether to accept the two attack gaps that cannot be fixed from the server side (issue #262).
-- Whether to leave Linux's torn reads alone (issue #45).
+- Issue #45 (Linux torn reads): measured in PR 336. cowfs tears 7x to 16x more per million reads than native btrfs at a matched write rate, but native btrfs tears too, and direct I/O is not recommended. If the mount direction stops, this closes with it.
 - Whether the base record should keep prior details after a half-failed swap (issue #323).
