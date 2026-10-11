@@ -1,0 +1,201 @@
+arm,round,slot,seconds,compiling_count,df_free_kb,cache_hits,cache_misses,cache_du_kb,notes
+B,R0,start,,,234775992,,,,load1=11.50
+B,R0,base,29.02,113,230790656,,,,load1=23.55 base build (cold cache for E)
+B,R1,start,,,230790616,,,,load1=20.31
+B,R1,1,6.66,,230903448,,,,load1=17.56
+B,R1,2,6.45,,230909408,,,,load1=15.27
+B,R1,3,6.86,,230904916,,,,load1=12.75
+B,R1,4,6.84,,230896744,,,,load1=11.84
+B,R2n,1,0.87,1,,,,,load1=11.84 native edit=cowfs-cli
+B,R3n,1,8.86,7,,,,,load1=16.30 native store edit on top of R2n
+B,R2n,2,1.32,1,,,,,load1=17.61 native edit=cowfs-treehouse
+B,R3n,2,9.50,7,,,,,load1=22.52 native store edit on top of R2n
+B,R2n,3,1.95,2,,,,,load1=21.62 native edit=cowfs-daemon
+B,R3n,3,11.48,7,,,,,load1=22.96 native store edit on top of R2n
+B,R2n,4,0.81,1,,,,,load1=21.82 native edit=cowfs-fuse
+B,R3n,4,12.93,7,,,,,load1=23.06 native store edit on top of R2n
+B,R2,start,,,228246980,,,,load1=20.35
+B,R2,1,3.12,1,228140256,,,,load1=17.35 edit=cowfs-cli
+B,R2,2,3.07,1,227988664,,,,load1=15.21 edit=cowfs-treehouse
+B,R2,3,5.08,2,227602224,,,,load1=12.95 edit=cowfs-daemon
+B,R2,4,1.09,1,227570900,,,,load1=11.18 edit=cowfs-fuse
+B,R3,start,,,227569120,,,,load1=10.30
+B,R3,1,14.75,7,225190196,,,,load1=15.71 edit=cowfs-store
+B,R3,2,14.77,7,222715860,,,,load1=16.51 edit=cowfs-store
+B,R3,3,13.80,7,220537384,,,,load1=19.48 edit=cowfs-store
+B,R3,4,14.79,7,219450808,,,,load1=19.28 edit=cowfs-store
+B,R4,start,,,219450560,,,,load1=16.86
+B,R4clean,1,5.41,0,221954212,,,,load1=14.02
+B,R4,1,24.44,113,217982044,,,,load1=19.12
+B,R4clean,2,5.39,0,220612516,,,,load1=15.66
+B,R4,2,24.13,113,216649100,,,,load1=18.67
+B,R4clean,3,5.45,0,219243820,,,,load1=15.84
+B,R4,3,24.16,113,215277920,,,,load1=16.37
+B,R4clean,4,5.30,0,218434968,,,,load1=13.86
+B,R4,4,23.66,113,214470392,,,,load1=45.07
+B,R4w,start,,,214470596,,,,load1=38.90
+B,R4wclean,1,3.61,0,218435892,,,,load1=30.88
+B,R4w,1,23.82,113,214473168,,,,load1=30.44
+B,R4wclean,2,3.48,0,218432340,,,,load1=24.82
+B,R4w,2,23.20,113,214471104,,,,load1=26.30
+B,R4wclean,3,3.53,0,218433628,,,,load1=21.42
+B,R4w,3,24.13,113,214472944,,,,load1=24.20
+B,R4wclean,4,2.93,0,218435392,,,,load1=20.25
+B,R4w,4,22.42,113,214472760,,,,load1=24.78
+B,R6,start,,,214471272,,,,load1=20.47
+B,R6,1,2.40,3,214454340,,,,"load1=18.02 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+B,R6,2,2.25,3,214439560,,,,"load1=15.73 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+B,R6,3,2.22,3,214422648,,,,"load1=13.13 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+B,R6,4,2.04,3,214423380,,,,"load1=11.65 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+B,R4nclean,1,12.89,0,218913724,,,,load1=9.56
+B,R4n,1,18.76,113,214970164,,,,load1=20.95 native clean+full in base
+B,R4nclean,2,2.73,0,218907716,,,,load1=18.11
+B,R4n,2,18.76,113,214967272,,,,load1=25.98 native clean+full in base
+B,R4nclean,3,2.78,0,218905588,,,,load1=21.02
+B,R4n,3,21.06,113,214958876,,,,load1=24.53 native clean+full in base
+B,R4nclean,4,2.85,0,218904912,,,,load1=21.22
+B,R4n,4,19.25,113,214959692,,,,load1=22.12 native clean+full in base
+B2,R0,start,,,234817220,,,,load1=16.85
+B2,R0,base,15.03,113,232184252,,,,load1=20.82 base build (cold cache for E)
+B2,R1,start,,,232184340,,,,load1=18.00
+B2,R1,1,0.75,,232181272,,,,load1=14.99
+B2,R1,2,0.76,,232176728,,,,load1=13.21
+B2,R1,3,0.78,,232174480,,,,load1=11.73
+B2,R1,4,0.76,,232172196,,,,load1=10.47
+B2,R2n,1,0.72,1,,,,,load1=10.47 native edit=cowfs-cli
+B2,R3n,1,6.43,7,,,,,load1=12.11 native store edit on top of R2n
+B2,R2n,2,1.15,1,,,,,load1=14.54 native edit=cowfs-treehouse
+B2,R3n,2,6.39,7,,,,,load1=18.18 native store edit on top of R2n
+B2,R2n,3,1.70,2,,,,,load1=19.99 native edit=cowfs-daemon
+B2,R3n,3,6.22,7,,,,,load1=25.27 native store edit on top of R2n
+B2,R2n,4,0.55,1,,,,,load1=23.98 native edit=cowfs-fuse
+B2,R3n,4,6.16,7,,,,,load1=31.83 native store edit on top of R2n
+B2,R2,start,,,230424516,,,,load1=29.67
+B2,R2,1,2.21,1,230343660,,,,load1=25.02 edit=cowfs-cli
+B2,R2,2,1.88,1,230265932,,,,load1=22.02 edit=cowfs-treehouse
+B2,R2,3,3.14,2,229995400,,,,load1=18.46 edit=cowfs-daemon
+B2,R2,4,0.83,1,229980860,,,,load1=15.92 edit=cowfs-fuse
+B2,R3,start,,,229980688,,,,load1=14.00
+B2,R3,1,6.98,7,228394864,,,,load1=17.89 edit=cowfs-store
+B2,R3,2,6.49,7,226731452,,,,load1=15.69 edit=cowfs-store
+B2,R3,3,6.25,7,225336076,,,,load1=17.01 edit=cowfs-store
+B2,R3,4,6.29,7,225286864,,,,load1=18.94 edit=cowfs-store
+B2,R4,start,,,225286640,,,,load1=16.55
+B2,R4clean,1,0.24,0,226952160,,,,load1=14.46
+B2,R4,1,12.65,113,224321500,,,,load1=21.54
+B2,R4clean,2,0.29,0,226064252,,,,load1=18.61
+B2,R4,2,13.49,113,223429264,,,,load1=16.79
+B2,R4clean,3,0.24,0,225098924,,,,load1=14.59
+B2,R4,3,12.74,113,222470840,,,,load1=19.49
+B2,R4clean,4,0.29,0,224214904,,,,load1=16.88
+B2,R4,4,12.49,113,221583136,,,,load1=17.02
+B2,R4w,start,,,221583108,,,,load1=15.44
+B2,R4wclean,1,0.34,0,224214468,,,,load1=13.52
+B2,R4w,1,12.62,113,221600656,,,,load1=20.51
+B2,R4wclean,2,0.35,0,224211220,,,,load1=18.05
+B2,R4w,2,12.23,113,221580912,,,,load1=25.29
+B2,R4wclean,3,0.34,0,224210128,,,,load1=22.03
+B2,R4w,3,12.71,113,221583452,,,,load1=25.57
+B2,R4wclean,4,0.34,0,224212156,,,,load1=22.02
+B2,R4w,4,12.56,113,221581832,,,,load1=27.22
+B2,R6,start,,,221581968,,,,load1=23.94
+B2,R6,1,1.99,3,221570300,,,,"load1=20.64 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+B2,R6,2,1.94,3,221557756,,,,"load1=16.74 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+B2,R6,3,1.95,3,221545212,,,,"load1=14.63 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+B2,R6,4,1.94,3,221533712,,,,"load1=12.08 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+B2,R4nclean,1,0.29,0,224211472,,,,load1=11.33
+B2,R4n,1,12.74,113,221591060,,,,load1=22.31 native clean+full in base
+B2,R4nclean,2,0.35,0,224219100,,,,load1=19.73
+B2,R4n,2,13.94,113,221583992,,,,load1=21.48 native clean+full in base
+B2,R4nclean,3,0.34,0,224019368,,,,load1=19.26
+B2,R4n,3,13.97,113,221388180,,,,load1=18.21 native clean+full in base
+B2,R4nclean,4,0.34,0,224016732,,,,load1=15.94
+B2,R4n,4,14.02,113,221385808,,,,load1=18.81 native clean+full in base
+E,R0,start,,,234580084,,,0,load1=16.20
+E,R0,base,15.30,113,230664248,0,145,107316,load1=22.86 base build (cold cache for E)
+E,R1,start,,,230514156,,,107316,load1=20.26
+E,R1,1,1.00,,229740536,,,107316,load1=18.16
+E,R1,2,0.80,,229703728,,,107316,load1=15.99
+E,R1,3,1.31,,229665108,,,107316,load1=14.62
+E,R1,4,0.85,,229642276,,,107316,load1=14.06
+E,R2n,1,0.84,1,,0,1,108108,load1=14.06 native edit=cowfs-cli
+E,R3n,1,13.72,7,,1,5,120436,load1=25.15 native store edit on top of R2n
+E,R2n,2,1.52,1,,0,1,122492,load1=28.10 native edit=cowfs-treehouse
+E,R3n,2,8.53,7,,1,5,134820,load1=32.66 native store edit on top of R2n
+E,R2n,3,1.90,2,,0,2,138276,load1=33.19 native edit=cowfs-daemon
+E,R3n,3,8.14,7,,1,5,150604,load1=31.17 native store edit on top of R2n
+E,R2n,4,0.55,1,,0,1,151076,load1=44.96 native edit=cowfs-fuse
+E,R3n,4,8.37,7,,1,5,163404,load1=38.91 native store edit on top of R2n
+E,R2,start,,,227549716,,,163404,load1=35.84
+E,R2,1,2.33,1,227100856,0,1,164192,load1=31.65 edit=cowfs-cli
+E,R2,2,6.72,1,225866972,0,1,166248,load1=30.84 edit=cowfs-treehouse
+E,R2,3,3.67,2,224934808,0,2,169700,load1=29.09 edit=cowfs-daemon
+E,R2,4,0.93,1,224927416,0,1,170172,load1=25.39 edit=cowfs-fuse
+E,R3,start,,,224927352,,,170172,load1=22.18
+E,R3,1,10.14,7,223327756,0,6,183284,load1=20.50 edit=cowfs-store
+E,R3,2,9.69,7,221646152,0,6,196396,load1=23.60 edit=cowfs-store
+E,R3,3,9.22,7,220248420,0,6,209508,load1=23.20 edit=cowfs-store
+E,R3,4,9.44,7,220189776,0,6,222620,load1=19.27 edit=cowfs-store
+E,R4,start,,,220189776,,,222620,load1=16.69
+E,R4clean,1,0.28,0,221855772,0,0,222620,load1=14.73
+E,R4,1,17.74,113,219261140,122,23,267068,load1=15.67
+E,R4clean,2,0.29,0,220993948,0,0,267068,load1=14.08
+E,R4,2,13.52,113,218388528,122,23,311516,load1=19.86
+E,R4clean,3,0.28,0,220057760,0,0,311516,load1=17.18
+E,R4,3,13.05,113,217466312,122,23,355964,load1=22.83
+E,R4clean,4,0.29,0,219209860,0,0,355964,load1=20.32
+E,R4,4,12.92,113,216601248,122,23,400408,load1=17.21
+E,R4w,start,,,216162656,,,400408,load1=31.05
+E,R4wclean,1,0.68,0,216872720,0,0,400408,load1=33.40
+E,R4w,1,19.08,113,209329936,145,0,400408,load1=59.69
+E,R4wclean,2,0.35,0,211887000,0,0,400408,load1=51.36
+E,R4w,2,12.23,113,209440312,145,0,400408,load1=50.53
+E,R4wclean,3,0.34,0,211998104,0,0,400408,load1=43.59
+E,R4w,3,11.17,113,209520732,145,0,400408,load1=43.48
+E,R4wclean,4,0.35,0,212079120,0,0,400408,load1=35.33
+E,R4w,4,11.52,113,209641876,145,0,400408,load1=43.90
+E,R6,start,,,209640364,,,400408,load1=37.84
+E,R6,1,1.67,3,209628448,1,3,401892,"load1=32.69 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+E,R6,2,1.03,3,209615052,3,1,402132,"load1=28.36 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+E,R6,3,1.05,3,209603544,3,1,402372,"load1=22.95 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+E,R6,4,1.02,3,209596108,3,1,402612,"load1=20.20 PASS [('ok', '7', '0'), ('ok', '0', '0')]"
+E,R4nclean,1,0.39,0,212257952,0,0,402612,load1=17.71
+E,R4n,1,12.30,113,209810724,145,0,402612,load1=20.92 native clean+full in base
+E,R4nclean,2,0.29,0,212242332,0,0,402612,load1=18.48
+E,R4n,2,10.35,113,209803792,145,0,402612,load1=25.77 native clean+full in base
+E,R4nclean,3,0.29,0,212235372,0,0,402612,load1=22.34
+E,R4n,3,10.48,113,209793900,145,0,402612,load1=24.00 native clean+full in base
+E,R4nclean,4,0.29,0,212225344,0,0,402612,load1=20.55
+E,R4n,4,10.64,113,209795100,145,0,402612,load1=26.26 native clean+full in base
+B,R7,1start,,,221998116,,,,load1=21.31
+B,R7,1,16.62,113,218052060,,,,"load1=25.91 fresh clone, no target"
+B2,R7,1start,,,221989020,,,,load1=22.56
+B2,R7,1,12.23,113,219356536,,,,"load1=28.79 fresh clone, no target"
+Ecold,R7,1start,,,222000804,,,0,load1=25.43
+Ecold,R7,1,14.39,113,219321380,0,145,107308,"load1=22.80 fresh clone, no target"
+Ewarm,R7,1start,,,222056456,,,402612,load1=18.72
+Ewarm,R7,1,12.58,113,219459736,122,23,447056,"load1=21.29 fresh clone, no target"
+B,R7,2start,,,222021736,,,,load1=18.70
+B,R7,2,16.86,113,218086356,,,,"load1=31.27 fresh clone, no target"
+B2,R7,2start,,,222017592,,,,load1=26.99
+B2,R7,2,13.69,113,219399264,,,,"load1=29.08 fresh clone, no target"
+Ecold,R7,2start,,,222012372,,,0,load1=25.31
+Ecold,R7,2,13.47,113,219271908,0,145,107308,"load1=25.14 fresh clone, no target"
+Ewarm,R7,2start,,,222008332,,,447056,load1=22.64
+Ewarm,R7,2,12.90,113,219409176,122,23,491496,"load1=27.97 fresh clone, no target"
+B,R7,3start,,,221967332,,,,load1=24.74
+B,R7,3,17.19,113,218029448,,,,"load1=32.32 fresh clone, no target"
+B2,R7,3start,,,221962720,,,,load1=28.93
+B2,R7,3,12.33,113,219336024,,,,"load1=34.47 fresh clone, no target"
+Ecold,R7,3start,,,221965628,,,0,load1=29.79
+Ecold,R7,3,13.38,113,219224800,0,145,107308,"load1=27.84 fresh clone, no target"
+Ewarm,R7,3start,,,221965596,,,491496,load1=24.19
+Ewarm,R7,3,12.65,113,219360380,122,23,535940,"load1=23.90 fresh clone, no target"
+B,R7,4start,,,221917180,,,,load1=20.77
+B,R7,4,16.56,113,217985720,,,,"load1=24.76 fresh clone, no target"
+B2,R7,4start,,,221918052,,,,load1=20.24
+B2,R7,4,12.39,113,219285756,,,,"load1=21.26 fresh clone, no target"
+Ecold,R7,4start,,,221914692,,,0,load1=18.12
+Ecold,R7,4,14.50,113,219188188,0,145,107308,"load1=16.94 fresh clone, no target"
+Ewarm,R7,4start,,,221909332,,,535940,load1=15.01
+Ewarm,R7,4,12.65,113,219303852,122,23,580384,"load1=12.76 fresh clone, no target"
